@@ -343,8 +343,9 @@ impl OpenAiCompatProvider {
             }
         }
         // Default (and strict fallback): most older local engines don't
-        // honour `response_format`. Ask for JSON and extract the first
-        // balanced `{…}` object from the text.
+        // honour `response_format`. Put the schema in the prompt before
+        // extracting the first balanced `{…}` object from the response.
+        let request = with_tolerant_schema_prompt(request, &schema)?;
         let (res, finish_reason) = self
             .inner
             .complete_with_operation_id_and_finish_reason(request, operation_id)
@@ -395,6 +396,20 @@ impl OpenAiCompatProvider {
             }
         }
     }
+}
+
+fn with_tolerant_schema_prompt(
+    mut request: ChatRequest,
+    schema: &serde_json::Value,
+) -> LlmResult<ChatRequest> {
+    let schema = serde_json::to_string(schema)?;
+    let instruction =
+        format!("Return ONE JSON object matching this JSON Schema exactly:\n\n{schema}");
+    request.system = Some(match request.system.take() {
+        Some(system) if !system.trim().is_empty() => format!("{system}\n\n{instruction}"),
+        _ => instruction,
+    });
+    Ok(request)
 }
 
 /// True for errors where a *retry without structured-output coercion*
@@ -492,6 +507,16 @@ mod tests {
             .map(str::to_owned)
     }
 
+    fn request_body(request: &wiremock::Request) -> serde_json::Value {
+        serde_json::from_slice(&request.body).expect("request body is JSON")
+    }
+
+    fn system_prompt(body: &serde_json::Value) -> &str {
+        body["messages"][0]["content"]
+            .as_str()
+            .expect("system message content")
+    }
+
     /// Acceptance (a): the header is present on the wire in the accepted
     /// format — a 36-character `[A-Za-z0-9._:-]` value (UUID v7 display
     /// string) well inside the 64-character header contract — and it carries
@@ -568,14 +593,15 @@ mod tests {
             .with_strict(true)
             .with_request_id_header();
         let operation_id = LlmOperationId::new();
+        let schema = json!({
+            "type": "object",
+            "properties": { "ok": { "type": "boolean" } },
+            "required": ["ok"],
+        });
         let value = provider
             .complete_structured_raw_with_operation_id(
                 ChatRequest::user_prompt("emit JSON"),
-                json!({
-                    "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
-                }),
+                schema.clone(),
                 operation_id,
             )
             .await
@@ -584,6 +610,14 @@ mod tests {
         assert_eq!(value, json!({ "ok": true }));
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 2, "strict attempt + tolerant fallback");
+        let strict_body = request_body(&requests[0]);
+        let tolerant_body = request_body(&requests[1]);
+        assert!(strict_body.get("response_format").is_some());
+        assert!(tolerant_body.get("response_format").is_none());
+        assert!(
+            system_prompt(&tolerant_body)
+                .contains(&serde_json::to_string(&schema).expect("schema serializes"))
+        );
         let expected = operation_id.to_string();
         for request in &requests {
             assert_eq!(
@@ -600,6 +634,52 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tolerant_structured_request_includes_schema_in_system_prompt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(chat_response_with_content(r#"{"proposals":[]}"#)),
+            )
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAiCompatProvider::new(server.uri(), None, "model-x").expect("provider builds");
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "proposals": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "operation": { "type": "string" },
+                            "kind": { "type": "string" },
+                            "evidence": { "type": "array" },
+                            "confidence": { "type": "number" },
+                        },
+                    },
+                },
+            },
+        });
+        let mut request = ChatRequest::user_prompt("review these observations");
+        request.system = Some("Keep the existing review rules.".into());
+        provider
+            .complete_structured_raw(request, schema.clone())
+            .await
+            .expect("tolerant structured completion succeeds");
+
+        let requests = server.received_requests().await.expect("requests");
+        let body = request_body(&requests[0]);
+        assert!(body.get("response_format").is_none());
+        let system = system_prompt(&body);
+        assert!(system.starts_with("Keep the existing review rules."));
+        assert!(system.contains(&serde_json::to_string(&schema).expect("schema serializes")));
     }
 
     /// Acceptance (e): `opencode` routes through this wrapper internally but

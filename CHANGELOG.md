@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Appended the target JSON Schema to the system prompt during `openai-compat`
+  tolerant structured completion fallback and direct tolerant mode, preventing
+  models from omitting top-level object wrappers when `response_format` is
+  unsupported or rejected (#1909).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).
