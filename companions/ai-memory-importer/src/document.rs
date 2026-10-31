@@ -2105,4 +2105,47 @@ mod tests {
             serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
         assert_eq!(recorded["status"], "failed");
     }
+
+    /// The server returns 12,000 characters of a body unless asked for more,
+    /// and never more than 64,000 (#1827). A rerun asks for the ceiling, so a
+    /// long document it wrote is still found present; a page past the ceiling
+    /// cannot be compared and fails with that reason, not as a foreign page.
+    #[tokio::test]
+    async fn a_rerun_compares_long_documents_whole_or_says_why_it_cannot() {
+        let temp = TempDir::new().unwrap();
+        let server = MockServer::start(&[("w", "p")]);
+        let manifest = temp.path().join("manifest.json");
+        let recorded = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap()
+        };
+        let line = "The importer keeps every rerun idempotent.\n";
+
+        let long = temp.path().join("long.md");
+        fs::write(&long, line.repeat(500)).unwrap();
+        run(apply_args(&long, &server.url, &manifest))
+            .await
+            .unwrap();
+        run(apply_args(&long, &server.url, &manifest))
+            .await
+            .unwrap();
+        assert_eq!(recorded()["status"], "present");
+        assert_eq!(server.state().stored_versions(), 1);
+
+        let longer = temp.path().join("longer.md");
+        fs::write(&longer, line.repeat(1600)).unwrap();
+        run(apply_args(&longer, &server.url, &manifest))
+            .await
+            .unwrap();
+        let error = run(apply_args(&longer, &server.url, &manifest))
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("longer than memory_read_page returns"),
+            "{message}"
+        );
+        assert!(!message.contains("did not write"), "{message}");
+        assert_eq!(recorded()["status"], "failed");
+        assert_eq!(server.state().stored_versions(), 2);
+    }
 }
