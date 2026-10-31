@@ -662,7 +662,10 @@ pub(crate) fn is_length_truncated(finish_reason: Option<&str>) -> bool {
 ///    a complete `required` array: `'required' is required to be supplied
 ///    and to be an array including every key in properties`.
 ///
-/// Both rules are unconditional here: this normalisation only runs on
+/// 3. `format` is removed from numeric nodes (`type` number/integer), because
+///    strict mode rejects it there (#1901); string formats are kept.
+///
+/// All rules are unconditional here: this normalisation only runs on
 /// the `Official` request dialect, which targets `api.openai.com`
 /// where strict mode is mandatory. Any caller-supplied
 /// `additionalProperties: true` or trimmed `required` array is
@@ -693,6 +696,13 @@ pub(crate) fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
             // the rewrite preserves the generated schema's accepted set.
             if let Some(one_of) = map.remove("oneOf") {
                 map.insert("anyOf".to_string(), one_of);
+            }
+            // schemars emits `format` (float/double/int64/uint…) on numeric
+            // nodes; opencode in strict mode answers 400 (#1901). It is only
+            // an annotation, since serde already validates the type. String
+            // formats (date-time, uuid) stay: strict accepts them.
+            if map.get("type").is_some_and(is_numeric_type) {
+                map.remove("format");
             }
             let is_object = map
                 .get("type")
@@ -725,6 +735,19 @@ pub(crate) fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// `true` when a JSON Schema `type` value names a numeric kind, either as a
+/// string or inside a union array like `["number","null"]`. Used to decide
+/// whether `format` is a numeric annotation that strict mode rejects.
+fn is_numeric_type(t: &serde_json::Value) -> bool {
+    match t {
+        serde_json::Value::String(s) => s == "number" || s == "integer",
+        serde_json::Value::Array(a) => a
+            .iter()
+            .any(|v| matches!(v.as_str(), Some("number" | "integer"))),
+        _ => false,
     }
 }
 
@@ -1054,6 +1077,149 @@ mod tests {
             tier.as_object().unwrap().len(),
             1,
             "only $ref should remain on the node"
+        );
+    }
+
+    #[test]
+    fn enforce_strict_strips_numeric_format_keeps_string_format() {
+        // Issue akitaonrails/ai-memory#1901: the opencode provider rejects
+        // strict JSON schemas whose numeric nodes carry `format` (e.g.
+        // `"format":"float"` emitted by schemars for f32/f64 and
+        // `"format":"int64"` for i64). String formats such as `date-time`
+        // are valid and must survive, so the strip is scoped to numeric
+        // `type` values only.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "score": { "type": "number", "format": "float" },
+                "count": { "type": "integer", "format": "int64" },
+                "maybe": { "type": ["number", "null"], "format": "float" },
+                "inner": {
+                    "type": "object",
+                    "properties": {
+                        "v": { "type": "number", "format": "double" }
+                    }
+                },
+                "when": { "type": "string", "format": "date-time" }
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+
+        let props = &schema["properties"];
+        for (label, node) in [
+            ("score", &props["score"]),
+            ("count", &props["count"]),
+            ("maybe", &props["maybe"]),
+            ("inner.v", &props["inner"]["properties"]["v"]),
+        ] {
+            assert!(
+                node.get("format").is_none(),
+                "numeric node `{label}` must not carry `format`, got {node}"
+            );
+        }
+        assert_eq!(
+            props["when"]["format"],
+            json!("date-time"),
+            "string format must be preserved"
+        );
+    }
+
+    #[test]
+    fn enforce_strict_keeps_string_format_on_nullable_union() {
+        // Guard for the #1901 scope: a `["string","null"]` union is not a
+        // numeric type, so its `date-time` format is a validation hint the
+        // strict endpoint accepts and must not be stripped.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "when": { "type": ["string", "null"], "format": "date-time" }
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        assert_eq!(
+            schema["properties"]["when"]["format"],
+            json!("date-time"),
+            "nullable string format must be preserved"
+        );
+    }
+
+    #[test]
+    fn enforce_strict_drops_unsigned_format_keeps_minimum() {
+        // schemars emits `format: "uint"` for unsigned ints. It is only an
+        // annotation (serde already enforces the type), so it goes; the
+        // `minimum` bound is a real constraint and must stay.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "n": { "type": "integer", "format": "uint", "minimum": 0 }
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        let n = &schema["properties"]["n"];
+        assert!(
+            n.get("format").is_none(),
+            "uint format must be removed, got {n}"
+        );
+        assert_eq!(n["minimum"], json!(0), "minimum must be kept");
+    }
+
+    #[test]
+    fn enforce_strict_keeps_property_named_format_and_type() {
+        // Property keys named `format` or `type` live in the `properties`
+        // map, not at keyword level. The numeric strip must key off the
+        // schema's own `type` keyword, so these entries survive untouched.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "format": { "type": "string" },
+                "type": { "type": "string" }
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        let props = &schema["properties"];
+        assert_eq!(props["format"], json!({ "type": "string" }));
+        assert_eq!(props["type"], json!({ "type": "string" }));
+    }
+
+    #[test]
+    fn enforce_strict_strips_numeric_format_in_items_defs_and_one_of() {
+        // The recursion must reach every position schemars can place a
+        // numeric node: array `items`, a `$defs` entry, and a branch of a
+        // `oneOf` (which becomes `anyOf` before recursion).
+        let mut schema = json!({
+            "type": "object",
+            "$defs": {
+                "Score": { "type": "number", "format": "float" }
+            },
+            "properties": {
+                "list": {
+                    "type": "array",
+                    "items": { "type": "integer", "format": "int64" }
+                },
+                "choice": {
+                    "oneOf": [
+                        { "type": "number", "format": "double" },
+                        { "type": "string", "const": "none" }
+                    ]
+                }
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        assert!(
+            schema["$defs"]["Score"].get("format").is_none(),
+            "$defs numeric format must be removed"
+        );
+        assert!(
+            schema["properties"]["list"]["items"]
+                .get("format")
+                .is_none(),
+            "items numeric format must be removed"
+        );
+        assert!(
+            schema["properties"]["choice"]["anyOf"][0]
+                .get("format")
+                .is_none(),
+            "oneOf branch numeric format must be removed"
         );
     }
 
