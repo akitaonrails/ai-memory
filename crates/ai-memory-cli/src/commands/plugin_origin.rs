@@ -60,19 +60,22 @@ impl PluginOrigin {
 /// sits.
 pub(crate) type SettingsHooks = (PathBuf, HooksFileShape);
 
-/// Whether a plugin-launched event must be dropped before capture. `cwd` is
-/// the payload's working directory; `settings_files` are the files whose
-/// ai-memory hooks outrank the plugin (see [`settings_files_for`]).
+/// Whether a plugin-launched event must be dropped before capture. `event` is
+/// the wire event the launcher passed and `harness_event` the payload's own
+/// `hook_event_name` (see [`settings_event_name`]); `cwd` is the payload's
+/// working directory; `settings_files` are the files whose ai-memory hooks
+/// outrank the plugin (see [`settings_files_for`]).
 pub(crate) fn drops_plugin_event(
     origin: PluginOrigin,
     event: &str,
+    harness_event: Option<&str>,
     cwd: Option<&str>,
     settings_files: &[SettingsHooks],
 ) -> bool {
     if is_folderless(cwd) {
         return true;
     }
-    let Some(name) = settings_event_name(origin, event) else {
+    let Some(name) = settings_event_name(origin, event, harness_event) else {
         // Muse's subagent events come from its built-in reminder observers,
         // each under its own session id, every turn; `install-hooks --agent
         // muse` leaves them out, and so does the plugin.
@@ -167,22 +170,34 @@ pub(crate) fn settings_files_for(
 
 /// The settings-file event name for a wire event (`session-start` →
 /// `SessionStart`).
-fn settings_event_name(origin: PluginOrigin, event: &str) -> Option<&'static str> {
-    match origin {
-        PluginOrigin::ClaudeCode => CLAUDE_CODE_EVENTS
+///
+/// Two settings events can share one wire event (`PostToolUse` and
+/// `PostToolUseFailure` both run `post-tool-use`). The harness's own event
+/// name picks between them; otherwise the first entry wins. So settings that
+/// wire only the success event do not silence the plugin's failure copy.
+fn settings_event_name(
+    origin: PluginOrigin,
+    event: &str,
+    harness_event: Option<&str>,
+) -> Option<&'static str> {
+    let events: &[(&'static str, &'static str)] = match origin {
+        PluginOrigin::ClaudeCode => &CLAUDE_CODE_EVENTS,
+        PluginOrigin::Droid => &DROID_EVENTS,
+        PluginOrigin::Muse => &MUSE_EVENTS,
+        PluginOrigin::Codex => return None,
+    };
+    let names = || {
+        events
             .iter()
-            .find(|(_, script)| script.strip_suffix(".sh") == Some(event))
-            .map(|(name, _)| *name),
-        PluginOrigin::Droid => DROID_EVENTS
-            .iter()
-            .find(|(_, script)| script.strip_suffix(".sh") == Some(event))
-            .map(|(name, _)| *name),
-        PluginOrigin::Muse => MUSE_EVENTS
-            .iter()
-            .find(|(_, script)| script.strip_suffix(".sh") == Some(event))
-            .map(|(name, _)| *name),
-        PluginOrigin::Codex => None,
-    }
+            .filter(|(_, script)| script.strip_suffix(".sh") == Some(event))
+            .map(|(name, _)| *name)
+    };
+    let first = names().next()?;
+    Some(
+        names()
+            .find(|name| Some(*name) == harness_event)
+            .unwrap_or(first),
+    )
 }
 
 /// A session with no project folder: no `cwd` at all, or one inside a Claude
@@ -268,16 +283,18 @@ mod tests {
         assert!(drops_plugin_event(
             PluginOrigin::ClaudeCode,
             "session-start",
+            None,
             cwd,
             &files
         ));
         assert!(
-            !drops_plugin_event(PluginOrigin::ClaudeCode, "stop", cwd, &files),
+            !drops_plugin_event(PluginOrigin::ClaudeCode, "stop", None, cwd, &files),
             "an event the settings hooks do not wire stays with the plugin"
         );
         assert!(!drops_plugin_event(
             PluginOrigin::ClaudeCode,
             "session-start",
+            None,
             cwd,
             &[(temp.path().join("missing.json"), HooksFileShape::HooksKey)]
         ));
@@ -290,6 +307,7 @@ mod tests {
         assert!(!drops_plugin_event(
             PluginOrigin::ClaudeCode,
             "session-start",
+            None,
             cwd,
             &files
         ));
@@ -298,6 +316,77 @@ mod tests {
         assert!(!drops_plugin_event(
             PluginOrigin::ClaudeCode,
             "session-start",
+            None,
+            cwd,
+            &files
+        ));
+    }
+
+    /// Adversarial: settings that wire only `PostToolUse` must not drop the
+    /// plugin's `PostToolUseFailure` copy. Controls: the success copy, a
+    /// payload without a harness event, and settings wiring both are dropped.
+    #[test]
+    fn a_plugin_failure_copy_is_dropped_only_when_settings_deliver_the_failure_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = temp.path().join("settings.json");
+        let cwd = Some("/work/repo");
+        let files = vec![(settings.clone(), HooksFileShape::HooksKey)];
+        let entry = |event: &str| {
+            format!(
+                r#""{event}":[{{"matcher":"","hooks":[{{"type":"command","command":"/usr/bin/ai-memory hook --event post-tool-use --agent claude-code --server-url http://127.0.0.1:49374"}}]}}]"#
+            )
+        };
+        std::fs::write(
+            &settings,
+            format!(r#"{{"hooks":{{{}}}}}"#, entry("PostToolUse")),
+        )
+        .unwrap();
+        assert!(
+            !drops_plugin_event(
+                PluginOrigin::ClaudeCode,
+                "post-tool-use",
+                Some("PostToolUseFailure"),
+                cwd,
+                &files
+            ),
+            "settings deliver only the success event: the plugin keeps the failure"
+        );
+        assert!(drops_plugin_event(
+            PluginOrigin::ClaudeCode,
+            "post-tool-use",
+            Some("PostToolUse"),
+            cwd,
+            &files
+        ));
+        assert!(drops_plugin_event(
+            PluginOrigin::ClaudeCode,
+            "post-tool-use",
+            None,
+            cwd,
+            &files
+        ));
+        // An unrelated harness event falls back to the first mapping.
+        assert!(drops_plugin_event(
+            PluginOrigin::ClaudeCode,
+            "post-tool-use",
+            Some("SessionStart"),
+            cwd,
+            &files
+        ));
+
+        std::fs::write(
+            &settings,
+            format!(
+                r#"{{"hooks":{{{},{}}}}}"#,
+                entry("PostToolUse"),
+                entry("PostToolUseFailure")
+            ),
+        )
+        .unwrap();
+        assert!(drops_plugin_event(
+            PluginOrigin::ClaudeCode,
+            "post-tool-use",
+            Some("PostToolUseFailure"),
             cwd,
             &files
         ));
@@ -322,6 +411,7 @@ mod tests {
             drops_plugin_event(
                 PluginOrigin::ClaudeCode,
                 "post-tool-use",
+                None,
                 Some("/work/repo"),
                 &files,
             )
@@ -350,6 +440,7 @@ mod tests {
         assert!(!drops_plugin_event(
             PluginOrigin::Codex,
             "session-start",
+            None,
             Some("/work/repo"),
             &[(settings, HooksFileShape::HooksKey)]
         ));
@@ -371,6 +462,7 @@ mod tests {
         drops_plugin_event(
             PluginOrigin::Droid,
             event,
+            None,
             Some("/work/repo"),
             &droid_files(home),
         )
@@ -428,11 +520,13 @@ mod tests {
             PluginOrigin::Droid,
             "user-prompt-submit",
             None,
+            None,
             &[]
         ));
         assert!(!drops_plugin_event(
             PluginOrigin::Droid,
             "user-prompt-submit",
+            None,
             Some("/work/repo"),
             &[]
         ));
@@ -448,7 +542,7 @@ mod tests {
             pairs.push(("XDG_CONFIG_HOME", xdg.as_str()));
         }
         let files = settings_files_for(PluginOrigin::Muse, Some("/work/repo"), lookup(&pairs));
-        drops_plugin_event(PluginOrigin::Muse, event, Some("/work/repo"), &files)
+        drops_plugin_event(PluginOrigin::Muse, event, None, Some("/work/repo"), &files)
     }
 
     /// Adversarial: Muse running the Claude Code plugin next to an
@@ -485,6 +579,7 @@ mod tests {
             !drops_plugin_event(
                 PluginOrigin::ClaudeCode,
                 "subagent-start",
+                None,
                 Some("/work/repo"),
                 &[]
             ),
@@ -510,11 +605,13 @@ mod tests {
             PluginOrigin::Muse,
             "user-prompt-submit",
             None,
+            None,
             &[]
         ));
         assert!(!drops_plugin_event(
             PluginOrigin::Muse,
             "user-prompt-submit",
+            None,
             Some("/work/repo"),
             &[]
         ));
@@ -567,7 +664,13 @@ mod tests {
             Some(r"C:\Users\me\AppData\Roaming\Claude\scratch-workspaces\a\b\scratch-1"),
         ] {
             assert!(
-                drops_plugin_event(PluginOrigin::ClaudeCode, "user-prompt-submit", cwd, &[]),
+                drops_plugin_event(
+                    PluginOrigin::ClaudeCode,
+                    "user-prompt-submit",
+                    None,
+                    cwd,
+                    &[]
+                ),
                 "{cwd:?}"
             );
         }
@@ -580,6 +683,7 @@ mod tests {
                 !drops_plugin_event(
                     PluginOrigin::ClaudeCode,
                     "user-prompt-submit",
+                    None,
                     Some(cwd),
                     &[]
                 ),

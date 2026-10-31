@@ -45,6 +45,17 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/ai-memory-hook\" claude-code post-tool-use"
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "matcher": "",

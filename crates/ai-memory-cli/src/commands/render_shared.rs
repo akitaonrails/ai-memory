@@ -5,8 +5,8 @@
 //! pieces of state:
 //!
 //! 1. The per-agent lifecycle-hook event lists ai-memory wires up
-//!    (Claude/Grok share `CLAUDE_CODE_EVENTS`; Codex, Cursor, Gemini,
-//!    and Antigravity define their own profiles) — kept in sync between
+//!    (`CLAUDE_CODE_EVENTS`; Grok's own `GROK_EVENTS`; Codex, Cursor,
+//!    Gemini, and Antigravity define their own profiles) — kept in sync between
 //!    hook-bundle generation (setup-agent) and config rendering
 //!    (install-hooks).
 //! 2. The optional `Authorization: Bearer <token>` header used by
@@ -30,15 +30,23 @@ use crate::commands::path_util::strip_windows_verbatim_prefix;
 /// Claude Code lifecycle events ai-memory hooks. Each pair is
 /// `(event-name-in-Claude-Code-settings, POSIX hook-script-filename)`.
 ///
+/// `PostToolUse` fires only when a tool succeeds; `PostToolUseFailure` fires
+/// when it fails (<https://code.claude.com/docs/en/hooks>). Without the second
+/// entry every failed command, build and test run was invisible. It reuses the
+/// post-tool-use script: the server aliases the event and reads the outcome
+/// from the payload.
+///
 /// Adding a hook event means updating this list AND adding the matching `.sh`
-/// and `.ps1` files under the agents that use this profile (`claude-code` and
-/// `grok`). Agents with different vocabularies keep their own event arrays
-/// below. The install-hooks parity test fails if a bundle drifts.
-pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
+/// and `.ps1` files under `hooks/claude-code/` (a reused script like
+/// post-tool-use needs no new file). Agents with different vocabularies keep
+/// their own event arrays below. The install-hooks parity test fails if a
+/// bundle drifts.
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 10] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
+    ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
@@ -49,14 +57,29 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 9] = [
     ("SubagentStop", "subagent-stop.sh"),
 ];
 
+/// Grok Build CLI: Claude Code's JSON shape and the nine events Grok is known
+/// to fire. `PostToolUseFailure` waits until Grok's vocabulary is verified.
+/// Its script bundle is `hooks/grok/`.
+pub(crate) const GROK_EVENTS: [(&str, &str); 9] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+    ("SessionEnd", "session-end.sh"),
+    ("SubagentStart", "subagent-start.sh"),
+    ("SubagentStop", "subagent-stop.sh"),
+];
+
 /// Claude Code otherwise gives SessionEnd hooks a 1.5-second shared budget.
 /// A settings-file timeout raises that budget (up to Claude's 60-second cap),
 /// leaving room for a slow local spool fsync without making other hooks wait.
 pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
 
-/// Kimi Code lifecycle events ai-memory hooks. Claude Code's 9-event
-/// vocabulary (`CLAUDE_CODE_EVENTS`) plus `PostToolUseFailure`: Kimi Code
-/// fires `PostToolUse` on successful calls only and reports failures
+/// Kimi Code lifecycle events ai-memory hooks: the same ten events as
+/// Claude Code (`CLAUDE_CODE_EVENTS`), `PostToolUseFailure` included. Kimi
+/// Code fires `PostToolUse` on successful calls only and reports failures
 /// separately. The failure entry reuses the post-tool-use script — the
 /// server aliases `PostToolUseFailure` to `PostToolUse` and reads the
 /// outcome from the payload.
@@ -89,7 +112,7 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
 /// its native camelCase one — this lets it free-ride on the same key-based
 /// payload extraction as Claude Code/Codex/Zcode (see `tool_observation_metadata`
 /// in `capture_policy.rs`) rather than needing a dedicated parser (#1040).
-/// Same vocabulary as `KIMI_CODE_EVENTS`: Claude Code's 9 events plus
+/// Same vocabulary as `KIMI_CODE_EVENTS` and `CLAUDE_CODE_EVENTS`, including
 /// `PostToolUseFailure`, which Copilot (per
 /// <https://docs.github.com/en/copilot/reference/hooks-configuration>) fires
 /// instead of `PostToolUse` when a tool call errors — the server already
@@ -833,7 +856,7 @@ fn with_claude_session_end_timeout(mut payload: Value) -> Value {
 }
 
 /// Grok Build CLI hook payload for docker/setup-agent script snippets.
-/// Grok shares Claude Code's JSON shape and event vocabulary, but uses
+/// Grok shares Claude Code's JSON shape (`GROK_EVENTS`), but uses
 /// its own script bundle so script fallback keeps `agent=grok` and never
 /// destructively fetches handoffs on SessionStart.
 #[must_use]
@@ -843,7 +866,7 @@ pub(crate) fn build_grok_payload(
     auth_token: Option<&str>,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
-        &CLAUDE_CODE_EVENTS,
+        &GROK_EVENTS,
         emit_root,
         server_url,
         auth_token,
@@ -1214,7 +1237,7 @@ pub(crate) fn build_grok_payload_with_data_dir(
     project_strategy: Option<&str>,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
-        &CLAUDE_CODE_EVENTS,
+        &GROK_EVENTS,
         emit_root,
         server_url,
         auth_token,
@@ -3969,13 +3992,32 @@ if (inheritOnly) {
             v.pointer("/hooks/PostToolUse/0/hooks/0/timeout").is_none(),
             "only the cancellation-prone SessionEnd budget is raised"
         );
+        // The failure event shares the post-tool-use handler.
+        assert_eq!(
+            v.pointer("/hooks/PostToolUseFailure/0/hooks/0/command"),
+            v.pointer("/hooks/PostToolUse/0/hooks/0/command"),
+            "the failure event must reuse the post-tool-use handler"
+        );
+    }
+
+    /// Grok's vocabulary is unverified, so its payload keeps nine events.
+    #[test]
+    fn grok_payload_keeps_its_nine_events() {
+        let root = PathBuf::from("/host/hooks/grok");
+        let v = build_grok_payload(&root, "http://localhost:49374", None);
+        let hooks = v.get("hooks").and_then(|h| h.as_object()).unwrap();
+        assert_eq!(hooks.len(), GROK_EVENTS.len());
+        assert!(!hooks.contains_key("PostToolUseFailure"));
+        for (event, _) in GROK_EVENTS {
+            assert!(hooks.contains_key(event), "missing event {event}");
+        }
     }
 
     #[test]
     fn grok_native_payload_uses_grok_agent() {
         let root = PathBuf::from("/host/hooks/grok");
         let v = build_hook_payload_for_platform(
-            &CLAUDE_CODE_EVENTS,
+            &GROK_EVENTS,
             &root,
             "http://localhost:49374",
             None,
@@ -3994,7 +4036,7 @@ if (inheritOnly) {
     fn grok_script_payload_uses_grok_bundle() {
         let root = PathBuf::from("/host/hooks/grok");
         let v = build_hook_payload_for_platform(
-            &CLAUDE_CODE_EVENTS,
+            &GROK_EVENTS,
             &root,
             "http://localhost:49374",
             None,
