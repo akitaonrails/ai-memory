@@ -1256,6 +1256,15 @@ async fn handle_hook_batch(
                 warn!(session = ?session, agent = %agent.as_str(), event = ?event, "hook batch event of a purged session dropped");
                 HookProcessingOutcome::DroppedInvalid
             }
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<StoreError>(),
+                    Some(StoreError::ManagedRunBoundaryRefused)
+                ) =>
+            {
+                warn!(session = ?session, agent = %agent.as_str(), event = ?event, "hook batch event refused by its managed run boundary dropped");
+                HookProcessingOutcome::DroppedInvalid
+            }
             Err(e) => {
                 state.ingest_metrics.record_failed();
                 warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
@@ -4403,6 +4412,20 @@ async fn process_envelope(
                 agent = %agent.as_str(),
                 event = ?event,
                 "hook event of a purged session dropped"
+            );
+            HookProcessingOutcome::DroppedInvalid
+        }
+        Err(e)
+            if matches!(
+                e.downcast_ref::<StoreError>(),
+                Some(StoreError::ManagedRunBoundaryRefused)
+            ) =>
+        {
+            warn!(
+                session = ?session,
+                agent = %agent.as_str(),
+                event = ?event,
+                "hook event refused by its managed run boundary dropped"
             );
             HookProcessingOutcome::DroppedInvalid
         }
@@ -9746,6 +9769,97 @@ pub(crate) mod tests {
                 .is_empty()
         );
         assert_eq!(state.ingest_metrics.snapshot().failed, 0);
+    }
+
+    /// A spooled event of an ID-selected run that has since finished is
+    /// refused by the run boundary for good. Fail-fast would leave it at the
+    /// head of the client's spool and block every later event, including
+    /// those of the current run, so it must be a terminal `dropped_invalid`
+    /// and the next item must still commit (#1892).
+    #[tokio::test]
+    async fn batch_drops_an_event_of_a_finished_pinned_run_then_commits_next_item() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let run = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "finished-run".into(),
+            })
+            .await
+            .unwrap();
+        state
+            .writer
+            .finish_workstream_run(
+                ai_memory_store::ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: run.run_id,
+                    native_session_id: Some("finished-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+
+        let items = vec![
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=user-prompt-submit&agent=claude-code&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "finished-native",
+                    "cwd": "/tmp/scratch",
+                    "prompt": "late",
+                }),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: serde_json::json!({"session_id":"batch-after-run", "prompt":"valid"}),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["results"],
+            serde_json::json!([{ "index": 0, "outcome": "dropped_invalid" }, { "index": 1, "outcome": "stored" }])
+        );
+        assert_eq!(ack["accepted"], 2, "both contiguous entries are cleared");
+        assert!(ack.get("failed_index").is_none() || ack["failed_index"].is_null());
+        let metrics = state.ingest_metrics.snapshot();
+        assert_eq!((metrics.dropped_invalid, metrics.failed), (1, 0));
     }
 
     #[tokio::test]

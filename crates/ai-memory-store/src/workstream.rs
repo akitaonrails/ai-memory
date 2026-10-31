@@ -291,7 +291,7 @@ pub(crate) fn pinned_hook_scope(
     let Some((true, linked, delivered, expires)) = pin else {
         return Ok(None);
     };
-    let refused = || StoreError::InvalidState("ID-selected managed run boundary mismatch".into());
+    let refused = || StoreError::ManagedRunBoundaryRefused;
     let run = ManagedRunBoundaryRow::read(&tx, input.run_id)?.ok_or_else(refused)?;
     let native = NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin())
         .map_err(|_| refused())?;
