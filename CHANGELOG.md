@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Appended the target JSON Schema to the system prompt during `openai-compat`
+  tolerant structured completion fallback and direct tolerant mode, preventing
+  models from omitting top-level object wrappers when `response_format` is
+  unsupported or rejected (#1909).
 - The generated OpenCode, OpenCode 2, OMP, Pi and OpenClaw integrations no
   longer follow HTTP redirects, matching the native hook client (#1818).
   Behind an SSO gateway, proxy or captive portal that redirects to a login
