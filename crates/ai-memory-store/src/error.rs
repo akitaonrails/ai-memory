@@ -182,6 +182,12 @@ pub enum StoreError {
     #[error("ID-selected managed run boundary mismatch")]
     ManagedRunBoundaryRefused,
 
+    /// An otherwise-valid ID-selected run is still active but its renewable
+    /// lease has lapsed. Unlike a terminal boundary refusal, a heartbeat may
+    /// make the same spooled event valid after a server outage.
+    #[error("ID-selected managed run lease lapsed")]
+    ManagedRunLeaseLapsed,
+
     /// A workspace delete was refused because it still holds projects and the
     /// caller did not pass `force`. Carries the project count so the admin
     /// endpoint / CLI can report it before the operator retries with force.
