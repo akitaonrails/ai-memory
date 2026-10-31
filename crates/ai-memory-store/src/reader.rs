@@ -14382,15 +14382,19 @@ fn session_counts_by_agent_sql(has_since: bool, owner_filter: &OwnerFilter) -> S
 
 /// SQL for [`ReaderPool::latest_interrupted_session_candidate`].
 ///
-/// Every observation probe here filters by session, workspace and project,
-/// the shape fixed in [`sessions_for_scope_sql`]: without `sqlite_stat1` the
-/// planner answered them from `idx_observations_project_created`, and a join
-/// on observations drove the query once per observation row, rescanning the
-/// project each time, so `GET /handoff` on a large project never returned
-/// (#1879). The query drives from the scope's sessions instead, reads each
-/// session's last activity in a subquery (the `substantive` probe guarantees
-/// one in-scope row, so it is never NULL), and `INDEXED BY` pins every probe
-/// to the session index.
+/// Every eligibility test is a fact about one session: its newest
+/// substantive work, whether that work outlived the recorded end, and
+/// whether a handoff from the session covers it. The materialized
+/// `candidates` set answers them once per session in the scope. Joining
+/// sessions to their observations, as this query once did, re-ran the
+/// per-session subqueries for every observation row, and without
+/// `sqlite_stat1` the planner answered each of them from
+/// `idx_observations_project_created`, so every row rescanned the project and
+/// `GET /handoff` on a large project never returned (#1879, the shape of
+/// #1257). `INDEXED BY` bounds each probe to one session. `handoffs` has no
+/// index on its source session, so the scope's handoffs are reduced to the
+/// newest per source session in one pass instead of being searched once per
+/// session.
 fn latest_interrupted_session_candidate_sql(
     owner_filter: &OwnerFilter,
     has_receiver: bool,
@@ -14406,37 +14410,32 @@ fn latest_interrupted_session_candidate_sql(
         ""
     };
     format!(
-        "SELECT s.id, s.agent_kind, \
-                (SELECT MAX(o.created_at) FROM observations o INDEXED BY idx_observations_session \
-                 WHERE o.session_id = s.id \
-                   AND o.workspace_id = :ws AND o.project_id = :proj) AS last_activity, \
-                s.cwd \
-         FROM sessions s \
-         WHERE s.workspace_id = :ws AND s.project_id = :proj \
-           AND (s.ended_at IS NULL OR EXISTS ( \
-               SELECT 1 FROM observations resumed INDEXED BY idx_observations_session \
-               WHERE resumed.session_id = s.id \
-                 AND resumed.workspace_id = :ws \
-                 AND resumed.project_id = :proj \
-                 AND resumed.kind IN ('user-prompt','pre-tool-use','post-tool-use') \
-                 AND resumed.created_at > s.ended_at \
-           )) \
-           AND EXISTS (SELECT 1 FROM observations substantive INDEXED BY idx_observations_session \
-                       WHERE substantive.session_id = s.id \
-                         AND substantive.workspace_id = :ws \
-                         AND substantive.project_id = :proj \
-                         AND substantive.kind IN ('user-prompt','pre-tool-use','post-tool-use'))\
-           AND NOT EXISTS (SELECT 1 FROM handoffs h \
-                           WHERE h.from_session_id = s.id \
-                             AND h.workspace_id = :ws AND h.project_id = :proj \
-                             AND h.created_at >= ( \
-                                 SELECT MAX(work.created_at) \
-                                 FROM observations work INDEXED BY idx_observations_session \
-                                 WHERE work.session_id = s.id \
-                                   AND work.workspace_id = :ws AND work.project_id = :proj \
-                                   AND work.kind IN ('user-prompt','pre-tool-use','post-tool-use'))) \
-           {owner_clause}{receiver_clause} \
-         ORDER BY last_activity DESC, s.started_at DESC, s.id DESC \
+        "WITH candidates AS MATERIALIZED ( \
+           SELECT s.id, s.agent_kind, s.started_at, s.ended_at, s.cwd, \
+                  (SELECT MAX(o.created_at) \
+                   FROM observations o INDEXED BY idx_observations_session \
+                   WHERE o.session_id = s.id \
+                     AND o.workspace_id = :ws AND o.project_id = :proj) AS last_activity, \
+                  (SELECT MAX(work.created_at) \
+                   FROM observations work INDEXED BY idx_observations_session \
+                   WHERE work.session_id = s.id \
+                     AND work.workspace_id = :ws AND work.project_id = :proj \
+                     AND work.kind IN ('user-prompt','pre-tool-use','post-tool-use')) AS last_work \
+           FROM sessions s \
+           WHERE s.workspace_id = :ws AND s.project_id = :proj{owner_clause}{receiver_clause} \
+         ), covered AS ( \
+           SELECT from_session_id, MAX(created_at) AS last_handoff \
+           FROM handoffs \
+           WHERE workspace_id = :ws AND project_id = :proj AND from_session_id IS NOT NULL \
+           GROUP BY from_session_id \
+         ) \
+         SELECT c.id, c.agent_kind, c.last_activity, c.cwd \
+         FROM candidates c \
+         LEFT JOIN covered h ON h.from_session_id = c.id \
+         WHERE c.last_work IS NOT NULL \
+           AND (c.ended_at IS NULL OR c.last_work > c.ended_at) \
+           AND (h.last_handoff IS NULL OR h.last_handoff < c.last_work) \
+         ORDER BY c.last_activity DESC, c.started_at DESC, c.id DESC \
          LIMIT 1"
     )
 }
@@ -16688,8 +16687,8 @@ mod tests {
     fn interrupted_session_probes_use_the_session_index() {
         // Same fresh-store state as `session_observation_probes_use_the_session_index`:
         // without `sqlite_stat1` the planner answered these probes from the
-        // project index and `GET /handoff` rescanned the project per
-        // observation row (#1879).
+        // project index, and every observation row rescanned the project and
+        // searched its handoffs again (#1879).
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let conn = rusqlite::Connection::open(store.db_path()).unwrap();
@@ -16713,20 +16712,54 @@ mod tests {
                     named.push((":receiver", &receiver_bytes));
                 }
                 let sql = super::latest_interrupted_session_candidate_sql(owner, has_receiver);
-                let (details, _) = observation_probe_plan(&conn, &sql, &named);
-                for alias in ["o", "resumed", "substantive", "work"] {
-                    let probes: Vec<&String> = details
-                        .iter()
-                        .filter(|detail| detail.starts_with(&format!("SEARCH {alias} ")))
-                        .collect();
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                // (id, parent, detail) so a step's enclosing subqueries are known.
+                let plan = stmt
+                    .query_map(named.as_slice(), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let label = format!("owner={owner:?} receiver={has_receiver}");
+                let observation_reads: Vec<&str> = plan
+                    .iter()
+                    .map(|(_, _, detail)| detail.as_str())
+                    .filter(|detail| {
+                        detail.contains("observations")
+                            || ["o", "work"].iter().any(|alias| {
+                                detail.starts_with(&format!("SEARCH {alias} "))
+                                    || detail.starts_with(&format!("SCAN {alias}"))
+                            })
+                    })
+                    .collect();
+                assert!(
+                    observation_reads.len() == 2
+                        && observation_reads
+                            .iter()
+                            .all(|detail| detail.contains("idx_observations_session")),
+                    "{label}: activity and work must each be one session-bounded probe: {plan:?}"
+                );
+                let handoff_reads: Vec<_> = plan
+                    .iter()
+                    .filter(|(_, _, detail)| detail.contains("handoffs"))
+                    .collect();
+                assert!(
+                    handoff_reads.len() == 1 && handoff_reads[0].2.starts_with("SEARCH handoffs "),
+                    "{label}: the scope's handoffs must be read once through a scope index: \
+                     {plan:?}"
+                );
+                let mut parent = handoff_reads[0].1;
+                while let Some((_, up, detail)) = plan.iter().find(|(id, _, _)| *id == parent) {
                     assert!(
-                        !probes.is_empty()
-                            && probes
-                                .iter()
-                                .all(|detail| detail.contains("idx_observations_session")),
-                        "receiver={has_receiver} owner={owner:?}: the {alias} probe must be \
-                         bounded by session, not by project: {details:?}"
+                        !detail.starts_with("CORRELATED"),
+                        "{label}: handoffs must not be searched once per session: {plan:?}"
                     );
+                    parent = *up;
                 }
             }
         }
