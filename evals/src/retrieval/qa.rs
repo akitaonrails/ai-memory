@@ -471,6 +471,7 @@ fn build_llm_provider(
         // Comparisons must not differ by engine-side thinking behaviour;
         // keep the product default (off) for every candidate.
         compat_disable_thinking: false,
+        compat_stream: None,
         request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
         reasoning_effort: None,
         extra_headers: ai_memory_llm::ExtraHeaders::default(),

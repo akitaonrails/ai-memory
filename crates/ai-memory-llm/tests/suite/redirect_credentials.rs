@@ -55,6 +55,7 @@ fn config(provider: ProviderChoice, auth: ProviderAuth, base_url: String) -> Pro
         base_url: Some(base_url),
         compat_strict: false,
         compat_disable_thinking: false,
+        compat_stream: None,
         request_timeout_secs: 5,
         reasoning_effort: None,
         extra_headers: ExtraHeaders::parse(["x-gateway-key: gateway-secret"]).expect("valid"),

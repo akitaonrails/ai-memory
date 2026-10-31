@@ -17,7 +17,7 @@
 //! actually changes about end-to-end behaviour.
 
 use ai_memory_llm::types::ChatRequest;
-use ai_memory_llm::{LlmProvider, OpenAiCompatProvider};
+use ai_memory_llm::{LlmError, LlmProvider, OpenAiCompatProvider};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -142,6 +142,33 @@ impl Respond for CountingResponder {
     }
 }
 
+#[derive(Clone, Default)]
+struct SseByDefaultResponder {
+    count: Arc<AtomicUsize>,
+}
+
+impl SseByDefaultResponder {
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+impl Respond for SseByDefaultResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        let request_body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request body is JSON");
+        if request_body["stream"] == false {
+            return ResponseTemplate::new(200).set_body_json(body_with_content(r#"{"ok":true}"#));
+        }
+
+        let json = body_with_content(r#"{"ok":true}"#);
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(format!("data: {json}\n\ndata: [DONE]\n\n"))
+    }
+}
+
 /// Strict path SUCCEEDS: model honoured `response_format` and returned
 /// clean JSON. Provider must surface the parsed object directly with
 /// exactly ONE upstream HTTP call (the tolerant fallback is NOT invoked).
@@ -166,6 +193,36 @@ async fn strict_success_returns_directly_and_makes_one_call() {
         1,
         "strict success must hit upstream exactly once (no fallback retry)"
     );
+}
+
+/// Some compatible endpoints stream when `stream` is omitted. This Chat
+/// Completions path only decodes JSON, so the operator must be able to opt out.
+#[tokio::test]
+async fn stream_setting_recovers_endpoint_that_defaults_to_sse() {
+    let server = MockServer::start().await;
+    let responder = SseByDefaultResponder::default();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(responder.clone())
+        .mount(&server)
+        .await;
+
+    let error = strict_provider(server.uri())
+        .complete_structured_raw(tiny_request(), tiny_schema())
+        .await
+        .expect_err("omitted stream receives SSE instead of one JSON response");
+    assert!(matches!(error, LlmError::Serde(_)), "{error}");
+    assert_eq!(responder.count(), 2);
+
+    let value = strict_provider(server.uri())
+        .with_stream(Some(false))
+        .expect("non-streaming configuration is supported")
+        .complete_structured_raw(tiny_request(), tiny_schema())
+        .await
+        .expect("non-streaming JSON response");
+
+    assert_eq!(value, json!({"ok": true}));
+    assert_eq!(responder.count(), 3);
 }
 
 /// Strict path returns 200 with a NON-OBJECT body (e.g. plain prose).
