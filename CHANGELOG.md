@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory-wikisync` no longer refuses a destination as "already being
+  modified" right after its own run released it. On Unix a child forked by
+  another thread inherits the lock until it calls `exec`, so the next run
+  could see it still held; the acquire now retries for about half a second.
+  A real concurrent run is still refused. This failed the companion's CI
+  suite about one run in five (#1897).
 - `ai-memory upgrade` on Windows now waits for a scanner to release the
   running or the freshly written binary before swapping them, instead of
   failing with "being used by another process". The swap retries that
