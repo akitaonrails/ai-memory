@@ -114,6 +114,111 @@ struct SweepTuning {
     compact_cold_episodic: bool,
 }
 
+/// Admission control for live `/admin/bootstrap` runs.
+///
+/// A run spends minutes in LLM calls and milliseconds writing pages, so
+/// one server-wide mutex leaves a local provider idle while callers for
+/// other projects queue behind it. The wiki's own commit lock already
+/// serialises `commit_all`, which is what the original mutex protected
+/// before that lock existed. Two guards remain:
+///
+/// - `slots` bounds how many runs call the LLM at once
+///   (`bootstrap_max_concurrent`, default 1: the previous behaviour).
+/// - one run per project at a time, so a second run for the same project
+///   waits and then reads the first run's manifest (`AlreadyBootstrapped`)
+///   instead of racing it and spending the LLM calls twice.
+#[derive(Clone)]
+pub struct BootstrapGate {
+    slots: Arc<tokio::sync::Semaphore>,
+    projects: Arc<std::sync::Mutex<BootstrapProjectLocks>>,
+}
+
+type BootstrapProjectLocks =
+    std::collections::HashMap<(WorkspaceId, ProjectId), Arc<tokio::sync::Mutex<()>>>;
+
+impl BootstrapGate {
+    /// Gate allowing up to `max_concurrent` live runs; zero is treated as one.
+    #[must_use]
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
+            projects: Arc::new(std::sync::Mutex::new(BootstrapProjectLocks::new())),
+        }
+    }
+
+    /// Wait for this project's turn, then for a free slot. The project lock
+    /// is taken first so a caller queued behind its own project never holds
+    /// a slot another project could use.
+    async fn acquire(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> Result<BootstrapPermit, tokio::sync::AcquireError> {
+        let project_lock = {
+            let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(projects.entry((ws, proj)).or_default())
+        };
+        let project = match Arc::clone(&project_lock).try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                info!(
+                    "another bootstrap of this project is in progress; queueing — \
+                     this request waits for it to finish"
+                );
+                project_lock.lock_owned().await
+            }
+        };
+        let slot = match Arc::clone(&self.slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                info!(
+                    "bootstrap_max_concurrent runs are in progress; queueing — \
+                     this request waits for a free slot"
+                );
+                Arc::clone(&self.slots).acquire_owned().await?
+            }
+        };
+        Ok(BootstrapPermit {
+            _slot: slot,
+            project: Some(project),
+            key: (ws, proj),
+            projects: Arc::clone(&self.projects),
+        })
+    }
+}
+
+impl Default for BootstrapGate {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+/// Held for the whole live run. Dropping it frees the slot and the project
+/// lock, and forgets the project's entry once nobody else waits on it, so
+/// the map stays as small as the set of projects currently bootstrapping.
+struct BootstrapPermit {
+    _slot: tokio::sync::OwnedSemaphorePermit,
+    project: Option<tokio::sync::OwnedMutexGuard<()>>,
+    key: (WorkspaceId, ProjectId),
+    projects: Arc<std::sync::Mutex<BootstrapProjectLocks>>,
+}
+
+impl Drop for BootstrapPermit {
+    fn drop(&mut self) {
+        let mut projects = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        // Release under the map lock: a new caller clones the entry under
+        // that same lock, so a count of one (the map's own) means no caller
+        // holds or awaits it and the entry can go.
+        self.project = None;
+        if projects
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            projects.remove(&self.key);
+        }
+    }
+}
+
 /// Shared state for the admin router.
 #[derive(Clone)]
 pub struct AdminState {
@@ -163,13 +268,10 @@ pub struct AdminState {
     /// Server home directory resolved once at config load. Used to keep admin
     /// audits consistent with the hook router's cwd-prefix guard.
     pub home_dir: Option<String>,
-    /// Serialises concurrent bootstrap requests. Bootstrap fans out
-    /// into an LLM call + a multi-page wiki write + a git commit;
-    /// running two in parallel would race the `commit_all` git ops and
-    /// stack LLM cost unnecessarily. The mutex is held for the entire
-    /// handler so a second caller waits its turn (request stays open
-    /// until the lock is acquired, then proceeds normally).
-    pub bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Admission control for live bootstrap runs: a bounded number at
+    /// once, one per project. A queued caller's request stays open until
+    /// its turn, then proceeds normally. See [`BootstrapGate`].
+    pub bootstrap_gate: BootstrapGate,
     /// Per-server token pepper, used by `/admin/api-credentials` to hash
     /// freshly-issued `aim_` secrets before they land in
     /// `api_credentials.token_hash`. `None` when the operator hasn't set
@@ -2529,18 +2631,15 @@ async fn handle_bootstrap(
     let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
     let (ws, proj) = target.scope.as_tuple();
 
-    // Serialise live bootstrap runs. Two parallel `process_sources`
-    // calls would race the wiki's `commit_all` (libgit2 ops on the
-    // same repo) and stack LLM cost unnecessarily. The wait is
-    // operator-visible only in log lines; the request stays open
-    // until the lock is acquired, then proceeds normally.
-    if state.bootstrap_lock.try_lock().is_err() {
-        info!(
-            "another bootstrap is in progress; queueing — \
-             this request waits for the active one to finish"
-        );
-    }
-    let _bootstrap_guard = state.bootstrap_lock.lock().await;
+    // Bounded, one run per project; see `BootstrapGate`. The wait is
+    // operator-visible only in log lines.
+    let _bootstrap_permit = state.bootstrap_gate.acquire(ws, proj).await.map_err(|e| {
+        log_server_error(StatusCode::INTERNAL_SERVER_ERROR, "bootstrap", &e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
 
     let llm = Arc::clone(
         state
@@ -9902,6 +10001,54 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    fn bootstrap_gate_entries(gate: &BootstrapGate) -> usize {
+        gate.projects.lock().unwrap().len()
+    }
+
+    /// The per-project map only holds projects with a run in progress or
+    /// queued: a released permit forgets its entry, and a waiter keeps it
+    /// alive until it too is done.
+    #[tokio::test]
+    async fn bootstrap_gate_forgets_a_project_once_nobody_waits_on_it() {
+        let gate = BootstrapGate::new(4);
+        let (ws, proj) = (WorkspaceId::new(), ProjectId::new());
+
+        let first = gate.acquire(ws, proj).await.unwrap();
+        let waiter = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.acquire(ws, proj).await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a second run for the same project must wait"
+        );
+
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter gets its turn once the first run ends")
+            .unwrap();
+        assert_eq!(
+            bootstrap_gate_entries(&gate),
+            1,
+            "the waiter still holds it"
+        );
+
+        drop(second);
+        assert_eq!(bootstrap_gate_entries(&gate), 0);
+    }
+
+    /// A zero limit would admit nothing and hang every caller; it is
+    /// clamped to one run at a time instead.
+    #[tokio::test]
+    async fn bootstrap_gate_treats_a_zero_limit_as_one() {
+        let gate = BootstrapGate::new(0);
+        let permit = gate.acquire(WorkspaceId::new(), ProjectId::new()).await;
+        assert!(permit.is_ok());
+        assert_eq!(gate.slots.available_permits(), 0);
+    }
+
     async fn message_send_fixture(
         reject: bool,
     ) -> (
@@ -10169,7 +10316,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10238,7 +10385,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10313,7 +10460,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49376".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10441,7 +10588,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49375".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10680,7 +10827,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -10878,7 +11025,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -11103,7 +11250,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -12001,7 +12148,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -13901,7 +14048,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14014,7 +14161,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14120,7 +14267,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14232,7 +14379,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14783,7 +14930,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(pepper),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -14852,7 +14999,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(pepper.clone()),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -15546,7 +15693,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -15681,7 +15828,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,
@@ -16654,7 +16801,7 @@ mod tests {
             db_path: store.db_path().to_path_buf(),
             bind: "127.0.0.1:49374".to_string(),
             home_dir: None,
-            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bootstrap_gate: BootstrapGate::default(),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
             scope_invalidator: None,

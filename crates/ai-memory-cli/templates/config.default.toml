@@ -137,6 +137,13 @@ log_level = "info"
 # tiers). Env equivalent: `AI_MEMORY_LLM_TIMEOUT_SECS`.
 # llm_timeout_secs = 300
 
+# How many live `bootstrap` runs may call the LLM at once, across projects. A
+# second run for the same project always waits for the first. The default runs
+# one at a time; raise it when the provider batches concurrent requests (a local
+# vLLM or llama.cpp server) to keep it busy while many repositories bootstrap.
+# Env equivalent: `AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT`.
+# bootstrap_max_concurrent = 1
+
 # Reasoning effort sent to the provider. Unset leaves the model default. Values:
 # none, minimal, low, medium, high, xhigh, max, ultra, persistent. Each provider
 # maps the value to its own request field. Env equivalent:
