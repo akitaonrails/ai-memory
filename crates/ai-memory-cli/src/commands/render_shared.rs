@@ -3264,6 +3264,14 @@ fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
             call.contains("proxy: false,"),
             "{name}: a fetch that can reach an environment proxy:\n{call}"
         );
+        // A followed redirect lets a gateway's login page count as a
+        // delivery (deleting a spooled event) or arrive as the handoff, and a
+        // 307 or 308 replays the body to the redirect target. The native hook
+        // client refuses redirects for the same reasons (#1818).
+        assert!(
+            call.contains("redirect: \"error\","),
+            "{name}: a fetch that follows redirects:\n{call}"
+        );
     }
     assert!(
         requests >= 3,
