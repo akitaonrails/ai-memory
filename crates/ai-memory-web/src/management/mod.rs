@@ -34,19 +34,21 @@ struct Management {
 /// caller mounts this only when the runtime console switch is enabled.
 pub fn router(base_path: &str, backend: Router) -> Router {
     let root = format!("{}/manage", crate::mount::normalize_prefix(base_path));
-    Router::new()
-        .route("/manage", get(page))
-        .route("/manage/", get(page))
-        .route("/manage/{screen}", get(page))
-        .route("/manage/action", post(forms::submit))
-        .route(
-            "/manage/static/tailwind.css",
-            get(crate::routes::statics::tailwind_css),
-        )
-        .route("/manage/static/logo.png", get(crate::routes::statics::logo))
-        .route("/manage/static/{asset}", get(asset))
-        .with_state(Arc::new(Management { backend, root }))
-        .layer(axum::middleware::from_fn(secure))
+    crate::localization::apply(
+        Router::new()
+            .route("/manage", get(page))
+            .route("/manage/", get(page))
+            .route("/manage/{screen}", get(page))
+            .route("/manage/action", post(forms::submit))
+            .route(
+                "/manage/static/tailwind.css",
+                get(crate::routes::statics::tailwind_css),
+            )
+            .route("/manage/static/logo.png", get(crate::routes::statics::logo))
+            .route("/manage/static/{asset}", get(asset))
+            .with_state(Arc::new(Management { backend, root }))
+            .layer(axum::middleware::from_fn(secure)),
+    )
 }
 
 #[derive(Default, Deserialize)]
@@ -58,6 +60,7 @@ struct Selection {
     offset: usize,
 }
 async fn page(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<Management>>,
     Query(selection): Query<Selection>,
     request: Request<Body>,
@@ -79,6 +82,7 @@ async fn page(
         extensions: parts.extensions,
     };
     let mut view = ConsoleView::new(&state.root, screen, backend::csrf_cookie(&client.headers));
+    view.i18n = i18n.clone();
     if screen != Screen::Login {
         let me = match identity(&client, &state.root).await {
             Ok(me) => me,
@@ -90,7 +94,7 @@ async fn page(
         view.username = me.username.clone();
         view.admin = me.admin;
         if screen == Screen::Users && !me.admin {
-            return failure(StatusCode::FORBIDDEN, "Admin access required".into());
+            return failure(&i18n, StatusCode::FORBIDDEN, "Admin access required".into());
         }
         if let Err(response) = view.load(&client, &me, selection).await {
             return response;
@@ -122,10 +126,18 @@ fn render(view: impl Template) -> Response {
 #[derive(Template)]
 #[template(path = "management/error.html")]
 struct ErrorView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     message: String,
 }
-fn failure(status: StatusCode, message: String) -> Response {
-    let mut response = render(ErrorView { message });
+fn failure(
+    i18n: &ai_memory_core::i18n::Localizer,
+    status: StatusCode,
+    message: String,
+) -> Response {
+    let mut response = render(ErrorView {
+        i18n: i18n.clone(),
+        message: i18n.native_error(&message),
+    });
     *response.status_mut() = status;
     response
 }

@@ -34,10 +34,14 @@ struct DeletePageResponseBody {
 /// failure, scope resolution failure, admission webhook rejecting the
 /// delete, or filesystem error).
 pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     if args.path.trim().is_empty() {
-        bail!("--path was passed empty; specify the wiki page path to delete");
+        bail!(
+            "{}",
+            i18n.text("cli-delete-page-path-was-passed-empty-specify-the-wiki-page-path-to-delete")
+        );
     }
 
     // Resolve the project the same way write-page/read-page do: explicit
@@ -57,10 +61,21 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
         },
     )
     .await
-    .context("deleting page via server")?;
+    .context(i18n.text("cli-delete-page-deleting-page-via-server"))?;
 
     let status = if resp.deleted { "✓ deleted" } else { "no-op" };
-    println!("{} {} under {}/{}", status, resp.path, workspace, project);
+    println!(
+        "{}",
+        i18n.format(
+            "cli-delete-page-under",
+            &[
+                ("value0", status.to_string()),
+                ("value1", resp.path.to_string()),
+                ("value2", workspace.to_string()),
+                ("value3", project.to_string())
+            ]
+        )
+    );
     Ok(())
 }
 

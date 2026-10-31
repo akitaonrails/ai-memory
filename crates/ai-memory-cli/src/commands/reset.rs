@@ -17,6 +17,7 @@ use crate::process_guard::{busy_message, sibling_processes};
 /// Returns an error if another `ai-memory` process is running, if
 /// `--confirm` was not provided, or if a directory cannot be removed.
 pub fn run(config: &Config, args: ResetArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let siblings = sibling_processes();
     if !siblings.is_empty() {
         bail!(busy_message("reset", &siblings));
@@ -24,9 +25,15 @@ pub fn run(config: &Config, args: ResetArgs) -> Result<()> {
 
     if !args.confirm {
         for path in data_purge::purge_preview(&config.data_dir) {
-            println!("would remove {}", path.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-reset-would-remove",
+                    &[("value0", format!("{}", path.display()))]
+                )
+            );
         }
-        println!("(dry-run; pass --confirm to wipe)");
+        println!("{}", i18n.text("cli-reset-dry-run-pass-confirm-to-wipe"));
         return Ok(());
     }
 

@@ -2,7 +2,7 @@
 
 use crate::templates::{
     SessionRow, TokenUsagePanel, TokenUsageRow, agent_label, duration_between, fmt_tokens,
-    humanize, project_href, session_href, short_id,
+    project_href, session_href, short_id,
 };
 use ai_memory_core::AgentKind;
 use ai_memory_store::{AgentUsage, SessionSummary, TokenUsageReport};
@@ -55,7 +55,12 @@ pub(crate) fn agent_card(row: AgentUsage, workspace: &str, project: &str) -> Age
     }
 }
 
-pub(crate) fn session_row(s: SessionSummary, workspace: &str, project: &str) -> SessionRow {
+pub(crate) fn session_row(
+    i18n: &ai_memory_core::i18n::Localizer,
+    s: SessionSummary,
+    workspace: &str,
+    project: &str,
+) -> SessionRow {
     let id = s.session_id.to_string();
     SessionRow {
         agent_label: agent_label(AgentKind::from_wire(&s.agent_kind)),
@@ -75,7 +80,7 @@ pub(crate) fn session_row(s: SessionSummary, workspace: &str, project: &str) -> 
         agent_kind: s.agent_kind,
         short_id: short_id(&id),
         observation_count: s.observation_count,
-        started_relative: humanize(&s.started_at),
+        started_relative: i18n.relative(&s.started_at),
         open: s.ended_at.is_none(),
     }
 }
@@ -238,6 +243,7 @@ impl UsageQuery {
 }
 
 pub(crate) fn usage_panel(
+    i18n: &ai_memory_core::i18n::Localizer,
     report: TokenUsageReport,
     workspace: &str,
     project: &str,
@@ -378,7 +384,7 @@ pub(crate) fn usage_panel(
                         fmt_tokens(c.cache_write)
                     ),
                     total: fmt_tokens(total),
-                    when: humanize(&recorded_at),
+                    when: i18n.relative(&recorded_at),
                     signal: signal.into(),
                 }
             })

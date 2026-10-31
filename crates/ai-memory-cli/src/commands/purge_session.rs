@@ -112,6 +112,7 @@ fn preview_message(outcome: &PreviewOutcome, label: &str) -> Option<String> {
 /// UUID, the server is unreachable, or the server returns a non-2xx
 /// response (including `404` for a session outside the named scope).
 pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     let (workspace, project) =
@@ -123,9 +124,7 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
     let session_id = args.session_id.trim();
     if uuid::Uuid::parse_str(session_id).is_err() {
         bail!(
-            "`--session-id {session_id}` is not a UUID. Pass the full \
-             `sessions.id` value; a prefix or a workstream id will not match."
-        );
+            "{}", i18n.format("cli-purge-session-session-id-session-id-is-not-a-uuid-pass-the-full-sessions-id-value-a-prefix", &[("value0", session_id.to_string())]));
     }
 
     let label = format!("{workspace}/{project}");
@@ -144,11 +143,7 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
             println!("{line}");
         }
         bail!(
-            "purge-session is destructive and irreversible.\n\
-             Re-run with --confirm to proceed:\n\n  \
-             ai-memory purge-session --workspace {workspace} --project {project} \
-             --session-id {session_id} --confirm",
-        );
+            "{}", i18n.format("cli-purge-session-purge-session-is-destructive-and-irreversible-re-run-with-confirm-to-proceed", &[("value0", workspace.to_string()), ("value1", project.to_string()), ("value2", session_id.to_string())]));
     }
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -170,7 +165,7 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
     if let Some(paths) = report["files_deleted"].as_array()
         && !paths.is_empty()
     {
-        println!("Wiki pages removed:");
+        println!("{}", i18n.text("cli-purge-session-wiki-pages-removed"));
         for path in paths.iter().filter_map(serde_json::Value::as_str) {
             println!("  - {path}");
         }
@@ -179,22 +174,19 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
         && !failed.is_empty()
     {
         println!(
-            "Warning: {} wiki page file(s) could not be removed from disk (DB rows are gone).",
-            failed.len()
-        );
+            "{}", i18n.format("cli-purge-session-warning-wiki-page-file-s-could-not-be-removed-from-disk-db-rows-are-gone", &[("value0", format!("{}", failed.len()))]));
         for path in failed.iter().filter_map(serde_json::Value::as_str) {
             println!("  - {path}");
         }
     }
     if report["compacted"].as_bool().unwrap_or(false) {
-        println!("Database compacted: freed bytes reclaimed.");
+        println!(
+            "{}",
+            i18n.text("cli-purge-project-database-compacted-freed-bytes-reclaimed")
+        );
     } else {
         println!(
-            "Note: this was a logical delete. The session is unreachable through \
-             the API and search, but its bytes remain in the database file until \
-             it is rewritten. Re-run with --compact to reclaim them (slow), and \
-             see `docs/` for what that does and does not guarantee."
-        );
+            "{}", i18n.text("cli-purge-session-note-this-was-a-logical-delete-the-session-is-unreachable-through-the-api-an"));
     }
     Ok(())
 }

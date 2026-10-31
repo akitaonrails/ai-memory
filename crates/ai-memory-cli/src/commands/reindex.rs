@@ -33,31 +33,24 @@ use crate::process_guard::{busy_message, sibling_processes};
 /// fails to open (e.g. a divergent migration lineage — rebuild onto a fresh
 /// `db/` instead), or a scope directory lacks its `_meta.md` manifest.
 pub async fn run(config: &Config, _args: ReindexArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let siblings = sibling_processes();
     if !siblings.is_empty() {
         bail!(busy_message("reindex", &siblings));
     }
 
-    let store = Store::open(&config.data_dir).context("opening store for reindex")?;
-    let target = store
-        .reader
-        .reindex_target_status()
-        .await
-        .context("checking whether the SQLite store is clean for reindex")?;
+    let store = Store::open(&config.data_dir)
+        .context(i18n.text("cli-reindex-opening-store-for-reindex"))?;
+    let target =
+        store.reader.reindex_target_status().await.context(
+            i18n.text("cli-reindex-checking-whether-the-sqlite-store-is-clean-for-reindex"),
+        )?;
     if !target.is_clean() {
         bail!(
-            "refusing to reindex into a non-empty SQLite store ({counts}). \
-             `ai-memory reindex` rebuilds a clean derived DB from wiki files; \
-             it is not an in-place dirty-index repair. Stop the server, take a \
-             backup, move or remove {db_path}, then re-run reindex. DB-only \
-             state (sessions, observations, handoffs, users, audit rows, \
-             embeddings, decay counters) is not reconstructed from markdown.",
-            counts = target.nonzero_summary(),
-            db_path = store.db_path().display(),
-        );
+            "{}", i18n.format("cli-reindex-refusing-to-reindex-into-a-non-empty-sqlite-store-counts-ai-memory-reindex-r", &[("value0", target.nonzero_summary().to_string()), ("value1", format!("{}", store.db_path().display()))]));
     }
     let wiki = Wiki::new(&config.data_dir, store.writer.clone())
-        .context("opening wiki")?
+        .context(i18n.text("cli-reindex-opening-wiki"))?
         // Reindex is index-rebuild only; embeddings are recomputed separately
         // via `embed` so a missing/paid provider never blocks a rebuild.
         .without_embedder();
@@ -65,7 +58,7 @@ pub async fn run(config: &Config, _args: ReindexArgs) -> Result<()> {
     let summary = wiki
         .reindex_all()
         .await
-        .context("rebuilding index from wiki/")?;
+        .context(i18n.text("cli-reindex-rebuilding-index-from-wiki"))?;
     info!(
         workspaces = summary.workspaces,
         projects = summary.projects,
@@ -73,18 +66,23 @@ pub async fn run(config: &Config, _args: ReindexArgs) -> Result<()> {
         "reindex complete"
     );
     println!(
-        "reindexed {} pages across {} project(s) in {} workspace(s) from {}",
-        summary.pages,
-        summary.projects,
-        summary.workspaces,
-        config.data_dir.join("wiki").display(),
+        "{}",
+        i18n.format(
+            "cli-reindex-reindexed-pages-across-project-s-in-workspace-s-from",
+            &[
+                ("value0", format!("{}", summary.pages)),
+                ("value1", format!("{}", summary.projects)),
+                ("value2", format!("{}", summary.workspaces)),
+                (
+                    "value3",
+                    format!("{}", config.data_dir.join("wiki").display())
+                )
+            ]
+        )
     );
     if summary.skipped_collisions > 0 {
         println!(
-            "skipped {} page(s) whose path differs from an indexed page only by case or Unicode \
-             normalization (they cannot coexist on macOS/Windows); the log names each pair",
-            summary.skipped_collisions,
-        );
+            "{}", i18n.format("cli-reindex-skipped-page-s-whose-path-differs-from-an-indexed-page-only-by-case-or-unico", &[("value0", format!("{}", summary.skipped_collisions))]));
     }
     Ok(())
 }

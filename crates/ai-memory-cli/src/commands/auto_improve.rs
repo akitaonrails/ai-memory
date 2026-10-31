@@ -103,30 +103,38 @@ pub async fn run(config: &Config, args: AutoImproveArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
-        println!("{}", render_human(&response));
+        println!("{}", render_human(&config.i18n, &response));
     }
     Ok(())
 }
 
-fn render_human(response: &StageResponse) -> String {
+fn render_human(i18n: &ai_memory_core::i18n::Localizer, response: &StageResponse) -> String {
     let mut lines = Vec::new();
     if response.approval_required {
-        lines.push(format!(
-            "Staged auto-improve run {} for manual approval",
-            response.run_id
+        lines.push(i18n.format(
+            "cli-auto-improve-staged-auto-improve-run-for-manual-approval",
+            &[("value0", response.run_id.to_string())],
         ));
     } else {
-        lines.push(format!(
-            "Auto-approved auto-improve run {}",
-            response.run_id
+        lines.push(i18n.format(
+            "cli-auto-improve-auto-approved-auto-improve-run",
+            &[("value0", response.run_id.to_string())],
         ));
     }
-    lines.push(format!("Approval policy: {}", response.approval_policy));
+    lines.push(i18n.format(
+        "cli-auto-improve-approval-policy",
+        &[("value0", response.approval_policy.to_string())],
+    ));
     for proposal in &response.proposals {
         if let Some(page_id) = &proposal.page_id {
-            lines.push(format!(
-                "  - {} [{}] page {} ({})",
-                proposal.id, proposal.status, page_id, proposal.sidecar_path
+            lines.push(i18n.format(
+                "cli-auto-improve-page",
+                &[
+                    ("value0", proposal.id.to_string()),
+                    ("value1", proposal.status.to_string()),
+                    ("value2", page_id.to_string()),
+                    ("value3", proposal.sidecar_path.to_string()),
+                ],
             ));
         } else {
             lines.push(format!(
@@ -185,7 +193,7 @@ mod tests {
             "reason": "a proposal is already pending review for this path",
         }])))
         .expect("server body parses");
-        let human = render_human(&response);
+        let human = render_human(&ai_memory_core::i18n::Localizer::default(), &response);
         assert!(human.contains("procedures/release.md"), "{human}");
         assert!(human.contains("already pending review"), "{human}");
     }
@@ -194,7 +202,10 @@ mod tests {
     fn a_clean_run_prints_no_skipped_section() {
         let response: StageResponse =
             serde_json::from_value(wire(serde_json::json!([]))).expect("server body parses");
-        assert!(!render_human(&response).contains("Skipped"));
+        assert!(
+            !render_human(&ai_memory_core::i18n::Localizer::default(), &response)
+                .contains("Skipped")
+        );
     }
 
     #[test]

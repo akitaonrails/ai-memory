@@ -219,6 +219,7 @@ fn opencode_dialect(
 /// terminal to ask on and no `--yes`), or any step fails; the other steps
 /// still run and the error counts the failures.
 pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -> Result<()> {
+    let i18n = &config.i18n;
     let captured = config.runtime_env.process_env().to_vec();
     let env = move |name: &str| -> Option<OsString> {
         captured
@@ -226,8 +227,10 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
             .find(|(key, _)| key.as_os_str() == name)
             .map(|(_, value)| value.clone())
     };
-    let home = super::run::native_home(config).context("locating your home directory")?;
-    let exe = std::env::current_exe().context("locating the running ai-memory binary")?;
+    let home = super::run::native_home(config)
+        .context(i18n.text("cli-setup-locating-your-home-directory"))?;
+    let exe = std::env::current_exe()
+        .context(i18n.text("cli-service-host-locating-the-running-ai-memory-binary"))?;
     let exe = service_exe(&exe, &env);
 
     let written_config = init_config_path(config, config_path);
@@ -310,6 +313,7 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
             Vec::new()
         };
         return super::setup_web::serve(
+            i18n,
             serde_json::to_value(plan_document(&plan))?,
             accepted,
             flags,
@@ -319,12 +323,12 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         )
         .await;
     }
-    print_plan(&plan);
+    print_plan(i18n, &plan);
     if args.plan {
         return Ok(());
     }
     if !args.yes {
-        plan.agents = choose_agents(confirm(plan.agents.len())?, plan.agents);
+        plan.agents = choose_agents(confirm(i18n, plan.agents.len())?, plan.agents);
     }
     execute(
         config,
@@ -557,57 +561,58 @@ fn plan_service(
     }
 }
 
-fn print_plan(plan: &SetupPlan) {
-    println!("ai-memory setup will:");
+fn print_plan(i18n: &ai_memory_core::i18n::Localizer, plan: &SetupPlan) {
+    println!("{}", i18n.diagnostic("ai-memory setup will:"));
     if plan.fresh {
         println!(
-            "  - create the data dir {} and write {} (with a new root bearer token in \
-             auth-tokens/default when the data dir is new)",
-            plan.data_dir.display(),
-            plan.config_path.display()
-        );
+            "{}", i18n.format("cli-setup-create-the-data-dir-and-write-with-a-new-root-bearer-token-in-auth-tokens-de", &[("value0", format!("{}", plan.data_dir.display())), ("value1", format!("{}", plan.config_path.display()))]));
     } else {
         println!(
-            "  - keep the existing install at {} ({})",
-            plan.data_dir.display(),
-            plan.config_path.display()
+            "{}",
+            i18n.format(
+                "cli-setup-keep-the-existing-install-at",
+                &[
+                    ("value0", format!("{}", plan.data_dir.display())),
+                    ("value1", format!("{}", plan.config_path.display()))
+                ]
+            )
         );
     }
     match &plan.service {
         ServicePlan::Install(unit) => println!(
-            "  - install and start a {} at {}{}",
-            unit.manager.describe(),
-            unit.path.display(),
-            if unit.manager == ServiceManager::WindowsRun {
+            "{}", i18n.format("cli-setup-install-and-start-a-at", &[("value0", unit.manager.describe().to_string()), ("value1", format!("{}", unit.path.display())), ("value2", (if unit.manager == ServiceManager::WindowsRun {
                 " (it starts `ai-memory service-host` at logon, which runs the server with no \
                  console window and restarts it after a failure)"
             } else {
                 ""
-            }
-        ),
-        ServicePlan::Skip(reason) => println!("  - service: {reason}"),
+            }).to_string())])),
+        ServicePlan::Skip(reason) => println!("{}", i18n.format("cli-setup-service-reason-2", &[("value0", reason.to_string())])),
     }
     if plan.agents.is_empty() {
         println!(
-            "  - wire no agent: none {}; name one with --agent <name>",
-            if plan.detected {
-                "was detected"
-            } else {
-                "was named"
-            }
+            "{}",
+            i18n.format(
+                "cli-setup-wire-no-agent-none-name-one-with-agent-name",
+                &[(
+                    "value0",
+                    (if plan.detected {
+                        "was detected"
+                    } else {
+                        "was named"
+                    })
+                    .to_string()
+                )]
+            )
         );
     } else {
-        println!("  - wire these agents:");
+        println!("{}", i18n.text("cli-setup-wire-these-agents"));
     }
     for (number, agent) in plan.agents.iter().enumerate() {
         let name = agent.agent.kind().as_str();
         let number = number + 1;
         if agent.plugin {
             println!(
-                "      {number}. {name}: leave it to its enabled ai-memory plugin ({}), which \
-                 carries the hooks, MCP entry and skills",
-                agent_plugins::PLUGIN_ID
-            );
+                "{}", i18n.format("cli-setup-number-name-leave-it-to-its-enabled-ai-memory-plugin-which-carries-the-hooks", &[("value0", format!("{}", number)), ("value1", name.to_string()), ("value2", agent_plugins::PLUGIN_ID.to_string())]));
             continue;
         }
         let mcp = if agent.mcp.is_some() {
@@ -618,15 +623,32 @@ fn print_plan(plan: &SetupPlan) {
         let why = agent
             .found
             .as_ref()
-            .map_or_else(|| "named with --agent".to_owned(), Found::describe);
-        println!("      {number}. {name}: {mcp} + skills ({why})");
+            .map_or_else(|| i18n.text("cli-setup-named-with-agent"), Found::describe);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-setup-number-name-mcp-skills-why",
+                &[
+                    ("value0", format!("{}", number)),
+                    ("value1", name.to_string()),
+                    ("value2", mcp.to_string()),
+                    ("value3", why.to_string())
+                ]
+            )
+        );
     }
-    println!("  - check /healthz, memory_status and doctor (read-only)");
+    println!(
+        "{}",
+        i18n.text("cli-setup-check-healthz-memory-status-and-doctor-read-only")
+    );
     let others = other_agents(&plan.agents);
     if !others.is_empty() {
         println!(
-            "Also supported, not in this plan (add with --agent <name>): {}",
-            others.join(", ")
+            "{}",
+            i18n.format(
+                "cli-setup-also-supported-not-in-this-plan-add-with-agent-name",
+                &[("value0", others.join(", ").to_string())]
+            )
         );
     }
 }
@@ -642,24 +664,25 @@ enum Answer {
 
 /// Ask on a terminal; refuse without one. With more than one planned agent
 /// the operator may answer with the numbers of the agents to wire.
-fn confirm(agents: usize) -> Result<Answer> {
+fn confirm(i18n: &ai_memory_core::i18n::Localizer, agents: usize) -> Result<Answer> {
     if !std::io::stdin().is_terminal() {
         bail!(
-            "nothing was changed: there is no terminal to confirm this plan on. Re-run \
-             `ai-memory setup --yes` to apply it."
-        );
+            "{}", i18n.text("cli-setup-nothing-was-changed-there-is-no-terminal-to-confirm-this-plan-on-re-run-ai-m"));
     }
     if agents > 1 {
-        print!("Proceed? [y/N], or type the numbers of the agents to wire (e.g. 1 3): ");
+        print!(
+            "{}",
+            i18n.text("cli-setup-proceed-y-n-or-type-the-numbers-of-the-agents-to-wire-e-g-1-3")
+        );
     } else {
-        print!("Proceed? [y/N] ");
+        print!("{}", i18n.text("cli-setup-proceed-y-n"));
     }
     std::io::stdout().flush().ok();
     let mut answer = String::new();
     std::io::stdin()
         .lock()
         .read_line(&mut answer)
-        .context("reading the answer")?;
+        .context(i18n.text("cli-setup-reading-the-answer"))?;
     parse_answer(&answer, agents)
 }
 
@@ -668,7 +691,10 @@ fn confirm(agents: usize) -> Result<Answer> {
 /// a number outside the plan, so a typo never wires an agent nobody chose.
 fn parse_answer(answer: &str, agents: usize) -> Result<Answer> {
     let answer = answer.trim();
-    if matches!(answer, "y" | "Y" | "yes" | "YES" | "Yes") {
+    if matches!(
+        answer,
+        "y" | "Y" | "yes" | "YES" | "Yes" | "s" | "S" | "sim" | "SIM" | "Sim"
+    ) {
         return Ok(Answer::All);
     }
     let numbers: Vec<&str> = answer
@@ -769,6 +795,7 @@ fn plan_document(plan: &SetupPlan) -> PlanDocument {
 
 /// The closing line once every step passed: restart the wired agents, then
 /// ask one of them something only ai-memory can answer.
+#[cfg(test)]
 fn next_step(agents: &[AgentPlan]) -> String {
     let names: Vec<&str> = agents
         .iter()
@@ -778,22 +805,20 @@ fn next_step(agents: &[AgentPlan]) -> String {
 }
 
 /// [`next_step`] for agents given by name.
+#[cfg(test)]
 pub(crate) fn next_step_for_names(names: &[impl AsRef<str>]) -> String {
+    localized_next_step(&ai_memory_core::i18n::Localizer::default(), names)
+}
+
+pub(crate) fn localized_next_step(
+    i18n: &ai_memory_core::i18n::Localizer,
+    names: &[impl AsRef<str>],
+) -> String {
     let names: Vec<&str> = names.iter().map(AsRef::as_ref).collect();
     match names.as_slice() {
-        [] => "ai-memory is set up, but no agent is wired; run `ai-memory setup --agent <name>`."
-            .to_owned(),
-        [one] => format!(
-            "ai-memory is set up. Restart {one} so it loads the new hooks and MCP entry, then \
-             ask it: \"{FIRST_QUESTION}\" It answers through ai-memory's tools; a new install \
-             remembers nothing yet, and every session from now on is captured."
-        ),
-        many => format!(
-            "ai-memory is set up. Restart {} so they load the new hooks and MCP entry, then ask \
-             one of them: \"{FIRST_QUESTION}\" It answers through ai-memory's tools; a new \
-             install remembers nothing yet, and every session from now on is captured.",
-            many.join(", ")
-        ),
+        [] => i18n.text("cli-setup-ready-no-agent"),
+        [one] => i18n.one("cli-setup-ready-one", one),
+        many => i18n.one("cli-setup-ready-many", many.join(", ")),
     }
 }
 
@@ -806,9 +831,10 @@ async fn execute(
     runner: &dyn CommandRunner,
     ready_timeout: Duration,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     let mut problems: Vec<String> = Vec::new();
 
-    println!("\n== init");
+    println!("{}", i18n.text("cli-setup-init"));
     let outcome = init::initialize(config, &InitArgs { force: false }, config_path)?;
     let mut config = config.clone();
     if let Some(token) = outcome.root_token
@@ -817,31 +843,55 @@ async fn execute(
         config.auth.adopt_token_file(token.path, token.token);
     }
     println!(
-        "config: {} {}",
-        if outcome.config_written {
-            "wrote"
-        } else {
-            "kept"
-        },
-        outcome.config_path.display()
+        "{}",
+        i18n.format(
+            "cli-setup-config",
+            &[
+                (
+                    "value0",
+                    (if outcome.config_written {
+                        "wrote"
+                    } else {
+                        "kept"
+                    })
+                    .to_string()
+                ),
+                ("value1", format!("{}", outcome.config_path.display()))
+            ]
+        )
     );
 
-    println!("\n== service");
+    println!("{}", i18n.text("cli-setup-service"));
     let mut wait_for_server = false;
     match &plan.service {
-        ServicePlan::Skip(reason) => println!("service: {reason}"),
+        ServicePlan::Skip(reason) => println!(
+            "{}",
+            i18n.format(
+                "cli-setup-service-reason",
+                &[("value0", reason.to_string())]
+            )
+        ),
         ServicePlan::Install(unit) => match user_service::install(unit, runner) {
             Ok(change) => {
                 wait_for_server = change != ServiceChange::Unchanged;
                 println!(
-                    "service: {} {}",
-                    match change {
-                        ServiceChange::Installed => "installed and started",
-                        ServiceChange::Updated => "updated and restarted",
-                        ServiceChange::Started => "started",
-                        ServiceChange::Unchanged => "already running from",
-                    },
-                    unit.path.display()
+                    "{}",
+                    i18n.format(
+                        "cli-setup-service-2",
+                        &[
+                            (
+                                "value0",
+                                (match change {
+                                    ServiceChange::Installed => "installed and started",
+                                    ServiceChange::Updated => "updated and restarted",
+                                    ServiceChange::Started => "started",
+                                    ServiceChange::Unchanged => "already running from",
+                                })
+                                .to_string()
+                            ),
+                            ("value1", format!("{}", unit.path.display()))
+                        ]
+                    )
                 );
             }
             Err(error) => problems.push(format!(
@@ -867,16 +917,24 @@ async fn execute(
         }
     }
 
-    println!("\n== self-check");
+    println!("{}", i18n.text("cli-setup-self-check"));
     for problem in self_check(&config, &endpoint).await {
         problems.push(format!("self-check: {problem}"));
     }
 
     println!();
     if config.auth.bearer_token.is_none() {
-        println!("auth: none (loopback); run `ai-memory auth enable` to require a bearer token");
+        println!(
+            "{}",
+            i18n.text(
+                "cli-setup-auth-none-loopback-run-ai-memory-auth-enable-to-require-a-bearer-token"
+            )
+        );
     } else {
-        println!("auth: bearer token (owner-only file; never printed)");
+        println!(
+            "{}",
+            i18n.text("cli-setup-auth-bearer-token-owner-only-file-never-printed")
+        );
     }
     if let Some(hint) = web_sign_in_hint(&config, &endpoint) {
         println!("{hint}");
@@ -885,16 +943,36 @@ async fn execute(
         let codex = codex_hook_trust(&config, &plan).await;
         println!(
             "{}",
-            ready_message(codex.as_ref(), &next_step(&plan.agents))
+            ready_message(
+                i18n,
+                codex.as_ref(),
+                &localized_next_step(
+                    i18n,
+                    &plan
+                        .agents
+                        .iter()
+                        .map(|agent| agent_name(agent.agent))
+                        .collect::<Vec<_>>()
+                )
+            )
         );
         return Ok(());
     }
     for problem in &problems {
-        eprintln!("problem: {problem}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-setup-problem-problem",
+                &[("value0", problem.to_string())]
+            )
+        );
     }
     bail!(
-        "setup finished with {} problem(s); fix them and re-run `ai-memory setup`",
-        problems.len()
+        "{}",
+        i18n.format(
+            "cli-setup-setup-finished-with-problem-s-fix-them-and-re-run-ai-memory-setup",
+            &[("value0", format!("{}", problems.len()))]
+        )
     )
 }
 
@@ -927,12 +1005,16 @@ async fn codex_hook_trust(
 /// has not trusted in its `/hooks` review, so with any skipped the install
 /// is not ready for Codex yet. Setup still succeeds: only the user can grant
 /// that trust, inside Codex, and re-running setup would not change it.
-fn ready_message(codex: Option<&super::codex_hook_trust::CodexHookTrust>, closing: &str) -> String {
+fn ready_message(
+    i18n: &ai_memory_core::i18n::Localizer,
+    codex: Option<&super::codex_hook_trust::CodexHookTrust>,
+    closing: &str,
+) -> String {
     // The closing line names the agents to restart and the question to ask;
     // with Codex hooks still unapproved it follows the action required
     // instead of claiming the install is ready.
     let restart = closing
-        .strip_prefix("ai-memory is set up. ")
+        .strip_prefix(i18n.text("cli-setup-ready-prefix").as_str())
         .unwrap_or(closing);
     match codex.filter(|trust| !trust.skipped.is_empty()) {
         None => closing.to_owned(),
@@ -942,13 +1024,13 @@ fn ready_message(codex: Option<&super::codex_hook_trust::CodexHookTrust>, closin
                 .iter()
                 .map(|(event, status)| format!("{event} ({status})"))
                 .collect();
-            format!(
-                "ai-memory is installed, but Codex has not approved its {} ai-memory hook(s) \
-                 yet: {}. Codex skips a hook until you trust it, so Codex sessions are not \
-                 captured until then. Action required: open Codex, run /hooks, and trust \
-                 them. {restart}",
-                trust.skipped.len(),
-                skipped.join(", "),
+            i18n.format(
+                "cli-setup-codex-trust",
+                &[
+                    ("count", trust.skipped.len().to_string()),
+                    ("hooks", skipped.join(", ")),
+                    ("closing", restart.to_owned()),
+                ],
             )
         }
     }
@@ -959,12 +1041,10 @@ fn ready_message(codex: Option<&super::codex_hook_trust::CodexHookTrust>, closin
 /// token file's contents are the password. The token itself is never printed.
 fn web_sign_in_hint(config: &Config, endpoint: &ServerEndpoint) -> Option<String> {
     let file = config.auth.token_file.as_ref().filter(|file| file.loaded)?;
-    Some(format!(
-        "web UI: {} (the service runs with --enable-web); when the browser asks \
-         for a username and password, use any username and the contents of {} \
-         as the password",
+    Some(config.i18n.two(
+        "cli-setup-web-sign-in",
         endpoint.build_url("/web"),
-        file.path.display()
+        file.path.display(),
     ))
 }
 
@@ -990,17 +1070,14 @@ fn wire_agent(
     plan: &AgentPlan,
     skills_done: &mut BTreeSet<String>,
 ) -> Vec<String> {
+    let i18n = &config.i18n;
     let mut problems = Vec::new();
     if plan.plugin {
         // Writing the settings-file wiring as well would load every skill
         // twice and register a second MCP server; the hook copies would be
         // de-duplicated, but nothing would be gained.
         println!(
-            "plugin: {} is enabled; leaving the settings-file hooks, MCP entry and skills \
-             alone (run `ai-memory install-hooks --agent {} --apply` to add them anyway)",
-            agent_plugins::PLUGIN_ID,
-            plan.agent.kind().as_str()
-        );
+            "{}", i18n.format("cli-setup-plugin-is-enabled-leaving-the-settings-file-hooks-mcp-entry-and-skills-alone", &[("value0", agent_plugins::PLUGIN_ID.to_string()), ("value1", plan.agent.kind().as_str().to_string())]));
         return problems;
     }
     let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
@@ -1033,9 +1110,13 @@ fn wire_mcp_and_hooks(
     dialect: Option<OpenCodeDialect>,
     problems: &mut Vec<String>,
 ) {
+    let i18n = &config.i18n;
     if let Some(client) = plan.mcp {
         if install_mcp::existing_entry_is_session_aware(client, None, ENTRY_NAME) {
-            println!("mcp: keeping the existing session-aware entry");
+            println!(
+                "{}",
+                i18n.text("cli-setup-mcp-keeping-the-existing-session-aware-entry")
+            );
         } else {
             let args = InstallMcpArgs {
                 client,
@@ -1081,10 +1162,17 @@ fn wire_mcp_and_hooks(
 /// `/healthz`, `memory_status` over MCP, and `doctor`; none of them writes a
 /// file. Returns the failures.
 async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
+    let i18n = &config.i18n;
     let mut problems = Vec::new();
     let healthz = endpoint.build_url("/healthz");
     match probe_setup_server(endpoint).await {
-        SetupProbe::Healthy => println!("healthz: ok ({healthz})"),
+        SetupProbe::Healthy => println!(
+            "{}",
+            i18n.format(
+                "cli-setup-healthz-ok-healthz",
+                &[("value0", healthz.to_string())]
+            )
+        ),
         SetupProbe::Unreachable(error) => {
             problems.push(format!("{healthz} did not answer: {error}"));
             // Nothing else can pass without a server.
@@ -1099,7 +1187,7 @@ async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
         }
     }
     match memory_status(config).await {
-        Ok(()) => println!("memory_status: ok"),
+        Ok(()) => println!("{}", i18n.text("cli-setup-memory-status-ok")),
         Err(error) => problems.push(format!("memory_status: {error:#}")),
     }
     let doctor = DoctorArgs {
@@ -1167,6 +1255,7 @@ async fn validate_healthz(mut response: reqwest::Response) -> Result<(), String>
 /// way `mcp-bridge` authenticates, so a refused credential shows here rather
 /// than in the agent's first session.
 async fn memory_status(config: &Config) -> Result<()> {
+    let i18n = &config.i18n;
     use rmcp::ServiceExt as _;
     use rmcp::model::CallToolRequestParams;
 
@@ -1179,9 +1268,9 @@ async fn memory_status(config: &Config) -> Result<()> {
         .call_tool(CallToolRequestParams::new("memory_status"))
         .await;
     client.cancel().await.ok();
-    let result = result.context("calling memory_status")?;
+    let result = result.context(i18n.text("cli-setup-calling-memory-status"))?;
     if result.is_error == Some(true) {
-        bail!("memory_status reported an error");
+        bail!("{}", i18n.text("cli-setup-memory-status-reported-an-error"));
     }
     Ok(())
 }
@@ -1425,7 +1514,11 @@ mod tests {
             ],
         };
         let closing = next_step(&[AgentPlan::new(AgentChoice::Codex, None)]);
-        let message = ready_message(Some(&untrusted), &closing);
+        let message = ready_message(
+            &ai_memory_core::i18n::Localizer::default(),
+            Some(&untrusted),
+            &closing,
+        );
         assert!(!message.contains(ready), "{message}");
         assert!(message.contains("run /hooks"), "{message}");
         assert!(
@@ -1440,8 +1533,18 @@ mod tests {
             skipped: Vec::new(),
         };
         assert!(message.contains(FIRST_QUESTION), "{message}");
-        assert_eq!(ready_message(Some(&trusted), &closing), closing);
-        assert_eq!(ready_message(None, &closing), closing);
+        assert_eq!(
+            ready_message(
+                &ai_memory_core::i18n::Localizer::default(),
+                Some(&trusted),
+                &closing
+            ),
+            closing
+        );
+        assert_eq!(
+            ready_message(&ai_memory_core::i18n::Localizer::default(), None, &closing),
+            closing
+        );
         assert!(closing.starts_with(ready));
     }
 

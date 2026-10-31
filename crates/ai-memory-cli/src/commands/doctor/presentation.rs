@@ -3,54 +3,90 @@
 use super::*;
 
 pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal) {
-    terminal.header("DOCTOR / capture coverage");
-    terminal.section("Connection");
+    let i18n = &terminal.i18n;
+    terminal.header(&i18n.text("cli-presentation-doctor-capture-coverage"));
+    terminal.section(&i18n.text("cli-presentation-connection"));
     terminal.line(format_args!(
-        "Capture coverage for {}/{} (server {})",
-        report.workspace, report.project, report.server
+        "{}",
+        i18n.format(
+            "cli-presentation-capture-coverage-for-server",
+            &[
+                ("value0", report.workspace.to_string()),
+                ("value1", report.project.to_string()),
+                ("value2", report.server.to_string())
+            ]
+        )
     ));
     if let Some(identity) = &report.identity {
         terminal.line(format_args!(
-            "  identity: {} ({}, server {})",
-            identity.operator.as_deref().unwrap_or("anonymous"),
-            identity.level,
-            identity.version
+            "{}",
+            i18n.format(
+                "cli-presentation-identity-server",
+                &[
+                    (
+                        "value0",
+                        identity
+                            .operator
+                            .as_deref()
+                            .unwrap_or("anonymous")
+                            .to_string()
+                    ),
+                    ("value1", identity.level.to_string()),
+                    ("value2", identity.version.to_string())
+                ]
+            )
         ));
     } else {
-        terminal.line(format_args!("  identity: unavailable"));
+        terminal.line(format_args!(
+            "{}",
+            i18n.text("cli-presentation-identity-unavailable")
+        ));
     }
     if let Some(posture) = report.auth_posture {
-        terminal.line(format_args!("  auth: {}", posture.line()));
+        terminal.line(format_args!(
+            "{}",
+            i18n.format(
+                "cli-presentation-auth",
+                &[("value0", posture.localized_line(i18n).to_string())]
+            )
+        ));
     }
     if report.capture_owner_active {
         terminal.line(format_args!(
-            "  AI_MEMORY_CAPTURE_OWNER is active: native capture is suppressed in this process.\n  \
-             Confirm the external producer is delivering events."
-        ));
+            "{}", i18n.text("cli-presentation-ai-memory-capture-owner-is-active-native-capture-is-suppressed-in-this-proce")));
     }
     if let Some(coordinate) = &report.project_coordinate {
-        terminal.text(&render_project_coordinate(coordinate));
+        terminal.text(&render_project_coordinate(i18n, coordinate));
     }
     if let Some(problem) = &report.capture_coverage_problem {
         terminal.line(format_args!(
-            "  capture coverage: unavailable ({})",
-            problem.reason
+            "{}",
+            i18n.format(
+                "cli-presentation-capture-coverage-unavailable",
+                &[("value0", problem.reason.to_string())]
+            )
         ));
     }
-    terminal.section("Capture health");
-    terminal.text(&render_capture_health(report));
-    terminal.text(&render_plugins(&report.plugins));
-    terminal.text(&render_muse(report.muse.as_ref()));
+    terminal.section(&i18n.text("cli-presentation-capture-health"));
+    terminal.text(&render_capture_health(i18n, report));
+    terminal.text(&render_plugins(i18n, &report.plugins));
+    terminal.text(&render_muse(i18n, report.muse.as_ref()));
     terminal.text(&hermes::render(&report.hermes));
     terminal.text(&super::super::agentmemory_residue::render(
         &report.agentmemory_residue,
     ));
     if report.since_days == 0 {
-        terminal.line(format_args!("  recent window: all on-disk sessions\n"));
+        terminal.line(format_args!(
+            "{}",
+            i18n.text("cli-presentation-recent-window-all-on-disk-sessions")
+        ));
     } else {
         terminal.line(format_args!(
-            "  recent window: last {} days\n",
-            report.since_days
+            "{}",
+            i18n.format(
+                "cli-presentation-recent-window-last-days",
+                &[("value0", format!("{}", report.since_days))]
+            )
         ));
     }
 
@@ -60,88 +96,90 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
 
     if let Some(problem) = &report.marker_capture_problem {
         terminal.line(format_args!(
-            "⚠ {}: the settings marker has an invalid `[capture]` section.\n  \
-             It fails closed — file and shell tool content is reduced to metadata there, \
-             nothing leaks — but its `ignore_paths` exclusions are NOT applying while it stays \
-             invalid. Fix the TOML and re-run `ai-memory doctor` to confirm.\n",
-            problem.classification
-        ));
+            "{}", i18n.format("cli-presentation-the-settings-marker-has-an-invalid-capture-section-it-fails-closed-file-and", &[("value0", problem.classification.to_string())])));
     }
 
     if !report.native_memory.is_empty() {
         terminal.line(format_args!(
-            "Note: a shell/PowerShell hook install does not \
-             enforce capture-policy v1 — \"excluded\" below only holds on a native hook \
-             install or a generated integration. Check the configured hook command; a dry-run \
-             `ai-memory install-hooks` reports the selected install path, not the active one.\n"
-        ));
+            "{}", i18n.text("cli-presentation-note-a-shell-powershell-hook-install-does-not-enforce-capture-policy-v1-excl")));
     }
 
     if report.rows.is_empty() {
         if report.capture_coverage_problem.is_some() {
             terminal.line(format_args!(
-                "  No local harness sessions found for this project; server capture counts are unavailable."
-            ));
+                "{}", i18n.text("cli-presentation-no-local-harness-sessions-found-for-this-project-server-capture-counts-are-u")));
         } else {
             terminal.line(format_args!(
-                "  No local harness sessions found for this project and nothing captured yet."
-            ));
+                "{}", i18n.text("cli-presentation-no-local-harness-sessions-found-for-this-project-and-nothing-captured-yet")));
         }
         return;
     }
 
-    terminal.section("Agent coverage");
+    terminal.section(&i18n.text("cli-presentation-agent-coverage"));
     for row in &report.rows {
         let mark = match row.uncaptured {
             Some(true) => "⚠",
             Some(false) => "✓",
             None => "?",
         };
-        let captured = row
-            .captured
-            .map_or_else(|| "unavailable".to_owned(), |count| count.to_string());
+        let captured = row.captured.map_or_else(
+            || i18n.text("cli-presentation-unavailable"),
+            |count| count.to_string(),
+        );
         terminal.line(format_args!(
-            "  {mark} {:<14} {:>4} local ({} recent) → {:>11} captured",
-            row.agent, row.local_total, row.local_recent, captured
+            "{}",
+            i18n.format(
+                "cli-presentation-agent-row",
+                &[
+                    ("value0", mark.to_string()),
+                    ("value1", format!("{:<14}", row.agent)),
+                    ("value2", format!("{:>4}", row.local_total)),
+                    ("value3", format!("{}", row.local_recent)),
+                    ("value4", format!("{:>11}", captured))
+                ]
+            )
         ));
         if row.uncaptured == Some(true) {
             if report.capture_owner_active {
                 terminal.line(format_args!(
-                    "      No captured session: check the external producer and repository policy."
-                ));
+                    "{}", i18n.text("cli-presentation-no-captured-session-check-the-external-producer-and-repository-policy")));
             } else {
                 terminal.line(format_args!(
-                    "      └ ran here but nothing was captured — install its hook:\n        \
-                     ai-memory install-hooks --agent {} --apply",
-                    row.agent
-                ));
+                    "{}", i18n.format("cli-presentation-ran-here-but-nothing-was-captured-install-its-hook-ai-memory-install-hooks-a", &[("value0", row.agent.to_string())])));
             }
         }
         if let Some(count) = row.mixed_capture_sessions.filter(|count| *count > 0) {
             terminal.line(format_args!(
-                "      {count} session(s) contain events from multiple capture sources.\n      \
-                 Backfill can also mix source metadata; this does not prove duplicate capture."
-            ));
+                "{}", i18n.format("cli-presentation-count-session-s-contain-events-from-multiple-capture-sources-backfill-can-al", &[("value0", format!("{}", count))])));
         }
         if let Some(memory) = report.native_memory.iter().find(|m| m.agent == row.agent) {
             terminal.line(format_args!(
-                "      native memory: {} ({} file{})",
-                memory.path,
-                memory.file_count,
-                if memory.file_count == 1 { "" } else { "s" }
+                "{}",
+                i18n.message(
+                    "cli-presentation-native-memory-file",
+                    &[
+                        ("value0", (memory.path.to_string()).into()),
+                        ("value1", (format!("{}", memory.file_count)).into()),
+                        ("value2", (memory.file_count).into())
+                    ]
+                )
             ));
-            terminal.line(format_args!("      capture: {}", memory.status));
+            terminal.line(format_args!(
+                "{}",
+                i18n.format(
+                    "cli-presentation-capture",
+                    &[("value0", memory.status.to_string())]
+                )
+            ));
         }
     }
 
     if report.capture_coverage_problem.is_some() {
         terminal.line(format_args!(
-            "\nCapture verdict unavailable: server capture counts could not be resolved."
-        ));
+            "{}", i18n.text("cli-presentation-capture-verdict-unavailable-server-capture-counts-could-not-be-resolved")));
     } else if report.uncaptured.is_empty() {
         terminal.line(format_args!(
-            "\n✓ Every harness that ran in this project recently is captured on the server."
-        ));
+            "{}", i18n.text("cli-presentation-every-harness-that-ran-in-this-project-recently-is-captured-on-the-server")));
     } else {
         let remedy = if report.capture_owner_active {
             "Check the external producer and repository policy, then re-run `ai-memory doctor`."
@@ -149,9 +187,15 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
             "Install the hook(s) above, then re-run `ai-memory doctor` to confirm."
         };
         terminal.line(format_args!(
-            "\n⚠ {} harness(es) ran here recently with no captured sessions: {}.\n  {remedy}",
-            report.uncaptured.len(),
-            report.uncaptured.join(", ")
+            "{}",
+            i18n.format(
+                "cli-presentation-harness-es-ran-here-recently-with-no-captured-sessions-remedy",
+                &[
+                    ("value0", format!("{}", report.uncaptured.len())),
+                    ("value1", report.uncaptured.join(", ").to_string()),
+                    ("value2", remedy.to_string())
+                ]
+            )
         ));
     }
 }

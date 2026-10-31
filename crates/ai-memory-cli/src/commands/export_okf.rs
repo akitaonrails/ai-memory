@@ -23,6 +23,7 @@ use crate::http_client::{ServerEndpoint, post_to_file};
 /// (e.g. a non-conformant page pre-migration), or the file cannot be
 /// written.
 pub async fn run(config: &Config, args: ExportOkfArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     if let Some(parent) = args.to.parent()
         && !parent.as_os_str().is_empty()
@@ -37,15 +38,21 @@ pub async fn run(config: &Config, args: ExportOkfArgs) -> Result<()> {
     );
     let size = post_to_file(&endpoint, &path, &args.to)
         .await
-        .context("requesting OKF bundle from server")?;
+        .context(i18n.text("cli-export-okf-requesting-okf-bundle-from-server"))?;
     info!(
         dest = %args.to.display(),
         bytes = size,
         "OKF bundle exported"
     );
     println!(
-        "exported OKF bundle to {} ({size} bytes)",
-        args.to.display()
+        "{}",
+        i18n.format(
+            "cli-export-okf-exported-okf-bundle-to-size-bytes",
+            &[
+                ("value0", format!("{}", args.to.display())),
+                ("value1", format!("{}", size))
+            ]
+        )
     );
     Ok(())
 }

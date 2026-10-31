@@ -31,11 +31,12 @@ const SVG_LABEL_CHARS: usize = 24;
 
 /// Handler for `GET /graph`.
 pub(crate) async fn global_handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
 ) -> Response {
     let viewer_id = viewer.map(|axum::Extension(viewer)| viewer.user());
-    match render_global(&state, viewer_id).await {
+    match render_global(&i18n, &state, viewer_id).await {
         Ok(html) => html.into_response(),
         Err(status) => status.into_response(),
     }
@@ -43,6 +44,7 @@ pub(crate) async fn global_handler(
 
 /// Handler for `GET /w/:workspace/:project/graph`.
 pub(crate) async fn project_handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project)): Path<(String, String)>,
@@ -50,7 +52,7 @@ pub(crate) async fn project_handler(
     let viewer_id = viewer.as_ref().map(|axum::Extension(viewer)| viewer.user());
     let scope = match super::resolve_read_scope(&state, viewer_id, &workspace, &project).await {
         Ok(scope) => scope,
-        Err(refusal) => return super::page::refusal_response(&refusal),
+        Err(refusal) => return super::page::localized_refusal_response(&i18n, &refusal),
     };
     let graph = match state
         .reader
@@ -60,13 +62,14 @@ pub(crate) async fn project_handler(
         Ok(graph) => graph,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    match render_project(&workspace, &project, graph) {
+    match render_project(&i18n, &workspace, &project, graph) {
         Ok(html) => html.into_response(),
         Err(status) => status.into_response(),
     }
 }
 
 async fn render_global(
+    i18n: &ai_memory_core::i18n::Localizer,
     state: &WebState,
     viewer: Option<ai_memory_core::UserId>,
 ) -> Result<Html<String>, StatusCode> {
@@ -77,6 +80,7 @@ async fn render_global(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let (svg_nodes, svg_edges, rows) = aggregate_projects(&edges);
     GraphView {
+        i18n: i18n.clone(),
         is_project: false,
         workspace: String::new(),
         project: String::new(),
@@ -99,6 +103,7 @@ async fn render_global(
 }
 
 fn render_project(
+    i18n: &ai_memory_core::i18n::Localizer,
     workspace: &str,
     project: &str,
     graph: LinkGraph,
@@ -115,6 +120,7 @@ fn render_project(
         })
         .collect();
     GraphView {
+        i18n: i18n.clone(),
         is_project: true,
         workspace: workspace.to_owned(),
         project: project.to_owned(),

@@ -272,6 +272,11 @@ pub struct FallbackProfile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Language for human-facing messages; protocol fields stay unchanged.
+    pub language: ai_memory_core::i18n::Language,
+    /// Embedded presentation catalogs, resolved once at startup.
+    #[serde(skip)]
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Root data directory holding `wiki/`, `raw/`, `db/`, `models/`, `logs/`.
     pub data_dir: PathBuf,
     /// Whether `--data-dir`, `AI_MEMORY_DATA_DIR` or the config file's
@@ -1423,6 +1428,8 @@ where
 impl Default for Config {
     fn default() -> Self {
         Self {
+            language: ai_memory_core::i18n::Language::English,
+            i18n: ai_memory_core::i18n::Localizer::default(),
             data_dir: default_data_dir(),
             data_dir_explicit: false,
             bind: DEFAULT_BIND.into(),
@@ -2391,6 +2398,7 @@ impl Config {
     /// # Errors
     /// Returns an error if the config file is malformed or any required
     /// field is missing.
+    #[cfg(test)]
     pub fn load(config_path: Option<&Path>, cli_data_dir: Option<PathBuf>) -> Result<Self> {
         Self::load_with_runtime_env(config_path, cli_data_dir, RuntimeEnv::from_process())
     }
@@ -2530,6 +2538,7 @@ impl Config {
                 server_url: &config.server_url,
             },
         )?;
+        config.i18n = ai_memory_core::i18n::Localizer::new(config.language);
         config.runtime_env = runtime_env;
 
         validate_run_profiles(&config.run)?;

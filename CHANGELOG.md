@@ -30,6 +30,14 @@ version in [`docs/changelog/`](docs/changelog/):
   preventing gateways from defaulting to SSE. Both Docker wrappers forward the
   setting to helper commands such as `llm-test`. Set `false` for non-streaming
   JSON; `true` is rejected because the Chat Completions transport cannot decode SSE (#1906).
+- Added Brazilian Portuguese to the web interface and to human CLI output,
+  through embedded Fluent catalogs for `en` and `pt-BR`. The CLI language comes
+  from `--language`, `AI_MEMORY_LANGUAGE` or the top-level `language` config key
+  and defaults to English, so existing output does not change. The web interface
+  follows `Accept-Language` and has a language selector that saves a cookie.
+  Help, prompts, status lines and command errors are translated at the display
+  boundary; JSON, MCP payloads, logs, stored content and generated configuration
+  keep their existing representation. See `docs/localization.md` (#1912).
 - Made the profile's LLM output budget configurable through
   `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
   default 2000, unchanged). The ceiling was hardcoded, and local thinking

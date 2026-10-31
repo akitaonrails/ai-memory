@@ -21,6 +21,7 @@ struct CheckpointResponse {
 /// Returns an error if the server is unreachable or returns a non-2xx
 /// response.
 pub async fn run(config: &Config, args: CheckpointsArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let limit = args.limit.to_string();
     let checkpoints: Vec<CheckpointResponse> = get_json(
@@ -36,7 +37,7 @@ pub async fn run(config: &Config, args: CheckpointsArgs) -> Result<()> {
     }
 
     if checkpoints.is_empty() {
-        println!("no wiki checkpoints found");
+        println!("{}", i18n.text("cli-checkpoints-no-wiki-checkpoints-found"));
         return Ok(());
     }
 

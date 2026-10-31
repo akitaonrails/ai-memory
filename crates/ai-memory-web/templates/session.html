@@ -1,50 +1,50 @@
 {% extends "base.html" %}
 
-{% block title %}Session {{ session_id }} — ai-memory{% endblock %}
+{% block title %}{{ i18n.text("web-session-agent") }} {{ session_id }} {{ i18n.text("web-ai-memory") }}{% endblock %}
 
 {% block header_search %}{% include "_header_search_scoped.html" %}{% endblock %}
 
 {% block content %}
-<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
   <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
   <span aria-hidden="true">/</span>
-  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-mono text-xs truncate max-w-xs">session {{ session_id }}</span>
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-mono text-xs truncate max-w-xs">{{ i18n.text("web-session") }} {{ session_id }}</span>
 </nav>
 
-<p class="section-note"><a href="{{ project_href }}/agents/{{ agent_kind }}">← All {{ agent_kind }} sessions</a></p>
-<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">Session timeline</h1>
+<p class="section-note"><a href="{{ project_href }}/agents/{{ agent_kind }}">{{ i18n.one("web-session-all-agent-sessions", agent_kind) }}</a></p>
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">{{ i18n.text("web-session-timeline") }}</h1>
 <p class="mb-1 text-sm text-slate-500 dark:text-slate-400">
   <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ agent_kind }}</span>
-  started <span title="{{ started_at }}">{{ started_at }}</span>{% if ended_at != "" %}, ended <span title="{{ ended_at }}">{{ ended_at }}</span>{% else %}, still open{% endif %}
+  {{ i18n.text("web-started-session") }} <span title="{{ started_at }}">{{ started_at }}</span>{% if ended_at != "" %}{{ i18n.text("web-ended-session") }} <span title="{{ ended_at }}">{{ ended_at }}</span>{% else %}{{ i18n.text("web-still-open") }}{% endif %}
 </p>
 <p class="mb-6 text-xs text-slate-500 dark:text-slate-400">
-  Captured observations, in order. They were sanitized when captured and are shown as plain text.
-  {% if elided_other_scope > 0 %}This session also left {{ elided_other_scope }} observation{% if elided_other_scope != 1 %}s{% endif %} in another project, not shown here.{% endif %}
+  {{ i18n.text("web-captured-observations-in-order-they-were-sanitized-when-captured-and-are-shown-as-pla") }}
+  {% if elided_other_scope > 0 %}{{ i18n.text("web-this-session-also-left") }} {{ elided_other_scope }} {{ i18n.count("web-count-observation", elided_other_scope) }} {{ i18n.text("web-in-another-project-not-shown-here") }}{% endif %}
 </p>
 
 {% include "_usage_panel.html" %}
 
-<nav id="scrubber" aria-label="Session scrubber" data-total="{{ total }}" data-limit="{{ limit }}" data-start="{{ shown_start }}"
+<nav id="scrubber" aria-label="{{ i18n.text("web-session-scrubber") }}" data-total="{{ total }}" data-limit="{{ limit }}" data-start="{{ shown_start }}"
      class="sticky top-14 z-10 mb-6 flex flex-wrap items-center gap-3 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 px-3 py-2 text-sm">
-  {% if first_href != "" %}<a href="{{ first_href }}" class="text-blue-600 dark:text-blue-400" rel="first">« First</a>{% else %}<span class="text-slate-300 dark:text-slate-700">« First</span>{% endif %}
-  {% if prev_href != "" %}<a href="{{ prev_href }}" class="text-blue-600 dark:text-blue-400" rel="prev" data-scrub="prev">‹ Prev</a>{% else %}<span class="text-slate-300 dark:text-slate-700">‹ Prev</span>{% endif %}
-  <span class="text-slate-500 dark:text-slate-400">{{ shown_start }}–{{ shown_end }} of {{ total }}</span>
-  {% if next_href != "" %}<a href="{{ next_href }}" class="text-blue-600 dark:text-blue-400" rel="next" data-scrub="next">Next ›</a>{% else %}<span class="text-slate-300 dark:text-slate-700">Next ›</span>{% endif %}
-  {% if last_href != "" %}<a href="{{ last_href }}" class="text-blue-600 dark:text-blue-400" rel="last">Last »</a>{% else %}<span class="text-slate-300 dark:text-slate-700">Last »</span>{% endif %}
+  {% if first_href != "" %}<a href="{{ first_href }}" class="text-blue-600 dark:text-blue-400" rel="first">{{ i18n.text("web-first") }}</a>{% else %}<span class="text-slate-300 dark:text-slate-700">{{ i18n.text("web-first") }}</span>{% endif %}
+  {% if prev_href != "" %}<a href="{{ prev_href }}" class="text-blue-600 dark:text-blue-400" rel="prev" data-scrub="prev">{{ i18n.text("web-prev") }}</a>{% else %}<span class="text-slate-300 dark:text-slate-700">{{ i18n.text("web-prev") }}</span>{% endif %}
+  <span class="text-slate-500 dark:text-slate-400">{{ i18n.three("web-range-of-total", shown_start, shown_end, total) }}</span>
+  {% if next_href != "" %}<a href="{{ next_href }}" class="text-blue-600 dark:text-blue-400" rel="next" data-scrub="next">{{ i18n.text("web-next-session") }}</a>{% else %}<span class="text-slate-300 dark:text-slate-700">{{ i18n.text("web-next-session") }}</span>{% endif %}
+  {% if last_href != "" %}<a href="{{ last_href }}" class="text-blue-600 dark:text-blue-400" rel="last">{{ i18n.text("web-last") }}</a>{% else %}<span class="text-slate-300 dark:text-slate-700">{{ i18n.text("web-last") }}</span>{% endif %}
   <form action="{{ session_href }}" method="get" class="flex items-center gap-2 ml-auto">
     <input type="hidden" name="limit" value="{{ limit }}">
-    <label for="scrub-at" class="text-slate-500 dark:text-slate-400">Jump to</label>
-    <input id="scrub-range" type="range" min="1" max="{{ total }}" value="{{ jump_value }}" hidden aria-label="Scrub through the session" class="w-32 sm:w-48">
+    <label for="scrub-at" class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-jump-to") }}</label>
+    <input id="scrub-range" type="range" min="1" max="{{ total }}" value="{{ jump_value }}" hidden aria-label="{{ i18n.text("web-scrub-through-the-session") }}" class="w-32 sm:w-48">
     <input id="scrub-at" name="at" type="number" min="1" max="{{ total }}" value="{{ jump_value }}"
            class="w-20 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-2 py-1 text-sm">
-    <button type="submit" class="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-sm font-medium text-slate-700 dark:text-slate-200 hover:border-blue-500">Go</button>
+    <button type="submit" class="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-sm font-medium text-slate-700 dark:text-slate-200 hover:border-blue-500">{{ i18n.text("web-go") }}</button>
   </form>
 </nav>
 
 {% if observations.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">No observations on this page.</p>
+<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-observations-on-this-page") }}</p>
 {% else %}
 <ol class="space-y-4">
   {% for obs in observations %}

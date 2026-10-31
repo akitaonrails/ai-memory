@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 
-{% block title %}{{ namespace }}/ — {{ project }} — ai-memory{% endblock %}
+{% block title %}{{ namespace }}/ — {{ project }} {{ i18n.text("web-ai-memory") }}{% endblock %}
 
 {% block header_search %}{% include "_header_search_scoped.html" %}{% endblock %}
 
 {% block content %}
-<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
   <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
   <span aria-hidden="true">/</span>
@@ -14,16 +14,16 @@
 </nav>
 
 <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">{{ namespace }}/</h1>
-<p class="mb-2 text-sm text-slate-500 dark:text-slate-400">{{ total }} page{% if total != 1 %}s{% endif %} in this namespace.{% if total > pages.len() %} Showing {{ first }}&ndash;{{ last }}.{% endif %}</p>
+<p class="mb-2 text-sm text-slate-500 dark:text-slate-400">{{ total }} {{ i18n.count("web-count-page", total) }} {{ i18n.text("web-in-this-namespace") }}{% if total > pages.len() %} {{ i18n.text("web-showing") }} {{ first }}&ndash;{{ last }}.{% endif %}</p>
 <p class="mb-6 text-sm text-slate-500 dark:text-slate-400">
-  Sort:
-  <a href="{{ sort_updated_href }}"{% if !sort_title %} aria-current="true" class="font-medium text-slate-900 dark:text-slate-100"{% else %} class="hover:text-blue-600 dark:hover:text-blue-400"{% endif %}>Recently updated</a>
+  {{ i18n.text("web-sort") }}
+  <a href="{{ sort_updated_href }}"{% if !sort_title %} aria-current="true" class="font-medium text-slate-900 dark:text-slate-100"{% else %} class="hover:text-blue-600 dark:hover:text-blue-400"{% endif %}>{{ i18n.text("web-recently-updated") }}</a>
   &middot;
-  <a href="{{ sort_title_href }}"{% if sort_title %} aria-current="true" class="font-medium text-slate-900 dark:text-slate-100"{% else %} class="hover:text-blue-600 dark:hover:text-blue-400"{% endif %}>Title</a>
+  <a href="{{ sort_title_href }}"{% if sort_title %} aria-current="true" class="font-medium text-slate-900 dark:text-slate-100"{% else %} class="hover:text-blue-600 dark:hover:text-blue-400"{% endif %}>{{ i18n.text("web-title") }}</a>
 </p>
 
 {% if pages.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">No pages in this namespace.</p>
+<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-pages-in-this-namespace") }}</p>
 {% else %}
 <ul class="divide-y divide-slate-100 dark:divide-slate-800">
   {% for page in pages %}
@@ -43,9 +43,9 @@
   {% endfor %}
 </ul>
 {% if prev_href.is_some() || next_href.is_some() %}
-<nav aria-label="Pagination" class="mt-6 flex items-center justify-between text-sm">
-  {% if let Some(href) = prev_href %}<a href="{{ href }}" rel="prev" class="text-blue-600 dark:text-blue-400 hover:underline">&larr; Previous</a>{% else %}<span></span>{% endif %}
-  {% if let Some(href) = next_href %}<a href="{{ href }}" rel="next" class="text-blue-600 dark:text-blue-400 hover:underline">Next &rarr;</a>{% endif %}
+<nav aria-label="{{ i18n.text("web-pagination") }}" class="mt-6 flex items-center justify-between text-sm">
+  {% if let Some(href) = prev_href %}<a href="{{ href }}" rel="prev" class="text-blue-600 dark:text-blue-400 hover:underline">{{ i18n.text("web-previous") }}</a>{% else %}<span></span>{% endif %}
+  {% if let Some(href) = next_href %}<a href="{{ href }}" rel="next" class="text-blue-600 dark:text-blue-400 hover:underline">{{ i18n.text("web-next") }}</a>{% endif %}
 </nav>
 {% endif %}
 {% endif %}

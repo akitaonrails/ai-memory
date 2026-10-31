@@ -172,10 +172,13 @@ async fn build_candidates(
 /// session stores cannot be located, or the server is unreachable or answers
 /// non-2xx.
 pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let cwd = std::env::current_dir().context("resolving the current working directory")?;
-    let home = run::native_home(config).context("locating the local harness session stores")?;
+    let cwd = std::env::current_dir()
+        .context(i18n.text("cli-doctor-resolving-the-current-working-directory"))?;
+    let home = run::native_home(config)
+        .context(i18n.text("cli-backfill-locating-the-local-harness-session-stores"))?;
 
     // Same discovery `backfill` uses to select what it would import: every
     // local native session (across every scanned harness) whose recorded cwd
@@ -186,11 +189,8 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
 
     if items.is_empty() {
         println!(
-            "ai-memory: repair-backfill-timestamps for {workspace}/{project}: no local \
-             transcript carried a readable timestamp ({uncaptured} session(s) scanned locally, \
-             none captured); nothing to send."
-        );
-        print_scan_limit_note(&limit_hit);
+            "{}", i18n.format("cli-repair-backfill-timestamps-ai-memory-repair-backfill-timestamps-for-workspace-project-no-local-transcri", &[("value0", workspace.to_string()), ("value1", project.to_string()), ("value2", format!("{}", uncaptured))]));
+        print_scan_limit_note(i18n, &limit_hit);
         return Ok(());
     }
 
@@ -227,27 +227,28 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
     }
 
     println!(
-        "ai-memory: repair-backfill-timestamps for {workspace}/{project}: {total_repaired} \
-         session(s) {}, {total_skipped} skipped, {uncaptured} local transcript(s) had no \
-         readable timestamp.",
-        if dry_run {
+        "{}", i18n.format("cli-repair-backfill-timestamps-ai-memory-repair-backfill-timestamps-for-workspace-project-total-repaired-se", &[("value0", workspace.to_string()), ("value1", project.to_string()), ("value2", format!("{}", total_repaired)), ("value3", (if dry_run {
             "would be repaired"
         } else {
             "repaired"
-        },
-    );
+        }).to_string()), ("value4", format!("{}", total_skipped)), ("value5", format!("{}", uncaptured))]));
     if responses.len() > 1 {
         println!(
-            "  sent {} session(s) across {} request(s) of up to {MAX_SESSIONS_PER_REQUEST} each \
-             (one transaction per request).",
-            items.len(),
-            responses.len(),
-        );
+            "{}", i18n.format("cli-repair-backfill-timestamps-sent-session-s-across-request-s-of-up-to-max-sessions-per-request-each-one-t", &[("value0", format!("{}", items.len())), ("value1", format!("{}", responses.len())), ("value2", format!("{}", MAX_SESSIONS_PER_REQUEST))]));
     }
     for (reason, count) in &skipped_by_reason {
-        println!("  skipped ({reason}): {count}");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-repair-backfill-timestamps-skipped-reason-count",
+                &[
+                    ("value0", reason.to_string()),
+                    ("value1", format!("{}", count))
+                ]
+            )
+        );
     }
-    print_scan_limit_note(&limit_hit);
+    print_scan_limit_note(i18n, &limit_hit);
 
     for response in &responses {
         for repaired in &response.repaired {
@@ -272,9 +273,7 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
     }
     if dry_run && total_repaired > 0 {
         println!(
-            "  dry run: nothing was written. Re-run with --confirm to apply (recorded in \
-             audit_log on apply, which is the reversibility backing)."
-        );
+            "{}", i18n.text("cli-repair-backfill-timestamps-dry-run-nothing-was-written-re-run-with-confirm-to-apply-recorded-in-audit-l"));
     }
     Ok(())
 }
@@ -282,13 +281,10 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
 /// A harness whose local scan came back at the cap means older sessions may
 /// exist that were not even considered — surface that instead of silently
 /// under-reporting.
-fn print_scan_limit_note(limit_hit: &[ManagedHarness]) {
+fn print_scan_limit_note(i18n: &ai_memory_core::i18n::Localizer, limit_hit: &[ManagedHarness]) {
     for harness in limit_hit {
         println!(
-            "  note: {} returned the maximum scanned sessions for this checkout; older \
-             sessions may exist and were not considered.",
-            harness.as_str()
-        );
+            "{}", i18n.format("cli-repair-backfill-timestamps-note-returned-the-maximum-scanned-sessions-for-this-checkout-older-sessions", &[("value0", harness.as_str().to_string())]));
     }
 }
 

@@ -82,6 +82,7 @@ bearer_token_file = {}
 /// - Anything else, an existing install above all, records nothing and keeps
 ///   the loopback no-auth behaviour it had (`ai-memory auth enable` opts in).
 fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<RecordedBearer>> {
+    let i18n = &config.i18n;
     if let Some(raw) = config
         .auth
         .bearer_token_file
@@ -106,9 +107,11 @@ fn root_bearer_for_new_config(config: &Config, fresh: bool) -> Result<Option<Rec
         crate::local_auth::provision_root_token(&crate::server_profiles::root_token_path(root))?;
     crate::local_auth::seed_hook_credential(root, &minted.token)?;
     println!(
-        "Generated a root bearer token in {} (owner-only). The server requires it on every \
-         route but /healthz; hooks, the CLI and `ai-memory mcp-bridge` read it from there.",
-        display_path(&minted.path)
+        "{}",
+        i18n.format(
+            "cli-init-generated-a-root-bearer-token-in-owner-only-the-server-requires-it-on-every",
+            &[("value0", display_path(&minted.path).to_string())]
+        )
     );
     Ok(Some(RecordedBearer {
         raw: crate::server_profiles::ROOT_TOKEN_RELATIVE.to_owned(),
@@ -162,6 +165,7 @@ pub(crate) fn initialize(
     args: &InitArgs,
     config_path: Option<&Path>,
 ) -> Result<InitOutcome> {
+    let i18n = &config.i18n;
     let root = &config.data_dir;
     let cfg_path = init_config_path(root, config_path);
     // Decided before anything is created: a data dir that already has a
@@ -198,8 +202,15 @@ pub(crate) fn initialize(
         // stable from install onwards: see comment in render_default_
         // auth_block. getrandom::Error doesn't impl `std::error::Error`
         // (anyhow's `with_context` would conflict), so map manually.
-        let pepper = generate_token_hex(TOKEN_PEPPER_BYTES)
-            .map_err(|e| anyhow::anyhow!("generating auth token_pepper: {e}"))?;
+        let pepper = generate_token_hex(TOKEN_PEPPER_BYTES).map_err(|e| {
+            anyhow::anyhow!(
+                "{}",
+                i18n.format(
+                    "cli-init-generating-auth-token-pepper-e",
+                    &[("value0", format!("{}", e))]
+                )
+            )
+        })?;
         let recorded = root_bearer_for_new_config(config, fresh)?;
         let bearer_line = recorded
             .as_ref()

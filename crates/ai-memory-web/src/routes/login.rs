@@ -17,11 +17,13 @@ pub(crate) struct NextQuery {
 }
 
 pub(crate) async fn login(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(cfg): State<Arc<HtmlAuthRedirectConfig>>,
     Query(q): Query<NextQuery>,
 ) -> Response {
     let next = sanitize_next(q.next.as_deref(), &cfg.web_root);
     let view = LoginView {
+        i18n: i18n.clone(),
         next,
         change_password_href: cfg.change_password_path.clone(),
     };
@@ -29,11 +31,15 @@ pub(crate) async fn login(
 }
 
 pub(crate) async fn change_password(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(cfg): State<Arc<HtmlAuthRedirectConfig>>,
     Query(q): Query<NextQuery>,
 ) -> Response {
     let next = sanitize_next(q.next.as_deref(), &cfg.web_root);
-    let view = ChangePasswordView { next };
+    let view = ChangePasswordView {
+        i18n: i18n.clone(),
+        next,
+    };
     render(view)
 }
 

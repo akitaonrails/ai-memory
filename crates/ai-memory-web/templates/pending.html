@@ -1,54 +1,52 @@
 {% extends "base.html" %}
 
-{% block title %}Pending writes — ai-memory{% endblock %}
+{% block title %}{{ i18n.text("web-pending-writes-ai-memory") }}{% endblock %}
 
 {% block nav_pending_current %}aria-current="page"{% endblock %}
 
 {% block content %}
 <div class="mb-6">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Pending writes</h1>
+  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">{{ i18n.text("web-pending-writes") }}</h1>
   <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">
-    Auto-improvement proposals that wait for a decision. Open a proposal to read it, then approve or reject it.
+    {{ i18n.text("web-auto-improvement-proposals-that-wait-for-a-decision-open-a-proposal-to-read-it-then-a") }}
   </p>
 </div>
 
 <form action="pending" method="get" id="pending-filter" class="mb-4 flex flex-wrap items-end gap-3 text-sm">
   <label class="flex flex-col gap-1">
-    <span class="font-medium text-slate-700 dark:text-slate-300">Project</span>
+    <span class="font-medium text-slate-700 dark:text-slate-300">{{ i18n.text("web-project") }}</span>
     <select name="project" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
       {% for option in projects %}
-      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ i18n.label(option.label) }}</option>
       {% endfor %}
     </select>
   </label>
   <label class="flex flex-col gap-1">
-    <span class="font-medium text-slate-700 dark:text-slate-300">Sort</span>
+    <span class="font-medium text-slate-700 dark:text-slate-300">{{ i18n.text("web-sort-pending") }}</span>
     <select name="sort" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
       {% for option in sorts %}
-      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+      <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ i18n.label(option.label) }}</option>
       {% endfor %}
     </select>
   </label>
-  <button type="submit" class="rounded-md bg-blue-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-blue-700">Apply</button>
+  <button type="submit" class="rounded-md bg-blue-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-blue-700">{{ i18n.text("web-apply") }}</button>
 </form>
 
 <p class="mb-4 text-sm text-slate-500 dark:text-slate-400">
-  <span id="pending-count">{{ rows.len() }}</span> shown · {{ total }} pending in {{ project_count }} project{% if project_count != 1 %}s{% endif %}
-  {% if truncated %}· only the oldest {{ limit }} of this selection are listed; pick a project, or use <code>ai-memory pending-writes list</code>{% endif %}
+  <span id="pending-count">{{ rows.len() }}</span> {{ i18n.text("web-shown") }} {{ i18n.two("web-pending-in-projects", total, project_count) }} {{ i18n.count("web-count-project", project_count) }}
+  {% if truncated %}{{ i18n.text("web-only-the-oldest") }} {{ limit }} {{ i18n.text("web-of-this-selection-are-listed-pick-a-project-or-use") }} <code>ai-memory pending-writes list</code>{% endif %}
 </p>
 
 {% if read_only %}
 <p class="mb-4 rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
-  This browser signed in with the root token, which can only read pages. To approve or reject here, set up password sign-in
-  (<code>AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD</code>, see "Human password bootstrap and recovery" in <code>docs/install.md</code>).
-  Until then, use the command shown under each proposal.
+  {{ i18n.rich("web-pending-root-token-cannot-decide", "")|safe }}
 </p>
 {% endif %}
 
 <p id="pending-status" class="mb-4 hidden rounded-md px-3 py-2 text-sm" role="status" aria-live="polite"></p>
 
 {% if rows.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">No pending proposals.</p>
+<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-pending-proposals") }}</p>
 {% else %}
 <ul id="pending-list" class="space-y-3">
   {% for row in rows %}
@@ -67,56 +65,56 @@
           <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ row.operation }}</span>
           {% endif %}
           {% if row.is_rule %}
-          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-300">rule</span>
+          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-300">{{ i18n.text("web-rule") }}</span>
           {% endif %}
           <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ row.kind }}</span>
         </div>
         <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
           <span>{{ row.scope_label }}</span>
           <span class="font-mono break-all">{{ row.target_path }}</span>
-          <span>confidence {{ row.confidence_pct }}%</span>
-          <span>staged {{ row.staged_relative }}</span>
+          <span>{{ i18n.text("web-confidence") }} {{ row.confidence_pct }}%</span>
+          <span>{{ i18n.text("web-staged") }} {{ row.staged_relative }}</span>
         </div>
       </summary>
       <div class="border-t border-slate-200 dark:border-slate-800 px-4 py-4 space-y-4">
         {% if row.is_rule %}
         <p class="rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
-          This proposal writes under <code>_rules/</code>. Every agent session loads those pages as instructions. Read the full body before you approve it.
+          {{ i18n.rich("web-pending-writes-rules", "")|safe }}
         </p>
         {% endif %}
         {% if row.rewrites_existing %}
         <p class="rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
-          This proposal replaces an existing page. Compare it with the
-          <a href="{{ row.target_href }}" class="underline">current page</a> before you approve it.
+          {{ i18n.text("web-this-proposal-replaces-an-existing-page-compare-it-with-the") }}
+          <a href="{{ row.target_href }}" class="underline">{{ i18n.text("web-current-page") }}</a> {{ i18n.text("web-before-you-approve-it") }}
         </p>
         {% endif %}
         <div>
-          <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">Rationale</h2>
+          <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-rationale") }}</h2>
           <pre class="whitespace-pre-wrap break-words rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-sm text-slate-700 dark:text-slate-300">{{ row.rationale }}</pre>
         </div>
         <div>
-          <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">Proposed body ({{ row.edit_mode }})</h2>
+          <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-proposed-body") }}{{ row.edit_mode }})</h2>
           <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-sm text-slate-700 dark:text-slate-300">{{ row.body_markdown }}</pre>
         </div>
-        <p class="text-xs text-slate-500 dark:text-slate-400 font-mono break-all">id {{ row.id }}</p>
+        <p class="text-xs text-slate-500 dark:text-slate-400 font-mono break-all">{{ i18n.text("web-id") }} {{ row.id }}</p>
         {% if read_only %}
         <div>
-          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">POSIX shell</h2>
+          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-posix-shell") }}</h2>
           <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.posix_cli_approve }}
 {{ row.posix_cli_reject }}</pre>
         </div>
         <div>
-          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">PowerShell</h2>
+          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-powershell") }}</h2>
           <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.powershell_cli_approve }}
 {{ row.powershell_cli_reject }}</pre>
         </div>
         {% else %}
         <div class="flex flex-wrap items-center gap-2">
           <button type="button" data-action="approve"
-                  class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">Approve</button>
+                  class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">{{ i18n.text("web-approve") }}</button>
           <button type="button" data-action="reject"
-                  class="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50">Reject</button>
-          <input type="text" name="reason" maxlength="500" placeholder="Reject reason (optional)" aria-label="Reject reason"
+                  class="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50">{{ i18n.text("web-reject") }}</button>
+          <input type="text" name="reason" maxlength="500" placeholder="{{ i18n.text("web-reject-reason-optional") }}" aria-label="{{ i18n.text("web-reject-reason") }}"
                  class="flex-1 min-w-0 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500">
         </div>
         {% endif %}
@@ -129,6 +127,7 @@
 
 <script>
 (function () {
+{% include "_js_api_errors.html" %}
   {% include "_js_cookie.html" %}
   var basePath = document
     .querySelector('meta[name="ai-memory-base-path"]')
@@ -176,20 +175,21 @@
         if (resp.ok) {
           item.remove();
           count.textContent = String(document.querySelectorAll(".pending-item").length);
-          showStatus(true, (action === "approve" ? "Approved " : "Rejected ") + path + ".");
+          showStatus(true, (action === "approve" ? {{ i18n.js("web-approved-prefix")|safe }} : {{ i18n.js("web-rejected-prefix")|safe }}) + path + ".");
           return;
         }
         buttons.forEach(function (b) { b.disabled = false; });
         if (resp.status === 409) {
-          showStatus(false, "The page at " + path + " changed after the proposal was staged. The proposal is now marked as a conflict. Reload the page.");
+          showStatus(false, (""+{{ i18n.js("web-the-page-at")|safe }}+" ") + path + (" "+{{ i18n.js("web-changed-after-the-proposal-was-staged-the-proposal-is-now-marked-as-a-conflict-reload")|safe }}+""));
           return;
         }
-        showStatus(false, (action === "approve" ? "Approve" : "Reject") + " failed for " + path +
-          " (" + resp.status + "): " + ((json && json.error) || "unknown error"));
+        showStatus(false, (action === "approve" ? {{ i18n.js("web-approve")|safe }} : {{ i18n.js("web-reject")|safe }}) + (" "+{{ i18n.js("web-failed-for")|safe }}+" ") + path +
+          " (" + resp.status + "): " + (apiError(json,{{ i18n.js("web-unknown-error")|safe }})));
       });
     }).catch(function () {
+{% include "_js_api_errors.html" %}
       buttons.forEach(function (b) { b.disabled = false; });
-      showStatus(false, "Network error. Try again.");
+      showStatus(false, {{ i18n.js("web-network-error-try-again-pending")|safe }});
     });
   }
 

@@ -77,6 +77,7 @@ pub(super) struct Count {
 #[derive(Template)]
 #[template(path = "management/console.html")]
 pub(super) struct ConsoleView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     pub mcp_path: String,
     pub min_password: usize,
     pub root: String,
@@ -102,6 +103,7 @@ pub(super) struct ConsoleView {
 impl ConsoleView {
     pub fn new(root: &str, screen: Screen, csrf: String) -> Self {
         Self {
+            i18n: ai_memory_core::i18n::Localizer::default(),
             mcp_path: format!("{}/mcp", root.strip_suffix("/manage").unwrap_or(root)),
             min_password: super::MIN_PASSWORD_CHARACTERS,
             root: root.into(),
@@ -198,6 +200,7 @@ impl ConsoleView {
             },
             _ => {
                 return Err(super::failure(
+                    &self.i18n,
                     axum::http::StatusCode::BAD_REQUEST,
                     "Both workspace and project are required".into(),
                 ));
@@ -209,6 +212,7 @@ impl ConsoleView {
         let (data, leaf, suffix, count) = if self.screen == "session" {
             let sid = selection.session.ok_or_else(|| {
                 super::failure(
+                    &self.i18n,
                     axum::http::StatusCode::BAD_REQUEST,
                     "Session ID required".into(),
                 )
@@ -264,6 +268,7 @@ impl ConsoleView {
             .filter(|s| *s > 0)
             .ok_or_else(|| {
                 super::failure(
+                    &self.i18n,
                     axum::http::StatusCode::BAD_GATEWAY,
                     "Missing pagination contract".into(),
                 )

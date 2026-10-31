@@ -17,7 +17,7 @@ use ai_memory_store::lookup_existing_scope;
 use crate::state::WebState;
 use crate::templates::{
     AgentBadge, Folder, MailboxRow, PageRow, ProjectMemoryStats, ProjectView, SessionRow,
-    agent_label, duration_between, fmt_tokens, humanize, page_href, project_href, session_href,
+    agent_label, duration_between, fmt_tokens, page_href, project_href, session_href,
 };
 
 /// Pending messages listed on the project page before it says there are more.
@@ -47,6 +47,7 @@ fn fmt_session_tokens(usage: Option<&ai_memory_store::SessionUsageView>) -> Stri
 
 /// Handler for `GET /w/:workspace/:project`.
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
@@ -57,17 +58,19 @@ pub(crate) async fn handler(
     let viewer_id = viewer.as_ref().map(|axum::Extension(viewer)| viewer.user());
     let authorized = match super::authorize_read(&state, viewer, &workspace, &project).await {
         Ok(authorized) => authorized,
-        Err(refusal) => return super::page::refusal_response(&refusal),
+        Err(refusal) => return super::page::localized_refusal_response(&i18n, &refusal),
     };
     let owner = super::api::session_owner_filter_for(actor, auth);
     render(
-        &state, workspace, project, viewer_id, authorized, owner, query,
+        &i18n, &state, workspace, project, viewer_id, authorized, owner, query,
     )
     .await
     .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn render(
+    i18n: &ai_memory_core::i18n::Localizer,
     state: &WebState,
     workspace: String,
     project: String,
@@ -86,8 +89,9 @@ async fn render(
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         },
-        mailbox(state, &workspace, &project, viewer, authorized),
+        mailbox(i18n, state, &workspace, &project, viewer, authorized),
         sessions(
+            i18n,
             state,
             &workspace,
             &project,
@@ -143,7 +147,7 @@ async fn render(
             last_activity_relative: item
                 .last_activity
                 .as_deref()
-                .map(humanize)
+                .map(|iso| i18n.relative(iso))
                 .unwrap_or_default(),
             tokens_total,
         },
@@ -223,7 +227,7 @@ async fn render(
                 href: page_href(&workspace, &project, &p.path),
                 title: p.title.clone(),
                 kind: p.kind.clone(),
-                updated_relative: humanize(&p.updated_at),
+                updated_relative: i18n.relative(&p.updated_at),
             },
         ));
     }
@@ -254,7 +258,7 @@ async fn render(
             href: page_href(&workspace, &project, &p.path),
             title: p.title.clone(),
             kind: p.kind.clone(),
-            updated_relative: humanize(&p.updated_at),
+            updated_relative: i18n.relative(&p.updated_at),
         })
         .collect();
 
@@ -275,6 +279,7 @@ async fn render(
         None => ai_memory_store::TokenUsageReport::default(),
     };
     let token_usage = crate::operations::usage_panel(
+        i18n,
         report,
         &workspace,
         &project,
@@ -293,6 +298,7 @@ async fn render(
         None => Vec::new(),
     };
     let html = ProjectView {
+        i18n: i18n.clone(),
         agents,
         inbox_href: format!(
             "inbox?workspace={}&project={}",
@@ -356,6 +362,7 @@ fn to_folders(
 /// already authorized the viewer for this project; sender names are filtered
 /// again per row in the store.
 async fn mailbox(
+    i18n: &ai_memory_core::i18n::Localizer,
     state: &WebState,
     workspace: &str,
     project: &str,
@@ -398,7 +405,7 @@ async fn mailbox(
                 sender,
                 sender_href,
                 snippet: snippet(&entry.message.body),
-                created_relative: humanize(&entry.message.created_at.to_string()),
+                created_relative: i18n.relative(&entry.message.created_at.to_string()),
             }
         })
         .collect();
@@ -409,6 +416,7 @@ async fn mailbox(
 /// owner-filtered reader as `/api/v1/.../sessions`: a session another operator
 /// owns is not listed.
 async fn sessions(
+    i18n: &ai_memory_core::i18n::Localizer,
     state: &WebState,
     workspace: &str,
     project: &str,
@@ -445,7 +453,7 @@ async fn sessions(
                 agent_kind: s.agent_kind,
                 short_id: crate::templates::short_id(&id),
                 observation_count: s.observation_count,
-                started_relative: humanize(&s.started_at),
+                started_relative: i18n.relative(&s.started_at),
                 open: s.ended_at.is_none(),
             }
         })

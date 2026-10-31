@@ -49,6 +49,7 @@ pub mod features;
 pub mod health;
 mod html_auth;
 mod knowledge;
+mod localization;
 #[cfg(feature = "management-ui")]
 pub mod management;
 mod markdown;

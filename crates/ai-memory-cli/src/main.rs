@@ -5,11 +5,21 @@
 
 #![doc(html_no_source)]
 
-use std::time::Duration;
+use std::{process::ExitCode, time::Duration};
 
 use anyhow::Result;
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match start() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}", ai_memory_cli::failure_report(&error));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn start() -> Result<()> {
     #[cfg(windows)]
     {
         // Windows executables start with a much smaller main-thread stack than

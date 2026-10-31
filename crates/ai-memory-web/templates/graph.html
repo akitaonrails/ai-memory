@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{% if is_project %}{{ workspace }}/{{ project }} graph — ai-memory{% else %}Link graph — ai-memory{% endif %}{% endblock %}
+{% block title %}{% if is_project %}{{ workspace }}/{{ project }} {{ i18n.text("web-graph-ai-memory") }}{% else %}{{ i18n.text("web-link-graph-ai-memory") }}{% endif %}{% endblock %}
 {% block nav_graph_current %}aria-current="page"{% endblock %}
 
 {% block header_search %}
@@ -8,12 +8,12 @@
 {% include "_header_search_scoped.html" %}
 {% else %}
 <form action="search" method="get" class="flex items-center gap-2">
-  <label for="header-search" class="sr-only">Search pages</label>
+  <label for="header-search" class="sr-only">{{ i18n.text("web-search-pages") }}</label>
   <input
     id="header-search"
     name="q"
     type="search"
-    placeholder="Search…"
+    placeholder="{{ i18n.text("web-search-graph") }}"
     class="w-40 sm:w-64 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
   >
 </form>
@@ -22,35 +22,35 @@
 
 {% block content %}
 {% if is_project %}
-<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
   <span class="text-slate-500 dark:text-slate-400">{{ workspace }}</span>
   <span aria-hidden="true">/</span>
   <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ project }}</a>
   <span aria-hidden="true">/</span>
-  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">graph</span>
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ i18n.text("web-graph") }}</span>
 </nav>
 {% else %}
-<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
-  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">graph</span>
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ i18n.text("web-graph") }}</span>
 </nav>
 {% endif %}
 
-<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ heading }}</h1>
-<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ blurb }}</p>
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.label(heading) }}</h1>
+<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.label(blurb) }}</p>
 
 {% if truncated %}
-<p class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">Showing the {{ shown }} pages with the most same-project neighbours (cap {{ node_cap }}). The rest stay on the project page.</p>
+<p class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">{{ i18n.two("web-graph-capped", shown, node_cap) }}</p>
 {% endif %}
 
 {% if svg_nodes.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">{{ empty_message }}</p>
+<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.label(empty_message) }}</p>
 {% else %}
 <svg viewBox="0 0 800 800" class="w-full max-w-3xl mx-auto mb-10 text-slate-700 dark:text-slate-200" role="img" aria-labelledby="graph-heading">
-  <title id="graph-heading">{{ heading }}</title>
+  <title id="graph-heading">{{ i18n.label(heading) }}</title>
   {% for edge in svg_edges %}
   <line x1="{{ edge.x1 }}" y1="{{ edge.y1 }}" x2="{{ edge.x2 }}" y2="{{ edge.y2 }}" stroke="currentColor" stroke-opacity="0.35" stroke-width="1.5" />
   {% endfor %}
@@ -66,16 +66,16 @@
 </svg>
 {% endif %}
 
-<h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Edges</h2>
+<h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-edges") }}</h2>
 {% if rows.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">No resolved links to list.</p>
+<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-resolved-links-to-list") }}</p>
 {% else %}
 <div class="overflow-x-auto">
   <table class="min-w-full text-sm">
     <thead>
       <tr class="text-left text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-        <th class="py-2 pr-4 font-semibold">From</th>
-        <th class="py-2 font-semibold">To</th>
+        <th class="py-2 pr-4 font-semibold">{{ i18n.text("web-from") }}</th>
+        <th class="py-2 font-semibold">{{ i18n.text("web-to") }}</th>
       </tr>
     </thead>
     <tbody class="divide-y divide-slate-100 dark:divide-slate-800">

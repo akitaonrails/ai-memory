@@ -2,7 +2,7 @@
 (function(){
   var timer,controller,stopped=false,busy=false;
   function apply(page,force){
-    if(!page.querySelector("#token-usage"))throw new Error("Missing usage");
+    if(!page.querySelector("#token-usage"))throw new Error({{ i18n.js("web-missing-usage")|safe }});
     ["#token-usage .usage-metrics","#token-usage .usage-results","#agents .agent-grid","#project-capture-summary","#session-token-table"].forEach(function(selector){var next=page.querySelector(selector),current=document.querySelector(selector);if(next&&current&&(force||!current.contains(document.activeElement)))current.replaceWith(next);});
     document.getElementById("token-refresh-status").textContent="";
   }
@@ -13,11 +13,11 @@
     busy=true;var url=location.href,request=new AbortController();controller=request;var timeout=setTimeout(function(){request.abort();},5000);
     try{
       var response=await fetch(url,{cache:"no-store",credentials:"same-origin",signal:request.signal,headers:{"Accept":"text/html"}});
-      if(!response.ok||response.redirected)throw new Error("Refresh unavailable");
+      if(!response.ok||response.redirected)throw new Error({{ i18n.js("web-refresh-unavailable")|safe }});
       if(stopped||location.href!==url)return;
       var page=new DOMParser().parseFromString(await response.text(),"text/html");
       apply(page,false);
-    }catch(_){document.getElementById("token-refresh-status").textContent="Update unavailable. Showing the last received values.";}
+    }catch(_){document.getElementById("token-refresh-status").textContent={{ i18n.js("web-update-unavailable-showing-the-last-received-values")|safe }};}
     finally{clearTimeout(timeout);busy=false;if(!stopped){clearTimeout(timer);timer=setTimeout(refresh,10000);}}
   }
   timer=setTimeout(refresh,10000);

@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 
-{% block title %}{{ title }} — ai-memory{% endblock %}
+{% block title %}{{ title }} {{ i18n.text("web-ai-memory") }}{% endblock %}
 
 {% block header_search %}{% include "_header_search_scoped.html" %}{% endblock %}
 
 {% block content %}
-<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
   <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
   <span aria-hidden="true">/</span>
@@ -27,27 +27,27 @@
     </span>
     {% if pinned %}
     <span class="inline-flex items-center rounded px-2 py-0.5 font-medium bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
-      pinned
+      {{ i18n.text("web-pinned") }}
     </span>
     {% endif %}
     {% if expired %}
     <span class="inline-flex items-center rounded px-2 py-0.5 font-medium bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
-      expired
+      {{ i18n.text("web-expired") }}
     </span>
     {% endif %}
-    <span class="ml-1">Updated <time datetime="{{ updated_at }}" title="{{ updated_at }}">{{ updated_relative }}</time></span>
+    <span class="ml-1">{{ i18n.text("web-updated") }} <time datetime="{{ updated_at }}" title="{{ updated_at }}">{{ updated_relative }}</time></span>
     <span>·</span>
-    <a href="{{ history_href }}" class="text-blue-600 dark:text-blue-400 underline">History</a>
+    <a href="{{ history_href }}" class="text-blue-600 dark:text-blue-400 underline">{{ i18n.text("web-history-page") }}</a>
     <span>·</span>
-    <span>Created <time datetime="{{ created_at }}" title="{{ created_at }}">{{ created_relative }}</time></span>
+    <span>{{ i18n.text("web-created") }} <time datetime="{{ created_at }}" title="{{ created_at }}">{{ created_relative }}</time></span>
     {% if supersedes_path != "" %}
     <span>·</span>
-    <span>Supersedes <a href="{{ supersedes_href }}" class="text-blue-600 dark:text-blue-400 underline">{{ supersedes_path }}</a></span>
+    <span>{{ i18n.text("web-supersedes") }} <a href="{{ supersedes_href }}" class="text-blue-600 dark:text-blue-400 underline">{{ supersedes_path }}</a></span>
     {% endif %}
     {% if author_username != "" %}
     <span>·</span>
     <span>
-      Last edited by
+      {{ i18n.text("web-last-edited-by") }}
       <span class="font-medium text-slate-700 dark:text-slate-300">{{ author_username }}</span>
       {% if author_name != "" %}<span class="text-slate-500 dark:text-slate-400">({{ author_name }})</span>{% endif %}
       {% if author_email != "" %}<a href="mailto:{{ author_email }}" class="text-blue-600 dark:text-blue-400 underline">{{ author_email }}</a>{% endif %}
@@ -82,11 +82,11 @@
   </div>
 </article>
 
-<aside aria-label="Page navigation" class="mt-8 space-y-6 text-sm lg:mt-0 lg:w-64 lg:shrink-0 lg:sticky lg:top-4 lg:max-h-screen lg:overflow-y-auto">
+<aside aria-label="{{ i18n.text("web-page-navigation") }}" class="mt-8 space-y-6 text-sm lg:mt-0 lg:w-64 lg:shrink-0 lg:sticky lg:top-4 lg:max-h-screen lg:overflow-y-auto">
   {% if !outline.is_empty() %}
   <details open>
-    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">On this page</summary>
-    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">On this page</h2>
+    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">{{ i18n.text("web-on-this-page") }}</summary>
+    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-on-this-page") }}</h2>
     <ul class="mt-2 space-y-1">
       {% for item in outline %}
       <li{% if item.nested %} class="pl-3"{% endif %}><a href="{{ item.href }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ item.text }}</a></li>
@@ -96,30 +96,30 @@
   {% endif %}
 
   <details open>
-    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">Cited by</summary>
-    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Cited by</h2>
+    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">{{ i18n.text("web-cited-by") }}</summary>
+    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-cited-by") }}</h2>
     {% if cited_by.is_empty() %}
-    <p class="mt-2 text-slate-500 dark:text-slate-400">No page links here yet.</p>
+    <p class="mt-2 text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-page-links-here-yet") }}</p>
     {% else %}
     <ul class="mt-2 space-y-1">
       {% for rel in cited_by %}
       <li><a href="{{ rel.href }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ rel.title }}</a>{% if rel.scope_hint != "" %} <span class="text-xs text-slate-500 dark:text-slate-400">{{ rel.scope_hint }}</span>{% endif %}</li>
       {% endfor %}
     </ul>
-    {% if cited_by_more > 0 %}<p class="mt-1 text-slate-500 dark:text-slate-400">and {{ cited_by_more }} more</p>{% endif %}
+    {% if cited_by_more > 0 %}<p class="mt-1 text-slate-500 dark:text-slate-400">{{ i18n.one("web-and-more", cited_by_more) }}</p>{% endif %}
     {% endif %}
   </details>
 
   {% if !cites.is_empty() %}
   <details open>
-    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">Cites</summary>
-    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Cites</h2>
+    <summary class="cursor-pointer list-none text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 lg:hidden">{{ i18n.text("web-cites") }}</summary>
+    <h2 class="hidden lg:block text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-cites") }}</h2>
     <ul class="mt-2 space-y-1">
       {% for rel in cites %}
       <li><a href="{{ rel.href }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ rel.title }}</a>{% if rel.scope_hint != "" %} <span class="text-xs text-slate-500 dark:text-slate-400">{{ rel.scope_hint }}</span>{% endif %}</li>
       {% endfor %}
     </ul>
-    {% if cites_more > 0 %}<p class="mt-1 text-slate-500 dark:text-slate-400">and {{ cites_more }} more</p>{% endif %}
+    {% if cites_more > 0 %}<p class="mt-1 text-slate-500 dark:text-slate-400">{{ i18n.one("web-and-more", cites_more) }}</p>{% endif %}
   </details>
   {% endif %}
 </aside>

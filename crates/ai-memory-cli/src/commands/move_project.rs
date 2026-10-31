@@ -74,6 +74,7 @@ fn confirm_command(from_workspace: &str, target_flag: &str, args: &MoveProjectAr
 /// Returns an error when `--confirm` is absent, the server is unreachable,
 /// or the server returns a non-2xx response.
 pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.from_workspace.as_deref(), "--from-workspace")?;
     super::refuse_empty_explicit(Some(args.to_workspace.as_str()), "--to-workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
@@ -108,22 +109,15 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             ),
             id.clone(),
         ),
-        (None, None) => bail!("one of --project or --project-id is required"),
+        (None, None) => bail!(
+            "{}",
+            i18n.text("cli-move-project-one-of-project-or-project-id-is-required")
+        ),
     };
 
     if !args.confirm {
         bail!(
-            "move-project moves {}/{} to workspace {}. If the destination has \
-             no same-named project it is a lossless true-move (re-stamp in \
-             place — sessions, observations and history preserved). If it \
-             already has one, the pages are copied in and merged, then the \
-             source is PURGED. Both are irreversible.\n\
-             Re-run with --confirm to proceed:\n\n  {}",
-            from_workspace,
-            target_flag,
-            args.to_workspace,
-            confirm_command(&from_workspace, &target_flag, &args),
-        );
+            "{}", i18n.format("cli-move-project-move-project-moves-to-workspace-if-the-destination-has-no-same-named-project", &[("value0", from_workspace.to_string()), ("value1", target_flag.to_string()), ("value2", args.to_workspace.to_string()), ("value3", confirm_command(&from_workspace, &target_flag, &args).to_string())]));
     }
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -149,7 +143,13 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
     let moved_via = report["moved_via"].as_str().unwrap_or("");
     let skipped_count = report["pages_skipped"].as_array().map_or(0, |s| s.len());
     if let Some(warning) = report["manifest_warning"].as_str() {
-        eprintln!("ai-memory: warning: {warning}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-move-project-ai-memory-warning-warning",
+                &[("value0", warning.to_string())]
+            )
+        );
     }
 
     if (moved_via == "true-move" || purged)
@@ -163,17 +163,13 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         )
     {
         eprintln!(
-            "ai-memory: project moved, but the client-local checkout link could not be updated ({error:#})"
-        );
+            "{}", i18n.format("cli-move-project-ai-memory-project-moved-but-the-client-local-checkout-link-could-not-be-upda", &[("value0", format!("{:#}", error))]));
     }
 
     if moved_via == "true-move" {
         // Lossless: re-stamped in place, nothing copied or purged.
         println!(
-            "Moved {}/{} → {}/{}: {pages} pages re-stamped (true move — \
-             sessions, observations and history preserved).",
-            from_workspace, target_label, args.to_workspace, target_label,
-        );
+            "{}", i18n.format("cli-move-project-moved-pages-pages-re-stamped-true-move-sessions-observations-and-history-pre", &[("value0", from_workspace.to_string()), ("value1", target_label.to_string()), ("value2", args.to_workspace.to_string()), ("value3", target_label.to_string()), ("value4", format!("{}", pages))]));
     } else {
         // copy-purge (merge into an existing same-named project).
         let tail = if skipped_count > 0 {
@@ -184,22 +180,26 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             ", SOURCE LEFT INTACT (partial copy)"
         };
         println!(
-            "Moved {}/{} → {}/{}: {pages} pages copied (merged into existing \
-             project){tail}.",
-            from_workspace, target_label, args.to_workspace, target_label,
+            "{}",
+            i18n.format(
+                "cli-move-project-moved-pages-pages-copied-merged-into-existing-project-tail",
+                &[
+                    ("value0", from_workspace.to_string()),
+                    ("value1", target_label.to_string()),
+                    ("value2", args.to_workspace.to_string()),
+                    ("value3", target_label.to_string()),
+                    ("value4", format!("{}", pages)),
+                    ("value5", tail.to_string())
+                ]
+            )
         );
         if skipped_count > 0 {
             println!(
-                "Warning: {skipped_count} page(s) could not be read from the \
-                 source and were skipped; the source was NOT purged. Fix and re-run.",
-            );
+                "{}", i18n.format("cli-move-project-warning-skipped-count-page-s-could-not-be-read-from-the-source-and-were-skip", &[("value0", format!("{}", skipped_count))]));
         }
         if let Some(conflicts) = report["conflicts"].as_array().filter(|c| !c.is_empty()) {
             println!(
-                "{} path conflict(s) — source page kept under a de-duplicated path \
-                 (both versions preserved):",
-                conflicts.len()
-            );
+                "{}", i18n.format("cli-move-project-path-conflict-s-source-page-kept-under-a-de-duplicated-path-both-versions-pr", &[("value0", format!("{}", conflicts.len()))]));
             for c in conflicts {
                 println!(
                     "  {} → {}",

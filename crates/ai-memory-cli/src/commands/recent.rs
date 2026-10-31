@@ -49,19 +49,29 @@ pub async fn run(config: &Config, args: RecentArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&hits)?);
     } else {
-        print!("{}", render_text(&hits, jiff::Timestamp::now()));
+        print!(
+            "{}",
+            render_text(&config.i18n, &hits, jiff::Timestamp::now())
+        );
     }
     Ok(())
 }
 
-fn render_text(hits: &[Hit], now: jiff::Timestamp) -> String {
+fn render_text(
+    i18n: &ai_memory_core::i18n::Localizer,
+    hits: &[Hit],
+    now: jiff::Timestamp,
+) -> String {
     use std::fmt::Write as _;
     if hits.is_empty() {
-        return "no recent pages\n".to_owned();
+        return i18n.text("cli-recent-no-recent-pages");
     }
-    let mut out = format!("{} page(s):\n", hits.len());
+    let mut out = i18n.format(
+        "cli-recent-page-s",
+        &[("value0", format!("{}", hits.len()))],
+    );
     for hit in hits {
-        let age = age_label(&hit.updated_at, now)
+        let age = age_label(i18n, &hit.updated_at, now)
             .map(|age| format!("  ({age})"))
             .unwrap_or_default();
         let _ = match (&hit.workspace, &hit.project) {
@@ -80,9 +90,13 @@ fn render_text(hits: &[Hit], now: jiff::Timestamp) -> String {
     out
 }
 
-fn age_label(updated_at: &str, now: jiff::Timestamp) -> Option<String> {
+fn age_label(
+    i18n: &ai_memory_core::i18n::Localizer,
+    updated_at: &str,
+    now: jiff::Timestamp,
+) -> Option<String> {
     let then: jiff::Timestamp = updated_at.parse().ok()?;
-    Some(super::humanize_age_secs((now - then).get_seconds()))
+    Some(i18n.age((now - then).get_seconds()))
 }
 
 #[cfg(test)]
@@ -111,7 +125,7 @@ mod tests {
                 "updated_at": "2026-10-17T12:12:00Z"
             })),
         ];
-        let text = render_text(&hits, now());
+        let text = render_text(&ai_memory_core::i18n::Localizer::default(), &hits, now());
         assert!(
             text.contains("  acme/api  notes/wal.md  2026-10-17T15:10:00Z  (2 minutes ago)\n"),
             "{text}"
@@ -134,7 +148,7 @@ mod tests {
             "id": "ignored", "path": "notes/wal.md", "title": "WAL",
             "snippet": "wal mode", "updated_at": "2026-10-17T15:12:00Z"
         }))];
-        let text = render_text(&hits, now());
+        let text = render_text(&ai_memory_core::i18n::Localizer::default(), &hits, now());
         assert!(
             text.contains("  notes/wal.md  2026-10-17T15:12:00Z  (just now)\n"),
             "{text}"
@@ -143,6 +157,9 @@ mod tests {
         assert!(json[0].get("workspace").is_none());
         assert!(json[0].get("project").is_none());
         assert_eq!(json[0]["updated_at"], "2026-10-17T15:12:00Z");
-        assert_eq!(render_text(&[], now()), "no recent pages\n");
+        assert_eq!(
+            render_text(&ai_memory_core::i18n::Localizer::default(), &[], now()),
+            "no recent pages\n"
+        );
     }
 }

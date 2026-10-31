@@ -6,6 +6,10 @@
 # `data_dir` is intentionally absent here: it's set by `--data-dir`
 # or `AI_MEMORY_DATA_DIR`, and the config file lives inside it.
 
+# Human-facing terminal language: "en" or "pt-BR". --language overrides this.
+# JSON, MCP, stored content and technical diagnostics keep their original format.
+language = "en"
+
 # HTTP bind address used by `ai-memory serve`.
 bind = "127.0.0.1:49374"
 

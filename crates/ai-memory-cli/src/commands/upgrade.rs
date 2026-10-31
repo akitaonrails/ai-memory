@@ -66,19 +66,20 @@ type StagedAgentList = Vec<(String, AgentChoice)>;
 
 /// Run the `upgrade` subcommand.
 pub async fn run(config: &Config, config_path: Option<&Path>, args: UpgradeArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let exe = resolve_current_exe()?;
     ensure_supported_install(&exe)?;
 
     let fetcher = ReqwestFetcher::new()?;
     let base = release_base_url(config);
     let tag = resolve_tag(&fetcher, &base, args.version.as_deref()).await?;
-    if skip_when_current(&tag, args.force) {
+    if skip_when_current(i18n, &tag, args.force) {
         refresh_plugins(config, &super::user_service::SystemRunner);
         return Ok(());
     }
 
-    let extract_root = download_and_extract_release(&fetcher, &base, &tag).await?;
-    apply_extracted_release(extract_root.path(), &exe)?;
+    let extract_root = download_and_extract_release(i18n, &fetcher, &base, &tag).await?;
+    apply_extracted_release(i18n, extract_root.path(), &exe)?;
 
     // The running process still contains the old release's embedded templates.
     // Re-enter through the replacement executable so every generated hook is
@@ -86,7 +87,13 @@ pub async fn run(config: &Config, config_path: Option<&Path>, args: UpgradeArgs)
     run_replacement_refresh(&exe, &config.data_dir, config_path)?;
     refresh_plugins(config, &super::user_service::SystemRunner);
     warn_remote_server(config);
-    println!("✓ upgraded to {tag}");
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-upgraded-to-tag",
+            &[("value0", tag.to_string())]
+        )
+    );
     info!(%tag, path = %exe.display(), "native upgrade complete");
     Ok(())
 }
@@ -137,30 +144,40 @@ fn ensure_supported_install(exe: &Path) -> Result<()> {
     }
 }
 
-fn skip_when_current(tag: &str, force: bool) -> bool {
+fn skip_when_current(i18n: &ai_memory_core::i18n::Localizer, tag: &str, force: bool) -> bool {
     let current = env!("CARGO_PKG_VERSION");
     if !force && versions_match(tag, current) {
-        println!("already up to date ({current})");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-already-up-to-date-current",
+                &[("value0", current.to_string())]
+            )
+        );
         return true;
     }
     false
 }
 
 async fn download_and_extract_release(
+    i18n: &ai_memory_core::i18n::Localizer,
     fetcher: &ReqwestFetcher,
     base: &str,
     tag: &str,
 ) -> Result<tempfile::TempDir> {
-    let asset = release_asset_name().context("no GitHub release asset for this OS/arch")?;
-    let archive_bytes = fetch_verified_archive(fetcher, base, tag, asset).await?;
-    let extract_root = tempfile::tempdir().context("creating extract temp dir")?;
+    let asset = release_asset_name()
+        .context(i18n.text("cli-upgrade-no-github-release-asset-for-this-os-arch"))?;
+    let archive_bytes = fetch_verified_archive(i18n, fetcher, base, tag, asset).await?;
+    let extract_root =
+        tempfile::tempdir().context(i18n.text("cli-upgrade-creating-extract-temp-dir"))?;
     extract_release_archive(&archive_bytes, extract_root.path(), asset)
-        .context("extracting release archive")?;
+        .context(i18n.text("cli-upgrade-extracting-release-archive"))?;
     ensure_extracted_binary(extract_root.path())?;
     Ok(extract_root)
 }
 
 async fn fetch_verified_archive(
+    i18n: &ai_memory_core::i18n::Localizer,
     fetcher: &ReqwestFetcher,
     base: &str,
     tag: &str,
@@ -168,7 +185,13 @@ async fn fetch_verified_archive(
 ) -> Result<Vec<u8>> {
     let archive_url = format!("{base}/download/{tag}/{asset}");
     let checksum_url = format!("{archive_url}.sha256");
-    println!("→ downloading {asset} ({tag})");
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-downloading-asset-tag",
+            &[("value0", asset.to_string()), ("value1", tag.to_string())]
+        )
+    );
     let archive_bytes = fetcher
         .get_bytes(&archive_url)
         .await
@@ -177,7 +200,7 @@ async fn fetch_verified_archive(
         .get_text(&checksum_url)
         .await
         .with_context(|| format!("downloading {checksum_url}"))?;
-    verify_archive_checksum(&archive_bytes, &checksum_text, asset)?;
+    verify_archive_checksum(i18n, &archive_bytes, &checksum_text, asset)?;
     Ok(archive_bytes)
 }
 
@@ -189,30 +212,58 @@ fn ensure_extracted_binary(extract_root: &Path) -> Result<()> {
     bail!("release archive is missing the {name} binary");
 }
 
-fn verify_archive_checksum(archive_bytes: &[u8], checksum_text: &str, asset: &str) -> Result<()> {
+fn verify_archive_checksum(
+    i18n: &ai_memory_core::i18n::Localizer,
+    archive_bytes: &[u8],
+    checksum_text: &str,
+    asset: &str,
+) -> Result<()> {
     let expected = parse_sha256_sidecar(checksum_text, asset)
         .with_context(|| format!("parsing checksum sidecar for {asset}"))?;
     let actual = sha256_hex(archive_bytes);
     if !actual.eq_ignore_ascii_case(&expected) {
-        bail!("release archive checksum mismatch (expected {expected}, got {actual})");
+        bail!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-release-archive-checksum-mismatch-expected-expected-got-actual",
+                &[
+                    ("value0", expected.to_string()),
+                    ("value1", actual.to_string())
+                ]
+            )
+        );
     }
-    println!("  ✓ checksum ok");
+    println!("{}", i18n.text("cli-upgrade-checksum-ok"));
     Ok(())
 }
 
-fn apply_extracted_release(extract_root: &Path, exe: &Path) -> Result<()> {
+fn apply_extracted_release(
+    i18n: &ai_memory_core::i18n::Localizer,
+    extract_root: &Path,
+    exe: &Path,
+) -> Result<()> {
     let install_dir = exe
         .parent()
         .map(Path::to_path_buf)
-        .context("executable has no parent directory")?;
-    replace_binary(extract_root, exe)?;
-    maybe_refresh_sibling_hooks(extract_root, &install_dir)?;
+        .context(i18n.text("cli-upgrade-executable-has-no-parent-directory"))?;
+    replace_binary(i18n, extract_root, exe)?;
+    maybe_refresh_sibling_hooks(i18n, extract_root, &install_dir)?;
     Ok(())
 }
 
-fn replace_binary(extract_root: &Path, exe: &Path) -> Result<()> {
+fn replace_binary(
+    i18n: &ai_memory_core::i18n::Localizer,
+    extract_root: &Path,
+    exe: &Path,
+) -> Result<()> {
     let new_binary = extract_root.join(shipped_binary_name());
-    println!("→ replacing {}", exe.display());
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-replacing",
+            &[("value0", format!("{}", exe.display()))]
+        )
+    );
     replace_file_atomic(&new_binary, exe).with_context(|| {
         format!(
             "replacing {}; if this fails mid-way look for {}.new / {}.old",
@@ -223,13 +274,23 @@ fn replace_binary(extract_root: &Path, exe: &Path) -> Result<()> {
     })
 }
 
-fn maybe_refresh_sibling_hooks(extract_root: &Path, install_dir: &Path) -> Result<()> {
+fn maybe_refresh_sibling_hooks(
+    i18n: &ai_memory_core::i18n::Localizer,
+    extract_root: &Path,
+    install_dir: &Path,
+) -> Result<()> {
     let extracted_hooks = extract_root.join(HOOKS_DIR_NAME);
     let sibling_hooks = install_dir.join(HOOKS_DIR_NAME);
     if !(extracted_hooks.is_dir() && sibling_hooks.exists()) {
         return Ok(());
     }
-    println!("→ refreshing {}", sibling_hooks.display());
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-refreshing",
+            &[("value0", format!("{}", sibling_hooks.display()))]
+        )
+    );
     replace_dir_atomic(&extracted_hooks, &sibling_hooks)
         .with_context(|| format!("replacing {}", sibling_hooks.display()))
 }
@@ -839,17 +900,32 @@ fn list_staged_agents(hooks_root: &Path) -> Result<(StagedAgentList, Vec<String>
 }
 
 fn refresh_staged_hooks(config: &Config) -> Result<()> {
+    let i18n = &config.i18n;
     let hooks_root = staged_hooks_root(config);
     if !hooks_root.is_dir() {
-        println!("→ no staged hook scripts found at {}", hooks_root.display());
-        println!("  (nothing to refresh — install-hooks hasn't been run with --apply yet)");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-no-staged-hook-scripts-found-at",
+                &[("value0", format!("{}", hooks_root.display()))]
+            )
+        );
+        println!(
+            "{}",
+            i18n.text(
+                "cli-upgrade-nothing-to-refresh-install-hooks-hasn-t-been-run-with-apply-yet"
+            )
+        );
         return Ok(());
     }
-    let agents = collect_refreshable_agents(&hooks_root)?;
+    let agents = collect_refreshable_agents(i18n, &hooks_root)?;
     if agents.is_empty() {
         println!(
-            "→ no staged agent dirs found under {}",
-            hooks_root.display()
+            "{}",
+            i18n.format(
+                "cli-upgrade-no-staged-agent-dirs-found-under",
+                &[("value0", format!("{}", hooks_root.display()))]
+            )
         );
         return Ok(());
     }
@@ -866,11 +942,21 @@ const GENERATED_INTEGRATIONS: &[(&str, AgentChoice)] = &[
 ];
 
 fn refresh_generated_integrations(config: &Config) {
+    let i18n = &config.i18n;
     for &(name, agent) in GENERATED_INTEGRATIONS {
         let path = match default_generated_integration_path(agent) {
             Ok(path) => path,
             Err(err) => {
-                println!("  (skipping generated {name} integration — {err:#})");
+                println!(
+                    "{}",
+                    i18n.format(
+                        "cli-upgrade-skipping-generated-name-integration-err",
+                        &[
+                            ("value0", name.to_string()),
+                            ("value1", format!("{:#}", err))
+                        ]
+                    )
+                );
                 continue;
             }
         };
@@ -881,7 +967,13 @@ fn refresh_generated_integrations(config: &Config) {
             continue;
         }
 
-        println!("→ refreshing generated {name} integration");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-refreshing-generated-name-integration",
+                &[("value0", name.to_string())]
+            )
+        );
         let mut args = apply_hooks_args(agent);
         args.config_file = if agent == AgentChoice::Openclaw {
             path.parent().map(Path::to_path_buf)
@@ -899,7 +991,14 @@ fn refresh_generated_integrations(config: &Config) {
         };
         if let Err(err) = result {
             println!(
-                "      (skipped — {err:#}; re-run `ai-memory install-hooks --agent {name} --apply`)"
+                "{}",
+                i18n.format(
+                    "cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-apply",
+                    &[
+                        ("value0", format!("{:#}", err)),
+                        ("value1", name.to_string())
+                    ]
+                )
             );
         }
     }
@@ -923,6 +1022,7 @@ fn default_generated_integration_path(agent: AgentChoice) -> Result<PathBuf> {
 /// run: its hooks must be re-trusted only when a command changes, and the
 /// operator should see that happen in Codex itself.
 fn refresh_plugins(config: &Config, runner: &dyn super::user_service::CommandRunner) {
+    let i18n = &config.i18n;
     use super::agent_plugins::{self, PluginHarness};
     let Some(home) = super::run::native_home(config) else {
         return;
@@ -938,16 +1038,13 @@ fn refresh_plugins(config: &Config, runner: &dyn super::user_service::CommandRun
     for plugin in agent_plugins::installed(&home, &env) {
         match plugin.harness {
             PluginHarness::ClaudeCode => {
-                println!("→ updating the ai-memory Claude Code plugin");
+                println!("{}", i18n.text("cli-upgrade-updating-the-ai-memory-claude-code-plugin"));
                 for line in agent_plugins::update_claude_code(runner) {
                     println!("    {line}");
                 }
             }
             PluginHarness::Codex => println!(
-                "→ the ai-memory Codex plugin is installed: run `codex plugin marketplace upgrade \
-                 ai-memory` and `codex plugin add {}` to update it",
-                agent_plugins::PLUGIN_ID
-            ),
+                "{}", i18n.format("cli-upgrade-the-ai-memory-codex-plugin-is-installed-run-codex-plugin-marketplace-upgrade", &[("value0", agent_plugins::PLUGIN_ID.to_string())])),
         }
     }
 }
@@ -960,47 +1057,61 @@ fn staged_hooks_root(config: &Config) -> PathBuf {
     .join(HOOKS_DIR_NAME)
 }
 
-fn collect_refreshable_agents(hooks_root: &Path) -> Result<StagedAgentList> {
+fn collect_refreshable_agents(
+    i18n: &ai_memory_core::i18n::Localizer,
+    hooks_root: &Path,
+) -> Result<StagedAgentList> {
     let (agents, unknown) = list_staged_agents(hooks_root)?;
     for name in &unknown {
-        println!("  (skipping unknown staged agent dir `{name}`)");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-upgrade-skipping-unknown-staged-agent-dir-name",
+                &[("value0", name.to_string())]
+            )
+        );
     }
     Ok(agents)
 }
 
 fn refresh_agent_list(config: &Config, agents: &StagedAgentList) {
+    let i18n = &config.i18n;
     let names: Vec<_> = agents.iter().map(|(n, _)| n.as_str()).collect();
-    println!("→ refreshing staged hook scripts for: {}", names.join(" "));
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-refreshing-staged-hook-scripts-for",
+            &[("value0", names.join(" ").to_string())]
+        )
+    );
     for (name, agent) in agents {
         apply_staged_agent_hooks(config, name, *agent);
     }
 }
 
 fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
+    let i18n = &config.i18n;
     if agent == AgentChoice::ClaudeCode
         && let Some(settings) = claude_user_level_install_absent()
     {
         println!(
-            "    (no ai-memory hooks in {} — skipping the user-level re-apply; the staged \
-             scripts are refreshed, but `--scope project` files are not rewritten: re-run \
-             `ai-memory install-hooks --agent {name} --scope project --apply` in each such \
-             checkout to pick up hook-command changes)",
-            settings.display()
-        );
-        match install_hooks::restage_claude_code_scripts(&config.data_dir, None) {
-            Ok(staged) => println!("    restaged {}", staged.display()),
+            "{}", i18n.format("cli-upgrade-no-ai-memory-hooks-in-skipping-the-user-level-re-apply-the-staged-scripts-ar", &[("value0", format!("{}", settings.display())), ("value1", name.to_string())]));
+        match install_hooks::restage_claude_code_scripts(&config.i18n, &config.data_dir, None) {
+            Ok(staged) => println!("{}", i18n.format("cli-upgrade-restaged", &[("value0", format!("{}", staged.display()))])),
             Err(err) => println!(
-                "      (skipped — {err:#}; re-run `ai-memory install-hooks \
-                 --agent {name} --scope project --apply` in each checkout)"
-            ),
+                "{}", i18n.format("cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-scope-project-apply-in", &[("value0", format!("{:#}", err)), ("value1", name.to_string())])),
         }
         return;
     }
-    println!("    ai-memory install-hooks --agent {name} --apply");
+    println!(
+        "{}",
+        i18n.diagnostic(&format!(
+            "    ai-memory install-hooks --agent {name} --apply"
+        ))
+    );
     if let Err(err) = install_hooks::run(config, apply_hooks_args(agent)) {
         println!(
-            "      (skipped — {err:#}; re-run with the same --server-url / --auth-token used originally)"
-        );
+            "{}", i18n.format("cli-upgrade-skipped-err-re-run-with-the-same-server-url-auth-token-used-originally", &[("value0", format!("{:#}", err))]));
     }
 }
 
@@ -1046,6 +1157,7 @@ fn apply_hooks_args(agent: AgentChoice) -> InstallHooksArgs {
 }
 
 fn warn_remote_server(config: &Config) {
+    let i18n = &config.i18n;
     if !config.server_url_configured() {
         return;
     }
@@ -1053,10 +1165,7 @@ fn warn_remote_server(config: &Config) {
         return;
     }
     eprintln!(
-        "note: AI_MEMORY_SERVER_URL={} looks remote — this upgrade refreshed only the local \
-         binary and hooks; redeploy the remote server separately",
-        config.server_url
-    );
+        "{}", i18n.format("cli-upgrade-note-ai-memory-server-url-looks-remote-this-upgrade-refreshed-only-the-local", &[("value0", config.server_url.to_string())]));
 }
 
 /// Loopback, or the `0.0.0.0` bind address a local server is often reached
@@ -1966,8 +2075,12 @@ mod tests {
     fn restage_refreshes_the_claude_scripts_without_a_settings_file() {
         let data = tempfile::TempDir::new().unwrap();
         let hooks_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
-        let staged =
-            install_hooks::restage_claude_code_scripts(data.path(), Some(&hooks_dir)).unwrap();
+        let staged = install_hooks::restage_claude_code_scripts(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            Some(&hooks_dir),
+        )
+        .unwrap();
         assert!(staged.starts_with(data.path()), "{staged:?}");
         let scripts = fs::read_dir(&staged)
             .unwrap()

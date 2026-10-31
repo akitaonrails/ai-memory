@@ -33,8 +33,12 @@ struct StageResponse {
 /// Returns an error if mutually-exclusive mode flags are set or the server
 /// rejects the request.
 pub async fn run(config: &Config, args: CuratorArgs) -> Result<()> {
+    let i18n = &config.i18n;
     if args.dry_run && args.stage {
-        bail!("choose either --dry-run or --stage, not both");
+        bail!(
+            "{}",
+            i18n.text("cli-curator-choose-either-dry-run-or-stage-not-both")
+        );
     }
     let dry_run = args.dry_run || !args.stage;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -59,8 +63,8 @@ pub async fn run(config: &Config, args: CuratorArgs) -> Result<()> {
         if args.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            print_human_report(&report, &project);
-            println!("\n--- machine-readable ---");
+            print_human_report(i18n, &report, &project);
+            println!("{}", i18n.text("cli-auto-improve-report-machine-readable"));
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
@@ -80,10 +84,32 @@ fn render_stage_human(response: &StageResponse) -> String {
     lines.join("\n")
 }
 
-fn print_human_report(report: &CuratorReport, project: &str) {
-    println!("\nCurator dry-run for {project}\n");
-    println!("Summary: {}", report.summary);
-    println!("Findings: {}", report.findings.len());
+fn print_human_report(
+    i18n: &ai_memory_core::i18n::Localizer,
+    report: &CuratorReport,
+    project: &str,
+) {
+    println!(
+        "{}",
+        i18n.format(
+            "cli-curator-curator-dry-run-for-project",
+            &[("value0", project.to_string())]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-auto-improve-report-summary",
+            &[("value0", report.summary.to_string())]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-auto-improve-report-findings",
+            &[("value0", format!("{}", report.findings.len()))]
+        )
+    );
     for finding in report.findings.iter().take(10) {
         println!(
             "  - {} [{}]: {}",
@@ -91,7 +117,13 @@ fn print_human_report(report: &CuratorReport, project: &str) {
         );
     }
     if report.findings.len() > 10 {
-        println!("  ... {} more", report.findings.len() - 10);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-auto-improve-report-more",
+                &[("value0", format!("{}", report.findings.len() - 10))]
+            )
+        );
     }
 }
 

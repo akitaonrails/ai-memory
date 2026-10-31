@@ -1,0 +1,2 @@
+var apiErrors={{ i18n.errors_js()|safe }};
+function apiError(data,fallback){var error=data && data.error;return apiErrors[error] || (typeof error==="string" ? error : fallback);}

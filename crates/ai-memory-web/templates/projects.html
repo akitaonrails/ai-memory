@@ -1,86 +1,79 @@
 {% extends "base.html" %}
 
-{% block title %}Projects — ai-memory{% endblock %}
+{% block title %}{{ i18n.text("web-projects-ai-memory") }}{% endblock %}
 
 {% block content %}
-<div class="page-heading"><div><p class="eyebrow">WORKSPACE OVERVIEW</p><h1>Memory dashboard</h1><p>Track activity, investigate token usage, and coordinate your agents.</p></div><a href="inbox" class="primary-button">✉ Open inbox</a></div>
-<section aria-label="Memory health overview"><div class="metric-grid">
-  <a class="metric-card metric-link" href="#project-list"><span>Projects</span><span class="metric-marker" aria-hidden="true">▦</span><strong>{{ dashboard.project_count }}</strong><small>Visible in your workspace</small></a>
-  <a class="metric-card metric-link" href="?sort=sessions#project-list"><span>Sessions</span><span class="metric-marker" aria-hidden="true">◈</span><strong>{{ dashboard.session_count }}</strong><small>Projects with most sessions first</small></a>
-  <a class="metric-card metric-link" href="?sort=events#project-list"><span>Captured events</span><span class="metric-marker" aria-hidden="true">⌁</span><strong>{{ dashboard.observation_count }}</strong><small>Projects with most events first</small></a>
-  <a class="metric-card metric-link" href="?sort=pages#project-list"><span>Compiled pages</span><span class="metric-marker" aria-hidden="true">☷</span><strong>{{ dashboard.page_count }}</strong><small>Projects with most pages first</small></a>
-  <a class="metric-card metric-link metric-attention" href="?sort=open&state=open#project-list"><span>Open sessions</span><span class="metric-marker" aria-hidden="true">◷</span><strong>{{ dashboard.open_session_count }}</strong><small>Projects with open sessions</small></a>
-</div><p class="section-note">{% if dashboard.last_activity_relative != "" %}Last capture {{ dashboard.last_activity_relative }}. {% endif %}Open means no SessionEnd was received; it can be an active agent or an interruption. Counts are metadata only; raw prompts and commands remain in scoped detail views.</p></section>
+<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-workspace-overview") }}</p><h1>{{ i18n.text("web-memory-dashboard") }}</h1><p>{{ i18n.text("web-track-activity-investigate-token-usage-and-coordinate-your-agents") }}</p></div><a href="inbox" class="primary-button">{{ i18n.text("web-open-inbox-projects") }}</a></div>
+<section aria-label="{{ i18n.text("web-memory-health-overview") }}"><div class="metric-grid">
+  <a class="metric-card metric-link" href="#project-list"><span>{{ i18n.text("web-projects") }}</span><span class="metric-marker" aria-hidden="true">▦</span><strong>{{ dashboard.project_count }}</strong><small>{{ i18n.text("web-visible-in-your-workspace") }}</small></a>
+  <a class="metric-card metric-link" href="?sort=sessions#project-list"><span>{{ i18n.text("web-sessions-agent") }}</span><span class="metric-marker" aria-hidden="true">◈</span><strong>{{ dashboard.session_count }}</strong><small>{{ i18n.text("web-projects-with-most-sessions-first") }}</small></a>
+  <a class="metric-card metric-link" href="?sort=events#project-list"><span>{{ i18n.text("web-captured-events") }}</span><span class="metric-marker" aria-hidden="true">⌁</span><strong>{{ dashboard.observation_count }}</strong><small>{{ i18n.text("web-projects-with-most-events-first") }}</small></a>
+  <a class="metric-card metric-link" href="?sort=pages#project-list"><span>{{ i18n.text("web-compiled-pages") }}</span><span class="metric-marker" aria-hidden="true">☷</span><strong>{{ dashboard.page_count }}</strong><small>{{ i18n.text("web-projects-with-most-pages-first") }}</small></a>
+  <a class="metric-card metric-link metric-attention" href="?sort=open&state=open#project-list"><span>{{ i18n.text("web-open-sessions") }}</span><span class="metric-marker" aria-hidden="true">◷</span><strong>{{ dashboard.open_session_count }}</strong><small>{{ i18n.text("web-projects-with-open-sessions") }}</small></a>
+</div><p class="section-note">{% if dashboard.last_activity_relative != "" %}{{ i18n.one("web-last-capture-sentence", dashboard.last_activity_relative) }} {% endif %}{{ i18n.text("web-open-means-no-sessionend-was-received-it-can-be-an-active-agent-or-an-interruption-co") }}</p></section>
 
 {% if let Some(ingest) = dashboard.ingest %}
-<section aria-label="Hook capture health" class="capture-health">
+<section aria-label="{{ i18n.text("web-hook-capture-health") }}" class="capture-health">
   <div class="flex flex-wrap items-baseline justify-between gap-2">
-    <h2 class="text-base font-semibold text-slate-900 dark:text-slate-100">Hook capture health</h2>
-    <p class="text-xs text-slate-500">Since this server started; counters contain no prompt or command content.</p>
+    <h2 class="text-base font-semibold text-slate-900 dark:text-slate-100">{{ i18n.text("web-hook-capture-health") }}</h2>
+    <p class="text-xs text-slate-500">{{ i18n.text("web-since-this-server-started-counters-contain-no-prompt-or-command-content") }}</p>
   </div>
   <div class="memory-hook-health-grid mt-4 text-sm">
-    <div><div class="text-slate-500">Accepted</div><div class="mt-1 text-xl font-semibold text-emerald-700 dark:text-emerald-300">{{ ingest.accepted }}</div></div>
-    <div><div class="text-slate-500">Policy-dropped</div><div class="mt-1 text-xl font-semibold">{{ ingest.dropped_by_policy }}</div></div>
-    <div><div class="text-slate-500">Capacity-shed</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_saturated > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_saturated }}</div></div>
-    <div><div class="text-slate-500">Rate-limited</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_rate_limited > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_rate_limited }}</div></div>
+    <div><div class="text-slate-500">{{ i18n.text("web-accepted") }}</div><div class="mt-1 text-xl font-semibold text-emerald-700 dark:text-emerald-300">{{ ingest.accepted }}</div></div>
+    <div><div class="text-slate-500">{{ i18n.text("web-policy-dropped") }}</div><div class="mt-1 text-xl font-semibold">{{ ingest.dropped_by_policy }}</div></div>
+    <div><div class="text-slate-500">{{ i18n.text("web-capacity-shed") }}</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_saturated > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_saturated }}</div></div>
+    <div><div class="text-slate-500">{{ i18n.text("web-rate-limited") }}</div><div class="mt-1 text-xl font-semibold {% if ingest.shed_rate_limited > 0 %}text-amber-700 dark:text-amber-300{% endif %}">{{ ingest.shed_rate_limited }}</div></div>
   </div>
 </section>
 {% endif %}
 
 {% if mail_total > 0 %}
 <div class="mb-6 rounded-md border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
-  <span class="font-medium">{{ mail_total }} message{% if mail_total != 1 %}s{% endif %} waiting for agents</span>
-  <span class="text-amber-800 dark:text-amber-300/90">in
-  {% for item in mail_projects %}<a href="{{ item.href }}" class="font-medium underline hover:text-amber-950 dark:hover:text-amber-100">{{ item.label }}</a> ({{ item.pending }}){% if !loop.last %}, {% endif %}{% endfor %}{% if mail_hidden > 0 %} and {{ mail_hidden }} more project{% if mail_hidden != 1 %}s{% endif %}{% endif %}.</span>
+  <span class="font-medium">{{ mail_total }} {{ i18n.count("web-count-message", mail_total) }} {{ i18n.text("web-waiting-for-agents-projects") }}</span>
+  <span class="text-amber-800 dark:text-amber-300/90">{{ i18n.text("web-in") }}
+  {% for item in mail_projects %}<a href="{{ item.href }}" class="font-medium underline hover:text-amber-950 dark:hover:text-amber-100">{{ item.label }}</a> ({{ item.pending }}){% if !loop.last %}, {% endif %}{% endfor %}{% if mail_hidden > 0 %} {{ i18n.text("web-and") }} {{ mail_hidden }} {{ i18n.text("web-more") }} {{ i18n.count("web-count-project", mail_hidden) }}{% endif %}.</span>
 </div>
 {% endif %}
 
 {% if let Some(dialog) = okf_dialog %}
 <div id="okf-dialog-overlay" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" data-dismiss-key="ai-memory-okf-dialog-{{ dialog.created_at }}">
   <div class="max-w-xl w-full rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-xl p-6" role="dialog" aria-modal="true" aria-labelledby="okf-dialog-title">
-    <h2 id="okf-dialog-title" class="text-lg font-semibold text-slate-900 dark:text-slate-100">Your memory was upgraded to the 2.0 format</h2>
+    <h2 id="okf-dialog-title" class="text-lg font-semibold text-slate-900 dark:text-slate-100">{{ i18n.text("web-your-memory-was-upgraded-to-the-2-0-format") }}</h2>
     <div class="mt-3 space-y-3 text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
       <p>
-        On {{ dialog.created_at }} this server migrated the wiki to the
-        <span class="font-medium">Open Knowledge Format (OKF v0.2)</span>: every page's
-        frontmatter was rewritten in place — same pages, same version history, bodies and
-        timestamps untouched — so your knowledge is now portable to any OKF-aware tool.
+        {{ i18n.one("web-okf-migrated-on", dialog.created_at) }}
+        <span class="font-medium">Open Knowledge Format (OKF v0.2)</span>{{ i18n.text("web-every-page-s-frontmatter-was-rewritten-in-place-same-pages-same-version-history-bodie") }}
       </p>
       {% if dialog.archive_present %}
       <p>
-        Before touching anything, a full backup of the data directory was verified and saved to
+        {{ i18n.text("web-before-touching-anything-a-full-backup-of-the-data-directory-was-verified-and-saved-t") }}
         <code class="font-mono text-xs bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">{{ dialog.archive_path }}</code>
         ({{ dialog.size_human }}).
       </p>
       <div class="rounded-md bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 p-3">
-        <p class="font-medium text-slate-800 dark:text-slate-200 mb-1">If something looks wrong</p>
+        <p class="font-medium text-slate-800 dark:text-slate-200 mb-1">{{ i18n.text("web-if-something-looks-wrong") }}</p>
         <ol class="list-decimal list-inside space-y-1 text-slate-700 dark:text-slate-300">
-          <li>Stop the server.</li>
-          <li>Move the current data directory aside.</li>
-          <li>Unpack the archive as the data directory and start the previous version.</li>
+          <li>{{ i18n.text("web-stop-the-server") }}</li>
+          <li>{{ i18n.text("web-move-the-current-data-directory-aside") }}</li>
+          <li>{{ i18n.text("web-unpack-the-archive-as-the-data-directory-and-start-the-previous-version") }}</li>
         </ol>
-        <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">Full steps, including the surgical git-checkpoint rollback: <code class="font-mono">docs/MIGRATION-2.0.md</code> in the ai-memory repository.</p>
+        <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">{{ i18n.rich("web-okf-full-steps", "font-mono")|safe }}</p>
       </div>
       <p>
-        If everything looks right, you can delete the archive — <code class="font-mono text-xs bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">ai-memory status</code>
-        shows it until the file is gone.
+        {{ i18n.rich("web-okf-delete-archive", "font-mono text-xs bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded")|safe }}
       </p>
       {% else %}
       <p>
-        The verified pre-migration backup archive
-        <code class="font-mono text-xs bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">{{ dialog.archive_path }}</code>
-        has since been deleted. If anything looks wrong, the wiki's git history still holds the
-        <code class="font-mono text-xs">pre-okf-migration checkpoint</code> commit — see
-        <code class="font-mono text-xs">docs/MIGRATION-2.0.md</code> for the rollback steps.
+        {{ i18n.rich_one("web-okf-archive-deleted", dialog.archive_path, "font-mono text-xs")|safe }}
       </p>
       {% endif %}
     </div>
     <div class="mt-5 flex items-center justify-between gap-4">
       <label class="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400 select-none">
         <input id="okf-dialog-dismiss" type="checkbox" class="rounded border-slate-300 dark:border-slate-600">
-        Do not show me again
+        {{ i18n.text("web-do-not-show-me-again") }}
       </label>
-      <button id="okf-dialog-close" type="button" class="rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-sm font-medium px-4 py-2 hover:bg-slate-700 dark:hover:bg-slate-300">Got it</button>
+      <button id="okf-dialog-close" type="button" class="rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-sm font-medium px-4 py-2 hover:bg-slate-700 dark:hover:bg-slate-300">{{ i18n.text("web-got-it") }}</button>
     </div>
   </div>
 </div>
@@ -132,21 +125,21 @@
 {% endif %}
 
 
-<div class="project-toolbar" id="project-list"><h2>Your projects <span class="subtle-pill">{{ projects.len() }}</span></h2><label class="sr-only" for="project-filter">Filter projects</label><input id="project-filter" type="search" placeholder="Filter projects…" autocomplete="off"><label class="sr-only" for="project-state">Project activity filter</label><select id="project-state"><option value="all">All projects</option><option value="open" {% if project_state == "open" %}selected{% endif %}>With open sessions</option><option value="inbox">With queued messages</option></select></div>
-{% if projects.is_empty() %}<div class="empty-state"><span aria-hidden="true">▦</span><h2>Your workspace starts here</h2><p>No projects yet — wire up a hook and start a session.</p></div>{% else %}
+<div class="project-toolbar" id="project-list"><h2>{{ i18n.text("web-your-projects") }} <span class="subtle-pill">{{ projects.len() }}</span></h2><label class="sr-only" for="project-filter">{{ i18n.text("web-filter-projects") }}</label><input id="project-filter" type="search" placeholder="{{ i18n.text("web-filter-projects-projects") }}" autocomplete="off"><label class="sr-only" for="project-state">{{ i18n.text("web-project-activity-filter") }}</label><select id="project-state"><option value="all">{{ i18n.text("web-all-projects") }}</option><option value="open" {% if project_state == "open" %}selected{% endif %}>{{ i18n.text("web-with-open-sessions") }}</option><option value="inbox">{{ i18n.text("web-with-queued-messages") }}</option></select></div>
+{% if projects.is_empty() %}<div class="empty-state"><span aria-hidden="true">▦</span><h2>{{ i18n.text("web-your-workspace-starts-here") }}</h2><p>{{ i18n.text("web-no-projects-yet-wire-up-a-hook-and-start-a-session") }}</p></div>{% else %}
 <div class="project-cards-grid" id="project-cards">
 {% for card in projects %}
 <article class="project-card" data-project-search="{{ card.workspace }} {{ card.project }} {{ card.agent_summary }}" data-open="{{ card.open_session_count }}" data-inbox="{{ card.pending_inbox }}" {% if project_state == "open" && card.open_session_count == 0 %}hidden{% endif %}>
-  <div class="project-card-top"><span class="project-icon" aria-hidden="true">▧</span><div class="project-card-title"><span>{{ card.workspace }}</span><h3><a aria-label="Open {{ card.workspace }}/{{ card.project }}" href="{{ card.href }}">{{ card.project }}</a></h3></div>{% if card.pending_inbox > 0 %}<a href="{{ card.inbox_href }}" class="status-pill status-open" title="Messages waiting for an agent">{{ card.pending_inbox }} inbox</a>{% endif %}</div>
-  <p class="card-hint">{% if card.agent_summary != "" %}{{ card.agent_summary }}{% else %}No agent sessions yet{% endif %}</p>
-  <div class="project-card-metrics"><div class="project-card-metric"><span>Sessions</span><strong>{{ card.session_count }}</strong></div><div class="project-card-metric"><span>Captured events</span><strong>{{ card.observation_count }}</strong></div><div class="project-card-metric"><span>Compiled pages</span><strong>{{ card.page_count }} <small>page{% if card.page_count != 1 %}s{% endif %}</small></strong></div><div class="project-card-metric"><span>Open sessions</span><strong>{{ card.open_session_count }}</strong></div></div>
-  <div class="project-card-footer"><span>{% if card.last_updated_relative != "" %}Last capture {{ card.last_updated_relative }}{% else %}No capture yet{% endif %}</span><a href="{{ card.href }}?tab=agents">Explore agents ↗</a></div>
+  <div class="project-card-top"><span class="project-icon" aria-hidden="true">▧</span><div class="project-card-title"><span>{{ card.workspace }}</span><h3><a aria-label="{{ i18n.two("web-open-value0-value1", card.workspace, card.project) }}" href="{{ card.href }}">{{ card.project }}</a></h3></div>{% if card.pending_inbox > 0 %}<a href="{{ card.inbox_href }}" class="status-pill status-open" title="{{ i18n.text("web-messages-waiting-for-an-agent") }}">{{ card.pending_inbox }} {{ i18n.text("web-inbox-projects") }}</a>{% endif %}</div>
+  <p class="card-hint">{% if card.agent_summary != "" %}{{ card.agent_summary }}{% else %}{{ i18n.text("web-no-agent-sessions-yet") }}{% endif %}</p>
+  <div class="project-card-metrics"><div class="project-card-metric"><span>{{ i18n.text("web-sessions-agent") }}</span><strong>{{ card.session_count }}</strong></div><div class="project-card-metric"><span>{{ i18n.text("web-captured-events") }}</span><strong>{{ card.observation_count }}</strong></div><div class="project-card-metric"><span>{{ i18n.text("web-compiled-pages") }}</span><strong>{{ card.page_count }} <small>{{ i18n.count("web-count-page", card.page_count) }}</small></strong></div><div class="project-card-metric"><span>{{ i18n.text("web-open-sessions") }}</span><strong>{{ card.open_session_count }}</strong></div></div>
+  <div class="project-card-footer"><span>{% if card.last_updated_relative != "" %}{{ i18n.one("web-last-capture-value", card.last_updated_relative) }}{% else %}{{ i18n.text("web-no-capture-yet") }}{% endif %}</span><a href="{{ card.href }}?tab=agents">{{ i18n.text("web-explore-agents") }}</a></div>
 </article>
 {% endfor %}
 </div>
-<p class="project-result-count" id="project-result-count" role="status" aria-live="polite"></p><div id="project-filter-empty" class="empty-state" hidden><h3>No projects match these filters</h3><p>Try another name or switch back to all projects.</p></div>
+<p class="project-result-count" id="project-result-count" role="status" aria-live="polite"></p><div id="project-filter-empty" class="empty-state" hidden><h3>{{ i18n.text("web-no-projects-match-these-filters") }}</h3><p>{{ i18n.text("web-try-another-name-or-switch-back-to-all-projects") }}</p></div>
 <script>
-(function(){var input=document.getElementById("project-filter"),state=document.getElementById("project-state"),cards=Array.from(document.querySelectorAll("article[data-project-search]"));function filter(){var term=input.value.trim().toLocaleLowerCase(),count=0;cards.forEach(function(card){var match=card.dataset.projectSearch.toLocaleLowerCase().includes(term)&&(state.value==="all"||(state.value==="open"&&Number(card.dataset.open)>0)||(state.value==="inbox"&&Number(card.dataset.inbox)>0));card.hidden=!match;if(match)count++;});document.getElementById("project-filter-empty").hidden=count!==0;document.getElementById("project-result-count").textContent=term||state.value!=="all"?count+" of "+cards.length+" projects":"";}input.addEventListener("input",filter);state.addEventListener("change",filter);filter();})();
+(function(){var input=document.getElementById("project-filter"),state=document.getElementById("project-state"),cards=Array.from(document.querySelectorAll("article[data-project-search]"));function filter(){var term=input.value.trim().toLocaleLowerCase(),count=0;cards.forEach(function(card){var match=card.dataset.projectSearch.toLocaleLowerCase().includes(term)&&(state.value==="all"||(state.value==="open"&&Number(card.dataset.open)>0)||(state.value==="inbox"&&Number(card.dataset.inbox)>0));card.hidden=!match;if(match)count++;});document.getElementById("project-filter-empty").hidden=count!==0;document.getElementById("project-result-count").textContent=term||state.value!=="all"?{{ i18n.js_two("web-project-filter-summary", "{shown}", "{total}")|safe }}.replace("{shown}",count).replace("{total}",cards.length):"";}input.addEventListener("input",filter);state.addEventListener("change",filter);filter();})();
 </script>{% endif %}
-<details class="section-note section-block"><summary>About compiled memory</summary><p>Pages are compiled from captured observations for agent retrieval. Use project details to audit sessions and inspect the underlying events.</p></details>
+<details class="section-note section-block"><summary>{{ i18n.text("web-about-compiled-memory") }}</summary><p>{{ i18n.text("web-pages-are-compiled-from-captured-observations-for-agent-retrieval-use-project-details") }}</p></details>
 {% endblock %}

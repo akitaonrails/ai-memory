@@ -1,45 +1,46 @@
 {% extends "base.html" %}
-{% block title %}Inbox — ai-memory{% endblock %}
+{% block title %}{{ i18n.text("web-inbox-ai-memory") }}{% endblock %}
 {% block content %}
-{% if project != "" %}<nav class="breadcrumbs" aria-label="Breadcrumb"><a href=".">Projects</a><span>/</span><span>{{ workspace }}</span><span>/</span><a href="{{ project_href }}">{{ project }}</a><span>/</span><span aria-current="page">Inbox</span></nav>{% endif %}
-<div class="page-heading"><div><p class="eyebrow">KEEP WORK MOVING</p><h1>Agent inbox</h1><p>{% if project != "" %}Viewing mailbox: <a href="{{ project_href }}"><strong>{{ workspace }} / {{ project }}</strong></a>{% else %}Create a project to start exchanging messages with agents.{% endif %}</p></div><a href="{{ inbox_href }}#compose" id="compose-shortcut" class="primary-button">＋ New message</a></div>
+{% if project != "" %}<nav class="breadcrumbs" aria-label="{{ i18n.text("web-breadcrumb") }}"><a href=".">{{ i18n.text("web-projects") }}</a><span>/</span><span>{{ workspace }}</span><span>/</span><a href="{{ project_href }}">{{ project }}</a><span>/</span><span aria-current="page">{{ i18n.text("web-inbox") }}</span></nav>{% endif %}
+<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-keep-work-moving") }}</p><h1>{{ i18n.text("web-agent-inbox") }}</h1><p>{% if project != "" %}{{ i18n.text("web-viewing-mailbox") }} <a href="{{ project_href }}"><strong>{{ workspace }} / {{ project }}</strong></a>{% else %}{{ i18n.text("web-create-a-project-to-start-exchanging-messages-with-agents") }}{% endif %}</p></div><a href="{{ inbox_href }}#compose" id="compose-shortcut" class="primary-button">{{ i18n.text("web-new-message") }}</a></div>
 <section class="surface mail-overview" aria-labelledby="mail-overview-title">
-  <h2 id="mail-overview-title">Waiting for agents</h2>
-  {% if pending_total > 0 %}<p class="section-note"><strong>{{ pending_total }} queued</strong> · {% if pending_projects == 1 %}1 project{% else %}{{ pending_projects }} projects{% endif %}. Opening a mailbox does not collect its messages.</p>
-  <nav class="mailbox-links" aria-label="Projects with queued messages">{% for scope in scopes %}{% if scope.pending > 0 %}<a class="mailbox-link" href="{{ scope.inbox_href }}" data-mailbox-workspace="{{ scope.workspace }}" data-mailbox-project="{{ scope.project }}" {% if scope.selected && inbox %}aria-current="page"{% endif %}><span>{{ scope.workspace }} / <strong>{{ scope.project }}</strong></span><span>{{ scope.pending }} queued <span aria-hidden="true">→</span></span></a>{% endif %}{% endfor %}</nav>
-  {% else %}<p class="section-note">No messages waiting for agents in projects you can access.</p>{% endif %}
+  <h2 id="mail-overview-title">{{ i18n.text("web-waiting-for-agents") }}</h2>
+  {% if pending_total > 0 %}<p class="section-note"><strong>{{ pending_total }} {{ i18n.text("web-queued") }}</strong> · {% if pending_projects == 1 %}{{ i18n.text("web-1-project") }}{% else %}{{ pending_projects }} {{ i18n.text("web-projects-inbox") }}{% endif %}{{ i18n.text("web-opening-a-mailbox-does-not-collect-its-messages") }}</p>
+  <nav class="mailbox-links" aria-label="{{ i18n.text("web-projects-with-queued-messages") }}">{% for scope in scopes %}{% if scope.pending > 0 %}<a class="mailbox-link" href="{{ scope.inbox_href }}" data-mailbox-workspace="{{ scope.workspace }}" data-mailbox-project="{{ scope.project }}" {% if scope.selected && inbox %}aria-current="page"{% endif %}><span>{{ scope.workspace }} / <strong>{{ scope.project }}</strong></span><span>{{ scope.pending }} {{ i18n.text("web-queued") }} <span aria-hidden="true">→</span></span></a>{% endif %}{% endfor %}</nav>
+  {% else %}<p class="section-note">{{ i18n.text("web-no-messages-waiting-for-agents-in-projects-you-can-access") }}</p>{% endif %}
 </section>
 <div class="inbox-layout">
   <section class="surface inbox-list" aria-labelledby="mail-title">
-    <div class="panel-heading"><label class="field-label" for="mail-project">PROJECT MAILBOX</label><select id="mail-project" class="field-input">{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}{% if scope.pending > 0 %} · {{ scope.pending }} queued{% endif %}</option>{% endfor %}</select>
-    <nav class="segmented-tabs" aria-label="Mailbox"><a id="mail-title" href="{{ inbox_href }}" {% if inbox %}aria-current="page"{% endif %}>Received</a><a href="{{ outbox_href }}" {% if !inbox %}aria-current="page"{% endif %}>Sent</a></nav>
-    <form action="inbox" method="get" class="mail-state-filter"><input type="hidden" name="workspace" value="{{ workspace }}"><input type="hidden" name="project" value="{{ project }}"><input type="hidden" name="box" value="{% if inbox %}inbox{% else %}outbox{% endif %}"><label for="mail-state" class="field-label">Message state</label><select id="mail-state" name="state" class="field-input"><option value="" {% if state == "" %}selected{% endif %}>All messages</option><option value="pending" {% if state == "pending" %}selected{% endif %}>Awaiting collection</option><option value="claimed" {% if state == "claimed" %}selected{% endif %}>Collected</option><option value="cancelled" {% if state == "cancelled" %}selected{% endif %}>Cancelled</option><option value="editing" {% if state == "editing" %}selected{% endif %}>Editing</option></select><noscript><button class="secondary-button" type="submit">Filter</button></noscript></form></div>
-    {% if inbox && editing_count > 0 %}<p class="section-note held-note" role="status"><strong>{{ editing_count }} held for editing.</strong> Agents cannot collect {% if editing_count == 1 %}it{% else %}them{% endif %} until {% if editing_count == 1 %}it is{% else %}they are{% endif %} saved or discarded. <a href="{{ editing_href }}">Show {% if editing_count == 1 %}it{% else %}them{% endif %}</a></p>{% endif %}
-    {% if rows.is_empty() %}<div class="empty-state mail-empty"><span aria-hidden="true">✉</span><h2>A little breathing room</h2><p>{% if state != "" %}No messages match this state in the selected mailbox.{% else if inbox %}No messages received by this project yet.{% else %}No messages sent from this project yet.{% endif %}</p><p>Choose an agent and leave a clear request for its next inbox check.</p></div>{% else %}
-    <div class="mail-rows">{% for row in rows %}<details class="mail-row" data-state="{{ row.state }}" data-message-id="{{ row.id }}" data-subject="{{ row.raw_subject }}"><summary><span class="mail-avatar" aria-hidden="true">✉</span><span class="mail-preview"><strong>{{ row.subject }}</strong><span>{{ row.from }} → {{ row.to }}</span><small>{{ row.agent }} · {{ row.when }}</small></span><span class="status-pill message-{{ row.state }}">{{ row.state_label }}</span><span class="mail-chevron" aria-hidden="true">⌄</span></summary><div class="mail-detail"><p class="mail-id mono">{{ row.id }}</p><p class="message-body">{{ row.body }}</p>{% if row.state == "claimed" %}<p class="section-note">Collected by an agent. This is not confirmation that the request has been completed.</p>{% endif %}{% if inbox && !needs_write_token %}{% if row.state == "pending" %}<div class="mail-actions"><button type="button" class="secondary-button" data-message-action="begin">Edit</button></div>{% else if row.state == "editing" %}<p class="section-note held-hint">Held while it is edited. Agents cannot collect it until it is saved or discarded.</p><div class="mail-actions"><button type="button" class="secondary-button" data-message-action="resume">Continue editing</button> <button type="button" class="secondary-button" data-message-action="release">Discard changes</button></div>{% endif %}{% endif %}</div></details>{% endfor %}</div>{% endif %}
-    <nav class="pagination" aria-label="Message pages">{% if previous != "" %}<a href="{{ previous }}" class="secondary-button">← Newer</a>{% endif %}{% if next != "" %}<a href="{{ next }}" class="secondary-button">Older →</a>{% endif %}</nav>
+    <div class="panel-heading"><label class="field-label" for="mail-project">{{ i18n.text("web-project-mailbox") }}</label><select id="mail-project" class="field-input">{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}{% if scope.pending > 0 %} · {{ scope.pending }} {{ i18n.text("web-queued") }}{% endif %}</option>{% endfor %}</select>
+    <nav class="segmented-tabs" aria-label="{{ i18n.text("web-mailbox") }}"><a id="mail-title" href="{{ inbox_href }}" {% if inbox %}aria-current="page"{% endif %}>{{ i18n.text("web-received") }}</a><a href="{{ outbox_href }}" {% if !inbox %}aria-current="page"{% endif %}>{{ i18n.text("web-sent") }}</a></nav>
+    <form action="inbox" method="get" class="mail-state-filter"><input type="hidden" name="workspace" value="{{ workspace }}"><input type="hidden" name="project" value="{{ project }}"><input type="hidden" name="box" value="{% if inbox %}inbox{% else %}outbox{% endif %}"><label for="mail-state" class="field-label">{{ i18n.text("web-message-state") }}</label><select id="mail-state" name="state" class="field-input"><option value="" {% if state == "" %}selected{% endif %}>{{ i18n.text("web-all-messages") }}</option><option value="pending" {% if state == "pending" %}selected{% endif %}>{{ i18n.text("web-awaiting-collection") }}</option><option value="claimed" {% if state == "claimed" %}selected{% endif %}>{{ i18n.text("web-collected") }}</option><option value="cancelled" {% if state == "cancelled" %}selected{% endif %}>{{ i18n.text("web-cancelled") }}</option><option value="editing" {% if state == "editing" %}selected{% endif %}>{{ i18n.text("web-editing") }}</option></select><noscript><button class="secondary-button" type="submit">{{ i18n.text("web-filter") }}</button></noscript></form></div>
+    {% if inbox && editing_count > 0 %}<p class="section-note held-note" role="status"><strong>{{ i18n.count("web-held-count", editing_count) }}</strong> {{ i18n.count("web-held-instructions", editing_count) }} <a href="{{ editing_href }}">{{ i18n.count("web-held-show", editing_count) }}</a></p>{% endif %}
+    {% if rows.is_empty() %}<div class="empty-state mail-empty"><span aria-hidden="true">✉</span><h2>{{ i18n.text("web-a-little-breathing-room") }}</h2><p>{% if state != "" %}{{ i18n.text("web-no-messages-match-this-state-in-the-selected-mailbox") }}{% else if inbox %}{{ i18n.text("web-no-messages-received-by-this-project-yet") }}{% else %}{{ i18n.text("web-no-messages-sent-from-this-project-yet") }}{% endif %}</p><p>{{ i18n.text("web-choose-an-agent-and-leave-a-clear-request-for-its-next-inbox-check") }}</p></div>{% else %}
+    <div class="mail-rows">{% for row in rows %}<details class="mail-row" data-state="{{ row.state }}" data-message-id="{{ row.id }}" data-subject="{{ row.raw_subject }}"><summary><span class="mail-avatar" aria-hidden="true">✉</span><span class="mail-preview"><strong>{{ row.subject }}</strong><span>{{ row.from }} → {{ row.to }}</span><small>{{ row.agent }} · {{ row.when }}</small></span><span class="status-pill message-{{ row.state }}">{{ row.state_label }}</span><span class="mail-chevron" aria-hidden="true">⌄</span></summary><div class="mail-detail"><p class="mail-id mono">{{ row.id }}</p><p class="message-body">{{ row.body }}</p>{% if row.state == "claimed" %}<p class="section-note">{{ i18n.text("web-collected-by-an-agent-this-is-not-confirmation-that-the-request-has-been-completed") }}</p>{% endif %}{% if inbox && !needs_write_token %}{% if row.state == "pending" %}<div class="mail-actions"><button type="button" class="secondary-button" data-message-action="begin">{{ i18n.text("web-edit") }}</button></div>{% else if row.state == "editing" %}<p class="section-note held-hint">{{ i18n.text("web-held-while-it-is-edited-agents-cannot-collect-it-until-it-is-saved-or-discarded") }}</p><div class="mail-actions"><button type="button" class="secondary-button" data-message-action="resume">{{ i18n.text("web-continue-editing") }}</button> <button type="button" class="secondary-button" data-message-action="release">{{ i18n.text("web-discard-changes") }}</button></div>{% endif %}{% endif %}</div></details>{% endfor %}</div>{% endif %}
+    <nav class="pagination" aria-label="{{ i18n.text("web-message-pages") }}">{% if previous != "" %}<a href="{{ previous }}" class="secondary-button">{{ i18n.text("web-newer") }}</a>{% endif %}{% if next != "" %}<a href="{{ next }}" class="secondary-button">{{ i18n.text("web-older") }}</a>{% endif %}</nav>
   </section>
   <aside id="compose" class="surface composer" aria-labelledby="compose-title">
-    <div class="composer-heading"><span class="compose-icon" aria-hidden="true">↗</span><div><p class="eyebrow">DIRECT TO AN AGENT</p><h2 id="compose-title">New message</h2></div></div>
+    <div class="composer-heading"><span class="compose-icon" aria-hidden="true">↗</span><div><p class="eyebrow">{{ i18n.text("web-direct-to-an-agent") }}</p><h2 id="compose-title">{{ i18n.text("web-new-message-inbox") }}</h2></div></div>
     <form id="message-composer" action="messages" method="post">
-      <label class="field-label" for="message-from">From project</label><select id="message-from" class="field-input" required>{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}</option>{% endfor %}</select>
-      <label class="field-label" for="message-to-project">To project</label><select id="message-to-project" class="field-input" required>{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}</option>{% endfor %}</select>
-      <p class="field-hint">Defaults to the source project. Choose another project for a cross-project message.</p>
-      <label class="field-label" for="message-to">To agent</label><select id="message-to" class="field-input" aria-describedby="message-agent-hint" required {% if !can_send %}disabled{% endif %}><option value="">{% if can_send %}Select a registered agent…{% else %}No registered agents in this project{% endif %}</option>{% for recipient in recipients %}{% if recipient.workspace == workspace && recipient.project == project %}<option value="{{ loop.index }}" data-workspace="{{ recipient.workspace }}" data-project="{{ recipient.project }}" data-agent="{{ recipient.agent }}" {% if recipient.selected %}selected{% endif %}>{{ recipient.label }}</option>{% endif %}{% endfor %}</select>
+      <label class="field-label" for="message-from">{{ i18n.text("web-from-project") }}</label><select id="message-from" class="field-input" required>{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}</option>{% endfor %}</select>
+      <label class="field-label" for="message-to-project">{{ i18n.text("web-to-project") }}</label><select id="message-to-project" class="field-input" required>{% for scope in scopes %}<option data-workspace="{{ scope.workspace }}" data-project="{{ scope.project }}" {% if scope.selected %}selected{% endif %}>{{ scope.workspace }} / {{ scope.project }}</option>{% endfor %}</select>
+      <p class="field-hint">{{ i18n.text("web-defaults-to-the-source-project-choose-another-project-for-a-cross-project-message") }}</p>
+      <label class="field-label" for="message-to">{{ i18n.text("web-to-agent") }}</label><select id="message-to" class="field-input" aria-describedby="message-agent-hint" required {% if !can_send %}disabled{% endif %}><option value="">{% if can_send %}{{ i18n.text("web-select-a-registered-agent") }}{% else %}{{ i18n.text("web-no-registered-agents-in-this-project") }}{% endif %}</option>{% for recipient in recipients %}{% if recipient.workspace == workspace && recipient.project == project %}<option value="{{ loop.index }}" data-workspace="{{ recipient.workspace }}" data-project="{{ recipient.project }}" data-agent="{{ recipient.agent }}" {% if recipient.selected %}selected{% endif %}>{{ recipient.label }}</option>{% endif %}{% endfor %}</select>
       <template id="message-agent-options">{% for recipient in recipients %}<option value="{{ loop.index }}" data-workspace="{{ recipient.workspace }}" data-project="{{ recipient.project }}" data-agent="{{ recipient.agent }}">{{ recipient.label }}</option>{% endfor %}</template>
-      <p id="message-agent-hint" class="field-hint" role="status" aria-live="polite">{% if can_send %}Only agents registered in the destination project are shown.{% else %}No agents registered in this project yet. Capture a session or choose another destination project.{% endif %}</p>
-      {% if needs_write_token %}<div class="delivery-note"><p>Your current browser sign-in permits reading. To send this message, re-enter a token with write access. The token is cleared after this request and is never saved.</p></div><label class="field-label" for="message-access-token">Write access token</label><input id="message-access-token" type="password" class="field-input" autocomplete="off" spellcheck="false" required placeholder="Used only for this message">{% endif %}
-      <label class="field-label" for="message-subject">Subject <span>optional</span></label><input id="message-subject" class="field-input" maxlength="200" placeholder="What needs to happen?">
-      <label class="field-label" for="message-body">Message</label><textarea id="message-body" class="field-input" rows="7" maxlength="8000" required placeholder="Describe the request, relevant context, and what a successful result looks like."></textarea>
-      <div class="composer-meta"><span>Plain text · secrets are scrubbed</span><span id="message-count">0 / 8,000</span></div>
-      <div class="delivery-note"><span aria-hidden="true">◷</span><p>Queued for this agent's next inbox check. Sending a message does not start an agent or execute its contents.</p></div>
-      <button class="primary-button send-button" type="submit" {% if !can_send %}disabled{% endif %}>Queue message <span aria-hidden="true">↗</span></button>
+      <p id="message-agent-hint" class="field-hint" role="status" aria-live="polite">{% if can_send %}{{ i18n.text("web-only-agents-registered-in-the-destination-project-are-shown") }}{% else %}{{ i18n.text("web-no-agents-registered-in-this-project-yet-capture-a-session-or-choose-another-destinat") }}{% endif %}</p>
+      {% if needs_write_token %}<div class="delivery-note"><p>{{ i18n.text("web-your-current-browser-sign-in-permits-reading-to-send-this-message-re-enter-a-token-wi") }}</p></div><label class="field-label" for="message-access-token">{{ i18n.text("web-write-access-token") }}</label><input id="message-access-token" type="password" class="field-input" autocomplete="off" spellcheck="false" required placeholder="{{ i18n.text("web-used-only-for-this-message") }}">{% endif %}
+      <label class="field-label" for="message-subject">{{ i18n.text("web-subject") }} <span>{{ i18n.text("web-optional") }}</span></label><input id="message-subject" class="field-input" maxlength="200" placeholder="{{ i18n.text("web-what-needs-to-happen") }}">
+      <label class="field-label" for="message-body">{{ i18n.text("web-message") }}</label><textarea id="message-body" class="field-input" rows="7" maxlength="8000" required placeholder="{{ i18n.text("web-describe-the-request-relevant-context-and-what-a-successful-result-looks-like") }}"></textarea>
+      <div class="composer-meta"><span>{{ i18n.text("web-plain-text-secrets-are-scrubbed") }}</span><span id="message-count">0 / 8,000</span></div>
+      <div class="delivery-note"><span aria-hidden="true">◷</span><p>{{ i18n.text("web-queued-for-this-agent-s-next-inbox-check-sending-a-message-does-not-start-an-agent-or") }}</p></div>
+      <button class="primary-button send-button" type="submit" {% if !can_send %}disabled{% endif %}>{{ i18n.text("web-queue-message") }} <span aria-hidden="true">↗</span></button>
       <p id="message-result" role="status" aria-live="polite" tabindex="-1"></p>
     </form>
   </aside>
 </div>
 <script>
 (function(){
+{% include "_js_api_errors.html" %}
   var project=document.getElementById("mail-project"),form=document.getElementById("message-composer"),body=document.getElementById("message-body"),result=document.getElementById("message-result");
   var fromProject=document.getElementById("message-from"),toProject=document.getElementById("message-to-project"),toAgent=document.getElementById("message-to"),button=form.querySelector('button[type="submit"]'),sending=false;
   var agents=document.getElementById("message-agent-options").content.querySelectorAll("option"),agentHint=document.getElementById("message-agent-hint");
@@ -48,8 +49,8 @@
     var scope=toProject.selectedOptions[0],placeholder=document.createElement("option");placeholder.value="";toAgent.replaceChildren(placeholder);
     agents.forEach(function(option){if(scope&&option.dataset.workspace===scope.dataset.workspace&&option.dataset.project===scope.dataset.project)toAgent.appendChild(option.cloneNode(true));});
     var available=toAgent.options.length>1;toAgent.disabled=!available;toAgent.value="";
-    placeholder.textContent=available?"Select a registered agent…":"No registered agents in this project";
-    agentHint.textContent=available?"Only agents registered in the destination project are shown.":"No agents registered in this project yet. Capture a session or choose another destination project.";
+    placeholder.textContent=available?{{ i18n.js("web-select-a-registered-agent")|safe }}:{{ i18n.js("web-no-registered-agents-in-this-project")|safe }};
+    agentHint.textContent=available?{{ i18n.js("web-only-agents-registered-in-the-destination-project-are-shown")|safe }}:{{ i18n.js("web-no-agents-registered-in-this-project-yet-capture-a-session-or-choose-another-destinat")|safe }};
     updateSendButton();
   }
   fromProject.addEventListener("change",function(){toProject.selectedIndex=fromProject.selectedIndex;filterAgents();});
@@ -63,40 +64,43 @@
     if(button.disabled)return;
     var from=fromProject.selectedOptions[0],destination=toProject.selectedOptions[0],to=toAgent.selectedOptions[0];
     if(!from||!destination||!to||!to.dataset.agent||to.dataset.workspace!==destination.dataset.workspace||to.dataset.project!==destination.dataset.project)return;
-    sending=true;updateSendButton();result.textContent="Queuing message…";result.className="";
+    sending=true;updateSendButton();result.textContent={{ i18n.js("web-queuing-message")|safe }};result.className="";
     {% include "_js_cookie.html" %}
     var token=document.getElementById("message-access-token"),headers={"Content-Type":"application/json","X-Ai-Memory-UI":"1","X-CSRF-Token":decodeURIComponent(cookie("ai_memory_csrf")||"")};
     if(token)headers.Authorization="Bearer "+token.value.trim();
-    var controller=new AbortController(),timeout=setTimeout(function(){controller.abort();},15000);
+    var controller=new AbortController(),timeout=setTimeout(function(){
+{% include "_js_api_errors.html" %}controller.abort();},15000);
     try{
       var response=await fetch(new URL("messages",document.baseURI),{method:"POST",credentials:"same-origin",signal:controller.signal,headers:headers,body:JSON.stringify({from_workspace:from.dataset.workspace,from_project:from.dataset.project,to_workspace:to.dataset.workspace,to_project:to.dataset.project,to_agent:to.dataset.agent,subject:document.getElementById("message-subject").value,body:body.value})});
-      if(response.redirected)throw new Error("Your session expired. Sign in again before sending.");
-      var data=await response.json();if(!response.ok)throw new Error(data.error||"The message could not be queued.");
+      if(response.redirected)throw new Error({{ i18n.js("web-your-session-expired-sign-in-again-before-sending")|safe }});
+      var data=await response.json();if(!response.ok)throw new Error(apiError(data,{{ i18n.js("web-the-message-could-not-be-queued")|safe }}));
       document.dispatchEvent(new Event("inbox:changed"));
-      result.className="send-success";result.textContent="Message queued for "+to.dataset.agent+". Reference: "+data.message_id;body.value="";document.getElementById("message-subject").value="";document.getElementById("message-count").textContent="0 / 8,000";
-      var link=document.createElement("a"),url=new URL("inbox",document.baseURI);url.searchParams.set("workspace",from.dataset.workspace);url.searchParams.set("project",from.dataset.project);url.searchParams.set("box","outbox");link.href=url.href;link.textContent="View sent messages →";result.appendChild(document.createTextNode(" "));result.appendChild(link);
-    }catch(error){result.className="send-error";result.textContent=error.name==="AbortError"?"Delivery is unconfirmed. Check Sent before trying again to avoid a duplicate.":(error.message||"Delivery is unconfirmed. Check Sent before trying again.");}
+      result.className="send-success";result.textContent=(""+{{ i18n.js("web-message-queued-for")|safe }}+" ")+to.dataset.agent+". Reference: "+data.message_id;body.value="";document.getElementById("message-subject").value="";document.getElementById("message-count").textContent="0 / 8,000";
+      var link=document.createElement("a"),url=new URL("inbox",document.baseURI);url.searchParams.set("workspace",from.dataset.workspace);url.searchParams.set("project",from.dataset.project);url.searchParams.set("box","outbox");link.href=url.href;link.textContent={{ i18n.js("web-view-sent-messages")|safe }};result.appendChild(document.createTextNode(" "));result.appendChild(link);
+    }catch(error){result.className="send-error";result.textContent=error.name==="AbortError"?{{ i18n.js("web-delivery-is-unconfirmed-check-sent-before-trying-again-to-avoid-a-duplicate")|safe }}:(error.message||{{ i18n.js("web-delivery-is-unconfirmed-check-sent-before-trying-again")|safe }});}
     finally{clearTimeout(timeout);if(token)token.value="";sending=false;updateSendButton();result.focus();}
   });
 })();
 </script>
 <script>
 (function(){
+{% include "_js_api_errors.html" %}
   var list=document.querySelector(".mail-rows");if(!list)return;
   {% include "_js_cookie.html" %}
   var picker=document.getElementById("mail-project");
   function scope(){var o=picker.selectedOptions[0];return {workspace:o.dataset.workspace,project:o.dataset.project};}
   async function call(id,action,payload){
     var headers={"Content-Type":"application/json","X-Ai-Memory-UI":"1","X-CSRF-Token":decodeURIComponent(cookie("ai_memory_csrf")||"")};
-    var controller=new AbortController(),timeout=setTimeout(function(){controller.abort();},15000);
+    var controller=new AbortController(),timeout=setTimeout(function(){
+{% include "_js_api_errors.html" %}controller.abort();},15000);
     try{
       var response=await fetch(new URL("messages/"+encodeURIComponent(id)+"/"+action,document.baseURI),{method:"POST",credentials:"same-origin",signal:controller.signal,headers:headers,body:JSON.stringify(Object.assign(scope(),payload||{}))});
-      if(response.redirected)throw new Error("Your session expired. Sign in again before editing.");
+      if(response.redirected)throw new Error({{ i18n.js("web-your-session-expired-sign-in-again-before-editing")|safe }});
       var data={};try{data=await response.json();}catch(ignored){}
-      if(!response.ok)throw new Error(data.error||"The request was refused.");
+      if(!response.ok)throw new Error(apiError(data,{{ i18n.js("web-the-request-was-refused")|safe }}));
       return data;
     }catch(error){
-      if(error.name==="AbortError")throw new Error("No answer from the server. Reload to see whether the change was applied.");
+      if(error.name==="AbortError")throw new Error({{ i18n.js("web-no-answer-from-the-server-reload-to-see-whether-the-change-was-applied")|safe }});
       throw error;
     }finally{clearTimeout(timeout);}
   }
@@ -105,28 +109,28 @@
     var detail=row.querySelector(".mail-detail"),id=row.dataset.messageId;
     detail.querySelectorAll(".mail-actions,.message-body,.held-hint,.edit-error").forEach(function(node){node.remove();});
     row.dataset.state="editing";
-    var pill=row.querySelector(".status-pill");pill.textContent="Editing";pill.className="status-pill message-editing";
+    var pill=row.querySelector(".status-pill");pill.textContent={{ i18n.js("web-editing")|safe }};pill.className="status-pill message-editing";
     var form=document.createElement("form"),subjectInput=document.createElement("input"),bodyInput=document.createElement("textarea"),status=document.createElement("p"),actions=document.createElement("div"),save=document.createElement("button"),discard=document.createElement("button"),hint=document.createElement("p");
     form.className="mail-editor";
     subjectInput.className="field-input";subjectInput.maxLength=200;subjectInput.value=subject;
     bodyInput.className="field-input";bodyInput.rows=8;bodyInput.maxLength=8000;bodyInput.required=true;bodyInput.value=body;
-    hint.className="section-note";hint.textContent="This message is held while you edit it. Agents cannot collect it until you save or discard.";
+    hint.className="section-note";hint.textContent={{ i18n.js("web-this-message-is-held-while-you-edit-it-agents-cannot-collect-it-until-you-save-or-dis")|safe }};
     status.setAttribute("role","status");status.setAttribute("aria-live","polite");
     actions.className="mail-actions";
-    save.type="submit";save.className="primary-button";save.textContent="Save and requeue";
-    discard.type="button";discard.className="secondary-button";discard.textContent="Discard changes";
+    save.type="submit";save.className="primary-button";save.textContent={{ i18n.js("web-save-and-requeue")|safe }};
+    discard.type="button";discard.className="secondary-button";discard.textContent={{ i18n.js("web-discard-changes")|safe }};
     actions.appendChild(save);actions.appendChild(discard);
-    form.appendChild(hint);form.appendChild(field("Subject",subjectInput,"edit-subject-"+id));form.appendChild(field("Message",bodyInput,"edit-body-"+id));form.appendChild(status);form.appendChild(actions);
+    form.appendChild(hint);form.appendChild(field({{ i18n.js("web-subject")|safe }},subjectInput,"edit-subject-"+id));form.appendChild(field({{ i18n.js("web-message")|safe }},bodyInput,"edit-body-"+id));form.appendChild(status);form.appendChild(actions);
     detail.appendChild(form);bodyInput.focus();
     function busy(on){save.disabled=on;discard.disabled=on;}
     form.addEventListener("submit",async function(event){
       event.preventDefault();if(!form.reportValidity())return;
-      busy(true);status.textContent="Saving…";
+      busy(true);status.textContent={{ i18n.js("web-saving")|safe }};
       try{await call(id,"save",{subject:subjectInput.value,body:bodyInput.value});document.dispatchEvent(new Event("inbox:changed"));location.reload();}
       catch(error){status.textContent=error.message;busy(false);}
     });
     discard.addEventListener("click",async function(){
-      busy(true);status.textContent="Returning to the queue…";
+      busy(true);status.textContent={{ i18n.js("web-returning-to-the-queue")|safe }};
       try{await call(id,"release");document.dispatchEvent(new Event("inbox:changed"));location.reload();}
       catch(error){status.textContent=error.message;busy(false);}
     });

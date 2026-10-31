@@ -19,8 +19,8 @@ use serde::Deserialize;
 use crate::diff::{self, Diff};
 use crate::state::WebState;
 use crate::templates::{
-    HistoryDiffLine, HistoryHunk, HistoryVersionRow, HistoryView, history_href, humanize,
-    page_href, project_href,
+    HistoryDiffLine, HistoryHunk, HistoryVersionRow, HistoryView, history_href, page_href,
+    project_href,
 };
 
 /// Versions listed per page when the request names no `limit`.
@@ -188,6 +188,7 @@ pub(crate) async fn load(
 
 /// Handler for `GET /w/:workspace/:project/h/*path`.
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Path((workspace, project, path)): Path<(String, String, String)>,
@@ -196,20 +197,28 @@ pub(crate) async fn handler(
     let viewer = viewer.map(|axum::Extension(viewer)| viewer.user());
     let history = match load(&state, viewer, &workspace, &project, &path, &query).await {
         Ok(history) => history,
-        Err(HistoryError::Scope(refusal)) => return super::page::refusal_response(&refusal),
+        Err(HistoryError::Scope(refusal)) => {
+            return super::page::localized_refusal_response(&i18n, &refusal);
+        }
         Err(HistoryError::BadRequest(message)) => {
             return (StatusCode::BAD_REQUEST, message).into_response();
         }
-        Err(HistoryError::NotFound(_)) => return super::page::not_found_response(),
+        Err(HistoryError::NotFound(_)) => return super::page::not_found_response(&i18n),
         Err(HistoryError::Internal(error)) => {
             tracing::error!(%error, "web history read failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    render(&workspace, &project, &path, history)
+    render(&i18n, &workspace, &project, &path, history)
 }
 
-fn render(workspace: &str, project: &str, path: &str, history: History) -> Response {
+fn render(
+    i18n: &ai_memory_core::i18n::Localizer,
+    workspace: &str,
+    project: &str,
+    path: &str,
+    history: History,
+) -> Response {
     let base = history_href(workspace, project, path);
     let from_id = history.from.as_ref().map(|f| f.id);
     let to_id = history.to.id;
@@ -223,7 +232,7 @@ fn render(workspace: &str, project: &str, path: &str, history: History) -> Respo
             is_latest: v.is_latest,
             title: v.title.clone(),
             created_at: v.created_at.clone(),
-            created_relative: humanize(&v.created_at),
+            created_relative: i18n.relative(&v.created_at),
             author: v
                 .author
                 .as_ref()
@@ -280,6 +289,7 @@ fn render(workspace: &str, project: &str, path: &str, history: History) -> Respo
         String::new()
     };
     let view = HistoryView {
+        i18n: i18n.clone(),
         workspace: workspace.to_owned(),
         project: project.to_owned(),
         project_href: project_href(workspace, project),

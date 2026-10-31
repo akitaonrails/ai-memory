@@ -42,6 +42,7 @@ struct MoveSessionRequest {
 /// unknown session/target, 409 guard or page collision, 422 batch source
 /// equal to the destination).
 pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.from_workspace.as_deref(), "--from-workspace")?;
     super::refuse_empty_explicit(args.from_project.as_deref(), "--from-project")?;
     super::refuse_empty_explicit(args.to_workspace.as_deref(), "--to-workspace")?;
@@ -72,18 +73,27 @@ pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
     };
     let report: serde_json::Value = post_json(&endpoint, "/admin/move-session", &request).await?;
     if let Some(warning) = report["manifest_warning"].as_str() {
-        eprintln!("ai-memory: warning: {warning}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-move-project-ai-memory-warning-warning",
+                &[("value0", warning.to_string())]
+            )
+        );
     }
 
     if request.session_id.is_some() {
-        print_session_report(&report, args.confirm);
+        print_session_report(i18n, &report, args.confirm);
     } else {
-        print_batch_report(&report, args.confirm);
+        print_batch_report(i18n, &report, args.confirm);
     }
     if !args.confirm {
         println!(
-            "\n(dry run; nothing was written)\nRe-run with --confirm to apply:\n\n  {}",
-            apply_command(&args)
+            "{}",
+            i18n.format(
+                "cli-move-session-dry-run-nothing-was-written-re-run-with-confirm-to-apply",
+                &[("value0", apply_command(&args).to_string())]
+            )
         );
     }
     Ok(())
@@ -107,36 +117,62 @@ fn session_row_line(report: &serde_json::Value, applied: bool) -> &'static str {
     }
 }
 
-fn print_session_report(report: &serde_json::Value, applied: bool) {
+fn print_session_report(
+    i18n: &ai_memory_core::i18n::Localizer,
+    report: &serde_json::Value,
+    applied: bool,
+) {
     let verb = if applied { "Moved" } else { "Would move" };
     println!(
-        "{verb} session {} from {} to {}:",
-        report["session_id"].as_str().unwrap_or("?"),
-        scope(&report["from"]),
-        scope(&report["to"]),
+        "{}",
+        i18n.format(
+            "cli-move-session-verb-session-from-to",
+            &[
+                ("value0", verb.to_string()),
+                (
+                    "value1",
+                    report["session_id"].as_str().unwrap_or("?").to_string()
+                ),
+                ("value2", scope(&report["from"]).to_string()),
+                ("value3", scope(&report["to"]).to_string())
+            ]
+        )
     );
-    print_would_create(report);
+    print_would_create(i18n, report);
     println!(
-        "  session row:         {}",
-        session_row_line(report, applied)
+        "{}",
+        i18n.format(
+            "cli-move-session-session-row",
+            &[("value0", session_row_line(report, applied).to_string())]
+        )
     );
     print_counts(
+        i18n,
         &report["summary"],
         report["page"].as_str().unwrap_or("none"),
     );
-    print_source_scopes(report, &scope(&report["to"]));
+    print_source_scopes(i18n, report, &scope(&report["to"]));
     if let Some(warning) = report["cwd_warning"].as_str() {
-        println!("Warning: {warning}");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-move-session-warning-warning",
+                &[("value0", warning.to_string())]
+            )
+        );
     }
-    print_checkpoints(report);
+    print_checkpoints(i18n, report);
 }
 
 /// Dry run with `--create` against a destination that does not exist yet.
-fn print_would_create(report: &serde_json::Value) {
+fn print_would_create(i18n: &ai_memory_core::i18n::Localizer, report: &serde_json::Value) {
     if report["would_create_project"].as_bool().unwrap_or(false) {
         println!(
-            "  would create project {} (absent; created on --confirm)",
-            scope(&report["to"])
+            "{}",
+            i18n.format(
+                "cli-move-session-would-create-project-absent-created-on-confirm",
+                &[("value0", scope(&report["to"]).to_string())]
+            )
         );
     }
 }
@@ -144,29 +180,63 @@ fn print_would_create(report: &serde_json::Value) {
 /// The wiki checkpoints a confirmed run took: `pre_checkpoint` only when the
 /// tree had uncommitted changes before the move, `checkpoint` when the move
 /// changed the tree.
-fn print_checkpoints(report: &serde_json::Value) {
+fn print_checkpoints(i18n: &ai_memory_core::i18n::Localizer, report: &serde_json::Value) {
     if let Some(oid) = report["pre_checkpoint"].as_str() {
-        println!("Pre-move checkpoint: {oid}");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-move-session-pre-move-checkpoint-oid",
+                &[("value0", oid.to_string())]
+            )
+        );
     }
     if let Some(oid) = report["checkpoint"].as_str() {
-        println!("Checkpoint: {oid}");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-move-session-checkpoint-oid",
+                &[("value0", oid.to_string())]
+            )
+        );
     }
 }
 
-fn print_batch_report(report: &serde_json::Value, applied: bool) {
+fn print_batch_report(
+    i18n: &ai_memory_core::i18n::Localizer,
+    report: &serde_json::Value,
+    applied: bool,
+) {
     let verb = if applied { "Moved" } else { "Would move" };
     let total = report["total"].as_u64().unwrap_or(0);
     let moved = report["moved"].as_u64().unwrap_or(0);
     println!(
-        "{verb} {moved} of {total} session(s) from {} to {}:",
-        scope(&report["from"]),
-        scope(&report["to"]),
+        "{}",
+        i18n.format(
+            "cli-move-session-verb-moved-of-total-session-s-from-to",
+            &[
+                ("value0", verb.to_string()),
+                ("value1", format!("{}", moved)),
+                ("value2", format!("{}", total)),
+                ("value3", scope(&report["from"]).to_string()),
+                ("value4", scope(&report["to"]).to_string())
+            ]
+        )
     );
-    print_would_create(report);
+    print_would_create(i18n, report);
     if let Some(sessions) = report["sessions"].as_array() {
         println!(
-            "{:<38} {:<8} {:>6} {:>8} {:>5} {:<22} cwd",
-            "session_id", "row", "obs", "handoffs", "jobs", "page"
+            "{}",
+            i18n.format(
+                "cli-move-session-table-header",
+                &[
+                    ("value0", format!("{:<38}", "session_id")),
+                    ("value1", format!("{:<8}", "row")),
+                    ("value2", format!("{:>6}", "obs")),
+                    ("value3", format!("{:>8}", "handoffs")),
+                    ("value4", format!("{:>5}", "jobs")),
+                    ("value5", format!("{:<22}", "page"))
+                ]
+            )
         );
         println!("{}", "-".repeat(109));
         for s in sessions {
@@ -191,9 +261,7 @@ fn print_batch_report(report: &serde_json::Value, applied: bool) {
             .count();
         if rehomed > 0 {
             println!(
-                "Note: {rehomed} session(s) marked re-home already had their session row in the \
-                 destination; only their stray rows (the counts above) were gathered."
-            );
+                "{}", i18n.format("cli-move-session-note-rehomed-session-s-marked-re-home-already-had-their-session-row-in-the-d", &[("value0", format!("{}", rehomed))]));
         }
         let warned = sessions
             .iter()
@@ -201,13 +269,10 @@ fn print_batch_report(report: &serde_json::Value, applied: bool) {
             .count();
         if warned > 0 {
             println!(
-                "Warning: {warned} session(s) have a cwd whose basename is not the destination \
-                 project; new sessions from those directories still resolve by basename unless \
-                 a .ai-memory.toml marker pins the project."
-            );
+                "{}", i18n.format("cli-move-session-warning-warned-session-s-have-a-cwd-whose-basename-is-not-the-destination-pr", &[("value0", format!("{}", warned))]));
         }
     }
-    print_checkpoints(report);
+    print_checkpoints(i18n, report);
 }
 
 /// Name every scope the move will drain, when it is more than the one the
@@ -217,7 +282,11 @@ fn print_batch_report(report: &serde_json::Value, applied: bool) {
 /// project nobody named — and moving back afterwards cannot restore the
 /// original split. The operator sees that here, in the dry run, rather than
 /// inferring it from a count that came out larger than expected.
-fn print_source_scopes(report: &serde_json::Value, destination: &str) {
+fn print_source_scopes(
+    i18n: &ai_memory_core::i18n::Localizer,
+    report: &serde_json::Value,
+    destination: &str,
+) {
     let Some(scopes) = report["source_scopes"].as_array() else {
         return;
     };
@@ -229,35 +298,82 @@ fn print_source_scopes(report: &serde_json::Value, destination: &str) {
         return;
     }
     println!(
-        "  gathering observations out of {} scopes into {destination}:",
-        others.len()
+        "{}",
+        i18n.format(
+            "cli-move-session-gathering-observations-out-of-scopes-into-destination",
+            &[
+                ("value0", format!("{}", others.len())),
+                ("value1", destination.to_string())
+            ]
+        )
     );
     for s in &others {
         println!(
-            "    {}/{}: {} observation(s)",
-            s["workspace"].as_str().unwrap_or("?"),
-            s["project"].as_str().unwrap_or("?"),
-            s["observations"].as_u64().unwrap_or(0),
+            "{}",
+            i18n.format(
+                "cli-move-session-observation-s",
+                &[
+                    ("value0", s["workspace"].as_str().unwrap_or("?").to_string()),
+                    ("value1", s["project"].as_str().unwrap_or("?").to_string()),
+                    (
+                        "value2",
+                        format!("{}", s["observations"].as_u64().unwrap_or(0))
+                    )
+                ]
+            )
         );
     }
     println!(
-        "  Note: this empties every scope listed above, not only the one named as the source. \
-         Moving the session back later returns all rows to a single project — the split shown \
-         here is not restored."
-    );
+        "{}", i18n.text("cli-move-session-note-this-empties-every-scope-listed-above-not-only-the-one-named-as-the-sou"));
 }
 
-fn print_counts(summary: &serde_json::Value, page: &str) {
+fn print_counts(i18n: &ai_memory_core::i18n::Localizer, summary: &serde_json::Value, page: &str) {
     let n = |key: &str| summary[key].as_u64().unwrap_or(0);
-    println!("  observations:        {}", n("observations"));
-    println!("  handoffs:            {}", n("handoffs"));
-    println!("  consolidation jobs:  {}", n("consolidation_jobs"));
-    println!("  auto-improve runs:   {}", n("auto_improve_runs"));
-    println!("  auto-improve claims: {}", n("auto_improve_claims"));
     println!(
-        "  page:                {page} ({} version(s) moved, {} retired)",
-        n("page_versions_moved"),
-        n("pages_regenerated")
+        "{}",
+        i18n.format(
+            "cli-move-session-observations",
+            &[("value0", format!("{}", n("observations")))]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-move-session-handoffs",
+            &[("value0", format!("{}", n("handoffs")))]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-move-session-consolidation-jobs",
+            &[("value0", format!("{}", n("consolidation_jobs")))]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-move-session-auto-improve-runs",
+            &[("value0", format!("{}", n("auto_improve_runs")))]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-move-session-auto-improve-claims",
+            &[("value0", format!("{}", n("auto_improve_claims")))]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-move-session-page-page-version-s-moved-retired",
+            &[
+                ("value0", page.to_string()),
+                ("value1", format!("{}", n("page_versions_moved"))),
+                ("value2", format!("{}", n("pages_regenerated")))
+            ]
+        )
     );
 }
 

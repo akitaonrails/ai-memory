@@ -152,41 +152,6 @@ pub(crate) fn encode_segment(segment: &str) -> String {
 // Humanise helper
 // ---------------------------------------------------------------------------
 
-/// Format an ISO-8601 timestamp string as a relative human-readable string
-/// (e.g. "3 hours ago", "2 days ago"). Falls back to the raw string on any
-/// parse error.
-#[must_use]
-pub(crate) fn humanize(iso: &str) -> String {
-    let Ok(then) = iso.parse::<jiff::Timestamp>() else {
-        return iso.to_owned();
-    };
-    let now = jiff::Timestamp::now();
-    // Compute elapsed seconds using microsecond arithmetic to avoid Span API.
-    let diff_us = now.as_microsecond() - then.as_microsecond();
-    let secs = diff_us.abs() / 1_000_000;
-    if secs < 60 {
-        return "just now".to_owned();
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins} minute{} ago", if mins == 1 { "" } else { "s" });
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" });
-    }
-    let days = hours / 24;
-    if days < 30 {
-        return format!("{days} day{} ago", if days == 1 { "" } else { "s" });
-    }
-    let months = days / 30;
-    if months < 12 {
-        return format!("{months} month{} ago", if months == 1 { "" } else { "s" });
-    }
-    let years = months / 12;
-    format!("{years} year{} ago", if years == 1 { "" } else { "s" })
-}
-
 /// Humanised session duration between two ISO-8601 timestamps, or `"open"`
 /// when `ended` is absent. Falls back to `"—"` on any parse error rather
 /// than a raw/misleading duration.
@@ -304,6 +269,7 @@ pub(crate) struct OkfDialog {
 #[derive(Template)]
 #[template(path = "projects.html")]
 pub(crate) struct ProjectsView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// All project cards, sorted by most recently active first.
     pub projects: Vec<ProjectCard>,
     /// Privacy-preserving aggregate signals above the project cards.
@@ -388,6 +354,7 @@ pub(crate) struct Folder {
 #[derive(Template)]
 #[template(path = "project.html")]
 pub(crate) struct ProjectView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     pub agents: Vec<crate::operations::AgentCard>,
     pub inbox_href: String,
     pub project_href: String,
@@ -499,6 +466,7 @@ pub(crate) struct WorkstreamRow {
 #[derive(Template)]
 #[template(path = "workstreams.html")]
 pub(crate) struct WorkstreamsView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Current page rows, attention-first then newest activity.
     pub rows: Vec<WorkstreamRow>,
     /// One-based page number.
@@ -515,6 +483,7 @@ pub(crate) struct WorkstreamsView {
 #[derive(Template)]
 #[template(path = "namespace.html")]
 pub(crate) struct NamespaceView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
@@ -574,6 +543,7 @@ pub(crate) struct RelatedRow {
 #[derive(Template)]
 #[template(path = "page.html")]
 pub(crate) struct PageView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     pub knowledge: crate::knowledge::KnowledgeView,
     /// Workspace name.
     pub workspace: String,
@@ -687,6 +657,7 @@ pub(crate) struct HistoryHunk {
 #[derive(Template)]
 #[template(path = "history.html")]
 pub(crate) struct HistoryView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Workspace name.
     pub workspace: String,
     /// Project name.
@@ -760,6 +731,7 @@ pub(crate) struct SessionObservationRow {
 #[derive(Template)]
 #[template(path = "session.html")]
 pub(crate) struct SessionView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     pub token_usage: TokenUsagePanel,
     /// Workspace name.
     pub workspace: String,
@@ -896,6 +868,7 @@ pub(crate) struct ScopeGroup {
 #[derive(Template)]
 #[template(path = "search.html")]
 pub(crate) struct SearchView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// The raw query string.
     pub query: String,
     /// Search hits, best first.
@@ -1007,6 +980,7 @@ pub(crate) struct SelectOption {
 #[derive(Template)]
 #[template(path = "pending.html")]
 pub(crate) struct PendingView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Proposals after the project filter, in the chosen order.
     pub rows: Vec<PendingRow>,
     /// Project filter options, the "all projects" option first.
@@ -1045,7 +1019,7 @@ pub(crate) struct HealthCheckRow {
 /// One label/value line on the health page.
 pub(crate) struct HealthRow {
     /// Label.
-    pub label: &'static str,
+    pub label: String,
     /// Value.
     pub value: String,
 }
@@ -1053,7 +1027,7 @@ pub(crate) struct HealthRow {
 /// A titled group of health rows.
 pub(crate) struct HealthSection {
     /// Section heading.
-    pub title: &'static str,
+    pub title: String,
     /// Its rows.
     pub rows: Vec<HealthRow>,
 }
@@ -1102,6 +1076,7 @@ pub(crate) struct GraphEdgeRow {
 #[derive(Template)]
 #[template(path = "graph.html")]
 pub(crate) struct GraphView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Project graph (scoped header search and breadcrumb) vs the global one.
     pub is_project: bool,
     /// Workspace name; empty on the global graph.
@@ -1134,6 +1109,7 @@ pub(crate) struct GraphView {
 #[derive(Template)]
 #[template(path = "health.html")]
 pub(crate) struct HealthView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// The host wired the process-side sources (hook counters, spool…).
     pub wired: bool,
     /// Failed checks, most severe first.
@@ -1145,7 +1121,9 @@ pub(crate) struct HealthView {
 /// View-model for a non-root session that opens a root-only page.
 #[derive(Template)]
 #[template(path = "admin_required.html")]
-pub(crate) struct AdminRequiredView {}
+pub(crate) struct AdminRequiredView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+}
 
 // ---------------------------------------------------------------------------
 // not_found.html
@@ -1154,7 +1132,9 @@ pub(crate) struct AdminRequiredView {}
 /// View-model for 404 responses.
 #[derive(Template)]
 #[template(path = "not_found.html")]
-pub(crate) struct NotFoundView {}
+pub(crate) struct NotFoundView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+}
 
 // ---------------------------------------------------------------------------
 // login.html / change_password.html
@@ -1164,6 +1144,7 @@ pub(crate) struct NotFoundView {}
 #[derive(Template)]
 #[template(path = "login.html")]
 pub(crate) struct LoginView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Sanitised post-login redirect target (absolute path under the wiki root).
     pub next: String,
     /// Absolute path to the change-password page (for `must_change_password`).
@@ -1174,6 +1155,7 @@ pub(crate) struct LoginView {
 #[derive(Template)]
 #[template(path = "change_password.html")]
 pub(crate) struct ChangePasswordView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Sanitised post-change redirect target (absolute path under the wiki root).
     pub next: String,
 }
@@ -1247,19 +1229,22 @@ mod tests {
 
     #[test]
     fn public_auth_pages_do_not_show_the_server_version() {
+        let i18n = ai_memory_core::i18n::Localizer::default();
         let version = format!("v{VERSION}");
         let login = LoginView {
+            i18n: i18n.clone(),
             next: "/web/".into(),
             change_password_href: "/web/change-password".into(),
         }
         .render()
         .unwrap();
         let change = ChangePasswordView {
+            i18n: i18n.clone(),
             next: "/web/".into(),
         }
         .render()
         .unwrap();
-        let signed_in = NotFoundView {}.render().unwrap();
+        let signed_in = NotFoundView { i18n: i18n.clone() }.render().unwrap();
         assert!(!login.contains(&version), "login page leaks {version}");
         assert!(
             !change.contains(&version),

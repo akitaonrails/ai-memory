@@ -41,17 +41,20 @@ const LEGACY_ORPHAN_TAIL_CRLF: &str =
 /// Returns an error if the target path can't be written or if the
 /// existing file isn't valid UTF-8.
 pub fn run(config: &Config, args: InstallInstructionsArgs) -> Result<()> {
-    run_inner(args, &config.runtime_env, true)
+    let i18n = &config.i18n;
+    run_inner(i18n, args, &config.runtime_env, true)
 }
 
 pub(super) fn run_quiet(
+    i18n: &ai_memory_core::i18n::Localizer,
     args: InstallInstructionsArgs,
     env: &crate::config::RuntimeEnv,
 ) -> Result<()> {
-    run_inner(args, env, false)
+    run_inner(i18n, args, env, false)
 }
 
 fn run_inner(
+    i18n: &ai_memory_core::i18n::Localizer,
     args: InstallInstructionsArgs,
     env: &crate::config::RuntimeEnv,
     report: bool,
@@ -61,7 +64,7 @@ fn run_inner(
     } else {
         full_block()
     };
-    let targets = resolve_targets(args.target.as_ref())?;
+    let targets = resolve_targets(i18n, args.target.as_ref())?;
     if report {
         let home = env
             .var_os("HOME")
@@ -89,7 +92,13 @@ fn run_inner(
 
     if args.print {
         for t in &targets {
-            println!("# Would write into: {}\n", t.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-install-instructions-would-write-into",
+                    &[("value0", format!("{}", t.display()))]
+                )
+            );
             println!("{block}");
         }
     } else {
@@ -141,11 +150,16 @@ fn run_inner(
 /// Kimi Code) converged on AGENTS.md. The heuristic "extend whatever's
 /// already there" matches the user's intent better than a hard-coded
 /// default.
-fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::path::PathBuf>> {
+fn resolve_targets(
+    i18n: &ai_memory_core::i18n::Localizer,
+    explicit: Option<&std::path::PathBuf>,
+) -> Result<Vec<std::path::PathBuf>> {
     if let Some(p) = explicit {
         return Ok(vec![p.clone()]);
     }
-    let cwd = std::env::current_dir().context("getting CWD for install-instructions target")?;
+    let cwd = std::env::current_dir().context(
+        i18n.text("cli-install-instructions-getting-cwd-for-install-instructions-target"),
+    )?;
     let claude_md = cwd.join("CLAUDE.md");
     let agents_md = cwd.join("AGENTS.md");
     let has_claude = claude_md.exists();
@@ -156,12 +170,7 @@ fn resolve_targets(explicit: Option<&std::path::PathBuf>) -> Result<Vec<std::pat
         (false, true) => Ok(vec![agents_md]),
         (false, false) => {
             eprintln!(
-                "note: neither CLAUDE.md nor AGENTS.md exists in {}; \
-                 creating CLAUDE.md. If you use Codex / OpenCode / \
-                 Cursor / Gemini CLI / Antigravity CLI / Kimi Code / \
-                 Kiro CLI, re-run with `--target AGENTS.md`.",
-                cwd.display()
-            );
+                "{}", i18n.format("cli-install-instructions-note-neither-claude-md-nor-agents-md-exists-in-creating-claude-md-if-you-use", &[("value0", format!("{}", cwd.display()))]));
             Ok(vec![claude_md])
         }
     }

@@ -28,6 +28,7 @@ const CLI_CLIENT_KIND: &str = "cli";
 /// Non-success response returned by the configured ai-memory server.
 #[derive(Debug)]
 pub(crate) struct ServerResponseError {
+    i18n: ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     path: String,
     status: reqwest::StatusCode,
@@ -48,23 +49,29 @@ impl ServerResponseError {
 
 impl fmt::Display for ServerResponseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} {}: server returned {}: {}",
-            self.method, self.path, self.status, self.body
-        )
+        formatter.write_str(&self.i18n.format(
+            "cli-http-server-response",
+            &[
+                ("method", self.method.to_string()),
+                ("path", self.path.clone()),
+                ("status", self.status.to_string()),
+                ("detail", self.body.clone()),
+            ],
+        ))
     }
 }
 
 impl std::error::Error for ServerResponseError {}
 
 fn server_response_error(
+    i18n: &ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     url: &reqwest::Url,
     status: reqwest::StatusCode,
     body: String,
 ) -> anyhow::Error {
     ServerResponseError {
+        i18n: i18n.clone(),
         method,
         path: url.path().to_owned(),
         status,
@@ -81,6 +88,7 @@ pub(crate) fn server_response_error_for_test(
     body: String,
 ) -> anyhow::Error {
     ServerResponseError {
+        i18n: ai_memory_core::i18n::Localizer::default(),
         method,
         path: path.to_owned(),
         status,
@@ -96,6 +104,7 @@ pub(crate) fn server_response_error_for_test(
 /// credentials in the URL never land in a message. `reqwest` does not carry
 /// the request method on the response, so callers supply it.
 async fn require_success(
+    i18n: &ai_memory_core::i18n::Localizer,
     method: reqwest::Method,
     resp: reqwest::Response,
 ) -> Result<reqwest::Response> {
@@ -105,12 +114,14 @@ async fn require_success(
     }
     let url = resp.url().clone();
     let body = resp.text().await.unwrap_or_default();
-    Err(server_response_error(method, &url, status, body))
+    Err(server_response_error(i18n, method, &url, status, body))
 }
 
 /// Resolved server target — origin URL + base-path prefix + optional bearer token.
 #[derive(Debug, Clone)]
 pub struct ServerEndpoint {
+    /// Human error/output language inherited from the command.
+    pub i18n: ai_memory_core::i18n::Localizer,
     /// Origin only (scheme + authority), any trailing slash and path
     /// stripped, e.g. `http://127.0.0.1:49374` or `http://192.168.0.90:49374`.
     pub url: String,
@@ -148,12 +159,14 @@ impl ServerEndpoint {
             config.auth.bearer_token.as_deref(),
         )
         .await;
-        Self::build(
+        let mut endpoint = Self::build(
             Some(config.server_url.clone()),
             token,
             config.server_url_configured(),
             Some(config.base_path.clone()).filter(|s| !s.is_empty()),
-        )
+        );
+        endpoint.i18n = config.i18n.clone();
+        endpoint
     }
 
     /// Build for a target the spawning hook already resolved: its URL
@@ -209,6 +222,7 @@ impl ServerEndpoint {
             normalize_prefix(&url_path)
         };
         Self {
+            i18n: ai_memory_core::i18n::Localizer::default(),
             url: origin,
             base_path,
             auth_token: token.filter(|s| !s.is_empty()),
@@ -325,7 +339,7 @@ pub async fn get_json<T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::GET, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::GET, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from GET {url}"))
@@ -347,7 +361,7 @@ pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::PATCH, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::PATCH, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from PATCH {url}"))
@@ -378,7 +392,7 @@ pub async fn post_json_no_content<B: Serialize>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    require_success(reqwest::Method::POST, resp).await?;
+    require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     Ok(())
 }
 
@@ -391,7 +405,7 @@ pub async fn post_empty(endpoint: &ServerEndpoint, path: &str) -> Result<()> {
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    require_success(reqwest::Method::POST, resp).await?;
+    require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     Ok(())
 }
 
@@ -413,7 +427,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let resp = require_success(reqwest::Method::POST, resp).await?;
+    let resp = require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from POST {url}"))
@@ -441,29 +455,19 @@ pub(crate) fn augment_connect_error(
     endpoint: &ServerEndpoint,
     url: &str,
 ) -> anyhow::Error {
+    let i18n = &endpoint.i18n;
     if error_chain_indicates_no_answer(&err) {
-        let hint = if endpoint.url_configured {
-            format!(
-                "\nAI_MEMORY_SERVER_URL is set to {} but nothing answered \
-                 (refused or timed out). Check the server is running, the \
-                 port is reachable from this host, and (if remote) any \
-                 firewall + bearer-token config matches.",
-                endpoint.url
-            )
-        } else {
-            format!(
-                "\nAI_MEMORY_SERVER_URL is NOT set; the CLI defaulted to \
-                 {} and nothing answered (refused or timed out). If your \
-                 server lives on another machine (e.g. a homelab), `export \
-                 AI_MEMORY_SERVER_URL=http://<server>:49374` and (if auth \
-                 is on) `export AI_MEMORY_AUTH_TOKEN=<token>` before \
-                 re-running.",
-                endpoint.url
-            )
-        };
-        anyhow::Error::new(err).context(format!("could not reach {url}.{hint}"))
+        let hint = i18n.one(
+            if endpoint.url_configured {
+                "cli-http-configured-server-hint"
+            } else {
+                "cli-http-default-server-hint"
+            },
+            &endpoint.url,
+        );
+        anyhow::Error::new(err).context(i18n.two("cli-http-unreachable", url, hint))
     } else {
-        anyhow::Error::new(err).context(format!("HTTP request to {url} failed"))
+        anyhow::Error::new(err).context(i18n.one("cli-http-request-failed", url))
     }
 }
 
@@ -578,7 +582,7 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let mut resp = require_success(reqwest::Method::POST, resp).await?;
+    let mut resp = require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     let permissions = checked_output_permissions(dest)?;
     let mut temporary = private_output_file(dest)
         .with_context(|| format!("creating temporary output beside {}", dest.display()))?;
@@ -766,6 +770,7 @@ mod tests {
         )
         .expect("test URL parses");
         let error = server_response_error(
+            &ai_memory_core::i18n::Localizer::default(),
             reqwest::Method::POST,
             &url,
             reqwest::StatusCode::NOT_FOUND,

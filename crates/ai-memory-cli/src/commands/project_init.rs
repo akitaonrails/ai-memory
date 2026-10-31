@@ -26,8 +26,12 @@ struct Suggestions {
 /// directory or marker cannot be inspected, or when the marker cannot be
 /// created without replacing an existing file.
 pub fn run(config: &Config, _: ProjectInitArgs) -> Result<()> {
+    let i18n = &config.i18n;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!("`ai-memory project init` needs an interactive terminal");
+        bail!(
+            "{}",
+            i18n.text("cli-project-init-ai-memory-project-init-needs-an-interactive-terminal")
+        );
     }
     // The physical directory to write in (the Docker wrapper binds the
     // checkout at /work), and the scope every client already resolves for
@@ -35,10 +39,12 @@ pub fn run(config: &Config, _: ProjectInitArgs) -> Result<()> {
     // marker that names a different scope would split the project's memory.
     let start = match super::scope_directories(config) {
         Some((_, lookup_cwd)) => std::path::PathBuf::from(lookup_cwd),
-        None => std::env::current_dir().context("reading the current directory")?,
+        None => std::env::current_dir()
+            .context(i18n.text("cli-profile-reading-the-current-directory"))?,
     };
     let (workspace, project) = super::resolve_scope(config, None, None)?;
     initialize(
+        &config.i18n,
         &start,
         &Suggestions { workspace, project },
         &mut io::stdin().lock(),
@@ -47,6 +53,7 @@ pub fn run(config: &Config, _: ProjectInitArgs) -> Result<()> {
 }
 
 fn initialize(
+    i18n: &ai_memory_core::i18n::Localizer,
     start: &Path,
     suggestions: &Suggestions,
     input: &mut impl io::BufRead,
@@ -65,14 +72,22 @@ fn initialize(
         );
     }
 
-    let workspace = prompt_scope_value("Workspace", &suggestions.workspace, input, output)?;
-    let project = prompt_scope_value("Project", &suggestions.project, input, output)?;
+    let workspace = prompt_scope_value(i18n, "Workspace", &suggestions.workspace, input, output)?;
+    let project = prompt_scope_value(i18n, "Project", &suggestions.project, input, output)?;
     write_new_marker(&marker, &render_marker(&workspace, &project))?;
-    writeln!(output, "Created {}.", marker.display()).context("reporting created marker")?;
+    writeln!(
+        output,
+        "{}",
+        i18n.diagnostic(&format!("Created {}.", marker.display()))
+    )
+    .context("reporting created marker")?;
     if repo_root.is_some() {
         writeln!(
             output,
-            "Commit it so every checkout and worktree of this repository routes the same way."
+            "{}",
+            i18n.diagnostic(
+                "Commit it so every checkout and worktree of this repository routes the same way."
+            )
         )
         .context("reporting created marker")?;
     }
@@ -80,6 +95,7 @@ fn initialize(
 }
 
 fn prompt_scope_value(
+    i18n: &ai_memory_core::i18n::Localizer,
     label: &str,
     suggestion: &str,
     input: &mut impl io::BufRead,
@@ -106,7 +122,10 @@ fn prompt_scope_value(
         }
         writeln!(
             output,
-            "Enter a non-empty name without '/', '\\', spaces or control characters."
+            "{}",
+            i18n.diagnostic(
+                "Enter a non-empty name without '/', '\\', spaces or control characters."
+            )
         )
         .context("reporting invalid marker scope")?;
     }
@@ -234,6 +253,7 @@ mod tests {
         let mut output = Vec::new();
 
         initialize(
+            &ai_memory_core::i18n::Localizer::default(),
             temp.path(),
             &suggest("default", "x"),
             &mut input,
@@ -262,6 +282,7 @@ mod tests {
         let mut output = Vec::new();
 
         initialize(
+            &ai_memory_core::i18n::Localizer::default(),
             temp.path(),
             &suggest("default", "acme-api"),
             &mut input,
@@ -297,7 +318,14 @@ mod tests {
         let mut input = Cursor::new(b"team\napi\n");
         let mut output = Vec::new();
 
-        initialize(&nested, &suggest("default", "x"), &mut input, &mut output).unwrap();
+        initialize(
+            &ai_memory_core::i18n::Localizer::default(),
+            &nested,
+            &suggest("default", "x"),
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
 
         assert!(worktree.join(MARKER_FILENAME).is_file());
         assert!(!main.join(MARKER_FILENAME).exists());
@@ -311,6 +339,7 @@ mod tests {
         let mut output = Vec::new();
 
         initialize(
+            &ai_memory_core::i18n::Localizer::default(),
             temp.path(),
             &suggest("default", "x"),
             &mut input,
@@ -340,6 +369,7 @@ mod tests {
         let mut output = Vec::new();
 
         let error = initialize(
+            &ai_memory_core::i18n::Localizer::default(),
             temp.path(),
             &suggest("default", "x"),
             &mut input,
@@ -375,6 +405,7 @@ mod tests {
         let mut output = Vec::new();
 
         let error = initialize(
+            &ai_memory_core::i18n::Localizer::default(),
             temp.path(),
             &suggest("default", "x"),
             &mut input,

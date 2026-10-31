@@ -2,7 +2,7 @@
 
 use crate::{
     state::WebState,
-    templates::{agent_label, encode_segment, humanize, project_href},
+    templates::{agent_label, encode_segment, project_href},
     views::{InboxView, MessageRow, RecipientOption, ScopeOption},
 };
 use ai_memory_core::{
@@ -41,6 +41,7 @@ fn mailbox_href(workspace: &str, project: &str, outbox: bool, offset: usize) -> 
 }
 
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     legacy: Option<axum::Extension<ai_memory_core::LegacyBrowserAuth>>,
@@ -105,7 +106,7 @@ pub(crate) async fn handler(
     } else {
         match super::resolve_read_scope(&state, viewer, &workspace, &project).await {
             Ok(s) => Some(s),
-            Err(e) => return super::page::refusal_response(&e),
+            Err(e) => return super::page::localized_refusal_response(&i18n, &e),
         }
     };
     let recipients = directory
@@ -191,22 +192,27 @@ pub(crate) async fn handler(
                 subject: m
                     .subject
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "Untitled message".into()),
+                    .unwrap_or_else(|| i18n.text("web-untitled-message")),
                 body: m.body,
                 from,
                 to,
                 agent: m
                     .to_agent
                     .map(|a| agent_label(a).to_owned())
-                    .unwrap_or_else(|| "Any project agent".into()),
+                    .unwrap_or_else(|| i18n.text("web-any-project-agent")),
                 state: m.state.as_str().into(),
-                state_label: match m.state {
-                    MessageState::Pending => "Queued",
-                    MessageState::Claimed => "Collected",
-                    MessageState::Cancelled => "Cancelled",
-                    MessageState::Editing => "Editing",
+                state_label: if i18n.tag() == "en" {
+                    match m.state {
+                        MessageState::Pending => "Queued",
+                        MessageState::Claimed => "Collected",
+                        MessageState::Cancelled => "Cancelled",
+                        MessageState::Editing => "Editing",
+                    }
+                    .to_owned()
+                } else {
+                    i18n.status(m.state.as_str())
                 },
-                when: humanize(&m.created_at.to_string()),
+                when: i18n.relative(&m.created_at.to_string()),
             }
         })
         .collect();
@@ -227,6 +233,7 @@ pub(crate) async fn handler(
         })
         .collect();
     let view = InboxView {
+        i18n: i18n.clone(),
         pending_total: scopes
             .iter()
             .fold(0_u64, |total, s| total.saturating_add(s.pending)),

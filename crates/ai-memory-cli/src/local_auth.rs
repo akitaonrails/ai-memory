@@ -123,6 +123,17 @@ impl AuthPosture {
         }
     }
 
+    pub(crate) fn localized_line(self, i18n: &ai_memory_core::i18n::Localizer) -> String {
+        if i18n.language() == ai_memory_core::i18n::Language::English {
+            return self.line();
+        }
+        match self {
+            Self::Token => i18n.text("cli-auth-posture-token"),
+            Self::NoneLoopback => i18n.one("cli-auth-posture-loopback", AUTH_ENABLE_FIX),
+            Self::None => i18n.text("cli-auth-posture-none"),
+        }
+    }
+
     /// The fix command, for JSON output.
     pub(crate) fn fix(self) -> Option<&'static str> {
         matches!(self, Self::NoneLoopback).then_some(AUTH_ENABLE_FIX)

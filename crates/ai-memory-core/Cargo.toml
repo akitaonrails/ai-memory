@@ -10,6 +10,10 @@ authors.workspace = true
 description = "Core domain types and errors for ai-memory."
 
 [dependencies]
+fluent-bundle.workspace = true
+fluent-syntax.workspace = true
+unic-langid.workspace = true
+tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -17,7 +21,6 @@ uuid.workspace = true
 jiff.workspace = true
 regex.workspace = true
 icu_normalizer.workspace = true
-tracing.workspace = true
 # JsonSchema on Tier/PageKind so the consolidation prompt's
 # structured-output schema enforces enum membership instead of
 # producing `{ "type": "string" }` with no constraints (which lets

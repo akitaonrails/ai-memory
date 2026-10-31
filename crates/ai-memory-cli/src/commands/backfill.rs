@@ -325,11 +325,22 @@ async fn backfill_endpoint(
     config: &Config,
     args: &crate::cli::BackfillArgs,
 ) -> Result<ServerEndpoint> {
+    let i18n = &config.i18n;
     if let Some(raw) = args.server_profile.as_deref() {
         let name = crate::server_profiles::ProfileName::parse(raw)
             .with_context(|| format!("`{raw}` is not a valid server profile name"))?;
-        let profile = crate::server_profiles::lookup(&config.data_dir, &name)
-            .map_err(|r| anyhow::anyhow!("server profile `{name}` was refused ({})", r.as_str()))?;
+        let profile = crate::server_profiles::lookup(&config.data_dir, &name).map_err(|r| {
+            anyhow::anyhow!(
+                "{}",
+                i18n.format(
+                    "cli-backfill-server-profile-name-was-refused",
+                    &[
+                        ("value0", format!("{}", name)),
+                        ("value1", r.as_str().to_string())
+                    ]
+                )
+            )
+        })?;
         return Ok(ServerEndpoint::for_hook_target(
             profile.url,
             Some(profile.token),
@@ -362,6 +373,7 @@ pub async fn run(config: &Config, args: crate::cli::BackfillArgs) -> Result<()> 
 
 /// [`run`] for the checkout at `cwd`.
 async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -> Result<()> {
+    let i18n = &config.i18n;
     // The SessionStart hook took the in-progress marker before spawning this
     // worker; free it however the run ends so a failed run can be retried.
     let inflight_claim = args
@@ -388,7 +400,8 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let home = run::native_home(config).context("locating the local harness session stores")?;
+    let home = run::native_home(config)
+        .context(i18n.text("cli-backfill-locating-the-local-harness-session-stores"))?;
     let mut report = BackfillReport {
         workspace: workspace.clone(),
         project: project.clone(),
@@ -403,7 +416,7 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
     let capture = TranscriptCapture::for_checkout(&config.data_dir, &cwd);
     if !capture.admits_capture() {
         report.skipped_not_admitted = true;
-        return finish(&args, &report);
+        return finish(i18n, &args, &report);
     }
     let endpoint = backfill_endpoint(config, &args).await?;
 
@@ -417,7 +430,7 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
             if !args.dry_run {
                 write_sentinel(&config.data_dir, &cwd);
             }
-            return finish(&args, &report);
+            return finish(i18n, &args, &report);
         }
     }
 
@@ -428,7 +441,7 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
     report.selected = selected.len();
 
     if args.dry_run {
-        return finish(&args, &report);
+        return finish(i18n, &args, &report);
     }
 
     // Import each selected session, oldest-first so the imported history reads
@@ -466,21 +479,32 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
                 // Quiet suppresses the success summary, not failures: the
                 // detached worker's stderr is the operator's diagnostic log.
                 eprintln!(
-                    "ai-memory: backfill of {} session {} failed: {error:#}",
-                    session.harness.as_str(),
-                    display_id(&session.native_session_id)
+                    "{}",
+                    i18n.format(
+                        "cli-backfill-ai-memory-backfill-of-session-failed-error",
+                        &[
+                            ("value0", session.harness.as_str().to_string()),
+                            ("value1", display_id(&session.native_session_id).to_string()),
+                            ("value2", format!("{:#}", error))
+                        ]
+                    )
                 );
             }
         }
     }
 
     write_sentinel(&config.data_dir, &cwd);
-    finish(&args, &report)?;
+    finish(i18n, &args, &report)?;
     if report.failed_sessions > 0 {
         bail!(
-            "backfill failed to import {} of {} selected session(s)",
-            report.failed_sessions,
-            report.selected
+            "{}",
+            i18n.format(
+                "cli-backfill-backfill-failed-to-import-of-selected-session-s",
+                &[
+                    ("value0", format!("{}", report.failed_sessions)),
+                    ("value1", format!("{}", report.selected))
+                ]
+            )
         );
     }
     Ok(())
@@ -897,6 +921,7 @@ async fn import_exported_transcript(
     transcript: ai_memory_workstream::ExportedTranscript,
     capture: &TranscriptCapture,
 ) -> Result<usize> {
+    let i18n = &endpoint.i18n;
     let sid = native_session_id;
     let agent = harness.agent_kind().as_str();
     let resolved = resolve_occurred_at(&transcript.events);
@@ -963,10 +988,7 @@ async fn import_exported_transcript(
         .count();
     if skipped > 0 {
         eprintln!(
-            "ai-memory: {} session {}: skipped {skipped} oversized transcript record(s); the rest was imported",
-            harness.as_str(),
-            run::display_session_id(display_id(sid))
-        );
+            "{}", i18n.format("cli-backfill-ai-memory-session-skipped-skipped-oversized-transcript-record-s-the-rest-was", &[("value0", harness.as_str().to_string()), ("value1", run::display_session_id(display_id(sid)).to_string()), ("value2", format!("{}", skipped))]));
     }
     Ok(content)
 }
@@ -1364,7 +1386,11 @@ async fn post_hook_items(endpoint: &ServerEndpoint, items: &[HookItem]) -> Resul
     Ok(())
 }
 
-fn finish(args: &crate::cli::BackfillArgs, report: &BackfillReport) -> Result<()> {
+fn finish(
+    i18n: &ai_memory_core::i18n::Localizer,
+    args: &crate::cli::BackfillArgs,
+    report: &BackfillReport,
+) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(report)?);
         return Ok(());
@@ -1374,29 +1400,38 @@ fn finish(args: &crate::cli::BackfillArgs, report: &BackfillReport) -> Result<()
     }
     if report.skipped_not_admitted {
         println!(
-            "ai-memory: capture mode is allowlist and this checkout has no .ai-memory.toml marker opting in (or its marker is unreadable) — nothing to backfill for {}/{}.",
-            report.workspace, report.project
-        );
+            "{}", i18n.format("cli-backfill-ai-memory-capture-mode-is-allowlist-and-this-checkout-has-no-ai-memory-toml", &[("value0", report.workspace.to_string()), ("value1", report.project.to_string())]));
         return Ok(());
     }
     if report.skipped_non_empty {
         println!(
-            "ai-memory: {}/{} already has captured sessions — nothing to backfill (use --force to import anyway).",
-            report.workspace, report.project
-        );
+            "{}", i18n.format("cli-backfill-ai-memory-already-has-captured-sessions-nothing-to-backfill-use-force-to-imp", &[("value0", report.workspace.to_string()), ("value1", report.project.to_string())]));
         return Ok(());
     }
     if report.dry_run {
         println!(
-            "ai-memory: would import {} local session(s) into {}/{} (dry run).",
-            report.selected, report.workspace, report.project
+            "{}",
+            i18n.format(
+                "cli-backfill-ai-memory-would-import-local-session-s-into-dry-run",
+                &[
+                    ("value0", format!("{}", report.selected)),
+                    ("value1", report.workspace.to_string()),
+                    ("value2", report.project.to_string())
+                ]
+            )
         );
         return Ok(());
     }
     if report.imported_sessions == 0 && report.failed_sessions == 0 {
         println!(
-            "ai-memory: no local session history found to backfill for {}/{}.",
-            report.workspace, report.project
+            "{}",
+            i18n.format(
+                "cli-backfill-ai-memory-no-local-session-history-found-to-backfill-for",
+                &[
+                    ("value0", report.workspace.to_string()),
+                    ("value1", report.project.to_string())
+                ]
+            )
         );
         return Ok(());
     }

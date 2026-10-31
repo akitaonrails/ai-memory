@@ -36,7 +36,7 @@ pub async fn run(config: &Config, args: ListProjectsArgs) -> Result<()> {
         return Ok(());
     }
 
-    print!("{}", render_human(&rows));
+    print!("{}", render_human(&config.i18n, &rows));
     Ok(())
 }
 
@@ -105,11 +105,16 @@ fn sort_rows(rows: &mut [ProjectRow]) {
     });
 }
 
-fn render_human(rows: &[ProjectRow]) -> String {
+fn render_human(i18n: &ai_memory_core::i18n::Localizer, rows: &[ProjectRow]) -> String {
     if rows.is_empty() {
-        return "No projects found.\n".to_owned();
+        return i18n.text("cli-list-projects-no-projects-found");
     }
 
+    let workspace_header = i18n.text("cli-table-workspace");
+    let project_header = i18n.text("cli-table-project");
+    let id_header = i18n.text("cli-table-project-id");
+    let pages_header = i18n.text("cli-table-pages");
+    let pages_width = unicode_width::UnicodeWidthStr::width(pages_header.as_str()).max(6);
     // Terminal columns are measured in display cells. Bytes over-count accents,
     // while scalar counts under-count double-width CJK characters.
     let workspace_width = rows
@@ -117,13 +122,17 @@ fn render_human(rows: &[ProjectRow]) -> String {
         .map(|row| unicode_width::UnicodeWidthStr::width(row.workspace_name.as_str()))
         .max()
         .unwrap_or(0)
-        .max(unicode_width::UnicodeWidthStr::width("WORKSPACE"));
+        .max(unicode_width::UnicodeWidthStr::width(
+            workspace_header.as_str(),
+        ));
     let project_width = rows
         .iter()
         .map(|row| unicode_width::UnicodeWidthStr::width(row.project_name.as_str()))
         .max()
         .unwrap_or(0)
-        .max(unicode_width::UnicodeWidthStr::width("PROJECT"));
+        .max(unicode_width::UnicodeWidthStr::width(
+            project_header.as_str(),
+        ));
     // The id column carries what `--project-id` takes. A row from an older
     // server has no id; render `-` rather than hiding the column, so the
     // header stays stable across server versions. (#1208)
@@ -132,18 +141,36 @@ fn render_human(rows: &[ProjectRow]) -> String {
         .map(|row| unicode_width::UnicodeWidthStr::width(row.project_id.as_deref().unwrap_or("-")))
         .max()
         .unwrap_or(0)
-        .max(unicode_width::UnicodeWidthStr::width("PROJECT ID"));
+        .max(unicode_width::UnicodeWidthStr::width(id_header.as_str()));
 
-    let mut out = format!(
-        "{}  {}  {}  {:>6}  LAST UPDATED\n",
-        display_cell("WORKSPACE", workspace_width),
-        display_cell("PROJECT", project_width),
-        display_cell("PROJECT ID", id_width),
-        "PAGES"
-    );
+    let mut out =
+        i18n.format(
+            "cli-list-projects-table-header",
+            &[
+                (
+                    "value0",
+                    display_cell(&workspace_header, workspace_width).to_string(),
+                ),
+                (
+                    "value1",
+                    display_cell(&project_header, project_width).to_string(),
+                ),
+                ("value2", display_cell(&id_header, id_width).to_string()),
+                (
+                    "value3",
+                    format!(
+                        "{}{}",
+                        " ".repeat(pages_width.saturating_sub(
+                            unicode_width::UnicodeWidthStr::width(pages_header.as_str())
+                        )),
+                        pages_header
+                    ),
+                ),
+            ],
+        );
     for row in rows {
         out += &format!(
-            "{}  {}  {}  {:>6}  {}\n",
+            "{}  {}  {}  {:>pages_width$}  {}\n",
             display_cell(&row.workspace_name, workspace_width),
             display_cell(&row.project_name, project_width),
             display_cell(row.project_id.as_deref().unwrap_or("-"), id_width),
@@ -179,7 +206,7 @@ mod tests {
     #[test]
     fn render_human_includes_the_project_id_needed_by_project_id_flags() {
         let rows = vec![row("default", "acme-api", 12, None)];
-        let out = render_human(&rows);
+        let out = render_human(&ai_memory_core::i18n::Localizer::default(), &rows);
         assert!(out.contains("PROJECT ID"), "{out}");
         assert!(
             out.contains("acme-api-id"),
@@ -195,7 +222,7 @@ mod tests {
             row("default", "café-api", 3, None),
             row("default", "web", 1, None),
         ];
-        let out = render_human(&rows);
+        let out = render_human(&ai_memory_core::i18n::Localizer::default(), &rows);
 
         // `café-api` is the widest PROJECT value, so only the two-space
         // column separator may follow it. Measured in bytes the column is 9
@@ -206,7 +233,10 @@ mod tests {
         );
         // Control: the same table in ASCII already renders this way, so the
         // assertion above is about the measurement, not the format.
-        let ascii = render_human(&[row("default", "acme-api", 3, None)]);
+        let ascii = render_human(
+            &ai_memory_core::i18n::Localizer::default(),
+            &[row("default", "acme-api", 3, None)],
+        );
         assert!(
             ascii.contains("acme-api  acme-api-id"),
             "the ASCII column is unchanged:\n{ascii}"
@@ -214,10 +244,13 @@ mod tests {
 
         // All three measured columns at once: with a non-ASCII value widest
         // in each, every data line occupies exactly the required display width.
-        let wide = render_human(&[
-            row("café-workspace", "café-api", 3, Some("2026-01-02")),
-            row("café-workspace", "web", 1, Some("2026-01-03")),
-        ]);
+        let wide = render_human(
+            &ai_memory_core::i18n::Localizer::default(),
+            &[
+                row("café-workspace", "café-api", 3, Some("2026-01-02")),
+                row("café-workspace", "web", 1, Some("2026-01-03")),
+            ],
+        );
         // 14 + 2 + 8 + 2 + 11 + 2 + 6 ("{:>6}" pages) + 2 + 10 (date).
         let expected = 14 + 2 + 8 + 2 + 11 + 2 + 6 + 2 + 10;
         for line in wide.lines().skip(1) {
@@ -228,10 +261,13 @@ mod tests {
             );
         }
 
-        let cjk = render_human(&[
-            row("開発環境共有", "記憶管理", 3, Some("2026-01-02")),
-            row("ops", "web", 1, Some("2026-01-03")),
-        ]);
+        let cjk = render_human(
+            &ai_memory_core::i18n::Localizer::default(),
+            &[
+                row("開発環境共有", "記憶管理", 3, Some("2026-01-02")),
+                row("ops", "web", 1, Some("2026-01-03")),
+            ],
+        );
         let mut lines = cjk.lines().skip(1);
         let first = lines.next().unwrap();
         let second = lines.next().unwrap();
@@ -254,7 +290,7 @@ mod tests {
             page_count: 1,
             last_updated: None,
         }];
-        let out = render_human(&rows);
+        let out = render_human(&ai_memory_core::i18n::Localizer::default(), &rows);
         let data_line = out.lines().nth(1).expect("one data line");
         assert!(data_line.contains("legacy"), "{data_line}");
         assert!(
@@ -265,13 +301,16 @@ mod tests {
 
     #[test]
     fn render_human_reports_an_empty_server() {
-        assert_eq!(render_human(&[]), "No projects found.\n");
+        assert_eq!(
+            render_human(&ai_memory_core::i18n::Localizer::default(), &[]),
+            "No projects found.\n"
+        );
     }
 
     #[test]
     fn render_human_prints_a_header_and_one_row_per_project() {
         let rows = vec![row("default", "acme-api", 12, Some("2026-09-30T00:00:00Z"))];
-        let out = render_human(&rows);
+        let out = render_human(&ai_memory_core::i18n::Localizer::default(), &rows);
         assert!(out.starts_with("WORKSPACE"), "{out}");
         assert!(out.contains("default"), "{out}");
         assert!(out.contains("acme-api"), "{out}");
@@ -282,7 +321,7 @@ mod tests {
     #[test]
     fn render_human_shows_a_dash_for_a_project_with_no_pages_yet() {
         let rows = vec![row("default", "empty-project", 0, None)];
-        let out = render_human(&rows);
+        let out = render_human(&ai_memory_core::i18n::Localizer::default(), &rows);
         let data_line = out.lines().nth(1).expect("one data line");
         assert!(data_line.contains("empty-project"), "{data_line}");
         assert!(data_line.trim_end().ends_with('-'), "{data_line}");
@@ -299,7 +338,7 @@ mod tests {
                 None,
             ),
         ];
-        let out = render_human(&rows);
+        let out = render_human(&ai_memory_core::i18n::Localizer::default(), &rows);
         // Every data line must be at least as wide as the longest name in its
         // column, i.e. the short names are padded, not truncated.
         for line in out.lines().skip(1) {

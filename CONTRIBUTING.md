@@ -162,6 +162,16 @@ Highlights for contributors:
   access disk directly and must retain their live-process guards. `backup`
   uses the running server's online SQLite backup API.
 
+## Translations
+
+Human CLI and web messages use embedded Fluent catalogs. See
+[interface languages](docs/localization.md) for message ownership, plural and
+escaping rules, adding languages, and the catalog checks. Update every shipped
+language when changing an existing message or CLI help description. A new CLI
+`bail!`, `anyhow!`, `.context` or `diagnostic` message also needs an entry in
+each `diagnostics.ftl`; `every_cli_diagnostic_has_a_catalog_entry` lists any
+that are missing.
+
 ## Versioning and deprecation policy
 
 This project follows [Semantic Versioning](https://semver.org/):

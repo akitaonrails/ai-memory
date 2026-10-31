@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use askama::Template;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Query, Request, State};
@@ -44,8 +45,12 @@ use subtle::ConstantTimeEq as _;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::Notify;
 
-/// The page; `__NONCE__` is replaced per run.
-const PAGE: &str = include_str!("../../templates/setup_web.html");
+#[derive(Template)]
+#[template(path = "setup_web.html")]
+struct SetupPage<'a> {
+    i18n: &'a ai_memory_core::i18n::Localizer,
+    nonce: &'a str,
+}
 
 /// Stop when no request arrived for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -70,6 +75,7 @@ struct RunState {
 }
 
 pub(crate) struct Wizard {
+    i18n: ai_memory_core::i18n::Localizer,
     port: u16,
     secret: String,
     csrf: String,
@@ -102,6 +108,7 @@ impl Wizard {
                 .map_err(|error| anyhow::anyhow!("generating a random secret: {error}"))
         };
         Ok(Self {
+            i18n: ai_memory_core::i18n::Localizer::default(),
             port,
             secret: random(32)?,
             csrf: random(32)?,
@@ -149,6 +156,7 @@ impl Wizard {
 /// # Errors
 /// When the listener cannot bind or the server fails.
 pub(crate) async fn serve(
+    i18n: &ai_memory_core::i18n::Localizer,
     plan: serde_json::Value,
     accepted: Vec<String>,
     setup_flags: Vec<OsString>,
@@ -158,29 +166,39 @@ pub(crate) async fn serve(
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
-        .context("binding the setup page to 127.0.0.1")?;
+        .context(i18n.text("cli-setup-web-binding-the-setup-page-to-127-0-0-1"))?;
     let port = listener.local_addr()?.port();
-    let exe = std::env::current_exe().context("locating the running ai-memory binary")?;
-    let wizard = Arc::new(Wizard::new(
+    let exe = std::env::current_exe()
+        .context(i18n.text("cli-service-host-locating-the-running-ai-memory-binary"))?;
+    let mut install_args = install_args;
+    install_args.extend([OsString::from("--language"), OsString::from(i18n.tag())]);
+    let mut wizard = Wizard::new(
         port,
         plan,
         accepted,
         setup_flags,
         child_launcher(exe, install_args),
-    )?);
+    )?;
+    wizard.i18n = i18n.clone();
+    let wizard = Arc::new(wizard);
     let url = wizard.url();
-    println!("Open the setup page to choose your agents and apply:\n\n  {url}\n");
     println!(
-        "It answers only on this machine. Over SSH, forward the port first \
-         (`ssh -L {port}:127.0.0.1:{port} <host>`) and open the same address. \
-         Press Ctrl-C here to stop without changing anything."
+        "{}",
+        i18n.format(
+            "cli-setup-web-open-the-setup-page-to-choose-your-agents-and-apply-url",
+            &[("value0", url.to_string())]
+        )
     );
+    println!(
+        "{}", i18n.format("cli-setup-web-it-answers-only-on-this-machine-over-ssh-forward-the-port-first-ssh-l-port-1", &[("value0", format!("{}", port)), ("value1", format!("{}", port))]));
     if open_browser {
         open_in_browser(&url);
     }
 
     let idle = Arc::clone(&wizard);
+    let idle_i18n = i18n.clone();
     tokio::spawn(async move {
+        let i18n = &idle_i18n;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let running = {
@@ -188,7 +206,10 @@ pub(crate) async fn serve(
                 run.started && !run.done
             };
             if !running && idle.last_seen.lock().elapsed() > IDLE_TIMEOUT {
-                println!("The setup page was idle for 15 minutes; stopping it.");
+                println!(
+                    "{}",
+                    i18n.text("cli-setup-web-the-setup-page-was-idle-for-15-minutes-stopping-it")
+                );
                 idle.shutdown.notify_one();
                 return;
             }
@@ -212,17 +233,15 @@ pub(crate) async fn serve(
             }
         })
         .await
-        .context("serving the setup page")?;
+        .context(i18n.text("cli-setup-web-serving-the-setup-page"))?;
 
     let run = wizard.run.lock();
     match (run.started, run.done, run.ok) {
-        (false, _, _) => println!("The setup page closed; nothing was changed."),
-        (true, true, true) => println!("{}", super::setup::next_step_for_names(&run.agents)),
+        (false, _, _) => println!("{}", i18n.text("cli-setup-web-the-setup-page-closed-nothing-was-changed")),
+        (true, true, true) => println!("{}", super::setup::localized_next_step(i18n, &run.agents)),
         (true, true, false) => anyhow::bail!(
-            "setup finished with problems; see the output on the page, or run `ai-memory setup` \
-             here"
-        ),
-        (true, false, _) => anyhow::bail!("the setup page stopped while setup was still running"),
+            "{}", i18n.text("cli-setup-web-setup-finished-with-problems-see-the-output-on-the-page-or-run-ai-memory-set")),
+        (true, false, _) => anyhow::bail!("{}", i18n.text("cli-setup-web-the-setup-page-stopped-while-setup-was-still-running")),
     }
     Ok(())
 }
@@ -323,7 +342,16 @@ async fn page(State(wizard): State<Arc<Wizard>>) -> Response {
         "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; \
          connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     );
-    let mut response = Response::new(Body::from(PAGE.replace("__NONCE__", nonce)));
+    let body = match (SetupPage {
+        i18n: &wizard.i18n,
+        nonce,
+    })
+    .render()
+    {
+        Ok(body) => body,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut response = Response::new(Body::from(body));
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,

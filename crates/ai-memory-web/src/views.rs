@@ -7,6 +7,7 @@ use askama::Template;
 #[derive(Template)]
 #[template(path = "agent.html")]
 pub(crate) struct AgentView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     pub workspace: String,
     pub project: String,
     pub project_href: String,
@@ -41,13 +42,14 @@ pub(crate) struct MessageRow {
     pub to: String,
     pub agent: String,
     pub state: String,
-    pub state_label: &'static str,
+    pub state_label: String,
     pub when: String,
 }
 
 #[derive(Template)]
 #[template(path = "inbox.html")]
 pub(crate) struct InboxView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     pub workspace: String,
     pub project: String,
     pub project_href: String,

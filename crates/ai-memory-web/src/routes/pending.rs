@@ -18,9 +18,7 @@ use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::state::WebState;
-use crate::templates::{
-    PendingRow, PendingView, SelectOption, encode_segment, humanize, page_href,
-};
+use crate::templates::{PendingRow, PendingView, SelectOption, encode_segment, page_href};
 
 /// Most proposals one page load reads. A queue this long needs the CLI, and
 /// the cap keeps the page (which embeds every body) bounded.
@@ -51,12 +49,13 @@ pub(crate) struct PendingQuery {
 
 /// Handler for `GET /pending`.
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     level: Option<Extension<AuthLevel>>,
     legacy: Option<Extension<LegacyBrowserAuth>>,
     Query(query): Query<PendingQuery>,
 ) -> Response {
-    if let Err(response) = super::require_admin(&state, level).await {
+    if let Err(response) = super::require_admin(&i18n, &state, level).await {
         return response;
     }
 
@@ -117,7 +116,11 @@ pub(crate) async fn handler(
 
     render(
         PendingView {
-            rows: reviews.into_iter().map(pending_row).collect(),
+            i18n: i18n.clone(),
+            rows: reviews
+                .into_iter()
+                .map(|review| pending_row(&i18n, review))
+                .collect(),
             projects,
             sorts,
             total,
@@ -168,12 +171,15 @@ fn sort_reviews(reviews: &mut [PendingAutoImproveReview], sort: &str) {
     });
 }
 
-fn pending_row(review: PendingAutoImproveReview) -> PendingRow {
+fn pending_row(
+    i18n: &ai_memory_core::i18n::Localizer,
+    review: PendingAutoImproveReview,
+) -> PendingRow {
     let label = scope_label(&review);
     let summary = review.summary;
     let target_path = summary.target_path.as_str().to_owned();
     let staged_relative = jiff::Timestamp::from_microsecond(summary.staged_at)
-        .map(|ts| humanize(&ts.to_string()))
+        .map(|ts| i18n.relative(&ts.to_string()))
         .unwrap_or_default();
     let id = summary.id.to_string();
     let posix_cli_approve =

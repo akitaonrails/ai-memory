@@ -125,9 +125,10 @@ pub(super) fn project_binding_for_server(
     project: &str,
     path: &Path,
 ) -> Result<Option<ManagedProjectScope>> {
+    let i18n = &config.i18n;
     let canonical = path
         .canonicalize()
-        .context("canonicalizing project binding checkout")?;
+        .context(i18n.text("cli-project-registry-canonicalizing-project-binding-checkout"))?;
     let fingerprints = inspect_repository_fingerprints(&canonical)?;
     let registry = match load_registry(&registry_path(config)) {
         Ok(registry) => registry,
@@ -136,8 +137,7 @@ pub(super) fn project_binding_for_server(
             // discovery. Select no ID and leave the file untouched; the server
             // still refuses ambiguous names and an explicit choice is required.
             eprintln!(
-                "ai-memory: could not read the checkout binding ({error:#}); using guarded project-name resolution"
-            );
+                "{}", i18n.format("cli-project-registry-ai-memory-could-not-read-the-checkout-binding-error-using-guarded-project-na", &[("value0", format!("{:#}", error))]));
             return Ok(None);
         }
     };
@@ -165,14 +165,14 @@ pub(super) fn record_project_binding(
     scope: &ManagedProjectScope,
     expected: &ai_memory_workstream::RepositoryFingerprints,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     let canonical = path
         .canonicalize()
-        .context("canonicalizing project binding checkout")?;
+        .context(i18n.text("cli-project-registry-canonicalizing-project-binding-checkout"))?;
     let fingerprints = inspect_repository_fingerprints(&canonical)?;
     if &fingerprints != expected {
         bail!(
-            "checkout identity changed while selecting the project; refusing to remember a stale selection"
-        );
+            "{}", i18n.text("cli-project-registry-checkout-identity-changed-while-selecting-the-project-refusing-to-remember-a"));
     }
     let server = endpoint.identity();
     update_registry(config, |registry| {
@@ -208,11 +208,18 @@ pub(super) fn record_prepared_checkout(
     project: &str,
     path: &Path,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     let canonical = path
         .canonicalize()
         .with_context(|| format!("canonicalizing checkout {}", path.display()))?;
     if !canonical.is_dir() {
-        bail!("checkout is not a directory: {}", canonical.display());
+        bail!(
+            "{}",
+            i18n.format(
+                "cli-project-registry-checkout-is-not-a-directory",
+                &[("value0", format!("{}", canonical.display()))]
+            )
+        );
     }
     let server = endpoint.identity();
     update_registry(config, |registry| {
@@ -328,6 +335,7 @@ fn update_registry(
     config: &Config,
     mutate: impl FnOnce(&mut ProjectRegistry) -> Result<bool>,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     fs::create_dir_all(&config.data_dir).with_context(|| {
         format!(
             "creating client data directory {}",
@@ -336,19 +344,25 @@ fn update_registry(
     })?;
     let lock = open_private_lock(&lock_path(config))?;
     lock.lock_exclusive()
-        .context("locking client project registry")?;
+        .context(i18n.text("cli-project-registry-locking-client-project-registry"))?;
 
     let path = registry_path(config);
     let mut registry = load_registry(&path)?;
     if mutate(&mut registry)? {
         if registry.links.len() > MAX_LINKS || registry.bindings.len() > MAX_LINKS {
-            bail!("client project registry exceeds {MAX_LINKS} links");
+            bail!(
+                "{}",
+                i18n.format(
+                    "cli-project-registry-client-project-registry-exceeds-max-links-links",
+                    &[("value0", format!("{}", MAX_LINKS))]
+                )
+            );
         }
-        let mut rendered =
-            serde_json::to_vec_pretty(&registry).context("serializing client project registry")?;
+        let mut rendered = serde_json::to_vec_pretty(&registry)
+            .context(i18n.text("cli-project-registry-serializing-client-project-registry"))?;
         rendered.push(b'\n');
         if rendered.len() as u64 > MAX_REGISTRY_BYTES {
-            bail!("client project registry exceeds the byte limit; keeping the previous registry");
+            bail!("{}", i18n.text("cli-project-registry-client-project-registry-exceeds-the-byte-limit-keeping-the-previous-registry"));
         }
         refuse_symlink(&path)?;
         ai_memory_wiki::write_atomic(&path, &rendered)
