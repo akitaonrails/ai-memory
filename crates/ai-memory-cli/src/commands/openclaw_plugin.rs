@@ -383,8 +383,11 @@ function postPreCompact(event: any, ctx: any): void {{
     // backlog.
     // Tracked in pendingHookRequests so session_end can await a bounded
     // flush instead of letting teardown kill the in-flight fetch (#676).
+    // A redirect rejects and spools the event: followed, a gateway's login
+    // page would count as a delivery.
     const request = fetch(url, {{
       proxy: false,
+      redirect: "error",
       method: "POST",
       headers: {{ "Content-Type": "application/json", ...authHeaders() }},
       body: JSON.stringify(policy.payload),
@@ -415,8 +418,11 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
   url.searchParams.set("agent", AGENT);
   if (!applyMarkerParams(url, currentCwd)) return undefined;
   try {{
+    // The body is prepended to the prompt, so a redirect is refused: a
+    // gateway's login page must never arrive as the handoff.
     const response = await fetch(url, {{
       proxy: false,
+      redirect: "error",
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
