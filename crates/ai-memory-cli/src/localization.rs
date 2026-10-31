@@ -378,7 +378,10 @@ mod tests {
         );
         let mut missing = Vec::new();
         for file in files {
-            let source = std::fs::read_to_string(&file).unwrap();
+            // A Windows checkout has CRLF, which rustc treats as a plain newline.
+            let source = std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n");
             let body = test_module
                 .find(&source)
                 .map_or(source.as_str(), |found| &source[..found.start()]);

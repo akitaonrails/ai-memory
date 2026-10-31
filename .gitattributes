@@ -4,6 +4,10 @@ crates/ai-memory-core/src/routing_skills/*/SKILL.md text eol=lf
 crates/ai-memory-core/src/routing_skills/*.md text eol=lf
 crates/ai-memory-consolidate/prompts/*.md text eol=lf
 
+# Fluent catalogs are embedded too, and CLI diagnostics match them against
+# source strings, so a checkout must not change their line endings.
+crates/ai-memory-core/locales/**/*.ftl text eol=lf
+
 # Refinery hashes the embedded SQL bytes. Keep migration checksums identical
 # across Unix and Windows checkouts, including checksum-provenance fixtures.
 crates/ai-memory-store/migrations/*.sql text eol=lf

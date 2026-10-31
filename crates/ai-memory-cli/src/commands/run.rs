@@ -1701,6 +1701,7 @@ async fn run_once_with_wiring(
     .await
     {
         let agent = harness.agent_kind().as_str();
+        let session = display_session_id(&session.to_string());
         match finalized {
             Ok(ids) if !ids.is_empty() => {
                 eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: finalized the {agent} session {session}")));
