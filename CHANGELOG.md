@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `bootstrap` now waits for a provider's `Retry-After` before retrying a
+  chunk, capped at 32 s like the remote embedders (#1397). It retried after a
+  fixed 2 s and gave up after three attempts, so a rate-limited hosted API
+  (DeepSeek, OpenAI) failed the run while it was still asking the client to
+  wait. Without a hint the fixed 2 s delay is unchanged (#1889).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).
