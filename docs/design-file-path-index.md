@@ -59,8 +59,9 @@ CREATE INDEX idx_observations_file_path
 ```
 
 The column follows the V10 precedent. A row has at most one path in this
-version (3.2), so a side table would only add a join. Because the path lives on
-the observation row, every lifecycle operation in 3.5 applies to it with no new
+version (section 3.2), so a side table would only add a join. Because the path
+lives on the observation row, every lifecycle operation in section 3.5 applies
+to it with no new
 code.
 
 ### 3.2 Where the path comes from
@@ -320,7 +321,7 @@ section 10, question 7.
 - **A side table:** fits several paths per call (a multi-file `apply_patch`), at
   the cost of a join and its own lifecycle. Deferred until multi-file calls are
   in scope.
-- **The path inside `_ai_memory_capture`:** breaks older servers (3.2).
+- **The path inside `_ai_memory_capture`:** breaks older servers (section 3.2).
 - **A protocol version bump:** same effect on older servers.
 - **A hash instead of the path:** a repository path has little entropy, so the
   hash hides little, and it makes the index unreadable for diagnosis.
