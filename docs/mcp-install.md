@@ -1352,6 +1352,9 @@ mirror Claude Code's vocabulary (`SessionStart`, `UserPromptSubmit`,
 native `ai-memory hook --event … --agent grok` commands. Session-end
 handoff *creation* works. Injection is the first `PostToolUse`: JSON
 `additionalContext` with the pending handoff and an opted-in `[briefing]`.
+A subagent runs in a Grok session of its own whose events carry
+`subagentType`: its tool calls never claim the handoff, and its end closes
+and summarizes that session without leaving one.
 `memory_handoff_list` is the first-turn path when the managed Grok rule is
 installed (skills live under `.grok/skills` / `$GROK_HOME/skills`, default
 `~/.grok/skills`; the rule lives under `$GROK_HOME/rules`).
