@@ -3123,8 +3123,11 @@ async function drainHookSpool(): Promise<void> {
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
       // Bun reads HTTP(S)_PROXY and ALL_PROXY even for a loopback URL;
       // `proxy: false` connects directly. Node's fetch ignores the key.
+      // A redirect is refused, not followed: a gateway's login page answers
+      // 200, and the entry would be deleted as delivered.
       const resp = await fetch(entry.url, {
         proxy: false,
+        redirect: "error",
         method: "POST",
         headers,
         body: entry.body,
