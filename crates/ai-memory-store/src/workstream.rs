@@ -291,18 +291,20 @@ pub(crate) fn pinned_hook_scope(
     let Some((true, linked, delivered, expires)) = pin else {
         return Ok(None);
     };
-    let refused = || StoreError::InvalidState("ID-selected managed run boundary mismatch".into());
+    let refused = || StoreError::ManagedRunBoundaryRefused;
     let run = ManagedRunBoundaryRow::read(&tx, input.run_id)?.ok_or_else(refused)?;
     let native = NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin())
         .map_err(|_| refused())?;
     if run.state != "active"
-        || expires <= Timestamp::now().as_microsecond()
         || run.agent != input.agent.as_str()
         || run.owner_user != input.owner_user
         || ((linked || delivered) && run.native_session.as_deref() != Some(native.as_str()))
         || ((input.session_start || !linked) && input.cwd.as_deref() != Some(run.cwd.as_str()))
     {
         return Err(refused());
+    }
+    if expires <= Timestamp::now().as_microsecond() {
+        return Err(StoreError::ManagedRunLeaseLapsed);
     }
     Ok(Some((
         WorkspaceId::from_slice(&run.workspace)?,

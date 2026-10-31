@@ -560,8 +560,9 @@ passed `claude plugin validate --strict` in the prototype.
 }
 ```
 
-`plugins/claude-code/hooks/hooks.json`, the same nine events and empty
-matchers `install-hooks` writes today:
+`plugins/claude-code/hooks/hooks.json`, the same events and empty matchers
+`install-hooks` writes today (`PostToolUseFailure` was added later in the same
+shape):
 
 ```json
 {

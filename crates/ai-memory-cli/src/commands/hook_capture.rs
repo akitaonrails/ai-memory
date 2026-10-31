@@ -175,8 +175,8 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
     };
-    // `workspacePaths` is Antigravity's spelling; `workspace_roots` is
-    // Cursor's. Cursor never sends a usable top-level `cwd` — `sessionStart`
+    // `workspacePaths` is Antigravity's spelling, `workspace_roots` is
+    // Cursor's, and `workspaceRoots` is Cline's. Cursor never sends a usable top-level `cwd` — `sessionStart`
     // / `sessionEnd` omit it and its tool events send `cwd: ""` — so without
     // this the whole session resolves to no cwd and lands in `default/scratch`.
     let first_array_path = |keys: &[&str]| {
@@ -194,7 +194,7 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
         })
     };
     let cwd = direct(&["cwd", "current_dir", "working_dir", "directory"])
-        .or_else(|| first_array_path(&["workspacePaths", "workspace_roots"]))
+        .or_else(|| first_array_path(&["workspacePaths", "workspace_roots", "workspaceRoots"]))
         .or_else(|| {
             [
                 ["path", "cwd"].as_slice(),
@@ -214,6 +214,7 @@ pub fn canonical_context(payload: &serde_json::Value) -> (Option<String>, Option
         "sessionID",
         "session",
         "conversationId",
+        "taskId",
     ])
     .or_else(|| {
         [
@@ -1616,6 +1617,34 @@ mod tests {
         assert_eq!(
             canonical_context(&tool_event).0,
             Some("/checkouts/repo-a".into())
+        );
+    }
+
+    /// Cline file hooks send no top-level `cwd` and no `session_id`: the
+    /// checkout arrives as `workspaceRoots` and the session as `taskId`
+    /// (#1888). Routing already reads both, so the capture gate must too, or
+    /// allowlist mode finds no marker and drops every Cline event. Shape
+    /// abridged from a Cline CLI 3.0.74 `TaskStart` payload.
+    #[test]
+    fn canonical_context_reads_cline_workspace_roots_and_task_id() {
+        let task_start = serde_json::json!({
+            "taskId": "conv_cline-task",
+            "hookName": "agent_start",
+            "sessionContext": {"rootSessionId": "root"},
+            "workspaceRoots": ["/checkouts/repo-a", "/checkouts/repo-b"],
+            "workspaceInfo": {"rootPath": "/checkouts/repo-a", "latestGitBranchName": "main"}
+        });
+        assert_eq!(
+            canonical_context(&task_start),
+            (
+                Some("/checkouts/repo-a".into()),
+                Some("conv_cline-task".into())
+            )
+        );
+        let routing = ai_memory_hooks::payload::hook_payload_context(&task_start);
+        assert_eq!(
+            canonical_context(&task_start),
+            (routing.cwd, routing.session_id)
         );
     }
 

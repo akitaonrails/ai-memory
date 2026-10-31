@@ -4987,6 +4987,7 @@ fn add_hook_spooling(source: String) -> Result<String> {
     const FETCH_REPLACEMENT: &str = r#"      try {
         const resp = await fetch(item.url, {
           proxy: false,
+          redirect: "error",
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify(item.payload),
@@ -4994,7 +4995,9 @@ fn add_hook_spooling(source: String) -> Result<String> {
         }).catch(() => undefined);
         // Unreachable server, 5xx or a transient 4xx (408, 425, 429): keep the
         // event on disk for a later drain (#580). Any other 4xx is permanent -
-        // spooling it would retry a rejection forever.
+        // spooling it would retry a rejection forever. A redirect rejects
+        // above and spools too: following it would count a gateway's login
+        // page as a delivery, and a 307 would replay the event to that host.
         if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(item.url, item.payload);
       } catch (_e) {
         try { spoolFailedHook(item.url, item.payload); } catch (_e2) {}
@@ -5310,8 +5313,11 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   if (id) url.searchParams.set("session_id", id);
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
+    // The body goes into the system prompt, so a redirect is refused: a
+    // gateway's login page must never arrive as the handoff.
     const response = await fetch(url, {{
       proxy: false,
+      redirect: "error",
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
@@ -5335,6 +5341,7 @@ async function fetchRecap(cwd: string, id: string): Promise<string | undefined> 
   try {{
     const response = await fetch(url, {{
       proxy: false,
+      redirect: "error",
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
@@ -5806,8 +5813,11 @@ function mcpHeaders(ctx?: any): Record<string, string> {
 
 async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<any> {
   const id = ++mcpRequestId;
+  // Like the hook client, the bridge never follows a redirect: a 307 or 308
+  // would replay the request body and session headers to the redirect target.
   const response = await fetch(MCP_SERVER, {
     proxy: false,
+    redirect: "error",
     method: "POST",
     headers: mcpHeaders(ctx),
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} }),
@@ -5823,6 +5833,7 @@ async function mcpRpc(method: string, params?: unknown, ctx?: any, signal?: Abor
 async function mcpNotify(method: string, params?: unknown, ctx?: any, signal?: AbortSignal): Promise<void> {
   const response = await fetch(MCP_SERVER, {
     proxy: false,
+    redirect: "error",
     method: "POST",
     headers: mcpHeaders(ctx),
     body: JSON.stringify({ jsonrpc: "2.0", method, params: params ?? {} }),
@@ -6144,8 +6155,11 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   if (id) url.searchParams.set("session_id", id);
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
+    // The body becomes the agent's context, so a redirect is refused: a
+    // gateway's login page must never arrive as the handoff.
     const response = await fetch(url, {{
       proxy: false,
+      redirect: "error",
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
@@ -6791,7 +6805,7 @@ fn render_grok(
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
-    for (_, script) in super::render_shared::CLAUDE_CODE_EVENTS {
+    for (_, script) in super::render_shared::GROK_EVENTS {
         let script = hook_script_for_claude_code(script);
         let abs = hooks_dir.join(script.as_ref());
         if !abs.exists() {
@@ -15071,6 +15085,105 @@ process.exit(0);
                 );
             }
         }
+
+        /// Every request reaches a gateway in front of the server that
+        /// answers with a redirect to its login page on another origin: 302
+        /// for reads, 307 for the event posts, which a followed redirect
+        /// would replay there. One event from an earlier offline session is
+        /// already spooled.
+        const REDIRECT_HARNESS: &str = r#"import { createServer } from "node:http";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const project = process.argv[2]!;
+const loginHits: string[] = [];
+const login = createServer((req, res) => {
+  req.resume();
+  loginHits.push(`${req.method} ${req.url}`);
+  res.writeHead(200, { "content-type": "text/html" });
+  res.end("<html>GATEWAY-LOGIN</html>");
+});
+await new Promise<void>((resolve) => login.listen(0, "127.0.0.1", () => resolve()));
+const loginPort = (login.address() as any).port;
+const gatewayBodies: string[] = [];
+const gateway = createServer((req, res) => {
+  let body = "";
+  req.on("data", (chunk) => (body += chunk));
+  req.on("end", () => {
+    gatewayBodies.push(body);
+    res.writeHead(req.method === "POST" ? 307 : 302, {
+      location: `http://127.0.0.1:${loginPort}/login`,
+    });
+    res.end();
+  });
+});
+await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", () => resolve()));
+const port = (gateway.address() as any).port;
+
+const spool = join(process.env.AI_MEMORY_DATA_DIR!, "hook-spool");
+mkdirSync(spool, { recursive: true });
+writeFileSync(join(spool, "0000000000001-1-0000000000000001.json"), JSON.stringify({
+  url: `http://127.0.0.1:${port}/hook?event=user-prompt&agent=omp`,
+  body: JSON.stringify({ sessionID: "s-offline", prompt: "SPOOLED-WHILE-OFFLINE" }),
+  created_ms: 1,
+  auth_mode: "none",
+}));
+writeFileSync(
+  "./ext.ts",
+  readFileSync("./ext.template.ts", "utf8").replace("http://127.0.0.1:65535", `http://127.0.0.1:${port}`),
+);
+const { default: AiMemoryExtension } = await import("./ext.ts");
+const handlers: Record<string, any> = {};
+AiMemoryExtension({ on: (name: string, fn: any) => { handlers[name] = fn; } });
+const ctx = { sessionManager: { getSessionId: () => "s-gateway" }, cwd: project };
+handlers["session_start"]({}, ctx);
+const reply = await handlers["before_agent_start"]({ prompt: "continue" }, ctx);
+await handlers["session_shutdown"]({}, ctx);
+// A queue flush starts the spool drain in the background: wait until it has
+// posted the spooled event, then give its answer time to land.
+const drained = () => gatewayBodies.some((body) => body.includes("SPOOLED-WHILE-OFFLINE"));
+for (let i = 0; i < 100 && !drained(); i++) {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+await new Promise((resolve) => setTimeout(resolve, 300));
+console.log(JSON.stringify({
+  handoff: reply?.message?.content ?? null,
+  loginHits,
+  drained: drained(),
+  spooled: readdirSync(spool).filter((name) => name.endsWith(".json")).sort(),
+}));
+process.exit(0);
+"#;
+
+        /// Followed, the gateway's redirect would put its login page in the
+        /// agent's context, count it as the delivery of every event (the
+        /// spooled one deleted, this session's never spooled) and replay the
+        /// posts to the login origin. Refused, that origin is never
+        /// contacted, no handoff is injected, and the events wait on disk
+        /// for the real server.
+        #[test]
+        fn omp_extension_refuses_a_gateway_redirect() {
+            if !node_strips_types() {
+                eprintln!("skipping: node lacks --experimental-strip-types");
+                return;
+            }
+            let tmp = TempDir::new().unwrap();
+            let project = tmp.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let run = run_harness(&tmp, extension_under_test(), REDIRECT_HARNESS, &project);
+            assert_eq!(run["loginHits"], serde_json::json!([]), "{run}");
+            assert!(run["handoff"].is_null(), "{run}");
+            assert_eq!(run["drained"], serde_json::json!(true), "{run}");
+            let spooled = run["spooled"].as_array().expect("spool listing");
+            assert!(
+                spooled.contains(&serde_json::json!("0000000000001-1-0000000000000001.json")),
+                "the refused drain must keep the earlier event: {run}"
+            );
+            assert!(
+                spooled.len() > 1,
+                "this session's refused posts must be spooled: {run}"
+            );
+        }
     }
 
     #[test]
@@ -16250,6 +16363,17 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             command.contains(&staged_script.to_string_lossy().into_owned()),
             "generated command must reference staged script {}: {command}",
             staged_script.display()
+        );
+        // The failure event shares the post-tool-use handler.
+        let failure = parsed
+            .pointer("/hooks/PostToolUseFailure/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .expect("PostToolUseFailure command should be present");
+        assert_eq!(
+            Some(failure),
+            parsed
+                .pointer("/hooks/PostToolUse/0/hooks/0/command")
+                .and_then(serde_json::Value::as_str)
         );
     }
 

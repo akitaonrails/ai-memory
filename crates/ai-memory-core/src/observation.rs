@@ -12,6 +12,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentKind, ObservationId, ProjectId, SessionId, WorkspaceId};
 
+/// Splits a tool observation body into its metadata header (`tool_family:
+/// …`, ids, `outcome: …`) and its output excerpt.
+pub const TOOL_BODY_SEPARATOR: &str = "\n---\n";
+
+/// Starts the header's outcome line; the outcome follows.
+pub const TOOL_OUTCOME_LINE_PREFIX: &str = "\noutcome: ";
+
+/// The header's last line when the harness reported the call as failed.
+pub const FAILED_TOOL_OUTCOME_LINE: &str = "\noutcome: error";
+
+/// Readers check the header on this many leading characters only. Every
+/// header the router writes fits, so an output excerpt is never scanned.
+pub const TOOL_BODY_HEADER_MAX_CHARS: usize = 512;
+
 /// Classification of a single observation, mirroring the headline
 /// Claude Code / Codex lifecycle hook events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

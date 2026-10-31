@@ -137,7 +137,10 @@ The page records the source file's basename, format, SHA-256 digest, and
 extractor version, followed by sanitized text. Its path includes the full
 source digest, and its last line carries a deterministic provenance marker.
 A rerun therefore performs no duplicate write. If another page already owns
-that path, the import refuses to replace it.
+that path, the import refuses to replace it. The rerun compares the whole
+stored page, read through `memory_read_page`, which returns at most 64,000
+characters of a body; a page longer than that cannot be compared, so its
+rerun fails with that reason instead of being reported as present.
 
 This is text extraction, not a media pipeline. Image-only PDFs need OCR before
 import. Images, raw audio/video, and proprietary media transcription are not
@@ -230,7 +233,8 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
 - Each record has a stable ingest key, a UUIDv5 of its agentmemory id, written
   on the page's last line. A rerun compares the entire sanitized planned body,
   including that line, with the page the server already holds before skipping
-  it. Editing the body while keeping its attribution footer therefore cannot
+  it. `memory_read_page` returns at most 64,000 characters of a body, so a
+  longer page cannot be compared and stops the run with that reason. Editing the body while keeping its attribution footer therefore cannot
   authorize a later imported version to replace the edit. Server-side
   sanitation that changes the body also stops automatic resumption. This
   comparison covers the body, not frontmatter-only edits; a later imported

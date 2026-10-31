@@ -395,8 +395,8 @@ write one, keeping in mind that `.github/mcp.json` is meant to be committed,
 so it should not carry a bearer token. `install-hooks --agent copilot-cli`
 run without `--server-url` reads the URL and token back from this entry.
 
-The hook installer wires Claude Code's nine events plus `PostToolUseFailure`
-with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
+The hook installer wires the same ten events as Claude Code, `PostToolUseFailure`
+included, with PascalCase names, which makes Copilot send its VS Code/Claude-compatible
 payload; native installs spool events locally and enforce capture exclusions. The
 `SessionStart` hook delivers the prior session's handoff: Copilot reads a
 top-level `additionalContext` from `SessionStart` stdout (not Claude Code's
@@ -1352,6 +1352,9 @@ mirror Claude Code's vocabulary (`SessionStart`, `UserPromptSubmit`,
 native `ai-memory hook --event … --agent grok` commands. Session-end
 handoff *creation* works. Injection is the first `PostToolUse`: JSON
 `additionalContext` with the pending handoff and an opted-in `[briefing]`.
+A subagent runs in a Grok session of its own whose events carry
+`subagentType`: its tool calls never claim the handoff, and its end closes
+and summarizes that session without leaving one.
 `memory_handoff_list` is the first-turn path when the managed Grok rule is
 installed (skills live under `.grok/skills` / `$GROK_HOME/skills`, default
 `~/.grok/skills`; the rule lives under `$GROK_HOME/rules`).

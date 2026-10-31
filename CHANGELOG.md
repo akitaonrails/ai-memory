@@ -30,6 +30,65 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Removed numeric `format` annotations from strict OpenAI-shaped JSON Schemas,
+  including nullable number and integer fields, while preserving string
+  formats. OpenCode Go Muse rejected schemars' `float` hint before running the
+  model, so every auto-improvement review failed with HTTP 400 (#1901).
+- Appended the target JSON Schema to the system prompt during `openai-compat`
+  tolerant structured completion fallback and direct tolerant mode, preventing
+  models from omitting top-level object wrappers when `response_format` is
+  unsupported or rejected (#1909).
+- The generated OpenCode, OpenCode 2, OMP, Pi and OpenClaw integrations no
+  longer follow HTTP redirects, matching the native hook client (#1818).
+  Behind an SSO gateway, proxy or captive portal that redirects to a login
+  page, the page's `200` counted as a delivery: the spool drain deleted
+  spooled events and new ones were never spooled, the login page's HTML was
+  injected as the session's handoff, and a `307` or `308` replayed event
+  bodies to the redirect target. A redirect now fails the request like an
+  unreachable server, so the event stays spooled and no handoff is injected.
+  `ai-memory upgrade` refreshes installed integrations (#1902).
+- `ai-memory-wikisync` no longer refuses a destination as "already being
+  modified" right after its own run released it. On Unix a child forked by
+  another thread inherits the lock until it calls `exec`, so the next run
+  could see it still held; the acquire now retries for about half a second.
+  A real concurrent run is still refused. This failed the companion's CI
+  suite about one run in five (#1897).
+- `ai-memory upgrade` on Windows now waits for a scanner to release the
+  running or the freshly written binary before swapping them, instead of
+  failing with "being used by another process". The swap retries that
+  sharing violation for about eight seconds, as the wiki's atomic writes
+  already did (#1895).
+- Captured Claude Code tool failures. Claude Code fires `PostToolUseFailure`,
+  not `PostToolUse`, when a tool fails, and ai-memory never wired that event
+  for Claude Code, so failed commands, builds and test runs never reached
+  capture, search, consolidation or the handoff. `install-hooks --agent
+  claude-code`, `setup` and the marketplace plugin now wire it to the
+  post-tool-use handler; the observation records `outcome: error` with the
+  bounded error text (never the tool's arguments); the session page counts
+  failed calls and quotes the newest one; the automatic handoff adds a `Last
+  failed tool call` line; and the plugin no longer drops a failure when
+  settings hooks wire only the success event. Re-run `ai-memory install-hooks
+  --agent claude-code --apply` (or `ai-memory setup`) on an existing install.
+  Grok Build CLI keeps its nine events (#1893).
+- `bootstrap` now waits for a provider's `Retry-After` before retrying a
+  chunk, capped at 32 s like the remote embedders (#1397). It retried after a
+  fixed 2 s and gave up after three attempts, so a rate-limited hosted API
+  (DeepSeek, OpenAI) failed the run while it was still asking the client to
+  wait. Without a hint the fixed 2 s delay is unchanged (#1889).
+- `GET /handoff` (the `session-start` hook) returns again on large projects.
+  On a store without planner statistics, the unfinished-session recovery
+  lookup walked every observation in the project and rescanned the project for
+  each one, so the request never returned and left a server thread spinning.
+  It now checks each of the project's sessions once through
+  `idx_observations_session` and reads the project's handoffs once (#1879).
+- A 2.x project is now adopted whichever checkout of its repository captures
+  first. When a linked worktree (`git worktree add`) captured before the main
+  checkout, the repository identity created a new project, every checkout then
+  followed the identity there, and the 2.x project with its pages and sessions
+  was orphaned. A worktree now claims the identity-less project named after its
+  main checkout, as the main checkout would. The server reads the worktree's
+  git metadata to find it; `docs/upgrading-to-3.0.md` covers a server that
+  cannot read the checkout (#1880).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).
@@ -44,6 +103,12 @@ version in [`docs/changelog/`](docs/changelog/):
   OpenClaw generated TypeScript integrations during `ai-memory upgrade` using
   the newly installed binary's templates, while leaving absent and user-owned
   installs untouched (#1869).
+- A Grok subagent's end no longer leaves a handoff. Grok runs each subagent
+  in a session of its own whose `SessionEnd` carries `subagentType`, but only
+  OpenCode and OMP subagent ends were kept off the baton, so the subagent's
+  summary became the newest handoff and the parent session, which claims one
+  on its next tool result, could receive it as a previous session's. The
+  subagent's session is still closed and summarized (#1907).
 - The web UI's root operator now sees every user's sessions in a project's
   Sessions, Agents and Token usage tabs, on each agent's page and on each
   session's page, and so do the `/api/v1` session list and observations
@@ -56,6 +121,13 @@ version in [`docs/changelog/`](docs/changelog/):
   the newest 200-session listing, instead of reporting a successful empty import.
   Exact lookups retain the adapter's checkout and top-level-session checks;
   automatic enumeration remains bounded (#1874).
+- `ai-memory-importer` reruns recognise pages longer than 12,000 characters
+  again. Since 3.3.0 `memory_read_page` cuts a body at 12,000 characters
+  unless asked for more, and the importer never asked, so a document rerun,
+  or a vault or export rerun or resume, compared the planned body with a cut
+  one and refused the page as one it did not write. It now asks for the
+  64,000-character ceiling; a page longer than that cannot be compared, and
+  its rerun fails with that reason instead (#1910).
 - Excluded Codex's generated approval-review transcripts and background
   suggestion prompts from transcript backfill and profile harvesting, and
   kept a hand-reworded profile page attached to its ledger topic even when a
@@ -76,6 +148,14 @@ version in [`docs/changelog/`](docs/changelog/):
   and `docs/config-properties.md` left out: `rerank_timeout_secs`,
   `[run] exit_prompt`, `[query_answer] max_context_tokens` and
   `[auto_improve.eval] builtin` (#1861).
+- Captured Gemini CLI tool calls with the same `tool <family>` title and body
+  as Claude Code's: the tool family, the outcome and the result. Gemini CLI
+  was missing from the closed tool-payload lists, so every `BeforeTool` and
+  `AfterTool` event was stored with the event kind as its title and an empty
+  body, and `[ingest] record_tool_names` never named a Gemini call. The body
+  keeps the model's `llmContent` (or the error message) and the outcome comes
+  from `tool_response.error`; `returnDisplay`, which for an edit holds both
+  whole versions of the file, is not stored (#1904).
 
 ## [3.3.0] - 2026-10-29
 

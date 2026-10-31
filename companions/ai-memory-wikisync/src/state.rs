@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -151,11 +152,35 @@ pub struct WriteLock {
     _file: fs::File,
 }
 
-/// Fail promptly when another mutating run owns this destination.
+/// Linear backoff, 10 ms + 20 ms + … + 100 ms: about half a second.
+const LOCK_RETRY_ATTEMPTS: u32 = 10;
+const LOCK_RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
+
+/// Fail when another mutating run owns this destination.
 ///
-/// The lock lives beside clone-local state and covers the whole operation,
-/// not only [`save`]: two plans derived from one baseline must not both apply.
+/// The lock covers the whole operation, not only [`save`]: two plans derived
+/// from one baseline must not both apply.
+///
+/// A held lock is retried for about half a second first. On Unix a child
+/// forked by another thread inherits the `flock` until it calls `exec`, so a
+/// lock released a moment ago can still read as held. A real concurrent run
+/// outlasts the budget and is refused.
 pub fn acquire_write_lock(dest_root: &Path) -> Result<WriteLock> {
+    acquire_write_lock_impl(
+        dest_root,
+        LOCK_RETRY_ATTEMPTS,
+        LOCK_RETRY_BASE_DELAY,
+        fs2::FileExt::try_lock_exclusive,
+    )
+}
+
+/// [`acquire_write_lock`] with the budget and the lock call injected for tests.
+fn acquire_write_lock_impl(
+    dest_root: &Path,
+    attempts: u32,
+    base_delay: Duration,
+    try_lock: impl Fn(&fs::File) -> std::io::Result<()>,
+) -> Result<WriteLock> {
     let dir = dest_root.join(STATE_DIR);
     ensure_real_state_dir(&dir)?;
     fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -179,13 +204,25 @@ pub fn acquire_write_lock(dest_root: &Path) -> Result<WriteLock> {
     if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         bail!("write lock became a symlink: {}", path.display());
     }
-    fs2::FileExt::try_lock_exclusive(&file).with_context(|| {
-        format!(
-            "destination {} is already being modified by another ai-memory-wikisync run",
-            dest_root.display()
-        )
-    })?;
-    Ok(WriteLock { _file: file })
+    let contended = fs2::lock_contended_error().raw_os_error();
+    let mut attempt = 0u32;
+    loop {
+        match try_lock(&file) {
+            Ok(()) => return Ok(WriteLock { _file: file }),
+            Err(err) if attempt < attempts && err.raw_os_error() == contended => {
+                attempt += 1;
+                std::thread::sleep(base_delay * attempt);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "destination {} is already being modified by another ai-memory-wikisync run",
+                        dest_root.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 /// The state directory must be a real directory, never a symlink: a symlink
@@ -381,6 +418,51 @@ mod tests {
 
         drop(first);
         acquire_write_lock(&root).expect("closing the first handle releases the OS lock");
+    }
+
+    /// A hold that clears is taken, one that never clears is refused after
+    /// the budget, any other error is reported at once.
+    #[test]
+    fn a_briefly_contended_lock_is_retried_within_its_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let contended = || fs2::lock_contended_error();
+
+        let calls = std::cell::Cell::new(0u32);
+        let lock = acquire_write_lock_impl(&root, 5, Duration::ZERO, |file| {
+            calls.set(calls.get() + 1);
+            if calls.get() <= 3 {
+                Err(contended())
+            } else {
+                fs2::FileExt::try_lock_exclusive(file)
+            }
+        })
+        .expect("a hold that clears is absorbed");
+        assert_eq!(calls.get(), 4);
+        drop(lock);
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = acquire_write_lock_impl(&root, 5, Duration::ZERO, |_| {
+            calls.set(calls.get() + 1);
+            Err(contended())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already being modified"), "{err}");
+        assert_eq!(
+            calls.get(),
+            6,
+            "initial attempt plus five retries, then stop"
+        );
+
+        let calls = std::cell::Cell::new(0u32);
+        let err = acquire_write_lock_impl(&root, 5, Duration::ZERO, |_| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other("disk on fire"))
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1, "a non-contention error is not retried");
+        assert!(format!("{err:#}").contains("disk on fire"), "{err:#}");
     }
 
     #[cfg(unix)]

@@ -308,6 +308,16 @@ configure ai-memory@ai-memory`:
   `install-mcp`, `install-skills`) to add them anyway.
 - Folderless sessions (a desktop scratch workspace with no project folder)
   are not captured through the plugin.
+- Ten events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `SessionEnd`,
+  `SubagentStart` and `SubagentStop`. Claude Code fires `PostToolUseFailure`
+  *instead of* `PostToolUse` when a tool fails (a non-zero exit, a thrown
+  error, an MCP error result). The observation records `outcome: error` and
+  the error text, bounded like any tool excerpt and never the tool's
+  arguments; the session page counts failed calls and quotes the newest one;
+  the automatic handoff adds a `Last failed tool call` line. An install made
+  before this fix has nine events; re-run `ai-memory install-hooks --agent
+  claude-code --apply` (or `ai-memory setup`) to add the tenth.
 - Factory Droid can install this plugin through its Claude marketplace
   fallback. Its events are recorded as `droid`, and when `install-hooks
   --agent droid` hooks deliver the same event (`~/.factory/hooks.json`, or
@@ -1930,9 +1940,9 @@ The events are configured with PascalCase names (`SessionStart`,
 `PreToolUse`, …), which makes Copilot send the VS Code/Claude-compatible
 snake_case payload (`session_id`, `cwd`, `tool_name`, `tool_input`,
 `tool_result`), so ai-memory's existing extraction applies and native commands
-enforce `[capture] ignore_paths`. Ten events are wired: Claude Code's nine plus
-`PostToolUseFailure`, which Copilot fires instead of `PostToolUse` when a tool
-errors. Entries sit directly in each event array with no `matcher`: Copilot
+enforce `[capture] ignore_paths`. Ten events are wired, the same as Claude
+Code's, including `PostToolUseFailure`, which Copilot fires instead of
+`PostToolUse` when a tool errors. Entries sit directly in each event array with no `matcher`: Copilot
 rejects `matcher` on `SessionStart`, `Stop`, `SessionEnd`, and the subagent
 events, and omitting it elsewhere means "every invocation". Tool output is
 read from `tool_result.text_result_for_llm`.

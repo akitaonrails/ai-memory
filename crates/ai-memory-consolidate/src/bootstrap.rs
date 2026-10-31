@@ -329,6 +329,18 @@ const BOOTSTRAP_CHUNK_MAX_ATTEMPTS: u32 = 3;
 /// Fixed, short delay between chunk retries. Deliberately not tenacity-style
 /// escalating backoff — see the cognee #2840 lesson in `ai-memory-llm`.
 const BOOTSTRAP_CHUNK_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Ceiling on a provider-requested wait, the same one the remote embedders
+/// apply to `Retry-After` (#1397), so one bad hint cannot park a run.
+const BOOTSTRAP_CHUNK_MAX_RETRY_AFTER: Duration = Duration::from_secs(32);
+
+/// Wait before retrying a chunk after `err`. A provider that names its own
+/// delay is waited for, up to [`BOOTSTRAP_CHUNK_MAX_RETRY_AFTER`]: retrying
+/// sooner than a rate-limited provider asked only spends the attempt on
+/// another `429`. Without a hint the fixed `fallback` applies, as before.
+fn chunk_retry_wait(err: &LlmError, fallback: Duration) -> Duration {
+    err.retry_after()
+        .map_or(fallback, |hint| hint.min(BOOTSTRAP_CHUNK_MAX_RETRY_AFTER))
+}
 
 /// Run one chunk's structured LLM call with a short, bounded retry.
 ///
@@ -357,13 +369,15 @@ async fn complete_chunk_with_retry(
         {
             Ok(batch) => return Ok(batch),
             Err(e) if attempt < BOOTSTRAP_CHUNK_MAX_ATTEMPTS && e.is_transient() => {
+                let wait = chunk_retry_wait(&e, retry_delay);
                 warn!(
                     attempt,
                     max = BOOTSTRAP_CHUNK_MAX_ATTEMPTS,
+                    wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                     error = %e,
                     "bootstrap chunk hit a transient LLM error; retrying shortly",
                 );
-                tokio::time::sleep(retry_delay).await;
+                tokio::time::sleep(wait).await;
                 attempt += 1;
             }
             Err(e) => return Err(e),
@@ -897,6 +911,58 @@ fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapEr
 #[cfg(not(windows))]
 fn discover_main_repo_root_fallback(start: &Path) -> Result<PathBuf, BootstrapError> {
     Err(BootstrapError::NotARepo(start.to_path_buf()))
+}
+
+/// The main checkout of the linked worktree that contains `start`, or `None`
+/// when `start` is anywhere else.
+///
+/// Only a worktree that `git worktree add` linked to a main checkout answers:
+/// a main checkout, a submodule, a worktree of a bare repository, a checkout
+/// with a separate git directory and a directory outside any repository all
+/// return `None`. [`discover_main_repo_root`] takes the parent of any shared
+/// git directory instead, which for a submodule is its superproject's
+/// `.git/modules`; a caller that acts on the answer needs the shared
+/// directory to be literally `<checkout>/.git`.
+#[must_use]
+pub fn linked_worktree_main_root(start: &Path) -> Option<PathBuf> {
+    let common_dir = match git2::Repository::discover(start) {
+        Ok(repo) if repo.is_worktree() => repo.commondir().to_path_buf(),
+        Ok(_) => return None,
+        Err(_) => linked_worktree_common_dir_fallback(start)?,
+    };
+    if common_dir.file_name()? != ".git" {
+        return None;
+    }
+    common_dir.parent().map(Path::to_path_buf)
+}
+
+#[cfg(windows)]
+fn linked_worktree_common_dir_fallback(start: &Path) -> Option<PathBuf> {
+    let output = git_command()
+        .arg("-C")
+        .arg(start)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines().map(str::trim);
+    let (git_dir, common_dir) = (lines.next()?, lines.next()?);
+    // A linked worktree keeps its own git directory beside the shared one;
+    // a main checkout or a submodule has a single directory.
+    (git_dir != common_dir).then(|| PathBuf::from(common_dir))
+}
+
+#[cfg(not(windows))]
+fn linked_worktree_common_dir_fallback(_start: &Path) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(any(windows, test))]
@@ -1718,6 +1784,7 @@ mod tests {
         ids: std::sync::Mutex<Vec<LlmOperationId>>,
         transient_failures: usize,
         permanent: bool,
+        retry_after: Option<Duration>,
     }
 
     #[async_trait::async_trait]
@@ -1747,7 +1814,7 @@ mod tests {
                 return Err(LlmError::Provider {
                     status: 503,
                     body: "busy".into(),
-                    retry_after: None,
+                    retry_after: self.retry_after,
                 });
             }
             Ok(serde_json::json!({ "pages": [], "rationale": "ok" }))
@@ -1780,6 +1847,7 @@ mod tests {
             ids: std::sync::Mutex::new(Vec::new()),
             transient_failures: 2, // fails twice, succeeds on the 3rd (= MAX)
             permanent: false,
+            retry_after: None,
         };
         let batch = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
             .await
@@ -1803,6 +1871,7 @@ mod tests {
             ids: std::sync::Mutex::new(Vec::new()),
             transient_failures: usize::MAX, // never clears
             permanent: false,
+            retry_after: None,
         };
         let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
             .await
@@ -1822,6 +1891,7 @@ mod tests {
             ids: std::sync::Mutex::new(Vec::new()),
             transient_failures: 0,
             permanent: true, // returns Auth — not transient
+            retry_after: None,
         };
         let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
             .await
@@ -1831,6 +1901,52 @@ mod tests {
             llm.calls.load(Ordering::SeqCst),
             1,
             "a deterministic error must fail on the first call, no retries"
+        );
+    }
+
+    /// A provider hint replaces the fixed delay, clamped to the same ceiling
+    /// the remote embedders use; without one the fixed delay is unchanged.
+    #[test]
+    fn chunk_retry_wait_honours_a_capped_provider_hint() {
+        let hinted = |hint| LlmError::Provider {
+            status: 429,
+            body: "slow down".into(),
+            retry_after: Some(hint),
+        };
+        let fixed = Duration::from_secs(2);
+        assert_eq!(chunk_retry_wait(&LlmError::Auth("x".into()), fixed), fixed);
+        assert_eq!(
+            chunk_retry_wait(&hinted(Duration::from_secs(10)), fixed),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            chunk_retry_wait(&hinted(Duration::from_secs(3600)), fixed),
+            BOOTSTRAP_CHUNK_MAX_RETRY_AFTER,
+            "a huge hint must not park the run"
+        );
+    }
+
+    /// A rate-limited provider that says when to come back is not retried
+    /// before then, even when the fixed delay is zero: retrying earlier only
+    /// spends the attempt on another 429.
+    #[tokio::test]
+    async fn chunk_retry_waits_for_the_providers_retry_after() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            ids: std::sync::Mutex::new(Vec::new()),
+            transient_failures: 1,
+            permanent: false,
+            retry_after: Some(Duration::from_millis(150)),
+        };
+        let started = std::time::Instant::now();
+        complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+            .await
+            .expect("the retry after the hinted wait succeeds");
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "retried after {:?}, before the provider's Retry-After",
+            started.elapsed()
         );
     }
 
@@ -2366,6 +2482,91 @@ mod tests {
             root.is_none(),
             "no git repo found ⇒ no repo path in the tuple"
         );
+    }
+
+    /// Only a worktree `git worktree add` linked to a main checkout names that
+    /// checkout. The main checkout itself, a submodule (whose shared directory
+    /// sits under the superproject's `.git/modules`), a worktree of a bare
+    /// repository and a plain directory all answer `None`.
+    #[test]
+    fn linked_worktree_main_root_answers_only_for_a_linked_worktree() {
+        let tmp = TempDir::new().unwrap();
+        // A fixed identity and no signing, so the contributor's global git
+        // config cannot decide whether the fixture commits succeed.
+        let git = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=test", "-c", "user.email=test@example.com"])
+                .args(["-c", "protocol.file.allow=always"])
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} in {dir:?} failed");
+        };
+        let path = |p: &Path| p.to_str().unwrap().to_owned();
+        let initial = [
+            "commit",
+            "-q",
+            "--no-gpg-sign",
+            "--allow-empty",
+            "-m",
+            "init",
+        ];
+
+        let main = tmp.path().join("api");
+        fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &initial);
+        let worktree = tmp.path().join("api-feature");
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "feature", &path(&worktree)],
+        );
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        let expected = Some(main.canonicalize().unwrap());
+        for start in [worktree.clone(), worktree.join("src")] {
+            assert_eq!(
+                linked_worktree_main_root(&start).and_then(|root| root.canonicalize().ok()),
+                expected,
+                "{start:?}"
+            );
+        }
+        assert_eq!(linked_worktree_main_root(&main), None);
+
+        let library = tmp.path().join("library");
+        fs::create_dir_all(&library).unwrap();
+        git(&library, &["init", "-q", "-b", "main"]);
+        git(&library, &initial);
+        git(
+            &main,
+            &["submodule", "add", "-q", &path(&library), "vendor/library"],
+        );
+        assert_eq!(
+            linked_worktree_main_root(&main.join("vendor").join("library")),
+            None,
+            "a submodule is not a linked worktree"
+        );
+
+        let bare = tmp.path().join("api.git");
+        git(
+            tmp.path(),
+            &["clone", "-q", "--bare", &path(&main), &path(&bare)],
+        );
+        let bare_worktree = tmp.path().join("api-bare-feature");
+        git(
+            &bare,
+            &["worktree", "add", "-q", &path(&bare_worktree), "main"],
+        );
+        assert_eq!(
+            linked_worktree_main_root(&bare_worktree),
+            None,
+            "a bare repository has no main checkout"
+        );
+
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(linked_worktree_main_root(&plain), None);
     }
 
     // ----------------------------------------------------------------

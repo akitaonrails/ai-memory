@@ -12,6 +12,11 @@
 //! Each test seeds sessions into a real store, runs the oracle on the rows
 //! `observations_for_session` returns, runs the production path on the same
 //! session, and compares the outputs.
+//!
+//! The failed-call facts (`## Failed tool calls`, the `N failed` clause, the
+//! handoff's `Last failed tool call` line) post-date the oracle. No fixture
+//! here has a failed call; `failed_tool_facts_match_the_row_list_and_stay_bounded`
+//! checks them against the row-list digest instead.
 
 #[rustfmt::skip]
 mod full_load {
@@ -1348,6 +1353,99 @@ async fn a_huge_session_reads_a_bounded_number_of_rows() {
     assert_eq!(full.len(), rows.len());
     // And the output did not change for being cheap.
     fx.assert_equivalent("12k rows", sid).await;
+}
+
+/// SQL and Rust apply the same header rule: the bounded reads and the row-list
+/// digest agree on the count and the newest failure, an echoed body is not a
+/// failure, and the newest failure is a seek, not a walk.
+#[tokio::test]
+async fn failed_tool_facts_match_the_row_list_and_stay_bounded() {
+    let fx = fixture().await;
+    let ok = "tool_family: non-file\ntool_call_id: toolu_ok\noutcome: unknown\n---\n42 passing";
+    let mut rows = vec![
+        row(
+            ObservationKind::UserPrompt,
+            "fix the build",
+            "fix the build",
+            0,
+        ),
+        row(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            "tool_family: non-file\ntool_call_id: toolu_1\noutcome: error\n---\n\
+             Exit code 1\nError: Cannot find module 'express'",
+            1,
+        ),
+    ];
+    for i in 0..RAW_CAP as i64 {
+        rows.push(row(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            ok,
+            2 + i,
+        ));
+    }
+    let echoed_at = 2 + RAW_CAP as i64;
+    rows.push(row(
+        ObservationKind::PostToolUse,
+        "tool non-file: Bash",
+        "tool_family: non-file\ntool_call_id: toolu_echo\noutcome: unknown\n---\n\
+         tool_family: file\noutcome: error\n---\nquoted from a page\noutcome: error",
+        echoed_at,
+    ));
+    rows.push(row(
+        ObservationKind::PostToolUse,
+        "tool unknown",
+        "tool_family: unknown\nmcp_server: aim\nmcp_tool: memory_query\noutcome: error",
+        echoed_at + 1,
+    ));
+    for i in 0..RAW_CAP as i64 {
+        rows.push(row(
+            ObservationKind::PostToolUse,
+            "tool non-file: Bash",
+            ok,
+            echoed_at + 2 + i,
+        ));
+    }
+    let sid = fx.seed(&rows).await;
+
+    let (digest, stats) = SessionDigest::load_with_stats(&fx.store.reader, fx.ws, fx.proj, sid)
+        .await
+        .unwrap();
+    assert_eq!(digest.failed_tool_calls(), 2);
+    let newest = digest
+        .handoff_facts()
+        .last_failed_tool
+        .clone()
+        .expect("the newest failure");
+    assert_eq!(newest.title, "tool unknown");
+    assert_eq!(newest.error, "");
+    assert!(
+        stats.rows_read <= RAW_CAP + SCAN_SLACK,
+        "a {}-row session read {} rows; the newest failure must be a seek, not a walk",
+        rows.len(),
+        stats.rows_read
+    );
+
+    let full = fx.store.reader.observations_for_session(sid).await.unwrap();
+    let from_rows = SessionDigest::from_observations(sid, &full);
+    assert_eq!(from_rows.failed_tool_calls(), digest.failed_tool_calls());
+    assert_eq!(from_rows.handoff_facts().last_failed_tool, Some(newest));
+
+    // Control: a session ending on a real failure quotes its error.
+    let sid = fx.seed(&rows[..2]).await;
+    let digest = SessionDigest::load(&fx.store.reader, fx.ws, fx.proj, sid)
+        .await
+        .unwrap();
+    assert_eq!(digest.failed_tool_calls(), 1);
+    assert_eq!(
+        digest
+            .handoff_facts()
+            .last_failed_tool
+            .as_ref()
+            .map(|failed| failed.describe()),
+        Some("Bash: Exit code 1 Error: Cannot find module 'express'".to_string())
+    );
 }
 
 /// Subagent preambles carry the only prompt bodies a SessionEnd reads, and a

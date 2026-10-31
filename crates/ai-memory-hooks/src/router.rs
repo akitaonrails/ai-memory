@@ -1256,6 +1256,15 @@ async fn handle_hook_batch(
                 warn!(session = ?session, agent = %agent.as_str(), event = ?event, "hook batch event of a purged session dropped");
                 HookProcessingOutcome::DroppedInvalid
             }
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<StoreError>(),
+                    Some(StoreError::ManagedRunBoundaryRefused)
+                ) =>
+            {
+                warn!(session = ?session, agent = %agent.as_str(), event = ?event, "hook batch event refused by its managed run boundary dropped");
+                HookProcessingOutcome::DroppedInvalid
+            }
             Err(e) => {
                 state.ingest_metrics.record_failed();
                 warn!(error = %e, accepted = accepted_indices.len(), "hook batch item failed; stopping (fail-fast)");
@@ -3762,6 +3771,54 @@ fn has_publishable_scope_hint(cwd: Option<&str>, project_override: Option<&str>)
     cwd.is_some_and(|value| !value.is_empty()) || project_override.is_some()
 }
 
+/// The identity-less project a linked worktree's main checkout would claim,
+/// offered as an identity capture's candidate from that worktree (#1880).
+///
+/// A 2.x project carries no identity and is named after the folder it was
+/// captured from, so only a capture whose cwd-derived name matches that
+/// folder claims it. A linked worktree sits in another folder: when it
+/// captured first, its identity created a new project, every checkout then
+/// followed the identity there, and the 2.x project was orphaned. Offering
+/// the main checkout's project makes the first capture's checkout irrelevant.
+/// A project that already holds an identity is not offered, and the writer
+/// still decides whether this caller may claim the one that is.
+async fn main_checkout_candidate(
+    state: &HookState,
+    workspace_id: WorkspaceId,
+    cwd: &str,
+) -> anyhow::Result<Option<ProjectId>> {
+    let owned = cwd.to_owned();
+    let main_name = state
+        .cwd_probes
+        .run(cwd, move || {
+            ai_memory_consolidate::linked_worktree_main_root(std::path::Path::new(&owned))
+                .and_then(|root| root.file_name()?.to_str().map(str::to_owned))
+        })
+        .await?;
+    // A reserved scope is never captured into by name, and a main checkout
+    // named like one must not hand it to a worktree either.
+    let Some(main_name) =
+        main_name.filter(|name| !ai_memory_core::profile::is_reserved_scope_project(name))
+    else {
+        return Ok(None);
+    };
+    let Some(project) = state
+        .reader
+        .find_project(workspace_id, main_name)
+        .await
+        .map_err(|e| anyhow::anyhow!("find_project: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let unclaimed = state
+        .reader
+        .scope_row_by_ids(workspace_id, project)
+        .await
+        .map_err(|e| anyhow::anyhow!("scope_row_by_ids: {e}"))?
+        .is_some_and(|row| row.identity.is_none());
+    Ok(unclaimed.then_some(project))
+}
+
 /// Resolve the `(workspace_id, project_id)` pair for a hook event without
 /// publishing it as active. Callers decide separately whether the event is a
 /// foreground interaction allowed to advance fallback routing.
@@ -4095,7 +4152,18 @@ async fn resolve_project_ids_inner(
         // name (or the cwd-prefix parent) is only the candidate for a project
         // that has not been claimed yet. One writer transaction, so two
         // captures racing on a new repository cannot both create it.
-        let candidate = parent.map(|(parent_id, _)| parent_id);
+        let candidate = match (parent, cwd_raw) {
+            (Some((parent_id, _)), _) => Some(parent_id),
+            // A marker name or the repo-root strategy already names the main
+            // checkout's project; the default basename names the worktree.
+            (None, Some(cwd))
+                if project_override.is_none()
+                    && matches!(project_strategy, ProjectStrategy::Basename) =>
+            {
+                main_checkout_candidate(state, ws, cwd).await?
+            }
+            (None, _) => None,
+        };
         let resolved = if promote_alias {
             state
                 .writer
@@ -4407,6 +4475,20 @@ async fn process_envelope(
                 agent = %agent.as_str(),
                 event = ?event,
                 "hook event of a purged session dropped"
+            );
+            HookProcessingOutcome::DroppedInvalid
+        }
+        Err(e)
+            if matches!(
+                e.downcast_ref::<StoreError>(),
+                Some(StoreError::ManagedRunBoundaryRefused)
+            ) =>
+        {
+            warn!(
+                session = ?session,
+                agent = %agent.as_str(),
+                event = ?event,
+                "hook event refused by its managed run boundary dropped"
             );
             HookProcessingOutcome::DroppedInvalid
         }
@@ -5330,11 +5412,16 @@ async fn process_authorized(
         let handoff_owner = owner_stamp_for_event(state, session_owner.as_ref()).await;
         // An OpenCode child session has its own id and forwards its parent as
         // `agent_id`, and the OMP extension marks a subagent session the same
-        // way; its end must not hand the next session a sub-task baton. Other
-        // harnesses are not gated: Claude Code also sets `agent_type` on a
-        // top-level `--agent` session, which still owns its baton.
-        let child_session =
-            matches!(env.agent, AgentKind::OpenCode | AgentKind::Omp) && body_is_subagent(&env.raw);
+        // way. Grok runs a subagent in a session of its own and puts
+        // `subagentType` on its events, the SessionEnd included, while the
+        // main session never carries it. Such an end must not hand the next
+        // session a sub-task baton. Other harnesses are not gated: Claude Code
+        // also sets `agent_type` on a top-level `--agent` session, which still
+        // owns its baton.
+        let child_session = matches!(
+            env.agent,
+            AgentKind::OpenCode | AgentKind::Omp | AgentKind::Grok
+        ) && body_is_subagent(&env.raw);
         // The opt-out covers both automatic batons: a session's end and a
         // turn checkpoint, which is OpenCode's only baton since a plugin
         // unload no longer ends its sessions, and Antigravity's since it has
@@ -5706,10 +5793,14 @@ fn build_auto_handoff(
         summary.push_str("\n\nLatest assistant response: ");
         summary.push_str(assistant);
     }
-    let next_steps = if facts.tools.is_empty() {
-        Vec::new()
-    } else {
-        vec![format!(
+    let mut next_steps = Vec::new();
+    // The newest failed call and its error: what broke is the first question.
+    // It may have been fixed later, so it is a report, not an open question.
+    if let Some(failed) = &facts.last_failed_tool {
+        next_steps.push(format!("Last failed tool call: {}", failed.describe()));
+    }
+    if !facts.tools.is_empty() {
+        next_steps.push(format!(
             "Tools used: {}",
             facts
                 .tools
@@ -5717,8 +5808,8 @@ fn build_auto_handoff(
                 .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
-        )]
-    };
+        ));
+    }
     NewHandoff {
         workspace_id,
         project_id,
@@ -7619,6 +7710,176 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(name(explicit).await.as_deref(), Some("site"));
+    }
+
+    /// A main checkout with one commit at `root/<main>` and a worktree linked
+    /// to it at `root/<worktree>`, on a new `feature` branch.
+    fn main_with_linked_worktree(
+        root: &std::path::Path,
+        main: &str,
+        worktree: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (main, worktree) = (root.join(main), root.join(worktree));
+        #[cfg(windows)]
+        {
+            init_repo_with_commit(&main);
+            let mut add = std::process::Command::new("git");
+            add.arg("-C")
+                .arg(&main)
+                .args(["worktree", "add", "-q", "-b", "feature"])
+                .arg(&worktree);
+            assert_command_success(add);
+        }
+        #[cfg(not(windows))]
+        {
+            let repo = init_repo_with_commit(&main);
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            let branch = repo.branch("feature", &head, false).unwrap();
+            repo.worktree(
+                "feature",
+                &worktree,
+                Some(git2::WorktreeAddOptions::new().reference(Some(&branch.into_reference()))),
+            )
+            .unwrap();
+        }
+        (main, worktree)
+    }
+
+    /// #1880: a 2.x project has no identity and the name of the folder it was
+    /// captured from. A linked worktree in another folder that captures first
+    /// adopts it, as its main checkout would, instead of creating a twin that
+    /// every checkout of the repository then follows.
+    #[tokio::test]
+    async fn a_linked_worktree_adopts_the_v2_project_its_main_checkout_would() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (main, worktree) = main_with_linked_worktree(tmp.path(), "api", "api-feature");
+        let v2 = state
+            .writer
+            .get_or_create_project(
+                state.workspace_id,
+                "api",
+                Some(main.to_string_lossy().into_owned()),
+            )
+            .await
+            .unwrap();
+
+        let adopted = capture_styled(&state, &worktree, "github.com/acme/api", Some("path")).await;
+        assert_eq!(adopted, v2, "the worktree adopts the 2.x project in place");
+        assert_eq!(
+            state
+                .reader
+                .project_name_by_id(state.workspace_id, v2)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("acme-api")
+        );
+        let from_main = capture_styled(&state, &main, "github.com/acme/api", Some("path")).await;
+        assert_eq!(from_main, v2, "the main checkout lands in the same project");
+    }
+
+    /// The main checkout's name held by another repository's identity is not
+    /// the worktree's to take: the worktree resolves to a project of its own
+    /// and the holder keeps its identity.
+    #[tokio::test]
+    async fn a_linked_worktree_never_takes_a_project_holding_another_identity() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (_main, worktree) = main_with_linked_worktree(tmp.path(), "api", "api-feature");
+        let other = tmp.path().join("other").join("api");
+        std::fs::create_dir_all(&other).unwrap();
+        let holder = capture_styled(&state, &other, "github.com/other/api", None).await;
+        let identity = |project| {
+            let reader = state.reader.clone();
+            let ws = state.workspace_id;
+            async move {
+                reader
+                    .scope_row_by_ids(ws, project)
+                    .await
+                    .unwrap()
+                    .and_then(|row| row.identity)
+            }
+        };
+        assert_eq!(
+            identity(holder).await.as_deref(),
+            Some("github.com/other/api")
+        );
+
+        let wt = capture_styled(&state, &worktree, "github.com/acme/api", Some("path")).await;
+        assert_ne!(wt, holder);
+        assert_eq!(
+            identity(holder).await.as_deref(),
+            Some("github.com/other/api")
+        );
+        assert_eq!(identity(wt).await.as_deref(), Some("github.com/acme/api"));
+    }
+
+    /// Adoption stays inside the capture's workspace: a 2.x project of the
+    /// same name in another workspace is left alone.
+    #[tokio::test]
+    async fn a_linked_worktree_never_adopts_another_workspaces_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (_main, worktree) = main_with_linked_worktree(tmp.path(), "api", "api-feature");
+        let elsewhere = state
+            .writer
+            .get_or_create_workspace("elsewhere")
+            .await
+            .unwrap();
+        let foreign = state
+            .writer
+            .get_or_create_project(elsewhere, "api", None)
+            .await
+            .unwrap();
+
+        let wt = capture_styled(&state, &worktree, "github.com/acme/api", Some("path")).await;
+        assert_ne!(wt, foreign);
+        let row = state
+            .reader
+            .scope_row_by_ids(elsewhere, foreign)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.project_name, "api");
+        assert!(
+            row.identity.is_none(),
+            "the other workspace's project is untouched"
+        );
+    }
+
+    /// Capture never lands in a reserved scope by name, so a main checkout
+    /// that happens to be named like one must not hand it to its worktree:
+    /// the global preferences scope keeps its name and stays unclaimed.
+    #[tokio::test]
+    async fn a_linked_worktree_never_adopts_a_reserved_scope() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let (_main, worktree) = main_with_linked_worktree(
+            tmp.path(),
+            ai_memory_core::GLOBAL_SCOPE_PROJECT,
+            "global-feature",
+        );
+        let global = state
+            .writer
+            .get_or_create_project(
+                state.workspace_id,
+                ai_memory_core::GLOBAL_SCOPE_PROJECT,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let wt = capture_styled(&state, &worktree, "github.com/acme/api", Some("path")).await;
+        assert_ne!(wt, global);
+        let row = state
+            .reader
+            .scope_row_by_ids(state.workspace_id, global)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.project_name, ai_memory_core::GLOBAL_SCOPE_PROJECT);
+        assert!(row.identity.is_none(), "the reserved scope stays unclaimed");
     }
 
     /// #708's collision, end to end: two unrelated repositories both checked
@@ -9752,6 +10013,97 @@ pub(crate) mod tests {
                 .is_empty()
         );
         assert_eq!(state.ingest_metrics.snapshot().failed, 0);
+    }
+
+    /// A spooled event of an ID-selected run that has since finished is
+    /// refused by the run boundary for good. Fail-fast would leave it at the
+    /// head of the client's spool and block every later event, including
+    /// those of the current run, so it must be a terminal `dropped_invalid`
+    /// and the next item must still commit (#1892).
+    #[tokio::test]
+    async fn batch_drops_an_event_of_a_finished_pinned_run_then_commits_next_item() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let run = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "repo".into(),
+                worktree_fingerprint: "worktree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "finished-run".into(),
+            })
+            .await
+            .unwrap();
+        state
+            .writer
+            .finish_workstream_run(
+                ai_memory_store::ManagedRunAuthority::from_auth(
+                    ai_memory_core::AuthLevel::Anonymous,
+                    None,
+                    None,
+                    &ai_memory_core::ActorContext::anonymous(),
+                    false,
+                ),
+                FinishWorkstreamRun {
+                    sanitizer: ai_memory_core::Sanitizer::default(),
+                    run_id: run.run_id,
+                    native_session_id: Some("finished-native".into()),
+                    source_cursor: None,
+                    events: Vec::new(),
+                    complete: true,
+                    segment_path: None,
+                    exit_code: Some(0),
+                },
+            )
+            .await
+            .unwrap();
+
+        let items = vec![
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=user-prompt-submit&agent=claude-code&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "finished-native",
+                    "cwd": "/tmp/scratch",
+                    "prompt": "late",
+                }),
+            },
+            HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: serde_json::json!({"session_id":"batch-after-run", "prompt":"valid"}),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["results"],
+            serde_json::json!([{ "index": 0, "outcome": "dropped_invalid" }, { "index": 1, "outcome": "stored" }])
+        );
+        assert_eq!(ack["accepted"], 2, "both contiguous entries are cleared");
+        assert!(ack.get("failed_index").is_none() || ack["failed_index"].is_null());
+        let metrics = state.ingest_metrics.snapshot();
+        assert_eq!((metrics.dropped_invalid, metrics.failed), (1, 0));
     }
 
     #[tokio::test]
@@ -16016,6 +16368,72 @@ pub(crate) mod tests {
         assert!(
             open_handoff_exists(&state).await,
             "a top-level OMP session still hands over its baton"
+        );
+    }
+
+    /// Grok runs a subagent in a session of its own and puts `subagentType`
+    /// on that session's events, its SessionEnd included
+    /// (`HookPayload::SessionEnd` in xai-grok-hooks `event.rs`); the main
+    /// session never carries it. The subagent's end closes and summarizes its
+    /// session without a baton, while a top-level Grok session in the same
+    /// project still leaves one.
+    #[tokio::test]
+    async fn grok_subagent_session_end_closes_and_summarizes_without_baton() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let grok_event = |session: SessionId, event: &str, subagent: Option<&str>| {
+            let hook_event_name = match event {
+                "user-prompt" => "UserPromptSubmit",
+                "stop" => "Stop",
+                _ => "SessionEnd",
+            };
+            let mut body = serde_json::json!({
+                "sessionId": session.to_string(),
+                "session_id": session.to_string(),
+                "hook_event_name": hook_event_name,
+                "prompt": "Find where the config is loaded",
+                "reason": "completed",
+            });
+            if let Some(subagent) = subagent {
+                body["subagentType"] = serde_json::json!(subagent);
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("grok".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        let subagent = SessionId::new();
+        for event in ["user-prompt", "session-end"] {
+            let env = grok_event(subagent, event, Some("explore"));
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+        assert!(!session_pages(&state).await.is_empty());
+        assert!(
+            !open_handoff_exists(&state).await,
+            "a Grok subagent's end must not leave a baton"
+        );
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(subagent)
+        );
+
+        let top_level = SessionId::new();
+        for event in ["user-prompt", "stop", "session-end"] {
+            let env = grok_event(top_level, event, None);
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+        assert!(
+            open_handoff_exists(&state).await,
+            "a top-level Grok session still hands over its baton"
         );
     }
 
@@ -24914,6 +25332,82 @@ pub(crate) mod tests {
             "a real tool name must still be listed; got: {:?}",
             handoff.next_steps
         );
+    }
+
+    /// The baton names the newest failed call with its error text; a family
+    /// label names no tool.
+    #[test]
+    fn auto_handoff_names_the_last_failed_tool_call() {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        let handoff_for = |rows: &[ai_memory_core::Observation]| {
+            build_auto_handoff(
+                WorkspaceId::new(),
+                ProjectId::new(),
+                AgentKind::ClaudeCode,
+                SessionId::new(),
+                None,
+                rows,
+                None,
+                false,
+            )
+        };
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\ntool_call_id: toolu_1\noutcome: error\n---\n\
+                 Exit code 1\nError: Cannot find module 'express'",
+            ),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\ntool_call_id: toolu_2\noutcome: error\n---\n\
+                 Exit code 2\nerror[E0425]: cannot find value `x`",
+            ),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\noutcome: unknown\n---\n42 passing",
+            ),
+            mk_obs(ObservationKind::Stop, "stop", ""),
+        ];
+        let handoff = handoff_for(&observations);
+        assert_eq!(
+            handoff.next_steps,
+            vec![
+                "Last failed tool call: Bash: Exit code 2 error[E0425]: cannot find value `x`"
+                    .to_string(),
+                "Tools used: Bash".to_string(),
+            ]
+        );
+
+        // A family label names no tool.
+        let bare = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: error\n---\nENOENT: no such file",
+            ),
+        ];
+        let handoff = handoff_for(&bare);
+        assert_eq!(
+            handoff.next_steps,
+            vec!["Last failed tool call: ENOENT: no such file".to_string()]
+        );
+
+        // Control: no failure, no line.
+        let fine = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\noutcome: unknown\n---\n42 passing",
+            ),
+        ];
+        let handoff = handoff_for(&fine);
+        assert_eq!(handoff.next_steps, vec!["Tools used: Bash".to_string()]);
     }
 
     /// `[ingest] record_tool_names` titles (`tool <family>: <name>`) list by

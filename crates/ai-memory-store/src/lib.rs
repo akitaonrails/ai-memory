@@ -6716,6 +6716,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lapsed_active_run_boundary_remains_retryable_after_heartbeat() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-lapsed-boundary").await;
+        let mut input = managed_prepare_input(ws, proj, "test:lapsed-boundary");
+        input.scope_by_id = true;
+        let run = store.writer.prepare_workstream_run(input).await.unwrap();
+        let identity = ManagedRunHookIdentity {
+            run_id: run.run_id,
+            agent: AgentKind::Codex,
+            cwd: Some("/repo".into()),
+            native_session_id: "native-session".into(),
+            owner_user: None,
+            session_start: true,
+        };
+
+        set_managed_run_lease(store.db_path(), run.run_id, 1);
+        let err = store
+            .reader
+            .managed_run_pinned_scope(identity)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ManagedRunLeaseLapsed));
+
+        assert!(
+            store
+                .writer
+                .heartbeat_managed_run(run.run_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_pinned_scope(ManagedRunHookIdentity {
+                    run_id: run.run_id,
+                    agent: AgentKind::Codex,
+                    cwd: Some("/repo".into()),
+                    native_session_id: "native-session".into(),
+                    owner_user: None,
+                    session_start: true,
+                })
+                .await
+                .unwrap(),
+            Some((ws, proj))
+        );
+    }
+
+    #[tokio::test]
     async fn finish_run_after_complete_is_an_idempotent_no_op() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();

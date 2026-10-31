@@ -1187,9 +1187,10 @@ mod tests {
 
     #[test]
     fn kimi_code_manual_script_paths_cover_kimi_event_set() {
-        // Kimi Code's hook vocabulary is Claude Code's nine events plus
-        // PostToolUseFailure; the failure entry reuses post-tool-use.sh,
-        // so the script list carries nine unique files for ten events.
+        // Kimi Code's hook vocabulary is Claude Code's ten events,
+        // PostToolUseFailure included; the failure entry reuses
+        // post-tool-use.sh, so the script list carries nine unique files for
+        // ten events.
         let root = Path::new("/hooks/kimi-code");
         let paths = event_script_paths(root, &[&KIMI_CODE_EVENTS]);
         let rendered = paths

@@ -845,6 +845,10 @@ mod tests {
                             );
                             assert!(header_value(request, "x-api-key").is_none());
                             assert_eq!(body["messages"][0]["content"], "hello");
+                            if index == 1 {
+                                assert_eq!(body["response_format"]["type"], "json_schema");
+                                assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+                            }
                             assert_eq!(body["reasoning_effort"], "high");
                             assert!(body.get("input").is_none());
                             assert!(body.get("tools").is_none());
@@ -1284,8 +1288,12 @@ mod tests {
                 ChatRequest::user_prompt("emit JSON"),
                 json!({
                     "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "confidence": { "type": "number", "format": "float" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    },
+                    "required": ["ok", "confidence", "created_at"],
                 }),
             )
             .await
@@ -1296,6 +1304,15 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["schema"]["type"], "object");
+        assert!(
+            body["text"]["format"]["schema"]["properties"]["confidence"]
+                .get("format")
+                .is_none()
+        );
+        assert_eq!(
+            body["text"]["format"]["schema"]["properties"]["created_at"]["format"],
+            "date-time"
+        );
     }
 
     #[tokio::test]
@@ -1358,14 +1375,16 @@ mod tests {
         .unwrap()
         .with_strict(true);
         let operation_id = LlmOperationId::new();
+        let schema = json!({
+            "type": "object",
+            "properties": { "ok": { "type": "boolean" } },
+            "required": ["ok"],
+        });
+        let schema_json = serde_json::to_string(&schema).unwrap();
         let value = provider
             .complete_structured_raw_with_operation_id(
                 ChatRequest::user_prompt("emit JSON"),
-                json!({
-                    "type": "object",
-                    "properties": { "ok": { "type": "boolean" } },
-                    "required": ["ok"],
-                }),
+                schema,
                 operation_id,
             )
             .await
@@ -1374,6 +1393,15 @@ mod tests {
         assert_eq!(value, json!({"ok": true}));
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
+        let fallback_body: serde_json::Value =
+            serde_json::from_slice(&requests[1].body).expect("request body is JSON");
+        assert_eq!(fallback_body["messages"][0]["role"], "system");
+        assert!(
+            fallback_body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(&schema_json)
+        );
         let expected_id = operation_id.to_string();
         assert_eq!(
             header_value(&requests[0], "x-opencode-session"),
