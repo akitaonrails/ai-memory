@@ -27,6 +27,12 @@ version in [`docs/changelog/`](docs/changelog/):
   OpenClaw generated TypeScript integrations during `ai-memory upgrade` using
   the newly installed binary's templates, while leaving absent and user-owned
   installs untouched (#1869).
+- A Grok subagent's end no longer leaves a handoff. Grok runs each subagent
+  in a session of its own whose `SessionEnd` carries `subagentType`, but only
+  OpenCode and OMP subagent ends were kept off the baton, so the subagent's
+  summary became the newest handoff and the parent session, which claims one
+  on its next tool result, could receive it as a previous session's. The
+  subagent's session is still closed and summarized (#1907).
 - The web UI's root operator now sees every user's sessions in a project's
   Sessions, Agents and Token usage tabs, on each agent's page and on each
   session's page, and so do the `/api/v1` session list and observations
