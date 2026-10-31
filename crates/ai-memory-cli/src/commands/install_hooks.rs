@@ -4968,6 +4968,7 @@ fn add_hook_spooling(source: String) -> Result<String> {
     const FETCH_REPLACEMENT: &str = r#"      try {
         const resp = await fetch(item.url, {
           proxy: false,
+          redirect: "error",
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify(item.payload),
@@ -4975,7 +4976,9 @@ fn add_hook_spooling(source: String) -> Result<String> {
         }).catch(() => undefined);
         // Unreachable server, 5xx or a transient 4xx (408, 425, 429): keep the
         // event on disk for a later drain (#580). Any other 4xx is permanent -
-        // spooling it would retry a rejection forever.
+        // spooling it would retry a rejection forever. A redirect rejects
+        // above and spools too: following it would count a gateway's login
+        // page as a delivery, and a 307 would replay the event to that host.
         if (!resp || hookStatusRetryable(resp.status)) spoolFailedHook(item.url, item.payload);
       } catch (_e) {
         try { spoolFailedHook(item.url, item.payload); } catch (_e2) {}
