@@ -124,6 +124,50 @@ export page whose `pagination.hasMore` is true needs `--allow-partial`.
 Claude memory graph and Qdrant imports remain roadmap items; there are no code
 stubs for them.
 
+### claude-mem SQLite
+
+`claude-mem --mapping <mapping.json>` reads claude-mem's local SQLite database
+(`~/.claude-mem/claude-mem.db`, or `--database <path>`). It imports only the
+model-produced observations and session summaries. Raw tool calls and event
+payloads are never read. Observation types `sensitive` and `security_alert`
+are skipped and counted without copying their bodies into the manifest;
+`security_note` is retained as an ai-memory `gotcha`.
+
+The mapping format follows `agentmemory-export`: `projects` maps claude-mem's
+project key, `cwds` can override it for schema generations that record
+`sdk_sessions.cwd`, and `unscoped` is the optional fallback. A target contains
+`workspace` and exactly one of `project` or stable `project_id`; the id form
+selects an existing project without creating a same-name twin. Observation
+pages land at `imported/claude-mem/<type>/<id>.md`; summaries use
+`imported/claude-mem/session-summary/<id>.md`. The closed type set is
+`decision`, `gotcha`, `security_note`, `feature`, `bugfix`, `change`,
+`refactor`, and `discovery`. Unknown types are skipped and counted without
+reading their bodies. `security_note` retains that source path and maps to the
+`gotcha` kind; the five change/discovery types map to `fact` while retaining
+their source type in the path.
+
+The importer opens the source read-only and uses SQLite's backup API to take a
+WAL-consistent private snapshot before inspection. It refuses a symlink or a
+source whose identity changes during the snapshot. Live databases are
+recognized from `schema_versions` and their actual `PRAGMA table_info`
+columns: the legacy text and structured observation families are supported,
+as are both the pre-v17 `sdk_session_id` and current `memory_session_id`
+relationships. Mixed or incomplete layouts fail closed with a schema
+diagnostic. A
+source is capped at 2 GiB, each source text field at 1 MiB, and each supported
+table at 100,000 rows. SQLite cells are capped at 8 MiB before allocation,
+each final page stays within the 64,000-character exact-read ceiling, and all
+planned page bodies together are capped at 512 MiB.
+
+```bash
+# Plan only; add --show-body for review.
+ai-memory-importer claude-mem --mapping mapping.json
+
+# Apply with a durable resume/conflict manifest.
+ai-memory-importer claude-mem --mapping mapping.json \
+  --apply --manifest-out claude-mem-import.json
+```
+
 ### Local documents
 
 `document --file <path>` extracts one explicitly selected local document into
@@ -243,6 +287,16 @@ The agentmemory routes keep the same dry-run default, `--apply` plus
   records each version as `written`, `present` (already there) or `failed`.
 - Without `--create-destination`, every destination must already exist; the
   check is a read, which never creates a scope.
+
+The claude-mem route submits bounded atomic page batches. A failed precondition
+or rejected page changes none of that batch; successful batches create one
+wiki checkpoint rather than one per page. It therefore requires a server that
+advertises `memory_write_pages_batch`; the older agentmemory routes retain
+their ai-memory 3.0 compatibility. The claude-mem manifest contains source
+ids, destinations, counts, and hashes, but never imported bodies or skipped
+sensitive/security bodies. Each imported page carries a deterministic
+source-row key, while resume authority still requires an exact full-body
+match; retaining the footer on an edited page does not permit overwrite.
 
 The document route adds these boundaries:
 

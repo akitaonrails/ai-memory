@@ -282,6 +282,7 @@ pub(crate) async fn run(args: DocumentArgs) -> Result<()> {
     let write = McpWrite {
         workspace: &plan.workspace,
         project: &plan.project,
+        project_id: None,
         path: &plan.destination_path,
         body: &plan.body,
         title: Some(&plan.title),
@@ -298,7 +299,7 @@ pub(crate) async fn run(args: DocumentArgs) -> Result<()> {
         }
         Err(error) if error.downcast_ref::<PreconditionFailed>().is_some() => {
             let current = client
-                .mcp_read_page(&plan.workspace, &plan.project, &plan.destination_path)
+                .mcp_read_page(&plan.workspace, &plan.project, None, &plan.destination_path)
                 .await
                 .with_context(|| {
                     format!("reading {} after a refused write", plan.destination_path)

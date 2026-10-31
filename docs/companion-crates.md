@@ -144,6 +144,13 @@ Initial source support is intentionally narrow:
   Observations are dropped unless replayed as `external-import` sessions
   through `/hook/batch`; records with no ai-memory counterpart are counted in
   the manifest. Details are in the importer README.
+- claude-mem's local SQLite database (`claude-mem`, with a required project or
+  checkout mapping). The importer snapshots a regular source file through
+  SQLite's backup API, recognizes only documented schema families by their
+  actual columns, skips sensitive/security-alert rows without copying their
+  bodies, and writes sanitized per-record pages through bounded atomic MCP
+  batches. Stable `project_id` targets select an existing destination without
+  creating a same-name project. Details and limits are in the importer README.
 - one explicitly selected local text/Markdown, text-layer PDF, DOCX, PPTX,
   XLSX, VTT, or SRT document (`document`, Unix-only). Extraction is bounded and
   sanitized, pages carry source digest and extractor provenance, and writes
@@ -207,8 +214,9 @@ Write:
   duplicate detection and context checks;
 - optionally call `memory_consolidate` or `memory_auto_improve` after import for
   post-import refinement, rather than building that refinement into core;
-- for bulk operations, loop over the public single-page operation unless ai-memory
-  later adds a generic bulk-mutation seam for its own reasons.
+- for bounded bulk imports, use `memory_write_pages_batch`: every page must be
+  conditional and one rejected or stale page rolls back the whole batch. Keep
+  ordinary writes on `memory_write_page`.
 
 Re-home by kind:
 
@@ -252,8 +260,9 @@ Re-home by kind:
 3. Add live writes through existing ai-memory public write/delete surfaces.
 4. Add optional LLM normalization as a companion-side pass.
 5. Add re-home/link-rewrite as a separate subcommand after import is stable.
-6. Only after repeated usage, consider whether ai-memory core lacks a small,
-   generic API seam; do not start by patching core endpoints.
+6. Reuse the bounded conditional `memory_write_pages_batch` seam for corpus
+   imports. Add another public mutation surface only when repeated use proves
+   that this generic batch cannot preserve the required safety contract.
 
 ## `ai-memory-wikisync`: team-wiki export and sync
 

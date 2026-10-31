@@ -23,6 +23,7 @@ const MCP_SESSION_ID: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 /// The server release that added conditional page writes.
 pub(crate) const MIN_SERVER: &str = "3.0";
+pub(crate) const MIN_BATCH_SERVER: &str = "3.4";
 /// The most characters `memory_read_page` returns of one body
 /// (`READ_PAGE_MAX_MAX_CHARS` in ai-memory-mcp `server.rs`).
 pub(crate) const READ_PAGE_MAX_CHARS: usize = 64_000;
@@ -40,6 +41,7 @@ pub(crate) enum Precondition<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreconditionFailed {
     pub(crate) current_page_id: Option<String>,
+    pub(crate) index: Option<usize>,
 }
 
 impl fmt::Display for PreconditionFailed {
@@ -62,6 +64,7 @@ impl std::error::Error for PreconditionFailed {}
 pub(crate) struct McpWrite<'a> {
     pub(crate) workspace: &'a str,
     pub(crate) project: &'a str,
+    pub(crate) project_id: Option<&'a str>,
     pub(crate) path: &'a str,
     pub(crate) body: &'a str,
     pub(crate) title: Option<&'a str>,
@@ -102,6 +105,30 @@ impl ReadPage {
 }
 
 impl ImportClient {
+    /// Validate one exact existing write destination without creating it.
+    pub(crate) async fn mcp_resolve_write_target(
+        &self,
+        workspace: &str,
+        project: &str,
+        project_id: Option<&str>,
+    ) -> Result<()> {
+        let mut arguments = json!({"workspace": workspace});
+        if let Some(project_id) = project_id {
+            arguments["project_id"] = json!(project_id);
+        } else {
+            arguments["project"] = json!(project);
+        }
+        let result = self
+            .call_tool("memory_resolve_write_target", arguments)
+            .await?;
+        let resolved = tool_json(&result)
+            .ok_or_else(|| anyhow!("memory_resolve_write_target answered without a target"))?;
+        if resolved.get("project_id").and_then(Value::as_str).is_none() {
+            bail!("memory_resolve_write_target answered without project_id");
+        }
+        Ok(())
+    }
+
     /// Refuse a server that predates conditional writes. It would accept
     /// `create_only` as an unknown argument and ignore it, turning every
     /// guarded write into an unconditional one.
@@ -123,6 +150,27 @@ impl ImportClient {
         Ok(())
     }
 
+    /// Refuse a server without the bounded atomic batch tool used by corpus
+    /// imports. Falling back to one checkpoint per page can turn a large
+    /// import into hours of git work and loses all-or-nothing batches.
+    pub(crate) async fn ensure_batch_writes(&self) -> Result<()> {
+        let result = self.mcp_request("tools/list", json!({})).await?;
+        let supported = result
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some("memory_write_pages_batch")
+            });
+        if !supported {
+            bail!(
+                "server too old for this corpus import; needs ai-memory >= {MIN_BATCH_SERVER} (atomic page batches)"
+            );
+        }
+        Ok(())
+    }
+
     /// Write one page version only if `precondition` holds. Returns the new
     /// version id; a refused precondition comes back as [`PreconditionFailed`].
     pub(crate) async fn mcp_write_page(
@@ -132,7 +180,6 @@ impl ImportClient {
     ) -> Result<String> {
         let mut arguments = json!({
             "workspace": write.workspace,
-            "project": write.project,
             "path": write.path,
             "body": write.body,
             "kind": write.kind,
@@ -140,6 +187,11 @@ impl ImportClient {
             "tags": write.tags,
             "pinned": false,
         });
+        if let Some(project_id) = write.project_id {
+            arguments["project_id"] = json!(project_id);
+        } else {
+            arguments["project"] = json!(write.project);
+        }
         if let Some(title) = write.title {
             arguments["title"] = json!(title);
         }
@@ -156,6 +208,79 @@ impl ImportClient {
             .ok_or_else(|| anyhow!("memory_write_page answered without a page_id"))
     }
 
+    /// Write one atomic batch into a single destination. The response ids
+    /// preserve request order. A refused precondition changes no page.
+    pub(crate) async fn mcp_write_pages_batch(
+        &self,
+        writes: &[(&McpWrite<'_>, Precondition<'_>)],
+    ) -> Result<Vec<String>> {
+        let Some((first, _)) = writes.first() else {
+            bail!("cannot write an empty page batch");
+        };
+        let mut pages = Vec::with_capacity(writes.len());
+        for (write, precondition) in writes {
+            if write.workspace != first.workspace
+                || write.project != first.project
+                || write.project_id != first.project_id
+            {
+                bail!("one page batch cannot span destinations");
+            }
+            let mut page = json!({
+                "path": write.path,
+                "body": write.body,
+                "kind": write.kind,
+                "tier": write.tier,
+                "tags": write.tags,
+                "pinned": false,
+            });
+            if let Some(title) = write.title {
+                page["title"] = json!(title);
+            }
+            if let Some(expires_at) = write.expires_at {
+                page["expires_at"] = json!(expires_at);
+            }
+            match precondition {
+                Precondition::Absent => page["create_only"] = json!(true),
+                Precondition::Latest(id) => page["expected_page_id"] = json!(id),
+            }
+            pages.push(page);
+        }
+        let mut arguments = json!({"workspace": first.workspace, "pages": pages});
+        if let Some(project_id) = first.project_id {
+            arguments["project_id"] = json!(project_id);
+        } else {
+            arguments["project"] = json!(first.project);
+        }
+        let result = self
+            .call_tool("memory_write_pages_batch", arguments)
+            .await?;
+        let written = tool_json(&result)
+            .and_then(|value| value.get("pages").cloned())
+            .and_then(|value| value.as_array().cloned())
+            .ok_or_else(|| anyhow!("memory_write_pages_batch answered without pages"))?;
+        if written.len() != writes.len() {
+            bail!(
+                "memory_write_pages_batch returned {} page ids for {} writes",
+                written.len(),
+                writes.len()
+            );
+        }
+        written
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if value.get("index").and_then(Value::as_u64) != Some(index as u64) {
+                    bail!("memory_write_pages_batch returned pages out of order");
+                }
+                value
+                    .get("page_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("memory_write_pages_batch page {index} has no page_id"))
+            })
+            .collect()
+    }
+
     /// Read one page by exact path.
     ///
     /// Since 3.3.0 the server cuts a body at 12,000 characters unless the
@@ -166,19 +291,20 @@ impl ImportClient {
         &self,
         workspace: &str,
         project: &str,
+        project_id: Option<&str>,
         path: &str,
     ) -> Result<ReadPage> {
-        let result = self
-            .call_tool(
-                "memory_read_page",
-                json!({
-                    "workspace": workspace,
-                    "project": project,
-                    "path": path,
-                    "max_chars": READ_PAGE_MAX_CHARS,
-                }),
-            )
-            .await?;
+        let mut arguments = json!({
+            "workspace": workspace,
+            "path": path,
+            "max_chars": READ_PAGE_MAX_CHARS,
+        });
+        if let Some(project_id) = project_id {
+            arguments["project_id"] = json!(project_id);
+        } else {
+            arguments["project"] = json!(project);
+        }
+        let result = self.call_tool("memory_read_page", arguments).await?;
         let page = tool_json(&result)
             .ok_or_else(|| anyhow!("memory_read_page answered without a page"))?;
         Ok(ReadPage {
@@ -386,6 +512,10 @@ fn precondition_failure(error: &Value) -> Option<PreconditionFailed> {
         return None;
     }
     Some(PreconditionFailed {
+        index: data
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
         current_page_id: data
             .get("current_page_id")
             .and_then(Value::as_str)
@@ -442,7 +572,8 @@ mod tests {
         assert_eq!(
             precondition_failure(&error),
             Some(PreconditionFailed {
-                current_page_id: Some("v2".into())
+                current_page_id: Some("v2".into()),
+                index: None,
             })
         );
         assert_eq!(

@@ -235,6 +235,14 @@ pub(crate) fn link_target(path: &str) -> String {
 pub(crate) struct Destination {
     pub(crate) workspace: String,
     pub(crate) project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) project_id: Option<String>,
+}
+
+impl Destination {
+    pub(crate) fn label(&self) -> &str {
+        self.project_id.as_deref().unwrap_or(&self.project)
+    }
 }
 
 /// One version of one page, already sanitized and carrying its provenance.
@@ -365,7 +373,7 @@ impl Manifest {
                 .map(|page| PageEntry {
                     record: page.record,
                     workspace: page.destination.workspace.clone(),
-                    project: page.destination.project.clone(),
+                    project: page.destination.label().to_owned(),
                     path: page.path.clone(),
                     versions: page
                         .versions
@@ -425,7 +433,7 @@ pub(crate) fn print_plan(pages: &[PlannedPage], manifest: &Manifest, show_body: 
                 .last()
                 .map_or("", |version| version.source_id.as_str()),
             page.destination.workspace,
-            page.destination.project,
+            page.destination.label(),
             page.path,
             page.versions.len(),
             if page.versions.len() == 1 { "" } else { "s" }
@@ -449,6 +457,11 @@ pub(crate) async fn preflight(
         return Ok(());
     }
     for destination in destinations {
+        if destination.project_id.is_some() {
+            // The guarded batch resolver itself verifies that a stable id is
+            // authorized and exists. `memory_recent` does not accept ids.
+            continue;
+        }
         if !client
             .mcp_scope_exists(&destination.workspace, &destination.project)
             .await
@@ -456,7 +469,7 @@ pub(crate) async fn preflight(
             bail!(
                 "destination {}/{} must already exist (or pass --create-destination)",
                 destination.workspace,
-                destination.project
+                destination.label()
             );
         }
     }
@@ -466,6 +479,176 @@ pub(crate) async fn preflight(
 /// Write every planned page, versions oldest first, each conditional on the
 /// version before it. Stops at the first failure; the manifest records every
 /// version's state, and a rerun resumes from what the server holds.
+pub(crate) async fn apply_pages_batched(
+    client: &ImportClient,
+    pages: &[PlannedPage],
+    manifest: &mut Manifest,
+    manifest_path: &Path,
+) -> Result<()> {
+    #[derive(Default)]
+    struct PageState {
+        index: usize,
+        latest: Option<String>,
+    }
+
+    const MAX_BATCH_PAGES: usize = 100;
+    const MAX_BATCH_BODY_BYTES: usize = 8 * 1024 * 1024;
+    let mut states: Vec<PageState> = (0..pages.len()).map(|_| PageState::default()).collect();
+
+    while let Some(first) = states
+        .iter()
+        .enumerate()
+        .find(|(page_index, state)| state.index < pages[*page_index].versions.len())
+        .map(|(index, _)| index)
+    {
+        let destination = &pages[first].destination;
+        let mut pending = Vec::new();
+        let mut body_bytes = 0usize;
+        for (page_index, state) in states.iter().enumerate() {
+            let page = &pages[page_index];
+            if state.index >= page.versions.len() || page.destination != *destination {
+                continue;
+            }
+            let next_bytes = page.versions[state.index].body.len();
+            if !pending.is_empty()
+                && (pending.len() == MAX_BATCH_PAGES
+                    || body_bytes.saturating_add(next_bytes) > MAX_BATCH_BODY_BYTES)
+            {
+                break;
+            }
+            if next_bytes > MAX_BATCH_BODY_BYTES {
+                let error = anyhow::anyhow!("{} exceeds the batch body limit", page.path);
+                return Err(manifest.fail(manifest_path, error));
+            }
+            body_bytes += next_bytes;
+            pending.push(page_index);
+        }
+
+        let writes: Vec<McpWrite<'_>> = pending
+            .iter()
+            .map(|&page_index| {
+                let page = &pages[page_index];
+                let version = &page.versions[states[page_index].index];
+                McpWrite {
+                    workspace: &page.destination.workspace,
+                    project: &page.destination.project,
+                    project_id: page.destination.project_id.as_deref(),
+                    path: &page.path,
+                    body: &version.body,
+                    title: Some(&version.title),
+                    kind: &version.kind,
+                    tier: version.tier,
+                    tags: &version.tags,
+                    expires_at: version.expires_at.as_deref(),
+                }
+            })
+            .collect();
+        let batch: Vec<_> = writes
+            .iter()
+            .zip(pending.iter())
+            .map(|(write, &page_index)| {
+                let precondition = states[page_index]
+                    .latest
+                    .as_deref()
+                    .map_or(Precondition::Absent, Precondition::Latest);
+                (write, precondition)
+            })
+            .collect();
+
+        match client.mcp_write_pages_batch(&batch).await {
+            Ok(page_ids) => {
+                for (&page_index, page_id) in pending.iter().zip(page_ids) {
+                    let version_index = states[page_index].index;
+                    let entry = &mut manifest.pages[page_index].versions[version_index];
+                    entry.status = VersionStatus::Written;
+                    entry.page_id = Some(page_id.clone());
+                    manifest.written_versions += 1;
+                    states[page_index].latest = Some(page_id);
+                    states[page_index].index += 1;
+                }
+                manifest.write(manifest_path)?;
+            }
+            Err(error) if error.downcast_ref::<PreconditionFailed>().is_some() => {
+                let failed = error.downcast_ref::<PreconditionFailed>().unwrap();
+                let local_index = failed.index.unwrap_or(0);
+                let Some(&page_index) = pending.get(local_index) else {
+                    return Err(manifest.fail(
+                        manifest_path,
+                        anyhow::anyhow!("batch precondition failure named an invalid index"),
+                    ));
+                };
+                let page = &pages[page_index];
+                let current = match client
+                    .mcp_read_page(
+                        &page.destination.workspace,
+                        &page.destination.project,
+                        page.destination.project_id.as_deref(),
+                        &page.path,
+                    )
+                    .await
+                    .with_context(|| format!("reading {} after a refused batch", page.path))
+                {
+                    Ok(current) => current,
+                    Err(error) => return Err(manifest.fail(manifest_path, error)),
+                };
+                if let Some(error) = current.unverifiable(&page.path) {
+                    let entry = &mut manifest.pages[page_index].versions[states[page_index].index];
+                    entry.status = VersionStatus::Failed;
+                    entry.error = Some(crate::mcp::preview(&format!("{error:#}")));
+                    return Err(manifest.fail(manifest_path, error));
+                }
+                let start = states[page_index].index;
+                let Some(found) = page
+                    .versions
+                    .iter()
+                    .rposition(|version| current.body == version.body)
+                    .filter(|found| *found >= start)
+                else {
+                    let entry = &mut manifest.pages[page_index].versions[start];
+                    entry.status = VersionStatus::Failed;
+                    entry.error = Some("destination page was not written by this import".into());
+                    let error = anyhow::anyhow!(
+                        "{} already holds a page this import did not write; refusing to replace it",
+                        page.path
+                    );
+                    return Err(manifest.fail(manifest_path, error));
+                };
+                for skipped in start..=found {
+                    let entry = &mut manifest.pages[page_index].versions[skipped];
+                    entry.status = VersionStatus::Present;
+                    if skipped == found {
+                        entry.page_id = current.page_id.clone();
+                    }
+                    manifest.present_versions += 1;
+                }
+                states[page_index].latest = current.page_id;
+                states[page_index].index = found + 1;
+                if states[page_index].latest.is_none()
+                    && states[page_index].index < page.versions.len()
+                {
+                    let error = anyhow::anyhow!(
+                        "{} has no version id; cannot continue its chain",
+                        page.path
+                    );
+                    return Err(manifest.fail(manifest_path, error));
+                }
+                manifest.write(manifest_path)?;
+            }
+            Err(error) => {
+                let page_index = pending[0];
+                let entry = &mut manifest.pages[page_index].versions[states[page_index].index];
+                entry.status = VersionStatus::Failed;
+                entry.error = Some(crate::mcp::preview(&format!("{error:#}")));
+                return Err(manifest.fail(manifest_path, error));
+            }
+        }
+    }
+    manifest.status = RunStatus::Imported;
+    manifest.write(manifest_path)
+}
+
+/// Compatibility path for the established agentmemory routes. They retain
+/// ai-memory 3.0 support; only claude-mem requires the newer batch tool.
 pub(crate) async fn apply_pages(
     client: &ImportClient,
     pages: &[PlannedPage],
@@ -495,6 +678,7 @@ async fn apply_page(
         let write = McpWrite {
             workspace: &page.destination.workspace,
             project: &page.destination.project,
+            project_id: page.destination.project_id.as_deref(),
             path: &page.path,
             body: &version.body,
             title: Some(&version.title),
@@ -517,13 +701,11 @@ async fn apply_page(
                 index += 1;
             }
             Err(error) if error.downcast_ref::<PreconditionFailed>().is_some() => {
-                // The page exists or moved on. The attribution key can survive
-                // a destination edit, so only an identical planned body can
-                // supply the version id for the next conditional write.
                 let current = client
                     .mcp_read_page(
                         &page.destination.workspace,
                         &page.destination.project,
+                        page.destination.project_id.as_deref(),
                         &page.path,
                     )
                     .await
@@ -537,7 +719,7 @@ async fn apply_page(
                 let Some(found) = page
                     .versions
                     .iter()
-                    .rposition(|v| current.body == v.body)
+                    .rposition(|version| current.body == version.body)
                     .filter(|found| *found >= index)
                 else {
                     let entry = &mut manifest.pages[page_index].versions[index];
@@ -583,7 +765,7 @@ pub(crate) fn print_done(manifest: &Manifest) {
 }
 
 #[cfg(test)]
-mod e2e;
+pub(crate) mod e2e;
 #[cfg(test)]
 pub(crate) mod mock;
 

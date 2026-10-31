@@ -20,9 +20,9 @@ use crate::mcp::tool_json;
 
 const BIN_ENV: &str = "AI_MEMORY_IMPORTER_E2E_BIN";
 
-struct Server {
+pub(crate) struct Server {
     child: Child,
-    url: String,
+    pub(crate) url: String,
     _root: TempDir,
 }
 
@@ -34,7 +34,7 @@ impl Drop for Server {
 }
 
 /// Start an isolated server, or `None` when no binary is configured.
-async fn start() -> Option<Server> {
+pub(crate) async fn start() -> Option<Server> {
     let Some(bin) = std::env::var_os(BIN_ENV).map(PathBuf::from) else {
         eprintln!("skipped: set {BIN_ENV} to an ai-memory binary to run this test");
         return None;
@@ -93,7 +93,7 @@ async fn start() -> Option<Server> {
     Some(server)
 }
 
-async fn tool(server: &Server, name: &str, arguments: Value) -> Value {
+pub(crate) async fn tool(server: &Server, name: &str, arguments: Value) -> Value {
     let client = ImportClient::new(&server.url).unwrap();
     let result = client.call_tool(name, arguments).await.unwrap();
     tool_json(&result).unwrap_or(result)

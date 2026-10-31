@@ -377,6 +377,11 @@ should be proposed from a completed session, or at explicit wrap-up \
   page only if nobody else has, pass the `page_id` `memory_read_page` \
   returned as `expected_page_id` (or `create_only: true` for a new page); \
   a stale one fails with `precondition_failed` and writes nothing.\n\
+- `memory_write_pages_batch` — only for a bounded bulk import that must land \
+  several complete pages atomically. Every item requires `create_only` or \
+  `expected_page_id`; do not use this for routine notes.\n\
+- `memory_resolve_write_target` — before a bulk importer writes, validate an \
+  exact existing destination and write access without creating anything.\n\
 - `memory_patch_page` — when changing or appending to one or more Markdown \
   sections of an existing page. Read the page first, then pass its required \
   `page_id` and the returned section hash for every `replace_section`. The \
@@ -1730,6 +1735,10 @@ struct ReadPageArgs {
     /// every project-scoped call.
     #[serde(default)]
     project: Option<String>,
+    /// Stable id of an existing project. Requires `workspace`, is mutually
+    /// exclusive with `project` and `scope`, and never creates a project.
+    #[serde(default)]
+    project_id: Option<String>,
     /// Workspace to read together with `project`. Session-aware clients may omit
     /// both for the current project; static MCP clients must pass both.
     #[serde(default)]
@@ -1967,6 +1976,10 @@ struct WritePageArgs {
     /// name that doesn't exist yet, the project is **created**.
     #[serde(default)]
     project: Option<String>,
+    /// Stable id of an existing project. Requires `workspace`, is mutually
+    /// exclusive with `project` and `scope`, and never creates a project.
+    #[serde(default)]
+    project_id: Option<String>,
     /// Workspace to write into. Only honoured together with an explicit
     /// `project`; created if it doesn't exist. Session-aware clients may omit
     /// both for the current project; static MCP clients must pass both. Omit
@@ -2008,6 +2021,75 @@ struct WritePageArgs {
     #[serde(default)]
     create_only: bool,
 }
+
+/// One fully materialized page in an atomic conditional batch.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BatchWritePageEntry {
+    #[serde(flatten)]
+    metadata: ai_memory_core::page::PageWriteMetadata,
+    /// Relative wiki path to write.
+    path: String,
+    /// Complete Markdown body for this version.
+    body: String,
+    /// Explicit title; normally omit and start the body with an H1.
+    #[serde(default)]
+    title: Option<String>,
+    /// Tier (`working`, `episodic`, `semantic`, `procedural`). Default semantic.
+    #[serde(default)]
+    tier: Option<String>,
+    /// Tags to attach to the page.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Pin the page so the decay sweep skips it.
+    #[serde(default)]
+    pinned: bool,
+    /// Optional TTL (RFC3339 instant or `YYYY-MM-DD`).
+    #[serde(default)]
+    expires_at: Option<String>,
+    /// Require this latest page version. Mutually exclusive with `create_only`.
+    #[serde(default)]
+    expected_page_id: Option<String>,
+    /// Require the path to be absent. Mutually exclusive with
+    /// `expected_page_id`.
+    #[serde(default)]
+    create_only: bool,
+}
+
+/// A bounded, atomic set of conditional writes into one existing project.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct BatchWritePagesArgs {
+    /// Existing destination workspace.
+    workspace: String,
+    /// Existing destination project name. Static MCP clients must pass it together
+    /// with `workspace`. Mutually exclusive with `project_id`.
+    #[serde(default)]
+    project: Option<String>,
+    /// Stable id of an existing project in `workspace`. Mutually exclusive
+    /// with `project`; this form never creates a project.
+    #[serde(default)]
+    project_id: Option<String>,
+    /// Conditional page versions to write atomically, in response order.
+    pages: Vec<BatchWritePageEntry>,
+}
+
+/// Exact, non-mutating write-target preflight for external clients.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct ResolveWriteTargetArgs {
+    /// Existing workspace containing the destination.
+    workspace: String,
+    /// Existing project name. Static MCP clients must pass it together with
+    /// `workspace`. Exactly one of `project` or `project_id` is required.
+    #[serde(default)]
+    project: Option<String>,
+    /// Stable id of an existing project in `workspace`. Exactly one of
+    /// `project` or `project_id` is required.
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+const BATCH_WRITE_MAX_PAGES: usize = 100;
+const BATCH_WRITE_MAX_BODY_BYTES: usize = 1024 * 1024;
+const BATCH_WRITE_MAX_TOTAL_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 #[tool_router]
 impl AiMemoryServer {
@@ -2396,6 +2478,46 @@ impl AiMemoryServer {
             .await
             .map(ai_memory_store::ResolvedScope::as_tuple)
             .map_err(Self::scope_error)
+    }
+
+    /// Resolve a caller-selected existing project by stable id. Unlike the
+    /// name-based write resolver this can never create or promote a scope.
+    async fn resolve_existing_project_id_as(
+        &self,
+        workspace: Option<&str>,
+        project: Option<&str>,
+        project_id: Option<&str>,
+        viewer: Option<ai_memory_core::UserId>,
+        required: ai_memory_store::ProjectAccess,
+    ) -> Result<Option<(WorkspaceId, ProjectId)>, McpError> {
+        let Some(raw_id) = project_id.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        if project.is_some_and(|value| !value.trim().is_empty()) {
+            return Err(McpError::invalid_params(
+                "project and project_id are mutually exclusive",
+                None,
+            ));
+        }
+        let workspace = workspace
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                McpError::invalid_params("workspace is required with project_id", None)
+            })?;
+        let project_id = ProjectId::from_str(raw_id).map_err(|error| {
+            McpError::invalid_params(format!("invalid project_id: {error}"), None)
+        })?;
+        ai_memory_store::lookup_project_id_guarded(
+            &self.reader,
+            workspace,
+            project_id,
+            viewer,
+            required,
+        )
+        .await
+        .map(|scope| Some(scope.as_tuple()))
+        .map_err(Self::scope_error)
     }
 
     /// [`Self::effective_ids_for_read_args_with_actor`], plus where the scope
@@ -4676,6 +4798,9 @@ impl AiMemoryServer {
         metadata. This replaces the whole page; omitted metadata is cleared. \
         Bounds apply to raw values before trimming or normalization. \
         Relations use only `causes`, `fixes`, and `contradicts`. \
+        An exact existing destination may be selected with `workspace` + \
+        stable `project_id`; it is mutually exclusive with `project`/`scope` \
+        and never creates a scope. \
         **Title convention:** start `body` with a `# Some Title` line — \
         ai-memory derives the title from that H1 automatically. Do NOT \
         pass the `title` argument; passing it forces correct JSON-escaping \
@@ -4697,6 +4822,97 @@ impl AiMemoryServer {
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         self.write_page_in_scope(args, parts, None).await
+    }
+
+    /// Validate and canonicalize one existing writable destination without
+    /// creating, promoting or otherwise changing it.
+    #[tool(
+        annotations(
+            title = "Resolve writable memory destination",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "Preflight an exact existing page-write destination without changing server state. Requires `workspace` and exactly one of existing `project` or stable `project_id`; there is no current-project fallback and no scope creation or identity promotion. The caller must have write access. Returns only the canonical workspace name, project name, and project id. Bulk importers should resolve every mapped destination before their first write."
+    )]
+    async fn memory_resolve_write_target(
+        &self,
+        Parameters(args): Parameters<ResolveWriteTargetArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let workspace = args.workspace.trim();
+        if workspace.is_empty() {
+            return Err(McpError::invalid_params(
+                "workspace must not be blank",
+                None,
+            ));
+        }
+        let project = args
+            .project
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let project_id = args
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let viewer = Self::viewer_from_parts(Some(&parts));
+        let scope = match (project, project_id) {
+            (Some(project), None) => ai_memory_store::lookup_existing_scope_guarded(
+                &self.reader,
+                workspace,
+                project,
+                viewer,
+                ai_memory_store::ProjectAccess::Write,
+            )
+            .await
+            .map_err(Self::scope_error)?,
+            (None, Some(raw_id)) => {
+                let project_id = ProjectId::from_str(raw_id).map_err(|error| {
+                    McpError::invalid_params(format!("invalid project_id: {error}"), None)
+                })?;
+                ai_memory_store::lookup_project_id_guarded(
+                    &self.reader,
+                    workspace,
+                    project_id,
+                    viewer,
+                    ai_memory_store::ProjectAccess::Write,
+                )
+                .await
+                .map_err(Self::scope_error)?
+            }
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "project and project_id are mutually exclusive",
+                    None,
+                ));
+            }
+            (None, None) => {
+                return Err(McpError::invalid_params(
+                    "exactly one of project or project_id is required",
+                    None,
+                ));
+            }
+        };
+        let workspace_name = self
+            .reader
+            .workspace_name_by_id(scope.workspace_id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .ok_or_else(|| McpError::internal_error("resolved workspace disappeared", None))?;
+        let project_name = self
+            .reader
+            .project_name_by_id(scope.workspace_id, scope.project_id)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?
+            .ok_or_else(|| McpError::internal_error("resolved project disappeared", None))?;
+        ok_json(&serde_json::json!({
+            "workspace": workspace_name,
+            "project": project_name,
+            "project_id": scope.project_id.to_string(),
+        }))
     }
 
     /// The body of [`Self::memory_write_page`]. `resolved` is a scope the
@@ -4787,13 +5003,33 @@ impl AiMemoryServer {
             Some(resolved) => resolved,
             None => match args.scope.as_deref().map(str::trim) {
                 None | Some("") => {
-                    self.resolve_write_target_with_actor(
-                        args.workspace.as_deref(),
-                        args.project.as_deref(),
-                        &aps_actor,
-                        Self::viewer_from_parts(Some(&parts)),
-                    )
-                    .await?
+                    match self
+                        .resolve_existing_project_id_as(
+                            args.workspace.as_deref(),
+                            args.project.as_deref(),
+                            args.project_id.as_deref(),
+                            Self::viewer_from_parts(Some(&parts)),
+                            ai_memory_store::ProjectAccess::Write,
+                        )
+                        .await?
+                    {
+                        Some((workspace_id, project_id)) => ai_memory_store::ResolvedWriteScope {
+                            scope: ai_memory_store::ResolvedScope {
+                                workspace_id,
+                                project_id,
+                            },
+                            promoted_from: None,
+                        },
+                        None => {
+                            self.resolve_write_target_with_actor(
+                                args.workspace.as_deref(),
+                                args.project.as_deref(),
+                                &aps_actor,
+                                Self::viewer_from_parts(Some(&parts)),
+                            )
+                            .await?
+                        }
+                    }
                 }
                 Some("global") => {
                     if args
@@ -4804,9 +5040,13 @@ impl AiMemoryServer {
                             .project
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
+                        || args
+                            .project_id
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
                     {
                         return Err(McpError::invalid_params(
-                            "scope: \"global\" cannot be combined with workspace/project",
+                            "scope: \"global\" cannot be combined with workspace/project/project_id",
                             None,
                         ));
                     }
@@ -4829,9 +5069,13 @@ impl AiMemoryServer {
                             .project
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
+                        || args
+                            .project_id
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
                     {
                         return Err(McpError::invalid_params(
-                            "scope: \"profile\" cannot be combined with workspace/project",
+                            "scope: \"profile\" cannot be combined with workspace/project/project_id",
                             None,
                         ));
                     }
@@ -5028,6 +5272,252 @@ impl AiMemoryServer {
         ok_json(&result)
     }
 
+    /// Atomically write a bounded set of conditional page versions.
+    #[tool(
+        annotations(
+            title = "Write memory page batch",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        description = "Write 1-100 complete page versions atomically into one existing project. Every page must carry exactly one precondition: `create_only: true` or `expected_page_id`. If any precondition fails, admission rejects a page, or persistence fails, no page version is written. Duplicate paths are refused. Each body is capped at 1 MiB and all bodies together at 8 MiB. The destination may be selected by existing `workspace` + `project`, or by `workspace` + stable `project_id`; neither form creates a project. The response preserves request order and returns one page id per item."
+    )]
+    async fn memory_write_pages_batch(
+        &self,
+        Parameters(args): Parameters<BatchWritePagesArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Err(McpError::internal_error(
+                "memory_write_pages_batch requires the server to be built with a wiki handle",
+                None,
+            ));
+        };
+        if args.pages.is_empty() || args.pages.len() > BATCH_WRITE_MAX_PAGES {
+            return Err(McpError::invalid_params(
+                format!(
+                    "pages must contain 1-{BATCH_WRITE_MAX_PAGES} entries (got {})",
+                    args.pages.len()
+                ),
+                None,
+            ));
+        }
+
+        let workspace = args.workspace.trim();
+        if workspace.is_empty() {
+            return Err(McpError::invalid_params(
+                "workspace must not be blank",
+                None,
+            ));
+        }
+        let viewer = Self::viewer_from_parts(Some(&parts));
+        let actor_key = Self::actor_key_from_parts(Some(&parts));
+        let (workspace_id, project_id) = match self
+            .resolve_existing_project_id_as(
+                Some(workspace),
+                args.project.as_deref(),
+                args.project_id.as_deref(),
+                viewer,
+                ai_memory_store::ProjectAccess::Write,
+            )
+            .await?
+        {
+            Some(ids) => ids,
+            None => {
+                let project = args
+                    .project
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            "exactly one of project or project_id is required",
+                            None,
+                        )
+                    })?;
+                self.effective_ids_for_mutation_args_with_actor(
+                    Some(workspace),
+                    Some(project),
+                    &actor_key,
+                    viewer,
+                )
+                .await?
+            }
+        };
+
+        let actor = crate::actor::actor_from_parts(&parts);
+        let author_id = crate::actor::author_id_from_parts(&parts);
+        let skip_webhooks = crate::actor::skip_webhooks_from_parts(&parts);
+        let mut total_body_bytes = 0usize;
+        let mut paths = HashSet::with_capacity(args.pages.len());
+        let mut requests = Vec::with_capacity(args.pages.len());
+        let mut response_paths = Vec::with_capacity(args.pages.len());
+
+        for (index, entry) in args.pages.into_iter().enumerate() {
+            let body_bytes = entry.body.len();
+            if body_bytes > BATCH_WRITE_MAX_BODY_BYTES {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "pages[{index}].body is {body_bytes} bytes; maximum is {BATCH_WRITE_MAX_BODY_BYTES}"
+                    ),
+                    None,
+                ));
+            }
+            total_body_bytes = total_body_bytes.checked_add(body_bytes).ok_or_else(|| {
+                McpError::invalid_params("aggregate page body size overflowed", None)
+            })?;
+            if total_body_bytes > BATCH_WRITE_MAX_TOTAL_BODY_BYTES {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "page bodies total {total_body_bytes} bytes; maximum is {BATCH_WRITE_MAX_TOTAL_BODY_BYTES}"
+                    ),
+                    None,
+                ));
+            }
+
+            let precondition =
+                page_precondition(entry.expected_page_id.as_deref(), entry.create_only)?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!("pages[{index}] requires create_only or expected_page_id"),
+                            None,
+                        )
+                    })?;
+            let path = PagePath::new(entry.path)
+                .and_then(|path| path.ensure_portable().map(|()| path))
+                .map_err(|error| {
+                    McpError::invalid_params(format!("invalid pages[{index}].path: {error}"), None)
+                })?;
+            let path = self.place_slot_write(path, &parts).await?;
+            if !paths.insert(path.to_string()) {
+                return Err(McpError::invalid_params(
+                    format!("duplicate batch path: {path}"),
+                    None,
+                ));
+            }
+
+            let mut frontmatter = entry
+                .metadata
+                .into_frontmatter()
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            ai_memory_core::page::ensure_profile_metadata_placement(&frontmatter, &path, false)
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            if let Some(title) = &entry.title {
+                frontmatter.insert("title".into(), serde_json::Value::String(title.clone()));
+            }
+            if !entry.tags.is_empty() {
+                frontmatter.insert(
+                    "tags".into(),
+                    serde_json::Value::Array(
+                        entry
+                            .tags
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+            if entry.pinned {
+                frontmatter.insert("pinned".into(), serde_json::Value::Bool(true));
+            }
+            if let Some(expires_at) = entry
+                .expires_at
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if ai_memory_core::parse_expires_at_instant(expires_at).is_none() {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "invalid pages[{index}].expires_at (want RFC3339 or YYYY-MM-DD): {expires_at}"
+                        ),
+                        None,
+                    ));
+                }
+                frontmatter.insert(
+                    "expires_at".into(),
+                    serde_json::Value::String(expires_at.to_owned()),
+                );
+            }
+            let tier_name = entry.tier.as_deref().unwrap_or("semantic");
+            let tier = tier_name.parse::<Tier>().map_err(|_| {
+                McpError::invalid_params(format!("unknown pages[{index}].tier {tier_name:?}"), None)
+            })?;
+            let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+                Some(ai_memory_wiki::AdmissionContext {
+                    op: ai_memory_wiki::AdmissionOp::WritePage,
+                    skip_webhooks: skip_webhooks.clone(),
+                    ..ai_memory_wiki::AdmissionContext::default()
+                })
+            } else {
+                None
+            };
+            response_paths.push(path.clone());
+            requests.push((
+                WritePageRequest {
+                    workspace_id,
+                    project_id,
+                    path,
+                    frontmatter: if frontmatter.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::Object(frontmatter)
+                    },
+                    body: entry.body,
+                    tier,
+                    pinned: entry.pinned,
+                    title: entry.title,
+                    admission_ctx,
+                    author_id,
+                    actor: actor.clone(),
+                    evidence: Vec::new(),
+                },
+                precondition,
+            ));
+        }
+
+        let written = wiki
+            .apply_batch_if(requests)
+            .await
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let ids = match written {
+            ai_memory_wiki::ConditionalBatchWrite::Written(ids) => ids,
+            ai_memory_wiki::ConditionalBatchWrite::Mismatch { index, current } => {
+                let path = &response_paths[index];
+                return Err(McpError::invalid_request(
+                    format!(
+                        "batch precondition failed at pages[{index}] ({path}); nothing was changed"
+                    ),
+                    Some(serde_json::json!({
+                        "reason": "precondition_failed",
+                        "index": index,
+                        "path": path.as_str(),
+                        "current_page_id": current.map(|id| id.to_string()),
+                    })),
+                ));
+            }
+        };
+        let checkpoint = checkpoint_or_warn(wiki, "memory_write_pages_batch");
+        let pages: Vec<_> = ids
+            .into_iter()
+            .zip(response_paths)
+            .enumerate()
+            .map(|(index, (page_id, path))| {
+                serde_json::json!({
+                    "index": index,
+                    "path": path.as_str(),
+                    "page_id": page_id.to_string(),
+                })
+            })
+            .collect();
+        ok_json(&serde_json::json!({
+            "pages": pages,
+            "checkpoint": checkpoint,
+        }))
+    }
+
     /// Apply a bounded batch of heading-anchored edits to an existing page.
     #[tool(
         annotations(
@@ -5199,6 +5689,9 @@ impl AiMemoryServer {
         whole page. \
         Set `scope: \"global\"` to read the reserved cross-project global \
         scope; do not combine it with `workspace`/`project`. \
+        For an exact existing destination, pass `workspace` + stable \
+        `project_id`; it is mutually exclusive with `project`/`scope` and \
+        never creates a scope. \
         \
         Set `include_related: true` to also walk the link graph outward from \
         this page and get a `related` array of the reachable pages, each with \
@@ -5228,13 +5721,27 @@ impl AiMemoryServer {
         let requested_scope = args.scope.as_deref().map(str::trim);
         let (ws, proj) = match requested_scope {
             None | Some("") => {
-                self.effective_ids_for_read_args_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?
+                match self
+                    .resolve_existing_project_id_as(
+                        args.workspace.as_deref(),
+                        args.project.as_deref(),
+                        args.project_id.as_deref(),
+                        Self::viewer_from_parts(Some(&parts)),
+                        ai_memory_store::ProjectAccess::Read,
+                    )
+                    .await?
+                {
+                    Some(ids) => ids,
+                    None => {
+                        self.effective_ids_for_read_args_with_actor(
+                            args.workspace.as_deref(),
+                            args.project.as_deref(),
+                            &aps_actor,
+                            Self::viewer_from_parts(Some(&parts)),
+                        )
+                        .await?
+                    }
+                }
             }
             Some("global") => {
                 if args
@@ -5245,9 +5752,13 @@ impl AiMemoryServer {
                         .project
                         .as_deref()
                         .is_some_and(|s| !s.trim().is_empty())
+                    || args
+                        .project_id
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
                 {
                     return Err(McpError::invalid_params(
-                        "scope: \"global\" cannot be combined with workspace/project",
+                        "scope: \"global\" cannot be combined with workspace/project/project_id",
                         None,
                     ));
                 }
@@ -5280,7 +5791,11 @@ impl AiMemoryServer {
                 .workspace
                 .as_deref()
                 .is_none_or(|s| s.trim().is_empty())
-            && args.project.as_deref().is_none_or(|s| s.trim().is_empty());
+            && args.project.as_deref().is_none_or(|s| s.trim().is_empty())
+            && args
+                .project_id
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty());
         let max_chars = args
             .max_chars
             .unwrap_or(READ_PAGE_DEFAULT_MAX_CHARS)
@@ -5831,6 +6346,7 @@ impl AiMemoryServer {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
             project: args.project,
+            project_id: None,
             workspace: args.workspace,
             scope: None,
             expires_at: text("expires_at"),
@@ -10277,7 +10793,9 @@ mod tests {
         "memory_message_cancel",
         "memory_consolidate",
         "memory_auto_improve",
+        "memory_resolve_write_target",
         "memory_write_page",
+        "memory_write_pages_batch",
         "memory_patch_page",
         "memory_read_page",
         "memory_read_session_observations",
@@ -10305,7 +10823,9 @@ mod tests {
         "memory_message_cancel",
         "memory_consolidate",
         "memory_auto_improve",
+        "memory_resolve_write_target",
         "memory_write_page",
+        "memory_write_pages_batch",
         "memory_patch_page",
         "memory_read_page",
         "memory_read_session_observations",
@@ -12527,6 +13047,7 @@ mod tests {
                     tags: Vec::new(),
                     pinned: false,
                     project: Some("sibling".to_string()),
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -13432,6 +13953,7 @@ mod tests {
             tags: Vec::new(),
             pinned: false,
             project: project.map(str::to_string),
+            project_id: None,
             workspace: None,
             scope: scope.map(str::to_string),
             expires_at: None,
@@ -15436,6 +15958,7 @@ mod tests {
                     query: None,
                     path: None,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -15487,6 +16010,7 @@ mod tests {
                     query: Some("  ".into()),
                     path: None,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -15511,6 +16035,7 @@ mod tests {
                     query: Some("zonkolite".into()),
                     path: Some(String::new()),
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -15540,6 +16065,7 @@ mod tests {
                     query: Some("no-such-term-anywhere".into()),
                     path: Some("notes/blankfill.md".into()),
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -15599,6 +16125,7 @@ mod tests {
                     query: None,
                     path: Some("notes/sibling.md".into()),
                     project: Some("docs".into()),
+                    project_id: None,
                     workspace: Some("practice".into()),
                     scope: None,
                     include_related: false,
@@ -15656,6 +16183,7 @@ mod tests {
                     query: None,
                     path: Some("notes/db-only-tool.md".into()),
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -15714,6 +16242,7 @@ mod tests {
                         query: None,
                         path: Some("notes/short.md".into()),
                         project: None,
+                        project_id: None,
                         workspace: None,
                         scope: None,
                         include_related: false,
@@ -15764,6 +16293,7 @@ mod tests {
                         query: None,
                         path: Some("notes/long.md".into()),
                         project: None,
+                        project_id: None,
                         workspace: None,
                         scope: None,
                         include_related: false,
@@ -15849,6 +16379,7 @@ mod tests {
                         query: None,
                         path: Some(path.into()),
                         project: None,
+                        project_id: None,
                         workspace: None,
                         scope: None,
                         include_related: false,
@@ -15897,6 +16428,7 @@ mod tests {
                     query: None,
                     path: Some("notes/does-not-exist.md".into()),
                     project: Some("scratch".into()),
+                    project_id: None,
                     workspace: Some("default".into()),
                     scope: None,
                     include_related: false,
@@ -15919,6 +16451,7 @@ mod tests {
                     query: Some("zzzz-no-such-term".into()),
                     path: None,
                     project: Some("scratch".into()),
+                    project_id: None,
                     workspace: Some("default".into()),
                     scope: None,
                     include_related: false,
@@ -15952,6 +16485,7 @@ mod tests {
                     query: None,
                     path: Some("blocked.md".into()),
                     project: Some("scratch".into()),
+                    project_id: None,
                     workspace: Some("default".into()),
                     scope: None,
                     include_related: false,
@@ -15982,6 +16516,7 @@ mod tests {
                     query: None,
                     path: Some("does-not-exist.md".into()),
                     project: Some("scratch".into()),
+                    project_id: None,
                     workspace: Some("default".into()),
                     scope: None,
                     include_related: false,
@@ -16009,6 +16544,7 @@ mod tests {
                     query: None,
                     path: Some("does-not-exist.md".into()),
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -18146,6 +18682,318 @@ mod tests {
         assert_ne!(schema["title"], "PageWriteMetadata");
     }
 
+    fn batch_entry(
+        path: &str,
+        body: &str,
+        create_only: bool,
+        expected_page_id: Option<&str>,
+    ) -> BatchWritePageEntry {
+        BatchWritePageEntry {
+            metadata: Default::default(),
+            path: path.into(),
+            body: body.into(),
+            title: None,
+            tier: None,
+            tags: vec!["import".into()],
+            pinned: false,
+            expires_at: None,
+            expected_page_id: expected_page_id.map(str::to_owned),
+            create_only,
+        }
+    }
+
+    #[tokio::test]
+    async fn page_read_and_write_can_target_an_existing_project_by_id() {
+        let (tmp, store, server, ws, _default_project) = setup_server().await;
+        let target = store
+            .writer
+            .get_or_create_project(ws, "renamed-destination", None)
+            .await
+            .unwrap();
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+
+        let write = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "imported/exact.md".into(),
+                    body: "# Exact destination\n\nproject id wins".into(),
+                    title: None,
+                    tier: None,
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    project_id: Some(target.to_string()),
+                    workspace: Some("default".into()),
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    expected_page_id: None,
+                    create_only: true,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert!(call_tool_json(write)["page_id"].is_string());
+
+        let read = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("imported/exact.md".into()),
+                    project: None,
+                    project_id: Some(target.to_string()),
+                    workspace: Some("default".into()),
+                    scope: None,
+                    include_related: false,
+                    related_depth: None,
+                    max_chars: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            call_tool_json(read)["body"],
+            "# Exact destination\n\nproject id wins"
+        );
+
+        let conflict = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("imported/exact.md".into()),
+                    project: Some("renamed-destination".into()),
+                    project_id: Some(target.to_string()),
+                    workspace: Some("default".into()),
+                    scope: None,
+                    include_related: false,
+                    related_depth: None,
+                    max_chars: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(conflict.message.contains("mutually exclusive"));
+    }
+
+    #[tokio::test]
+    async fn memory_resolve_write_target_canonicalizes_name_and_id_without_mutation() {
+        let (_tmp, store, server, ws, _default_project) = setup_server().await;
+        let target = store
+            .writer
+            .get_or_create_project(ws, "import-destination", None)
+            .await
+            .unwrap();
+        let resolve = |project, project_id| ResolveWriteTargetArgs {
+            workspace: "default".into(),
+            project,
+            project_id,
+        };
+
+        for args in [
+            resolve(Some("import-destination".into()), None),
+            resolve(None, Some(target.to_string())),
+        ] {
+            let result = server
+                .memory_resolve_write_target(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap();
+            let result = call_tool_json(result);
+            assert_eq!(result["workspace"], "default");
+            assert_eq!(result["project"], "import-destination");
+            assert_eq!(result["project_id"], target.to_string());
+        }
+
+        for args in [
+            resolve(None, None),
+            resolve(Some("import-destination".into()), Some(target.to_string())),
+            resolve(Some("missing".into()), None),
+        ] {
+            assert!(
+                server
+                    .memory_resolve_write_target(
+                        Parameters(args),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .is_err(),
+                "an incomplete, ambiguous or missing destination must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_resolve_write_target_refuses_foreign_ids_and_unauthorized_callers() {
+        let (_tmp, store, server, _ws, _default_project) = setup_server().await;
+        let foreign_workspace = store
+            .writer
+            .get_or_create_workspace("foreign")
+            .await
+            .unwrap();
+        let foreign_project = store
+            .writer
+            .get_or_create_project(foreign_workspace, "destination", None)
+            .await
+            .unwrap();
+        let foreign = server
+            .memory_resolve_write_target(
+                Parameters(ResolveWriteTargetArgs {
+                    workspace: "default".into(),
+                    project: None,
+                    project_id: Some(foreign_project.to_string()),
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(foreign.message.contains("not found"));
+
+        let tmp = TempDir::new().unwrap();
+        let (_store, restricted, _writer, ungranted) = global_gate_fixture(&tmp).await;
+        let denied = restricted
+            .memory_resolve_write_target(
+                Parameters(ResolveWriteTargetArgs {
+                    workspace: "default".into(),
+                    project: None,
+                    project_id: Some(restricted.project_id.to_string()),
+                }),
+                OptionalParts(parts_as_user(ungranted)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            denied.message.contains("access") || denied.message.contains("authorized"),
+            "preflight must require write authorization: {denied}"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_id_page_write_preserves_project_authorization() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, server, _writer, ungranted) = global_gate_fixture(&tmp).await;
+        let denied = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "imported/denied.md".into(),
+                    body: "# Denied".into(),
+                    title: None,
+                    tier: None,
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    project_id: Some(server.project_id.to_string()),
+                    workspace: Some("default".into()),
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    expected_page_id: None,
+                    create_only: true,
+                }),
+                OptionalParts(parts_as_user(ungranted)),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            denied.message.contains("access") || denied.message.contains("authorized"),
+            "stable-id selection must use the normal authorization boundary: {denied}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_write_pages_batch_is_ordered_and_atomic_on_mismatch() {
+        let (tmp, store, server, _ws, project) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let created = server
+            .memory_write_pages_batch(
+                Parameters(BatchWritePagesArgs {
+                    workspace: "default".into(),
+                    project: None,
+                    project_id: Some(project.to_string()),
+                    pages: vec![
+                        batch_entry("imported/a.md", "# A\n\nfirst", true, None),
+                        batch_entry("imported/b.md", "# B\n\nfirst", true, None),
+                    ],
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let created = call_tool_json(created);
+        assert_eq!(created["pages"][0]["path"], "imported/a.md");
+        assert_eq!(created["pages"][1]["path"], "imported/b.md");
+        let a_id = created["pages"][0]["page_id"].as_str().unwrap();
+
+        let refused = server
+            .memory_write_pages_batch(
+                Parameters(BatchWritePagesArgs {
+                    workspace: "default".into(),
+                    project: Some("scratch".into()),
+                    project_id: None,
+                    pages: vec![
+                        batch_entry("imported/a.md", "# A\n\nsecond", false, Some(a_id)),
+                        batch_entry("imported/b.md", "# B\n\nsecond", true, None),
+                    ],
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.data.as_ref().unwrap()["index"], 1);
+        assert_eq!(
+            refused.data.as_ref().unwrap()["reason"],
+            "precondition_failed"
+        );
+
+        let a = server
+            .wiki
+            .as_ref()
+            .unwrap()
+            .read_page(
+                server.workspace_id,
+                project,
+                &PagePath::new("imported/a.md").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(a.body, "# A\n\nfirst", "the first write must roll back too");
+    }
+
+    #[tokio::test]
+    async fn memory_write_pages_batch_refuses_unconditional_and_duplicate_entries() {
+        let (tmp, store, server, _ws, project) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let args = |pages| BatchWritePagesArgs {
+            workspace: "default".into(),
+            project: None,
+            project_id: Some(project.to_string()),
+            pages,
+        };
+
+        let unconditional = server
+            .memory_write_pages_batch(
+                Parameters(args(vec![batch_entry("imported/a.md", "# A", false, None)])),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(unconditional.message.contains("requires create_only"));
+
+        let duplicate = server
+            .memory_write_pages_batch(
+                Parameters(args(vec![
+                    batch_entry("imported/a.md", "# A", true, None),
+                    batch_entry("imported/a.md", "# Again", true, None),
+                ])),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(duplicate.message.contains("duplicate batch path"));
+    }
+
     #[tokio::test]
     async fn memory_write_page_metadata_roundtrip() {
         let tmp = TempDir::new().unwrap();
@@ -18458,6 +19306,7 @@ mod tests {
                     tags: vec!["finance".into()],
                     pinned: true,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -18551,6 +19400,7 @@ mod tests {
             tags: Vec::new(),
             pinned: false,
             project: Some("here".into()),
+            project_id: None,
             workspace: Some("default".into()),
             scope: None,
             expires_at: None,
@@ -18849,6 +19699,7 @@ mod tests {
                         tags: vec![],
                         pinned: false,
                         project: None,
+                        project_id: None,
                         workspace: None,
                         scope: None,
                         expires_at: None,
@@ -18886,6 +19737,7 @@ mod tests {
                     tags: vec!["customer".into()],
                     pinned: true,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -18905,6 +19757,7 @@ mod tests {
                     path: Some("notes/status.md".into()),
                     query: None,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -19022,6 +19875,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -19120,6 +19974,7 @@ mod tests {
                 tags: vec![],
                 pinned: false,
                 project: project.map(Into::into),
+                project_id: None,
                 workspace: None,
                 scope: scope.map(Into::into),
                 expires_at: None,
@@ -19155,6 +20010,7 @@ mod tests {
                     query: None,
                     path: Some("../x.md".into()),
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -19219,6 +20075,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: Some("default".into()),
                     scope: None,
                     expires_at: None,
@@ -19289,6 +20146,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -19400,6 +20258,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -19433,6 +20292,7 @@ mod tests {
                     path: Some("notes/keep.md".into()),
                     query: None,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                 }),
@@ -19483,6 +20343,7 @@ mod tests {
                     path: Some("notes/keep.md".into()),
                     query: None,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                 }),
@@ -19506,6 +20367,7 @@ mod tests {
                         tags: vec![],
                         pinned: false,
                         project: None,
+                        project_id: None,
                         workspace: None,
                         scope: None,
                         expires_at: None,
@@ -19551,6 +20413,7 @@ mod tests {
                         path: Some("notes/keep.md".into()),
                         query: None,
                         project: None,
+                        project_id: None,
                         workspace: None,
                         scope: None,
                     }),
@@ -19595,6 +20458,7 @@ mod tests {
                     path: Some("notes/keep.md".into()),
                     query: None,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                 }),
@@ -19662,6 +20526,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -19764,6 +20629,7 @@ mod tests {
             tags: vec![],
             pinned: false,
             project: project.map(str::to_owned),
+            project_id: None,
             workspace: workspace.map(str::to_owned),
             scope: scope.map(str::to_owned),
             expires_at: None,
@@ -19802,6 +20668,7 @@ mod tests {
             query: None,
             path: Some("notes/collision.md".into()),
             project: None,
+            project_id: None,
             workspace: None,
             scope: scope.map(str::to_owned),
             include_related: false,
@@ -19920,6 +20787,7 @@ mod tests {
                     path: Some("preferences.md".into()),
                     query: None,
                     project: Some("_global".into()),
+                    project_id: None,
                     workspace: Some("default".into()),
                     scope: None,
                 }),
@@ -20017,6 +20885,7 @@ mod tests {
             tags: vec![],
             pinned: false,
             project: None,
+            project_id: None,
             workspace: None,
             scope: scope.map(str::to_owned),
             expires_at: None,
@@ -20185,6 +21054,7 @@ mod tests {
                     path: Some("profile/tools/pnpm.md".into()),
                     query: None,
                     project: Some(joaos.clone()),
+                    project_id: None,
                     workspace: Some("default".into()),
                     scope: None,
                 }),
@@ -20671,6 +21541,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -20703,6 +21574,7 @@ mod tests {
                             path: Some("secrets/rates.md".into()),
                             query: None,
                             project: None,
+                            project_id: None,
                             workspace: None,
                             scope: None,
                         }),
@@ -20835,6 +21707,7 @@ mod tests {
                             path: Some("notes/a.md".into()),
                             query: None,
                             project: None,
+                            project_id: None,
                             workspace: None,
                             scope: None,
                         }),
@@ -21336,6 +22209,7 @@ mod tests {
                             tags: Vec::new(),
                             pinned: false,
                             project: None,
+                            project_id: None,
                             workspace: None,
                             scope: None,
                             expires_at: None,
@@ -21434,6 +22308,7 @@ mod tests {
                             tags: Vec::new(),
                             pinned: false,
                             project: None,
+                            project_id: None,
                             workspace: None,
                             scope: None,
                             expires_at: None,
@@ -21540,6 +22415,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -21558,6 +22434,7 @@ mod tests {
                     query: None,
                     path: Some("notes/default.md".into()),
                     project: Some("typo".into()),
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -21612,6 +22489,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -21645,6 +22523,7 @@ mod tests {
                     query: None,
                     path: Some("notes/temp.md".into()),
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -21731,6 +22610,7 @@ mod tests {
                     tags: vec!["delivery".into()],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -21796,6 +22676,7 @@ mod tests {
                         query: None,
                         path: Some("notes/retries.md".into()),
                         project: None,
+                        project_id: None,
                         workspace: None,
                         scope: None,
                         include_related: false,
@@ -21992,6 +22873,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -22028,6 +22910,7 @@ mod tests {
                     query: None,
                     path: Some("notes/keep.md".into()),
                     project: None,
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     include_related: false,
@@ -22095,6 +22978,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: Some("shared".into()),
+                    project_id: None,
                     workspace: Some("alpha".into()),
                     scope: None,
                     expires_at: None,
@@ -22117,6 +23001,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: Some("shared".into()),
+                    project_id: None,
                     workspace: Some("beta".into()),
                     scope: None,
                     expires_at: None,
@@ -22151,6 +23036,7 @@ mod tests {
                     query: None,
                     path: Some("notes/twin.md".into()),
                     project: Some("shared".into()),
+                    project_id: None,
                     workspace: Some("alpha".into()),
                     scope: None,
                     include_related: false,
@@ -22172,6 +23058,7 @@ mod tests {
                     query: None,
                     path: Some("notes/twin.md".into()),
                     project: Some("shared".into()),
+                    project_id: None,
                     workspace: Some("beta".into()),
                     scope: None,
                     include_related: false,
@@ -22230,6 +23117,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: Some("other".into()),
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -22998,6 +23886,7 @@ mod tests {
                         query: None,
                         path: Some("notes/bob-authored.md".into()),
                         project: None,
+                        project_id: None,
                         workspace: None,
                         scope: None,
                         include_related: false,
@@ -24662,6 +25551,7 @@ mod tests {
                     tags: vec![],
                     pinned: false,
                     project: Some("audited".into()),
+                    project_id: None,
                     workspace: None,
                     scope: None,
                     expires_at: None,
@@ -25238,6 +26128,7 @@ mod tests {
                 tags: vec![],
                 pinned: false,
                 project: Some(project.into()),
+                project_id: None,
                 workspace: Some("default".into()),
                 scope: None,
                 expires_at: None,
@@ -25277,6 +26168,7 @@ mod tests {
                         query: None,
                         path: Some(path.into()),
                         project: Some("scratch".into()),
+                        project_id: None,
                         workspace: Some("default".into()),
                         scope: None,
                         include_related: false,

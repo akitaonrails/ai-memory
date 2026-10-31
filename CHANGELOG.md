@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a guarded `memory_write_pages_batch` MCP tool for companion imports:
+  1-100 conditional page versions are admitted and persisted atomically in one
+  existing project, with bounded bodies, duplicate-path rejection, ordered
+  results, and one wiki checkpoint. Exact page reads and writes can now target
+  an existing project by stable `project_id` without creating a name-only
+  duplicate. The optional `ai-memory-importer claude-mem` command uses these
+  contracts to plan or import supported claude-mem SQLite schema families from
+  a WAL-consistent read-only snapshot, with explicit project mapping,
+  client-side sanitization, sensitive-record exclusion, exact-body resume, and
+  dry-run by default (#1840).
 - Added `ai-memory-eval retrieval-compare`, which pairs two saved retrieval
   reports by question and lists the questions whose first hit moved, the
   cutoffs each crossed, and how many moved per question type. `--fts` marks

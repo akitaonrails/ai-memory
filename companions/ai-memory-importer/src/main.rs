@@ -16,6 +16,7 @@ use url::Url;
 use walkdir::WalkDir;
 
 mod agentmemory;
+mod claude_mem;
 mod document;
 mod mcp;
 #[cfg(test)]
@@ -49,6 +50,8 @@ enum Commands {
     AgentmemoryVault(agentmemory::vault::VaultArgs),
     /// Import an agentmemory `ExportData` JSON file.
     AgentmemoryExport(agentmemory::export::ExportArgs),
+    /// Import observations and session summaries from claude-mem's SQLite store.
+    ClaudeMem(claude_mem::ClaudeMemArgs),
     /// Extract one bounded local document into an attributed wiki page.
     Document(document::DocumentArgs),
 }
@@ -314,6 +317,7 @@ async fn main() -> Result<()> {
         Commands::ExternalConversation(args) => run_conversation(args).await,
         Commands::AgentmemoryVault(args) => agentmemory::vault::run(args).await,
         Commands::AgentmemoryExport(args) => agentmemory::export::run(args).await,
+        Commands::ClaudeMem(args) => claude_mem::run(args).await,
         Commands::Document(args) => document::run(args).await,
     }
 }
