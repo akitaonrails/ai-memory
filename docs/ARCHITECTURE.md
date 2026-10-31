@@ -1577,6 +1577,8 @@ AI_MEMORY_LLM_COMPAT_DISABLE_THINKING  openai-compat only, false by default; tru
                            response that stops with finish_reason=length, or a 2xx
                            with empty message.content, is a terminal error
                            (classes truncated-response / empty-content)
+AI_MEMORY_LLM_COMPAT_STREAM optional false to request non-streaming openai-compat JSON;
+                           omitted by default; true is rejected because SSE is unsupported
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
                            (none|minimal|low|medium|high|xhigh|max|ultra|persistent)

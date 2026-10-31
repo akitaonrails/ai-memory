@@ -34,6 +34,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         base_url: args.base_url.or_else(|| config.llm_test_base_url(provider)),
         compat_strict: config.llm_compat_strict,
         compat_disable_thinking: config.llm_compat_disable_thinking,
+        compat_stream: config.llm_compat_stream,
         request_timeout_secs: config.llm_timeout_secs,
         reasoning_effort: config.llm_reasoning_effort,
         extra_headers: config

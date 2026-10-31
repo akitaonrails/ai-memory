@@ -559,6 +559,7 @@ impl From<ResolvedConfig> for ProviderConfig {
             // Comparisons must not differ by engine-side thinking behaviour;
             // keep the product default (off) for every candidate.
             compat_disable_thinking: false,
+            compat_stream: None,
             request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
             // The A/B harness compares consolidation quality; reasoning
             // effort stays at each model's own default unless a future

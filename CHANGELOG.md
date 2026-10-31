@@ -25,6 +25,11 @@ version in [`docs/changelog/`](docs/changelog/):
   while many repositories bootstrapped. Runs for the same project still wait
   for each other, and the wiki's own commit lock still serialises the git
   commit (#1890).
+- Supported optional `AI_MEMORY_LLM_COMPAT_STREAM` (`llm_compat_stream` in `config.toml`)
+  to explicitly set the `stream` field for `openai-compat` Chat Completions requests,
+  preventing gateways from defaulting to SSE. Both Docker wrappers forward the
+  setting to helper commands such as `llm-test`. Set `false` for non-streaming
+  JSON; `true` is rejected because the Chat Completions transport cannot decode SSE (#1906).
 - Made the profile's LLM output budget configurable through
   `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
   default 2000, unchanged). The ceiling was hardcoded, and local thinking
