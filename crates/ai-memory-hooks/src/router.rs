@@ -16018,6 +16018,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// Grok runs a subagent in a session of its own and puts `subagentType`
+    /// on that session's events, its SessionEnd included
+    /// (`HookPayload::SessionEnd` in xai-grok-hooks `event.rs`); the main
+    /// session never carries it. The subagent's end closes and summarizes its
+    /// session without a baton, while a top-level Grok session in the same
+    /// project still leaves one.
+    #[tokio::test]
+    async fn grok_subagent_session_end_closes_and_summarizes_without_baton() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let grok_event = |session: SessionId, event: &str, subagent: Option<&str>| {
+            let hook_event_name = match event {
+                "user-prompt" => "UserPromptSubmit",
+                "stop" => "Stop",
+                _ => "SessionEnd",
+            };
+            let mut body = serde_json::json!({
+                "sessionId": session.to_string(),
+                "session_id": session.to_string(),
+                "hook_event_name": hook_event_name,
+                "prompt": "Find where the config is loaded",
+                "reason": "completed",
+            });
+            if let Some(subagent) = subagent {
+                body["subagentType"] = serde_json::json!(subagent);
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("grok".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        let subagent = SessionId::new();
+        for event in ["user-prompt", "session-end"] {
+            let env = grok_event(subagent, event, Some("explore"));
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+        assert!(!session_pages(&state).await.is_empty());
+        assert!(
+            !open_handoff_exists(&state).await,
+            "a Grok subagent's end must not leave a baton"
+        );
+        assert_eq!(
+            state
+                .reader
+                .latest_completed_session_for_project(state.workspace_id, state.project_id)
+                .await
+                .unwrap(),
+            Some(subagent)
+        );
+
+        let top_level = SessionId::new();
+        for event in ["user-prompt", "stop", "session-end"] {
+            let env = grok_event(top_level, event, None);
+            process(&state, env, None, Vec::new()).await.unwrap();
+        }
+        assert!(
+            open_handoff_exists(&state).await,
+            "a top-level Grok session still hands over its baton"
+        );
+    }
+
     // Claude Code stamps `agent_type` on a top-level `--agent` session, so
     // that marker must not cost it its baton; and a captured Stop body is
     // surfaced for any agent in the capture table, not only OpenCode.
