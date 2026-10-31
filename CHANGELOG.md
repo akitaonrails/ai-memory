@@ -59,6 +59,14 @@ version in [`docs/changelog/`](docs/changelog/):
   and `docs/config-properties.md` left out: `rerank_timeout_secs`,
   `[run] exit_prompt`, `[query_answer] max_context_tokens` and
   `[auto_improve.eval] builtin` (#1861).
+- Captured Gemini CLI tool calls with the same `tool <family>` title and body
+  as Claude Code's: the tool family, the outcome and the result. Gemini CLI
+  was missing from the closed tool-payload lists, so every `BeforeTool` and
+  `AfterTool` event was stored with the event kind as its title and an empty
+  body, and `[ingest] record_tool_names` never named a Gemini call. The body
+  keeps the model's `llmContent` (or the error message) and the outcome comes
+  from `tool_response.error`; `returnDisplay`, which for an edit holds both
+  whole versions of the file, is not stored (#1904).
 
 ## [3.3.0] - 2026-10-29
 
