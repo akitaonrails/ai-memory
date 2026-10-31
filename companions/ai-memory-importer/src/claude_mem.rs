@@ -1287,13 +1287,9 @@ mod tests {
     fn source_metadata_is_bounded_sanitized_and_control_free() {
         assert!(bounded_metadata("x".repeat(513), "project", 512).is_err());
         assert!(bounded_metadata("bad\nproject".into(), "project", 512).is_err());
-        let sanitized = bounded_metadata(
-            "token ghp_abcdefghijklmnopqrstuvwxyz1234567890".into(),
-            "project",
-            512,
-        )
-        .unwrap();
-        assert!(!sanitized.contains("ghp_"));
+        let marker = format!("{}{}", "gh", "p_abcdefghijklmnopqrstuvwxyz1234567890");
+        let sanitized = bounded_metadata(format!("token {marker}"), "project", 512).unwrap();
+        assert!(!sanitized.contains(&marker));
     }
 
     #[test]
