@@ -17,8 +17,8 @@ version in [`docs/changelog/`](docs/changelog/):
   On a store without planner statistics, the unfinished-session recovery
   lookup walked every observation in the project and rescanned the project for
   each one, so the request never returned and left a server thread spinning.
-  It now walks the project's sessions and pins each per-session probe to
-  `idx_observations_session` (#1879).
+  It now checks each of the project's sessions once through
+  `idx_observations_session` and reads the project's handoffs once (#1879).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).
