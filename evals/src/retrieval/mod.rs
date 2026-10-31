@@ -30,6 +30,7 @@
 //!   through the real page write path instead of replaying hooks;
 //! - `--date-prefix turn|session-start|none` moves the per-turn date.
 
+pub(crate) mod compare;
 pub(crate) mod dataset;
 pub(crate) mod grep;
 pub(crate) mod ingest;
