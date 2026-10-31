@@ -5326,11 +5326,16 @@ async fn process_authorized(
         let handoff_owner = owner_stamp_for_event(state, session_owner.as_ref()).await;
         // An OpenCode child session has its own id and forwards its parent as
         // `agent_id`, and the OMP extension marks a subagent session the same
-        // way; its end must not hand the next session a sub-task baton. Other
-        // harnesses are not gated: Claude Code also sets `agent_type` on a
-        // top-level `--agent` session, which still owns its baton.
-        let child_session =
-            matches!(env.agent, AgentKind::OpenCode | AgentKind::Omp) && body_is_subagent(&env.raw);
+        // way. Grok runs a subagent in a session of its own and puts
+        // `subagentType` on its events, the SessionEnd included, while the
+        // main session never carries it. Such an end must not hand the next
+        // session a sub-task baton. Other harnesses are not gated: Claude Code
+        // also sets `agent_type` on a top-level `--agent` session, which still
+        // owns its baton.
+        let child_session = matches!(
+            env.agent,
+            AgentKind::OpenCode | AgentKind::Omp | AgentKind::Grok
+        ) && body_is_subagent(&env.raw);
         // The opt-out covers both automatic batons: a session's end and a
         // turn checkpoint, which is OpenCode's only baton since a plugin
         // unload no longer ends its sessions, and Antigravity's since it has
