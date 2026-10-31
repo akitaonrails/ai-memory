@@ -472,6 +472,17 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             Some(false) => ToolOutcome::Error,
             None => ToolOutcome::Unknown,
         },
+        // Gemini CLI's AfterTool `tool_response` has an `error` object only
+        // when the call failed: "If this property is present, the tool call
+        // is considered a failure" (`ToolResult`, packages/core/src/tools/
+        // tools.ts, v0.66.0). A payload without `tool_response` proves nothing.
+        AgentKind::GeminiCli => match raw.get("tool_response").and_then(Value::as_object) {
+            Some(response) => match response.get("error") {
+                None | Some(Value::Null) => ToolOutcome::Success,
+                Some(_) => ToolOutcome::Error,
+            },
+            None => ToolOutcome::Unknown,
+        },
         AgentKind::AntigravityCli
             if raw
                 .get("error")
