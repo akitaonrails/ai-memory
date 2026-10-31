@@ -6132,8 +6132,11 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   if (id) url.searchParams.set("session_id", id);
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
+    // The body becomes the agent's context, so a redirect is refused: a
+    // gateway's login page must never arrive as the handoff.
     const response = await fetch(url, {{
       proxy: false,
+      redirect: "error",
       headers: authHeaders(),
       signal: timeoutSignal(1000),
     }});
