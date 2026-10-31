@@ -5318,6 +5318,30 @@ mod tests {
         );
     }
 
+    /// Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+    /// `tool_input` but no tool-call id, so the observation metadata reads the
+    /// name alone, and only a BeforeTool with `tool_input` proves its input.
+    #[test]
+    fn gemini_cli_tool_payload_fields_have_no_call_id() {
+        let before = json!({
+            "session_id": "gemini-session",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": "ls", "dir_path": "src"}
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::GeminiCli, &before),
+            Some(("run_shell_command", None))
+        );
+        let metadata = tool_observation_metadata(AgentKind::GeminiCli, &before, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id, None);
+        let no_input = json!({"tool_name": "read_file"});
+        assert!(tool_observation_metadata(AgentKind::GeminiCli, &no_input, true).is_none());
+        let after = tool_observation_metadata(AgentKind::GeminiCli, &no_input, false).unwrap();
+        assert_eq!(after.tool_family, ToolFamily::File);
+    }
+
     /// Droid hook payloads carry no tool-call id, so the drop list and the
     /// observation metadata read the tool name alone (#1240).
     #[test]
