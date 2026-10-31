@@ -929,6 +929,9 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // PostToolUse.
             | AgentKind::Dsh
             | AgentKind::Cline
+            // Gemini CLI's BeforeTool and AfterTool carry Claude Code's
+            // `tool_name` and `tool_input`, plus a `tool_response` object.
+            | AgentKind::GeminiCli
             | AgentKind::QwenCode
             | AgentKind::Qoder
     )
@@ -1077,6 +1080,19 @@ fn safe_tool_body(
                 raw.pointer("/tool_result/output")
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/tool_result/error").and_then(value_to_text))
+            } else if agent == AgentKind::GeminiCli {
+                // Gemini CLI's `AfterTool` `tool_response` holds the model's
+                // copy of the result in `llmContent` (a string or a Part
+                // list) beside `returnDisplay`, the terminal rendering, which
+                // for an edit is a diff object carrying both whole versions of
+                // the file. Read only the model's text, then the error message
+                // (`ToolResult`, packages/core/src/tools/tools.ts, v0.66.0).
+                raw.pointer("/tool_response/llmContent")
+                    .and_then(value_to_text)
+                    .or_else(|| {
+                        raw.pointer("/tool_response/error/message")
+                            .and_then(value_to_text)
+                    })
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -3614,6 +3630,108 @@ mod tests {
                 "tool_name": "read_file",
                 "tool_input": {"path": "/workspace/project/sample.txt"},
             }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+    }
+
+    /// Gemini CLI's AfterTool carries `tool_name`, `tool_input` and a
+    /// `tool_response` of `{llmContent, returnDisplay, error?}`, and BeforeTool
+    /// the first two (docs/hooks/reference.md and `hookEventHandler.ts`,
+    /// v0.66.0). Gemini was absent from `closed_tool_agent`, so its tool
+    /// observations were stored with no title or body, the failure mode Grok
+    /// had in #931. The body keeps the model's `llmContent`, never
+    /// `returnDisplay`, which for an edit holds both whole versions of the file.
+    #[test]
+    fn gemini_cli_tool_events_keep_their_family_title_and_output() {
+        // Adds the base fields every Gemini hook input carries.
+        let gemini = |event: &str, mut body: serde_json::Value| {
+            let hook_event_name = if event == "pre-tool-use" {
+                "BeforeTool"
+            } else {
+                "AfterTool"
+            };
+            body["session_id"] = serde_json::json!("gemini-session");
+            body["transcript_path"] =
+                serde_json::json!("/home/u/.gemini/tmp/project/chats/session.json");
+            body["cwd"] = serde_json::json!("/workspace/project");
+            body["hook_event_name"] = serde_json::json!(hook_event_name);
+            body["timestamp"] = serde_json::json!("2026-10-31T12:00:00.000Z");
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("gemini-cli".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        let edit = gemini(
+            "post-tool-use",
+            serde_json::json!({
+                "tool_name": "replace",
+                "tool_input": {"file_path": "/workspace/project/src/lib.rs", "old_string": "a", "new_string": "b"},
+                "tool_response": {
+                    "llmContent": "Successfully modified file: src/lib.rs (1 replacements). MARKER_GEMINI_EDIT",
+                    "returnDisplay": {
+                        "fileDiff": "@@ -1 +1 @@",
+                        "fileName": "lib.rs",
+                        "originalContent": "SENTINEL_ORIGINAL_FILE",
+                        "newContent": "SENTINEL_NEW_FILE",
+                    },
+                },
+            }),
+        );
+        assert_eq!(edit.agent, AgentKind::GeminiCli);
+        assert_eq!(edit.title_hint.as_deref(), Some("tool file"));
+        let body = edit.body_excerpt.expect("gemini edit body");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(body.contains("MARKER_GEMINI_EDIT"), "{body:?}");
+        assert!(!body.contains("SENTINEL_ORIGINAL_FILE"), "{body:?}");
+        assert!(!body.contains("SENTINEL_NEW_FILE"), "{body:?}");
+
+        // `llmContent` can be a Part list; its texts are kept in order.
+        let shell = gemini(
+            "post-tool-use",
+            serde_json::json!({
+                "tool_name": "run_shell_command",
+                "tool_input": {"command": "ls"},
+                "tool_response": {
+                    "llmContent": [{"text": "MARKER_PART_ONE"}, {"text": "MARKER_PART_TWO"}],
+                    "returnDisplay": "SENTINEL_DISPLAY",
+                },
+            }),
+        );
+        assert_eq!(shell.title_hint.as_deref(), Some("tool non-file"));
+        let body = shell.body_excerpt.expect("gemini shell body");
+        assert!(
+            body.contains("MARKER_PART_ONE\nMARKER_PART_TWO"),
+            "{body:?}"
+        );
+        assert!(!body.contains("SENTINEL_DISPLAY"), "{body:?}");
+
+        // A failed call: `error` makes the outcome an error, and its message
+        // stands in when `llmContent` is empty.
+        let failed = gemini(
+            "post-tool-use",
+            serde_json::json!({
+                "tool_name": "read_file",
+                "tool_input": {"file_path": "/workspace/project/missing.md"},
+                "tool_response": {
+                    "llmContent": "",
+                    "returnDisplay": "SENTINEL_DISPLAY",
+                    "error": {"message": "MARKER_GEMINI_ERROR", "type": "FILE_NOT_FOUND"},
+                },
+            }),
+        );
+        let body = failed.body_excerpt.expect("gemini failure body");
+        assert!(body.contains("outcome: error"), "{body:?}");
+        assert!(body.contains("MARKER_GEMINI_ERROR"), "{body:?}");
+
+        let pre = gemini(
+            "pre-tool-use",
+            serde_json::json!({"tool_name": "read_file", "tool_input": {"file_path": "README.md"}}),
         );
         assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
         assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));

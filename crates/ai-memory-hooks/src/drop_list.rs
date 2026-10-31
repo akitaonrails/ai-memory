@@ -363,6 +363,20 @@ mod tests {
             serde_json::json!({ "session_id": "s", "tool_name": "write_file", "tool_use_id": "toolu_5" }),
         );
         assert!(!list.matches(&qwen_kept));
+        // Gemini CLI sends `tool_name` but no tool-call id, so only its name
+        // matches; a `tool_use_id` in its payload is not read as one.
+        let gemini = agent_event(
+            "gemini-cli",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "hook_event_name": "AfterTool", "tool_name": "noisy_poll", "tool_input": {}, "tool_response": { "llmContent": "x" } }),
+        );
+        assert!(list.matches(&gemini));
+        let gemini_kept = agent_event(
+            "gemini-cli",
+            "pre-tool-use",
+            serde_json::json!({ "session_id": "s", "hook_event_name": "BeforeTool", "tool_name": "read_file", "tool_input": { "file_path": "a" }, "tool_use_id": "plugin-6" }),
+        );
+        assert!(!list.matches(&gemini_kept));
         // Controls: the same agents with ordinary ids and names stay.
         let kept = agent_event(
             "opencode",
