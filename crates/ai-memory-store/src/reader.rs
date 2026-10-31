@@ -5690,47 +5690,9 @@ impl ReaderPool {
         receiving_session_id: Option<SessionId>,
     ) -> StoreResult<Option<InterruptedSessionCandidate>> {
         self.with_conn(move |conn| {
-            let owner_clause = match &owner_filter {
-                OwnerFilter::Any => "",
-                OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
-                OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
-            };
-            let receiver_clause = if receiving_session_id.is_some() {
-                " AND s.id != :receiver"
-            } else {
-                ""
-            };
-            let sql = format!(
-                "SELECT s.id, s.agent_kind, MAX(o.created_at) AS last_activity, s.cwd \
-                 FROM sessions s \
-                 JOIN observations o ON o.session_id = s.id \
-                 WHERE s.workspace_id = :ws AND s.project_id = :proj \
-                   AND (s.ended_at IS NULL OR EXISTS ( \
-                       SELECT 1 FROM observations resumed \
-                       WHERE resumed.session_id = s.id \
-                         AND resumed.workspace_id = :ws \
-                         AND resumed.project_id = :proj \
-                         AND resumed.kind IN ('user-prompt','pre-tool-use','post-tool-use') \
-                         AND resumed.created_at > s.ended_at \
-                   )) \
-                   AND o.workspace_id = :ws AND o.project_id = :proj \
-                   AND EXISTS (SELECT 1 FROM observations substantive \
-                               WHERE substantive.session_id = s.id \
-                                 AND substantive.workspace_id = :ws \
-                                 AND substantive.project_id = :proj \
-                                 AND substantive.kind IN ('user-prompt','pre-tool-use','post-tool-use'))\
-                   AND NOT EXISTS (SELECT 1 FROM handoffs h \
-                                   WHERE h.from_session_id = s.id \
-                                     AND h.workspace_id = :ws AND h.project_id = :proj \
-                                     AND h.created_at >= ( \
-                                         SELECT MAX(work.created_at) FROM observations work \
-                                         WHERE work.session_id = s.id \
-                                           AND work.workspace_id = :ws AND work.project_id = :proj \
-                                           AND work.kind IN ('user-prompt','pre-tool-use','post-tool-use'))) \
-                   {owner_clause}{receiver_clause} \
-                 GROUP BY s.id, s.agent_kind, s.started_at, s.cwd \
-                 ORDER BY last_activity DESC, s.started_at DESC, s.id DESC \
-                 LIMIT 1"
+            let sql = latest_interrupted_session_candidate_sql(
+                &owner_filter,
+                receiving_session_id.is_some(),
             );
             let ws_bytes = workspace_id.as_bytes();
             let proj_bytes = project_id.as_bytes();
@@ -14418,6 +14380,71 @@ fn session_counts_by_agent_sql(has_since: bool, owner_filter: &OwnerFilter) -> S
     )
 }
 
+/// SQL for [`ReaderPool::latest_interrupted_session_candidate`].
+///
+/// Every eligibility test is a fact about one session: its newest
+/// substantive work, whether that work outlived the recorded end, and
+/// whether a handoff from the session covers it. The materialized
+/// `candidates` set answers them once per session in the scope. Joining
+/// sessions to their observations, as this query once did, re-ran the
+/// per-session subqueries for every observation row, and without
+/// `sqlite_stat1` the planner answered each of them from
+/// `idx_observations_project_created`, so every row rescanned the project and
+/// `GET /handoff` on a large project never returned (#1879, the shape of
+/// #1257). `INDEXED BY` bounds each probe to one session. `handoffs` has no
+/// index on its source session, so the scope's handoffs are reduced to the
+/// newest per source session in one pass instead of being searched once per
+/// session. Only a handoff at or after a session's newest work can cover it,
+/// so that pass starts at the oldest such work among the sessions still
+/// eligible; unbounded, it sorted the project's whole handoff history on
+/// every call.
+fn latest_interrupted_session_candidate_sql(
+    owner_filter: &OwnerFilter,
+    has_receiver: bool,
+) -> String {
+    let owner_clause = match owner_filter {
+        OwnerFilter::Any => "",
+        OwnerFilter::User(_) => " AND (s.actor_user IS NULL OR s.actor_user = :actor)",
+        OwnerFilter::Unattributed => " AND s.actor_user IS NULL",
+    };
+    let receiver_clause = if has_receiver {
+        " AND s.id != :receiver"
+    } else {
+        ""
+    };
+    format!(
+        "WITH candidates AS MATERIALIZED ( \
+           SELECT s.id, s.agent_kind, s.started_at, s.ended_at, s.cwd, \
+                  (SELECT MAX(o.created_at) \
+                   FROM observations o INDEXED BY idx_observations_session \
+                   WHERE o.session_id = s.id \
+                     AND o.workspace_id = :ws AND o.project_id = :proj) AS last_activity, \
+                  (SELECT MAX(work.created_at) \
+                   FROM observations work INDEXED BY idx_observations_session \
+                   WHERE work.session_id = s.id \
+                     AND work.workspace_id = :ws AND work.project_id = :proj \
+                     AND work.kind IN ('user-prompt','pre-tool-use','post-tool-use')) AS last_work \
+           FROM sessions s \
+           WHERE s.workspace_id = :ws AND s.project_id = :proj{owner_clause}{receiver_clause} \
+         ), covered AS ( \
+           SELECT from_session_id, MAX(created_at) AS last_handoff \
+           FROM handoffs \
+           WHERE workspace_id = :ws AND project_id = :proj AND from_session_id IS NOT NULL \
+             AND created_at >= (SELECT MIN(last_work) FROM candidates \
+                                WHERE ended_at IS NULL OR last_work > ended_at) \
+           GROUP BY from_session_id \
+         ) \
+         SELECT c.id, c.agent_kind, c.last_activity, c.cwd \
+         FROM candidates c \
+         LEFT JOIN covered h ON h.from_session_id = c.id \
+         WHERE c.last_work IS NOT NULL \
+           AND (c.ended_at IS NULL OR c.last_work > c.ended_at) \
+           AND (h.last_handoff IS NULL OR h.last_handoff < c.last_work) \
+         ORDER BY c.last_activity DESC, c.started_at DESC, c.id DESC \
+         LIMIT 1"
+    )
+}
+
 /// Build the scoped session listing query (or its point lookup).
 ///
 /// The per-session observation count and the point lookup's membership
@@ -16656,6 +16683,96 @@ mod tests {
                         assert_eq!(probes.len(), 2, "{label}: {details:?}");
                     }
                     assert_session_bounded(label, &sql, &named);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_session_probes_use_the_session_index() {
+        // Same fresh-store state as `session_observation_probes_use_the_session_index`:
+        // without `sqlite_stat1` the planner answered these probes from the
+        // project index, and every observation row rescanned the project and
+        // searched its handoffs again (#1879).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let (ws, proj, receiver) = (WorkspaceId::new(), ProjectId::new(), SessionId::new());
+        let (ws_bytes, proj_bytes, receiver_bytes) =
+            (ws.as_bytes(), proj.as_bytes(), receiver.as_bytes());
+        let actor = "user:alice";
+        let owners = [
+            OwnerFilter::Any,
+            OwnerFilter::User(actor.into()),
+            OwnerFilter::Unattributed,
+        ];
+        for owner in &owners {
+            for has_receiver in [false, true] {
+                let mut named: Vec<(&str, &dyn rusqlite::ToSql)> =
+                    vec![(":ws", &ws_bytes), (":proj", &proj_bytes)];
+                if matches!(owner, OwnerFilter::User(_)) {
+                    named.push((":actor", &actor));
+                }
+                if has_receiver {
+                    named.push((":receiver", &receiver_bytes));
+                }
+                let sql = super::latest_interrupted_session_candidate_sql(owner, has_receiver);
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+                // (id, parent, detail) so a step's enclosing subqueries are known.
+                let plan = stmt
+                    .query_map(named.as_slice(), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let label = format!("owner={owner:?} receiver={has_receiver}");
+                let observation_reads: Vec<&str> = plan
+                    .iter()
+                    .map(|(_, _, detail)| detail.as_str())
+                    .filter(|detail| {
+                        detail.contains("observations")
+                            || ["o", "work"].iter().any(|alias| {
+                                detail.starts_with(&format!("SEARCH {alias} "))
+                                    || detail.starts_with(&format!("SCAN {alias}"))
+                            })
+                    })
+                    .collect();
+                assert!(
+                    observation_reads.len() == 2
+                        && observation_reads
+                            .iter()
+                            .all(|detail| detail.contains("idx_observations_session")),
+                    "{label}: activity and work must each be one session-bounded probe: {plan:?}"
+                );
+                let handoff_reads: Vec<_> = plan
+                    .iter()
+                    .filter(|(_, _, detail)| detail.contains("handoffs"))
+                    .collect();
+                assert!(
+                    handoff_reads.len() == 1 && handoff_reads[0].2.starts_with("SEARCH handoffs "),
+                    "{label}: the scope's handoffs must be read once through a scope index: \
+                     {plan:?}"
+                );
+                // Only a handoff at or after some candidate's newest work can
+                // cover it; without the bound the read sorts the project's
+                // whole handoff history.
+                assert!(
+                    handoff_reads[0].2.contains("created_at>?"),
+                    "{label}: the handoffs read must be bounded by the oldest candidate work: \
+                     {plan:?}"
+                );
+                let mut parent = handoff_reads[0].1;
+                while let Some((_, up, detail)) = plan.iter().find(|(id, _, _)| *id == parent) {
+                    assert!(
+                        !detail.starts_with("CORRELATED"),
+                        "{label}: handoffs must not be searched once per session: {plan:?}"
+                    );
+                    parent = *up;
                 }
             }
         }
