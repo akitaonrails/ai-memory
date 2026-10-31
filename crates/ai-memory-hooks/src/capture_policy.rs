@@ -344,6 +344,10 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // Kiro v2/v3 tool hooks use `tool_name` + `tool_input`. Unknown payload
         // shapes fail safe to metadata-only under an active policy.
         AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
+        // Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+        // `tool_input` but no tool-call id (docs/hooks/reference.md and
+        // `hookEventHandler.ts`, v0.66.0).
+        AgentKind::GeminiCli => (object.get("tool_name")?.as_str()?, None),
         AgentKind::AntigravityCli => (object.get("toolCall")?.get("name")?.as_str()?, None),
         AgentKind::Hermes => (
             object.get("tool_name")?.as_str()?,
@@ -417,6 +421,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::CodeBuddy
                             | AgentKind::IbmBob
                             | AgentKind::Dsh
+                            | AgentKind::GeminiCli
                             | AgentKind::QwenCode
                             | AgentKind::Qoder
                     ) {
