@@ -1034,7 +1034,16 @@ fn is_dropped_plugin_copy(
     };
     let (cwd, _) = hook_context(&args.agent, raw);
     let settings = settings_files_for(origin, cwd.as_deref(), &mut lookup);
-    drops_plugin_event(origin, &args.event, cwd.as_deref(), &settings)
+    let harness_event = raw
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str);
+    drops_plugin_event(
+        origin,
+        &args.event,
+        harness_event,
+        cwd.as_deref(),
+        &settings,
+    )
 }
 
 fn write_success_response<W: std::io::Write>(

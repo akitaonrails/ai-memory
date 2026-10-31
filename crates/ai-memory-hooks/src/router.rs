@@ -5702,10 +5702,14 @@ fn build_auto_handoff(
         summary.push_str("\n\nLatest assistant response: ");
         summary.push_str(assistant);
     }
-    let next_steps = if facts.tools.is_empty() {
-        Vec::new()
-    } else {
-        vec![format!(
+    let mut next_steps = Vec::new();
+    // The newest failed call and its error: what broke is the first question.
+    // It may have been fixed later, so it is a report, not an open question.
+    if let Some(failed) = &facts.last_failed_tool {
+        next_steps.push(format!("Last failed tool call: {}", failed.describe()));
+    }
+    if !facts.tools.is_empty() {
+        next_steps.push(format!(
             "Tools used: {}",
             facts
                 .tools
@@ -5713,8 +5717,8 @@ fn build_auto_handoff(
                 .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
-        )]
-    };
+        ));
+    }
     NewHandoff {
         workspace_id,
         project_id,
@@ -24688,6 +24692,82 @@ pub(crate) mod tests {
             "a real tool name must still be listed; got: {:?}",
             handoff.next_steps
         );
+    }
+
+    /// The baton names the newest failed call with its error text; a family
+    /// label names no tool.
+    #[test]
+    fn auto_handoff_names_the_last_failed_tool_call() {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        let handoff_for = |rows: &[ai_memory_core::Observation]| {
+            build_auto_handoff(
+                WorkspaceId::new(),
+                ProjectId::new(),
+                AgentKind::ClaudeCode,
+                SessionId::new(),
+                None,
+                rows,
+                None,
+                false,
+            )
+        };
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\ntool_call_id: toolu_1\noutcome: error\n---\n\
+                 Exit code 1\nError: Cannot find module 'express'",
+            ),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\ntool_call_id: toolu_2\noutcome: error\n---\n\
+                 Exit code 2\nerror[E0425]: cannot find value `x`",
+            ),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\noutcome: unknown\n---\n42 passing",
+            ),
+            mk_obs(ObservationKind::Stop, "stop", ""),
+        ];
+        let handoff = handoff_for(&observations);
+        assert_eq!(
+            handoff.next_steps,
+            vec![
+                "Last failed tool call: Bash: Exit code 2 error[E0425]: cannot find value `x`"
+                    .to_string(),
+                "Tools used: Bash".to_string(),
+            ]
+        );
+
+        // A family label names no tool.
+        let bare = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: error\n---\nENOENT: no such file",
+            ),
+        ];
+        let handoff = handoff_for(&bare);
+        assert_eq!(
+            handoff.next_steps,
+            vec!["Last failed tool call: ENOENT: no such file".to_string()]
+        );
+
+        // Control: no failure, no line.
+        let fine = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file: Bash",
+                "tool_family: non-file\noutcome: unknown\n---\n42 passing",
+            ),
+        ];
+        let handoff = handoff_for(&fine);
+        assert_eq!(handoff.next_steps, vec!["Tools used: Bash".to_string()]);
     }
 
     /// `[ingest] record_tool_names` titles (`tool <family>: <name>`) list by

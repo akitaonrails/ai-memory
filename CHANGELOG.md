@@ -13,6 +13,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Captured Claude Code tool failures. Claude Code fires `PostToolUseFailure`,
+  not `PostToolUse`, when a tool fails, and ai-memory never wired that event
+  for Claude Code, so failed commands, builds and test runs never reached
+  capture, search, consolidation or the handoff. `install-hooks --agent
+  claude-code`, `setup` and the marketplace plugin now wire it to the
+  post-tool-use handler; the observation records `outcome: error` with the
+  bounded error text (never the tool's arguments); the session page counts
+  failed calls and quotes the newest one; the automatic handoff adds a `Last
+  failed tool call` line; and the plugin no longer drops a failure when
+  settings hooks wire only the success event. Re-run `ai-memory install-hooks
+  --agent claude-code --apply` (or `ai-memory setup`) on an existing install.
+  Grok Build CLI keeps its nine events (#1893).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).

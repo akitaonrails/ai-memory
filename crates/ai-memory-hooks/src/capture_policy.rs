@@ -483,7 +483,15 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Meta Muse Code's `PostToolUseFailure` has the same `error` string
         // (captured offline on Muse Code 1.4.7); its `PostToolUse` proves no
         // outcome.
-        AgentKind::Zcode | AgentKind::Muse | AgentKind::QwenCode | AgentKind::Qoder
+        // Claude Code's `PostToolUseFailure` carries the same `error` string
+        // (<https://code.claude.com/docs/en/hooks>); an aborted call
+        // (`is_interrupt`) did not succeed either. Its `PostToolUse` fires
+        // only on success and has no `error` key.
+        AgentKind::Zcode
+        | AgentKind::Muse
+        | AgentKind::QwenCode
+        | AgentKind::Qoder
+        | AgentKind::ClaudeCode
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -5735,6 +5743,56 @@ mod tests {
         let no_input = json!({"tool_name": "read_file"});
         assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, true).is_none());
         assert!(tool_observation_metadata(AgentKind::Grizzybot, &no_input, false).is_some());
+    }
+
+    /// Claude Code's documented `PostToolUseFailure` payload proves an error;
+    /// its success payload proves nothing.
+    #[test]
+    fn claude_code_post_tool_use_failure_error_maps_to_error_outcome() {
+        let failure = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test", "description": "Run test suite"},
+            "tool_use_id": "toolu_01ABC123",
+            "error": "Exit code 1
+        Error: Cannot find module 'express'",
+            "is_interrupt": false,
+            "duration_ms": 4187
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &failure),
+            ToolOutcome::Error
+        );
+        // An abort is still a call that did not succeed.
+        let interrupted = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sleep 100"},
+            "error": "Command aborted",
+            "is_interrupt": true
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &interrupted),
+            ToolOutcome::Error
+        );
+        // Control: a success and an empty `error` stay unknown.
+        let success = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "tool_response": {"stdout": "ok", "stderr": "", "interrupted": false}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::ClaudeCode, &success),
+            ToolOutcome::Unknown
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::ClaudeCode,
+                &json!({"tool_name": "Bash", "error": ""})
+            ),
+            ToolOutcome::Unknown
+        );
     }
 
     #[test]
