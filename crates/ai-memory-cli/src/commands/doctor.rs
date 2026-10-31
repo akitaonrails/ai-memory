@@ -141,11 +141,17 @@ struct OperatorIdentity {
 }
 
 async fn read_identity(ep: &ServerEndpoint) -> Option<OperatorIdentity> {
+    let i18n = &ep.i18n;
     match get_json::<OperatorIdentity>(ep, "/identity", &[]).await {
         Ok(identity) => Some(identity),
         Err(error) if super::is_scope_not_found(&error) => None,
         Err(_) => {
-            eprintln!("Machine identity is unavailable; showing capture coverage only.");
+            eprintln!(
+                "{}",
+                i18n.text(
+                    "cli-doctor-machine-identity-is-unavailable-showing-capture-coverage-only"
+                )
+            );
             None
         }
     }
@@ -554,8 +560,13 @@ async fn project_coordinate_report(
 /// directory is unreadable, or the server cannot be reached / its response
 /// cannot be parsed.
 pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
-    let (identity_cwd, lookup_cwd) = super::scope_directories(config)
-        .ok_or_else(|| anyhow::anyhow!("resolving the current working directory"))?;
+    let i18n = &config.i18n;
+    let (identity_cwd, lookup_cwd) = super::scope_directories(config).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}",
+            i18n.text("cli-doctor-resolving-the-current-working-directory")
+        )
+    })?;
     let explicit_scope = args
         .workspace
         .as_deref()
@@ -577,7 +588,12 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         let marker =
             crate::marker::inspect_scope_for(&lookup_cwd, &identity_cwd, &config.runtime_env);
         if marker.status == "invalid_home_routes" {
-            anyhow::bail!("invalid home route map; doctor did not query a fallback server scope");
+            anyhow::bail!(
+                "{}",
+                i18n.text(
+                    "cli-doctor-invalid-home-route-map-doctor-did-not-query-a-fallback-server-scope"
+                )
+            );
         }
         marker
     };
@@ -594,8 +610,8 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     )?;
 
     let cwd = PathBuf::from(&identity_cwd);
-    let home =
-        super::run::native_home(config).context("locating the local harness session stores")?;
+    let home = super::run::native_home(config)
+        .context(i18n.text("cli-backfill-locating-the-local-harness-session-stores"))?;
 
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     let project_coordinate = Some(
@@ -739,7 +755,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     } else {
         presentation::render(
             &report,
-            &crate::terminal::Terminal::stdout(&config.runtime_env),
+            &crate::terminal::Terminal::stdout(&config.runtime_env, &config.i18n),
         );
     }
     Ok(())
@@ -802,35 +818,37 @@ fn muse_report(path: &Path) -> Option<MuseReport> {
 }
 
 /// Human lines for Muse's settings file; empty without one.
-fn render_muse(report: Option<&MuseReport>) -> String {
+fn render_muse(i18n: &ai_memory_core::i18n::Localizer, report: Option<&MuseReport>) -> String {
     let Some(report) = report else {
         return String::new();
     };
-    let mut out = format!(
-        "  muse: {} (hooks {}, MCP entry {})\n",
-        report.settings,
-        if report.hooks_wired {
-            "wired"
-        } else {
-            "not wired: run `ai-memory install-hooks --agent muse --apply`"
-        },
-        report
-            .mcp_entry
-            .map_or_else(|| "absent".to_owned(), |key| format!("under `{key}`")),
+    let mut out = i18n.format(
+        "cli-doctor-muse-hooks-mcp-entry",
+        &[
+            ("value0", report.settings.to_string()),
+            (
+                "value1",
+                (if report.hooks_wired {
+                    "wired"
+                } else {
+                    "not wired: run `ai-memory install-hooks --agent muse --apply`"
+                })
+                .to_string(),
+            ),
+            (
+                "value2",
+                report
+                    .mcp_entry
+                    .map_or_else(|| "absent".to_owned(), |key| format!("under `{key}`"))
+                    .to_string(),
+            ),
+        ],
     );
     if report.conflicting_server_maps {
-        out.push_str(&format!(
-            "⚠ {} has both `mcpServers` and `mcp_servers`, so Muse ignores every MCP server. \
-             Move the servers into one of the two maps.\n",
-            report.settings
-        ));
+        out.push_str(&i18n.format("cli-doctor-has-both-mcpservers-and-mcp-servers-so-muse-ignores-every-mcp-server-move-th", &[("value0", report.settings.to_string())]));
     }
     if report.schema_version_missing {
-        out.push_str(&format!(
-            "⚠ {} has no \"schema_version\", so every muse command fails at startup. Add \
-             \"schema_version\": 1.\n",
-            report.settings
-        ));
+        out.push_str(&i18n.format("cli-doctor-has-no-schema-version-so-every-muse-command-fails-at-startup-add-schema-vers", &[("value0", report.settings.to_string())]));
     }
     out
 }
@@ -943,30 +961,43 @@ fn claude_hooks_disabled_by(settings: &Path) -> Option<&'static str> {
 }
 
 /// Human lines for the installed plugins; empty without any.
-fn render_plugins(plugins: &[PluginReport]) -> String {
+fn render_plugins(i18n: &ai_memory_core::i18n::Localizer, plugins: &[PluginReport]) -> String {
     use super::agent_plugins::{PLUGIN_ID, PluginHarness};
     let mut out = String::new();
     for report in plugins {
         let plugin = &report.plugin;
         let agent = plugin.harness.agent();
-        out.push_str(&format!(
-            "  plugin: {PLUGIN_ID} {} for {agent} ({})\n",
-            plugin.version.as_deref().unwrap_or("(version unknown)"),
-            if plugin.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
-        ));
+        out.push_str(
+            &i18n.format(
+                "cli-doctor-plugin-plugin-id-for-agent",
+                &[
+                    ("value0", PLUGIN_ID.to_string()),
+                    (
+                        "value1",
+                        plugin
+                            .version
+                            .as_deref()
+                            .unwrap_or("(version unknown)")
+                            .to_string(),
+                    ),
+                    ("value2", agent.to_string()),
+                    (
+                        "value3",
+                        (if plugin.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        })
+                        .to_string(),
+                    ),
+                ],
+            ),
+        );
         if !plugin.enabled {
             continue;
         }
         if let Some(version) = plugin.version_skew() {
-            out.push_str(&format!(
-                "⚠ The {agent} plugin is {version} but this binary is {}. Run `ai-memory \
-                 upgrade` (it updates the Claude Code plugin too) or update the plugin in {agent}.\n",
-                report.binary_version
-            ));
+            out.push_str(&i18n.format("cli-doctor-the-agent-plugin-is-version-but-this-binary-is-run-ai-memory-upgrade-it-upda", &[("value0", agent.to_string()), ("value1", version.to_string()), ("value2", report.binary_version.to_string()), ("value3", agent.to_string())]));
         }
         if let Some(path) = &report.settings_hooks {
             let consequence = match plugin.harness {
@@ -976,42 +1007,21 @@ fn render_plugins(plugins: &[PluginReport]) -> String {
                 }
                 PluginHarness::Codex => "Codex runs both, so each event is captured twice",
             };
-            out.push_str(&format!(
-                "⚠ {agent} also has ai-memory settings-file hooks in {}. {consequence}. Keep \
-                 one: remove the ai-memory entries from that file, or run `{}`.\n",
-                path.display(),
-                uninstall_line(plugin.harness),
-            ));
+            out.push_str(&i18n.format("cli-doctor-agent-also-has-ai-memory-settings-file-hooks-in-consequence-keep-one-remove", &[("value0", agent.to_string()), ("value1", format!("{}", path.display())), ("value2", consequence.to_string()), ("value3", uninstall_line(plugin.harness).to_string())]));
         }
         if let Some(path) = &report.installed_skills {
-            out.push_str(&format!(
-                "⚠ The ai-memory routing skills are installed in {} as well as in the plugin, so \
-                 {agent} loads both copies. Keep one: `ai-memory uninstall --only skills --apply` \
-                 removes the installed ones.\n",
-                path.display()
-            ));
+            out.push_str(&i18n.format("cli-doctor-the-ai-memory-routing-skills-are-installed-in-as-well-as-in-the-plugin-so-ag", &[("value0", format!("{}", path.display())), ("value1", agent.to_string())]));
         }
         if let Some(path) = &report.settings_mcp {
-            out.push_str(&format!(
-                "⚠ An ai-memory MCP server is registered in {} as well as by the plugin, so \
-                 {agent} lists the memory tools twice. Keep one.\n",
-                path.display()
-            ));
+            out.push_str(&i18n.format("cli-doctor-an-ai-memory-mcp-server-is-registered-in-as-well-as-by-the-plugin-so-agent-l", &[("value0", format!("{}", path.display())), ("value1", agent.to_string())]));
         }
         if let Some(setting) = report.hooks_disabled_by {
-            out.push_str(&format!(
-                "⚠ {setting} is set in your Claude Code settings: the plugin's hooks do not run \
-                 and sessions are not captured.\n"
-            ));
+            out.push_str(&i18n.format("cli-doctor-setting-is-set-in-your-claude-code-settings-the-plugin-s-hooks-do-not-run-an", &[("value0", setting.to_string())]));
         }
         if let Some(trust) = &report.hook_trust
             && !trust.skipped.is_empty()
         {
-            out.push_str(&format!(
-                "⚠ Codex skips {} of the plugin's hooks (untrusted or modified). Open Codex, run \
-                 /hooks, and trust them; until then Codex sessions are not captured.\n",
-                trust.skipped.len()
-            ));
+            out.push_str(&i18n.format("cli-doctor-codex-skips-of-the-plugin-s-hooks-untrusted-or-modified-open-codex-run-hooks", &[("value0", format!("{}", trust.skipped.len()))]));
         }
     }
     out
@@ -1024,27 +1034,24 @@ fn uninstall_line(harness: super::agent_plugins::PluginHarness) -> String {
 
 /// Human lines for the spool, the server and the Codex hook trust; empty
 /// when there is nothing to warn about.
-fn render_capture_health(report: &DoctorReport) -> String {
+fn render_capture_health(i18n: &ai_memory_core::i18n::Localizer, report: &DoctorReport) -> String {
     let mut out = String::new();
     if report.server_unreachable {
-        out.push_str(&format!(
-            "⚠ The server at {} did not answer. Hook events are being spooled locally.\n",
-            report.server
+        out.push_str(&i18n.format(
+            "cli-doctor-the-server-at-did-not-answer-hook-events-are-being-spooled-locally",
+            &[("value0", report.server.to_string())],
         ));
     }
     let spool = &report.spool;
     if spool.at_capacity() {
-        out.push_str(&format!(
-            "⚠ The hook spool is full ({} events, oldest {}): newly captured events are \
-             dropped until space is available.\n",
-            spool.pending,
-            spool_age(spool.oldest_age_ms),
-        ));
+        out.push_str(&i18n.format("cli-doctor-the-hook-spool-is-full-events-oldest-newly-captured-events-are-dropped-until", &[("value0", format!("{}", spool.pending)), ("value1", spool_age(spool.oldest_age_ms).to_string())]));
     } else if spool.pending > 0 {
-        out.push_str(&format!(
-            "  hook spool: {} event(s) waiting for the server (oldest {}).\n",
-            spool.pending,
-            spool_age(spool.oldest_age_ms),
+        out.push_str(&i18n.format(
+            "cli-doctor-hook-spool-event-s-waiting-for-the-server-oldest",
+            &[
+                ("value0", format!("{}", spool.pending)),
+                ("value1", spool_age(spool.oldest_age_ms).to_string()),
+            ],
         ));
     }
     if let Some(trust) = &report.codex_hooks
@@ -1055,13 +1062,7 @@ fn render_capture_health(report: &DoctorReport) -> String {
             .iter()
             .map(|(event, status)| format!("{event} ({status})"))
             .collect();
-        out.push_str(&format!(
-            "⚠ Codex skips {} ai-memory hook(s): {}. Codex runs a hook only after you \
-             trust it, and again after its command changes. Open Codex, run /hooks, and \
-             trust them; until then Codex sessions are not captured.\n",
-            trust.skipped.len(),
-            skipped.join(", "),
-        ));
+        out.push_str(&i18n.format("cli-doctor-codex-skips-ai-memory-hook-s-codex-runs-a-hook-only-after-you-trust-it-and-a", &[("value0", format!("{}", trust.skipped.len())), ("value1", skipped.join(", ").to_string())]));
     }
     out
 }
@@ -1079,7 +1080,10 @@ fn spool_age(age_ms: Option<u64>) -> String {
     }
 }
 
-fn render_project_coordinate(coordinate: &ProjectCoordinateReport) -> String {
+fn render_project_coordinate(
+    i18n: &ai_memory_core::i18n::Localizer,
+    coordinate: &ProjectCoordinateReport,
+) -> String {
     use std::fmt::Write as _;
     let mut output = String::new();
     match &coordinate.server {
@@ -1087,51 +1091,115 @@ fn render_project_coordinate(coordinate: &ProjectCoordinateReport) -> String {
             let current = server.current_name.as_deref().unwrap_or("none");
             let _ = writeln!(
                 output,
-                "  project coordinate: {} (requested {}, current {})",
-                server.status, server.requested_name, current
+                "{}",
+                i18n.format(
+                    "cli-doctor-project-coordinate-requested-current",
+                    &[
+                        ("value0", format!("{}", server.status)),
+                        ("value1", server.requested_name.to_string()),
+                        ("value2", current.to_string())
+                    ]
+                )
             );
             if server.rename_eligible {
-                output.push_str("    an authorized write can promote this project name in place\n");
+                output.push_str(
+                    &i18n.text(
+                        "cli-doctor-an-authorized-write-can-promote-this-project-name-in-place",
+                    ),
+                );
             }
             if let Some(reason) = &server.collision_reason {
-                let _ = writeln!(output, "    collision: {reason}");
+                let _ = writeln!(
+                    output,
+                    "{}",
+                    i18n.format(
+                        "cli-doctor-collision-reason",
+                        &[("value0", format!("{}", reason))]
+                    )
+                );
             }
         }
         None => {
             let _ = writeln!(
                 output,
-                "  project coordinate: unavailable ({})",
-                coordinate
-                    .server_problem
-                    .as_deref()
-                    .unwrap_or("unknown error")
+                "{}",
+                i18n.format(
+                    "cli-doctor-project-coordinate-unavailable",
+                    &[(
+                        "value0",
+                        coordinate
+                            .server_problem
+                            .as_deref()
+                            .unwrap_or("unknown error")
+                            .to_string()
+                    )]
+                )
             );
         }
     }
     let local = &coordinate.local;
     let _ = writeln!(
         output,
-        "    local: scope {}, marker {}",
-        local.scope_source, local.marker_status
+        "{}",
+        i18n.format(
+            "cli-doctor-local-scope-marker",
+            &[
+                ("value0", local.scope_source.to_string()),
+                ("value1", local.marker_status.to_string())
+            ]
+        )
     );
     if let Some(source) = &local.identity_source {
         let _ = writeln!(
             output,
-            "    repository: source {source}, style {}",
-            local
-                .identity_style
-                .as_deref()
-                .unwrap_or(ai_memory_core::repository_identity::IdentityStyle::Path.as_str())
+            "{}",
+            i18n.format(
+                "cli-doctor-repository-source-source-style",
+                &[
+                    ("value0", source.to_string()),
+                    (
+                        "value1",
+                        local
+                            .identity_style
+                            .as_deref()
+                            .unwrap_or(
+                                ai_memory_core::repository_identity::IdentityStyle::Path.as_str()
+                            )
+                            .to_string()
+                    )
+                ]
+            )
         );
     }
     if let Some(canonical) = &local.canonical_candidate {
-        let _ = writeln!(output, "    canonical candidate: {canonical}");
+        let _ = writeln!(
+            output,
+            "{}",
+            i18n.format(
+                "cli-doctor-canonical-candidate-canonical",
+                &[("value0", canonical.to_string())]
+            )
+        );
     }
     if let Some(legacy) = &local.legacy_candidate {
-        let _ = writeln!(output, "    legacy candidate: {legacy}");
+        let _ = writeln!(
+            output,
+            "{}",
+            i18n.format(
+                "cli-doctor-legacy-candidate-legacy",
+                &[("value0", legacy.to_string())]
+            )
+        );
     }
     for message in &local.messages {
-        let _ = writeln!(output, "    marker diagnostic: {message}");
+        let _ = writeln!(
+            output,
+            "{}",
+            i18n.format(
+                "cli-doctor-marker-diagnostic-message",
+                &[("value0", message.to_string())]
+            )
+        );
     }
     output
 }
@@ -1204,7 +1272,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         assert_eq!(muse_report(&path), None);
-        assert_eq!(render_muse(None), "");
+        assert_eq!(
+            render_muse(&ai_memory_core::i18n::Localizer::default(), None),
+            ""
+        );
 
         std::fs::write(
             &path,
@@ -1216,7 +1287,7 @@ mod tests {
         assert_eq!(wired.mcp_entry, Some("mcp_servers"));
         assert!(!wired.conflicting_server_maps);
         assert!(!wired.schema_version_missing);
-        let text = render_muse(Some(&wired));
+        let text = render_muse(&ai_memory_core::i18n::Localizer::default(), Some(&wired));
         assert!(text.contains("hooks wired"), "{text}");
         assert!(!text.contains('⚠'), "{text}");
 
@@ -1226,7 +1297,7 @@ mod tests {
         assert_eq!(broken.mcp_entry, None);
         assert!(broken.conflicting_server_maps);
         assert!(broken.schema_version_missing);
-        let text = render_muse(Some(&broken));
+        let text = render_muse(&ai_memory_core::i18n::Localizer::default(), Some(&broken));
         assert!(text.contains("ignores every MCP server"), "{text}");
         assert!(text.contains("schema_version"), "{text}");
         assert!(text.contains("not wired"), "{text}");
@@ -1247,7 +1318,7 @@ mod tests {
         install_claude_plugin(home.path(), env!("CARGO_PKG_VERSION"), true);
         let reports = plugin_reports(home.path(), &cwd, &env).await;
         assert_eq!(reports.len(), 1);
-        let quiet = render_plugins(&reports);
+        let quiet = render_plugins(&ai_memory_core::i18n::Localizer::default(), &reports);
         assert!(quiet.contains("plugin: ai-memory@ai-memory"), "{quiet}");
         assert!(!quiet.contains('⚠'), "{quiet}");
 
@@ -1275,7 +1346,7 @@ mod tests {
         assert!(report.installed_skills.is_some());
         assert!(report.settings_mcp.is_some());
         assert_eq!(report.hooks_disabled_by, Some("disableAllHooks"));
-        let out = render_plugins(&reports);
+        let out = render_plugins(&ai_memory_core::i18n::Localizer::default(), &reports);
         for needle in [
             "is 0.0.1 but this binary is",
             "settings-file hooks",
@@ -1306,7 +1377,10 @@ mod tests {
             trusted: vec!["sessionStart".into()],
             skipped: vec![("stop".into(), "modified".into())],
         };
-        let out = render_capture_health(&health_report(full, true, Some(skipped)));
+        let out = render_capture_health(
+            &ai_memory_core::i18n::Localizer::default(),
+            &health_report(full, true, Some(skipped)),
+        );
         assert!(out.contains("did not answer"), "{out}");
         assert!(
             out.contains("spool is full (10000 events, oldest 1d)"),
@@ -1323,7 +1397,10 @@ mod tests {
             retries_total: 1,
             capacity: 10_000,
         };
-        let out = render_capture_health(&health_report(waiting, false, None));
+        let out = render_capture_health(
+            &ai_memory_core::i18n::Localizer::default(),
+            &health_report(waiting, false, None),
+        );
         assert_eq!(
             out,
             "  hook spool: 4 event(s) waiting for the server (oldest 1m).\n"
@@ -1333,8 +1410,10 @@ mod tests {
             trusted: vec!["sessionStart".into()],
             skipped: Vec::new(),
         };
-        let quiet =
-            render_capture_health(&health_report(SpoolHealth::default(), false, Some(trusted)));
+        let quiet = render_capture_health(
+            &ai_memory_core::i18n::Localizer::default(),
+            &health_report(SpoolHealth::default(), false, Some(trusted)),
+        );
         assert_eq!(quiet, "");
     }
 
@@ -1369,28 +1448,34 @@ mod tests {
             legacy_candidate: Some("api".into()),
             messages: Vec::new(),
         };
-        let promotion = render_project_coordinate(&ProjectCoordinateReport {
-            local: local.clone(),
-            server: Some(server_coordinate(
-                ai_memory_store::ProjectCoordinateStatus::CanonicalCompat,
-                None,
-            )),
-            server_problem: None,
-        });
+        let promotion = render_project_coordinate(
+            &ai_memory_core::i18n::Localizer::default(),
+            &ProjectCoordinateReport {
+                local: local.clone(),
+                server: Some(server_coordinate(
+                    ai_memory_store::ProjectCoordinateStatus::CanonicalCompat,
+                    None,
+                )),
+                server_problem: None,
+            },
+        );
         assert!(promotion.contains("canonical_compat"), "{promotion}");
         assert!(
             promotion.contains("promote this project name in place"),
             "{promotion}"
         );
 
-        let collision = render_project_coordinate(&ProjectCoordinateReport {
-            local,
-            server: Some(server_coordinate(
-                ai_memory_store::ProjectCoordinateStatus::Ambiguous,
-                Some(ai_memory_store::ProjectCoordinateCollisionReason::CrossForgeCollision),
-            )),
-            server_problem: None,
-        });
+        let collision = render_project_coordinate(
+            &ai_memory_core::i18n::Localizer::default(),
+            &ProjectCoordinateReport {
+                local,
+                server: Some(server_coordinate(
+                    ai_memory_store::ProjectCoordinateStatus::Ambiguous,
+                    Some(ai_memory_store::ProjectCoordinateCollisionReason::CrossForgeCollision),
+                )),
+                server_problem: None,
+            },
+        );
         assert!(collision.contains("cross_forge_collision"), "{collision}");
         assert!(
             !collision.contains("promote this project name"),

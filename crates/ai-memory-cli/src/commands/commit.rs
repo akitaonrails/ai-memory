@@ -29,6 +29,7 @@ struct CommitResponse {
 /// Returns an error if the server is unreachable or returns a non-2xx
 /// response.
 pub async fn run(config: &Config, args: CommitArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: CommitResponse = post_json(
         &endpoint,
@@ -39,14 +40,30 @@ pub async fn run(config: &Config, args: CommitArgs) -> Result<()> {
     )
     .await?;
     if resp.committed {
-        println!("committed: {}", resp.oid.as_deref().unwrap_or("(unknown)"));
+        println!(
+            "{}",
+            i18n.format(
+                "cli-commit-committed",
+                &[(
+                    "value0",
+                    resp.oid.as_deref().unwrap_or("(unknown)").to_string()
+                )]
+            )
+        );
     } else {
         println!(
-            "nothing to commit{}",
-            resp.reason
-                .as_deref()
-                .map(|r| format!(" ({r})"))
-                .unwrap_or_default()
+            "{}",
+            i18n.format(
+                "cli-commit-nothing-to-commit",
+                &[(
+                    "value0",
+                    resp.reason
+                        .as_deref()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default()
+                        .to_string()
+                )]
+            )
         );
     }
     Ok(())

@@ -42,6 +42,7 @@ struct AccessResponse {
 }
 
 async fn access(ep: &ServerEndpoint, args: ProjectAccessArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     super::refuse_empty_explicit(Some(args.workspace.as_str()), "--workspace")?;
     super::refuse_empty_explicit(Some(args.project.as_str()), "--project")?;
     super::refuse_empty_explicit(Some(args.mode.as_str()), "--mode")?;
@@ -55,24 +56,40 @@ async fn access(ep: &ServerEndpoint, args: ProjectAccessArgs) -> Result<()> {
         }),
     )
     .await
-    .context("setting project access")?;
+    .context(i18n.text("cli-project-setting-project-access"))?;
     let repo = format!("{}/{}", args.workspace, args.project);
     if resp.changed {
-        println!("{repo} is now {} (was {}).", resp.mode, resp.previous);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-project-repo-is-now-was",
+                &[
+                    ("value0", repo.to_string()),
+                    ("value1", resp.mode.to_string()),
+                    ("value2", resp.previous.to_string())
+                ]
+            )
+        );
     } else {
-        println!("{repo} was already {}; nothing changed.", resp.mode);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-project-repo-was-already-nothing-changed",
+                &[
+                    ("value0", repo.to_string()),
+                    ("value1", resp.mode.to_string())
+                ]
+            )
+        );
     }
     if !resp.without_access.is_empty() {
         println!();
-        println!("These users have written to {repo} and hold no grant, so they are now refused:");
+        println!("{}", i18n.format("cli-project-these-users-have-written-to-repo-and-hold-no-grant-so-they-are-now-refused", &[("value0", repo.to_string())]));
         for name in &resp.without_access {
             println!("  {name}");
         }
         println!(
-            "Grant the ones who should keep access: ai-memory user grant --user <name> \
-             --workspace {} --project {} --level write",
-            args.workspace, args.project
-        );
+            "{}", i18n.format("cli-project-grant-the-ones-who-should-keep-access-ai-memory-user-grant-user-name-workspa", &[("value0", args.workspace.to_string()), ("value1", args.project.to_string())]));
     }
     Ok(())
 }

@@ -22,6 +22,7 @@ const OPENCLAW_BIN: &str = "openclaw";
 
 /// Write and install the generated OpenClaw plugin package.
 pub(crate) fn apply(
+    i18n: &ai_memory_core::i18n::Localizer,
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
@@ -44,16 +45,33 @@ pub(crate) fn apply(
     match install_plugin(&plugin_dir)? {
         InstallStatus::Installed => {
             println!();
-            println!("OpenClaw plugin installed from {}.", plugin_dir.display());
             println!(
-                "If your OpenClaw gateway did not auto-restart, run `openclaw gateway restart`."
+                "{}",
+                i18n.diagnostic(&format!(
+                    "OpenClaw plugin installed from {}.",
+                    plugin_dir.display()
+                ))
             );
-            println!("Verify with `openclaw plugins inspect ai-memory --runtime --json`.");
+            println!(
+                "{}",
+                i18n.diagnostic(
+                    "If your OpenClaw gateway did not auto-restart, run `openclaw gateway restart`."
+                )
+            );
+            println!(
+                "{}",
+                i18n.diagnostic(
+                    "Verify with `openclaw plugins inspect ai-memory --runtime --json`."
+                )
+            );
         }
         InstallStatus::CliMissing => {
             println!();
-            println!("OpenClaw CLI not found on PATH; plugin package was written only.");
-            println!("Install it with:");
+            println!(
+                "{}",
+                i18n.diagnostic("OpenClaw CLI not found on PATH; plugin package was written only.")
+            );
+            println!("{}", i18n.diagnostic("Install it with:"));
             println!(
                 "  openclaw plugins install --link {} --force",
                 plugin_dir.display()

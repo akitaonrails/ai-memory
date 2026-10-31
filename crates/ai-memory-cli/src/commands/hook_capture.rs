@@ -1094,8 +1094,11 @@ pub async fn get_handoff(
         Ok(r) => r,
         Err(e) => {
             eprintln!(
-                "ai-memory hook warning: handoff fetch failed ({e}); \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook warning: handoff fetch failed ({e}); \
                  a pending handoff (if any) was NOT injected"
+                ))
             );
             return None;
         }
@@ -1107,9 +1110,12 @@ pub async fn get_handoff(
         // is the server's reason and goes to stderr, never into context.
         let reason = resp.text().await.unwrap_or_default();
         eprintln!(
-            "ai-memory hook warning: not authorized for this project's memory ({}); \
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook warning: not authorized for this project's memory ({}); \
              nothing was injected",
-            reason.trim()
+                reason.trim()
+            ))
         );
         return None;
     }

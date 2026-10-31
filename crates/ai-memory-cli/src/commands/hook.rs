@@ -345,7 +345,12 @@ fn dispatch_backfill_close(
         });
     }
     let Ok(payload) = serde_json::to_string(&body) else {
-        eprintln!("ai-memory hook warning: could not serialize backfill-close body; skipped");
+        eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(
+                "ai-memory hook warning: could not serialize backfill-close body; skipped"
+            )
+        );
         return;
     };
     let cwd_qs = candidate
@@ -362,7 +367,12 @@ fn dispatch_backfill_close(
     let spool = hook_spool::spool_dir(dd);
     let entry = hook_spool::entry_for(event_url, payload, auth_token, oidc_present);
     if let Err(e) = hook_spool::enqueue_with_config(&spool, &entry, None) {
-        eprintln!("ai-memory hook warning: failed to spool backfill-close event: {e}");
+        eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook warning: failed to spool backfill-close event: {e}"
+            ))
+        );
     }
 }
 
@@ -651,7 +661,12 @@ pub async fn run_drain(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         Ok(outcome) => {
             let _ = write_drain_report(&mut std::io::stderr(), &outcome);
         }
-        Err(err) => eprintln!("ai-memory hook-drain warning: failed to acquire drain lock: {err}"),
+        Err(err) => eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook-drain warning: failed to acquire drain lock: {err}"
+            ))
+        ),
     }
     Ok(())
 }
@@ -678,8 +693,11 @@ fn write_drain_report<W: std::io::Write>(
         // the fix, the confusion the fix is for.
         hook_spool::LockedDrainResult::LockBusy => writeln!(
             w,
-            "ai-memory hook-drain warning: another drainer holds the spool lock; \
+            "{}",
+            crate::localization::process_diagnostic(
+                "ai-memory hook-drain warning: another drainer holds the spool lock; \
              this pass attempted no delivery and left the spool untouched"
+            )
         ),
         hook_spool::LockedDrainResult::Drained(result) => {
             if result.remaining == 0 && result.dropped == 0 {
@@ -692,10 +710,13 @@ fn write_drain_report<W: std::io::Write>(
             // drain cannot observe — the precise confusion #493 was written in.
             writeln!(
                 w,
-                "ai-memory hook-drain warning: {} event(s) acknowledged by the server, \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook-drain warning: {} event(s) acknowledged by the server, \
                  {} still queued, {} DROPPED undelivered (past the retry cap or \
                  older than the spool TTL)",
-                result.sent, result.remaining, result.dropped
+                    result.sent, result.remaining, result.dropped
+                ))
             )
         }
     }
@@ -1452,7 +1473,10 @@ where
         Ok(parsed) => parsed,
         Err(_) => {
             eprintln!(
-                "ai-memory hook warning: could not parse event payload as JSON; nothing was captured"
+                "{}",
+                crate::localization::process_diagnostic(
+                    "ai-memory hook warning: could not parse event payload as JSON; nothing was captured"
+                )
             );
             write_success_response(stdout, agent_kind, hook_event)?;
             return Ok(());
@@ -1693,11 +1717,14 @@ where
         HookRoute::Profile(resolved) => Some(resolved),
         HookRoute::Rejected { name, reason } => {
             eprintln!(
-                "ai-memory hook warning: this repository's marker selects server profile {}, \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook warning: this repository's marker selects server profile {}, \
                  which was refused ({}); the event was dropped",
-                name.as_ref()
-                    .map_or_else(|| "<invalid>".to_owned(), |n| format!("`{n}`")),
-                reason.as_str()
+                    name.as_ref()
+                        .map_or_else(|| "<invalid>".to_owned(), |n| format!("`{n}`")),
+                    reason.as_str()
+                ))
             );
             write_success_response(stdout, agent_kind, hook_event)?;
             return Ok(());
@@ -1890,7 +1917,10 @@ where
                 store_antigravity_transcript_cursor(&prompts.cursor_path, &prompts.cursor);
             } else {
                 eprintln!(
-                    "ai-memory hook warning: failed to spool an Antigravity prompt; it is retried on the next turn"
+                    "{}",
+                    crate::localization::process_diagnostic(
+                        "ai-memory hook warning: failed to spool an Antigravity prompt; it is retried on the next turn"
+                    )
                 );
             }
         };
@@ -1910,7 +1940,10 @@ where
                     .routed_to(profile_name);
             if hook_spool::enqueue_with_config(&spool, &entry, Some(&spool_policy)).is_err() {
                 eprintln!(
-                    "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+                    "{}",
+                    crate::localization::process_diagnostic(
+                        "ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped"
+                    )
                 );
             } else if let Some(batch) = live_batch.take() {
                 batch.commit();
@@ -1995,8 +2028,11 @@ where
         // handoff on demand via the MCP `memory_handoff_accept` tool.
         if agent_kind.session_start_injects_handoff() && !handoff_scoped {
             eprintln!(
-                "ai-memory hook warning: the event named no project directory, so no handoff \
+                "{}",
+                crate::localization::process_diagnostic(
+                    "ai-memory hook warning: the event named no project directory, so no handoff \
                  was fetched; recover a pending one with memory_handoff_accept"
+                )
             );
         }
         if agent_kind.session_start_injects_handoff() && handoff_scoped {
@@ -2350,7 +2386,10 @@ where
         )
     {
         eprintln!(
-            "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook warning: failed to start background spool drainer; event remains queued: {err}"
+            ))
         );
     }
 

@@ -16,7 +16,7 @@ use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::state::WebState;
-use crate::templates::{WorkstreamRow, WorkstreamsView, humanize, project_href, short_id};
+use crate::templates::{WorkstreamRow, WorkstreamsView, project_href, short_id};
 
 const PAGE_SIZE: usize = 100;
 const MAX_PAGE: usize = 10_000;
@@ -28,11 +28,12 @@ pub(crate) struct WorkstreamsQuery {
 }
 
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     level: Option<Extension<AuthLevel>>,
     Query(query): Query<WorkstreamsQuery>,
 ) -> Response {
-    if let Err(response) = super::require_admin(&state, level).await {
+    if let Err(response) = super::require_admin(&i18n, &state, level).await {
         return response;
     }
     let page = query.page.unwrap_or(1).clamp(1, MAX_PAGE);
@@ -48,7 +49,11 @@ pub(crate) async fn handler(
     let has_next = rows.len() > PAGE_SIZE;
     rows.truncate(PAGE_SIZE);
     let view = WorkstreamsView {
-        rows: rows.into_iter().map(workstream_row).collect(),
+        i18n: i18n.clone(),
+        rows: rows
+            .into_iter()
+            .map(|summary| workstream_row(&i18n, summary))
+            .collect(),
         page,
         prev_href: (page > 1).then(|| page_href(page - 1)),
         next_href: has_next.then(|| page_href(page + 1)),
@@ -60,7 +65,10 @@ pub(crate) async fn handler(
     ([(header::CACHE_CONTROL, "no-store")], Html(body)).into_response()
 }
 
-fn workstream_row(summary: OperationalWorkstreamSummary) -> WorkstreamRow {
+fn workstream_row(
+    i18n: &ai_memory_core::i18n::Localizer,
+    summary: OperationalWorkstreamSummary,
+) -> WorkstreamRow {
     let status = summary.status.as_str().to_owned();
     let status_label = match summary.status {
         WorkstreamOperationalStatus::Active => "Active",
@@ -75,7 +83,11 @@ fn workstream_row(summary: OperationalWorkstreamSummary) -> WorkstreamRow {
         name: summary.name,
         short_id: short_id(&summary.workstream_id.to_string()),
         status,
-        status_label,
+        status_label: if i18n.tag() == "en" {
+            status_label
+        } else {
+            i18n.status(summary.status.as_str())
+        },
         latest_agent: summary
             .latest_agent
             .map_or_else(String::new, |agent| agent.as_str().to_owned()),
@@ -88,19 +100,19 @@ fn workstream_row(summary: OperationalWorkstreamSummary) -> WorkstreamRow {
             .map(|agent| agent.as_str().to_owned())
             .collect(),
         event_count: summary.event_count,
-        last_active_relative: humanize_micros(summary.last_active_at),
+        last_active_relative: humanize_micros(i18n, summary.last_active_at),
         latest_started_relative: summary
             .latest_started_at
-            .map_or_else(String::new, humanize_micros),
+            .map_or_else(String::new, |value| humanize_micros(i18n, value)),
         latest_ended_relative: summary
             .latest_ended_at
-            .map_or_else(String::new, humanize_micros),
+            .map_or_else(String::new, |value| humanize_micros(i18n, value)),
     }
 }
 
-fn humanize_micros(value: i64) -> String {
+fn humanize_micros(i18n: &ai_memory_core::i18n::Localizer, value: i64) -> String {
     jiff::Timestamp::from_microsecond(value)
-        .map(|timestamp| humanize(&timestamp.to_string()))
+        .map(|timestamp| i18n.relative(&timestamp.to_string()))
         .unwrap_or_else(|_| value.to_string())
 }
 

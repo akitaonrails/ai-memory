@@ -148,7 +148,11 @@ fn push_rewrite(plan: &mut Vec<PlannedChange>, path: PathBuf, removed: Vec<Strin
 /// `~/.omp`), and `~/.omp/agent`, where `install-mcp` always wrote the MCP
 /// entry. A profile name OMP refuses is reported and skipped instead of
 /// aborting every other agent's cleanup.
-fn omp_agent_dirs(home: Option<&Path>, profile: Option<&str>) -> Vec<PathBuf> {
+fn omp_agent_dirs(
+    i18n: &ai_memory_core::i18n::Localizer,
+    home: Option<&Path>,
+    profile: Option<&str>,
+) -> Vec<PathBuf> {
     let Some(home) = home else {
         return Vec::new();
     };
@@ -157,7 +161,13 @@ fn omp_agent_dirs(home: Option<&Path>, profile: Option<&str>) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(4);
     match ai_memory_workstream::omp_agent_dir(home, profile, env) {
         Ok(dir) => dirs.push(dir),
-        Err(error) => eprintln!("warning: skipping the active OMP profile: {error:#}"),
+        Err(error) => eprintln!(
+            "{}",
+            i18n.format(
+                "cli-uninstall-warning-skipping-the-active-omp-profile-error",
+                &[("value0", format!("{:#}", error))]
+            )
+        ),
     }
     let fallbacks = [
         ai_memory_workstream::omp_agent_dir(home, Some("default"), env).ok(),
@@ -186,6 +196,7 @@ fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: Del
 /// `GROK_HOME`, `APPDATA`) come
 /// from `env`, the environment `Config::load` captured (invariant #1).
 fn build_plan(
+    i18n: &ai_memory_core::i18n::Localizer,
     args: &UninstallArgs,
     data_dir: &Path,
     env: &crate::config::RuntimeEnv,
@@ -198,7 +209,7 @@ fn build_plan(
     let claude_config_dir = claude_config_dir(env.var_os("CLAUDE_CONFIG_DIR"));
     let omp_dirs = if want(crate::cli::UninstallOnly::Hooks) || want(crate::cli::UninstallOnly::Mcp)
     {
-        omp_agent_dirs(home.as_deref(), args.profile.as_deref())
+        omp_agent_dirs(i18n, home.as_deref(), args.profile.as_deref())
     } else {
         Vec::new()
     };
@@ -217,7 +228,8 @@ fn build_plan(
         // A `--scope project` install lives in the checkout's gitignored
         // `.claude/settings.local.json`; sweep the one for the current
         // directory, as the Kiro project configs below are.
-        let cwd = std::env::current_dir().context("getting CWD for hook removal")?;
+        let cwd = std::env::current_dir()
+            .context(i18n.text("cli-uninstall-getting-cwd-for-hook-removal"))?;
         let project_local = install_hooks::project_claude_settings_local(&cwd);
         if !hook_files.iter().any(|(path, _)| *path == project_local) {
             hook_files.push((project_local, HookConfigShape::NestedHooksKey));
@@ -529,7 +541,8 @@ fn build_plan(
 
     // ---- Instructions (cwd CLAUDE.md / AGENTS.md) ----
     if want(crate::cli::UninstallOnly::Instructions) {
-        let cwd = std::env::current_dir().context("getting CWD for instruction removal")?;
+        let cwd = std::env::current_dir()
+            .context(i18n.text("cli-uninstall-getting-cwd-for-instruction-removal"))?;
         for name_md in ["CLAUDE.md", "AGENTS.md"] {
             let path = cwd.join(name_md);
             if !path.exists() {
@@ -551,7 +564,8 @@ fn build_plan(
 
     // ---- Managed Agent Skills (project + global roots) ----
     if want(crate::cli::UninstallOnly::Skills) {
-        let cwd = std::env::current_dir().context("getting CWD for skill removal")?;
+        let cwd = std::env::current_dir()
+            .context(i18n.text("cli-uninstall-getting-cwd-for-skill-removal"))?;
         let appdata = env.var_os("APPDATA").map(PathBuf::from);
         let grok_home = install_mcp::grok_home_in(env.var_os("GROK_HOME")).ok();
         let copilot_home = install_mcp::copilot_home_in(env.var_os("COPILOT_HOME")).ok();
@@ -660,22 +674,39 @@ fn push_unique_skill_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
 }
 
 /// Print the plan, one line per file, mirroring `reset`'s dry-run style.
-fn print_plan(plan: &[PlannedChange]) {
+fn print_plan(i18n: &ai_memory_core::i18n::Localizer, plan: &[PlannedChange]) {
     if plan.is_empty() {
-        println!("Nothing to remove. ai-memory wiring not found.");
+        println!(
+            "{}",
+            i18n.text("cli-uninstall-nothing-to-remove-ai-memory-wiring-not-found")
+        );
         return;
     }
     for change in plan {
         match change {
             PlannedChange::Rewrite { path, removed, .. } => {
                 println!(
-                    "would remove {} from {}",
-                    removed.join(", "),
-                    path.display()
+                    "{}",
+                    i18n.format(
+                        "cli-uninstall-would-remove-from",
+                        &[
+                            ("value0", removed.join(", ").to_string()),
+                            ("value1", format!("{}", path.display()))
+                        ]
+                    )
                 );
             }
             PlannedChange::DeleteFile { path, kind } => {
-                println!("would delete {} ({})", path.display(), kind.label());
+                println!(
+                    "{}",
+                    i18n.format(
+                        "cli-uninstall-would-delete",
+                        &[
+                            ("value0", format!("{}", path.display())),
+                            ("value1", kind.label().to_string())
+                        ]
+                    )
+                );
             }
         }
     }
@@ -685,6 +716,7 @@ fn print_plan(plan: &[PlannedChange]) {
 /// atomic + backed up. Planning records exact operations per file, so shared
 /// files such as `~/.gemini/settings.json` only apply the selected concerns.
 fn apply_change(
+    i18n: &ai_memory_core::i18n::Localizer,
     change: &PlannedChange,
     private_backup: Option<&PrivateBackup>,
     name: Option<&str>,
@@ -697,26 +729,29 @@ fn apply_change(
             }
             if !generated_file_is_ours(path, *kind) {
                 println!(
-                    "skipped {} because it no longer looks like an ai-memory-generated {}",
-                    path.display(),
-                    kind.label()
-                );
+                    "{}", i18n.format("cli-uninstall-skipped-because-it-no-longer-looks-like-an-ai-memory-generated", &[("value0", format!("{}", path.display())), ("value1", kind.label().to_string())]));
                 return Ok(());
             }
             std::fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))?;
-            println!("✓ deleted {}", path.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-uninstall-deleted",
+                    &[("value0", format!("{}", path.display()))]
+                )
+            );
             if *kind == DeleteKind::ManagedSkill {
-                remove_empty_skill_dirs(path)?;
+                remove_empty_skill_dirs(i18n, path)?;
             }
             if *kind == DeleteKind::GrokHandoffRule
                 && let Some(parent) = path.parent()
             {
-                remove_dir_if_empty(parent)?;
+                remove_dir_if_empty(i18n, parent)?;
             }
             if *kind == DeleteKind::ClineHook
                 && let Some(parent) = path.parent()
             {
-                remove_dir_if_empty(parent)?;
+                remove_dir_if_empty(i18n, parent)?;
             }
         }
         PlannedChange::Rewrite { path, ops, .. } => {
@@ -752,21 +787,24 @@ fn apply_change(
     Ok(())
 }
 
-fn remove_empty_skill_dirs(skill_file: &Path) -> Result<()> {
+fn remove_empty_skill_dirs(
+    i18n: &ai_memory_core::i18n::Localizer,
+    skill_file: &Path,
+) -> Result<()> {
     let Some(skill_dir) = skill_file.parent() else {
         return Ok(());
     };
     let root = skill_dir.parent().map(Path::to_path_buf);
 
-    remove_dir_if_empty(skill_dir)?;
+    remove_dir_if_empty(i18n, skill_dir)?;
     if let Some(root) = root {
-        remove_dir_if_empty(&root)?;
+        remove_dir_if_empty(i18n, &root)?;
     }
 
     Ok(())
 }
 
-fn remove_dir_if_empty(path: &Path) -> Result<()> {
+fn remove_dir_if_empty(i18n: &ai_memory_core::i18n::Localizer, path: &Path) -> Result<()> {
     if !path.is_dir() {
         return Ok(());
     }
@@ -778,7 +816,13 @@ fn remove_dir_if_empty(path: &Path) -> Result<()> {
     }
 
     std::fs::remove_dir(path).with_context(|| format!("removing {}", path.display()))?;
-    println!("✓ removed empty directory {}", path.display());
+    println!(
+        "{}",
+        i18n.format(
+            "cli-uninstall-removed-empty-directory",
+            &[("value0", format!("{}", path.display()))]
+        )
+    );
     Ok(())
 }
 
@@ -788,11 +832,12 @@ fn remove_dir_if_empty(path: &Path) -> Result<()> {
 /// Returns an error if a config file is malformed or a removal write
 /// fails. Absent files / nothing-to-remove are not errors.
 pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
+    let i18n = &config.i18n;
     let name = args.mcp_name.clone();
     let url = args.mcp_url.clone();
 
-    let plan = build_plan(&args, &config.data_dir, &config.runtime_env)?;
-    print_plan(&plan);
+    let plan = build_plan(i18n, &args, &config.data_dir, &config.runtime_env)?;
+    print_plan(i18n, &plan);
     // The marketplace plugins carry hooks, MCP and skills together, so only a
     // full uninstall removes them; the harness's own CLI does the removal.
     let plugins = if args.only.is_none() {
@@ -802,7 +847,16 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     };
     for plugin in &plugins {
         let (program, plugin_args) = plugin.harness.uninstall_command();
-        println!("would run `{program} {}`", plugin_args.join(" "));
+        println!(
+            "{}",
+            i18n.format(
+                "cli-uninstall-would-run-program",
+                &[
+                    ("value0", program.to_string()),
+                    ("value1", plugin_args.join(" ").to_string())
+                ]
+            )
+        );
     }
     let service = if args.only.is_none() {
         setup_service(config)
@@ -810,25 +864,31 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         None
     };
     if let Some((_, removal)) = &service {
-        print_service_plan(removal);
+        print_service_plan(i18n, removal);
     }
     let remove_service = matches!(&service, Some((_, user_service::Removal::Removed(_))));
     let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
     if hooks_removed {
         // Only the current checkout's project file is reachable from here.
         println!(
-            "note: run `ai-memory uninstall --only hooks --apply` inside every other checkout that \
-             used `install-hooks --scope project`; their .claude/settings.local.json keeps calling \
-             this binary and data dir."
-        );
+            "{}", i18n.text("cli-uninstall-note-run-ai-memory-uninstall-only-hooks-apply-inside-every-other-checkout-th"));
     }
     if args.purge_data {
         for path in data_purge::purge_preview(&config.data_dir) {
-            println!("would purge {}", path.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-uninstall-would-purge",
+                    &[("value0", format!("{}", path.display()))]
+                )
+            );
         }
     }
     if !args.apply {
-        println!("(dry-run; pass --apply to remove)");
+        println!(
+            "{}",
+            i18n.text("cli-uninstall-dry-run-pass-apply-to-remove")
+        );
         return Ok(());
     }
     if plan.is_empty() && plugins.is_empty() && !args.purge_data && !remove_service {
@@ -836,18 +896,22 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     }
 
     if std::io::stdin().is_terminal() && !args.yes {
-        eprint!("Proceed with removal? [y/N] ");
+        eprint!("{}", i18n.text("cli-uninstall-proceed-with-removal-y-n"));
         use std::io::Write as _;
         std::io::stderr().flush().ok();
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).ok();
-        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
-            println!("aborted.");
+        if !matches!(
+            line.trim().to_lowercase().as_str(),
+            "y" | "yes" | "s" | "sim"
+        ) {
+            println!("{}", i18n.text("cli-uninstall-aborted"));
             return Ok(());
         }
     }
 
     stop_service_guarding_purge(
+        i18n,
         service.as_ref(),
         args.purge_data,
         &config.data_dir,
@@ -869,10 +933,10 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
             ),
             _ => None,
         };
-        apply_change(change, private_backup.as_ref(), name.as_deref(), &url)?;
+        apply_change(i18n, change, private_backup.as_ref(), name.as_deref(), &url)?;
     }
 
-    uninstall_plugins(&plugins, &user_service::SystemRunner);
+    uninstall_plugins(&config.i18n, &plugins, &user_service::SystemRunner);
 
     // Removing the hooks removes the readers of the stored bearer, so leaving
     // it on disk would strand a live credential (#552). An uninstall that
@@ -889,10 +953,8 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         && !bridge_keeps_key
         && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir)
     {
-        eprintln!(
-            "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
-            config.data_dir.display()
-        );
+        eprintln!("{}", i18n.diagnostic(&format!("ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
+            config.data_dir.display())));
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
     // reasoning applies; the registry of URLs stays. The root bearer the
@@ -901,19 +963,23 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     if let Err(error) =
         crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
     {
-        eprintln!(
-            "ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
-            config.data_dir.display()
-        );
+        eprintln!("{}", i18n.diagnostic(&format!("ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
+            config.data_dir.display())));
     }
 
     if args.purge_data {
         for path in data_purge::purge_data_dirs(&config.data_dir)? {
-            println!("✓ purged {}", path.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-uninstall-purged",
+                    &[("value0", format!("{}", path.display()))]
+                )
+            );
         }
     }
 
-    print_docker_hint(args.purge_data);
+    print_docker_hint(i18n, args.purge_data);
 
     Ok(())
 }
@@ -936,6 +1002,7 @@ fn installed_plugins(config: &Config) -> Vec<agent_plugins::InstalledPlugin> {
 /// Remove each plugin through its harness's CLI. A failure is reported with
 /// the command to run, and never stops the rest of the teardown.
 fn uninstall_plugins(
+    i18n: &ai_memory_core::i18n::Localizer,
     plugins: &[agent_plugins::InstalledPlugin],
     runner: &dyn user_service::CommandRunner,
 ) {
@@ -944,13 +1011,9 @@ fn uninstall_plugins(
         let shown = format!("{program} {}", args.join(" "));
         match runner.run(program, &args) {
             Ok(outcome) if outcome.success => println!("✓ {shown}"),
-            Ok(outcome) => eprintln!(
-                "ai-memory uninstall warning: `{shown}` failed ({}); run it yourself",
-                outcome.stderr.trim()
-            ),
-            Err(error) => eprintln!(
-                "ai-memory uninstall warning: could not run `{shown}` ({error:#}); run it yourself"
-            ),
+            Ok(outcome) => eprintln!("{}", i18n.diagnostic(&format!("ai-memory uninstall warning: `{shown}` failed ({}); run it yourself",
+                outcome.stderr.trim()))),
+            Err(error) => eprintln!("{}", i18n.diagnostic(&format!("ai-memory uninstall warning: could not run `{shown}` ({error:#}); run it yourself"))),
         }
     }
 }
@@ -989,6 +1052,7 @@ fn setup_service(config: &Config) -> Option<(ServiceManager, user_service::Remov
 /// did not exit still holds the data. Wiring-only uninstall stays unguarded;
 /// it edits agent config files the server never touches.
 fn stop_service_guarding_purge(
+    i18n: &ai_memory_core::i18n::Localizer,
     service: Option<&(ServiceManager, user_service::Removal)>,
     purge_data: bool,
     data_dir: &Path,
@@ -1019,9 +1083,15 @@ fn stop_service_guarding_purge(
     if let Some((manager, path)) = to_stop {
         match user_service::remove(manager, path, data_dir, runner)? {
             user_service::Removal::Removed(path) => {
-                println!("✓ stopped and removed the user service {}", path.display());
+                println!(
+                    "{}",
+                    i18n.format(
+                        "cli-uninstall-stopped-and-removed-the-user-service",
+                        &[("value0", format!("{}", path.display()))]
+                    )
+                );
             }
-            other => print_service_plan(&other),
+            other => print_service_plan(i18n, &other),
         }
     }
     if purge_data && to_stop.is_some() {
@@ -1106,34 +1176,44 @@ fn service_main_pid(
     (pid != 0).then_some(pid)
 }
 
-fn print_service_plan(removal: &user_service::Removal) {
+fn print_service_plan(i18n: &ai_memory_core::i18n::Localizer, removal: &user_service::Removal) {
     match removal {
         user_service::Removal::Absent => {}
         user_service::Removal::Removed(path) => {
-            println!("would stop and remove the user service {}", path.display());
+            println!("{}", i18n.format("cli-uninstall-would-stop-and-remove-the-user-service", &[("value0", format!("{}", path.display()))]));
         }
         user_service::Removal::NotOurs(path) => println!(
-            "leaving {}: `ai-memory setup` did not write it, or it was edited since; remove it \
-             yourself if it runs ai-memory",
-            path.display()
-        ),
+            "{}", i18n.format("cli-uninstall-leaving-ai-memory-setup-did-not-write-it-or-it-was-edited-since-remove-it-yo", &[("value0", format!("{}", path.display()))])),
     }
 }
 
 /// Print the manual Docker teardown steps (never executed). When the
 /// data was purged locally, note that; otherwise remind how to wipe it.
-fn print_docker_hint(data_purged: bool) {
+fn print_docker_hint(i18n: &ai_memory_core::i18n::Localizer, data_purged: bool) {
     println!();
-    println!("Wiring removed. ai-memory's server + data live in its container/volume —");
-    println!("tear those down manually:");
-    println!("  docker compose -f docker/docker-compose.yml down -v");
-    println!("  docker volume rm ai-memory-data   # if you used the default volume");
-    println!("  rm -f bin/ai-memory               # the wrapper script, if installed");
+    println!(
+        "{}",
+        i18n.text(
+            "cli-uninstall-wiring-removed-ai-memory-s-server-data-live-in-its-container-volume"
+        )
+    );
+    println!("{}", i18n.text("cli-uninstall-tear-those-down-manually"));
+    println!(
+        "{}",
+        i18n.text("cli-uninstall-docker-compose-f-docker-docker-compose-yml-down-v")
+    );
+    println!(
+        "{}",
+        i18n.text("cli-uninstall-docker-volume-rm-ai-memory-data-if-you-used-the-default-volume")
+    );
+    println!(
+        "{}",
+        i18n.text("cli-uninstall-rm-f-bin-ai-memory-the-wrapper-script-if-installed")
+    );
     if !data_purged {
         println!();
         println!(
-            "Local data dir was left intact. To wipe it: `ai-memory reset --confirm` (or re-run with --purge-data)."
-        );
+            "{}", i18n.text("cli-uninstall-local-data-dir-was-left-intact-to-wipe-it-ai-memory-reset-confirm-or-re-run"));
     }
 }
 
@@ -1937,6 +2017,7 @@ mod tests {
         };
 
         let error = stop_service_guarding_purge(
+            &ai_memory_core::i18n::Localizer::default(),
             Some(&service),
             true,
             root.path(),
@@ -1955,6 +2036,7 @@ mod tests {
 
         let alive = std::cell::RefCell::new(pids(&[4242]));
         stop_service_guarding_purge(
+            &ai_memory_core::i18n::Localizer::default(),
             Some(&service),
             true,
             root.path(),
@@ -1983,6 +2065,7 @@ mod tests {
             main_pid: "4242",
         };
         let error = stop_service_guarding_purge(
+            &ai_memory_core::i18n::Localizer::default(),
             Some(&service),
             true,
             root.path(),
@@ -2009,6 +2092,7 @@ mod tests {
         // Alive at the pre-check and for two polls after the stop, then gone.
         let polls = std::cell::Cell::new(0);
         stop_service_guarding_purge(
+            &ai_memory_core::i18n::Localizer::default(),
             Some(&service),
             true,
             root.path(),
@@ -2074,7 +2158,13 @@ mod tests {
             profile: None,
         };
         let data = tempfile::tempdir().unwrap();
-        let plan = build_plan(&args, data.path(), &env).unwrap();
+        let plan = build_plan(
+            &ai_memory_core::i18n::Localizer::default(),
+            &args,
+            data.path(),
+            &env,
+        )
+        .unwrap();
         assert!(
             plan.iter().any(|change| matches!(
                 change,
@@ -2103,7 +2193,11 @@ mod tests {
         assert_eq!(plugins.len(), 2, "a disabled plugin is still removed");
 
         let runner = RecordingRunner::new(Some(1));
-        uninstall_plugins(&plugins, &runner);
+        uninstall_plugins(
+            &ai_memory_core::i18n::Localizer::default(),
+            &plugins,
+            &runner,
+        );
         assert_eq!(
             *runner.calls.borrow(),
             vec![
@@ -3374,6 +3468,7 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
         .unwrap();
 
         apply_change(
+            &ai_memory_core::i18n::Localizer::default(),
             &PlannedChange::Rewrite {
                 path: path.clone(),
                 removed: vec!["ai-memory".to_string()],

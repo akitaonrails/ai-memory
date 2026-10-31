@@ -1,12 +1,21 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Management — ai-memory</title><link rel="icon" href="{{ root }}/static/logo.png"><link rel="stylesheet" href="{{ root }}/static/tailwind.css">
+<html lang="{{ i18n.tag() }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ i18n.text("web-management-ai-memory") }}</title><link rel="icon" href="{{ root }}/static/logo.png"><link rel="stylesheet" href="{{ root }}/static/tailwind.css">
 <script>{{ script|safe }}</script></head>
 <body class="management min-h-screen"><header class="management-header border-b"><div class="max-w-6xl mx-auto px-6 py-5 flex flex-wrap justify-between items-center gap-4">
-<a class="management-brand flex items-center gap-3" href="{{ root }}/sessions"><img src="{{ root }}/static/logo.png" class="h-10 w-10" alt=""><strong>ai-memory</strong><span class="management-muted text-sm">Management</span></a>
-<div class="flex flex-wrap items-center gap-4"><div role="group" aria-label="Color theme" class="management-themes"><button type="button" data-theme="system">System</button><button type="button" data-theme="light">Light</button><button type="button" data-theme="dark">Dark</button></div>
-{% if !username.is_empty() %}<span>{{ username }} · {% if admin %}Admin{% else %}User{% endif %}</span><form action="{{ root }}/action" method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Sign out</button></form>{% endif %}
+<a class="management-brand flex items-center gap-3" href="{{ root }}/sessions"><img src="{{ root }}/static/logo.png" class="h-10 w-10" alt=""><strong>ai-memory</strong><span class="management-muted text-sm">{{ i18n.text("web-management") }}</span></a>
+<div class="flex flex-wrap items-center gap-4"><label for="interface-language" class="sr-only">{{ i18n.text("web-language") }}</label>
+      <select id="interface-language" aria-label="{{ i18n.text("web-language") }}">
+        <option value="en" lang="en" {% if i18n.tag() == "en" %}selected{% endif %}>English</option>
+        <option value="pt-BR" lang="pt-BR" {% if i18n.tag() == "pt-BR" %}selected{% endif %}>Português (Brasil)</option>
+      </select><div role="group" aria-label="{{ i18n.text("web-color-theme") }}" class="management-themes"><button type="button" data-theme="system">{{ i18n.text("web-system") }}</button><button type="button" data-theme="light">{{ i18n.text("web-light") }}</button><button type="button" data-theme="dark">{{ i18n.text("web-dark") }}</button></div>
+{% if !username.is_empty() %}<span>{{ username }} · {% if admin %}{{ i18n.text("web-admin") }}{% else %}{{ i18n.text("web-user") }}{% endif %}</span><form action="{{ root }}/action" method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button>{{ i18n.text("web-sign-out") }}</button></form>{% endif %}
 </div></div></header>
 <main class="max-w-6xl mx-auto px-6 py-8" id="main-content">
-{% if !username.is_empty() %}<nav aria-label="Management" class="flex flex-wrap gap-3 mb-8"><a href="{{ root }}/sessions">Sessions</a>{% if admin %}<a href="{{ root }}/users">Users</a>{% endif %}<a href="{{ root }}/keys">MCP connection</a><a href="{{ root }}/password">Password</a></nav>{% endif %}
-{% block content %}{% endblock %}</main></body></html>
+{% if !username.is_empty() %}<nav aria-label="{{ i18n.text("web-management") }}" class="flex flex-wrap gap-3 mb-8"><a href="{{ root }}/sessions">{{ i18n.text("web-sessions-agent") }}</a>{% if admin %}<a href="{{ root }}/users">{{ i18n.text("web-users") }}</a>{% endif %}<a href="{{ root }}/keys">{{ i18n.text("web-mcp-connection") }}</a><a href="{{ root }}/password">{{ i18n.text("web-password") }}</a></nav>{% endif %}
+{% block content %}{% endblock %}</main><script>
+(function(){document.getElementById("interface-language").addEventListener("change",function(event){
+  var root="{{ root }}",base=root.replace(/\/manage$/,"");
+  document.cookie="ai_memory_language="+encodeURIComponent(event.target.value)+"; Path="+(base||"")+"/; Max-Age=31536000; SameSite=Lax"+(location.protocol==="https:"?"; Secure":"");location.reload();
+});})();
+</script></body></html>

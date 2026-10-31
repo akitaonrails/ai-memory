@@ -56,9 +56,10 @@ struct FinalizeSessionReport {
 /// cannot list the scope's open sessions, or the server rejects a synthetic
 /// `session-end` hook.
 pub async fn run(config: &Config, args: FinalizeSessionArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (workspace, project, finalized) = finalize(config, &args).await?;
     let agent = args.agent;
-    print_report(args, workspace, project, agent, finalized)
+    print_report(i18n, args, workspace, project, agent, finalized)
 }
 
 /// Finalizes the sessions `args` selects (open ones, plus the exact ended
@@ -149,6 +150,7 @@ async fn replay_prompts(
     cwd: &str,
     session_id: &str,
 ) {
+    let i18n = &config.i18n;
     if !super::hook::admits_capture_at(&config.data_dir, Path::new(cwd)) {
         return;
     }
@@ -159,9 +161,7 @@ async fn replay_prompts(
     }
     let Some(home) = super::run::native_home(config) else {
         eprintln!(
-            "ai-memory: no home directory; session {} is finalized without its prompts",
-            super::run::display_session_id(session_id)
-        );
+            "{}", i18n.format("cli-finalize-session-ai-memory-no-home-directory-session-is-finalized-without-its-prompts", &[("value0", super::run::display_session_id(session_id).to_string())]));
         return;
     };
     if let Err(error) = super::backfill::replay_session_prompts(
@@ -176,9 +176,7 @@ async fn replay_prompts(
     .await
     {
         eprintln!(
-            "ai-memory: could not replay the prompts of session {} ({error:#}); finalizing without them",
-            super::run::display_session_id(session_id)
-        );
+            "{}", i18n.format("cli-finalize-session-ai-memory-could-not-replay-the-prompts-of-session-error-finalizing-without-t", &[("value0", super::run::display_session_id(session_id).to_string()), ("value1", format!("{:#}", error))]));
     }
 }
 
@@ -229,6 +227,7 @@ async fn fetch_open_sessions(
 }
 
 fn print_report(
+    i18n: &ai_memory_core::i18n::Localizer,
     args: FinalizeSessionArgs,
     workspace: String,
     project: String,
@@ -245,16 +244,28 @@ fn print_report(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report.finalized.is_empty() {
         println!(
-            "No open {} sessions matched {}/{}",
-            report.agent, report.workspace, report.project
+            "{}",
+            i18n.format(
+                "cli-finalize-session-no-open-sessions-matched",
+                &[
+                    ("value0", report.agent.to_string()),
+                    ("value1", report.workspace.to_string()),
+                    ("value2", report.project.to_string())
+                ]
+            )
         );
     } else {
         println!(
-            "Finalized {} {} session(s) for {}/{}",
-            report.finalized.len(),
-            report.agent,
-            report.workspace,
-            report.project
+            "{}",
+            i18n.format(
+                "cli-finalize-session-finalized-session-s-for",
+                &[
+                    ("value0", format!("{}", report.finalized.len())),
+                    ("value1", report.agent.to_string()),
+                    ("value2", report.workspace.to_string()),
+                    ("value3", report.project.to_string())
+                ]
+            )
         );
         for session_id in &report.finalized {
             println!("  - {session_id}");

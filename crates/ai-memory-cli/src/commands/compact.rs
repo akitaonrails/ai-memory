@@ -23,14 +23,10 @@ struct CompactRequest {
 /// Returns an error when `--confirm` is absent, the server is unreachable, or
 /// the server returns a non-2xx response.
 pub async fn run(config: &Config, args: CompactArgs) -> Result<()> {
+    let i18n = &config.i18n;
     if !args.confirm {
         bail!(
-            "compact rewrites the whole database under an exclusive lock: every \
-             write blocks until it finishes, and it needs free disk space of \
-             roughly the database's own size.\n\n\
-             Check `ai-memory status` for the reclaimable figure first, then:\n\n  \
-             ai-memory compact --confirm"
-        );
+            "{}", i18n.text("cli-compact-compact-rewrites-the-whole-database-under-an-exclusive-lock-every-write-bloc"));
     }
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -44,20 +40,22 @@ pub async fn run(config: &Config, args: CompactArgs) -> Result<()> {
     let n = |key: &str| report[key].as_u64().unwrap_or(0);
     let reclaimed = n("bytes_reclaimed");
     println!(
-        "Compacted: {} → {} ({} reclaimed).",
-        human_bytes(n("bytes_before")),
-        human_bytes(n("bytes_after")),
-        human_bytes(reclaimed),
+        "{}",
+        i18n.format(
+            "cli-compact-compacted-reclaimed",
+            &[
+                ("value0", human_bytes(n("bytes_before")).to_string()),
+                ("value1", human_bytes(n("bytes_after")).to_string()),
+                ("value2", human_bytes(reclaimed).to_string())
+            ]
+        )
     );
     if reclaimed == 0 {
         // Not a failure, and worth saying plainly: SQLite reuses free pages,
         // so a healthy store that is not carrying a large deletion has
         // genuinely nothing to give back.
         println!(
-            "Nothing to reclaim — the database had no meaningful free-page \
-             backlog. This is the normal result for a store that has not just \
-             had a large deletion."
-        );
+            "{}", i18n.text("cli-compact-nothing-to-reclaim-the-database-had-no-meaningful-free-page-backlog-this-is"));
     }
     Ok(())
 }

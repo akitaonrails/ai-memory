@@ -1,16 +1,16 @@
 <section id="agents" class="section-block" aria-labelledby="agents-title">
-  <div class="section-heading"><div><p class="eyebrow">YOUR AGENT FLEET</p><h2 id="agents-title">One project. Every agent.</h2><p>See who has worked here, where tokens went, and what needs attention.</p></div><span class="subtle-pill">{{ agents.len() }} registered</span></div>
-  {% if agents.is_empty() %}<div class="empty-state"><span aria-hidden="true">◈</span><h3>Your agents will appear here</h3><p>A captured session registers its agent in this project.</p></div>{% else %}
+  <div class="section-heading"><div><p class="eyebrow">{{ i18n.text("web-your-agent-fleet") }}</p><h2 id="agents-title">{{ i18n.text("web-one-project-every-agent") }}</h2><p>{{ i18n.text("web-see-who-has-worked-here-where-tokens-went-and-what-needs-attention") }}</p></div><span class="subtle-pill">{{ agents.len() }} {{ i18n.text("web-registered") }}</span></div>
+  {% if agents.is_empty() %}<div class="empty-state"><span aria-hidden="true">◈</span><h3>{{ i18n.text("web-your-agents-will-appear-here") }}</h3><p>{{ i18n.text("web-a-captured-session-registers-its-agent-in-this-project") }}</p></div>{% else %}
   <div class="agent-grid">
     {% for agent in agents %}
     <article class="agent-card" data-agent="{{ agent.kind }}">
-      <div class="agent-card-top"><span class="agent-avatar" aria-hidden="true">{% if agent.kind == "codex" %}Cx{% else if agent.kind == "claude-code" %}Cl{% else %}Ai{% endif %}</span><div><a href="{{ agent.href }}" class="agent-name">{{ agent.label }}</a><p>{{ agent.sessions }} session{% if agent.sessions != 1 %}s{% endif %} recorded</p></div><span class="status-pill {% if agent.open > 0 %}status-open{% endif %}">{% if agent.open > 0 %}{{ agent.open }} open{% else %}No open sessions{% endif %}</span></div>
-      <div class="agent-card-usage"><div><span>Reported tokens</span><strong>{{ agent.tokens }}</strong></div><div><span>Measured calls</span><strong>{{ agent.calls }}</strong></div></div>
-      <div class="coverage-label"><span>Usage coverage</span><strong>{{ agent.measured }}/{{ agent.sessions }} sessions</strong></div><progress class="coverage-bar" value="{{ agent.coverage }}" max="100" aria-label="Sessions reporting token usage">{{ agent.coverage }}%</progress>
-      {% if agent.measured == 0 %}<p class="card-hint hint-warning">Usage not reported yet. Check the agent's capture setup.</p>{% else %}<p class="card-hint">{{ agent.input }} input <span>·</span> {{ agent.output }} output <span>·</span> {{ agent.cache }} cache</p>{% endif %}
-      <div class="card-actions"><a href="{{ agent.href }}">Explore sessions <span aria-hidden="true">↗</span></a><a href="{{ agent.compose_href }}" class="quiet-button">Message <span aria-hidden="true">↗</span></a></div>
+      <div class="agent-card-top"><span class="agent-avatar" aria-hidden="true">{% if agent.kind == "codex" %}Cx{% else if agent.kind == "claude-code" %}Cl{% else %}Ai{% endif %}</span><div><a href="{{ agent.href }}" class="agent-name">{{ agent.label }}</a><p>{{ i18n.count("web-agent-sessions-recorded", agent.sessions) }}</p></div><span class="status-pill {% if agent.open > 0 %}status-open{% endif %}">{% if agent.open > 0 %}{{ agent.open }} {{ i18n.text("web-open") }}{% else %}{{ i18n.text("web-no-open-sessions") }}{% endif %}</span></div>
+      <div class="agent-card-usage"><div><span>{{ i18n.text("web-reported-tokens") }}</span><strong>{{ agent.tokens }}</strong></div><div><span>{{ i18n.text("web-measured-calls") }}</span><strong>{{ agent.calls }}</strong></div></div>
+      <div class="coverage-label"><span>{{ i18n.text("web-usage-coverage") }}</span><strong>{{ agent.measured }}/{{ agent.sessions }} {{ i18n.text("web-sessions") }}</strong></div><progress class="coverage-bar" value="{{ agent.coverage }}" max="100" aria-label="{{ i18n.text("web-sessions-reporting-token-usage") }}">{{ agent.coverage }}%</progress>
+      {% if agent.measured == 0 %}<p class="card-hint hint-warning">{{ i18n.text("web-usage-not-reported-yet-check-the-agent-s-capture-setup") }}</p>{% else %}<p class="card-hint">{{ agent.input }} {{ i18n.text("web-input") }} <span>·</span> {{ agent.output }} {{ i18n.text("web-output") }} <span>·</span> {{ agent.cache }} {{ i18n.text("web-cache") }}</p>{% endif %}
+      <div class="card-actions"><a href="{{ agent.href }}">{{ i18n.text("web-explore-sessions") }} <span aria-hidden="true">↗</span></a><a href="{{ agent.compose_href }}" class="quiet-button">{{ i18n.text("web-message") }} <span aria-hidden="true">↗</span></a></div>
     </article>
     {% endfor %}
   </div>{% endif %}
-  <p class="section-note">Open means no session-end event was received. It does not confirm that an agent is currently running. Missing token usage is unknown, never zero.</p>
+  <p class="section-note">{{ i18n.text("web-open-means-no-session-end-event-was-received-it-does-not-confirm-that-an-agent-is-cur") }}</p>
 </section>

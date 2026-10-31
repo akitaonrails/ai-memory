@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 
-{% block title %}Sign in — ai-memory{% endblock %}
+{% block title %}{{ i18n.text("web-sign-in-ai-memory") }}{% endblock %}
 
 {% block header_actions %}{% endblock %}
 {% block footer_version %}{% endblock %}
 
 {% block content %}
 <div class="max-w-md">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Sign in</h1>
-  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">Use your ai-memory username and password.</p>
+  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">{{ i18n.text("web-sign-in") }}</h1>
+  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-use-your-ai-memory-username-and-password") }}</p>
 
   <p id="auth-error" class="mt-4 hidden text-sm text-amber-800 dark:text-amber-300" role="alert"></p>
 
@@ -16,7 +16,7 @@
         data-next="{{ next }}"
         data-change-password="{{ change_password_href }}">
     <div>
-      <label for="username" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Username</label>
+      <label for="username" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">{{ i18n.text("web-username") }}</label>
       <input
         id="username"
         name="username"
@@ -27,7 +27,7 @@
       >
     </div>
     <div>
-      <label for="password" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">Password</label>
+      <label for="password" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">{{ i18n.text("web-password") }}</label>
       <input
         id="password"
         name="password"
@@ -38,12 +38,13 @@
       >
     </div>
     <button type="submit" class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
-      Sign in
+      {{ i18n.text("web-sign-in") }}
     </button>
   </form>
 </div>
 <script>
 (function () {
+{% include "_js_api_errors.html" %}
   var form = document.getElementById("login-form");
   var err = document.getElementById("auth-error");
   var next = form.getAttribute("data-next") || "/";
@@ -68,9 +69,10 @@
       headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify(body)
     }).then(function (resp) {
-      return resp.json().catch(function () { return {}; }).then(function (json) {
+      return resp.json().catch(function () {
+{% include "_js_api_errors.html" %} return {}; }).then(function (json) {
         if (!resp.ok) {
-          showError((json && json.error) || ("Sign in failed (" + resp.status + ")"));
+          showError(apiError(json, ({{ i18n.js("web-sign-in-failed")|safe }} + resp.status + ")")));
           return;
         }
         if (json && json.must_change_password) {
@@ -80,7 +82,8 @@
         location.assign(next);
       });
     }).catch(function () {
-      showError("Network error — try again.");
+{% include "_js_api_errors.html" %}
+      showError({{ i18n.js("web-network-error-try-again")|safe }});
     });
   });
 })();

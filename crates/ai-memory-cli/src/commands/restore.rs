@@ -81,16 +81,24 @@ enum ConfigPlacement {
 /// extracted, or the restored store fails to open. In every one of those
 /// cases the live data dir is left as it was.
 pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let siblings = sibling_processes();
     if !siblings.is_empty() {
         bail!(busy_message("restore", &siblings));
     }
 
     if !args.from.is_file() {
-        bail!("source tarball {} not found", args.from.display());
+        bail!(
+            "{}",
+            i18n.format(
+                "cli-restore-source-tarball-not-found",
+                &[("value0", format!("{}", args.from.display()))]
+            )
+        );
     }
 
     let outcome = restore_data_dir_with_legacy_pepper(
+        &config.i18n,
         &config.data_dir,
         &args.from,
         args.force,
@@ -101,19 +109,20 @@ pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
     .await?;
     info!("restore complete");
     println!(
-        "restored {} -> {}",
-        args.from.display(),
-        config.data_dir.display()
+        "{}",
+        i18n.format(
+            "cli-restore-restored",
+            &[
+                ("value0", format!("{}", args.from.display())),
+                ("value1", format!("{}", config.data_dir.display()))
+            ]
+        )
     );
     match outcome {
         ConfigOutcome::NotInArchive => {}
-        ConfigOutcome::Restored => println!("restored the backup's config.toml"),
+        ConfigOutcome::Restored => println!("{}", i18n.text("cli-restore-restored-the-backup-s-config-toml")),
         ConfigOutcome::SavedBeside(path) => println!(
-            "kept the live config.toml; the backup's copy is at {}. A config can run \
-             commands and redirect data: review it before adopting it, or rerun with \
-             --with-config to restore it in place.",
-            path.display()
-        ),
+            "{}", i18n.format("cli-restore-kept-the-live-config-toml-the-backup-s-copy-is-at-a-config-can-run-commands", &[("value0", format!("{}", path.display()))])),
     }
     Ok(())
 }
@@ -125,15 +134,17 @@ pub async fn run(config: &Config, args: RestoreArgs) -> Result<()> {
 /// rename and rolled back if any step of the exchange fails.
 #[cfg(test)]
 async fn restore_data_dir(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     from: &Path,
     force: bool,
     with_config: bool,
 ) -> Result<ConfigOutcome> {
-    restore_data_dir_with_legacy_pepper(data_dir, from, force, with_config, None, false).await
+    restore_data_dir_with_legacy_pepper(i18n, data_dir, from, force, with_config, None, false).await
 }
 
 async fn restore_data_dir_with_legacy_pepper(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     from: &Path,
     force: bool,
@@ -163,6 +174,7 @@ async fn restore_data_dir_with_legacy_pepper(
     let previous = data_dir.join(format!(".restore-previous-{stamp}"));
 
     let outcome = stage_then_swap(
+        i18n,
         data_dir,
         from,
         &staging,
@@ -179,14 +191,19 @@ async fn restore_data_dir_with_legacy_pepper(
     {
         warn!(path = %staging.display(), error = %e, "could not remove restore staging dir");
         eprintln!(
-            "warning: could not remove staging dir {} ({e}); delete it by hand",
-            staging.display()
+            "{}",
+            i18n.diagnostic(&format!(
+                "warning: could not remove staging dir {} ({e}); delete it by hand",
+                staging.display()
+            ))
         );
     }
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stage_then_swap(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     from: &Path,
     staging: &Path,
@@ -291,6 +308,7 @@ async fn stage_then_swap(
 
     // 3. Exchange the live directories for the staged ones.
     swap_into_place(
+        i18n,
         data_dir,
         staging,
         previous,
@@ -331,6 +349,7 @@ fn save_archived_config(staged: &Path, beside: &Path) -> std::io::Result<()> {
 /// rename; if one fails, the moves already made are reversed so the data
 /// dir ends up as it started.
 fn swap_into_place(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     staging: &Path,
     previous: &Path,
@@ -388,9 +407,12 @@ fn swap_into_place(
     if let Err(e) = std::fs::remove_dir_all(previous) {
         warn!(path = %previous.display(), error = %e, "could not remove pre-restore data");
         eprintln!(
-            "warning: restore succeeded but the pre-restore data under {} could not be \
+            "{}",
+            i18n.diagnostic(&format!(
+                "warning: restore succeeded but the pre-restore data under {} could not be \
              removed ({e}); delete it by hand",
-            previous.display()
+                previous.display()
+            ))
         );
     }
     Ok(())
@@ -645,7 +667,10 @@ mod tests {
 
         let archive_dir = tempfile::TempDir::new().unwrap();
         let archive_path = archive_dir.path().join("backup.tar.gz");
+        // Distributions may default to pax (`--format=posix`), which encodes
+        // sparse files without the GNU-sparse entry type this test needs.
         let status = std::process::Command::new("tar")
+            .arg("--format=gnu")
             .arg("--sparse")
             .arg("-czf")
             .arg(&archive_path)
@@ -862,9 +887,15 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "bad.tar.gz", b"this is not a gzip stream");
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("extracting"),
@@ -881,9 +912,15 @@ mod tests {
         let whole = good_archive();
         let from = write_tarball(scratch.path(), "cut.tar.gz", &whole[..whole.len() / 2]);
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("extracting"),
@@ -903,9 +940,15 @@ mod tests {
         bytes[checksum_offset] ^= 0x80;
         let from = write_tarball(scratch.path(), "bad-crc.tar.gz", &bytes);
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("verifying gzip stream"),
@@ -928,9 +971,15 @@ mod tests {
             &bytes[..bytes.len() - 8],
         );
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("verifying gzip stream"),
@@ -957,9 +1006,15 @@ mod tests {
             ]),
         );
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("unexpected path"),
@@ -982,9 +1037,15 @@ mod tests {
             ]),
         );
 
-        let err = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("opening restored store"),
@@ -1004,9 +1065,15 @@ mod tests {
             &gz_tarball(&[("wiki/default/project/notes/new.md", b"new page")]),
         );
 
-        let error = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let error = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
         assert_live_data_untouched(data.path());
     }
@@ -1025,9 +1092,15 @@ mod tests {
             ]),
         );
 
-        let error = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let error = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
         assert_live_data_untouched(data.path());
     }
@@ -1052,9 +1125,15 @@ mod tests {
             &gz_tarball(&[("db/memory.sqlite", &db)]),
         );
 
-        let error = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap_err();
+        let error = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("initialized ai-memory database snapshot"));
         assert_live_data_untouched(data.path());
     }
@@ -1071,9 +1150,15 @@ mod tests {
             &gz_tarball(&[("db/memory.sqlite", &db)]),
         );
 
-        restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap();
+        restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
 
         let conn = rusqlite::Connection::open(data.path().join("db/memory.sqlite")).unwrap();
         let pages: i64 = conn
@@ -1095,9 +1180,15 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        let err = restore_data_dir(data.path(), &from, false, false)
-            .await
-            .unwrap_err();
+        let err = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("pass --force"),
@@ -1113,9 +1204,15 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        let outcome = restore_data_dir(data.path(), &from, true, true)
-            .await
-            .unwrap();
+        let outcome = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ConfigOutcome::Restored);
         assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
 
@@ -1170,9 +1267,15 @@ mod tests {
             ]),
         );
 
-        let outcome = restore_data_dir(data.path(), &from, true, false)
-            .await
-            .unwrap();
+        let outcome = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
 
         let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
         assert_eq!(outcome, ConfigOutcome::SavedBeside(beside.clone()));
@@ -1211,9 +1314,15 @@ mod tests {
             ]),
         );
 
-        let outcome = restore_data_dir(data.path(), &from, true, true)
-            .await
-            .unwrap();
+        let outcome = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ConfigOutcome::NotInArchive);
         assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
@@ -1234,9 +1343,15 @@ mod tests {
         let scratch = tempfile::TempDir::new().unwrap();
         let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
 
-        let outcome = restore_data_dir(data.path(), &from, false, false)
-            .await
-            .unwrap();
+        let outcome = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
@@ -1266,6 +1381,7 @@ mod tests {
         );
 
         let refused = restore_data_dir_with_legacy_pepper(
+            &ai_memory_core::i18n::Localizer::default(),
             data.path(),
             &from,
             true,
@@ -1284,6 +1400,7 @@ mod tests {
         assert_live_data_untouched(data.path());
 
         restore_data_dir_with_legacy_pepper(
+            &ai_memory_core::i18n::Localizer::default(),
             data.path(),
             &from,
             true,
@@ -1326,6 +1443,7 @@ mod tests {
                 let data = tempfile::TempDir::new().unwrap();
                 seed_live_data(data.path());
                 let err = restore_data_dir_with_legacy_pepper(
+                    &ai_memory_core::i18n::Localizer::default(),
                     data.path(),
                     &from,
                     true,
@@ -1346,6 +1464,7 @@ mod tests {
             let data = tempfile::TempDir::new().unwrap();
             seed_live_data(data.path());
             let outcome = restore_data_dir_with_legacy_pepper(
+                &ai_memory_core::i18n::Localizer::default(),
                 data.path(),
                 &from,
                 true,
@@ -1394,6 +1513,7 @@ mod tests {
             let data = tempfile::TempDir::new().unwrap();
             seed_live_data(data.path());
             let refused = restore_data_dir_with_legacy_pepper(
+                &ai_memory_core::i18n::Localizer::default(),
                 data.path(),
                 &from,
                 true,
@@ -1414,6 +1534,7 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let outcome = restore_data_dir_with_legacy_pepper(
+            &ai_memory_core::i18n::Localizer::default(),
             data.path(),
             &from,
             true,
@@ -1432,6 +1553,7 @@ mod tests {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
         let outcome = restore_data_dir_with_legacy_pepper(
+            &ai_memory_core::i18n::Localizer::default(),
             data.path(),
             &from,
             true,

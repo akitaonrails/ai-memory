@@ -15,8 +15,13 @@ use clap_complete::Shell;
 /// after the harness keeps the public no-delimiter UX and makes all existing
 /// wrapper-after-harness recovery (`--yolo`, `--fresh`, etc.) explicit in the
 /// run command rather than dependent on clap's option-name knowledge.
-pub(crate) fn parse_process() -> Cli {
-    try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+pub(crate) fn parse_process(env: &crate::config::RuntimeEnv) -> Cli {
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    delimit_run_native_args(&mut args);
+    let language =
+        crate::localization::language_hint(&args, env.var_os("AI_MEMORY_LANGUAGE").as_deref());
+    let i18n = ai_memory_core::i18n::Localizer::new(language);
+    try_parse_localized(args, &i18n).unwrap_or_else(|error| crate::localization::exit(error, &i18n))
 }
 
 pub(crate) fn try_parse_from<I, T>(args: I) -> Result<Cli, clap::Error>
@@ -26,7 +31,16 @@ where
 {
     let mut args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     delimit_run_native_args(&mut args);
-    let matches = <Cli as clap::CommandFactory>::command().try_get_matches_from(args)?;
+    let language = crate::localization::language_hint(&args, None);
+    try_parse_localized(args, &ai_memory_core::i18n::Localizer::new(language))
+}
+
+fn try_parse_localized(
+    args: Vec<OsString>,
+    i18n: &ai_memory_core::i18n::Localizer,
+) -> Result<Cli, clap::Error> {
+    let command = <Cli as clap::CommandFactory>::command();
+    let matches = crate::localization::command(command, "root", i18n).try_get_matches_from(args)?;
     let mut cli = Cli::from_arg_matches(&matches)?;
     if let Command::Run(run) = &mut cli.command {
         // The value parser collapses every `claude*` spelling onto
@@ -49,11 +63,14 @@ fn delimit_run_native_args(args: &mut Vec<OsString>) {
         let Some(raw) = args.get(index).and_then(|arg| arg.to_str()) else {
             return;
         };
-        if matches!(raw, "--data-dir" | "--config") {
+        if matches!(raw, "--data-dir" | "--config" | "--language") {
             index += 2;
             continue;
         }
-        if raw.starts_with("--data-dir=") || raw.starts_with("--config=") {
+        if raw.starts_with("--data-dir=")
+            || raw.starts_with("--config=")
+            || raw.starts_with("--language=")
+        {
             index += 1;
             continue;
         }
@@ -75,6 +92,7 @@ fn delimit_run_native_args(args: &mut Vec<OsString>) {
         let takes_separate_value = matches!(
             key,
             "--workspace"
+                | "--language"
                 | "--project"
                 | "--workstream"
                 | "--new"
@@ -106,6 +124,9 @@ fn delimit_run_native_args(args: &mut Vec<OsString>) {
 #[derive(Debug, Parser)]
 #[command(name = "ai-memory", version, about, long_about = None)]
 pub struct Cli {
+    /// Language for human output (en or pt-BR).
+    #[arg(long, global = true)]
+    pub language: Option<ai_memory_core::i18n::Language>,
     /// Override the data directory.
     ///
     /// Defaults to a platform path under `dirs::data_local_dir()`. The

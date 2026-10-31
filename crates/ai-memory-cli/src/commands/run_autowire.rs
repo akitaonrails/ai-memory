@@ -495,9 +495,12 @@ pub(crate) fn ensure_wired_with_env(
         // No sentinel: the check is two small file reads, and a later
         // `claude plugin uninstall` must let the next launch wire again.
         eprintln!(
-            "ai-memory: the ai-memory plugin is enabled in {}; it carries the hooks and MCP \
+            "{}",
+            config.i18n.diagnostic(&format!(
+                "ai-memory: the ai-memory plugin is enabled in {}; it carries the hooks and MCP \
              entry, so this launch wires nothing for it.",
-            harness.agent()
+                harness.agent()
+            ))
         );
         return;
     }
@@ -507,35 +510,47 @@ pub(crate) fn ensure_wired_with_env(
 
     if skip_mcp {
         eprintln!(
-            "ai-memory: first managed launch of {} here while the server is unreachable — \
+            "{}",
+            config.i18n.diagnostic(&format!(
+                "ai-memory: first managed launch of {} here while the server is unreachable — \
              wiring its ai-memory hooks (capture spools locally); the MCP registration waits \
              for the next online launch (disable with --no-autowire or \
              AI_MEMORY_RUN_AUTOWIRE=false).",
-            harness.as_str()
+                harness.as_str()
+            ))
         );
     } else {
         eprintln!(
-            "ai-memory: first managed launch of {} here — wiring its ai-memory hooks + MCP so \
+            "{}",
+            config.i18n.diagnostic(&format!(
+                "ai-memory: first managed launch of {} here — wiring its ai-memory hooks + MCP so \
              capture and recall work (disable with --no-autowire or AI_MEMORY_RUN_AUTOWIRE=false).",
-            harness.as_str()
+                harness.as_str()
+            ))
         );
     }
 
     let mut installs = wire_installs(config, targets, overrides);
     if let Some(project_file) = project_hooks {
         eprintln!(
-            "ai-memory: project-scoped ai-memory hooks found at {}; not wiring the user-level \
+            "{}",
+            config.i18n.diagnostic(&format!(
+                "ai-memory: project-scoped ai-memory hooks found at {}; not wiring the user-level \
              Claude Code settings on top of them.",
-            project_file.display()
+                project_file.display()
+            ))
         );
         installs.hooks.clear();
     }
     let warn_hooks = |reason: &str| {
         eprintln!(
-            "ai-memory: could not auto-install {} hooks ({reason}); continuing launch. \
+            "{}",
+            config.i18n.diagnostic(&format!(
+                "ai-memory: could not auto-install {} hooks ({reason}); continuing launch. \
              Wire them manually with `ai-memory install-hooks --agent {} --apply`.",
-            harness.as_str(),
-            agent.kind().as_str()
+                harness.as_str(),
+                agent.kind().as_str()
+            ))
         );
     };
     // Install MCP first so a major-version migration has one canonical selected
@@ -570,9 +585,12 @@ pub(crate) fn ensure_wired_with_env(
                 ) =>
             {
                 eprintln!(
-                    "ai-memory: keeping the existing session-aware {} MCP bridge; not \
+                    "{}",
+                    config.i18n.diagnostic(&format!(
+                        "ai-memory: keeping the existing session-aware {} MCP bridge; not \
                      overwriting it with the static HTTP registration.",
-                    harness.as_str()
+                        harness.as_str()
+                    ))
                 );
                 None
             }
@@ -586,10 +604,13 @@ pub(crate) fn ensure_wired_with_env(
     };
     if let Some(reason) = &mcp_failure {
         eprintln!(
-            "ai-memory: could not auto-install the {} MCP server ({reason}); continuing \
+            "{}",
+            config.i18n.diagnostic(&format!(
+                "ai-memory: could not auto-install the {} MCP server ({reason}); continuing \
              launch. Wire it manually with `ai-memory install-mcp --client {} --apply`.",
-            harness.as_str(),
-            agent.kind().as_str()
+                harness.as_str(),
+                agent.kind().as_str()
+            ))
         );
     }
 
@@ -605,7 +626,7 @@ pub(crate) fn ensure_wired_with_env(
             ) {
                 Ok(()) => {
                     if let Some(dir) = &installs.shared_extensions_dir {
-                        install_hooks::warn_agents_share_extensions_dir(dir);
+                        install_hooks::warn_agents_share_extensions_dir(&config.i18n, dir);
                     }
                 }
                 Err(error) => warn_hooks(&format!("{error:#}")),

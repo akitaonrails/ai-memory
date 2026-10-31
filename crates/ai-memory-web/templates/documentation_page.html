@@ -1,22 +1,22 @@
 {% extends "base.html" %}
-{% block title %}{{ doc.title }} — ai-memory docs{% endblock %}
+{% block title %}{{ i18n.label(doc.title) }} {{ i18n.text("web-ai-memory-docs") }}{% endblock %}
 {% block nav_docs_current %}{% if !doc.id.starts_with("changelog") %}aria-current="page"{% endif %}{% endblock %}
 {% block nav_changelog_current %}{% if doc.id.starts_with("changelog") %}aria-current="page"{% endif %}{% endblock %}
 {% block content %}
-<nav class="breadcrumbs" aria-label="Breadcrumb"><a href="docs">Documentation</a><span>/</span><span aria-current="page">{{ doc.title }}</span></nav>
-<div class="page-heading"><div><p class="eyebrow">{{ doc.category }} · v{{ crate::templates::VERSION }}</p><h1>{{ doc.title }}</h1><p>{{ doc.description }}</p></div><a href="{{ markdown_href }}" class="secondary-button">Read Markdown ↗</a></div>
-{% if !releases.is_empty() %}<form action="docs/{{ doc.id }}" method="get" class="docs-release"><label for="release-version">Release</label><select id="release-version" name="release" class="field-input">{% for release in releases %}<option value="{{ release.id }}" {% if release.selected %}selected{% endif %}>{{ release.label }}</option>{% endfor %}</select><noscript><button type="submit" class="secondary-button">Show release</button></noscript><span class="section-note">{% if selected_release == "Unreleased" %}Changes not yet assigned to a tagged release.{% else %}Historical release notes from this build's documentation.{% endif %}</span></form>{% endif %}
+<nav class="breadcrumbs" aria-label="{{ i18n.text("web-breadcrumb") }}"><a href="docs">{{ i18n.text("web-documentation") }}</a><span>/</span><span aria-current="page">{{ i18n.label(doc.title) }}</span></nav>
+<div class="page-heading"><div><p class="eyebrow">{{ i18n.label(doc.category) }} · v{{ crate::templates::VERSION }}</p><h1>{{ i18n.label(doc.title) }}</h1><p>{{ i18n.label(doc.description) }}</p></div><a href="{{ markdown_href }}" class="secondary-button">{{ i18n.text("web-read-markdown") }}</a></div>
+{% if !releases.is_empty() %}<form action="docs/{{ doc.id }}" method="get" class="docs-release"><label for="release-version">{{ i18n.text("web-release") }}</label><select id="release-version" name="release" class="field-input">{% for release in releases %}<option value="{{ release.id }}" {% if release.selected %}selected{% endif %}>{{ i18n.label(release.label) }}</option>{% endfor %}</select><noscript><button type="submit" class="secondary-button">{{ i18n.text("web-show-release") }}</button></noscript><span class="section-note">{% if selected_release == "Unreleased" %}{{ i18n.text("web-changes-not-yet-assigned-to-a-tagged-release") }}{% else %}{{ i18n.text("web-historical-release-notes-from-this-build-s-documentation") }}{% endif %}</span></form>{% endif %}
 {% if !features.is_empty() %}
-<section class="surface installation-status" aria-label="Effective installation state">
-<details {% if doc.id == "features" %}open{% endif %}><summary>Effective installation state and next steps</summary>
-<p class="section-note">These facts describe this server and your current access. Provider health, browser preferences and remote client setup are separate. <a href="../api/v1/docs/features/status">Read status JSON ↗</a></p>
-<div class="feature-status-grid">{% for feature in features %}<section class="feature-status" data-feature="{{ feature.id }}"><h2>{{ feature.title }}</h2><p><strong>{{ feature.state }}</strong></p><p>{{ feature.detail }}</p><p class="section-note">Next step: {{ feature.next_step }}</p><a href="docs/{{ feature.guide }}">Setup guide ↗</a></section>{% endfor %}</div>
+<section class="surface installation-status" aria-label="{{ i18n.text("web-effective-installation-state") }}">
+<details {% if doc.id == "features" %}open{% endif %}><summary>{{ i18n.text("web-effective-installation-state-and-next-steps") }}</summary>
+<p class="section-note">{{ i18n.text("web-these-facts-describe-this-server-and-your-current-access-provider-health-browser-pref") }} <a href="../api/v1/docs/features/status">{{ i18n.text("web-read-status-json") }}</a></p>
+<div class="feature-status-grid">{% for feature in features %}<section class="feature-status" data-feature="{{ feature.id }}"><h2>{{ i18n.label(feature.title) }}</h2><p><strong>{{ i18n.label(feature.state) }}</strong></p><p>{{ i18n.label(feature.detail) }}</p><p class="section-note">{{ i18n.text("web-next-step") }} {{ i18n.label(feature.next_step) }}</p><a href="docs/{{ feature.guide }}">{{ i18n.text("web-setup-guide") }}</a></section>{% endfor %}</div>
 </details></section>
 {% endif %}
 <div class="docs-layout">
-<aside class="surface docs-sidebar" aria-label="Documentation guides"><details open><summary>Browse guides</summary><nav>{% for item in sidebar %}<a href="docs/{{ item.id }}" {% if item.id == doc.id %}aria-current="page"{% endif %}>{{ item.title }}</a>{% endfor %}</nav></details></aside>
-{% if !outline.is_empty() %}<aside class="docs-outline" aria-label="On this page"><details open><summary>On this page</summary><nav>{% for entry in outline %}{% if entry.level <= 3 %}<a href="{{ current_href }}#{{ entry.id }}" class="toc-level-{{ entry.level }}">{{ entry.text }}</a>{% endif %}{% endfor %}</nav></details></aside>{% endif %}
-<article class="surface docs-article"><p class="docs-source">Source: <code>{{ doc.source }}</code> · included in this server build</p><div class="markdown-body">{{ html|safe }}</div><a class="secondary-button" href="docs">← All documentation</a></article>
+<aside class="surface docs-sidebar" aria-label="{{ i18n.text("web-documentation-guides") }}"><details open><summary>{{ i18n.text("web-browse-guides") }}</summary><nav>{% for item in sidebar %}<a href="docs/{{ item.id }}" {% if item.id == doc.id %}aria-current="page"{% endif %}>{{ item.title }}</a>{% endfor %}</nav></details></aside>
+{% if !outline.is_empty() %}<aside class="docs-outline" aria-label="{{ i18n.text("web-on-this-page") }}"><details open><summary>{{ i18n.text("web-on-this-page") }}</summary><nav>{% for entry in outline %}{% if entry.level <= 3 %}<a href="{{ current_href }}#{{ entry.id }}" class="toc-level-{{ entry.level }}">{{ entry.text }}</a>{% endif %}{% endfor %}</nav></details></aside>{% endif %}
+<article class="surface docs-article"><p class="docs-source">{{ i18n.text("web-source") }} <code>{{ doc.source }}</code> {{ i18n.text("web-included-in-this-server-build") }}</p><div class="markdown-body">{{ html|safe }}</div><a class="secondary-button" href="docs">{{ i18n.text("web-all-documentation") }}</a></article>
 </div>
 <script>
 const releaseSelect=document.getElementById("release-version");

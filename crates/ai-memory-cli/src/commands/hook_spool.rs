@@ -319,7 +319,10 @@ pub fn enqueue_with_config(
     if total_spool_entries(spool)? >= MAX_SPOOL_FILES {
         let _ = std::fs::remove_file(&tmp);
         eprintln!(
-            "ai-memory: hook-spool at capacity ({MAX_SPOOL_FILES}); dropping one new UNDELIVERED event"
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory: hook-spool at capacity ({MAX_SPOOL_FILES}); dropping one new UNDELIVERED event"
+            ))
         );
         return Ok(());
     }
@@ -1444,8 +1447,11 @@ pub async fn drain_with_live_token(
         Ok(recovery) => recovery,
         Err(error) => {
             eprintln!(
-                "ai-memory hook-drain warning: could not recover stranded temp entries in {}: {error}",
-                spool.display()
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook-drain warning: could not recover stranded temp entries in {}: {error}",
+                    spool.display()
+                ))
             );
             TempRecovery {
                 unreadable: 1,
@@ -1455,11 +1461,14 @@ pub async fn drain_with_live_token(
     };
     if recovery.adopted > 0 || recovery.dropped > 0 || recovery.unreadable > 0 {
         eprintln!(
-            "ai-memory hook-drain: recovered {}, dropped {} malformed, left {} unreadable temp entr{}",
-            recovery.adopted,
-            recovery.dropped,
-            recovery.unreadable,
-            if recovery.unreadable == 1 { "y" } else { "ies" }
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook-drain: recovered {}, dropped {} malformed, left {} unreadable temp entr{}",
+                recovery.adopted,
+                recovery.dropped,
+                recovery.unreadable,
+                if recovery.unreadable == 1 { "y" } else { "ies" }
+            ))
         );
     }
     let (mut files, unreadable) = match list_entries(spool) {
@@ -1468,18 +1477,24 @@ pub async fn drain_with_live_token(
             // Never silent: a spool we cannot read is an outage, not an idle
             // pass, and the difference is invisible from the exit code.
             eprintln!(
-                "ai-memory hook-drain warning: could not list the spool directory {}: {e}; \
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook-drain warning: could not list the spool directory {}: {e}; \
                  no events were attempted",
-                spool.display()
+                    spool.display()
+                ))
             );
             return DrainResult::default();
         }
     };
     if unreadable > 0 {
         eprintln!(
-            "ai-memory hook-drain warning: skipped {unreadable} unreadable spool entr{} in {}",
-            if unreadable == 1 { "y" } else { "ies" },
-            spool.display()
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory hook-drain warning: skipped {unreadable} unreadable spool entr{} in {}",
+                if unreadable == 1 { "y" } else { "ies" },
+                spool.display()
+            ))
         );
     }
     files.sort();
@@ -2503,8 +2518,11 @@ fn rewrite_entry(path: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
 fn note_retry_persist(outcome: std::io::Result<()>) -> bool {
     if outcome.is_err() {
         eprintln!(
-            "ai-memory hook warning: failed to persist spool retry count; \
+            "{}",
+            crate::localization::process_diagnostic(
+                "ai-memory hook warning: failed to persist spool retry count; \
              event may retry until it ages out"
+            )
         );
         return false;
     }

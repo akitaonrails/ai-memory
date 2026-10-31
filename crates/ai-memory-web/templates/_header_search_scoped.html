@@ -1,12 +1,12 @@
 <form action="search" method="get" class="topbar-search">
   <input type="hidden" name="workspace" value="{{ workspace }}">
   <input type="hidden" name="project" value="{{ project }}">
-  <label for="header-search" class="sr-only">Search pages in {{ workspace }}/{{ project }}</label>
+  <label for="header-search" class="sr-only">{{ i18n.text("web-search-pages-in") }} {{ workspace }}/{{ project }}</label>
   <input
     id="header-search"
     name="q"
     type="search"
-    placeholder="Search {{ workspace }}/{{ project }}…"
+    placeholder="{{ i18n.two("web-search-value0-value1", workspace, project) }}"
     class="w-40 sm:w-64 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
   >
 </form>

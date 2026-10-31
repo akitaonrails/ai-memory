@@ -23,6 +23,7 @@ pub(crate) struct AgentQuery {
 }
 
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
@@ -39,7 +40,7 @@ pub(crate) async fn handler(
             .await
         {
             Ok(scope) => scope,
-            Err(e) => return super::page::refusal_response(&e),
+            Err(e) => return super::page::localized_refusal_response(&i18n, &e),
         };
     let owner = super::api::session_owner_filter_for(actor, auth);
     let rows = match state
@@ -72,10 +73,11 @@ pub(crate) async fn handler(
     let card = agent_card(row, &workspace, &project);
     let href = &card.href;
     let view = AgentView {
+        i18n: i18n.clone(),
         project_href: project_href(&workspace, &project),
         sessions: sessions
             .into_iter()
-            .map(|s| session_row(s, &workspace, &project))
+            .map(|s| session_row(&i18n, s, &workspace, &project))
             .collect(),
         previous: if query.offset > 0 {
             format!("{href}?offset={}", query.offset.saturating_sub(50))

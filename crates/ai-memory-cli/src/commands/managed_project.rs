@@ -52,6 +52,7 @@ pub(super) fn is_missing(error: &anyhow::Error) -> bool {
 }
 
 pub(super) async fn choose(
+    i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
     workspace: &str,
     project: &str,
@@ -92,8 +93,14 @@ pub(super) async fn choose(
             "project name is ambiguous; rerun with --project-id <id>. Authorized choices: {choices}"
         );
     }
+    let chooser_i18n = i18n.clone();
     let read = tokio::task::spawn_blocking(move || {
-        read_choice(&response, &mut io::stdin().lock(), &mut io::stderr())
+        read_choice(
+            &chooser_i18n,
+            &response,
+            &mut io::stdin().lock(),
+            &mut io::stderr(),
+        )
     });
     tokio::select! {
         () = interrupted.cancelled() => bail!("project selection interrupted; no managed run was opened"),
@@ -102,13 +109,17 @@ pub(super) async fn choose(
 }
 
 fn read_choice(
+    i18n: &ai_memory_core::i18n::Localizer,
     response: &ManagedProjectCandidatesResponse,
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result<ManagedProjectScope> {
     writeln!(
         output,
-        "This checkout's project name is ambiguous. Select the existing project to use:"
+        "{}",
+        i18n.diagnostic(
+            "This checkout's project name is ambiguous. Select the existing project to use:"
+        )
     )?;
     for (index, scope) in response.candidates.iter().enumerate() {
         writeln!(
@@ -123,10 +134,15 @@ fn read_choice(
     if response.truncated {
         writeln!(
             output,
-            "More matches exist; use --project-id if your project is not shown."
+            "{}",
+            i18n.diagnostic("More matches exist; use --project-id if your project is not shown.")
         )?;
     }
-    write!(output, "Select a number, or Enter to cancel: ")?;
+    write!(
+        output,
+        "{}",
+        i18n.diagnostic("Select a number, or Enter to cancel: ")
+    )?;
     output.flush()?;
     let mut line = String::new();
     std::io::Read::take(&mut *input, 128).read_line(&mut line)?;
@@ -169,6 +185,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
         let error = choose(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             "default",
             "api",
@@ -195,10 +212,24 @@ mod tests {
             truncated: false,
         };
         for input in ["", "\n", "0\n", "2\n", "q\n"] {
-            assert!(read_choice(&response, &mut input.as_bytes(), &mut Vec::new()).is_err());
+            assert!(
+                read_choice(
+                    &ai_memory_core::i18n::Localizer::default(),
+                    &response,
+                    &mut input.as_bytes(),
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
         }
         assert_eq!(
-            read_choice(&response, &mut "1\n".as_bytes(), &mut Vec::new()).unwrap(),
+            read_choice(
+                &ai_memory_core::i18n::Localizer::default(),
+                &response,
+                &mut "1\n".as_bytes(),
+                &mut Vec::new()
+            )
+            .unwrap(),
             scope
         );
     }

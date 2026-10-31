@@ -75,6 +75,7 @@ async fn fetch_status(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<S
 }
 
 async fn status(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let s = fetch_status(ep, scope).await?;
     let deployment = if s.distinguishes_operators {
         "multi-user"
@@ -82,45 +83,98 @@ async fn status(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
         "single-user"
     };
     match s.effective_share.as_deref() {
-        Some(share) => println!("Profile: on ({share}; {deployment} server)"),
-        None => println!("Profile: off ({deployment} server)"),
+        Some(share) => println!(
+            "{}",
+            i18n.format(
+                "cli-profile-profile-on-share-deployment-server",
+                &[
+                    ("value0", share.to_string()),
+                    ("value1", deployment.to_string())
+                ]
+            )
+        ),
+        None => println!(
+            "{}",
+            i18n.format(
+                "cli-profile-profile-off-deployment-server",
+                &[("value0", deployment.to_string())]
+            )
+        ),
     }
-    println!("  enabled = {}, share = {}", s.enabled, s.share);
+    println!(
+        "{}",
+        i18n.format(
+            "cli-profile-enabled-share",
+            &[
+                ("value0", s.enabled.to_string()),
+                ("value1", s.share.to_string())
+            ]
+        )
+    );
     match &s.scope {
         Some(names) => println!(
-            "  scope: {}/{} — {} entr{}, digest {} of {} bytes",
-            names.workspace,
-            names.project,
-            s.entries,
-            if s.entries == 1 { "y" } else { "ies" },
-            s.digest_bytes,
-            s.digest_max_bytes
+            "{}",
+            i18n.message(
+                "cli-profile-scope-entr-digest-of-bytes",
+                &[
+                    ("value0", (names.workspace.to_string()).into()),
+                    ("value1", (names.project.to_string()).into()),
+                    ("value2", (format!("{}", s.entries)).into()),
+                    ("value3", (s.entries).into()),
+                    ("value4", (format!("{}", s.digest_bytes)).into()),
+                    ("value5", (format!("{}", s.digest_max_bytes)).into())
+                ]
+            )
         ),
         None if s.effective_share.as_deref() == Some("user") && scope.user.is_none() => {
-            println!("  scope: one private profile per user; pass --user <name> to inspect one");
+            println!(
+                "{}",
+                i18n.text(
+                    "cli-profile-scope-one-private-profile-per-user-pass-user-name-to-inspect-one"
+                )
+            );
         }
         None if s.effective_share.is_some() => {
-            println!("  scope: no profile entries yet");
+            println!("{}", i18n.text("cli-profile-scope-no-profile-entries-yet"));
         }
         None => {}
     }
     println!(
-        "  digest at session start: {} (baseline for new projects: {} bytes)",
-        if s.inject_on_session_start {
-            "on"
-        } else {
-            "off"
-        },
-        s.baseline_max_bytes
+        "{}",
+        i18n.format(
+            "cli-profile-digest-at-session-start-baseline-for-new-projects-bytes",
+            &[
+                (
+                    "value0",
+                    (if s.inject_on_session_start {
+                        "on"
+                    } else {
+                        "off"
+                    })
+                    .to_string()
+                ),
+                ("value1", format!("{}", s.baseline_max_bytes))
+            ]
+        )
     );
     println!(
-        "  min_projects = {}, apply_max_lines = {}, llm = {}",
-        s.min_projects, s.apply_max_lines, s.llm
+        "{}",
+        i18n.format(
+            "cli-profile-min-projects-apply-max-lines-llm",
+            &[
+                ("value0", format!("{}", s.min_projects)),
+                ("value1", format!("{}", s.apply_max_lines)),
+                ("value2", format!("{}", s.llm))
+            ]
+        )
     );
     if s.contribute_opt_outs.is_empty() {
-        println!("  every project contributes");
+        println!("{}", i18n.text("cli-profile-every-project-contributes"));
     } else {
-        println!("  projects that opted out ([profile] contribute = false):");
+        println!(
+            "{}",
+            i18n.text("cli-profile-projects-that-opted-out-profile-contribute-false")
+        );
         for p in &s.contribute_opt_outs {
             println!("    {}/{}", p.workspace, p.project);
         }
@@ -143,11 +197,12 @@ struct ListResponse {
 }
 
 async fn list(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let resp: ListResponse = get_json(ep, "/admin/profile/list", &scope_query(scope))
         .await
-        .context("listing the profile")?;
+        .context(i18n.text("cli-profile-listing-the-profile"))?;
     let Some(names) = resp.scope else {
-        println!("No profile entries yet.");
+        println!("{}", i18n.text("cli-profile-no-profile-entries-yet"));
         return Ok(());
     };
     println!("{}/{}:", names.workspace, names.project);
@@ -222,6 +277,7 @@ struct DeleteResponse {
 }
 
 async fn forget(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Result<()> {
+    let i18n = &ep.i18n;
     let names = profile_scope(ep, scope).await?;
     let path = profile_path(path);
     let resp: DeleteResponse = post_json(
@@ -236,9 +292,21 @@ async fn forget(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Re
     .await
     .with_context(|| format!("forgetting {path}"))?;
     if resp.deleted {
-        println!("Forgot {} (the git history keeps it).", resp.path);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-profile-forgot-the-git-history-keeps-it",
+                &[("value0", resp.path.to_string())]
+            )
+        );
     } else {
-        println!("{} was not in the profile; nothing changed.", resp.path);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-profile-was-not-in-the-profile-nothing-changed",
+                &[("value0", resp.path.to_string())]
+            )
+        );
     }
     Ok(())
 }
@@ -275,17 +343,27 @@ struct ReviewResponse {
 }
 
 async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let r: ReviewResponse = get_json(ep, "/admin/profile/review", &scope_query(scope))
         .await
-        .context("reviewing the profile")?;
+        .context(i18n.text("cli-profile-reviewing-the-profile"))?;
     let Some(share) = r.share else {
-        println!("The profile is off on this server.");
+        println!(
+            "{}",
+            i18n.text("cli-profile-the-profile-is-off-on-this-server")
+        );
         return Ok(());
     };
     println!(
-        "Profile ({share}): {} entr{}",
-        r.entries.len(),
-        if r.entries.len() == 1 { "y" } else { "ies" }
+        "{}",
+        i18n.message(
+            "cli-profile-profile-share-entr",
+            &[
+                ("value0", (share.to_string()).into()),
+                ("value1", (format!("{}", r.entries.len())).into()),
+                ("value2", (r.entries.len()).into())
+            ]
+        )
     );
     for entry in &r.entries {
         let mut facts = Vec::new();
@@ -320,10 +398,21 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
         }
     }
     if !r.pending_updates.is_empty() {
-        println!("Next pass will update: {}", r.pending_updates.join(", "));
+        println!(
+            "{}",
+            i18n.format(
+                "cli-profile-next-pass-will-update",
+                &[("value0", r.pending_updates.join(", ").to_string())]
+            )
+        );
     }
     if !r.waiting.is_empty() {
-        println!("Not in the profile yet (needs more projects, or say it as a general rule):");
+        println!(
+            "{}",
+            i18n.text(
+                "cli-profile-not-in-the-profile-yet-needs-more-projects-or-say-it-as-a-general-rule"
+            )
+        );
         for group in &r.waiting {
             let people = if group.contributors_needed > 0 {
                 format!(
@@ -339,26 +428,40 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
                 String::new()
             };
             println!(
-                "  {} ({} project{}, {} more needed{people})",
-                group.statement,
-                group.projects,
-                if group.projects == 1 { "" } else { "s" },
-                group.needs
+                "{}",
+                i18n.message(
+                    "cli-profile-project-more-needed-people",
+                    &[
+                        ("value0", (group.statement.to_string()).into()),
+                        ("value1", (format!("{}", group.projects)).into()),
+                        ("value2", (group.projects).into()),
+                        ("value3", (format!("{}", group.needs)).into()),
+                        ("value4", (people.to_string()).into())
+                    ]
+                )
             );
         }
     }
     if !r.hand_edited.is_empty() {
-        println!("Edited by hand, left alone: {}", r.hand_edited.join(", "));
+        println!(
+            "{}",
+            i18n.format(
+                "cli-profile-edited-by-hand-left-alone",
+                &[("value0", r.hand_edited.join(", ").to_string())]
+            )
+        );
     }
     if !r.forgotten.is_empty() {
         println!(
-            "Forgotten, stays out until you say it again: {}",
-            r.forgotten.join(", ")
+            "{}",
+            i18n.format(
+                "cli-profile-forgotten-stays-out-until-you-say-it-again",
+                &[("value0", r.forgotten.join(", ").to_string())]
+            )
         );
     }
     println!(
-        "Fix a wrong entry: `ai-memory profile forget <path>`; reword it by editing the page (it then stays yours)."
-    );
+        "{}", i18n.text("cli-profile-fix-a-wrong-entry-ai-memory-profile-forget-path-reword-it-by-editing-the-pag"));
     Ok(())
 }
 
@@ -376,34 +479,55 @@ struct RebuildReport {
 }
 
 async fn rebuild(ep: &ServerEndpoint) -> Result<()> {
+    let i18n = &ep.i18n;
     let r: RebuildReport = post_json(ep, "/admin/profile/rebuild", &serde_json::json!({}))
         .await
-        .context("rebuilding the profile")?;
+        .context(i18n.text("cli-profile-rebuilding-the-profile"))?;
     println!(
-        "Rebuilt the {} profile: read {} project{}, {} new candidate{}, {} entr{} written, {} unchanged.",
-        r.share.as_deref().unwrap_or("?"),
-        r.projects_harvested,
-        if r.projects_harvested == 1 { "" } else { "s" },
-        r.candidates_added,
-        if r.candidates_added == 1 { "" } else { "s" },
-        r.entries_written,
-        if r.entries_written == 1 { "y" } else { "ies" },
-        r.entries_unchanged
+        "{}",
+        i18n.message(
+            "cli-profile-rebuilt-the-profile-read-project-new-candidate-entr-written-unchanged",
+            &[
+                (
+                    "value0",
+                    (r.share.as_deref().unwrap_or("?").to_string()).into()
+                ),
+                ("value1", (format!("{}", r.projects_harvested)).into()),
+                ("value2", (r.projects_harvested).into()),
+                ("value3", (format!("{}", r.candidates_added)).into()),
+                ("value4", (r.candidates_added).into()),
+                ("value5", (format!("{}", r.entries_written)).into()),
+                ("value6", (r.entries_written).into()),
+                ("value7", (format!("{}", r.entries_unchanged)).into())
+            ]
+        )
     );
     if r.llm_calls > 0 || r.llm_fallbacks > 0 {
         println!(
-            "  LLM calls: {} ({} fell back to the zero-LLM path)",
-            r.llm_calls, r.llm_fallbacks
+            "{}",
+            i18n.format(
+                "cli-profile-llm-calls-fell-back-to-the-zero-llm-path",
+                &[
+                    ("value0", format!("{}", r.llm_calls)),
+                    ("value1", format!("{}", r.llm_fallbacks))
+                ]
+            )
         );
     }
     if !r.skipped_manual.is_empty() {
         println!(
-            "  left alone (edited by hand): {}",
-            r.skipped_manual.join(", ")
+            "{}",
+            i18n.format(
+                "cli-profile-left-alone-edited-by-hand",
+                &[("value0", r.skipped_manual.join(", ").to_string())]
+            )
         );
     }
     for error in &r.errors {
-        println!("  error: {error}");
+        println!(
+            "{}",
+            i18n.format("cli-profile-error-error", &[("value0", error.to_string())])
+        );
     }
     Ok(())
 }
@@ -418,7 +542,9 @@ struct ApplyResponse {
 /// `profile apply`: write (or `--remove`) the managed profile block in the
 /// current repository's rules file.
 async fn apply(ep: &ServerEndpoint, config: &Config, args: &ProfileApplyArgs) -> Result<()> {
-    let cwd = std::env::current_dir().context("reading the current directory")?;
+    let i18n = &config.i18n;
+    let cwd =
+        std::env::current_dir().context(i18n.text("cli-profile-reading-the-current-directory"))?;
     let root = repository_root(&cwd);
     let target = choose_target(&root, args.target.as_deref());
     let backup = PrivateBackup {
@@ -426,15 +552,18 @@ async fn apply(ep: &ServerEndpoint, config: &Config, args: &ProfileApplyArgs) ->
         stem: checkout_backup_stem(&root),
     };
     if args.remove {
-        return remove_block(&target, &backup);
+        return remove_block(i18n, &target, &backup);
     }
     if let Some(marker) = crate::marker::find_settings_marker(&cwd.to_string_lossy())
         && crate::marker::parse_toml_flag(&marker, "consume")
             .is_some_and(|v| crate::marker::is_falsy(&v))
     {
         bail!(
-            "{} sets `[profile] consume = false`, so this project does not take the profile",
-            marker.display()
+            "{}",
+            i18n.format(
+                "cli-profile-sets-profile-consume-false-so-this-project-does-not-take-the-profile",
+                &[("value0", format!("{}", marker.display()))]
+            )
         );
     }
     let (workspace, project) = super::resolve_scope(config, None, None)?;
@@ -447,19 +576,36 @@ async fn apply(ep: &ServerEndpoint, config: &Config, args: &ProfileApplyArgs) ->
     }
     let resp: ApplyResponse = get_json(ep, "/admin/profile/apply", &query)
         .await
-        .context("reading the profile entries for this project")?;
+        .context(i18n.text("cli-profile-reading-the-profile-entries-for-this-project"))?;
     if !resp.consume {
         bail!(
-            "{workspace}/{project} sets `[profile] consume = false`, so it does not take the profile"
-        );
+            "{}", i18n.format("cli-profile-workspace-project-sets-profile-consume-false-so-it-does-not-take-the-profile", &[("value0", workspace.to_string()), ("value1", project.to_string())]));
     }
     if resp.lines.is_empty() {
-        println!("No profile entries apply to {workspace}/{project}; nothing written.");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-profile-no-profile-entries-apply-to-workspace-project-nothing-written",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string())
+                ]
+            )
+        );
         return Ok(());
     }
     let block = ai_memory_core::profile::render_profile_block(&resp.lines, resp.omitted);
     if args.dry_run {
-        println!("Would write to {}:\n\n{block}", target.display());
+        println!(
+            "{}",
+            i18n.format(
+                "cli-profile-would-write-to-block",
+                &[
+                    ("value0", format!("{}", target.display())),
+                    ("value1", block.to_string())
+                ]
+            )
+        );
         return Ok(());
     }
     let outcome = apply_atomic_with_backup(&target, Some(&backup), |existing| {
@@ -468,25 +614,45 @@ async fn apply(ep: &ServerEndpoint, config: &Config, args: &ProfileApplyArgs) ->
         ))
     })?;
     println!(
-        "{}: {} ({} entr{}{})",
-        target.display(),
-        outcome.verb(),
-        resp.lines.len(),
-        if resp.lines.len() == 1 { "y" } else { "ies" },
-        if resp.omitted > 0 {
-            format!(", {} more over apply_max_lines", resp.omitted)
-        } else {
-            String::new()
-        }
+        "{}",
+        i18n.message(
+            "cli-profile-entr",
+            &[
+                ("value0", (format!("{}", target.display())).into()),
+                ("value1", (outcome.verb().to_string()).into()),
+                ("value2", (format!("{}", resp.lines.len())).into()),
+                ("value3", (resp.lines.len()).into()),
+                (
+                    "value4",
+                    ((if resp.omitted > 0 {
+                        format!(", {} more over apply_max_lines", resp.omitted)
+                    } else {
+                        String::new()
+                    })
+                    .to_string())
+                    .into()
+                )
+            ]
+        )
     );
     Ok(())
 }
 
-fn remove_block(target: &Path, backup: &PrivateBackup) -> Result<()> {
+fn remove_block(
+    i18n: &ai_memory_core::i18n::Localizer,
+    target: &Path,
+    backup: &PrivateBackup,
+) -> Result<()> {
     let existing = match std::fs::read_to_string(target) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!("{} does not exist; nothing to remove.", target.display());
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-profile-does-not-exist-nothing-to-remove",
+                    &[("value0", format!("{}", target.display()))]
+                )
+            );
             return Ok(());
         }
         Err(error) => {
@@ -495,8 +661,11 @@ fn remove_block(target: &Path, backup: &PrivateBackup) -> Result<()> {
     };
     let Some(remaining) = ai_memory_core::profile::remove_profile_block(&existing) else {
         println!(
-            "{} has no profile block; nothing to remove.",
-            target.display()
+            "{}",
+            i18n.format(
+                "cli-profile-has-no-profile-block-nothing-to-remove",
+                &[("value0", format!("{}", target.display()))]
+            )
         );
         return Ok(());
     };
@@ -504,16 +673,24 @@ fn remove_block(target: &Path, backup: &PrivateBackup) -> Result<()> {
         // The file held nothing but the block `apply` created it for.
         std::fs::remove_file(target).with_context(|| format!("removing {}", target.display()))?;
         println!(
-            "{}: removed (it held only the profile block)",
-            target.display()
+            "{}",
+            i18n.format(
+                "cli-profile-removed-it-held-only-the-profile-block",
+                &[("value0", format!("{}", target.display()))]
+            )
         );
         return Ok(());
     }
     let outcome = apply_atomic_with_backup(target, Some(backup), |_| Ok(remaining))?;
     println!(
-        "{}: profile block removed ({})",
-        target.display(),
-        outcome.verb()
+        "{}",
+        i18n.format(
+            "cli-profile-profile-block-removed",
+            &[
+                ("value0", format!("{}", target.display())),
+                ("value1", outcome.verb().to_string())
+            ]
+        )
     );
     Ok(())
 }

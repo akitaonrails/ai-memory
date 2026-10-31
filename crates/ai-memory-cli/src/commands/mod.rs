@@ -230,6 +230,7 @@ pub(crate) fn resolve_scope_with_marker(
     marker: Option<(crate::marker::MarkerScope, String, String)>,
     announce: bool,
 ) -> Result<(String, String)> {
+    let i18n = &config.i18n;
     refuse_empty_explicit(explicit_ws, "--workspace")?;
     refuse_empty_explicit(explicit_proj, "--project")?;
 
@@ -287,9 +288,16 @@ pub(crate) fn resolve_scope_with_marker(
         // Name only the halves the marker actually decided: an explicit flag
         // that was honoured must not read as if the file overrode it.
         eprintln!(
-            "ai-memory: scope {workspace}/{project} ({} from {})",
-            decided.join(" + "),
-            scope.path.display()
+            "{}",
+            i18n.format(
+                "cli-mod-ai-memory-scope-workspace-project-from",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string()),
+                    ("value2", decided.join(" + ").to_string()),
+                    ("value3", format!("{}", scope.path.display()))
+                ]
+            )
         );
     }
     Ok((workspace, project))
@@ -316,10 +324,14 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
     explicit_ws: Option<&str>,
     explicit_proj: Option<&str>,
 ) -> Result<(String, String)> {
+    let i18n = &config.i18n;
     if !cwd.exists() {
         return Err(anyhow!(
-            "project candidate does not exist: {}",
-            cwd.display()
+            "{}",
+            i18n.format(
+                "cli-mod-project-candidate-does-not-exist",
+                &[("value0", format!("{}", cwd.display()))]
+            )
         ));
     }
     let cwd = crate::marker::absolute_normalized(cwd);
@@ -349,7 +361,15 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
                         .map(|(name, _)| name)
                     }
                 })
-                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{}",
+                        i18n.format(
+                            "cli-mod-could-not-derive-project-name-from",
+                            &[("value0", format!("{}", cwd.display()))]
+                        )
+                    )
+                })?,
             None => crate::marker::discover_remote_identity(&identity)
                 .and_then(|repository| {
                     ai_memory_core::repository_identity::path_style_name(&repository)
@@ -361,7 +381,15 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
                     )
                     .map(|(name, _)| name)
                 })
-                .ok_or_else(|| anyhow!("could not derive project name from {}", cwd.display()))?,
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{}",
+                        i18n.format(
+                            "cli-mod-could-not-derive-project-name-from",
+                            &[("value0", format!("{}", cwd.display()))]
+                        )
+                    )
+                })?,
         }
     };
     Ok((workspace, project))
@@ -372,6 +400,7 @@ pub(crate) fn resolve_scope_for_path_with_explicit(
 /// workspace). Resolving the pair there would make the command fail on the
 /// cwd-derived project name it is about to throw away.
 pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> Result<String> {
+    let i18n = &config.i18n;
     refuse_empty_explicit(explicit_ws, "--workspace")?;
     if let Some(explicit) = explicit_ws {
         return Ok(explicit.to_string());
@@ -380,8 +409,14 @@ pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> R
         Some((scope, _, _)) => match scope.workspace {
             Some(declared) => {
                 eprintln!(
-                    "ai-memory: workspace {declared} (workspace from {})",
-                    scope.path.display()
+                    "{}",
+                    i18n.format(
+                        "cli-mod-ai-memory-workspace-declared-workspace-from",
+                        &[
+                            ("value0", declared.to_string()),
+                            ("value1", format!("{}", scope.path.display()))
+                        ]
+                    )
                 );
                 declared
             }
@@ -459,6 +494,7 @@ fn scope_cwd(config: &Config) -> Option<String> {
 /// have been writing into. Dot-prefixed dirs are preserved
 /// verbatim (`~/.config` → project `.config`).
 pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> Result<String> {
+    let i18n = &config.i18n;
     if let Some(p) = explicit.filter(|s| !s.is_empty()) {
         return Ok(p.to_string());
     }
@@ -485,17 +521,11 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
     // pass `-e AI_MEMORY_HOST_CWD=$PWD` and the binary has no idea
     // which host dir invoked it. Bail with a clear remedy instead
     // of silently writing every project to `default/work`.
-    let cwd = std::env::current_dir().context("getting CWD for project auto-detect")?;
+    let cwd = std::env::current_dir()
+        .context(i18n.text("cli-mod-getting-cwd-for-project-auto-detect"))?;
     if cwd.as_os_str() == "/work" {
         bail!(
-            "the `ai-memory` wrapper at ~/.local/bin/ai-memory looks stale \
-             (it didn't pass AI_MEMORY_HOST_CWD into the container). Without \
-             this, every project would land in `default/work` regardless of \
-             which host dir you ran from. Reinstall the checksum-verified \
-             wrapper from the latest GitHub Release as documented in README.md,\n  \
-             (or run `ai-memory upgrade` if your existing wrapper is recent enough \
-             to know that command)"
-        );
+            "{}", i18n.text("cli-mod-the-ai-memory-wrapper-at-local-bin-ai-memory-looks-stale-it-didn-t-pass-ai-m"));
     }
 
     // Shared with the hook router via `derive_project_name`: with no valid
@@ -513,9 +543,11 @@ pub(crate) fn resolve_project_name(config: &Config, explicit: Option<&str>) -> R
         return Ok(name);
     }
     Err(anyhow!(
-        "could not derive project name from CWD ({}); \
-         pass --project explicitly",
-        cwd.display()
+        "{}",
+        i18n.format(
+            "cli-mod-could-not-derive-project-name-from-cwd-pass-project-explicitly",
+            &[("value0", format!("{}", cwd.display()))]
+        )
     ))
 }
 

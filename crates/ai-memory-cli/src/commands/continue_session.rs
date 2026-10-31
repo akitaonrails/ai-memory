@@ -24,22 +24,24 @@ use crate::http_client::ServerEndpoint;
 
 /// Resolve the newest still-valid checkout and continue it.
 pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let links = project_registry::links_for_server(config, &endpoint)?;
     let candidates = filter_workspace(links, args.workspace.as_deref());
     if candidates.is_empty() {
         bail!(
-            "no managed checkout is linked for this server yet; \
-             launch one with `ai-memory show` or `ai-memory run <harness>` first"
-        );
+            "{}", i18n.text("cli-continue-session-no-managed-checkout-is-linked-for-this-server-yet-launch-one-with-ai-memory"));
     }
 
     let (candidates, invalid_timestamps) = newest_first(candidates);
     let mut rejected = invalid_timestamps.len();
     for link in invalid_timestamps {
         eprintln!(
-            "skipping {}: client registry has an invalid linked_at timestamp",
-            scope_label(&link)
+            "{}",
+            i18n.format(
+                "cli-continue-session-skipping-client-registry-has-an-invalid-linked-at-timestamp",
+                &[("value0", scope_label(&link).to_string())]
+            )
         );
     }
     for link in candidates {
@@ -53,15 +55,32 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 // stripped like every other stored string before it reaches
                 // the terminal.
                 let label = scope_label(&link);
-                eprintln!("skipping {label}: {}", terminal_text(&reason.to_string()));
+                eprintln!(
+                    "{}",
+                    i18n.format(
+                        "cli-continue-session-skipping-label",
+                        &[
+                            ("value0", label.to_string()),
+                            ("value1", terminal_text(&reason.to_string()).to_string())
+                        ]
+                    )
+                );
                 rejected += 1;
                 continue;
             }
         };
         eprintln!(
-            "continuing {} in {}",
-            scope_label(&link),
-            terminal_text(&target.to_string_lossy())
+            "{}",
+            i18n.format(
+                "cli-continue-session-continuing-in",
+                &[
+                    ("value0", scope_label(&link).to_string()),
+                    (
+                        "value1",
+                        terminal_text(&target.to_string_lossy()).to_string()
+                    )
+                ]
+            )
         );
         let project_id = project_registry::project_binding(
             config,
@@ -104,10 +123,7 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
     }
 
     bail!(
-        "no linked checkout is still usable ({} skipped); \
-         pick one explicitly with `ai-memory show`",
-        rejected
-    )
+        "{}", i18n.format("cli-continue-session-no-linked-checkout-is-still-usable-skipped-pick-one-explicitly-with-ai-memor", &[("value0", format!("{}", rejected))]))
 }
 
 fn filter_workspace(links: Vec<ProjectLink>, workspace: Option<&str>) -> Vec<ProjectLink> {
@@ -151,6 +167,7 @@ fn linked_at(link: &ProjectLink) -> Option<jiff::Timestamp> {
 /// exists but now resolves to a different project, which would otherwise
 /// file this session's memory under the wrong scope.
 pub(super) fn resolve_target(config: &Config, link: &ProjectLink) -> Result<PathBuf> {
+    let i18n = &config.i18n;
     let path = validate_registered_path(&link.path)?;
     let (workspace, project) = super::resolve_scope_for_path(config, &path)?;
     if workspace != link.workspace || project != link.project {
@@ -167,9 +184,14 @@ pub(super) fn resolve_target(config: &Config, link: &ProjectLink) -> Result<Path
             return Ok(path);
         }
         bail!(
-            "checkout now resolves to {}/{}",
-            terminal_text(&workspace),
-            terminal_text(&project)
+            "{}",
+            i18n.format(
+                "cli-continue-session-checkout-now-resolves-to",
+                &[
+                    ("value0", terminal_text(&workspace).to_string()),
+                    ("value1", terminal_text(&project).to_string())
+                ]
+            )
         );
     }
     Ok(path)

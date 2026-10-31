@@ -257,11 +257,12 @@ fn matcher_catches_all(entry: &serde_json::Value) -> bool {
 /// not rewritten: a change to the hook commands reaches a checkout only when
 /// `install-hooks --scope project --apply` is re-run there.
 pub(crate) fn restage_claude_code_scripts(
+    i18n: &ai_memory_core::i18n::Localizer,
     data_dir: &Path,
     hooks_dir: Option<&Path>,
 ) -> Result<PathBuf> {
     let hooks_dir = resolve_hooks_dir(hooks_dir, AgentChoice::ClaudeCode, data_dir)?;
-    stage_hook_scripts(&hooks_dir, "claude-code", data_dir)
+    stage_hook_scripts(i18n, &hooks_dir, "claude-code", data_dir)
 }
 
 /// Codex's hooks file — `$CODEX_HOME/hooks.json` when the var is set, else
@@ -648,12 +649,10 @@ fn kiro_cli_home_join(
 /// # Errors
 /// Returns an error if the hook script directory cannot be located.
 pub fn run(config: &Config, args: InstallHooksArgs) -> Result<()> {
+    let i18n = &config.i18n;
     if args.scope == HookInstallScope::Project && args.agent != AgentChoice::ClaudeCode {
         anyhow::bail!(
-            "`--scope project` is only supported for `--agent claude-code`; ai-memory writes no \
-             project-local hook file for {}",
-            args.agent.kind().as_str()
-        );
+            "{}", i18n.format("cli-install-hooks-scope-project-is-only-supported-for-agent-claude-code-ai-memory-writes-no-pr", &[("value0", args.agent.kind().as_str().to_string())]));
     }
     run_with_opencode_dialect_and_mcp_path(config, args, None, None)
 }
@@ -672,6 +671,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     dialect: Option<ai_memory_workstream::OpenCodeDialect>,
     mcp_config_path: Option<&Path>,
 ) -> Result<()> {
+    let i18n = &config.i18n;
     let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
     args.agent = match (args.agent, dialect) {
         (AgentChoice::OpenCode, Some(ai_memory_workstream::OpenCodeDialect::V1)) => {
@@ -686,7 +686,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     let needs_inferred_url = args.server_url.is_none() && !config.server_url_configured();
     let needs_inferred_token = args.auth_token.is_none() && config.auth.bearer_token.is_none();
     let inferred = if needs_inferred_url || needs_inferred_token {
-        infer_installed_mcp_config(args.agent, mcp_config_path)?
+        infer_installed_mcp_config(i18n, args.agent, mcp_config_path)?
     } else {
         None
     };
@@ -746,24 +746,12 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             }
             Err(e) if renderable_token.is_none() => {
                 eprintln!(
-                    "[ai-memory] warning: could not persist the hook auth token under {} ({e}). \
-                     The token comes from [auth].bearer_token_file and is never embedded in an \
-                     agent config, so these hooks will not authenticate until the data dir is \
-                     writable and `install-hooks --apply` is re-run.",
-                    config.data_dir.display()
-                );
+                    "{}", i18n.format("cli-install-hooks-ai-memory-warning-could-not-persist-the-hook-auth-token-under-e-the-token-co", &[("value0", format!("{}", config.data_dir.display())), ("value1", format!("{}", e))]));
                 false
             }
             Err(e) => {
                 eprintln!(
-                    "[ai-memory] warning: could not persist the hook auth token under {} ({e}); \
-                     embedding it in the rendered hook config instead so capture still works. \
-                     The token is then readable in that file / process argv. To keep it out \
-                     (recommended), install with a writable host data dir — e.g. \
-                     `AI_MEMORY_DATA_DIR=$HOME/.local/share/ai-memory` for the docker wrapper — \
-                     or a native `ai-memory` binary.",
-                    config.data_dir.display()
-                );
+                    "{}", i18n.format("cli-install-hooks-ai-memory-warning-could-not-persist-the-hook-auth-token-under-e-embedding-it", &[("value0", format!("{}", config.data_dir.display())), ("value1", format!("{}", e))]));
                 false
             }
         }
@@ -793,7 +781,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     // docs/users.md recommends, with a message saying the token was absent.
     validate_as_user(args.as_user.as_deref(), auth_token_owned.as_deref())?;
     if let Some(user) = args.as_user.as_deref().filter(|s| !s.trim().is_empty()) {
-        eprintln!("[ai-memory] hooks installing for user: {user}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-install-hooks-ai-memory-hooks-installing-for-user-user",
+                &[("value0", user.to_string())]
+            )
+        );
     }
     let generated = matches!(
         args.agent,
@@ -805,12 +799,10 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     );
     if generated || local_hook_policy_v1_supported() {
         eprintln!(
-            "[ai-memory] capture-policy capability v1 enforced by this selected integration; re-run --apply to refresh existing installs."
-        );
+            "{}", i18n.text("cli-install-hooks-ai-memory-capture-policy-capability-v1-enforced-by-this-selected-integration"));
     } else {
         eprintln!(
-            "[ai-memory] selected shell/PowerShell compatibility path does not enforce capture-policy v1; use a native platform selection or generated integration."
-        );
+            "{}", i18n.text("cli-install-hooks-ai-memory-selected-shell-powershell-compatibility-path-does-not-enforce-capt"));
     }
     // Assistant capture requires a native client-side sanitizer. No
     // silent fallback: bail so an operator on a script-fallback platform or a
@@ -818,20 +810,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     // command whose capture would be silently dropped.
     if args.capture_assistant && !capture_assistant_allowed(args.agent) {
         anyhow::bail!(
-            "--capture-assistant requires --agent claude-code, codex, or opencode2 on a native hook platform \
-             (PosixNative/WindowsNative). The current selection uses the script fallback or a \
-             different agent, where the opt-in cannot take effect. Remove --capture-assistant or \
-             switch to a supported native install."
-        );
+            "{}", i18n.text("cli-install-hooks-capture-assistant-requires-agent-claude-code-codex-or-opencode2-on-a-native"));
     }
     if (args.no_capture_prompts || args.capture_prompts)
         && !prompt_capture_options_allowed(args.agent)
     {
         anyhow::bail!(
-            "--no-capture-prompts and --capture-prompts require --agent claude-code. Other \
-             agents may use their prompt hook to deliver handoff context, so removing it could \
-             break cross-agent continuity."
-        );
+            "{}", i18n.text("cli-install-hooks-no-capture-prompts-and-capture-prompts-require-agent-claude-code-other-agent"));
     }
     // Codex's default hooks file depends on CODEX_HOME. Resolve it from the
     // captured environment once, into `args` like the project strategy below,
@@ -862,9 +847,15 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         // work, and say which mode is in force. A protection the operator
         // cannot see is one they cannot trust.
         let capture_mode = persist_capture_mode(&config.data_dir, args.capture_mode)?;
-        println!("capture mode: {capture_mode}");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-install-hooks-capture-mode-capture-mode",
+                &[("value0", capture_mode.to_string())]
+            )
+        );
         if capture_mode == "allowlist" {
-            println!("  repositories without a .ai-memory.toml marker emit no lifecycle events");
+            println!("{}", i18n.text("cli-install-hooks-repositories-without-a-ai-memory-toml-marker-emit-no-lifecycle-events"));
             // The gate runs inside the native hook binary (immediately before
             // the spool write) and, since #661, inside the generated
             // TypeScript integrations' shared `capturePolicy` (before any
@@ -875,9 +866,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             // the exact failure #446 is about.
             if !generated && !local_hook_policy_v1_supported() {
                 println!(
-                    "  WARNING: this install uses script hooks, which POST directly and \
-                     cannot enforce the mode. Allowlist is stored but NOT in force here."
-                );
+                    "{}", i18n.text("cli-install-hooks-warning-this-install-uses-script-hooks-which-post-directly-and-cannot-enforc"));
             }
         }
         // Preserve a project-strategy an earlier `--apply` baked when this run
@@ -891,17 +880,22 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         args.project_strategy = install_project_strategy(&args);
         return match args.agent {
             AgentChoice::OpenCode => {
-                apply_to_opencode_plugin(&server_url, auth, &args, &capture_mode)
+                apply_to_opencode_plugin(&config.i18n, &server_url, auth, &args, &capture_mode)
             }
             AgentChoice::OpenCode2 => {
-                apply_to_opencode2_plugin(&server_url, auth, &args, &capture_mode)
+                apply_to_opencode2_plugin(&config.i18n, &server_url, auth, &args, &capture_mode)
             }
-            AgentChoice::Pi => apply_to_pi_extension(&server_url, auth, &args, &capture_mode),
-            AgentChoice::Omp => apply_to_omp_extension(&server_url, auth, &args, &capture_mode),
+            AgentChoice::Pi => {
+                apply_to_pi_extension(&config.i18n, &server_url, auth, &args, &capture_mode)
+            }
+            AgentChoice::Omp => {
+                apply_to_omp_extension(&config.i18n, &server_url, auth, &args, &capture_mode)
+            }
             AgentChoice::ClaudeCode => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_claude_code_settings(
+                    &config.i18n,
                     &hooks_dir,
                     &server_url,
                     auth,
@@ -912,12 +906,20 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             AgentChoice::Codex => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_codex_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_codex_settings(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::CommandCode => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_command_code_settings(
+                    &config.i18n,
                     &hooks_dir,
                     &server_url,
                     auth,
@@ -928,17 +930,32 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             AgentChoice::Cursor => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_cursor_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_cursor_settings(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::GeminiCli => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_gemini_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_gemini_settings(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::AntigravityCli => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_antigravity_settings(
+                    &config.i18n,
                     &hooks_dir,
                     &server_url,
                     auth,
@@ -949,12 +966,21 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             AgentChoice::Grok => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_grok_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)?;
+                apply_to_grok_settings(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )?;
                 let hook_file = match &args.config_file {
                     Some(path) => path.clone(),
                     None => grok_hooks_path()?,
                 };
-                crate::commands::install_skills::install_grok_companions_after_hooks(&hook_file)
+                crate::commands::install_skills::install_grok_companions_after_hooks(
+                    i18n, &hook_file,
+                )
             }
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
@@ -973,20 +999,35 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             AgentChoice::Devin => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_devin_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_devin_settings(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::Openclaw => {
-                openclaw_plugin::apply(&server_url, auth, &args, &capture_mode)
+                openclaw_plugin::apply(&config.i18n, &server_url, auth, &args, &capture_mode)
             }
             AgentChoice::KimiCode => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_kimi_code_config(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_kimi_code_config(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::KiroCli => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
                 apply_to_kiro_cli_agent_configs(
+                    &config.i18n,
                     &hooks_dir,
                     &server_url,
                     auth,
@@ -997,17 +1038,38 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             AgentChoice::KiroCliV3 => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_kiro_cli_v3_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_kiro_cli_v3_hooks(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::Pool => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_pool(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_pool(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::CopilotCli => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_copilot_cli_hooks(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_copilot_cli_hooks(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
             AgentChoice::Droid => {
                 let path = match &args.config_file {
@@ -1017,10 +1079,9 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                 apply_to_droid_hooks(&path, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::Muse => {
-                let path = args
-                    .config_file
-                    .clone()
-                    .context("internal: the Muse settings path is resolved before apply")?;
+                let path = args.config_file.clone().context(i18n.text(
+                    "cli-install-hooks-internal-the-muse-settings-path-is-resolved-before-apply",
+                ))?;
                 apply_to_muse_settings(&path, &server_url, auth, &config.data_dir, &args)
             }
             AgentChoice::CodeBuddy => {
@@ -1040,11 +1101,23 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             AgentChoice::Dsh => {
                 let hooks_dir =
                     resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-                apply_to_dsh(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+                apply_to_dsh(
+                    &config.i18n,
+                    &hooks_dir,
+                    &server_url,
+                    auth,
+                    &config.data_dir,
+                    &args,
+                )
             }
-            AgentChoice::Cline => {
-                apply_to_cline_hooks(&server_url, auth, &config.data_dir, &args, &capture_mode)
-            }
+            AgentChoice::Cline => apply_to_cline_hooks(
+                &config.i18n,
+                &server_url,
+                auth,
+                &config.data_dir,
+                &args,
+                &capture_mode,
+            ),
             AgentChoice::QwenCode => {
                 let path = match &args.config_file {
                     Some(path) => path.clone(),
@@ -1691,6 +1764,7 @@ fn infer_first_toml_mcp_config(
 }
 
 fn infer_installed_mcp_config(
+    i18n: &ai_memory_core::i18n::Localizer,
     agent: AgentChoice,
     config_path: Option<&Path>,
 ) -> Result<Option<InferredMcpConfig>> {
@@ -1702,14 +1776,13 @@ fn infer_installed_mcp_config(
         None => install_mcp::mcp_config_path(client)?,
     };
     if agent == AgentChoice::Grok {
-        let cwd = std::env::current_dir()
-            .context("could not resolve current dir for Grok project configuration")?;
+        let cwd = std::env::current_dir().context(i18n.text(
+            "cli-install-hooks-could-not-resolve-current-dir-for-grok-project-configuration",
+        ))?;
         let repo_root = ai_memory_consolidate::discover_repo_root(&cwd).ok();
         if let Some(project_config) = find_grok_project_overlay(&cwd, repo_root.as_deref(), &path) {
             anyhow::bail!(
-                "Grok project configuration {} may override GROK_HOME; pass explicit --server-url and --auth-token rather than inferring MCP settings",
-                project_config.display()
-            );
+                "{}", i18n.format("cli-install-hooks-grok-project-configuration-may-override-grok-home-pass-explicit-server-url-a", &[("value0", format!("{}", project_config.display()))]));
         }
     }
     if matches!(client, McpClient::Codex) {
@@ -1748,7 +1821,9 @@ fn infer_installed_mcp_config(
             ..inferred
         })),
         McpClient::Grok => infer_grok_mcp_config(&content),
-        McpClient::OpenCode | McpClient::OpenCode2 => infer_opencode_mcp_config(&content, client),
+        McpClient::OpenCode | McpClient::OpenCode2 => {
+            infer_opencode_mcp_config(i18n, &content, client)
+        }
         McpClient::Cursor => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
@@ -1970,11 +2045,12 @@ pub(crate) fn hook_config_target_with(
 }
 
 fn infer_opencode_mcp_config(
+    i18n: &ai_memory_core::i18n::Localizer,
     content: &str,
     selected: McpClient,
 ) -> Result<Option<InferredMcpConfig>> {
     Ok(
-        install_mcp::infer_owned_opencode_mcp_config(content, selected)?.map(|inferred| {
+        install_mcp::infer_owned_opencode_mcp_config(i18n, content, selected)?.map(|inferred| {
             InferredMcpConfig {
                 hook_server_url: hook_server_url_from_mcp_url(&inferred.mcp_url),
                 auth_token: inferred.auth_token,
@@ -2327,18 +2403,20 @@ fn configure_claude_prompt_capture(
 /// ai-memory cares about (`CLAUDE_CODE_EVENTS`); preserve every other hook the
 /// user has wired up to other tools.
 fn apply_to_claude_code_settings(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "claude-code", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "claude-code", data_dir)?;
     apply_to_claude_code_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
 #[cfg(test)]
 fn apply_to_claude_code_settings_in(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -2346,7 +2424,7 @@ fn apply_to_claude_code_settings_in(
     staging_data_local: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts_in(hooks_dir, "claude-code", staging_data_local)?;
+    let staged = stage_hook_scripts_in(i18n, hooks_dir, "claude-code", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "claude-code");
     let capture_prompts = install_claude_prompt_capture(args);
     let payload = configure_claude_prompt_capture(
@@ -2478,6 +2556,7 @@ fn apply_to_claude_code_settings_with_payload(
 /// every `~/.grok/hooks/*.json`), so a pre-existing third-party hook file is
 /// left untouched.
 fn apply_to_grok_settings(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -2488,7 +2567,7 @@ fn apply_to_grok_settings(
         Some(p) => p.clone(),
         None => grok_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "grok", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "grok", data_dir)?;
     let command_dir = staged_command_dir(&staged, "grok");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let payload = build_grok_payload_with_data_dir(
@@ -2534,18 +2613,20 @@ fn apply_to_grok_settings(
 /// (PostCompaction instead of PreCompact, no subagent events). SessionStart injects
 /// the handoff via hookSpecificOutput.additionalContext.
 fn apply_to_devin_settings(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "devin", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "devin", data_dir)?;
     apply_to_devin_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
 #[cfg(test)]
 fn apply_to_devin_settings_in(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -2553,7 +2634,7 @@ fn apply_to_devin_settings_in(
     staging_data_local: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts_in(hooks_dir, "devin", staging_data_local)?;
+    let staged = stage_hook_scripts_in(i18n, hooks_dir, "devin", staging_data_local)?;
     apply_to_devin_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
@@ -2624,18 +2705,20 @@ fn apply_to_devin_settings_with_staged(
 /// `matcher` to be omitted for SessionStart and Stop, so its profile must not
 /// reuse the otherwise similar Claude/Codex payload byte-for-byte.
 fn apply_to_command_code_settings(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "command-code", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "command-code", data_dir)?;
     apply_to_command_code_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
 #[cfg(test)]
 fn apply_to_command_code_settings_in(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -2643,7 +2726,7 @@ fn apply_to_command_code_settings_in(
     staging_data_local: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts_in(hooks_dir, "command-code", staging_data_local)?;
+    let staged = stage_hook_scripts_in(i18n, hooks_dir, "command-code", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "command-code");
     let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
         &COMMAND_CODE_PROFILE,
@@ -2723,18 +2806,20 @@ fn apply_to_command_code_settings_with_payload(
 /// is Copilot's standalone hook format: `{"version": 1, "hooks": {...}}` with
 /// flat, matcher-less entries (`COPILOT_CLI_PROFILE`, #1040).
 fn apply_to_copilot_cli_hooks(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "copilot-cli", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "copilot-cli", data_dir)?;
     apply_to_copilot_cli_hooks_with_staged(&staged, server_url, auth_token, data_dir, args)
 }
 
 #[cfg(test)]
 fn apply_to_copilot_cli_hooks_in(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -2742,7 +2827,7 @@ fn apply_to_copilot_cli_hooks_in(
     staging_data_local: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts_in(hooks_dir, "copilot-cli", staging_data_local)?;
+    let staged = stage_hook_scripts_in(i18n, hooks_dir, "copilot-cli", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "copilot-cli");
     let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
         &COPILOT_CLI_PROFILE,
@@ -2844,18 +2929,20 @@ fn apply_to_copilot_cli_hooks_with_payload(
 /// them in the TUI ("Trust all and continue") or sets
 /// `--dangerously-bypass-hook-trust`. We print a reminder.
 fn apply_to_codex_settings(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "codex", data_dir)?;
-    apply_to_codex_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+    let staged = stage_hook_scripts(i18n, hooks_dir, "codex", data_dir)?;
+    apply_to_codex_settings_with_staged(i18n, &staged, server_url, auth_token, data_dir, args)
 }
 
 #[cfg(test)]
 fn apply_to_codex_settings_in(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -2863,7 +2950,7 @@ fn apply_to_codex_settings_in(
     staging_data_local: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts_in(hooks_dir, "codex", staging_data_local)?;
+    let staged = stage_hook_scripts_in(i18n, hooks_dir, "codex", staging_data_local)?;
     let command_dir = staged_command_dir(&staged, "codex");
     let payload = crate::commands::render_shared::build_profile_script_payload_for_test(
         &super::render_shared::CODEX_PROFILE,
@@ -2874,10 +2961,11 @@ fn apply_to_codex_settings_in(
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
     );
-    apply_to_codex_settings_with_payload(payload, args)
+    apply_to_codex_settings_with_payload(i18n, payload, args)
 }
 
 fn apply_to_codex_settings_with_staged(
+    i18n: &ai_memory_core::i18n::Localizer,
     staged: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -2898,10 +2986,11 @@ fn apply_to_codex_settings_with_staged(
         // on a native path.
         args.capture_assistant,
     );
-    apply_to_codex_settings_with_payload(payload, args)
+    apply_to_codex_settings_with_payload(i18n, payload, args)
 }
 
 fn apply_to_codex_settings_with_payload(
+    i18n: &ai_memory_core::i18n::Localizer,
     payload: serde_json::Value,
     args: &InstallHooksArgs,
 ) -> Result<()> {
@@ -2925,11 +3014,28 @@ fn apply_to_codex_settings_with_payload(
     // they fire.
     if !matches!(outcome, ApplyOutcome::NoOp) {
         println!();
-        println!("Codex requires explicit trust for new hooks. Next time you start `codex`:");
-        println!("  → the TUI will surface 'Hooks need review' for each new event");
-        println!("  → choose 'Trust all and continue' (or trust individually)");
-        println!("To bypass the prompt for automated installs, start with");
-        println!("`codex --dangerously-bypass-hook-trust` (review hook scripts first).");
+        println!(
+            "{}",
+            i18n.diagnostic(
+                "Codex requires explicit trust for new hooks. Next time you start `codex`:"
+            )
+        );
+        println!(
+            "{}",
+            i18n.diagnostic("  → the TUI will surface 'Hooks need review' for each new event")
+        );
+        println!(
+            "{}",
+            i18n.diagnostic("  → choose 'Trust all and continue' (or trust individually)")
+        );
+        println!(
+            "{}",
+            i18n.diagnostic("To bypass the prompt for automated installs, start with")
+        );
+        println!(
+            "{}",
+            i18n.diagnostic("`codex --dangerously-bypass-hook-trust` (review hook scripts first).")
+        );
     }
     Ok(())
 }
@@ -3001,6 +3107,7 @@ fn merge_codex_payload(payload: serde_json::Value, config_path: &Path) -> Result
 /// the existing file (preserving any non-overlapping events the
 /// user has wired up to other tools).
 fn apply_to_cursor_settings(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -3011,7 +3118,7 @@ fn apply_to_cursor_settings(
         Some(p) => p.clone(),
         None => cursor_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "cursor", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "cursor", data_dir)?;
     let command_dir = staged_command_dir(&staged, "cursor");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_cursor_hooks(
@@ -3145,6 +3252,7 @@ fn merge_cursor_hooks(
 /// inner-hook level, so the env vars get inlined into the command
 /// string by the shared payload builder.
 fn apply_to_gemini_settings(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -3155,7 +3263,7 @@ fn apply_to_gemini_settings(
         Some(p) => p.clone(),
         None => gemini_settings_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "gemini-cli", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "gemini-cli", data_dir)?;
     let command_dir = staged_command_dir(&staged, "gemini-cli");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_gemini_hooks(
@@ -3230,6 +3338,7 @@ fn merge_gemini_hooks(
 ///
 /// Config file: `~/.gemini/config/hooks.json`
 fn apply_to_antigravity_settings(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -3240,7 +3349,7 @@ fn apply_to_antigravity_settings(
         Some(p) => p.clone(),
         None => antigravity_hooks_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "antigravity-cli", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "antigravity-cli", data_dir)?;
     let command_dir = staged_command_dir(&staged, "antigravity-cli");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_antigravity_hooks(
@@ -3322,6 +3431,7 @@ fn merge_antigravity_hooks(
 /// `event` + `command` — `matcher` omitted (Kimi Code matches
 /// everything) and `timeout` omitted (30s default).
 fn apply_to_kimi_code_config(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -3332,7 +3442,7 @@ fn apply_to_kimi_code_config(
         Some(p) => p.clone(),
         None => kimi_code_config_path()?,
     };
-    let staged = stage_hook_scripts(hooks_dir, "kimi-code", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "kimi-code", data_dir)?;
     let command_dir = staged_command_dir(&staged, "kimi-code");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     let outcome = merge_kimi_code_hooks(
@@ -3433,6 +3543,7 @@ fn is_ai_memory_toml_hook_entry(entry: &toml_edit::Table) -> bool {
 /// disk), so hooks in it would never fire and the install would look
 /// successful while capturing nothing.
 fn apply_to_kiro_cli_agent_configs(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -3471,7 +3582,7 @@ fn apply_to_kiro_cli_agent_configs(
         args.project_strategy,
     )?;
 
-    let staged = stage_hook_scripts(hooks_dir, "kiro-cli", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "kiro-cli", data_dir)?;
     let command_dir = staged_command_dir(&staged, "kiro-cli");
     for (path, strategy) in prepared {
         let outcome = merge_kiro_cli_agent_hooks(
@@ -3586,6 +3697,7 @@ fn render_kiro_cli_agent_hooks(
 }
 
 fn apply_to_kiro_cli_v3_hooks(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
@@ -3609,7 +3721,7 @@ fn apply_to_kiro_cli_v3_hooks(
         &existing, hooks_dir, server_url, auth_token, data_dir, strategy, &path,
     )?;
 
-    let staged = stage_hook_scripts(hooks_dir, "kiro-cli", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "kiro-cli", data_dir)?;
     let command_dir = staged_command_dir(&staged, "kiro-cli");
     let outcome = merge_kiro_cli_v3_hooks(
         &command_dir,
@@ -3806,6 +3918,7 @@ pub(crate) fn is_ai_memory_kiro_hook_command(command: &str) -> bool {
 /// `experimental.chat.system.transform`, because plugin shell stdout is
 /// not prepended to the model context the way Claude Code hook stdout is.
 fn apply_to_opencode_plugin(
+    i18n: &ai_memory_core::i18n::Localizer,
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
@@ -3819,7 +3932,7 @@ fn apply_to_opencode_plugin(
     let body = build_opencode_plugin(server_url, auth_token, strategy, capture_mode);
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
-    remove_incompatible_opencode_plugin(&path, AgentChoice::OpenCode)?;
+    remove_incompatible_opencode_plugin(i18n, &path, AgentChoice::OpenCode)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -3832,9 +3945,17 @@ fn apply_to_opencode_plugin(
     );
     if !matches!(outcome, ApplyOutcome::NoOp) {
         println!();
-        println!("OpenCode auto-loads plugins from ~/.config/opencode/plugins/ on next start.");
-        println!("If you're already inside an `opencode` session, restart it for the");
-        println!("new plugin to take effect.");
+        println!(
+            "{}",
+            i18n.diagnostic(
+                "OpenCode auto-loads plugins from ~/.config/opencode/plugins/ on next start."
+            )
+        );
+        println!(
+            "{}",
+            i18n.diagnostic("If you're already inside an `opencode` session, restart it for the")
+        );
+        println!("{}", i18n.diagnostic("new plugin to take effect."));
     }
     Ok(())
 }
@@ -3855,11 +3976,16 @@ fn opencode_plugin_content_is_owned(content: &str, agent: AgentChoice) -> bool {
     }
 }
 
-fn remove_incompatible_opencode_plugin(path: &Path, installed: AgentChoice) -> Result<()> {
-    remove_incompatible_opencode_plugin_with(path, installed, |_| Ok(()))
+fn remove_incompatible_opencode_plugin(
+    i18n: &ai_memory_core::i18n::Localizer,
+    path: &Path,
+    installed: AgentChoice,
+) -> Result<()> {
+    remove_incompatible_opencode_plugin_with(i18n, path, installed, |_| Ok(()))
 }
 
 fn remove_incompatible_opencode_plugin_with(
+    i18n: &ai_memory_core::i18n::Localizer,
     path: &Path,
     installed: AgentChoice,
     after_quarantine: impl FnOnce(&Path) -> Result<()>,
@@ -3910,8 +4036,11 @@ fn remove_incompatible_opencode_plugin_with(
             )
         })?;
         println!(
-            "✓ removed incompatible generated plugin {}",
-            sibling.display()
+            "{}",
+            i18n.diagnostic(&format!(
+                "✓ removed incompatible generated plugin {}",
+                sibling.display()
+            ))
         );
         return Ok(());
     }
@@ -4014,6 +4143,7 @@ pub(crate) fn opencode2_plugin_path() -> anyhow::Result<std::path::PathBuf> {
 /// incompatible sibling is removed only when its exact ai-memory ownership
 /// markers match.
 fn apply_to_opencode2_plugin(
+    i18n: &ai_memory_core::i18n::Localizer,
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
@@ -4033,7 +4163,7 @@ fn apply_to_opencode2_plugin(
     )?;
 
     let outcome = apply_atomic(&path, move |_existing| Ok(body.clone()))?;
-    remove_incompatible_opencode_plugin(&path, AgentChoice::OpenCode2)?;
+    remove_incompatible_opencode_plugin(i18n, &path, AgentChoice::OpenCode2)?;
     println!(
         "✓ {} {} ({})",
         outcome.verb(),
@@ -4046,9 +4176,17 @@ fn apply_to_opencode2_plugin(
     );
     if !matches!(outcome, ApplyOutcome::NoOp) {
         println!();
-        println!("OpenCode 2 auto-loads plugins from ~/.config/opencode/plugins/ on next start.");
-        println!("If you're already inside an `opencode2` session, restart it for the");
-        println!("new plugin to take effect.");
+        println!(
+            "{}",
+            i18n.diagnostic(
+                "OpenCode 2 auto-loads plugins from ~/.config/opencode/plugins/ on next start."
+            )
+        );
+        println!(
+            "{}",
+            i18n.diagnostic("If you're already inside an `opencode2` session, restart it for the")
+        );
+        println!("{}", i18n.diagnostic("new plugin to take effect."));
     }
     Ok(())
 }
@@ -5513,23 +5651,30 @@ pub(crate) fn shared_extensions_dir(
 
 /// Print the Pi/OMP double-capture warning for `dir`; see
 /// [`shared_extensions_dir`].
-pub(crate) fn warn_agents_share_extensions_dir(dir: &Path) {
+pub(crate) fn warn_agents_share_extensions_dir(i18n: &ai_memory_core::i18n::Localizer, dir: &Path) {
     eprintln!(
-        "warning: Pi and OMP both resolve to {}, an agent dir they share\n\
+        "{}",
+        i18n.diagnostic(&format!(
+            "warning: Pi and OMP both resolve to {}, an agent dir they share\n\
          \x20 (PI_CODING_AGENT_DIR, or OMP's PI_CONFIG_DIR).\n\
          \x20 Each agent loads every *.ts in that directory, so installing both\n\
          \x20 captures each event twice, once as `pi` and once as `omp`.\n\
          \x20 Give them separate homes, or move OMP to a named profile, which\n\
          \x20 ignores PI_CODING_AGENT_DIR (OMP_PROFILE=<name>, or `--profile <name>`\n\
          \x20 on both `omp` and `ai-memory install-hooks --agent omp`).",
-        dir.display()
+            dir.display()
+        ))
     );
 }
 
-fn warn_if_agents_share_extensions_dir(this_agent: AgentChoice, this_path: &Path) {
+fn warn_if_agents_share_extensions_dir(
+    i18n: &ai_memory_core::i18n::Localizer,
+    this_agent: AgentChoice,
+    this_path: &Path,
+) {
     if let Some(dir) = shared_extensions_dir(this_agent, this_path, &|name| std::env::var_os(name))
     {
-        warn_agents_share_extensions_dir(&dir);
+        warn_agents_share_extensions_dir(i18n, &dir);
     }
 }
 
@@ -5552,7 +5697,7 @@ fn warn_if_agents_share_extensions_dir(this_agent: AgentChoice, this_path: &Path
 /// legacy `ai-memory.ts` there belongs to whichever installed last. Removing
 /// the *other* agent's file would silently stop its capture until the
 /// operator happened to reinstall it.
-fn remove_legacy_extension(new_path: &Path, agent: &str) {
+fn remove_legacy_extension(i18n: &ai_memory_core::i18n::Localizer, new_path: &Path, agent: &str) {
     let legacy = new_path.with_file_name("ai-memory.ts");
     if legacy == new_path || !legacy.exists() {
         return;
@@ -5565,14 +5710,23 @@ fn remove_legacy_extension(new_path: &Path, agent: &str) {
     let ours = content.contains(&banner) && content.contains(&agent_const);
     if !ours {
         println!(
-            "note: left {} in place — it was not generated by this agent's \
+            "{}",
+            i18n.diagnostic(&format!(
+                "note: left {} in place — it was not generated by this agent's \
              installer. Remove it yourself if the agent should stop loading it.",
-            legacy.display()
+                legacy.display()
+            ))
         );
         return;
     }
     match std::fs::remove_file(&legacy) {
-        Ok(()) => println!("✓ Removed superseded extension {}", legacy.display()),
+        Ok(()) => println!(
+            "{}",
+            i18n.diagnostic(&format!(
+                "✓ Removed superseded extension {}",
+                legacy.display()
+            ))
+        ),
         Err(e) => eprintln!(
             "[ai-memory] warning: could not remove superseded extension {}: {e}",
             legacy.display()
@@ -5587,6 +5741,7 @@ fn remove_legacy_extension(new_path: &Path, agent: &str) {
 /// `extensions/` at startup, so no separate settings merge is needed. The extension uses OMP's
 /// lifecycle API for capture and `before_agent_start` for handoff injection.
 fn apply_to_omp_extension(
+    i18n: &ai_memory_core::i18n::Localizer,
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
@@ -5608,17 +5763,23 @@ fn apply_to_omp_extension(
         }
     );
 
-    warn_if_agents_share_extensions_dir(AgentChoice::Omp, &path);
-    remove_legacy_extension(&path, "omp");
+    warn_if_agents_share_extensions_dir(i18n, AgentChoice::Omp, &path);
+    remove_legacy_extension(i18n, &path, "omp");
 
     if !matches!(outcome, ApplyOutcome::NoOp) {
         println!();
         println!(
-            "OMP auto-loads direct TypeScript extensions from {} on next start.",
-            path.parent().unwrap_or(&path).display()
+            "{}",
+            i18n.diagnostic(&format!(
+                "OMP auto-loads direct TypeScript extensions from {} on next start.",
+                path.parent().unwrap_or(&path).display()
+            ))
         );
-        println!("If you're already inside an `omp` session, restart it for the");
-        println!("new extension to take effect.");
+        println!(
+            "{}",
+            i18n.diagnostic("If you're already inside an `omp` session, restart it for the")
+        );
+        println!("{}", i18n.diagnostic("new extension to take effect."));
     }
     Ok(())
 }
@@ -5674,6 +5835,7 @@ fn resolve_omp_extension_path(args: &InstallHooksArgs) -> Result<PathBuf> {
 }
 
 fn apply_to_pi_extension(
+    i18n: &ai_memory_core::i18n::Localizer,
     server_url: &str,
     auth_token: Option<&str>,
     args: &InstallHooksArgs,
@@ -5695,13 +5857,21 @@ fn apply_to_pi_extension(
         }
     );
 
-    warn_if_agents_share_extensions_dir(AgentChoice::Pi, &path);
-    remove_legacy_extension(&path, "pi");
+    warn_if_agents_share_extensions_dir(i18n, AgentChoice::Pi, &path);
+    remove_legacy_extension(i18n, &path, "pi");
 
     if !matches!(outcome, ApplyOutcome::NoOp) {
         println!();
-        println!("Pi loads TypeScript extensions from ~/.pi/agent/extensions/ on next start.");
-        println!("Restart Pi for lifecycle capture and MCP tools to take effect.");
+        println!(
+            "{}",
+            i18n.diagnostic(
+                "Pi loads TypeScript extensions from ~/.pi/agent/extensions/ on next start."
+            )
+        );
+        println!(
+            "{}",
+            i18n.diagnostic("Restart Pi for lifecycle capture and MCP tools to take effect.")
+        );
     }
     Ok(())
 }
@@ -6346,8 +6516,14 @@ fn manual_agent_project_strategy_instruction(project_strategy: Option<&str>) -> 
 ///
 /// Errors propagate when source is missing, the staging dir
 /// can't be created, or any file copy fails.
-fn stage_hook_scripts(source_dir: &Path, agent_label: &str, data_dir: &Path) -> Result<PathBuf> {
+fn stage_hook_scripts(
+    i18n: &ai_memory_core::i18n::Localizer,
+    source_dir: &Path,
+    agent_label: &str,
+    data_dir: &Path,
+) -> Result<PathBuf> {
     stage_hook_scripts_in(
+        i18n,
         source_dir,
         agent_label,
         &hook_staging_root(data_dir, ai_memory_wiki::backup::running_in_container()),
@@ -6377,7 +6553,12 @@ pub(crate) fn hook_staging_root(data_dir: &Path, in_container: bool) -> PathBuf 
     }
 }
 
-fn stage_hook_scripts_in(source_dir: &Path, agent_label: &str, data_dir: &Path) -> Result<PathBuf> {
+fn stage_hook_scripts_in(
+    i18n: &ai_memory_core::i18n::Localizer,
+    source_dir: &Path,
+    agent_label: &str,
+    data_dir: &Path,
+) -> Result<PathBuf> {
     // `<data_dir>/hooks/<agent>`, not `<platform default>/ai-memory/hooks/…`.
     // Byte-identical for a default install, since `default_data_dir()` *is*
     // `data_local_dir()/ai-memory` — but it now follows `--data-dir` and
@@ -6457,7 +6638,13 @@ fn stage_hook_scripts_in(source_dir: &Path, agent_label: &str, data_dir: &Path) 
     }
 
     let verb = if same_path { "verified" } else { "staged" };
-    eprintln!("✓ {verb} {count} hook script(s) → {}", dest_root.display());
+    eprintln!(
+        "{}",
+        i18n.diagnostic(&format!(
+            "✓ {verb} {count} hook script(s) → {}",
+            dest_root.display()
+        ))
+    );
     Ok(dest_root)
 }
 
@@ -8209,13 +8396,14 @@ fn render_pool_output(
 /// written: install-hooks is a user-scoped operation and must not mutate
 /// files inside the user's repositories.
 fn apply_to_pool(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "pool", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "pool", data_dir)?;
     let command_dir = staged_command_dir(&staged, "pool");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     print!(
@@ -8361,6 +8549,7 @@ fn render_cline_hooks(
 }
 
 fn apply_to_cline_hooks(
+    i18n: &ai_memory_core::i18n::Localizer,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
@@ -8423,8 +8612,16 @@ fn apply_to_cline_hooks(
         }
         eprintln!("✓ {} {}", outcome.verb(), path.display());
     }
-    println!("Restart Cline so it reloads the hook directory.");
-    println!("Cline yolo mode disables hooks; lifecycle capture is unavailable in that mode.");
+    println!(
+        "{}",
+        i18n.diagnostic("Restart Cline so it reloads the hook directory.")
+    );
+    println!(
+        "{}",
+        i18n.diagnostic(
+            "Cline yolo mode disables hooks; lifecycle capture is unavailable in that mode."
+        )
+    );
     Ok(())
 }
 
@@ -8517,13 +8714,14 @@ fn render_dsh_output(
 /// the merge is deliberately left to the operator - the same reason
 /// `install-mcp --client dsh` refuses to write MCP config.
 fn apply_to_dsh(
+    i18n: &ai_memory_core::i18n::Localizer,
     hooks_dir: &Path,
     server_url: &str,
     auth_token: Option<&str>,
     data_dir: &Path,
     args: &InstallHooksArgs,
 ) -> Result<()> {
-    let staged = stage_hook_scripts(hooks_dir, "dsh", data_dir)?;
+    let staged = stage_hook_scripts(i18n, hooks_dir, "dsh", data_dir)?;
     let command_dir = staged_command_dir(&staged, "dsh");
     fs::create_dir_all(&command_dir)
         .with_context(|| format!("creating hook staging dir {}", command_dir.display()))?;
@@ -8542,7 +8740,13 @@ fn apply_to_dsh(
             .expect("static hook payload serializes")
             .as_bytes(),
     )?;
-    eprintln!("✓ wrote DSH hook config → {}", hooks_json.display());
+    eprintln!(
+        "{}",
+        i18n.diagnostic(&format!(
+            "✓ wrote DSH hook config → {}",
+            hooks_json.display()
+        ))
+    );
     print!("{}", dsh_bridge_patch_fragment(&command_dir));
     Ok(())
 }
@@ -8918,6 +9122,7 @@ mod tests {
         };
 
         apply_to_command_code_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             source.path(),
             "http://memory:49374",
             Some("token"),
@@ -8928,6 +9133,7 @@ mod tests {
         .unwrap();
         let first = fs::read_to_string(&config_path).unwrap();
         apply_to_command_code_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             source.path(),
             "http://memory:49374",
             Some("token"),
@@ -9003,6 +9209,7 @@ mod tests {
         };
 
         apply_to_copilot_cli_hooks_in(
+            &ai_memory_core::i18n::Localizer::default(),
             source.path(),
             "http://memory:49374",
             Some("token"),
@@ -9013,6 +9220,7 @@ mod tests {
         .unwrap();
         let first = fs::read_to_string(&config_path).unwrap();
         apply_to_copilot_cli_hooks_in(
+            &ai_memory_core::i18n::Localizer::default(),
             source.path(),
             "http://memory:49374",
             Some("token"),
@@ -9885,9 +10093,13 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let inferred = infer_installed_mcp_config(AgentChoice::Droid, Some(&mcp))
-            .unwrap()
-            .unwrap();
+        let inferred = infer_installed_mcp_config(
+            &ai_memory_core::i18n::Localizer::default(),
+            AgentChoice::Droid,
+            Some(&mcp),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             inferred.hook_server_url.as_deref(),
             Some("http://memory:49374")
@@ -9929,6 +10141,7 @@ mod tests {
         args.project_strategy = Some(ProjectStrategyArg::RepoRoot);
 
         apply_to_cline_hooks(
+            &ai_memory_core::i18n::Localizer::default(),
             "https://memory.example",
             Some("tok'en"),
             &data,
@@ -9963,8 +10176,15 @@ mod tests {
         fs::remove_file(&first).unwrap();
         let owned = target.join(format!("TaskResume.{extension}"));
         fs::write(&owned, "user-owned hook\n").unwrap();
-        let error = apply_to_cline_hooks("https://memory.example", None, &data, &args, "denylist")
-            .unwrap_err();
+        let error = apply_to_cline_hooks(
+            &ai_memory_core::i18n::Localizer::default(),
+            "https://memory.example",
+            None,
+            &data,
+            &args,
+            "denylist",
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("refusing to replace user-owned"));
         assert_eq!(fs::read_to_string(owned).unwrap(), "user-owned hook\n");
         assert!(!first.exists(), "preflight must prevent a partial rewrite");
@@ -9996,6 +10216,7 @@ mod tests {
         args.agent = AgentChoice::Cline;
         args.config_file = Some(target);
         let error = apply_to_cline_hooks(
+            &ai_memory_core::i18n::Localizer::default(),
             "https://memory.example",
             Some("secret"),
             &data,
@@ -10674,8 +10895,15 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         fs::write(root.path().join("hooks").join("_lib.sh"), "#!/bin/sh\n").unwrap();
         let mut args = default_hook_args();
         args.agent = AgentChoice::Dsh;
-        apply_to_dsh(&source, "http://127.0.0.1:49374", None, data.path(), &args)
-            .expect("apply_to_dsh succeeds");
+        apply_to_dsh(
+            &ai_memory_core::i18n::Localizer::default(),
+            &source,
+            "http://127.0.0.1:49374",
+            None,
+            data.path(),
+            &args,
+        )
+        .expect("apply_to_dsh succeeds");
 
         let staged = data.path().join("hooks").join("dsh");
         assert!(staged.join("session-start.sh").is_file(), "scripts staged");
@@ -10734,6 +10962,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         let mut args = default_hook_args();
         args.agent = AgentChoice::Dsh;
         apply_to_dsh(
+            &ai_memory_core::i18n::Localizer::default(),
             &source,
             "http://127.0.0.1:49374",
             Some("private-bearer"),
@@ -10775,6 +11004,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         let mut args = default_hook_args();
         args.agent = AgentChoice::Dsh;
         let error = apply_to_dsh(
+            &ai_memory_core::i18n::Localizer::default(),
             &source,
             "http://127.0.0.1:49374",
             Some("private-bearer"),
@@ -11361,6 +11591,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
     #[test]
     fn opencode_mcp_inference_supplies_hook_origin_and_token() {
         let inferred = infer_opencode_mcp_config(
+            &ai_memory_core::i18n::Localizer::default(),
             r#"{
               "mcp": {
                 "ai-memory": {
@@ -11395,9 +11626,13 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
                 r#"{"mcp":{"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false,"headers":{"Authorization":"Bearer v2-token"}}}}}"#,
             ),
         ] {
-            let inferred = infer_opencode_mcp_config(content, selected)
-                .unwrap()
-                .unwrap();
+            let inferred = infer_opencode_mcp_config(
+                &ai_memory_core::i18n::Localizer::default(),
+                content,
+                selected,
+            )
+            .unwrap()
+            .unwrap();
             let expected = if selected == McpClient::OpenCode2 {
                 ("http://v1-host:49374", "v1-token")
             } else {
@@ -11460,7 +11695,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
 
     #[test]
     fn opencode_mcp_inference_accepts_matching_owned_entries() {
-        let inferred = infer_opencode_mcp_config(
+        let inferred = infer_opencode_mcp_config(&ai_memory_core::i18n::Localizer::default(),
             r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://same-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer same-token"}},"servers":{"ai-memory":{"type":"remote","url":"http://same-host:49374/mcp","oauth":false,"headers":{"Authorization":"Bearer same-token"}}}}}"#,
             McpClient::OpenCode2,
         )
@@ -11477,7 +11712,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
 
     #[test]
     fn opencode_mcp_inference_rejects_conflicting_owned_entries() {
-        let error = infer_opencode_mcp_config(
+        let error = infer_opencode_mcp_config(&ai_memory_core::i18n::Localizer::default(),
             r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://v1-host:49374/mcp","enabled":true},"servers":{"ai-memory":{"type":"remote","url":"http://v2-host:49374/mcp","oauth":false}}}}"#,
             McpClient::OpenCode2,
         )
@@ -11491,7 +11726,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
 
     #[test]
     fn opencode_mcp_inference_ignores_user_owned_entries() {
-        let inferred = infer_opencode_mcp_config(
+        let inferred = infer_opencode_mcp_config(&ai_memory_core::i18n::Localizer::default(),
             r#"{"mcp":{"ai-memory":{"type":"remote","url":"http://user-host:49374/mcp","enabled":true,"headers":{"Authorization":"Bearer user-token","X-User":"route"}}}}"#,
             McpClient::OpenCode,
         )
@@ -11961,7 +12196,13 @@ model = "gpt-5"
         stub_scripts(&agent_src, &["session-start.sh", "post-tool-use.sh"]);
 
         let data_dir = tmp.path().join("data");
-        let staged = stage_hook_scripts_in(&agent_src, "stage-shared-lib", &data_dir).unwrap();
+        let staged = stage_hook_scripts_in(
+            &ai_memory_core::i18n::Localizer::default(),
+            &agent_src,
+            "stage-shared-lib",
+            &data_dir,
+        )
+        .unwrap();
         assert!(staged.join("session-start.sh").exists());
         assert!(staged.join("post-tool-use.sh").exists());
         assert!(
@@ -11988,7 +12229,13 @@ model = "gpt-5"
         stub_scripts(&agent_src, &["session-start.sh"]);
 
         let data_dir = tmp.path().join("data");
-        let staged = stage_hook_scripts_in(&agent_src, "stage-no-lib", &data_dir).unwrap();
+        let staged = stage_hook_scripts_in(
+            &ai_memory_core::i18n::Localizer::default(),
+            &agent_src,
+            "stage-no-lib",
+            &data_dir,
+        )
+        .unwrap();
         assert!(staged.join("session-start.sh").exists());
         assert!(!staged.join("_lib.sh").exists());
     }
@@ -12013,7 +12260,13 @@ model = "gpt-5"
 
         // Source == destination (this is what resolve_hooks_dir hands
         // us when no other candidate exists).
-        let staged = stage_hook_scripts_in(&in_place, agent_label, &data_dir).unwrap();
+        let staged = stage_hook_scripts_in(
+            &ai_memory_core::i18n::Localizer::default(),
+            &in_place,
+            agent_label,
+            &data_dir,
+        )
+        .unwrap();
 
         assert_eq!(staged, in_place, "destination must canonicalize to source");
         assert!(
@@ -12045,8 +12298,13 @@ model = "gpt-5"
         fs::create_dir_all(&in_place).unwrap();
         // Intentionally no scripts in `in_place`.
 
-        let err = stage_hook_scripts_in(&in_place, agent_label, &data_dir)
-            .expect_err("an empty source dir must produce a hard error, not Ok(0)");
+        let err = stage_hook_scripts_in(
+            &ai_memory_core::i18n::Localizer::default(),
+            &in_place,
+            agent_label,
+            &data_dir,
+        )
+        .expect_err("an empty source dir must produce a hard error, not Ok(0)");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no hook scripts"),
@@ -12071,8 +12329,13 @@ model = "gpt-5"
         // Source dir exists but has no scripts.
 
         let data_dir = tmp.path().join("data");
-        let err = stage_hook_scripts_in(&agent_src, "stage-empty-src", &data_dir)
-            .expect_err("zero scripts should be an error, not a silent success");
+        let err = stage_hook_scripts_in(
+            &ai_memory_core::i18n::Localizer::default(),
+            &agent_src,
+            "stage-empty-src",
+            &data_dir,
+        )
+        .expect_err("zero scripts should be an error, not a silent success");
         assert!(format!("{err:#}").contains("no hook scripts"));
     }
 
@@ -12089,7 +12352,13 @@ model = "gpt-5"
         fs::write(source.join("session-start.sh"), b"#!/bin/sh\n").unwrap();
 
         // Staged into the configured dir…
-        let staged = stage_hook_scripts_in(&source, "claude-code", &data_dir).unwrap();
+        let staged = stage_hook_scripts_in(
+            &ai_memory_core::i18n::Localizer::default(),
+            &source,
+            "claude-code",
+            &data_dir,
+        )
+        .unwrap();
         assert_eq!(staged, data_dir.join("hooks").join("claude-code"));
         assert!(staged.join("session-start.sh").is_file());
         assert!(
@@ -12118,7 +12387,13 @@ model = "gpt-5"
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("session-start.sh"), b"#!/bin/sh\n").unwrap();
 
-        let staged = stage_hook_scripts_in(&source, "claude-code", &default_data_dir).unwrap();
+        let staged = stage_hook_scripts_in(
+            &ai_memory_core::i18n::Localizer::default(),
+            &source,
+            "claude-code",
+            &default_data_dir,
+        )
+        .unwrap();
         assert_eq!(
             staged,
             data_local
@@ -12969,12 +13244,22 @@ model = "gpt-5"
         )
         .unwrap();
 
-        remove_incompatible_opencode_plugin(&v2, AgentChoice::OpenCode2).unwrap();
+        remove_incompatible_opencode_plugin(
+            &ai_memory_core::i18n::Localizer::default(),
+            &v2,
+            AgentChoice::OpenCode2,
+        )
+        .unwrap();
         assert!(!v1.exists());
         assert!(v2.exists());
 
         fs::write(&v1, "export default function userPlugin() {}\n").unwrap();
-        remove_incompatible_opencode_plugin(&v2, AgentChoice::OpenCode2).unwrap();
+        remove_incompatible_opencode_plugin(
+            &ai_memory_core::i18n::Localizer::default(),
+            &v2,
+            AgentChoice::OpenCode2,
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(&v1).unwrap(),
             "export default function userPlugin() {}\n"
@@ -12985,7 +13270,12 @@ model = "gpt-5"
             "// Auto-generated by `ai-memory install-hooks --agent opencode2 --apply`.\nconst AGENT = \"opencode2\";\n",
         )
         .unwrap();
-        remove_incompatible_opencode_plugin(&v1, AgentChoice::OpenCode).unwrap();
+        remove_incompatible_opencode_plugin(
+            &ai_memory_core::i18n::Localizer::default(),
+            &v1,
+            AgentChoice::OpenCode,
+        )
+        .unwrap();
         assert!(!v2.exists());
     }
 
@@ -13000,10 +13290,15 @@ model = "gpt-5"
         )
         .unwrap();
 
-        remove_incompatible_opencode_plugin_with(&v2, AgentChoice::OpenCode2, |sibling| {
-            fs::write(sibling, "export default function userReplacement() {}\n")?;
-            Ok(())
-        })
+        remove_incompatible_opencode_plugin_with(
+            &ai_memory_core::i18n::Localizer::default(),
+            &v2,
+            AgentChoice::OpenCode2,
+            |sibling| {
+                fs::write(sibling, "export default function userReplacement() {}\n")?;
+                Ok(())
+            },
+        )
         .unwrap();
 
         assert_eq!(
@@ -13094,9 +13389,23 @@ model = "gpt-5"
         args.agent = AgentChoice::OpenCode2;
         args.config_file = Some(plugin.clone());
 
-        apply_to_opencode2_plugin("http://127.0.0.1:49374", None, &args, "denylist").unwrap();
+        apply_to_opencode2_plugin(
+            &ai_memory_core::i18n::Localizer::default(),
+            "http://127.0.0.1:49374",
+            None,
+            &args,
+            "denylist",
+        )
+        .unwrap();
         let first = fs::read(&plugin).unwrap();
-        apply_to_opencode2_plugin("http://127.0.0.1:49374", None, &args, "denylist").unwrap();
+        apply_to_opencode2_plugin(
+            &ai_memory_core::i18n::Localizer::default(),
+            "http://127.0.0.1:49374",
+            None,
+            &args,
+            "denylist",
+        )
+        .unwrap();
         assert_eq!(fs::read(&plugin).unwrap(), first);
         assert!(!sibling.exists());
     }
@@ -13112,7 +13421,12 @@ model = "gpt-5"
         )
         .unwrap();
 
-        remove_incompatible_opencode_plugin(&custom, AgentChoice::OpenCode2).unwrap();
+        remove_incompatible_opencode_plugin(
+            &ai_memory_core::i18n::Localizer::default(),
+            &custom,
+            AgentChoice::OpenCode2,
+        )
+        .unwrap();
         assert!(sibling.exists());
     }
 
@@ -14247,7 +14561,11 @@ model = "gpt-5"
         let user_content = "// user-owned extension that happens to use this filename\n";
         std::fs::write(&legacy, user_content).unwrap();
 
-        remove_legacy_extension(&dir.path().join("ai-memory-omp.ts"), "omp");
+        remove_legacy_extension(
+            &ai_memory_core::i18n::Localizer::default(),
+            &dir.path().join("ai-memory-omp.ts"),
+            "omp",
+        );
 
         assert!(legacy.exists(), "user-owned file must survive");
         assert_eq!(std::fs::read_to_string(&legacy).unwrap(), user_content);
@@ -14265,7 +14583,11 @@ model = "gpt-5"
         )
         .unwrap();
 
-        remove_legacy_extension(&dir.path().join("ai-memory-omp.ts"), "omp");
+        remove_legacy_extension(
+            &ai_memory_core::i18n::Localizer::default(),
+            &dir.path().join("ai-memory-omp.ts"),
+            "omp",
+        );
 
         assert!(
             !legacy.exists(),
@@ -14284,7 +14606,11 @@ model = "gpt-5"
         std::fs::write(&legacy, omp_content).unwrap();
 
         // A *Pi* install runs its cleanup over the shared directory.
-        remove_legacy_extension(&dir.path().join("ai-memory-pi.ts"), "pi");
+        remove_legacy_extension(
+            &ai_memory_core::i18n::Localizer::default(),
+            &dir.path().join("ai-memory-pi.ts"),
+            "pi",
+        );
 
         assert!(legacy.exists(), "OMP's file must survive a Pi install");
         assert_eq!(std::fs::read_to_string(&legacy).unwrap(), omp_content);
@@ -15628,6 +15954,7 @@ process.exit(0);
         let staging_tmp = TempDir::new().unwrap();
 
         apply_to_codex_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16205,6 +16532,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         let staging_tmp = TempDir::new().unwrap();
 
         apply_to_claude_code_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16294,6 +16622,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             ..default_hook_args()
         };
         apply_to_claude_code_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16325,6 +16654,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             ..default_hook_args()
         };
         apply_to_claude_code_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16342,6 +16672,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             ..default_hook_args()
         };
         apply_to_claude_code_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16790,6 +17121,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         let config_path = config_tmp.path().join("hooks.v1.json");
 
         apply_to_devin_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16858,6 +17190,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         .unwrap();
 
         apply_to_devin_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16938,6 +17271,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         };
 
         apply_to_devin_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16948,6 +17282,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         .unwrap();
 
         apply_to_devin_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16988,6 +17323,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         };
 
         apply_to_devin_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -16998,6 +17334,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         .unwrap();
 
         apply_to_devin_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
@@ -17040,6 +17377,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         .unwrap();
 
         apply_to_devin_settings_in(
+            &ai_memory_core::i18n::Localizer::default(),
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,

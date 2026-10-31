@@ -29,6 +29,7 @@ struct ReclaimLedgerVersionsRequest {
 /// Returns an error when the server is unreachable or returns a non-2xx
 /// response.
 pub async fn run(config: &Config, args: ReclaimLedgerVersionsArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let dry_run = !args.confirm;
 
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -53,22 +54,25 @@ pub async fn run(config: &Config, args: ReclaimLedgerVersionsArgs) -> Result<()>
 
     if paths == 0 || rows == 0 {
         println!(
-            "No superseded ledger versions to reclaim. Nothing written by the \
-             pre-2.1.1 indexer is left in this store."
-        );
+            "{}", i18n.text("cli-reclaim-ledger-versions-no-superseded-ledger-versions-to-reclaim-nothing-written-by-the-pre-2-1-1-in"));
         return Ok(());
     }
 
     if dry_run {
         println!(
-            "Would delete {rows} superseded version(s) of the hook event ledger \
-             across {paths} ledger path(s), carrying {} of page body.",
-            human_bytes(body_bytes),
-        );
+            "{}", i18n.format("cli-reclaim-ledger-versions-would-delete-rows-superseded-version-s-of-the-hook-event-ledger-across-paths", &[("value0", format!("{}", rows)), ("value1", format!("{}", paths)), ("value2", human_bytes(body_bytes).to_string())]));
         if dropped_latest {
-            println!("  --drop-latest: each ledger's live row would go too.");
+            println!(
+                "{}",
+                i18n.text(
+                    "cli-reclaim-ledger-versions-drop-latest-each-ledger-s-live-row-would-go-too"
+                )
+            );
         }
-        println!("Nothing was changed. To apply:");
+        println!(
+            "{}",
+            i18n.text("cli-reclaim-ledger-versions-nothing-was-changed-to-apply")
+        );
         let mut flags = String::from("  ai-memory reclaim-ledger-versions --confirm");
         if args.drop_latest {
             flags.push_str(" --drop-latest");
@@ -81,25 +85,30 @@ pub async fn run(config: &Config, args: ReclaimLedgerVersionsArgs) -> Result<()>
     }
 
     println!(
-        "Deleted {rows} superseded ledger version(s) across {paths} ledger \
-         path(s), carrying {} of page body.",
-        human_bytes(body_bytes),
-    );
+        "{}", i18n.format("cli-reclaim-ledger-versions-deleted-rows-superseded-ledger-version-s-across-paths-ledger-path-s-carrying", &[("value0", format!("{}", rows)), ("value1", format!("{}", paths)), ("value2", human_bytes(body_bytes).to_string())]));
     if dropped_latest {
-        println!("  Each ledger's live row was dropped as well (--drop-latest).");
+        println!(
+            "{}",
+            i18n.text(
+                "cli-reclaim-ledger-versions-each-ledger-s-live-row-was-dropped-as-well-drop-latest"
+            )
+        );
     }
     if compacted {
         println!(
-            "Reclaimed {} ({} → {}).",
-            human_bytes(n("bytes_reclaimed")),
-            human_bytes(n("bytes_before")),
-            human_bytes(n("bytes_after")),
+            "{}",
+            i18n.format(
+                "cli-reclaim-ledger-versions-reclaimed",
+                &[
+                    ("value0", human_bytes(n("bytes_reclaimed")).to_string()),
+                    ("value1", human_bytes(n("bytes_before")).to_string()),
+                    ("value2", human_bytes(n("bytes_after")).to_string())
+                ]
+            )
         );
     } else {
         println!(
-            "The bytes are free pages now. Run `ai-memory compact --confirm` \
-             to return them to the filesystem."
-        );
+            "{}", i18n.text("cli-reclaim-ledger-versions-the-bytes-are-free-pages-now-run-ai-memory-compact-confirm-to-return-them-to"));
     }
     Ok(())
 }

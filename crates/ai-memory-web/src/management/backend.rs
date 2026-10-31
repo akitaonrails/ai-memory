@@ -81,6 +81,11 @@ impl Client {
             Ok(reply.data)
         } else {
             Err(super::failure(
+                &self
+                    .extensions
+                    .get::<ai_memory_core::i18n::Localizer>()
+                    .cloned()
+                    .unwrap_or_default(),
                 reply.status,
                 super::views::text(&reply.data, "error"),
             ))

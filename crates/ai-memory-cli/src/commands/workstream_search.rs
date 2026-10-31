@@ -9,6 +9,7 @@ use crate::http_client::{ServerEndpoint, get_json};
 
 /// Search or tail one portable managed-workstream ledger.
 pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let path = format!("/workstream/{}/events", args.workstream_id);
     let limit = args.limit.to_string();
@@ -28,22 +29,45 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
         return Ok(());
     }
     if events.is_empty() {
-        println!("No matching managed-workstream events.");
+        println!(
+            "{}",
+            i18n.text("cli-workstream-search-no-matching-managed-workstream-events")
+        );
         return Ok(());
     }
     for event in events {
         let role = event.display_label();
         println!(
-            "## Event {} | {} | {}",
-            event.sequence,
-            event.agent.as_str(),
-            role,
+            "{}",
+            i18n.format(
+                "cli-workstream-search-event",
+                &[
+                    ("value0", format!("{}", event.sequence)),
+                    ("value1", event.agent.as_str().to_string()),
+                    ("value2", role.to_string())
+                ]
+            )
         );
         if let Some(source) = &event.source_record_id {
-            println!("Source record: {}", serde_json::to_string(source)?);
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-workstream-search-source-record",
+                    &[("value0", serde_json::to_string(source)?.to_string())]
+                )
+            );
         }
         if !event.metadata.is_null() {
-            println!("Provenance: {}", serde_json::to_string(&event.metadata)?);
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-workstream-search-provenance",
+                    &[(
+                        "value0",
+                        serde_json::to_string(&event.metadata)?.to_string()
+                    )]
+                )
+            );
         }
         println!("{}\n", event.content);
     }

@@ -255,6 +255,7 @@ enum HeartbeatFailureKind {
 }
 
 fn resolve_opencode_for_launch(
+    i18n: &ai_memory_core::i18n::Localizer,
     requested: Option<RunHarnessChoice>,
     executable: Option<&OsStr>,
     env: &EffectiveChildEnv,
@@ -269,7 +270,12 @@ fn resolve_opencode_for_launch(
     match super::opencode_dialect::resolve_generic(executable, env) {
         Ok(resolved) => Ok(Some(resolved)),
         Err(error) if automatic => {
-            eprintln!("ai-memory: automatic OpenCode scan skipped: {error:#}");
+            eprintln!(
+                "{}",
+                i18n.diagnostic(&format!(
+                    "ai-memory: automatic OpenCode scan skipped: {error:#}"
+                ))
+            );
             Ok(None)
         }
         Err(error) => Err(error),
@@ -357,6 +363,7 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
             let stdin = io::stdin();
             let stderr = io::stderr();
             choose_after_run(
+                &config.i18n,
                 outcome.harness,
                 &outcome.workstream_name,
                 &available,
@@ -367,7 +374,12 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
         let action = match action {
             Ok(action) => action,
             Err(error) => {
-                eprintln!("ai-memory: could not read the post-run choice ({error}); exiting");
+                eprintln!(
+                    "{}",
+                    config.i18n.diagnostic(&format!(
+                        "ai-memory: could not read the post-run choice ({error}); exiting"
+                    ))
+                );
                 return Ok(outcome.exit_code);
             }
         };
@@ -421,6 +433,7 @@ fn available_switch_harnesses(
 }
 
 fn choose_after_run(
+    i18n: &ai_memory_core::i18n::Localizer,
     current: ManagedHarness,
     workstream_name: &str,
     available: &[RunHarnessChoice],
@@ -429,23 +442,33 @@ fn choose_after_run(
 ) -> io::Result<AfterRunAction> {
     writeln!(
         output,
-        "ai-memory: {} exited successfully in workstream '{}'.",
-        current.as_str(),
-        workstream_name
+        "{}",
+        i18n.diagnostic(&format!(
+            "ai-memory: {} exited successfully in workstream '{}'.",
+            current.as_str(),
+            workstream_name
+        ))
     )?;
     for (index, choice) in available.iter().enumerate() {
         writeln!(
             output,
-            "  {}) switch to {}",
-            index + 1,
-            managed_harness(*choice).as_str()
+            "{}",
+            i18n.diagnostic(&format!(
+                "  {}) switch to {}",
+                index + 1,
+                managed_harness(*choice).as_str()
+            ))
         )?;
     }
-    writeln!(output, "  r) run {} again", current.as_str())?;
-    writeln!(output, "  q) quit (default)")?;
+    writeln!(
+        output,
+        "{}",
+        i18n.diagnostic(&format!("  r) run {} again", current.as_str()))
+    )?;
+    writeln!(output, "{}", i18n.diagnostic("  q) quit (default)"))?;
 
     loop {
-        write!(output, "Select [q]: ")?;
+        write!(output, "{}", i18n.diagnostic("Select [q]: "))?;
         output.flush()?;
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -463,7 +486,11 @@ fn choose_after_run(
         {
             return Ok(AfterRunAction::Switch(*harness));
         }
-        writeln!(output, "Choose a listed number, r, or q.")?;
+        writeln!(
+            output,
+            "{}",
+            i18n.diagnostic("Choose a listed number, r, or q.")
+        )?;
     }
 }
 
@@ -572,8 +599,12 @@ async fn run_once_with_wiring(
         args.claude_wrapper.as_deref(),
         executable_search,
     );
-    let resolved_opencode =
-        resolve_opencode_for_launch(requested_harness, executable.as_deref(), &child_env)?;
+    let resolved_opencode = resolve_opencode_for_launch(
+        &config.i18n,
+        requested_harness,
+        executable.as_deref(),
+        &child_env,
+    )?;
     if matches!(requested_harness, Some(RunHarnessChoice::OpenCode))
         && let Some(resolved) = &resolved_opencode
     {
@@ -582,6 +613,7 @@ async fn run_once_with_wiring(
     let auto_candidates = if automatic_harness {
         filter_usable_auto_sessions(
             list_auto_sessions(
+                &config.i18n,
                 &home,
                 &repository.cwd,
                 &child_env,
@@ -660,8 +692,14 @@ async fn run_once_with_wiring(
         // `--jail` defers to that file while a listed toggle still overrides it.
         let toggles = parse_jail_toggles(spec, &jail_checklist(&jail_facts, &support), &support)?;
         if jail_plan.warn {
-            let confirmation = tokio::task::spawn_blocking(|| {
-                read_yolo_confirmation(false, &mut io::stdin().lock(), &mut io::stderr())
+            let confirmation_i18n = config.i18n.clone();
+            let confirmation = tokio::task::spawn_blocking(move || {
+                read_yolo_confirmation(
+                    &confirmation_i18n,
+                    false,
+                    &mut io::stdin().lock(),
+                    &mut io::stderr(),
+                )
             })
             .await
             .context("waiting for the --yolo confirmation")?
@@ -708,9 +746,7 @@ async fn run_once_with_wiring(
                 .context("opening managed workstream; the agent was not started"));
         }
         if jailed && apply_jail_process_isolation(provisional_harness, &mut native_args) {
-            eprintln!(
-                "ai-memory: OpenCode is running --standalone so its server and tool processes stay inside ai-jail"
-            );
+            eprintln!("{}", config.i18n.diagnostic("ai-memory: OpenCode is running --standalone so its server and tool processes stay inside ai-jail"));
         }
         return run_degraded_offline(
             config,
@@ -763,7 +799,14 @@ async fn run_once_with_wiring(
     let interrupted_before_spawn = CancellationToken::new();
     let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
     let prepared = async {
-        match prepare_managed_run(&endpoint, &prepare, interactive, &interrupted_before_spawn).await
+        match prepare_managed_run(
+            &config.i18n,
+            &endpoint,
+            &prepare,
+            interactive,
+            &interrupted_before_spawn,
+        )
+        .await
         {
             Err(error)
                 if (super::managed_project::is_ambiguous(&error)
@@ -773,6 +816,7 @@ async fn run_once_with_wiring(
                         && super::managed_project::is_missing(&error)) =>
             {
                 let scope = super::managed_project::choose(
+                    &config.i18n,
                     &endpoint,
                     &workspace,
                     &project,
@@ -783,8 +827,14 @@ async fn run_once_with_wiring(
                 prepare.project_id = Some(scope.project_id);
                 prepare.project.clear();
                 prepare.repository_identity = None;
-                prepare_managed_run(&endpoint, &prepare, interactive, &interrupted_before_spawn)
-                    .await
+                prepare_managed_run(
+                    &config.i18n,
+                    &endpoint,
+                    &prepare,
+                    interactive,
+                    &interrupted_before_spawn,
+                )
+                .await
             }
             result => result,
         }
@@ -799,7 +849,12 @@ async fn run_once_with_wiring(
         }
     };
     if let Some(warning) = prepared.manifest_warning.as_deref() {
-        eprintln!("ai-memory: warning: {warning}");
+        eprintln!(
+            "{}",
+            config
+                .i18n
+                .diagnostic(&format!("ai-memory: warning: {warning}"))
+        );
     }
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
     macro_rules! acquired_try {
@@ -808,7 +863,7 @@ async fn run_once_with_wiring(
                 Ok(value) => value,
                 Err(error) => {
                     interrupt_task.abort();
-                    cancel_managed_run_after_failure(&endpoint, &run_path).await;
+                    cancel_managed_run_after_failure(&config.i18n, &endpoint, &run_path).await;
                     return Err(error);
                 }
             }
@@ -835,10 +890,8 @@ async fn run_once_with_wiring(
             },
         )
     {
-        eprintln!(
-            "ai-memory: could not remember the project ID ({error:#}); use --project-id {} next time",
-            scope.project_id
-        );
+        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not remember the project ID ({error:#}); use --project-id {} next time",
+            scope.project_id)));
     }
     let resolved_name = prepared
         .resolved_project
@@ -851,9 +904,7 @@ async fn run_once_with_wiring(
         resolved_name,
         &repository.cwd,
     ) {
-        eprintln!(
-            "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
-        );
+        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run")));
     }
     let privacy = acquired_try!(Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from));
     if let Some(id) = prepared.native_session_id.as_deref() {
@@ -868,9 +919,7 @@ async fn run_once_with_wiring(
     }
     let resolved_harness = if automatic_harness {
         let resolved = prepared.resolved_agent.unwrap_or_else(|| {
-            eprintln!(
-                "ai-memory: the server does not support managed harness precedence; using the newest checkout-local session. Upgrade the server for established-workstream selection"
-            );
+            eprintln!("{}", config.i18n.diagnostic("ai-memory: the server does not support managed harness precedence; using the newest checkout-local session. Upgrade the server for established-workstream selection"));
             provisional_harness.agent_kind()
         });
         let selected = acquired_try!(managed_harness_from_agent(resolved).ok_or_else(|| {
@@ -903,9 +952,7 @@ async fn run_once_with_wiring(
         resolved_harness
     };
     if jailed && apply_jail_process_isolation(harness, &mut native_args) {
-        eprintln!(
-            "ai-memory: OpenCode is running --standalone so its server and tool processes stay inside ai-jail"
-        );
+        eprintln!("{}", config.i18n.diagnostic("ai-memory: OpenCode is running --standalone so its server and tool processes stay inside ai-jail"));
     }
     if automatic_harness
         && matches!(
@@ -939,6 +986,7 @@ async fn run_once_with_wiring(
     );
     let native_grok_rules = user_supplied_grok_rules(&native_args);
     let (mut plan, orphaned_session) = acquired_try!(build_preflighted_launch_plan(
+        &config.i18n,
         harness,
         executable.clone(),
         native_args.clone(),
@@ -962,21 +1010,17 @@ async fn run_once_with_wiring(
             &orphaned_session,
         )
         .unwrap_or_else(|error| {
-            eprintln!(
-                "ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted"
-            );
+            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted")));
             None
         });
         let current = effective_store(harness, &home, &repository.cwd, plan.session_dir.as_deref());
         if let Some(error) = store_mismatch_error(harness, &orphaned_session, recorded, &current) {
             acquired_try!(Err(error));
         }
-        eprintln!(
-            "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
+        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
             harness.as_str(),
             display_session_id(&orphaned_session),
-            prepared.workstream_name
-        );
+            prepared.workstream_name)));
         // The hint tells the user to repeat their own command with a selector
         // right after the harness name, which only works when they typed one
         // and launched an interactive session (`codex exec` and `opencode run`
@@ -998,9 +1042,12 @@ async fn run_once_with_wiring(
         }
     } else if force_fresh && plan.mode == LaunchMode::Session {
         eprintln!(
-            "ai-memory: starting a fresh {} session in workstream '{}'",
-            harness.as_str(),
-            prepared.workstream_name
+            "{}",
+            config.i18n.diagnostic(&format!(
+                "ai-memory: starting a fresh {} session in workstream '{}'",
+                harness.as_str(),
+                prepared.workstream_name
+            ))
         );
     }
     if automatic_harness
@@ -1027,9 +1074,12 @@ async fn run_once_with_wiring(
             }),
         ));
         eprintln!(
-            "ai-memory: continuing newest checkout-local {} session {}",
-            harness.as_str(),
-            display_session_id(&candidate.session.native_session_id)
+            "{}",
+            config.i18n.diagnostic(&format!(
+                "ai-memory: continuing newest checkout-local {} session {}",
+                harness.as_str(),
+                display_session_id(&candidate.session.native_session_id)
+            ))
         );
     } else if prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
@@ -1051,7 +1101,7 @@ async fn run_once_with_wiring(
         {
             Ok(candidates) if !candidates.is_empty() => {
                 let selection = acquired_try!(
-                    choose_native_session_interactive(
+                    choose_native_session_interactive(&config.i18n,
                         harness,
                         prepared.workstream_name.clone(),
                         candidates,
@@ -1076,17 +1126,13 @@ async fn run_once_with_wiring(
                         ));
                     }
                     Ok(None) => {}
-                    Err(error) => eprintln!(
-                        "ai-memory: could not read the native session choice ({error}); starting a new {} session",
-                        harness.as_str()
-                    ),
+                    Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not read the native session choice ({error}); starting a new {} session",
+                        harness.as_str()))),
                 }
             }
             Ok(_) => {}
-            Err(error) => eprintln!(
-                "ai-memory: could not inspect prior {} sessions ({error}); starting a new session",
-                harness.as_str()
-            ),
+            Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not inspect prior {} sessions ({error}); starting a new session",
+                harness.as_str()))),
         }
     }
     if yolo_requested {
@@ -1098,8 +1144,11 @@ async fn run_once_with_wiring(
             || harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
         {
             eprintln!(
-                "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
+                "{}",
+                config.i18n.diagnostic(
+                    "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
                  (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+                )
             );
         }
         apply_yolo(harness, &mut plan.args);
@@ -1131,9 +1180,7 @@ async fn run_once_with_wiring(
         false
     };
     if remove_kiro_home {
-        eprintln!(
-            "ai-memory: Kiro v3 stored this session under the default home despite custom KIRO_HOME; using the default home for this resume"
-        );
+        eprintln!("{}", config.i18n.diagnostic("ai-memory: Kiro v3 stored this session under the default home despite custom KIRO_HOME; using the default home for this resume"));
     }
     // Auto-wire this harness's ai-memory hooks + MCP the first time it launches
     // here, so managed launch "just works" for capture and recall without a
@@ -1221,13 +1268,11 @@ async fn run_once_with_wiring(
         None
     };
     if let Some(attach_id) = &attached_background {
-        eprintln!(
-            "ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
+        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
             plan.expected_session_id
                 .as_deref()
                 .map(display_session_id)
-                .unwrap_or_default()
-        );
+                .unwrap_or_default())));
         plan.args = vec![OsString::from("attach"), OsString::from(attach_id)];
     }
 
@@ -1251,10 +1296,8 @@ async fn run_once_with_wiring(
         {
             Ok(history) => history,
             Err(error) => {
-                eprintln!(
-                    "ai-memory: could not prepare the previous {} session history ({error:#}); continuing with the portable workstream packet",
-                    previous.agent.as_str()
-                );
+                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not prepare the previous {} session history ({error:#}); continuing with the portable workstream packet",
+                    previous.agent.as_str())));
                 None
             }
         },
@@ -1271,9 +1314,7 @@ async fn run_once_with_wiring(
         // rules flag wins and the packet stays undelivered (it is redelivered
         // on the next managed run that can accept it).
         if native_grok_rules {
-            eprintln!(
-                "ai-memory: --rules was supplied natively; the workstream context packet will be delivered on a later run"
-            );
+            eprintln!("{}", config.i18n.diagnostic("ai-memory: --rules was supplied natively; the workstream context packet will be delivered on a later run"));
             None
         } else {
             acquired_try!(fetch_grok_context(&endpoint, &run_path).await)
@@ -1352,7 +1393,7 @@ async fn run_once_with_wiring(
                 .is_ok();
             interrupt_task.abort();
             if !finished {
-                cancel_managed_run_after_failure(&endpoint, &run_path).await;
+                cancel_managed_run_after_failure(&config.i18n, &endpoint, &run_path).await;
             }
             return Err(anyhow!(spawn_message)).context(format!(
                 "starting managed {} executable {}",
@@ -1421,20 +1462,19 @@ async fn run_once_with_wiring(
                     .as_ref()
                     .and_then(|status| status.native_session_id.as_deref())
             {
-                eprintln!(
-                    "ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
+                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
                     harness.as_str(),
                     harness.agent_kind().as_str(),
                     SessionId::from_native(linked),
                     super::render_shared::shell_quote(&workspace),
-                    super::render_shared::shell_quote(&project)
-                );
+                    super::render_shared::shell_quote(&project))));
             }
             None
         }
     };
     let native_session_id = acquired_try!(
         resolve_native_session_after_run(
+            &config.i18n,
             &plan,
             harness,
             &home,
@@ -1465,9 +1505,7 @@ async fn run_once_with_wiring(
         ) {
             Ok(ids) => ids,
             Err(error) => {
-                eprintln!(
-                    "ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported"
-                );
+                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported")));
                 Vec::new()
             }
         }
@@ -1481,6 +1519,7 @@ async fn run_once_with_wiring(
             .then_some(prepared.source_cursor.as_deref())
             .flatten();
         let mut exported = export_after_flush(
+            &config.i18n,
             harness,
             &home,
             &repository.cwd,
@@ -1503,6 +1542,7 @@ async fn run_once_with_wiring(
         && harness.transcript_capability() == ai_memory_workstream::TranscriptCapability::Export
     {
         let exported = export_after_flush(
+            &config.i18n,
             harness,
             &home,
             &repository.cwd,
@@ -1588,14 +1628,12 @@ async fn run_once_with_wiring(
                 )
             );
             if !left_behind_session_ids.is_empty() {
-                eprintln!(
-                    "ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
+                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
                     left_behind_session_ids
                         .iter()
                         .map(|id| display_session_id(id))
                         .collect::<Vec<_>>()
-                        .join(", ")
-                );
+                        .join(", "))));
             }
             journal_finish_failed_run(
                 config,
@@ -1646,8 +1684,11 @@ async fn run_once_with_wiring(
         );
     }
     eprintln!(
-        "ai-memory: workstream '{}' saved {imported} new event(s)",
-        prepared.workstream_name
+        "{}",
+        config.i18n.diagnostic(&format!(
+            "ai-memory: workstream '{}' saved {imported} new event(s)",
+            prepared.workstream_name
+        ))
     );
     interrupt_task.abort();
     if let Some((session, finalized)) = finalize_hookless_session(
@@ -1662,17 +1703,15 @@ async fn run_once_with_wiring(
         let agent = harness.agent_kind().as_str();
         match finalized {
             Ok(ids) if !ids.is_empty() => {
-                eprintln!("ai-memory: finalized the {agent} session {session}");
+                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: finalized the {agent} session {session}")));
             }
             // No session under that id for this agent and owner in this
             // scope: its hooks are not installed or never fired, or they
             // filed it under another workspace/project.
             Ok(_) => {}
-            Err(error) => eprintln!(
-                "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+            Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
                 super::render_shared::shell_quote(&workspace),
-                super::render_shared::shell_quote(&project)
-            ),
+                super::render_shared::shell_quote(&project)))),
         }
     }
     Ok(RunOutcome {
@@ -1745,6 +1784,7 @@ async fn degraded_launch(
     // resumes, because the user named the session themselves and no
     // arbitration is needed. Everything else starts a fresh session.
     let (mut plan, _) = build_preflighted_launch_plan(
+        &config.i18n,
         launch.harness,
         launch.executable.clone(),
         launch.native_args.to_vec(),
@@ -1772,8 +1812,11 @@ async fn degraded_launch(
             || launch.harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
         {
             eprintln!(
-                "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
+                "{}",
+                config.i18n.diagnostic(
+                    "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
                  (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+                )
             );
         }
         apply_yolo(launch.harness, &mut plan.args);
@@ -1870,8 +1913,11 @@ async fn degraded_launch(
     let exit_code = status.code().unwrap_or(1);
     let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&config.data_dir));
     eprintln!(
-        "ai-memory: this run was not recorded on the server; {}",
-        spooled_events_note(&spool)
+        "{}",
+        config.i18n.diagnostic(&format!(
+            "ai-memory: this run was not recorded on the server; {}",
+            spooled_events_note(&spool)
+        ))
     );
     journal_degraded_run(
         config,
@@ -1923,34 +1969,41 @@ async fn journal_degraded_run(
         .await
         .unwrap_or_else(|error| {
             eprintln!(
-                "ai-memory: could not uniquely identify the session this run used ({error:#}); \
+                "{}",
+                config.i18n.diagnostic(&format!(
+                    "ai-memory: could not uniquely identify the session this run used ({error:#}); \
                  nothing was journaled; preserve the local transcript and run `ai-memory \
                  backfill --force --session <id>` after identifying it"
+                ))
             );
             None
         }),
         Err(error) => {
             eprintln!(
-                "ai-memory: could not record this run for recovery (privacy config: {error}); \
+                "{}",
+                config.i18n.diagnostic(&format!(
+                    "ai-memory: could not record this run for recovery (privacy config: {error}); \
                  nothing was journaled"
+                ))
             );
             return;
         }
     };
     let Some(native_session_id) = native_session_id else {
         eprintln!(
-            "ai-memory: no native session was discovered, so this run could not be journaled; \
+            "{}",
+            config.i18n.diagnostic(
+                "ai-memory: no native session was discovered, so this run could not be journaled; \
              retain the harness transcript for manual backfill"
+            )
         );
         return;
     };
     let source_cursor = match prelaunch_cursor {
         Some(Ok(cursor)) => Some(cursor),
         Some(Err(error)) => {
-            eprintln!(
-                "ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
-                display_session_id(&native_session_id)
-            );
+            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                display_session_id(&native_session_id))));
             return;
         }
         None => None,
@@ -1972,18 +2025,14 @@ async fn journal_degraded_run(
         {
             Ok(export) => export,
             Err(error) => {
-                eprintln!(
-                    "ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
-                    display_session_id(&native_session_id)
-                );
+                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                    display_session_id(&native_session_id))));
                 return;
             }
         };
         let Some(final_cursor) = exact_export.source_cursor.clone() else {
-            eprintln!(
-                "ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
-                launch.harness.as_str()
-            );
+            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
+                launch.harness.as_str())));
             return;
         };
         (
@@ -2019,15 +2068,21 @@ async fn journal_degraded_run(
     match super::recovery::append_journal_entry(&config.data_dir, entry) {
         Ok(()) => {
             eprintln!(
-                "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
+                "{}",
+                config.i18n.diagnostic(
+                    "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
                  is back to replay this session's exact native transcript"
+                )
             );
         }
         Err(error) => {
             eprintln!(
-                "ai-memory: could not record this run for recovery ({error:#}); the native \
+                "{}",
+                config.i18n.diagnostic(&format!(
+                    "ai-memory: could not record this run for recovery ({error:#}); the native \
                  transcript remains in the harness store and can be imported with `ai-memory \
                  backfill --force --session <id>`"
+                ))
             );
         }
     }
@@ -2262,14 +2317,20 @@ fn journal_finish_failed_run(
     match super::recovery::append_journal_entry(&config.data_dir, entry) {
         Ok(()) => {
             eprintln!(
-                "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
+                "{}",
+                config.i18n.diagnostic(
+                    "ai-memory: recorded for recovery — run `ai-memory recover` once the server \
                  is back to re-import this transcript"
+                )
             );
         }
         Err(error) => {
             eprintln!(
-                "ai-memory: could not record this run for recovery ({error:#}); retain the \
+                "{}",
+                config.i18n.diagnostic(&format!(
+                    "ai-memory: could not record this run for recovery ({error:#}); retain the \
                  native transcript and original run id for manual repair"
+                ))
             );
         }
     }
@@ -2397,7 +2458,11 @@ async fn send_managed_heartbeat_with_timeout(
     result
 }
 
-async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &str) {
+async fn cancel_managed_run_after_failure(
+    i18n: &ai_memory_core::i18n::Localizer,
+    endpoint: &ServerEndpoint,
+    run_path: &str,
+) {
     if let Err(error) = post_empty_with_retry(
         endpoint,
         &format!("{run_path}/cancel"),
@@ -2406,7 +2471,10 @@ async fn cancel_managed_run_after_failure(endpoint: &ServerEndpoint, run_path: &
     .await
     {
         eprintln!(
-            "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
+            "{}",
+            i18n.diagnostic(&format!(
+                "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
+            ))
         );
     }
 }
@@ -2542,8 +2610,8 @@ fn jail_decision(
 /// else also proceeds — this is a `[Y/n]` prompt, not a strict allowlist.
 fn yolo_decision(confirmed_line: &str) -> bool {
     !matches!(
-        confirmed_line.trim().to_ascii_lowercase().as_str(),
-        "n" | "no"
+        confirmed_line.trim().to_lowercase().as_str(),
+        "n" | "no" | "não" | "nao"
     )
 }
 
@@ -2561,19 +2629,22 @@ struct YoloConfirmation {
 /// `input`/`output` are injected so the wording and default-yes semantics
 /// are unit-tested without a real terminal.
 fn read_yolo_confirmation(
+    i18n: &ai_memory_core::i18n::Localizer,
     ai_jail_available: bool,
     input: &mut impl io::BufRead,
     output: &mut impl io::Write,
 ) -> io::Result<YoloConfirmation> {
     writeln!(
         output,
-        "⚠  --yolo runs every tool call with no confirmation. An agent can delete"
+        "{}",
+        i18n.diagnostic("⚠  --yolo runs every tool call with no confirmation. An agent can delete")
     )?;
     writeln!(
         output,
-        "   files, run any command, and reach the network unsupervised."
+        "{}",
+        i18n.diagnostic("   files, run any command, and reach the network unsupervised.")
     )?;
-    write!(output, "   Proceed? [Y/n] ")?;
+    write!(output, "{}", i18n.diagnostic("   Proceed? [Y/n] "))?;
     output.flush()?;
     let mut line = String::new();
     input.read_line(&mut line)?;
@@ -2591,7 +2662,8 @@ fn read_yolo_confirmation(
     }
     write!(
         output,
-        "ai-jail is installed. Re-run this session inside it? [Y/n] "
+        "{}",
+        i18n.diagnostic("ai-jail is installed. Re-run this session inside it? [Y/n] ")
     )?;
     output.flush()?;
     let mut jail_line = String::new();
@@ -2652,14 +2724,13 @@ fn apply_checklist_answer(line: &str, checked: &mut [bool]) -> ChecklistAnswer {
 }
 
 fn render_checklist(
+    i18n: &ai_memory_core::i18n::Localizer,
     items: &[JailChecklistItem],
     checked: &[bool],
     output: &mut impl io::Write,
 ) -> io::Result<()> {
     writeln!(
-        output,
-        "Enable in the jail (Enter = as marked; numbers flip, e.g. \"2 4\"; \"all\" / \"none\"):"
-    )?;
+        output, "{}", i18n.diagnostic("Enable in the jail (Enter = as marked; numbers flip, e.g. \"2 4\"; \"all\" / \"none\"):"))?;
     let width = items
         .iter()
         .map(|item| item.toggle.label.chars().count())
@@ -2685,6 +2756,7 @@ fn render_checklist(
 /// it ([`marked_choices`]): checked rows `--X`, unchecked rows `--no-X`, so an
 /// unchecked row stays off even if the user's own ai-jail config enables it.
 fn read_jail_checklist(
+    i18n: &ai_memory_core::i18n::Localizer,
     items: &[JailChecklistItem],
     input: &mut impl io::BufRead,
     output: &mut impl io::Write,
@@ -2692,7 +2764,7 @@ fn read_jail_checklist(
     let mut checked: Vec<bool> = items.iter().map(|item| item.checked).collect();
     let mut invalid = 0;
     loop {
-        render_checklist(items, &checked, output)?;
+        render_checklist(i18n, items, &checked, output)?;
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
             writeln!(output)?;
@@ -2703,11 +2775,11 @@ fn read_jail_checklist(
             ChecklistAnswer::Changed => {}
             ChecklistAnswer::Invalid(message) => {
                 invalid += 1;
-                writeln!(output, "{message}")?;
+                writeln!(output, "{}", i18n.diagnostic(&message))?;
                 if invalid >= CHECKLIST_MAX_INVALID {
-                    return Err(io::Error::other(
+                    return Err(io::Error::other(i18n.diagnostic(
                         "too many unrecognized answers to the ai-jail checklist",
-                    ));
+                    )));
                 }
             }
         }
@@ -2801,8 +2873,10 @@ async fn confirm_yolo_and_maybe_reexec(
         JailMode::Stay | JailMode::Explicit(_) => (None, false),
     };
     let ai_jail_available = ai_jail.is_some();
+    let confirmation_i18n = config.i18n.clone();
     let confirmation = tokio::task::spawn_blocking(move || {
         read_yolo_confirmation(
+            &confirmation_i18n,
             ai_jail_available,
             &mut io::stdin().lock(),
             &mut io::stderr(),
@@ -2825,8 +2899,14 @@ async fn confirm_yolo_and_maybe_reexec(
     let toggles = if !show_checklist || items.is_empty() {
         Vec::new()
     } else {
+        let checklist_i18n = config.i18n.clone();
         tokio::task::spawn_blocking(move || {
-            read_jail_checklist(&items, &mut io::stdin().lock(), &mut io::stderr())
+            read_jail_checklist(
+                &checklist_i18n,
+                &items,
+                &mut io::stdin().lock(),
+                &mut io::stderr(),
+            )
         })
         .await
         .context("waiting for the ai-jail checklist")?
@@ -2838,7 +2918,7 @@ async fn confirm_yolo_and_maybe_reexec(
     // rather than left to the 90s orphan timeout — the jailed re-run opens
     // its own workstream cleanly. A degraded launch holds no lease.
     if let Some((endpoint, run_path)) = lease {
-        cancel_managed_run_after_failure(endpoint, run_path).await;
+        cancel_managed_run_after_failure(&config.i18n, endpoint, run_path).await;
     }
     Err(exec_under_ai_jail(
         ai_jail,
@@ -3034,6 +3114,7 @@ fn own_native_session(
 /// transcript, so the workstream follows it. Otherwise the next launch resumes
 /// the launch session, which holds none of the later conversation.
 fn follow_claude_continued_session(
+    i18n: &ai_memory_core::i18n::Localizer,
     plan: &LaunchPlan,
     harness: ManagedHarness,
     home: &Path,
@@ -3051,18 +3132,19 @@ fn follow_claude_continued_session(
                 ClaudeContinuation::Cleared(_) => "was cleared into session",
             };
             eprintln!(
-                "ai-memory: Claude session {} {how} {}; the workstream now follows it",
-                display_session_id(&own),
-                display_session_id(continuation.session_id())
+                "{}",
+                i18n.diagnostic(&format!(
+                    "ai-memory: Claude session {} {how} {}; the workstream now follows it",
+                    display_session_id(&own),
+                    display_session_id(continuation.session_id())
+                ))
             );
             continuation.session_id().to_owned()
         }
         Ok(None) => own,
         Err(error) => {
-            eprintln!(
-                "ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
-                display_session_id(&own)
-            );
+            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
+                display_session_id(&own))));
             own
         }
     }
@@ -3101,6 +3183,7 @@ fn claude_left_behind_session_ids(
 
 #[allow(clippy::too_many_arguments)]
 async fn resolve_native_session_after_run(
+    i18n: &ai_memory_core::i18n::Localizer,
     plan: &LaunchPlan,
     harness: ManagedHarness,
     home: &Path,
@@ -3117,7 +3200,7 @@ async fn resolve_native_session_after_run(
     }
     if let Ok(Some(own)) = own_native_session(plan, harness, home, cwd, server_status, sanitizer) {
         return Ok(Some(follow_claude_continued_session(
-            plan, harness, home, cwd, own, started_at,
+            i18n, plan, harness, home, cwd, own, started_at,
         )));
     }
     let linked = server_status
@@ -3138,9 +3221,7 @@ async fn resolve_native_session_after_run(
         // The session the run was prepared with is no evidence either: this
         // launch may not have touched it while another one did.
         Err(error) if error.is::<AmbiguousNativeSession>() => {
-            eprintln!(
-                "ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it"
-            );
+            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it")));
             return Ok(None);
         }
         Err(error) => return Err(error),
@@ -3161,6 +3242,7 @@ async fn resolve_native_session_after_run(
 }
 
 async fn list_auto_sessions(
+    i18n: &ai_memory_core::i18n::Localizer,
     home: &Path,
     cwd: &Path,
     env: &EffectiveChildEnv,
@@ -3202,7 +3284,10 @@ async fn list_auto_sessions(
         ));
     }
     for failure in failures {
-        eprintln!("ai-memory: session scan skipped {failure}");
+        eprintln!(
+            "{}",
+            i18n.diagnostic(&format!("ai-memory: session scan skipped {failure}"))
+        );
     }
     found.sort_by(|left, right| {
         right
@@ -3581,6 +3666,7 @@ fn missing_context_warning(harness: ManagedHarness, resumes_linked_session: bool
 
 #[allow(clippy::too_many_arguments)]
 fn build_preflighted_launch_plan(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: ManagedHarness,
     executable: Option<OsString>,
     native_args: Vec<OsString>,
@@ -3634,11 +3720,9 @@ fn build_preflighted_launch_plan(
             Some(linked_session_id.to_string()),
         )),
         Err(error) => {
-            eprintln!(
-                "ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
+            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
                 harness.as_str(),
-                display_session_id(linked_session_id)
-            );
+                display_session_id(linked_session_id))));
             Ok((plan, None))
         }
     }
@@ -3697,9 +3781,7 @@ fn remember_session_store(
         native_session_id,
         store,
     ) {
-        eprintln!(
-            "ai-memory: could not record the client-local session store ({error:#}); continuing the managed run"
-        );
+        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not record the client-local session store ({error:#}); continuing the managed run")));
     }
 }
 
@@ -4262,6 +4344,7 @@ pub(crate) fn native_home(config: &Config) -> Option<PathBuf> {
 }
 
 async fn choose_native_session_interactive(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: ManagedHarness,
     workstream_name: String,
     candidates: Vec<NativeSessionCandidate>,
@@ -4269,10 +4352,12 @@ async fn choose_native_session_interactive(
     run_path: &str,
     interrupted: &CancellationToken,
 ) -> Result<io::Result<Option<String>>> {
+    let chooser_i18n = i18n.clone();
     let chooser = tokio::task::spawn_blocking(move || {
         let stdin = io::stdin();
         let mut stderr = io::stderr();
         choose_native_session(
+            &chooser_i18n,
             harness,
             &workstream_name,
             &candidates,
@@ -4325,6 +4410,7 @@ async fn wait_for_native_session_choice(
 }
 
 fn choose_native_session(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: ManagedHarness,
     workstream_name: &str,
     candidates: &[NativeSessionCandidate],
@@ -4334,24 +4420,38 @@ fn choose_native_session(
 ) -> io::Result<Option<String>> {
     writeln!(
         output,
-        "ai-memory: no {} session is linked to workstream '{}'.",
-        harness.as_str(),
-        workstream_name
+        "{}",
+        i18n.diagnostic(&format!(
+            "ai-memory: no {} session is linked to workstream '{}'.",
+            harness.as_str(),
+            workstream_name
+        ))
     )?;
-    writeln!(output, "Previous sessions for this checkout:")?;
+    writeln!(
+        output,
+        "{}",
+        i18n.diagnostic("Previous sessions for this checkout:")
+    )?;
     for (index, candidate) in candidates.iter().enumerate() {
         writeln!(
             output,
-            "  {}) {} (updated {})",
-            index + 1,
-            display_session_id(&candidate.native_session_id),
-            session_age(candidate.updated_at, now)
+            "{}",
+            i18n.diagnostic(&format!(
+                "  {}) {} (updated {})",
+                index + 1,
+                display_session_id(&candidate.native_session_id),
+                session_age(candidate.updated_at, now)
+            ))
         )?;
     }
-    writeln!(output, "  0) Start a new {} session", harness.as_str())?;
+    writeln!(
+        output,
+        "{}",
+        i18n.diagnostic(&format!("  0) Start a new {} session", harness.as_str()))
+    )?;
 
     loop {
-        write!(output, "Select [1]: ")?;
+        write!(output, "{}", i18n.diagnostic("Select [1]: "))?;
         output.flush()?;
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
@@ -4370,7 +4470,11 @@ fn choose_native_session(
         {
             return Ok(Some(candidate.native_session_id.clone()));
         }
-        writeln!(output, "Enter 0 through {}.", candidates.len())?;
+        writeln!(
+            output,
+            "{}",
+            i18n.diagnostic(&format!("Enter 0 through {}.", candidates.len()))
+        )?;
     }
 }
 
@@ -4500,6 +4604,7 @@ async fn export_exact_after_run(
 }
 
 async fn export_after_flush(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: ManagedHarness,
     home: &std::path::Path,
     cwd: &std::path::Path,
@@ -4518,7 +4623,12 @@ async fn export_after_flush(
     if let Err(error) =
         wait_for_transcript_flush(harness, home, cwd, session_dir, native_session_id).await
     {
-        eprintln!("ai-memory: transcript flush check failed: {error}");
+        eprintln!(
+            "{}",
+            i18n.diagnostic(&format!(
+                "ai-memory: transcript flush check failed: {error}"
+            ))
+        );
     }
     match export_transcript(
         harness,
@@ -4685,6 +4795,7 @@ impl PrepareRunOutcome {
 }
 
 fn complete_prepare_run(
+    i18n: &ai_memory_core::i18n::Localizer,
     outcome: PrepareRunOutcome,
     output: &mut impl io::Write,
 ) -> Result<PrepareManagedRunResponse> {
@@ -4695,7 +4806,11 @@ fn complete_prepare_run(
         }
         Err(error) => {
             if let Some(warning) = outcome.manifest_warning {
-                let _ = writeln!(output, "ai-memory: warning: {warning}");
+                let _ = writeln!(
+                    output,
+                    "{}",
+                    i18n.diagnostic(&format!("ai-memory: warning: {warning}"))
+                );
             }
             Err(error)
         }
@@ -4703,6 +4818,7 @@ fn complete_prepare_run(
 }
 
 async fn prepare_managed_run(
+    i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
     interactive: bool,
@@ -4716,9 +4832,14 @@ async fn prepare_managed_run(
             )),
             other => other,
         };
-        return complete_prepare_run(PrepareRunOutcome::from_result(result), &mut io::stderr());
+        return complete_prepare_run(
+            i18n,
+            PrepareRunOutcome::from_result(result),
+            &mut io::stderr(),
+        );
     }
     let outcome = prepare_managed_run_with_retry(
+        i18n,
         endpoint,
         request,
         PREPARE_BUSY_RETRY_WINDOW,
@@ -4730,6 +4851,7 @@ async fn prepare_managed_run(
         // Scripts, hooks, and CI keep the short window: they must never hang
         // silently for up to a full lease.
         wait_out_held_lease(
+            i18n,
             endpoint,
             request,
             outcome,
@@ -4741,7 +4863,7 @@ async fn prepare_managed_run(
     } else {
         outcome
     };
-    complete_prepare_run(outcome, &mut io::stderr())
+    complete_prepare_run(i18n, outcome, &mut io::stderr())
 }
 
 /// After the quick retry window, an interactive launch waits out a lease left
@@ -4751,6 +4873,7 @@ async fn prepare_managed_run(
 /// launcher that is still running; that is reported, never waited on or taken
 /// over (the server's busy check stays the only arbiter of ownership).
 async fn wait_out_held_lease(
+    i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
     outcome: PrepareRunOutcome,
@@ -4781,12 +4904,15 @@ async fn wait_out_held_lease(
         };
     };
     eprintln!(
-        "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
+        "{}",
+        i18n.diagnostic(&format!(
+            "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
          without releasing it. Waiting {}s for that lease to lapse (Ctrl-C to abort; \
          `--new <name>` starts a separate workstream).",
-        held.owner,
-        held.expires,
-        wait.as_secs_f64().ceil()
+            held.owner,
+            held.expires,
+            wait.as_secs_f64().ceil()
+        ))
     );
     tokio::select! {
         biased;
@@ -4799,6 +4925,7 @@ async fn wait_out_held_lease(
         () = tokio::time::sleep(wait) => {}
     }
     let retry = prepare_managed_run_with_retry(
+        i18n,
         endpoint,
         request,
         retry_window,
@@ -4857,6 +4984,7 @@ fn held_lease_wait(
 }
 
 async fn prepare_managed_run_with_retry(
+    i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
     request: &PrepareManagedRunRequest,
     retry_window: Duration,
@@ -4880,9 +5008,7 @@ async fn prepare_managed_run_with_retry(
                     manifest_warning = server_manifest_warning(&error);
                 }
                 if !reported_wait {
-                    eprintln!(
-                        "ai-memory: another launcher owns this workstream; waiting briefly in case it is finalizing"
-                    );
+                    eprintln!("{}", i18n.diagnostic("ai-memory: another launcher owns this workstream; waiting briefly in case it is finalizing"));
                     reported_wait = true;
                 }
                 tokio::time::sleep(retry_interval).await;
@@ -5392,6 +5518,7 @@ mod tests {
     fn run_checklist(input: &str) -> (io::Result<Vec<String>>, String) {
         let mut output = Vec::new();
         let result = read_jail_checklist(
+            &ai_memory_core::i18n::Localizer::default(),
             &checklist_items(),
             &mut Cursor::new(input.as_bytes().to_vec()),
             &mut output,
@@ -5659,13 +5786,22 @@ mod tests {
         assert!(!yolo_decision("N"));
         assert!(!yolo_decision("no"));
         assert!(!yolo_decision("NO\n"));
+        assert!(!yolo_decision("não"));
+        assert!(!yolo_decision("NÃO\n"));
+        assert!(!yolo_decision("nao"));
     }
 
     #[test]
     fn read_yolo_confirmation_default_enter_proceeds_without_jail_offer() {
         let mut input = Cursor::new(b"\n".to_vec());
         let mut output = Vec::new();
-        let confirmation = read_yolo_confirmation(false, &mut input, &mut output).unwrap();
+        let confirmation = read_yolo_confirmation(
+            &ai_memory_core::i18n::Localizer::default(),
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(
             confirmation,
             YoloConfirmation {
@@ -5682,7 +5818,13 @@ mod tests {
     fn read_yolo_confirmation_decline_aborts_before_the_jail_offer() {
         let mut input = Cursor::new(b"n\n".to_vec());
         let mut output = Vec::new();
-        let confirmation = read_yolo_confirmation(true, &mut input, &mut output).unwrap();
+        let confirmation = read_yolo_confirmation(
+            &ai_memory_core::i18n::Localizer::default(),
+            true,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(
             confirmation,
             YoloConfirmation {
@@ -5701,7 +5843,13 @@ mod tests {
     fn read_yolo_confirmation_offers_ai_jail_and_reads_its_answer() {
         let mut input = Cursor::new(b"\nn\n".to_vec());
         let mut output = Vec::new();
-        let confirmation = read_yolo_confirmation(true, &mut input, &mut output).unwrap();
+        let confirmation = read_yolo_confirmation(
+            &ai_memory_core::i18n::Localizer::default(),
+            true,
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(
             confirmation,
             YoloConfirmation {
@@ -5744,6 +5892,7 @@ mod tests {
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
         let action = choose_after_run(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Claude,
             "research",
             &[RunHarnessChoice::Codex],
@@ -5766,6 +5915,7 @@ mod tests {
         let mut output = Vec::new();
         assert_eq!(
             choose_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Claude,
                 "research",
                 &[RunHarnessChoice::Codex],
@@ -6635,6 +6785,7 @@ mod tests {
         };
 
         let prepared = prepare_managed_run_with_retry(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             // A wall-clock give-up deadline, not a latency assertion. This
@@ -6703,6 +6854,7 @@ mod tests {
         );
         let (endpoint, server) = serve(app).await;
         let outcome = prepare_managed_run_with_retry(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &held_lease_request(),
             Duration::from_secs(5),
@@ -6718,7 +6870,12 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        let error = complete_prepare_run(outcome, &mut output).expect_err("final 404 is preserved");
+        let error = complete_prepare_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            outcome,
+            &mut output,
+        )
+        .expect_err("final 404 is preserved");
         let response = error.downcast_ref::<ServerResponseError>().unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         assert!(response.body().contains("final missing workstream"));
@@ -6772,6 +6929,7 @@ mod tests {
         );
         let (endpoint, server) = serve(app).await;
         let outcome = prepare_managed_run_with_retry(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &held_lease_request(),
             Duration::from_secs(5),
@@ -6780,7 +6938,12 @@ mod tests {
         )
         .await;
         let mut output = Vec::new();
-        let response = complete_prepare_run(outcome, &mut output).unwrap();
+        let response = complete_prepare_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            outcome,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
             response.manifest_warning.as_deref(),
@@ -6935,6 +7098,7 @@ mod tests {
                 .expect_err("the first attempt sees the held lease");
         let started = std::time::Instant::now();
         let prepared = wait_out_held_lease(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             PrepareRunOutcome::from_result(Err(first)),
@@ -6971,6 +7135,7 @@ mod tests {
             .to_string(),
         );
         let outcome = wait_out_held_lease(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             PrepareRunOutcome::from_result(Err(first)),
@@ -6980,7 +7145,12 @@ mod tests {
         )
         .await;
         let mut output = Vec::new();
-        let response = complete_prepare_run(outcome, &mut output).unwrap();
+        let response = complete_prepare_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            outcome,
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(
             response.manifest_warning.as_deref(),
@@ -7002,6 +7172,7 @@ mod tests {
                 .await
                 .expect_err("held");
         let error = wait_out_held_lease(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             PrepareRunOutcome::from_result(Err(first)),
@@ -7027,9 +7198,15 @@ mod tests {
         request.force_unlock = true;
         let started = std::time::Instant::now();
 
-        let error = prepare_managed_run(&endpoint, &request, true, &CancellationToken::new())
-            .await
-            .expect_err("a server that refuses the takeover must fail immediately");
+        let error = prepare_managed_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            &endpoint,
+            &request,
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a server that refuses the takeover must fail immediately");
 
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
@@ -7053,6 +7230,7 @@ mod tests {
         interrupted.cancel();
         let started = std::time::Instant::now();
         let error = wait_out_held_lease(
+            &ai_memory_core::i18n::Localizer::default(),
             &endpoint,
             &request,
             PrepareRunOutcome::from_result(Err(first)),
@@ -7103,9 +7281,14 @@ mod tests {
         let search = env.executable_search();
 
         assert!(
-            resolve_opencode_for_launch(None, None, &env)
-                .unwrap()
-                .is_none()
+            resolve_opencode_for_launch(
+                &ai_memory_core::i18n::Localizer::default(),
+                None,
+                None,
+                &env
+            )
+            .unwrap()
+            .is_none()
         );
         let usable = filter_usable_auto_sessions(
             vec![auto_candidate(ManagedHarness::Codex, 100)],
@@ -7115,8 +7298,13 @@ mod tests {
         assert_eq!(usable.len(), 1);
         assert_eq!(usable[0].harness, ManagedHarness::Codex);
 
-        let explicit =
-            resolve_opencode_for_launch(Some(RunHarnessChoice::OpenCode), None, &env).unwrap_err();
+        let explicit = resolve_opencode_for_launch(
+            &ai_memory_core::i18n::Localizer::default(),
+            Some(RunHarnessChoice::OpenCode),
+            None,
+            &env,
+        )
+        .unwrap_err();
         assert!(
             format!("{explicit:#}").contains("could not determine the OpenCode major"),
             "{explicit:#}"
@@ -7148,6 +7336,7 @@ mod tests {
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
         let selected = choose_native_session(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Codex,
             "default",
             &candidates(),
@@ -7250,6 +7439,7 @@ mod tests {
         let mut output = Vec::new();
         assert!(
             choose_native_session(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Claude,
                 "default",
                 &candidates(),
@@ -7263,6 +7453,7 @@ mod tests {
 
         let mut older_input = Cursor::new(b"invalid\n2\n");
         let selected = choose_native_session(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Codex,
             "default",
             &candidates(),
@@ -7553,6 +7744,7 @@ mod tests {
 
         let env = EffectiveChildEnv::default();
         let (fresh, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::KiroV3,
             None,
             vec![OsString::from("--v3")],
@@ -8884,6 +9076,7 @@ mod tests {
         let env = EffectiveChildEnv::default();
 
         let (resumed, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Pi,
             None,
             native_args.clone(),
@@ -8900,6 +9093,7 @@ mod tests {
 
         std::fs::remove_file(transcript).unwrap();
         let (fresh, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Pi,
             None,
             native_args.clone(),
@@ -8915,6 +9109,7 @@ mod tests {
         assert!(!fresh.args.iter().any(|arg| arg == "linked"));
 
         let (explicit, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Pi,
             None,
             [
@@ -8956,6 +9151,7 @@ mod tests {
         let env = EffectiveChildEnv::default();
         let plan = || {
             build_preflighted_launch_plan(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Codex,
                 None,
                 Vec::new(),
@@ -9114,9 +9310,15 @@ mod tests {
                 .map(|(key, value)| (OsString::from(key), OsString::from(value))),
         );
 
-        let found = list_auto_sessions(&home, &cwd, &env, Some(ManagedHarness::OpenCode))
-            .await
-            .unwrap();
+        let found = list_auto_sessions(
+            &ai_memory_core::i18n::Localizer::default(),
+            &home,
+            &cwd,
+            &env,
+            Some(ManagedHarness::OpenCode),
+        )
+        .await
+        .unwrap();
         let claude: Vec<&str> = found
             .iter()
             .filter(|candidate| candidate.harness == ManagedHarness::Claude)
@@ -9132,6 +9334,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let env = EffectiveChildEnv::default();
         let (fresh, orphaned) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Claude,
             None,
             Vec::new(),
@@ -9147,6 +9350,7 @@ mod tests {
         assert!(!fresh.args.iter().any(|arg| arg == "--resume"));
 
         let error = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Claude,
             None,
             [OsString::from("--resume"), OsString::from("chosen")].to_vec(),
@@ -9246,6 +9450,7 @@ mod tests {
             let cwd = cwd.clone();
             async move {
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Claude,
                     &home,
@@ -9298,6 +9503,7 @@ mod tests {
             let cwd = cwd.clone();
             async move {
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Claude,
                     &home,
@@ -9394,6 +9600,7 @@ mod tests {
             );
             assert_eq!(
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Codex,
                     temp.path(),
@@ -9417,6 +9624,7 @@ mod tests {
             let status = status(linked, "nested");
             assert_eq!(
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Codex,
                     temp.path(),
@@ -9469,6 +9677,7 @@ mod tests {
         assert_eq!(utility.mode, LaunchMode::Passthrough);
         assert!(
             resolve_native_session_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 &utility,
                 ManagedHarness::Codex,
                 temp.path(),
@@ -9486,6 +9695,7 @@ mod tests {
         session.session_dir = None;
         assert_eq!(
             resolve_native_session_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 &session,
                 ManagedHarness::Codex,
                 temp.path(),
@@ -9553,6 +9763,7 @@ mod tests {
             args.extend(extra.iter().map(OsString::from));
             let plan = build_launch_plan(ManagedHarness::Crush, None, args, None).unwrap();
             resolve_native_session_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 &plan,
                 ManagedHarness::Crush,
                 temp.path(),
@@ -10941,6 +11152,7 @@ mod tests {
             "native\u{200b}tail",
         ] {
             let result = build_preflighted_launch_plan(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Codex,
                 None,
                 Vec::new(),
@@ -10958,6 +11170,7 @@ mod tests {
         }
         assert!(
             build_preflighted_launch_plan(
+                &ai_memory_core::i18n::Localizer::default(),
                 ManagedHarness::Claude,
                 None,
                 Vec::new(),
@@ -10971,6 +11184,7 @@ mod tests {
             "fresh mode must validate the original prepared identity before discarding it"
         );
         let (plan, _) = build_preflighted_launch_plan(
+            &ai_memory_core::i18n::Localizer::default(),
             ManagedHarness::Claude,
             None,
             Vec::new(),
@@ -11534,6 +11748,7 @@ mod tests {
             );
             assert!(
                 resolve_native_session_after_run(
+                    &ai_memory_core::i18n::Localizer::default(),
                     &plan,
                     ManagedHarness::Codex,
                     home.path(),
@@ -11718,6 +11933,7 @@ mod tests {
                 build_launch_plan(ManagedHarness::Codex, None, Vec::new(), None).unwrap();
             plan.session_dir = None;
             let result = resolve_native_session_after_run(
+                &ai_memory_core::i18n::Localizer::default(),
                 &plan,
                 ManagedHarness::Codex,
                 home.path(),

@@ -17,6 +17,7 @@ use crate::http_client::{ServerEndpoint, post_to_file};
 /// Returns an error if the POST to `/admin/backup` fails, the server
 /// returns a non-2xx status, or the output file cannot be written.
 pub async fn run(config: &Config, args: BackupArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let dest = &args.to;
     if let Some(parent) = dest.parent()
@@ -27,13 +28,18 @@ pub async fn run(config: &Config, args: BackupArgs) -> Result<()> {
     }
     let size = post_to_file(&endpoint, "/admin/backup", dest)
         .await
-        .context("requesting backup from server")?;
+        .context(i18n.text("cli-backup-requesting-backup-from-server"))?;
 
     info!(path = %dest.display(), bytes = size, "backup written");
     println!(
-        "✓ wrote backup to {} ({})",
-        dest.display(),
-        human_bytes(size)
+        "{}",
+        i18n.format(
+            "cli-backup-wrote-backup-to",
+            &[
+                ("value0", format!("{}", dest.display())),
+                ("value1", human_bytes(size).to_string())
+            ]
+        )
     );
     Ok(())
 }

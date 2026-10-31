@@ -15,6 +15,7 @@ pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
+pub mod i18n;
 pub mod ids;
 pub mod latency;
 pub use latency::{LATENCY_BUCKET_BOUNDS_US, LatencyHistogram, LatencySnapshot, LatencyTimer};

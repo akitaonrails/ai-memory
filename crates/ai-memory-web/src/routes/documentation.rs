@@ -27,6 +27,7 @@ pub(crate) struct DocsQuery {
 #[derive(Template)]
 #[template(path = "documentation_index.html")]
 struct IndexView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     query: String,
     docs: Vec<&'static Document>,
 }
@@ -40,6 +41,7 @@ struct ReleaseOption {
 #[derive(Template)]
 #[template(path = "documentation_page.html")]
 struct DocumentView {
+    pub i18n: ai_memory_core::i18n::Localizer,
     doc: &'static Document,
     html: String,
     outline: Vec<markdown::OutlineEntry>,
@@ -60,12 +62,16 @@ fn response(body: impl IntoResponse) -> Response {
     response
 }
 
-pub(crate) async fn index(Query(query): Query<DocsQuery>) -> Response {
+pub(crate) async fn index(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
+    Query(query): Query<DocsQuery>,
+) -> Response {
     if query.q.chars().count() > 200 {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let docs = documentation::search(&query.q);
     match (IndexView {
+        i18n: i18n.clone(),
         query: query.q,
         docs,
     })
@@ -119,6 +125,7 @@ fn selected<'a>(
 }
 
 pub(crate) async fn page(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     auth: Option<axum::Extension<AuthLevel>>,
     Path(slug): Path<String>,
@@ -166,6 +173,7 @@ pub(crate) async fn page(
         })
         .collect();
     let view = DocumentView {
+        i18n: i18n.clone(),
         features,
         doc,
         html: rendered.html,

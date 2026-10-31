@@ -19,6 +19,7 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// Returns an error when the server is unreachable or returns a non-2xx
 /// response (e.g. 404 workspace/project not found, 422 name taken or invalid).
 pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
     super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
@@ -42,7 +43,7 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     let requested = from
         .clone()
         .or_else(|| project_id.clone())
-        .context("one of --from or --project-id is required")?;
+        .context(i18n.text("cli-rename-project-one-of-from-or-project-id-is-required"))?;
     let body = serde_json::json!({
         "workspace": workspace,
         "from": from,
@@ -53,18 +54,32 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     let pages = summary["pages"].as_u64().unwrap_or(0);
     let old_name = renamed_from(&summary, requested);
     if let Some(warning) = summary["manifest_warning"].as_str() {
-        eprintln!("ai-memory: warning: {warning}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-move-project-ai-memory-warning-warning",
+                &[("value0", warning.to_string())]
+            )
+        );
     }
     if let Err(error) = super::project_registry::rekey_scope(
         config, &endpoint, &workspace, &old_name, &workspace, &args.to,
     ) {
         eprintln!(
-            "ai-memory: project renamed, but the client-local checkout link could not be updated ({error:#})"
-        );
+            "{}", i18n.format("cli-rename-project-ai-memory-project-renamed-but-the-client-local-checkout-link-could-not-be-up", &[("value0", format!("{:#}", error))]));
     }
     println!(
-        "Renamed {}/{} → {}/{} ({} pages now under the new name).",
-        workspace, old_name, workspace, args.to, pages
+        "{}",
+        i18n.format(
+            "cli-rename-project-renamed-pages-now-under-the-new-name",
+            &[
+                ("value0", workspace.to_string()),
+                ("value1", old_name.to_string()),
+                ("value2", workspace.to_string()),
+                ("value3", args.to.to_string()),
+                ("value4", format!("{}", pages))
+            ]
+        )
     );
     Ok(())
 }

@@ -58,6 +58,12 @@ ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.
 
 # (Workspace shared deps follow below)
 
+# Localization. Catalogs are embedded; no runtime files or JavaScript tooling.
+fluent-bundle = "0.16"
+unic-langid = "0.9"
+fluent-syntax = "0.12"
+askama = { version = "0.12", default-features = false, features = ["humansize", "num-traits", "urlencode"] }
+
 # Error handling.
 anyhow = "1"
 thiserror = "2"
@@ -91,7 +97,7 @@ uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 
 # Config & CLI.
 figment = { version = "0.10", features = ["toml", "env"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env", "string"] }
 # Shell-completion generator for `ai-memory completions <shell>`. Reads the
 # same derived `Command` the parser uses, so completions can never drift
 # from the actual CLI surface.

@@ -98,6 +98,7 @@ struct CreateUserBody<'a> {
 }
 
 async fn add_human(ep: &ServerEndpoint, args: UserAddHumanArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let role = args
         .role
         .as_deref()
@@ -119,20 +120,21 @@ async fn add_human(ep: &ServerEndpoint, args: UserAddHumanArgs) -> Result<()> {
     };
     let resp: UserWithPassword = post_json(ep, "/admin/human-users", &body)
         .await
-        .context("creating human user")?;
-    print_temp_password(&resp, args.json, "created")
+        .context(i18n.text("cli-user-creating-human-user"))?;
+    print_temp_password(i18n, &resp, args.json, "created")
 }
 
 async fn list(ep: &ServerEndpoint, args: UserListArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let resp: UserList = get_json(ep, "/admin/users", &[])
         .await
-        .context("listing users")?;
+        .context(i18n.text("cli-user-listing-users"))?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp.users)?);
         return Ok(());
     }
     if resp.users.is_empty() {
-        println!("(no registered users)");
+        println!("{}", i18n.text("cli-user-no-registered-users"));
         return Ok(());
     }
     write_users(&resp.users, &mut io::stdout().lock())
@@ -188,40 +190,49 @@ fn pad_cell(value: &str, width: usize) -> String {
 }
 
 async fn reset_password(ep: &ServerEndpoint, args: UserResetPasswordArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     if !args.yes {
-        confirm(&format!(
-            "Reset password for user '{}'? Their current password stops working immediately. (y/N) ",
-            args.username
-        ))?;
+        confirm(&i18n.one("cli-user-confirm-password", &args.username))?;
     }
     let path = format!("/admin/users/{}/reset-password", url_encode(&args.username));
     let resp: UserWithPassword = post_json(ep, &path, &serde_json::json!({}))
         .await
-        .context("resetting password")?;
-    print_temp_password(&resp, args.json, "reset password for")
+        .context(i18n.text("cli-user-resetting-password"))?;
+    print_temp_password(i18n, &resp, args.json, "reset password for")
 }
 
 async fn disable(ep: &ServerEndpoint, args: UserDisableArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     if !args.yes {
-        confirm(&format!(
-            "Disable human login for user '{}'? (y/N) ",
-            args.username
-        ))?;
+        confirm(&i18n.one("cli-user-confirm-disable", &args.username))?;
     }
     let path = format!("/admin/users/{}/disable", url_encode(&args.username));
     let _: UserResponse = post_json(ep, &path, &serde_json::json!({}))
         .await
-        .context("disabling user")?;
-    println!("✓ disabled user '{}'", args.username);
+        .context(i18n.text("cli-user-disabling-user"))?;
+    println!(
+        "{}",
+        i18n.format(
+            "cli-user-disabled-user",
+            &[("value0", args.username.to_string())]
+        )
+    );
     Ok(())
 }
 
 async fn enable(ep: &ServerEndpoint, args: UserEnableArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let path = format!("/admin/users/{}/enable", url_encode(&args.username));
     let _: UserResponse = post_json(ep, &path, &serde_json::json!({}))
         .await
-        .context("enabling user")?;
-    println!("✓ enabled user '{}'", args.username);
+        .context(i18n.text("cli-user-enabling-user"))?;
+    println!(
+        "{}",
+        i18n.format(
+            "cli-user-enabled-user",
+            &[("value0", args.username.to_string())]
+        )
+    );
     Ok(())
 }
 
@@ -236,6 +247,7 @@ struct PatchUserBody {
 }
 
 async fn patch(ep: &ServerEndpoint, args: UserPatchArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let body = PatchUserBody {
         name: args.name.map(|s| {
             let trimmed = s.trim().to_string();
@@ -261,14 +273,19 @@ async fn patch(ep: &ServerEndpoint, args: UserPatchArgs) -> Result<()> {
     let path = format!("/admin/users/{}", url_encode(&args.username));
     let resp: UserResponse = patch_json(ep, &path, &body)
         .await
-        .context("patching user")?;
+        .context(i18n.text("cli-user-patching-user"))?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp.user)?);
     } else {
         println!(
-            "✓ updated user '{}' ({})",
-            display_username(&resp.user.username),
-            resp.user.status()
+            "{}",
+            i18n.format(
+                "cli-user-updated-user",
+                &[
+                    ("value0", display_username(&resp.user.username).to_string()),
+                    ("value1", resp.user.status().to_string())
+                ]
+            )
         );
     }
     Ok(())
@@ -284,7 +301,12 @@ fn display_username(value: &str) -> &str {
     value
 }
 
-fn print_temp_password(resp: &UserWithPassword, json: bool, verb: &str) -> Result<()> {
+fn print_temp_password(
+    i18n: &ai_memory_core::i18n::Localizer,
+    resp: &UserWithPassword,
+    json: bool,
+    verb: &str,
+) -> Result<()> {
     if json {
         println!(
             "{}",
@@ -295,20 +317,34 @@ fn print_temp_password(resp: &UserWithPassword, json: bool, verb: &str) -> Resul
         );
     } else {
         let mut stderr = io::stderr().lock();
-        let _ = writeln!(stderr, "✓ {verb} user '{}'", resp.user.username);
+        let _ = writeln!(
+            stderr,
+            "{}",
+            i18n.format(
+                "cli-user-verb-user",
+                &[
+                    ("value0", verb.to_string()),
+                    ("value1", resp.user.username.to_string())
+                ]
+            )
+        );
         if let Some(name) = &resp.user.name {
-            let _ = writeln!(stderr, "  name:  {name}");
+            let _ = writeln!(
+                stderr,
+                "{}",
+                i18n.format("cli-user-name-name", &[("value0", name.to_string())])
+            );
         }
         if let Some(email) = &resp.user.email {
-            let _ = writeln!(stderr, "  email: {email}");
+            let _ = writeln!(
+                stderr,
+                "{}",
+                i18n.format("cli-user-email-email", &[("value0", email.to_string())])
+            );
         }
         let _ = writeln!(
             stderr,
-            "  role:  {}\n\n\
-             Store this temporary password now — it will NOT be shown again. \
-             The user must change it on next login.",
-            resp.user.role
-        );
+            "{}", i18n.format("cli-user-role-store-this-temporary-password-now-it-will-not-be-shown-again-the-user-m", &[("value0", resp.user.role.to_string())]));
         println!("{}", resp.temporary_password);
     }
     Ok(())
@@ -326,7 +362,11 @@ fn confirm(prompt: &str) -> Result<()> {
         bail!("aborted (no input)");
     }
     let trimmed = buf.trim();
-    if !trimmed.eq_ignore_ascii_case("y") && !trimmed.eq_ignore_ascii_case("yes") {
+    if !trimmed.eq_ignore_ascii_case("y")
+        && !trimmed.eq_ignore_ascii_case("yes")
+        && !trimmed.eq_ignore_ascii_case("s")
+        && !trimmed.eq_ignore_ascii_case("sim")
+    {
         bail!("aborted");
     }
     Ok(())

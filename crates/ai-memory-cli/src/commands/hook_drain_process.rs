@@ -205,7 +205,10 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
                 .open(&spec.stderr_log)?;
             let _ = writeln!(
                 log,
-                "ai-memory hook-drain: breakaway spawn failed with access denied; retrying without breakaway"
+                "{}",
+                crate::localization::process_diagnostic(
+                    "ai-memory hook-drain: breakaway spawn failed with access denied; retrying without breakaway"
+                )
             );
             let config = spawn_config(spec, false);
             let stderr = OpenOptions::new()

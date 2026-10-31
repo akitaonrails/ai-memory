@@ -1,11 +1,11 @@
 <!doctype html>
-<html lang="en">
+<html lang="{{ i18n.tag() }}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>ai-memory setup</title>
-<style nonce="__NONCE__">
+<title>{{ i18n.text("setup-web-ai-memory-setup") }}</title>
+<style nonce="{{ nonce }}">
 :root {
   --bg: #fafaf9; --fg: #1c1917; --muted: #57534e; --line: #e7e5e4;
   --card: #ffffff; --accent: #0f766e; --accent-fg: #ffffff; --bad: #b91c1c; --good: #15803d;
@@ -50,50 +50,50 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
 </head>
 <body>
 <main>
-  <h1>ai-memory setup</h1>
-  <p class="lead">Check the plan, choose your agents, and apply. Nothing changes until you press Apply.</p>
-  <p id="loading" class="note">Loading the plan…</p>
+  <h1>{{ i18n.text("setup-web-ai-memory-setup") }}</h1>
+  <p class="lead">{{ i18n.text("setup-web-check-the-plan-choose-your-agents-and-apply-nothing-changes-until-you-press-apply") }}</p>
+  <p id="loading" class="note">{{ i18n.text("setup-web-loading-the-plan") }}</p>
   <p id="failed" class="result bad" hidden></p>
 
   <div id="plan" hidden>
     <section>
-      <h2>Install</h2>
+      <h2>{{ i18n.text("setup-web-install") }}</h2>
       <dl>
-        <dt>Data dir</dt><dd><code id="data-dir"></code></dd>
-        <dt>Config</dt><dd><code id="config-path"></code></dd>
-        <dt>State</dt><dd id="fresh"></dd>
-        <dt>Service</dt><dd id="service"></dd>
+        <dt>{{ i18n.text("setup-web-data-dir") }}</dt><dd><code id="data-dir"></code></dd>
+        <dt>{{ i18n.text("setup-web-config") }}</dt><dd><code id="config-path"></code></dd>
+        <dt>{{ i18n.text("setup-web-state") }}</dt><dd id="fresh"></dd>
+        <dt>{{ i18n.text("setup-web-service") }}</dt><dd id="service"></dd>
       </dl>
     </section>
 
     <section>
-      <h2>Agents</h2>
+      <h2>{{ i18n.text("setup-web-agents") }}</h2>
       <div id="agents"></div>
-      <p id="no-agents" class="note" hidden>No agent was detected. Pick one below.</p>
+      <p id="no-agents" class="note" hidden>{{ i18n.text("setup-web-no-agent-was-detected-pick-one-below") }}</p>
       <details id="others-box">
-        <summary>Other supported agents</summary>
+        <summary>{{ i18n.text("setup-web-other-supported-agents") }}</summary>
         <div class="others" id="others"></div>
       </details>
     </section>
 
     <section>
       <div class="actions">
-        <button id="apply" type="button">Apply</button>
-        <span class="note">Runs <code>ai-memory setup --yes</code> with the agents you picked, then checks the result.</span>
+        <button id="apply" type="button">{{ i18n.text("setup-web-apply") }}</button>
+        <span class="note">{{ i18n.text("setup-web-runs") }} <code>ai-memory setup --yes</code> {{ i18n.text("setup-web-with-the-agents-you-picked-then-checks-the-result") }}</span>
       </div>
       <pre id="log" hidden></pre>
       <div id="outcome" hidden>
         <p id="result" class="result"></p>
-        <p id="next" hidden>Restart <span id="restart"></span>, then ask it:<br><span class="question" id="question"></span></p>
+        <p id="next" hidden>{{ i18n.text("setup-web-restart") }} <span id="restart"></span>{{ i18n.text("setup-web-then-ask-it") }}<br><span class="question" id="question"></span></p>
       </div>
       <div class="actions" id="finish-row" hidden>
-        <button id="finish" class="secondary" type="button">Finish and close the setup server</button>
+        <button id="finish" class="secondary" type="button">{{ i18n.text("setup-web-finish-and-close-the-setup-server") }}</button>
       </div>
     </section>
   </div>
-  <p id="closed" class="note" hidden>The setup server has stopped. You can close this tab.</p>
+  <p id="closed" class="note" hidden>{{ i18n.text("setup-web-the-setup-server-has-stopped-you-can-close-this-tab") }}</p>
 </main>
-<script nonce="__NONCE__">
+<script nonce="{{ nonce }}">
 (function () {
   "use strict";
   var base = location.pathname.replace(/\/?$/, "/");
@@ -102,13 +102,13 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
   var text = function (id, value) { $(id).textContent = value; };
 
   function describeFound(found) {
-    if (!found) return "named on the command line";
-    var what = { session_store: "session store", mcp_config: "MCP config", config_dir: "directory" }[found.kind] || found.kind;
-    return "found its " + what + " at " + found.path;
+    if (!found) return {{ i18n.js("setup-web-named-on-the-command-line")|safe }};
+    var what = { session_store: {{ i18n.js("setup-web-session-store")|safe }}, mcp_config: {{ i18n.js("setup-web-mcp-config")|safe }}, config_dir: {{ i18n.js("setup-web-directory")|safe }} }[found.kind] || found.kind;
+    return {{ i18n.js_two("setup-web-resource-found", "{resource}", "{path}")|safe }}.replace("{resource}",what).replace("{path}",function(){return found.path;});
   }
 
   function wiring(value) {
-    return { plugin: "left to its enabled ai-memory plugin", "mcp+hooks+skills": "MCP + hooks + skills", "hooks+skills": "hooks + skills" }[value] || value;
+    return { plugin: {{ i18n.js("setup-web-left-to-its-enabled-ai-memory-plugin")|safe }}, "mcp+hooks+skills": "MCP + hooks + skills", "hooks+skills": "hooks + skills" }[value] || value;
   }
 
   function checkbox(name, checked) {
@@ -125,9 +125,9 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     csrf = doc.csrf;
     text("data-dir", plan.data_dir);
     text("config-path", plan.config_path);
-    text("fresh", plan.fresh ? "new install: creates the data dir, the config and a root bearer token" : "existing install: kept as it is");
+    text("fresh", plan.fresh ? {{ i18n.js("setup-web-new-install-creates-the-data-dir-the-config-and-a-root-bearer-token")|safe }} : {{ i18n.js("setup-web-existing-install-kept-as-it-is")|safe }});
     text("service", plan.service.action === "install"
-      ? "install and start a " + plan.service.manager + " at " + plan.service.path
+      ? {{ i18n.js_two("setup-web-install-service", "{manager}", "{path}")|safe }}.replace("{manager}",plan.service.manager).replace("{path}",function(){return plan.service.path;})
       : plan.service.reason);
     var agents = $("agents");
     plan.agents.forEach(function (agent) {
@@ -153,7 +153,7 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       label.appendChild(document.createTextNode(name));
       others.appendChild(label);
     });
-    text("question", plan.first_question);
+    text("question", {{ i18n.js("setup-web-first-question")|safe }});
     $("loading").hidden = true;
     $("plan").hidden = false;
   }
@@ -188,12 +188,12 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
       var result = $("result");
       if (p.ok) {
         result.className = "result ok";
-        result.textContent = "ai-memory is set up.";
+        result.textContent = {{ i18n.js("setup-web-ai-memory-is-set-up")|safe }};
         text("restart", p.agents.join(", "));
         $("next").hidden = p.agents.length === 0;
       } else {
         result.className = "result bad";
-        result.textContent = "Setup finished with problems; see the lines starting with \"problem:\" above, fix them, and apply again.";
+        result.textContent = {{ i18n.js("setup-web-setup-finished-with-problems-see-the-lines-starting-with-problem-above-fix-them-and-a")|safe }};
         $("apply").disabled = false;
       }
       $("finish-row").hidden = false;
@@ -202,7 +202,7 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
 
   $("apply").addEventListener("click", function () {
     var agents = chosen();
-    if (agents.length === 0) { fail("Pick at least one agent."); return; }
+    if (agents.length === 0) { fail({{ i18n.js("setup-web-pick-at-least-one-agent")|safe }}); return; }
     $("failed").hidden = true;
     $("apply").disabled = true;
     $("log").hidden = false;
@@ -210,8 +210,8 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     $("outcome").hidden = true;
     post("apply", { agents: agents }).then(function (r) {
       if (r.status === 202) { poll(0); return; }
-      return r.text().then(function (body) { fail(body || ("The server answered " + r.status)); $("apply").disabled = false; });
-    }).catch(function () { fail("The setup server did not answer."); $("apply").disabled = false; });
+      return r.text().then(function (body) { fail(body || ({{ i18n.js("setup-web-the-server-answered")|safe }} + r.status)); $("apply").disabled = false; });
+    }).catch(function () { fail({{ i18n.js("setup-web-the-setup-server-did-not-answer")|safe }}); $("apply").disabled = false; });
   });
 
   $("finish").addEventListener("click", function () {
@@ -226,7 +226,7 @@ pre#log { background: var(--bg); border: 1px solid var(--line); border-radius: 8
     return r.json();
   }).then(render).catch(function (error) {
     $("loading").hidden = true;
-    fail("Could not load the plan (" + error.message + "). Is `ai-memory setup --web` still running?");
+    fail({{ i18n.js("setup-web-could-not-load-the-plan")|safe }} + error.message + {{ i18n.js("setup-web-is-ai-memory-setup-setup-web-still-running")|safe }});
   });
 })();
 </script>

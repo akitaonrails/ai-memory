@@ -31,6 +31,7 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// Bails when the resolved repo path cannot be inspected, when source
 /// collection fails, or when the server returns a non-2xx response.
 pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     info!(server = %ep.url, auth = ep.auth_token.is_some(), "bootstrap CLI configured");
 
@@ -50,8 +51,10 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
         None => match discover_repo_root(std::path::Path::new(".")) {
             Ok(root) => (root, true),
             Err(_) => {
-                let cwd = std::env::current_dir()
-                    .context("getting CWD for bootstrap (no git repo, falling back to .)")?;
+                let cwd =
+                    std::env::current_dir().context(i18n.text(
+                        "cli-bootstrap-getting-cwd-for-bootstrap-no-git-repo-falling-back-to",
+                    ))?;
                 info!(
                     cwd = %cwd.display(),
                     "no .git found at or above CWD; bootstrapping from non-git sources only"
@@ -66,10 +69,7 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     let include_git = !args.exclude_git && has_git;
     if !has_git && !args.exclude_git {
         eprintln!(
-            "note: no .git found at {}; bootstrapping from README/docs/rules only \
-             (git-commit history skipped). Pass --repo-path or `git init` to include commits.",
-            repo_path.display()
-        );
+            "{}", i18n.format("cli-bootstrap-note-no-git-found-at-bootstrapping-from-readme-docs-rules-only-git-commit-hi", &[("value0", format!("{}", repo_path.display()))]));
     }
 
     // ---- project — auto-derive from repo basename if absent -------
@@ -123,9 +123,15 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
             args.max_input_tokens,
             args.chunk_input_tokens,
         );
-        print_human_report(&outcome, &workspace, &project);
+        print_human_report(i18n, &outcome, &workspace, &project);
         let report = serde_json::to_string_pretty(&outcome)?;
-        println!("\n--- machine-readable ---\n{report}");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-bootstrap-machine-readable-report",
+                &[("value0", report.to_string())]
+            )
+        );
         return Ok(());
     }
 
@@ -143,9 +149,15 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     });
     let outcome: BootstrapOutcome = post_json(&ep, "/admin/bootstrap", &body).await?;
 
-    print_human_report(&outcome, &workspace, &project);
+    print_human_report(i18n, &outcome, &workspace, &project);
     let report = serde_json::to_string_pretty(&outcome)?;
-    println!("\n--- machine-readable ---\n{report}");
+    println!(
+        "{}",
+        i18n.format(
+            "cli-bootstrap-machine-readable-report",
+            &[("value0", report.to_string())]
+        )
+    );
     Ok(())
 }
 
@@ -200,103 +212,165 @@ fn local_dry_run(
 /// each source kind separately + every page written + an explicit
 /// "what ai-memory knows now" footer so the operator doesn't assume
 /// the wiki has 100% coverage of the project.
-fn print_human_report(outcome: &BootstrapOutcome, workspace: &str, project: &str) {
+fn print_human_report(
+    i18n: &ai_memory_core::i18n::Localizer,
+    outcome: &BootstrapOutcome,
+    workspace: &str,
+    project: &str,
+) {
     let kind = if outcome.dry_run {
         "Dry-run"
     } else {
         "Bootstrap"
     };
-    println!("\n{kind} complete for {workspace}/{project}\n");
+    println!(
+        "{}",
+        i18n.format(
+            "cli-bootstrap-kind-complete-for-workspace-project",
+            &[
+                ("value0", kind.to_string()),
+                ("value1", workspace.to_string()),
+                ("value2", project.to_string())
+            ]
+        )
+    );
     if let Some(warning) = &outcome.manifest_warning {
-        eprintln!("ai-memory: warning: {warning}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-move-project-ai-memory-warning-warning",
+                &[("value0", warning.to_string())]
+            )
+        );
     }
 
-    println!("Sources loaded into the LLM:");
+    println!("{}", i18n.text("cli-bootstrap-sources-loaded-into-the-llm"));
     let c = &outcome.sources_by_kind;
     if c.git_commits > 0 {
         println!(
-            "  - {} git commit summar{}",
-            c.git_commits,
-            if c.git_commits == 1 { "y" } else { "ies" }
+            "{}",
+            i18n.message(
+                "cli-bootstrap-git-commit-summar",
+                &[
+                    ("value0", (format!("{}", c.git_commits)).into()),
+                    ("value1", (c.git_commits).into())
+                ]
+            )
         );
     }
     if c.readme > 0 {
-        println!("  - README");
+        println!("{}", i18n.text("cli-bootstrap-readme"));
     }
     if c.doc_files > 0 {
         println!(
-            "  - {} doc file{} (under docs/)",
-            c.doc_files,
-            if c.doc_files == 1 { "" } else { "s" }
+            "{}",
+            i18n.message(
+                "cli-bootstrap-doc-file-under-docs",
+                &[
+                    ("value0", (format!("{}", c.doc_files)).into()),
+                    ("value1", (c.doc_files).into())
+                ]
+            )
         );
     }
     if c.module_headers > 0 {
         println!(
-            "  - {} Rust module header{}",
-            c.module_headers,
-            if c.module_headers == 1 { "" } else { "s" }
+            "{}",
+            i18n.message(
+                "cli-bootstrap-rust-module-header",
+                &[
+                    ("value0", (format!("{}", c.module_headers)).into()),
+                    ("value1", (c.module_headers).into())
+                ]
+            )
         );
     }
     if c.project_rules > 0 {
         println!(
-            "  - {} project-rules file{} (CLAUDE.md / AGENTS.md / ...)",
-            c.project_rules,
-            if c.project_rules == 1 { "" } else { "s" }
+            "{}",
+            i18n.message(
+                "cli-bootstrap-project-rules-file-claude-md-agents-md",
+                &[
+                    ("value0", (format!("{}", c.project_rules)).into()),
+                    ("value1", (c.project_rules).into())
+                ]
+            )
         );
     }
     println!(
-        "  -> ~{} input tokens estimated{}",
-        outcome.estimated_input_tokens,
-        if outcome.sources_dropped > 0 {
-            format!(
-                " (dropped {} lower-priority source{} to stay under budget)",
-                outcome.sources_dropped,
-                if outcome.sources_dropped == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )
-        } else {
-            String::new()
-        }
+        "{}",
+        i18n.format(
+            "cli-bootstrap-input-tokens-estimated",
+            &[
+                ("value0", format!("{}", outcome.estimated_input_tokens)),
+                (
+                    "value1",
+                    (if outcome.sources_dropped > 0 {
+                        format!(
+                            " (dropped {} lower-priority source{} to stay under budget)",
+                            outcome.sources_dropped,
+                            if outcome.sources_dropped == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        )
+                    } else {
+                        String::new()
+                    })
+                    .to_string()
+                )
+            ]
+        )
     );
     if outcome.llm_chunks > 1 {
         println!(
-            "  -> {} sequential LLM chunk{}",
-            outcome.llm_chunks,
-            if outcome.llm_chunks == 1 { "" } else { "s" }
+            "{}",
+            i18n.message(
+                "cli-bootstrap-sequential-llm-chunk",
+                &[
+                    ("value0", (format!("{}", outcome.llm_chunks)).into()),
+                    ("value1", (outcome.llm_chunks).into())
+                ]
+            )
         );
     }
 
     if outcome.dry_run {
-        println!("\n(dry-run -- no LLM call, no pages written)");
+        println!(
+            "{}",
+            i18n.text("cli-bootstrap-dry-run-no-llm-call-no-pages-written")
+        );
     } else {
         println!(
-            "\nGenerated {} wiki page{}:",
-            outcome.pages_written.len(),
-            if outcome.pages_written.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
+            "{}",
+            i18n.message(
+                "cli-bootstrap-generated-wiki-page",
+                &[
+                    (
+                        "value0",
+                        (format!("{}", outcome.pages_written.len())).into()
+                    ),
+                    ("value1", (outcome.pages_written.len()).into())
+                ]
+            )
         );
         for p in &outcome.pages_written {
             println!("  - {p}");
         }
         if !outcome.rationale.is_empty() {
-            println!("\nRationale: {}", outcome.rationale);
+            println!(
+                "{}",
+                i18n.format(
+                    "cli-bootstrap-rationale",
+                    &[("value0", outcome.rationale.to_string())]
+                )
+            );
         }
     }
 
     println!(
-        "\nWhat ai-memory knows now\n  \
-         Only the sources listed above. NOT every file in your project,\n  \
-         NOT every commit since project start, NOT runtime behaviour or\n  \
-         test logs. As you use Claude Code (or another MCP agent) the\n  \
-         lifecycle hooks will automatically capture your actual workflow,\n  \
-         and consolidation will refine the wiki over time."
-    );
+        "{}", i18n.text("cli-bootstrap-what-ai-memory-knows-now-only-the-sources-listed-above-not-every-file-in-you"));
 }
 
 #[cfg(test)]

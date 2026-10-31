@@ -309,15 +309,15 @@ fn plain_arg(path: &Path) -> std::ffi::OsString {
 /// On a platform other than Windows, or when the host cannot start itself or
 /// the server.
 pub async fn run(config: &Config, args: ServiceHostArgs, config_path: Option<&Path>) -> Result<()> {
+    let i18n = &config.i18n;
     if !cfg!(windows) {
         anyhow::bail!(
-            "`service-host` is the Windows logon entry's launcher; on this platform `ai-memory \
-             setup` installs a systemd user unit or a LaunchAgent instead"
-        );
+            "{}", i18n.text("cli-service-host-service-host-is-the-windows-logon-entry-s-launcher-on-this-platform-ai-memor"));
     }
     // `current_exe()` can return a `\\?\` verbatim path; the host launches
     // itself and the server with it, so strip the prefix there too (#1280).
-    let exe = std::env::current_exe().context("locating the running ai-memory binary")?;
+    let exe = std::env::current_exe()
+        .context(i18n.text("cli-service-host-locating-the-running-ai-memory-binary"))?;
     let exe = std::path::PathBuf::from(plain_arg(&exe));
     let install = install_args(config, config_path);
     if !args.supervise {
@@ -366,7 +366,7 @@ pub async fn run(config: &Config, args: ServiceHostArgs, config_path: Option<&Pa
         .map(|succeeded| (succeeded, state_path))
     })
     .await
-    .context("the service-host supervisor stopped unexpectedly")?;
+    .context(i18n.text("cli-service-host-the-service-host-supervisor-stopped-unexpectedly"))?;
     let (succeeded, state_path) = outcome?;
     std::fs::remove_file(&state_path).ok();
     if !succeeded {

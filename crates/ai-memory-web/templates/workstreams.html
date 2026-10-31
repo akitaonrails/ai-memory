@@ -1,29 +1,29 @@
 {% extends "base.html" %}
 
-{% block title %}Workstreams — ai-memory{% endblock %}
+{% block title %}{{ i18n.text("web-workstreams-ai-memory") }}{% endblock %}
 {% block nav_workstreams_current %}aria-current="page"{% endblock %}
 
 {% block content %}
 <div class="mb-6 flex flex-wrap items-end justify-between gap-4">
   <div>
-    <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">Managed workstreams</h1>
-    <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">Operational state across projects, ordered by attention and recent activity.</p>
+    <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">{{ i18n.text("web-managed-workstreams") }}</h1>
+    <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-operational-state-across-projects-ordered-by-attention-and-recent-activity") }}</p>
   </div>
-  <span class="text-xs text-slate-500 dark:text-slate-400">Page {{ page }}</span>
+  <span class="text-xs text-slate-500 dark:text-slate-400">{{ i18n.text("web-page-workstreams") }} {{ page }}</span>
 </div>
 
 {% if rows.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">No managed workstreams on this page.</p>
+<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-managed-workstreams-on-this-page") }}</p>
 {% else %}
 <div class="overflow-x-auto border-y border-slate-200 dark:border-slate-800">
   <table class="w-full text-left text-sm">
     <thead class="bg-slate-50 dark:bg-slate-900 text-xs uppercase text-slate-500 dark:text-slate-400">
       <tr>
-        <th scope="col" class="px-3 py-2 font-semibold">Workstream</th>
-        <th scope="col" class="px-3 py-2 font-semibold">Status</th>
-        <th scope="col" class="px-3 py-2 font-semibold">Latest run</th>
-        <th scope="col" class="hidden sm:table-cell px-3 py-2 font-semibold">Evidence</th>
-        <th scope="col" class="hidden sm:table-cell px-3 py-2 font-semibold text-right">Activity</th>
+        <th scope="col" class="px-3 py-2 font-semibold">{{ i18n.text("web-workstream") }}</th>
+        <th scope="col" class="px-3 py-2 font-semibold">{{ i18n.text("web-status") }}</th>
+        <th scope="col" class="px-3 py-2 font-semibold">{{ i18n.text("web-latest-run") }}</th>
+        <th scope="col" class="hidden sm:table-cell px-3 py-2 font-semibold">{{ i18n.text("web-evidence") }}</th>
+        <th scope="col" class="hidden sm:table-cell px-3 py-2 font-semibold text-right">{{ i18n.text("web-activity-workstreams") }}</th>
       </tr>
     </thead>
     <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
@@ -35,7 +35,7 @@
             <a href="{{ row.project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ row.scope_label }}</a>
             <span class="font-mono">{{ row.short_id }}</span>
           </div>
-          <div class="mt-1 text-xs text-slate-500 dark:text-slate-400 sm:hidden">{{ row.event_count }} event{% if row.event_count != 1 %}s{% endif %}</div>
+          <div class="mt-1 text-xs text-slate-500 dark:text-slate-400 sm:hidden">{{ row.event_count }} {{ i18n.count("web-count-event", row.event_count) }}</div>
         </td>
         <td class="px-3 py-3 align-top">
           {% if row.status == "active" %}
@@ -48,17 +48,17 @@
         </td>
         <td class="px-3 py-3 align-top">
           {% if row.latest_agent.is_empty() %}
-          <span class="text-slate-500 dark:text-slate-400">Not launched</span>
+          <span class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-not-launched") }}</span>
           {% else %}
           <div class="flex flex-wrap items-center gap-2">
             <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ row.latest_agent }}</span>
             <span class="font-mono text-xs text-slate-500 dark:text-slate-400">{{ row.latest_run_short }}</span>
           </div>
-          <div class="mt-1 text-xs text-slate-500 dark:text-slate-400">Started {{ row.latest_started_relative }}{% if !row.latest_ended_relative.is_empty() %}; ended {{ row.latest_ended_relative }}{% endif %}</div>
+          <div class="mt-1 text-xs text-slate-500 dark:text-slate-400">{{ i18n.text("web-started") }} {{ row.latest_started_relative }}{% if !row.latest_ended_relative.is_empty() %}{{ i18n.text("web-ended-workstreams") }} {{ row.latest_ended_relative }}{% endif %}</div>
           {% endif %}
         </td>
         <td class="hidden sm:table-cell px-3 py-3 align-top">
-          <div>{{ row.event_count }} event{% if row.event_count != 1 %}s{% endif %}</div>
+          <div>{{ row.event_count }} {{ i18n.count("web-count-event", row.event_count) }}</div>
           {% if !row.linked_harnesses.is_empty() %}
           <div class="mt-1 flex flex-wrap gap-1">
             {% for harness in row.linked_harnesses %}
@@ -76,9 +76,9 @@
 {% endif %}
 
 {% if prev_href.is_some() || next_href.is_some() %}
-<nav aria-label="Workstream pages" class="mt-6 flex items-center justify-between gap-4 text-sm">
-  {% if let Some(href) = prev_href %}<a href="{{ href }}" class="font-medium text-blue-600 dark:text-blue-400 hover:underline">Previous</a>{% else %}<span></span>{% endif %}
-  {% if let Some(href) = next_href %}<a href="{{ href }}" class="font-medium text-blue-600 dark:text-blue-400 hover:underline">Next</a>{% endif %}
+<nav aria-label="{{ i18n.text("web-workstream-pages") }}" class="mt-6 flex items-center justify-between gap-4 text-sm">
+  {% if let Some(href) = prev_href %}<a href="{{ href }}" class="font-medium text-blue-600 dark:text-blue-400 hover:underline">{{ i18n.text("web-previous-workstreams") }}</a>{% else %}<span></span>{% endif %}
+  {% if let Some(href) = next_href %}<a href="{{ href }}" class="font-medium text-blue-600 dark:text-blue-400 hover:underline">{{ i18n.text("web-next-workstreams") }}</a>{% endif %}
 </nav>
 {% endif %}
 {% endblock %}

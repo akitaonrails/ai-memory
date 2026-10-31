@@ -71,35 +71,41 @@ struct CreateBody<'a> {
 }
 
 async fn add(ep: &ServerEndpoint, args: ApiKeyAddArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let body = CreateBody {
         username: args.username.trim(),
         label: args.label.trim(),
     };
     let resp: CredentialWithToken = post_json(ep, "/admin/api-credentials", &body)
         .await
-        .context("creating API credential")?;
-    print_token(&resp, args.json, "created")
+        .context(i18n.text("cli-api-key-creating-api-credential"))?;
+    print_token(i18n, &resp, args.json, "created")
 }
 
 async fn list(ep: &ServerEndpoint, args: ApiKeyListArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     let resp: CredentialList = get_json(ep, "/admin/api-credentials", &[])
         .await
-        .context("listing API credentials")?;
+        .context(i18n.text("cli-api-key-listing-api-credentials"))?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp.credentials)?);
         return Ok(());
     }
     if resp.credentials.is_empty() {
-        println!("(no API credentials)");
+        println!("{}", i18n.text("cli-api-key-no-api-credentials"));
         return Ok(());
     }
-    write_credentials(&resp.credentials, &mut io::stdout().lock())
+    write_credentials(i18n, &resp.credentials, &mut io::stdout().lock())
 }
 
 /// Lay out the credentials table using terminal display-cell widths. Labels
 /// are free text, so a byte count over-pads an accented label and misplaces
 /// every cell after a double-width one.
-fn write_credentials(credentials: &[CredentialRow], out: &mut impl Write) -> Result<()> {
+fn write_credentials(
+    i18n: &ai_memory_core::i18n::Localizer,
+    credentials: &[CredentialRow],
+    out: &mut impl Write,
+) -> Result<()> {
     let id_w = credentials
         .iter()
         .map(|c| unicode_width::UnicodeWidthStr::width(c.id.as_str()))
@@ -114,10 +120,13 @@ fn write_credentials(credentials: &[CredentialRow], out: &mut impl Write) -> Res
         .max(5);
     writeln!(
         out,
-        "{}  {}  {:<8}  PREVIEW",
-        pad_cell("ID", id_w),
-        pad_cell("LABEL", label_w),
-        "STATUS"
+        "{}",
+        i18n.diagnostic(&format!(
+            "{}  {}  {:<8}  PREVIEW",
+            pad_cell("ID", id_w),
+            pad_cell("LABEL", label_w),
+            "STATUS"
+        ))
     )?;
     for c in credentials {
         writeln!(
@@ -138,32 +147,42 @@ fn pad_cell(value: &str, width: usize) -> String {
 }
 
 async fn rotate(ep: &ServerEndpoint, args: ApiKeyRotateArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     if !args.yes {
-        confirm(&format!(
-            "Rotate API key '{}'? Existing clients using the old secret will 401 immediately. (y/N) ",
-            args.id
-        ))?;
+        confirm(&i18n.one("cli-api-key-confirm-rotate", &args.id))?;
     }
     let path = format!("/admin/api-credentials/{}/rotate", args.id.trim());
     let resp: CredentialWithToken = post_json(ep, &path, &serde_json::json!({}))
         .await
-        .context("rotating API credential")?;
-    print_token(&resp, args.json, "rotated")
+        .context(i18n.text("cli-api-key-rotating-api-credential"))?;
+    print_token(i18n, &resp, args.json, "rotated")
 }
 
 async fn revoke(ep: &ServerEndpoint, args: ApiKeyRevokeArgs) -> Result<()> {
+    let i18n = &ep.i18n;
     if !args.yes {
-        confirm(&format!("Revoke API key '{}'? (y/N) ", args.id))?;
+        confirm(&i18n.one("cli-api-key-confirm-revoke", &args.id))?;
     }
     let path = format!("/admin/api-credentials/{}/revoke", args.id.trim());
     let _: serde_json::Value = post_json(ep, &path, &serde_json::json!({}))
         .await
-        .context("revoking API credential")?;
-    println!("✓ revoked API key '{}'", args.id);
+        .context(i18n.text("cli-api-key-revoking-api-credential"))?;
+    println!(
+        "{}",
+        i18n.format(
+            "cli-api-key-revoked-api-key",
+            &[("value0", args.id.to_string())]
+        )
+    );
     Ok(())
 }
 
-fn print_token(resp: &CredentialWithToken, json: bool, verb: &str) -> Result<()> {
+fn print_token(
+    i18n: &ai_memory_core::i18n::Localizer,
+    resp: &CredentialWithToken,
+    json: bool,
+    verb: &str,
+) -> Result<()> {
     if json {
         println!(
             "{}",
@@ -176,9 +195,15 @@ fn print_token(resp: &CredentialWithToken, json: bool, verb: &str) -> Result<()>
         let mut stderr = io::stderr().lock();
         let _ = writeln!(
             stderr,
-            "✓ {verb} API key '{}' ({})\n\n\
-             Store this token now — it will NOT be shown again.",
-            resp.credential.id, resp.credential.label
+            "{}",
+            i18n.format(
+                "cli-api-key-verb-api-key-store-this-token-now-it-will-not-be-shown-again",
+                &[
+                    ("value0", verb.to_string()),
+                    ("value1", resp.credential.id.to_string()),
+                    ("value2", resp.credential.label.to_string())
+                ]
+            )
         );
         println!("{}", resp.token);
     }
@@ -196,7 +221,11 @@ fn confirm(prompt: &str) -> Result<()> {
         bail!("aborted (no input)");
     }
     let trimmed = buf.trim();
-    if !trimmed.eq_ignore_ascii_case("y") && !trimmed.eq_ignore_ascii_case("yes") {
+    if !trimmed.eq_ignore_ascii_case("y")
+        && !trimmed.eq_ignore_ascii_case("yes")
+        && !trimmed.eq_ignore_ascii_case("s")
+        && !trimmed.eq_ignore_ascii_case("sim")
+    {
         bail!("aborted");
     }
     Ok(())
@@ -227,7 +256,12 @@ mod tests {
 
     fn render(credentials: &[CredentialRow]) -> String {
         let mut buf = Vec::new();
-        write_credentials(credentials, &mut buf).expect("rendering to a buffer cannot fail");
+        write_credentials(
+            &ai_memory_core::i18n::Localizer::default(),
+            credentials,
+            &mut buf,
+        )
+        .expect("rendering to a buffer cannot fail");
         String::from_utf8(buf).expect("the table is utf-8")
     }
 

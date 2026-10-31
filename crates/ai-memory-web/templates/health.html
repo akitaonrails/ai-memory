@@ -1,28 +1,28 @@
 {% extends "base.html" %}
 
-{% block title %}Health — ai-memory{% endblock %}
+{% block title %}{{ i18n.text("web-health-ai-memory") }}{% endblock %}
 
 {% block nav_health_current %}aria-current="page"{% endblock %}
 
 {% block content %}
-<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">Server health</h1>
-<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">Counters, queues and model state for this server process. Read-only: each fix is a command to run, not a button.</p>
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.text("web-server-health") }}</h1>
+<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.text("web-counters-queues-and-model-state-for-this-server-process-read-only-each-fix-is-a-comma") }}</p>
 
 {% if !wired %}
-<p class="mb-6 rounded-md border border-amber-300 dark:border-amber-700 p-3 text-sm text-amber-800 dark:text-amber-300">This server did not wire its process counters into the web UI; hook, spool and provider figures below are empty.</p>
+<p class="mb-6 rounded-md border border-amber-300 dark:border-amber-700 p-3 text-sm text-amber-800 dark:text-amber-300">{{ i18n.text("web-this-server-did-not-wire-its-process-counters-into-the-web-ui-hook-spool-and-provider") }}</p>
 {% endif %}
 
-<section class="mb-8" aria-label="Checks">
-  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Checks</h2>
+<section class="mb-8" aria-label="{{ i18n.text("web-checks") }}">
+  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-checks") }}</h2>
   {% if checks.is_empty() %}
-  <p class="text-sm text-green-700 dark:text-green-400" data-check="none">Every server-side check passes.</p>
+  <p class="text-sm text-green-700 dark:text-green-400" data-check="none">{{ i18n.text("web-every-server-side-check-passes") }}</p>
   {% else %}
   <ul class="space-y-3">
     {% for check in checks %}
     <li class="rounded-md border border-slate-200 dark:border-slate-800 p-3" data-check="{{ check.id }}">
-      <p class="text-sm"><span class="font-mono text-xs uppercase {% if check.status == "error" %}text-red-700 dark:text-red-400{% else %}text-amber-700 dark:text-amber-400{% endif %}">{{ check.status }}</span> {{ check.detail }}</p>
+      <p class="text-sm"><span class="font-mono text-xs uppercase {% if check.status == "error" %}text-red-700 dark:text-red-400{% else %}text-amber-700 dark:text-amber-400{% endif %}">{{ i18n.status(check.status) }}</span> {{ check.detail }}</p>
       {% if let Some(fix) = check.fix %}
-      <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">Fix: <code class="font-mono">{{ fix }}</code></p>
+      <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">{{ i18n.text("web-fix") }} <code class="font-mono">{{ fix }}</code></p>
       {% endif %}
     </li>
     {% endfor %}

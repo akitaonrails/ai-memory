@@ -47,6 +47,7 @@ fn check_report(report: &serde_json::Value) -> Result<()> {
 /// response, or (live mode only) if the report shows pages that failed
 /// to embed — the full report is still printed to stdout first.
 pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     // Model migrations must reach stale rows in every project namespace.
     // Without an explicit `--project`, `--force` / `--reembed` fans out
@@ -83,7 +84,16 @@ pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
     if args.dry_run {
         let would = report["would_embed"].as_u64().unwrap_or(0);
         let skipped = report["skipped"].as_u64().unwrap_or(0);
-        println!("dry-run: would embed {would} page(s), {skipped} already up-to-date");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-embed-dry-run-would-embed-would-page-s-skipped-already-up-to-date",
+                &[
+                    ("value0", format!("{}", would)),
+                    ("value1", format!("{}", skipped))
+                ]
+            )
+        );
     } else {
         println!("{}", serde_json::to_string_pretty(&report)?);
         // Live mode: the report is on stdout, the exit code must agree.

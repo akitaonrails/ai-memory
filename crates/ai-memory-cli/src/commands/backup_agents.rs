@@ -47,8 +47,10 @@ pub struct DiscoveredAsset {
 /// Returns an error if directory traversal fails, source files cannot be read,
 /// or writing the output archive fails.
 pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
-    let home = home_dir().context("locating user home directory")?;
-    let cwd = std::env::current_dir().context("locating current working directory")?;
+    let i18n = &_config.i18n;
+    let home = home_dir().context(i18n.text("cli-backup-agents-locating-user-home-directory"))?;
+    let cwd = std::env::current_dir()
+        .context(i18n.text("cli-backup-agents-locating-current-working-directory"))?;
 
     let mut discovered = discover_assets(&home, &cwd, &args)?;
 
@@ -63,12 +65,15 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
     discovered.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
 
     if discovered.is_empty() {
-        println!("No AI agent assets detected for backup.");
+        println!(
+            "{}",
+            i18n.text("cli-backup-agents-no-ai-agent-assets-detected-for-backup")
+        );
         return Ok(());
     }
 
     if args.dry_run {
-        print_dry_run(&discovered);
+        print_dry_run(i18n, &discovered);
         return Ok(());
     }
 
@@ -99,14 +104,14 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
     let count = build_archive(
         temporary
             .reopen()
-            .context("reopening temporary agent archive")?,
+            .context(i18n.text("cli-backup-agents-reopening-temporary-agent-archive"))?,
         &discovered,
         args.include_secrets,
     )?;
     temporary
         .as_file()
         .sync_all()
-        .context("syncing temporary agent archive")?;
+        .context(i18n.text("cli-backup-agents-syncing-temporary-agent-archive"))?;
     let persisted = temporary
         .persist(dest)
         .map_err(|error| error.error)
@@ -122,25 +127,32 @@ pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
     info!(path = %dest.display(), bytes = size, count, "agent assets backup written");
 
     println!(
-        "✓ Backed up {} agent assets to {} ({})",
-        count,
-        dest.display(),
-        human_bytes(size)
+        "{}",
+        i18n.format(
+            "cli-backup-agents-backed-up-agent-assets-to",
+            &[
+                ("value0", format!("{}", count)),
+                ("value1", format!("{}", dest.display())),
+                ("value2", human_bytes(size).to_string())
+            ]
+        )
     );
 
     if args.include_secrets {
         eprintln!(
-            "⚠️  Warning: Secrets were included without sanitization. Archive mode is 0600 on Unix; protect the file on other platforms."
-        );
+            "{}", i18n.text("cli-backup-agents-warning-secrets-were-included-without-sanitization-archive-mode-is-0600-on-u"));
     }
 
     Ok(())
 }
 
-fn print_dry_run(discovered: &[DiscoveredAsset]) {
+fn print_dry_run(i18n: &ai_memory_core::i18n::Localizer, discovered: &[DiscoveredAsset]) {
     println!(
-        "Found {} assets across AI agents (dry-run):",
-        discovered.len()
+        "{}",
+        i18n.format(
+            "cli-backup-agents-found-assets-across-ai-agents-dry-run",
+            &[("value0", format!("{}", discovered.len()))]
+        )
     );
     for asset in discovered {
         println!(

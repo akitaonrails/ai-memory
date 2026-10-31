@@ -1,40 +1,40 @@
 {% extends "base.html" %}
 
-{% block title %}{{ project }} — ai-memory{% endblock %}
+{% block title %}{{ project }} {{ i18n.text("web-ai-memory") }}{% endblock %}
 
 {% block header_search %}{% include "_header_search_scoped.html" %}{% endblock %}
 
 {% block content %}
-<nav class="breadcrumbs" aria-label="Breadcrumb"><a href=".">Projects</a><span>/</span><span>{{ workspace }}</span><span>/</span><span aria-current="page">{{ project }}</span></nav>
-<div class="page-heading"><div><p class="eyebrow">PROJECT WORKSPACE</p><h1>{{ project }}</h1><p>Understand your agents, inspect their sessions, and find expensive calls.</p></div><a href="{{ inbox_href }}#compose" class="primary-button">✉ Message an agent</a></div>
+<nav class="breadcrumbs" aria-label="{{ i18n.text("web-breadcrumb") }}"><a href=".">{{ i18n.text("web-projects") }}</a><span>/</span><span>{{ workspace }}</span><span>/</span><span aria-current="page">{{ project }}</span></nav>
+<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-project-workspace") }}</p><h1>{{ project }}</h1><p>{{ i18n.text("web-understand-your-agents-inspect-their-sessions-and-find-expensive-calls") }}</p></div><a href="{{ inbox_href }}#compose" class="primary-button">{{ i18n.text("web-message-an-agent") }}</a></div>
 <div class="project-navigation">
-  <nav class="project-tabs" role="tablist" aria-label="Project sections">
-    <a id="project-tab-overview" href="{{ project_href }}?tab=overview" role="tab" aria-controls="project-panel-overview" aria-selected="true" data-project-tab="overview">Overview</a>
-    <a id="project-tab-agents" href="{{ project_href }}?tab=agents" role="tab" aria-controls="project-panel-agents" aria-selected="false" tabindex="-1" data-project-tab="agents">Agents</a>
-    <a id="project-tab-tokens" href="{{ project_href }}?tab=tokens" role="tab" aria-controls="project-panel-tokens" aria-selected="false" tabindex="-1" data-project-tab="tokens">Token usage</a>
-    <a id="project-tab-sessions" href="{{ project_href }}?tab=sessions" role="tab" aria-controls="project-panel-sessions" aria-selected="false" tabindex="-1" data-project-tab="sessions">Sessions</a>
-    <a id="project-tab-knowledge" href="{{ project_href }}?tab=knowledge" role="tab" aria-controls="project-panel-knowledge" aria-selected="false" tabindex="-1" data-project-tab="knowledge">Knowledge</a>
+  <nav class="project-tabs" role="tablist" aria-label="{{ i18n.text("web-project-sections") }}">
+    <a id="project-tab-overview" href="{{ project_href }}?tab=overview" role="tab" aria-controls="project-panel-overview" aria-selected="true" data-project-tab="overview">{{ i18n.text("web-overview") }}</a>
+    <a id="project-tab-agents" href="{{ project_href }}?tab=agents" role="tab" aria-controls="project-panel-agents" aria-selected="false" tabindex="-1" data-project-tab="agents">{{ i18n.text("web-agents") }}</a>
+    <a id="project-tab-tokens" href="{{ project_href }}?tab=tokens" role="tab" aria-controls="project-panel-tokens" aria-selected="false" tabindex="-1" data-project-tab="tokens">{{ i18n.text("web-token-usage") }}</a>
+    <a id="project-tab-sessions" href="{{ project_href }}?tab=sessions" role="tab" aria-controls="project-panel-sessions" aria-selected="false" tabindex="-1" data-project-tab="sessions">{{ i18n.text("web-sessions-agent") }}</a>
+    <a id="project-tab-knowledge" href="{{ project_href }}?tab=knowledge" role="tab" aria-controls="project-panel-knowledge" aria-selected="false" tabindex="-1" data-project-tab="knowledge">{{ i18n.text("web-knowledge") }}</a>
   </nav>
-  <nav class="project-tools" aria-label="Project tools"><a href="{{ inbox_href }}">Inbox <span aria-hidden="true">↗</span></a><a href="{{ graph_href }}">Link graph <span aria-hidden="true">↗</span></a></nav>
+  <nav class="project-tools" aria-label="{{ i18n.text("web-project-tools") }}"><a href="{{ inbox_href }}">{{ i18n.text("web-inbox") }} <span aria-hidden="true">↗</span></a><a href="{{ graph_href }}">{{ i18n.text("web-link-graph") }} <span aria-hidden="true">↗</span></a></nav>
 </div>
 <noscript><style>.project-panel[hidden]{display:block}</style></noscript>
 <section id="project-panel-overview" class="project-panel" role="tabpanel" aria-labelledby="project-tab-overview" tabindex="0">
-  <div class="section-heading"><div><p class="eyebrow">AT A GLANCE</p><h2>Project overview</h2><p>Capture, activity, and pending messages. Choose a tab to explore the details.</p></div></div>
-<section id="project-capture-summary" aria-label="Project capture summary" class="section-block">
+  <div class="section-heading"><div><p class="eyebrow">{{ i18n.text("web-at-a-glance") }}</p><h2>{{ i18n.text("web-project-overview") }}</h2><p>{{ i18n.text("web-capture-activity-and-pending-messages-choose-a-tab-to-explore-the-details") }}</p></div></div>
+<section id="project-capture-summary" aria-label="{{ i18n.text("web-project-capture-summary") }}" class="section-block">
   <div class="metric-grid project-memory-grid">
-    <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions#session-token-table"><span>Sessions</span><strong>{{ stats.session_count }}</strong><small>Registered activity</small></a>
-    <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions&sort=events#session-token-table"><span>Captured events</span><strong>{{ stats.observation_count }}</strong><small>Busiest sessions first</small></a>
-    <a class="metric-card metric-link" href="{{ project_href }}?tab=knowledge#project-panel-knowledge"><span>Compiled pages</span><strong>{{ stats.page_count }}</strong><small>Knowledge for recall</small></a>
-    <a class="metric-card metric-link metric-attention" href="{{ project_href }}?tab=sessions&state=open#session-token-table"><span>Open sessions</span><strong>{{ stats.open_session_count }}</strong><small>Only unfinished sessions</small></a>
-    <a class="metric-card metric-link" href="{{ project_href }}?tab=tokens#token-usage"><span>Tokens (in / out)</span><strong style="font-size:23px">{{ stats.tokens_total }}</strong><small>Reported session totals</small></a>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions#session-token-table"><span>{{ i18n.text("web-sessions-agent") }}</span><strong>{{ stats.session_count }}</strong><small>{{ i18n.text("web-registered-activity") }}</small></a>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=sessions&sort=events#session-token-table"><span>{{ i18n.text("web-captured-events") }}</span><strong>{{ stats.observation_count }}</strong><small>{{ i18n.text("web-busiest-sessions-first") }}</small></a>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=knowledge#project-panel-knowledge"><span>{{ i18n.text("web-compiled-pages") }}</span><strong>{{ stats.page_count }}</strong><small>{{ i18n.text("web-knowledge-for-recall") }}</small></a>
+    <a class="metric-card metric-link metric-attention" href="{{ project_href }}?tab=sessions&state=open#session-token-table"><span>{{ i18n.text("web-open-sessions") }}</span><strong>{{ stats.open_session_count }}</strong><small>{{ i18n.text("web-only-unfinished-sessions") }}</small></a>
+    <a class="metric-card metric-link" href="{{ project_href }}?tab=tokens#token-usage"><span>{{ i18n.text("web-tokens-in-out") }}</span><strong style="font-size:23px">{{ stats.tokens_total }}</strong><small>{{ i18n.text("web-reported-session-totals") }}</small></a>
   </div>
   <p class="mt-4 text-xs text-slate-500 dark:text-slate-400">
-    {% if stats.last_activity_relative != "" %}Last capture {{ stats.last_activity_relative }}. {% endif %}
-    {% if stats.open_session_count > 0 %}Open means no SessionEnd was received; it may be an active agent or an interruption.{% else %}No currently open session is recorded.{% endif %}
+    {% if stats.last_activity_relative != "" %}{{ i18n.one("web-last-capture-sentence", stats.last_activity_relative) }} {% endif %}
+    {% if stats.open_session_count > 0 %}{{ i18n.text("web-open-means-no-sessionend-was-received-it-may-be-an-active-agent-or-an-interruption") }}{% else %}{{ i18n.text("web-no-currently-open-session-is-recorded") }}{% endif %}
   </p>
   {% if !by_agent.is_empty() %}
   <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-200 dark:border-slate-800 pt-4">
-    <span class="text-xs text-slate-500 dark:text-slate-400">Agents:</span>
+    <span class="text-xs text-slate-500 dark:text-slate-400">{{ i18n.text("web-agents-project") }}</span>
     {% for badge in by_agent %}
     <span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-100 dark:border-blue-900">
       {{ badge.label }} <span class="text-blue-500 dark:text-blue-400">· {{ badge.count }}</span>
@@ -45,13 +45,13 @@
 </section>
     <section class="surface panel-heading" aria-labelledby="mailbox-heading">
       <div class="flex items-center gap-2 mb-3">
-        <a href="{{ inbox_href }}" class="secondary-button" style="float:right">Open inbox ↗</a><h2 id="mailbox-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">Mailbox</h2>
+        <a href="{{ inbox_href }}" class="secondary-button" style="float:right">{{ i18n.text("web-open-inbox") }}</a><h2 id="mailbox-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-mailbox") }}</h2>
         {% if !mailbox.is_empty() %}
-        <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300">{% if mailbox_capped %}{{ mailbox.len() }} of {{ mailbox_total }}{% else %}{{ mailbox_total }}{% endif %} pending</span>
+        <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300">{% if mailbox_capped %}{{ i18n.two("web-mailbox-capped-pending", mailbox.len(), mailbox_total) }}{% else %}{{ i18n.one("web-mailbox-pending", mailbox_total) }}{% endif %}</span>
         {% endif %}
       </div>
       {% if mailbox.is_empty() %}
-      <p class="text-sm text-slate-500 dark:text-slate-400">No pending messages for this project.</p>
+      <p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-pending-messages-for-this-project") }}</p>
       {% else %}
       <ul class="divide-y divide-slate-100 dark:divide-slate-800">
         {% for message in mailbox %}
@@ -60,9 +60,9 @@
             <div class="text-sm font-medium text-slate-800 dark:text-slate-100 truncate">{{ message.subject }}</div>
             <div class="flex items-center gap-2 mt-1">
               {% if let Some(href) = message.sender_href %}
-              <a href="{{ href }}" class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 shrink-0">from {{ message.sender }}</a>
+              <a href="{{ href }}" class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 shrink-0">{{ i18n.text("web-from-project-2") }} {{ message.sender }}</a>
               {% else %}
-              <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 shrink-0">from {{ message.sender }}</span>
+              <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 shrink-0">{{ i18n.text("web-from-project-2") }} {{ message.sender }}</span>
               {% endif %}
               <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 shrink-0">{{ message.nature }}</span>
               <span class="text-xs text-slate-500 dark:text-slate-400 truncate">{{ message.snippet }}</span>
@@ -73,7 +73,7 @@
         {% endfor %}
       </ul>
       <p class="mt-2 text-xs text-slate-500 dark:text-slate-400">
-        {% if mailbox_capped %}Showing the oldest {{ mailbox.len() }} of {{ mailbox_total }}; <code class="font-mono">ai-memory message list --workspace {{ workspace }} --project {{ project }} --limit 200</code> lists up to 200. {% endif %}An agent in this project reads them with <code class="font-mono">memory_message_pop</code>.
+        {% if mailbox_capped %}{{ i18n.two("web-mailbox-oldest-shown", mailbox.len(), mailbox_total) }}; <code class="font-mono">ai-memory message list --workspace {{ workspace }} --project {{ project }} --limit 200</code> {{ i18n.text("web-lists-up-to-200") }} {% endif %}{{ i18n.rich("web-mailbox-agent-reads", "font-mono")|safe }}
       </p>
       {% endif %}
     </section>
@@ -85,17 +85,17 @@
 {% include "_usage_panel.html" %}
 </section>
 <section id="project-panel-knowledge" class="project-panel" role="tabpanel" aria-labelledby="project-tab-knowledge" tabindex="0" hidden>
-<div class="section-heading"><div><p class="eyebrow">COMPILED MEMORY</p><h2>Knowledge</h2><p>Browse saved pages or search this project's memory.</p></div></div>
+<div class="section-heading"><div><p class="eyebrow">{{ i18n.text("web-compiled-memory") }}</p><h2>{{ i18n.text("web-knowledge") }}</h2><p>{{ i18n.text("web-browse-saved-pages-or-search-this-project-s-memory") }}</p></div></div>
 <div id="knowledge" class="surface knowledge-layout">
   <form action="search" method="get" class="knowledge-search">
     <input type="hidden" name="workspace" value="{{ workspace }}"><input type="hidden" name="project" value="{{ project }}">
-    <label for="project-search-q" class="sr-only">Search this project's memory</label><input id="project-search-q" name="q" type="search" class="field-input" placeholder="Search project memory…"><button type="submit" class="secondary-button">Search</button>
+    <label for="project-search-q" class="sr-only">{{ i18n.text("web-search-this-project-s-memory") }}</label><input id="project-search-q" name="q" type="search" class="field-input" placeholder="{{ i18n.text("web-search-project-memory") }}"><button type="submit" class="secondary-button">{{ i18n.text("web-search") }}</button>
   </form>
   <!-- Sidebar: folder tree -->
-  <aside aria-label="Project pages">
-    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Pages</h2>
+  <aside aria-label="{{ i18n.text("web-project-pages") }}">
+    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-pages") }}</h2>
     {% if folders.is_empty() %}
-    <p class="text-sm text-slate-400 dark:text-slate-600">No compiled pages yet.</p>
+    <p class="text-sm text-slate-400 dark:text-slate-600">{{ i18n.text("web-no-compiled-pages-yet") }}</p>
     {% else %}
     <ul class="space-y-1">
       {% for folder in folders %}
@@ -114,7 +114,7 @@
           </li>
           {% endfor %}
           {% if let Some(href) = folder.href %}{% if folder.total > folder.pages.len() %}
-          <li><a href="{{ href }}" class="block text-xs text-blue-600 dark:text-blue-400 hover:underline py-0.5">View all {{ folder.total }}</a></li>
+          <li><a href="{{ href }}" class="block text-xs text-blue-600 dark:text-blue-400 hover:underline py-0.5">{{ i18n.text("web-view-all") }} {{ folder.total }}</a></li>
           {% endif %}{% endif %}
         </ul>
       </li>
@@ -123,7 +123,7 @@
     {% endif %}
     {% if !system.is_empty() %}
     <details class="mt-6">
-      <summary class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 cursor-pointer select-none">System</summary>
+      <summary class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 cursor-pointer select-none">{{ i18n.text("web-system") }}</summary>
       <ul class="space-y-1 mt-3">
         {% for folder in system %}
         <li>
@@ -141,7 +141,7 @@
             </li>
             {% endfor %}
             {% if let Some(href) = folder.href %}{% if folder.total > folder.pages.len() %}
-            <li><a href="{{ href }}" class="block text-xs text-blue-600 dark:text-blue-400 hover:underline py-0.5">View all {{ folder.total }}</a></li>
+            <li><a href="{{ href }}" class="block text-xs text-blue-600 dark:text-blue-400 hover:underline py-0.5">{{ i18n.text("web-view-all") }} {{ folder.total }}</a></li>
             {% endif %}{% endif %}
           </ul>
         </li>
@@ -153,14 +153,14 @@
 
   <!-- Main: recent pages -->
   <div class="flex-1 min-w-0">
-    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Recent Activity</h2>
+    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-recent-activity") }}</h2>
     {% if recent.is_empty() %}
     <div class="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 p-5 text-sm text-slate-500 dark:text-slate-400">
-      <p class="font-medium text-slate-700 dark:text-slate-200">No compiled memory pages yet.</p>
+      <p class="font-medium text-slate-700 dark:text-slate-200">{{ i18n.text("web-no-compiled-memory-pages-yet") }}</p>
       {% if stats.session_count > 0 %}
-      <p class="mt-2">This project has {{ stats.session_count }} captured session{% if stats.session_count != 1 %}s{% endif %} and {{ stats.observation_count }} sanitized event{% if stats.observation_count != 1 %}s{% endif %}. Pages appear after consolidation; agents can still retrieve current context through MCP.</p>
+      <p class="mt-2">{{ i18n.text("web-this-project-has") }} {{ stats.session_count }} {{ i18n.count("web-count-captured-session", stats.session_count) }} {{ i18n.text("web-and") }} {{ stats.observation_count }} {{ i18n.count("web-count-sanitized-event", stats.observation_count) }}{{ i18n.text("web-pages-appear-after-consolidation-agents-can-still-retrieve-current-context-through-mc") }}</p>
       {% else %}
-      <p class="mt-2">No capture has been received for this project yet. Start an agent session with the hook enabled, then return after its observations are consolidated.</p>
+      <p class="mt-2">{{ i18n.text("web-no-capture-has-been-received-for-this-project-yet-start-an-agent-session-with-the-hoo") }}</p>
       {% endif %}
     </div>
     {% else %}
@@ -195,19 +195,19 @@
 </section>
 <section id="project-panel-sessions" class="project-panel" role="tabpanel" aria-labelledby="project-tab-sessions" tabindex="0" hidden>
 <div id="session-token-table" class="surface section-block">
-  <div class="section-heading panel-heading"><div><p class="eyebrow">RECENT ACTIVITY</p><h2>Sessions</h2><p>Open a session to inspect its model responses and captured events.</p></div></div>
+  <div class="section-heading panel-heading"><div><p class="eyebrow">{{ i18n.text("web-recent-activity-project") }}</p><h2>{{ i18n.text("web-sessions-agent") }}</h2><p>{{ i18n.text("web-open-a-session-to-inspect-its-model-responses-and-captured-events") }}</p></div></div>
   {% if sessions.is_empty() %}
-  <p class="text-sm text-slate-400 dark:text-slate-600">No sessions recorded yet.</p>
+  <p class="text-sm text-slate-400 dark:text-slate-600">{{ i18n.text("web-no-sessions-recorded-yet") }}</p>
   {% else %}
   <div class="rounded-lg border border-slate-200 dark:border-slate-800 overflow-x-auto">
     <table class="sessions-table ops-table">
       <thead class="border-b border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400">
         <tr>
-          <th>Agent</th>
-          <th>Started</th>
-          <th>Duration</th>
-          <th>Events</th>
-          <th>Tokens</th>
+          <th>{{ i18n.text("web-agent") }}</th>
+          <th>{{ i18n.text("web-started") }}</th>
+          <th>{{ i18n.text("web-duration") }}</th>
+          <th>{{ i18n.text("web-events") }}</th>
+          <th>{{ i18n.text("web-tokens") }}</th>
         </tr>
       </thead>
       <tbody class="divide-y divide-slate-100 dark:divide-slate-800">

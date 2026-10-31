@@ -10,20 +10,25 @@ use crate::http_client::{ServerEndpoint, post_json};
 
 /// Retitle one workstream selectable from this checkout.
 pub async fn run(config: &Config, args: RenameWorkstreamArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
     if args.to.trim().is_empty() {
-        bail!("--to was passed empty; specify the new workstream name");
+        bail!(
+            "{}",
+            i18n.text("cli-rename-workstream-to-was-passed-empty-specify-the-new-workstream-name")
+        );
     }
 
     // clap's `conflicts_with` rejects passing both, but not passing neither:
     // the pair is optional on either side, so an empty invocation reaches here
     // with nothing to address.
     if args.from.is_none() && args.workstream_id.is_none() {
-        bail!("pass --from NAME or --workstream-id ID to choose the workstream to rename");
+        bail!("{}", i18n.text("cli-rename-workstream-pass-from-name-or-workstream-id-id-to-choose-the-workstream-to-rename"));
     }
-    let cwd = std::env::current_dir().context("getting managed workstream checkout")?;
+    let cwd = std::env::current_dir()
+        .context(i18n.text("cli-rename-workstream-getting-managed-workstream-checkout"))?;
     let repository = inspect_repository(&cwd)?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
@@ -46,19 +51,29 @@ pub async fn run(config: &Config, args: RenameWorkstreamArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&renamed)?);
         return Ok(());
     }
-    print!("{}", render_human(&renamed));
+    print!("{}", render_human(&config.i18n, &renamed));
     Ok(())
 }
 
-fn render_human(renamed: &RenamedManagedWorkstream) -> String {
+fn render_human(
+    i18n: &ai_memory_core::i18n::Localizer,
+    renamed: &RenamedManagedWorkstream,
+) -> String {
     if renamed.from == renamed.to {
         // A repeated rename is not a failure, but reporting it as a change
         // would be a lie: nothing was written.
-        return format!("Workstream '{}' already has that name.\n", renamed.to);
+        return i18n.format(
+            "cli-rename-workstream-workstream-already-has-that-name",
+            &[("value0", renamed.to.to_string())],
+        );
     }
-    format!(
-        "Renamed workstream '{}' to '{}'.\n    id: {}\n",
-        renamed.from, renamed.to, renamed.workstream_id
+    i18n.format(
+        "cli-rename-workstream-renamed-workstream-to-id",
+        &[
+            ("value0", renamed.from.to_string()),
+            ("value1", renamed.to.to_string()),
+            ("value2", format!("{}", renamed.workstream_id)),
+        ],
     )
 }
 
@@ -78,7 +93,7 @@ mod tests {
     #[test]
     fn human_output_reports_both_names_and_the_stable_id() {
         let renamed = renamed("typo-nmae", "refactor-db");
-        let rendered = render_human(&renamed);
+        let rendered = render_human(&ai_memory_core::i18n::Localizer::default(), &renamed);
         assert!(rendered.contains("'typo-nmae' to 'refactor-db'"));
         // The id is indented far enough that a continuation line cannot be
         // mistaken for the start of another record, matching `workstreams`.
@@ -88,7 +103,10 @@ mod tests {
 
     #[test]
     fn renaming_to_the_same_name_does_not_claim_a_change() {
-        let rendered = render_human(&renamed("stable", "stable"));
+        let rendered = render_human(
+            &ai_memory_core::i18n::Localizer::default(),
+            &renamed("stable", "stable"),
+        );
         assert!(rendered.contains("already has that name"));
         assert!(!rendered.contains("Renamed"));
     }

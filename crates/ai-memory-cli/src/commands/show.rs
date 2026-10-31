@@ -48,7 +48,6 @@ const SKIPPED_DIRS: [&str; 8] = [
     "__pycache__",
 ];
 const MAX_SCAN_ENTRIES: usize = 4096;
-const NEW_PROJECT_LABEL: &str = "+ New project";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProjectRow {
@@ -137,13 +136,19 @@ struct JsonOutput {
 
 /// Pick a local checkout and harness, then delegate to managed `run`.
 pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
+    let i18n = &config.i18n;
     if args.json && (args.yolo || args.true_yolo || args.fresh || !args.native_args.is_empty()) {
-        bail!("--json only lists launch options; do not combine it with launch arguments");
+        bail!(
+            "{}",
+            i18n.text(
+                "cli-show-json-only-lists-launch-options-do-not-combine-it-with-launch-arguments"
+            )
+        );
     }
     let root = std::env::current_dir()
-        .context("reading the current directory")?
+        .context(i18n.text("cli-profile-reading-the-current-directory"))?
         .canonicalize()
-        .context("canonicalizing the current directory")?;
+        .context(i18n.text("cli-show-canonicalizing-the-current-directory"))?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let candidates = collect_candidates(
         config,
@@ -161,33 +166,40 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!(
-            "`ai-memory show` needs a terminal; use `ai-memory show --json` to list choices in scripts"
-        );
+            "{}", i18n.text("cli-show-ai-memory-show-needs-a-terminal-use-ai-memory-show-json-to-list-choices-in-s"));
     }
     if harnesses.is_empty() {
         bail!(
-            "no supported managed harness was found in PATH (looked for: {})",
-            RunHarnessChoice::value_variants()
-                .iter()
-                .map(|choice| harness_name(*choice))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "{}",
+            i18n.format(
+                "cli-show-no-supported-managed-harness-was-found-in-path-looked-for",
+                &[(
+                    "value0",
+                    RunHarnessChoice::value_variants()
+                        .iter()
+                        .map(|choice| harness_name(*choice))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                        .to_string()
+                )]
+            )
         );
     }
 
     let mut project_choices = vec![Choice {
-        label: NEW_PROJECT_LABEL.to_owned(),
-        detail: "create a directory and install its agent context".to_owned(),
+        label: i18n.text("cli-picker-new-project"),
+        detail: i18n.text("cli-picker-new-project-detail"),
     }];
     project_choices.extend(candidates.iter().map(|candidate| Choice {
         label: candidate.label(),
         detail: candidate.detail(),
     }));
-    let Some(project_index) = select("Project", &mut project_choices)? else {
+    let Some(project_index) = select(i18n, &i18n.text("cli-picker-project"), &mut project_choices)?
+    else {
         return Ok(0);
     };
     let new_project = if project_index == 0 {
-        let Some(name) = prompt_project_name(&root)? else {
+        let Some(name) = prompt_project_name(i18n, &root)? else {
             return Ok(0);
         };
         Some(name)
@@ -206,7 +218,11 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
         .as_deref()
         .map(terminal_text)
         .unwrap_or_else(|| project_choices[project_index].label.clone());
-    let Some(harness_index) = select(&format!("Agent | {project_label}"), &mut harness_choices)?
+    let Some(harness_index) = select(
+        i18n,
+        &i18n.one("cli-picker-agent-title", &project_label),
+        &mut harness_choices,
+    )?
     else {
         return Ok(0);
     };
@@ -214,7 +230,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
 
     let (target, workspace, project) = if let Some(name) = new_project {
         let workspace = args.workspace.as_deref().unwrap_or(DEFAULT_WORKSPACE);
-        let target = create_project(&root, &name, workspace, harness, &config.runtime_env)?;
+        let target = create_project(i18n, &root, &name, workspace, harness, &config.runtime_env)?;
         (target, workspace.to_owned(), name)
     } else {
         let candidate = &candidates[project_index - 1];
@@ -263,6 +279,7 @@ async fn collect_candidates(
     workspace_filter: Option<&str>,
     scan: bool,
 ) -> Vec<Candidate> {
+    let i18n = &config.i18n;
     let rows: Option<Vec<ProjectRow>> = match crate::commands::list_projects::fetch_project_rows(
         endpoint,
         workspace_filter,
@@ -272,9 +289,7 @@ async fn collect_candidates(
         Ok(rows) => Some(rows),
         Err(error) => {
             eprintln!(
-                "ai-memory: server project listing unavailable ({}); using client-local links and scan results",
-                terminal_text(&format!("{error:#}"))
-            );
+                "{}", i18n.format("cli-show-ai-memory-server-project-listing-unavailable-using-client-local-links-and-sc", &[("value0", terminal_text(&format!("{error:#}")).to_string())]));
             None
         }
     };
@@ -289,8 +304,11 @@ async fn collect_candidates(
         Ok(links) => links,
         Err(error) => {
             eprintln!(
-                "ai-memory: client project registry unavailable ({}); using scan results",
-                terminal_text(&format!("{error:#}"))
+                "{}",
+                i18n.format(
+                    "cli-show-ai-memory-client-project-registry-unavailable-using-scan-results",
+                    &[("value0", terminal_text(&format!("{error:#}")).to_string())]
+                )
             );
             Vec::new()
         }
@@ -313,10 +331,15 @@ async fn collect_candidates(
             Err(error) => {
                 if stale_warnings < 3 {
                     eprintln!(
-                        "ai-memory: ignored stale client project link {}/{} ({})",
-                        terminal_text(&link.workspace),
-                        terminal_text(&link.project),
-                        terminal_text(&format!("{error:#}"))
+                        "{}",
+                        i18n.format(
+                            "cli-show-ai-memory-ignored-stale-client-project-link",
+                            &[
+                                ("value0", terminal_text(&link.workspace).to_string()),
+                                ("value1", terminal_text(&link.project).to_string()),
+                                ("value2", terminal_text(&format!("{error:#}")).to_string())
+                            ]
+                        )
                     );
                 }
                 stale_warnings += 1;
@@ -338,8 +361,11 @@ async fn collect_candidates(
     }
     if stale_warnings > 3 {
         eprintln!(
-            "ai-memory: ignored {} additional stale client project links",
-            stale_warnings - 3
+            "{}",
+            i18n.format(
+                "cli-show-ai-memory-ignored-additional-stale-client-project-links",
+                &[("value0", format!("{}", stale_warnings - 3))]
+            )
         );
     }
 
@@ -470,16 +496,12 @@ pub(super) fn validate_registered_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn revalidate_candidate(config: &Config, candidate: &Candidate) -> Result<PathBuf> {
+    let i18n = &config.i18n;
     let path = validate_registered_path(&candidate.path)?;
     let (workspace, project) = super::resolve_scope_for_path(config, &path)?;
     if workspace != candidate.workspace || project != candidate.project {
         bail!(
-            "checkout scope changed after it was listed: expected {}/{}, found {}/{}; rerun `ai-memory show`",
-            terminal_text(&candidate.workspace),
-            terminal_text(&candidate.project),
-            terminal_text(&workspace),
-            terminal_text(&project)
-        );
+            "{}", i18n.format("cli-show-checkout-scope-changed-after-it-was-listed-expected-found-rerun-ai-memory-sh", &[("value0", terminal_text(&candidate.workspace).to_string()), ("value1", terminal_text(&candidate.project).to_string()), ("value2", terminal_text(&workspace).to_string()), ("value3", terminal_text(&project).to_string())]));
     }
     Ok(path)
 }
@@ -564,18 +586,20 @@ fn marker_body(workspace: &str, project: &str) -> String {
 }
 
 fn create_project(
+    i18n: &ai_memory_core::i18n::Localizer,
     parent: &Path,
     name: &str,
     workspace: &str,
     harness: RunHarnessChoice,
     env: &crate::config::RuntimeEnv,
 ) -> Result<PathBuf> {
-    create_project_with_initializer(parent, name, workspace, |staging| {
-        install_context_files(harness, staging, env)
+    create_project_with_initializer(i18n, parent, name, workspace, |staging| {
+        install_context_files(i18n, harness, staging, env)
     })
 }
 
 fn create_project_with_initializer(
+    i18n: &ai_memory_core::i18n::Localizer,
     parent: &Path,
     name: &str,
     workspace: &str,
@@ -583,12 +607,17 @@ fn create_project_with_initializer(
 ) -> Result<PathBuf> {
     if !portable_component(name) {
         bail!(
-            "invalid project name {name:?}: use lowercase ASCII letters, digits, dot, dash, or underscore, starting with a letter or digit"
-        );
+            "{}", i18n.format("cli-show-invalid-project-name-name-use-lowercase-ascii-letters-digits-dot-dash-or-und", &[("value0", format!("{:?}", name))]));
     }
     let target = parent.join(name);
     if target.exists() {
-        bail!("project directory already exists: {}", target.display());
+        bail!(
+            "{}",
+            i18n.format(
+                "cli-show-project-directory-already-exists",
+                &[("value0", format!("{}", target.display()))]
+            )
+        );
     }
     let staging = tempfile::Builder::new()
         .prefix(".ai-memory-project-")
@@ -598,12 +627,15 @@ fn create_project_with_initializer(
         &staging.path().join(".ai-memory.toml"),
         marker_body(workspace, name).as_bytes(),
     )
-    .context("writing the staged project marker")?;
+    .context(i18n.text("cli-show-writing-the-staged-project-marker"))?;
     initialize(staging.path())?;
     if target.exists() {
         bail!(
-            "project directory appeared while it was being prepared: {}",
-            target.display()
+            "{}",
+            i18n.format(
+                "cli-show-project-directory-appeared-while-it-was-being-prepared",
+                &[("value0", format!("{}", target.display()))]
+            )
         );
     }
     std::fs::rename(staging.path(), &target)
@@ -611,11 +643,18 @@ fn create_project_with_initializer(
     let target = target
         .canonicalize()
         .with_context(|| format!("canonicalizing new project {}", target.display()))?;
-    println!("created {}", target.display());
+    println!(
+        "{}",
+        i18n.format(
+            "cli-show-created",
+            &[("value0", format!("{}", target.display()))]
+        )
+    );
     Ok(target)
 }
 
 fn install_context_files(
+    i18n: &ai_memory_core::i18n::Localizer,
     harness: RunHarnessChoice,
     path: &Path,
     env: &crate::config::RuntimeEnv,
@@ -633,6 +672,7 @@ fn install_context_files(
         ),
     };
     install_instructions::run_quiet(
+        i18n,
         InstallInstructionsArgs {
             target: Some(path.join(instruction)),
             print: false,
@@ -692,11 +732,16 @@ pub(super) enum HorizontalDirection {
 
 type HorizontalHandler<'a> = &'a mut dyn FnMut(usize, HorizontalDirection, &mut Choice);
 
-pub(super) fn select(title: &str, choices: &mut [Choice]) -> Result<Option<usize>> {
-    select_inner(title, choices, None, None, None)
+pub(super) fn select(
+    i18n: &ai_memory_core::i18n::Localizer,
+    title: &str,
+    choices: &mut [Choice],
+) -> Result<Option<usize>> {
+    select_inner(i18n, title, choices, None, None, None)
 }
 
 pub(super) fn select_with_horizontal(
+    i18n: &ai_memory_core::i18n::Localizer,
     title: &str,
     choices: &mut [Choice],
     horizontal_hint: &str,
@@ -704,6 +749,7 @@ pub(super) fn select_with_horizontal(
     on_horizontal: &mut dyn FnMut(usize, HorizontalDirection, &mut Choice),
 ) -> Result<Option<usize>> {
     select_inner(
+        i18n,
         title,
         choices,
         Some(horizontal_hint),
@@ -753,6 +799,7 @@ impl PickerSearch {
 }
 
 fn select_inner(
+    i18n: &ai_memory_core::i18n::Localizer,
     title: &str,
     choices: &mut [Choice],
     horizontal_hint: Option<&str>,
@@ -760,7 +807,7 @@ fn select_inner(
     initial_search: Option<&str>,
 ) -> Result<Option<usize>> {
     if choices.is_empty() {
-        bail!("nothing to choose from");
+        bail!("{}", i18n.text("cli-picker-empty"));
     }
     terminal::enable_raw_mode().context("entering raw mode")?;
     let _guard = TerminalGuard;
@@ -779,7 +826,7 @@ fn select_inner(
         let indices = search.indices(choices);
         let visible = if indices.is_empty() {
             vec![Choice {
-                label: "No matching workstreams — edit the search or press Esc to clear".into(),
+                label: i18n.text("cli-picker-no-match"),
                 detail: String::new(),
             }]
         } else {
@@ -790,16 +837,20 @@ fn select_inner(
         };
         selected = selected.min(visible.len() - 1);
         let title = if initial_search.is_some() {
-            format!(
-                "{title} [{}/{}] | search: {}",
-                indices.len(),
-                choices.len(),
-                search.query
+            i18n.format(
+                "cli-picker-search-title",
+                &[
+                    ("title", title.to_owned()),
+                    ("matching", indices.len().to_string()),
+                    ("total", choices.len().to_string()),
+                    ("query", search.query.clone()),
+                ],
             )
         } else {
             title.to_owned()
         };
         drawn = draw(
+            i18n,
             &title,
             &visible,
             selected,
@@ -881,7 +932,10 @@ fn horizontal_direction(code: &KeyCode) -> Option<HorizontalDirection> {
     }
 }
 
-fn prompt_project_name(parent: &Path) -> Result<Option<String>> {
+fn prompt_project_name(
+    i18n: &ai_memory_core::i18n::Localizer,
+    parent: &Path,
+) -> Result<Option<String>> {
     terminal::enable_raw_mode().context("entering raw mode")?;
     let _guard = TerminalGuard;
     execute!(std::io::stdout(), cursor::Hide)?;
@@ -893,7 +947,13 @@ fn prompt_project_name(parent: &Path) -> Result<Option<String>> {
     let mut problem = None;
     let mut drawn = 0u16;
     loop {
-        drawn = draw_prompt("New project name", &name, problem.as_deref(), drawn)?;
+        drawn = draw_prompt(
+            i18n,
+            &i18n.text("cli-picker-project-name"),
+            &name,
+            problem.as_deref(),
+            drawn,
+        )?;
         let Event::Key(KeyEvent {
             code,
             modifiers,
@@ -917,7 +977,7 @@ fn prompt_project_name(parent: &Path) -> Result<Option<String>> {
                 problem = None;
             }
             KeyCode::Enter => {
-                problem = rejection(parent, &name);
+                problem = rejection(i18n, parent, &name);
                 if problem.is_none() {
                     clear(drawn)?;
                     return Ok(Some(name));
@@ -932,20 +992,26 @@ fn prompt_project_name(parent: &Path) -> Result<Option<String>> {
     }
 }
 
-fn rejection(parent: &Path, name: &str) -> Option<String> {
+fn rejection(i18n: &ai_memory_core::i18n::Localizer, parent: &Path, name: &str) -> Option<String> {
     if name.is_empty() {
-        return Some("type a name".to_owned());
+        return Some(i18n.text("cli-picker-name-required"));
     }
     if !portable_component(name) {
-        return Some("use lowercase letters, digits, dot, dash, or underscore".to_owned());
+        return Some(i18n.text("cli-picker-name-policy"));
     }
     if parent.join(name).exists() {
-        return Some(format!("{name} already exists here"));
+        return Some(i18n.one("cli-picker-name-exists", name));
     }
     None
 }
 
-fn draw_prompt(title: &str, name: &str, problem: Option<&str>, previous: u16) -> Result<u16> {
+fn draw_prompt(
+    i18n: &ai_memory_core::i18n::Localizer,
+    title: &str,
+    name: &str,
+    problem: Option<&str>,
+    previous: u16,
+) -> Result<u16> {
     let (columns, _) = terminal::size().unwrap_or((80, 24));
     let width = usize::from(columns.max(20)).saturating_sub(1);
     let mut out = std::io::stdout();
@@ -969,7 +1035,7 @@ fn draw_prompt(title: &str, name: &str, problem: Option<&str>, previous: u16) ->
     )?;
     let footer = problem
         .map(|problem| format!("  {}", terminal_text(problem)))
-        .unwrap_or_else(|| "  enter create | esc cancel".to_owned());
+        .unwrap_or_else(|| i18n.text("cli-picker-create-hint"));
     let footer = truncate(&footer, width);
     if problem.is_some() {
         write!(out, "{}\r\n", footer.as_str().red())?;
@@ -1010,7 +1076,9 @@ fn truncate(text: &str, width: usize) -> String {
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
+    i18n: &ai_memory_core::i18n::Localizer,
     title: &str,
     choices: &[Choice],
     selected: usize,
@@ -1062,15 +1130,18 @@ fn draw(
         .map(|hint| format!(" | {hint}"))
         .unwrap_or_default();
     let hint = if searchable {
-        "  type to search | ↑↓ move | ←→ harness | enter select | esc clear/cancel".to_owned()
+        i18n.text("cli-picker-search-hint")
     } else if choices.len() > viewport {
-        format!(
-            "  up/down move{horizontal_hint} | pgup/pgdn page | enter select | esc cancel [{}/{}]",
-            selected + 1,
-            choices.len()
+        i18n.format(
+            "cli-picker-paged-hint",
+            &[
+                ("horizontal", horizontal_hint.clone()),
+                ("selected", (selected + 1).to_string()),
+                ("total", choices.len().to_string()),
+            ],
         )
     } else {
-        format!("  up/down move{horizontal_hint} | enter select | esc cancel")
+        i18n.one("cli-picker-basic-hint", &horizontal_hint)
     };
     write!(out, "{}\r\n", truncate(&hint, width).dark_grey())?;
     out.flush()?;
@@ -1217,9 +1288,13 @@ mod tests {
     #[test]
     fn failed_project_initialization_rolls_back_the_staging_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let result = create_project_with_initializer(tmp.path(), "app", "default", |_path| {
-            bail!("synthetic failure")
-        });
+        let result = create_project_with_initializer(
+            &ai_memory_core::i18n::Localizer::default(),
+            tmp.path(),
+            "app",
+            "default",
+            |_path| bail!("synthetic failure"),
+        );
 
         assert!(result.is_err());
         assert!(!tmp.path().join("app").exists());
@@ -1235,11 +1310,17 @@ mod tests {
     #[test]
     fn created_project_is_published_only_after_initialization() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = create_project_with_initializer(tmp.path(), "app", "default", |staging| {
-            assert!(!tmp.path().join("app").exists());
-            std::fs::write(staging.join("AGENTS.md"), b"ready")?;
-            Ok(())
-        })
+        let path = create_project_with_initializer(
+            &ai_memory_core::i18n::Localizer::default(),
+            tmp.path(),
+            "app",
+            "default",
+            |staging| {
+                assert!(!tmp.path().join("app").exists());
+                std::fs::write(staging.join("AGENTS.md"), b"ready")?;
+                Ok(())
+            },
+        )
         .unwrap();
 
         assert_eq!(std::fs::read(path.join("AGENTS.md")).unwrap(), b"ready");
@@ -1251,9 +1332,14 @@ mod tests {
     #[test]
     fn marker_encoding_preserves_an_existing_nonportable_workspace_name() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path =
-            create_project_with_initializer(tmp.path(), "app", "Team \"One\"", |_staging| Ok(()))
-                .unwrap();
+        let path = create_project_with_initializer(
+            &ai_memory_core::i18n::Localizer::default(),
+            tmp.path(),
+            "app",
+            "Team \"One\"",
+            |_staging| Ok(()),
+        )
+        .unwrap();
 
         let marker = std::fs::read_to_string(path.join(".ai-memory.toml")).unwrap();
         let document = marker.parse::<toml_edit::DocumentMut>().unwrap();

@@ -38,6 +38,7 @@ struct AutoImproveReportStageResponse {
 /// # Errors
 /// Returns an error if the server is unreachable or rejects the read-only report request.
 pub async fn run(config: &Config, args: AutoImproveReportArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
@@ -56,7 +57,7 @@ pub async fn run(config: &Config, args: AutoImproveReportArgs) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&response)?);
         } else {
             println!("{}", render_stage_human(&response, &project));
-            println!("\n--- machine-readable ---");
+            println!("{}", i18n.text("cli-auto-improve-report-machine-readable"));
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
         return Ok(());
@@ -67,8 +68,8 @@ pub async fn run(config: &Config, args: AutoImproveReportArgs) -> Result<()> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_human_report(&report, &project);
-        println!("\n--- machine-readable ---");
+        print_human_report(i18n, &report, &project);
+        println!("{}", i18n.text("cli-auto-improve-report-machine-readable"));
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
     Ok(())
@@ -86,33 +87,84 @@ fn render_stage_human(response: &AutoImproveReportStageResponse, project: &str) 
     lines.join("\n")
 }
 
-fn print_human_report(report: &AutoImproveTelemetryReport, project: &str) {
-    println!("\nAuto-improve telemetry for {project}\n");
-    println!("Summary: {}", report.summary);
+fn print_human_report(
+    i18n: &ai_memory_core::i18n::Localizer,
+    report: &AutoImproveTelemetryReport,
+    project: &str,
+) {
     println!(
-        "Terminal denominator: {}",
-        report.terminal_rates.denominator
+        "{}",
+        i18n.format(
+            "cli-auto-improve-report-auto-improve-telemetry-for-project",
+            &[("value0", project.to_string())]
+        )
     );
     println!(
-        "Rates: approved {:.1}%, rejected {:.1}%, conflict {:.1}%, failed {:.1}%",
-        report.terminal_rates.approved_rate * 100.0,
-        report.terminal_rates.rejected_rate * 100.0,
-        report.terminal_rates.conflict_rate * 100.0,
-        report.terminal_rates.failed_rate * 100.0,
+        "{}",
+        i18n.format(
+            "cli-auto-improve-report-summary",
+            &[("value0", report.summary.to_string())]
+        )
     );
     println!(
-        "Runs: {} ({} with learning proposals)",
-        report.aggregate.run_count, report.aggregate.runs_with_learning_proposals
+        "{}",
+        i18n.format(
+            "cli-auto-improve-report-terminal-denominator",
+            &[("value0", format!("{}", report.terminal_rates.denominator))]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-auto-improve-report-rates-approved-1-rejected-1-conflict-1-failed-1",
+            &[
+                (
+                    "value0",
+                    format!("{:.1}", report.terminal_rates.approved_rate * 100.0)
+                ),
+                (
+                    "value1",
+                    format!("{:.1}", report.terminal_rates.rejected_rate * 100.0)
+                ),
+                (
+                    "value2",
+                    format!("{:.1}", report.terminal_rates.conflict_rate * 100.0)
+                ),
+                (
+                    "value3",
+                    format!("{:.1}", report.terminal_rates.failed_rate * 100.0)
+                )
+            ]
+        )
+    );
+    println!(
+        "{}",
+        i18n.format(
+            "cli-auto-improve-report-runs-with-learning-proposals",
+            &[
+                ("value0", format!("{}", report.aggregate.run_count)),
+                (
+                    "value1",
+                    format!("{}", report.aggregate.runs_with_learning_proposals)
+                )
+            ]
+        )
     );
 
     if !report.aggregate.top_targets.is_empty() {
-        println!("Top targets:");
+        println!("{}", i18n.text("cli-auto-improve-report-top-targets"));
         for row in report.aggregate.top_targets.iter().take(10) {
             println!("  - {}: {}", row.key, row.count);
         }
     }
 
-    println!("Findings: {}", report.findings.len());
+    println!(
+        "{}",
+        i18n.format(
+            "cli-auto-improve-report-findings",
+            &[("value0", format!("{}", report.findings.len()))]
+        )
+    );
     for finding in report.findings.iter().take(10) {
         println!(
             "  - {} [{}]: {}",
@@ -120,7 +172,13 @@ fn print_human_report(report: &AutoImproveTelemetryReport, project: &str) {
         );
     }
     if report.findings.len() > 10 {
-        println!("  ... {} more", report.findings.len() - 10);
+        println!(
+            "{}",
+            i18n.format(
+                "cli-auto-improve-report-more",
+                &[("value0", format!("{}", report.findings.len() - 10))]
+            )
+        );
     }
 }
 

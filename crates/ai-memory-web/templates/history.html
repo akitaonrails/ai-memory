@@ -1,88 +1,88 @@
 {% extends "base.html" %}
 
-{% block title %}History of {{ path }} — ai-memory{% endblock %}
+{% block title %}{{ i18n.text("web-history-of") }} {{ path }} {{ i18n.text("web-ai-memory") }}{% endblock %}
 
 {% block header_search %}{% include "_header_search_scoped.html" %}{% endblock %}
 
 {% block content %}
-<nav aria-label="Breadcrumb" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">home</a>
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
   <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
   <span aria-hidden="true">/</span>
   <a href="{{ page_href }}" class="hover:text-blue-600 dark:hover:text-blue-400 truncate max-w-xs">{{ path }}</a>
   <span aria-hidden="true">/</span>
-  <span aria-current="page" class="text-slate-700 dark:text-slate-200">history</span>
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200">{{ i18n.text("web-history") }}</span>
 </nav>
 
-<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">History of {{ path }}</h1>
-<p class="mb-6 text-sm text-slate-500 dark:text-slate-400">{{ total }} version{% if total != 1 %}s{% endif %}, newest first. Superseded versions stay in the record; nothing here can change them.</p>
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">{{ i18n.text("web-history-of") }} {{ path }}</h1>
+<p class="mb-6 text-sm text-slate-500 dark:text-slate-400">{{ total }} {{ i18n.count("web-count-version", total) }}{{ i18n.text("web-newest-first-superseded-versions-stay-in-the-record-nothing-here-can-change-them") }}</p>
 
 <section class="mb-10" aria-labelledby="diff-heading">
   <h2 id="diff-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">
-    {% if from_short != "" %}Changes from <span class="font-mono">{{ from_short }}</span> to <span class="font-mono">{{ to_short }}</span>{% else %}Content of <span class="font-mono">{{ to_short }}</span> (no earlier version at this path){% endif %}
+    {% if from_short != "" %}{{ i18n.text("web-changes-from") }} <span class="font-mono">{{ from_short }}</span> {{ i18n.text("web-to-history") }} <span class="font-mono">{{ to_short }}</span>{% else %}{{ i18n.text("web-content-of") }} <span class="font-mono">{{ to_short }}</span> {{ i18n.text("web-no-earlier-version-at-this-path") }}{% endif %}
   </h2>
   <p class="mb-3 text-xs text-slate-500 dark:text-slate-400">
     {% if from_short != "" %}<span title="{{ from_created }}">{{ from_title }}</span> → {% endif %}<span title="{{ to_created }}">{{ to_title }}</span>
   </p>
   {% if same %}
-  <p class="text-sm text-slate-500 dark:text-slate-400">The two versions have the same body.</p>
+  <p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-the-two-versions-have-the-same-body") }}</p>
   {% else if too_large != "" %}
-  <p class="text-sm text-amber-700 dark:text-amber-300">No diff shown: {{ too_large }}.</p>
+  <p class="text-sm text-amber-700 dark:text-amber-300">{{ i18n.text("web-no-diff-shown") }} {{ i18n.label(too_large) }}.</p>
   {% else if hunks.is_empty() %}
-  <p class="text-sm text-slate-500 dark:text-slate-400">The bodies differ only in line endings.</p>
+  <p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-the-bodies-differ-only-in-line-endings") }}</p>
   {% else %}
   <div class="overflow-x-auto rounded border border-slate-200 dark:border-slate-800">
     <pre class="text-xs font-mono leading-5">{% for hunk in hunks %}<span class="block px-3 bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">{{ hunk.header }}</span>{% for line in hunk.lines %}<span class="block px-3 whitespace-pre {% if line.sign == "+" %}bg-emerald-50 text-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200{% else if line.sign == "-" %}bg-rose-50 text-rose-900 dark:bg-rose-950/40 dark:text-rose-200{% else %}text-slate-600 dark:text-slate-400{% endif %}">{{ line.sign }}{{ line.text }}</span>{% endfor %}{% endfor %}</pre>
   </div>
   {% if truncated %}
-  <p class="mt-2 text-xs text-amber-700 dark:text-amber-300">Diff cut short at the line limit.</p>
+  <p class="mt-2 text-xs text-amber-700 dark:text-amber-300">{{ i18n.text("web-diff-cut-short-at-the-line-limit") }}</p>
   {% endif %}
   {% endif %}
 </section>
 
 <section aria-labelledby="versions-heading">
-  <h2 id="versions-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">Versions {{ shown_start }}–{{ shown_end }} of {{ total }}</h2>
+  <h2 id="versions-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.three("web-history-versions-range", shown_start, shown_end, total) }}</h2>
   <form action="{{ history_href }}" method="get">
     <input type="hidden" name="limit" value="{{ limit }}">
     <div class="overflow-x-auto">
       <table class="w-full text-sm">
         <thead>
           <tr class="text-left text-xs text-slate-500 dark:text-slate-400 border-b border-slate-200 dark:border-slate-800">
-            <th class="py-2 pr-2 font-medium">From</th>
-            <th class="py-2 pr-4 font-medium">To</th>
-            <th class="py-2 pr-4 font-medium">Version</th>
-            <th class="py-2 pr-4 font-medium">Written</th>
-            <th class="py-2 pr-4 font-medium">Author</th>
-            <th class="py-2 pr-4 font-medium">Title</th>
-            <th class="py-2 pr-4 font-medium">Size</th>
+            <th class="py-2 pr-2 font-medium">{{ i18n.text("web-from") }}</th>
+            <th class="py-2 pr-4 font-medium">{{ i18n.text("web-to") }}</th>
+            <th class="py-2 pr-4 font-medium">{{ i18n.text("web-version") }}</th>
+            <th class="py-2 pr-4 font-medium">{{ i18n.text("web-written") }}</th>
+            <th class="py-2 pr-4 font-medium">{{ i18n.text("web-author") }}</th>
+            <th class="py-2 pr-4 font-medium">{{ i18n.text("web-title") }}</th>
+            <th class="py-2 pr-4 font-medium">{{ i18n.text("web-size") }}</th>
             <th class="py-2 font-medium"></th>
           </tr>
         </thead>
         <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
           {% for version in versions %}
           <tr data-version="{{ version.id }}">
-            <td class="py-2 pr-2"><input type="radio" name="from" value="{{ version.id }}" aria-label="Diff from {{ version.short_id }}"{% if version.is_from %} checked{% endif %}></td>
-            <td class="py-2 pr-4"><input type="radio" name="to" value="{{ version.id }}" aria-label="Diff to {{ version.short_id }}"{% if version.is_to %} checked{% endif %}></td>
+            <td class="py-2 pr-2"><input type="radio" name="from" value="{{ version.id }}" aria-label="{{ i18n.one("web-diff-from-value0", version.short_id) }}"{% if version.is_from %} checked{% endif %}></td>
+            <td class="py-2 pr-4"><input type="radio" name="to" value="{{ version.id }}" aria-label="{{ i18n.one("web-diff-to-value0", version.short_id) }}"{% if version.is_to %} checked{% endif %}></td>
             <td class="py-2 pr-4 font-mono text-xs whitespace-nowrap">
               {{ version.short_id }}
-              {% if version.is_latest %}<span class="ml-1 inline-flex items-center rounded px-1.5 py-0.5 font-sans font-medium bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">latest</span>{% endif %}
-              {% if version.supersedes_short != "" %}<span class="block text-slate-500 dark:text-slate-400">replaced {{ version.supersedes_short }}</span>{% endif %}
+              {% if version.is_latest %}<span class="ml-1 inline-flex items-center rounded px-1.5 py-0.5 font-sans font-medium bg-blue-50 dark:bg-blue-950 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">{{ i18n.text("web-latest") }}</span>{% endif %}
+              {% if version.supersedes_short != "" %}<span class="block text-slate-500 dark:text-slate-400">{{ i18n.text("web-replaced") }} {{ version.supersedes_short }}</span>{% endif %}
             </td>
             <td class="py-2 pr-4 whitespace-nowrap text-slate-500 dark:text-slate-400" title="{{ version.created_at }}">{{ version.created_relative }}</td>
             <td class="py-2 pr-4 text-slate-600 dark:text-slate-300">{% if version.author != "" %}{{ version.author }}{% else %}<span class="text-slate-500 dark:text-slate-400">—</span>{% endif %}</td>
             <td class="py-2 pr-4 text-slate-700 dark:text-slate-200">{{ version.title }}</td>
-            <td class="py-2 pr-4 whitespace-nowrap text-slate-500 dark:text-slate-400">{{ version.body_chars }} chars</td>
-            <td class="py-2 whitespace-nowrap">{% if version.compare_href != "" %}<a href="{{ version.compare_href }}" class="text-blue-600 dark:text-blue-400 underline text-xs">vs previous</a>{% endif %}</td>
+            <td class="py-2 pr-4 whitespace-nowrap text-slate-500 dark:text-slate-400">{{ version.body_chars }} {{ i18n.text("web-chars") }}</td>
+            <td class="py-2 whitespace-nowrap">{% if version.compare_href != "" %}<a href="{{ version.compare_href }}" class="text-blue-600 dark:text-blue-400 underline text-xs">{{ i18n.text("web-vs-previous") }}</a>{% endif %}</td>
           </tr>
           {% endfor %}
         </tbody>
       </table>
     </div>
     <div class="mt-4 flex flex-wrap items-center gap-3">
-      <button type="submit" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:border-blue-500">Compare selected</button>
-      {% if newer_href != "" %}<a href="{{ newer_href }}" class="text-sm text-blue-600 dark:text-blue-400 underline">Newer versions</a>{% endif %}
-      {% if older_href != "" %}<a href="{{ older_href }}" class="text-sm text-blue-600 dark:text-blue-400 underline">Older versions</a>{% endif %}
+      <button type="submit" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm font-medium text-slate-700 dark:text-slate-200 hover:border-blue-500">{{ i18n.text("web-compare-selected") }}</button>
+      {% if newer_href != "" %}<a href="{{ newer_href }}" class="text-sm text-blue-600 dark:text-blue-400 underline">{{ i18n.text("web-newer-versions") }}</a>{% endif %}
+      {% if older_href != "" %}<a href="{{ older_href }}" class="text-sm text-blue-600 dark:text-blue-400 underline">{{ i18n.text("web-older-versions") }}</a>{% endif %}
     </div>
   </form>
 </section>

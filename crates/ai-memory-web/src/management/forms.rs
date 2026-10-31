@@ -65,6 +65,7 @@ struct Command {
     confirm: bool,
 }
 pub(super) async fn submit(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<Management>>,
     request: Request<Body>,
 ) -> Response {
@@ -72,6 +73,7 @@ pub(super) async fn submit(
     // Require a same-origin POST before translating any form into JSON.
     if !same_origin(request.headers()) {
         return super::failure(
+            &i18n,
             StatusCode::FORBIDDEN,
             "Cross-origin form request refused".into(),
         );
@@ -88,6 +90,7 @@ pub(super) async fn submit(
         extensions,
     };
     let mut view = ConsoleView::new(&state.root, Screen::Secret, command.csrf.clone());
+    view.i18n = i18n.clone();
     if command.action != Action::Login {
         let me = match super::identity(&client, &state.root).await {
             Ok(me) => me,
@@ -97,7 +100,11 @@ pub(super) async fn submit(
             && command.action != Action::Password
             && command.action != Action::Logout
         {
-            return super::failure(StatusCode::FORBIDDEN, "Password change required".into());
+            return super::failure(
+                &i18n,
+                StatusCode::FORBIDDEN,
+                "Password change required".into(),
+            );
         }
         view.username = me.username;
         view.admin = me.admin;
@@ -106,13 +113,14 @@ pub(super) async fn submit(
         && command.new_password.chars().count() < super::MIN_PASSWORD_CHARACTERS
     {
         return super::failure(
+            &i18n,
             StatusCode::BAD_REQUEST,
             "Use at least 12 characters.".into(),
         );
     }
     let (method, path, body, destination) = match command.target() {
         Ok(target) => target,
-        Err(message) => return super::failure(StatusCode::BAD_REQUEST, message.to_string()),
+        Err(message) => return super::failure(&i18n, StatusCode::BAD_REQUEST, message.to_string()),
     };
     let reply = match client
         .call(
@@ -131,7 +139,7 @@ pub(super) async fn submit(
         Err(response) => return response,
     };
     let mut response = if !reply.status.is_success() {
-        super::failure(reply.status, text(&reply.data, "error"))
+        super::failure(&i18n, reply.status, text(&reply.data, "error"))
     } else if command.action == Action::PreviewPurge {
         view.preview(
             &reply.data,
@@ -143,12 +151,11 @@ pub(super) async fn submit(
     } else if !text(&reply.data, "temporary_password").is_empty()
         || !text(&reply.data, "token").is_empty()
     {
-        view.secret_title = if reply.data["temporary_password"].is_string() {
-            "Temporary password"
+        view.secret_title = i18n.text(if reply.data["temporary_password"].is_string() {
+            "web-temporary-password"
         } else {
-            "New MCP API key"
-        }
-        .into();
+            "web-new-mcp-key"
+        });
         view.secret = if reply.data["temporary_password"].is_string() {
             text(&reply.data, "temporary_password")
         } else {
@@ -160,7 +167,7 @@ pub(super) async fn submit(
             .as_array()
             .is_some_and(|a| !a.is_empty())
     {
-        super::failure(StatusCode::OK,"Database deletion completed, but some wiki files could not be removed. Ask an Admin to check the server logs.".into())
+        super::failure(&i18n, StatusCode::OK,"Database deletion completed, but some wiki files could not be removed. Ask an Admin to check the server logs.".into())
     } else {
         let destination =
             if command.action == Action::Login && reply.data["must_change_password"] == true {

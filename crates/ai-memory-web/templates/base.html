@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" class="h-full">
+<html lang="{{ i18n.tag() }}" class="h-full">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -10,48 +10,53 @@
   <link rel="stylesheet" href="static/tailwind.css">
 </head>
 <body class="dashboard-shell">
-  <a id="skip-link" href="#main-content" class="skip-link">Skip to content</a>
-  <aside class="app-sidebar" id="app-navigation" aria-label="Workspace navigation">
-    <a href="." class="app-brand"><img src="static/logo.png" alt="" width="34" height="34"><span>ai-memory<small>AGENT WORKSPACE</small></span></a>
-    <p class="nav-label">WORKSPACE</p>
-    <nav aria-label="Main" class="app-nav">
-      <a href="." data-nav="projects"><span aria-hidden="true">▦</span>Projects</a>
-      <a href="inbox" data-nav="inbox"><span aria-hidden="true">✉</span>Inbox <span id="inbox-pending-count" class="nav-message-count" hidden aria-hidden="true"></span></a>
-      <div id="inbox-notifications" class="nav-inbox-notifications" hidden><p id="inbox-notification-summary"></p><ul id="inbox-notification-projects" aria-label="Projects with pending messages"></ul></div>
+  <a id="skip-link" href="#main-content" class="skip-link">{{ i18n.text("web-skip-to-content") }}</a>
+  <aside class="app-sidebar" id="app-navigation" aria-label="{{ i18n.text("web-workspace-navigation") }}">
+    <a href="." class="app-brand"><img src="static/logo.png" alt="" width="34" height="34"><span>ai-memory<small>{{ i18n.text("web-agent-workspace") }}</small></span></a>
+    <p class="nav-label">{{ i18n.text("web-workspace") }}</p>
+    <nav aria-label="{{ i18n.text("web-main") }}" class="app-nav">
+      <a href="." data-nav="projects"><span aria-hidden="true">▦</span>{{ i18n.text("web-projects") }}</a>
+      <a href="inbox" data-nav="inbox"><span aria-hidden="true">✉</span>{{ i18n.text("web-inbox") }} <span id="inbox-pending-count" class="nav-message-count" hidden aria-hidden="true"></span></a>
+      <div id="inbox-notifications" class="nav-inbox-notifications" hidden><p id="inbox-notification-summary"></p><ul id="inbox-notification-projects" aria-label="{{ i18n.text("web-projects-with-pending-messages") }}"></ul></div>
       <span id="inbox-notification-status" class="sr-only" role="status" aria-live="polite"></span>
-      <a href="workstreams" data-nav="workstreams" {% block nav_workstreams_current %}{% endblock %}><span aria-hidden="true">⑂</span>Workstreams</a>
-      <a href="search" data-nav="search"><span aria-hidden="true">⌕</span>Search memory</a>
-      <a href="graph" data-nav="graph" {% block nav_graph_current %}{% endblock %}><span aria-hidden="true">⌘</span>Knowledge graph</a>
-      <p class="nav-label">OBSERVE &amp; IMPROVE</p>
-      <a href="pending" data-nav="pending" {% block nav_pending_current %}{% endblock %}><span aria-hidden="true">☷</span>Learning review</a>
-      <a href="health" data-nav="health" {% block nav_health_current %}{% endblock %}><span aria-hidden="true">⌁</span>Server health</a>
-      <p class="nav-label">RESOURCES</p>
-      <a href="docs" data-nav="docs" {% block nav_docs_current %}{% endblock %}><span aria-hidden="true">▤</span>Documentation</a>
-      <a href="docs/changelog" data-nav="changelog" {% block nav_changelog_current %}{% endblock %}><span aria-hidden="true">↻</span>Changelog</a>
+      <a href="workstreams" data-nav="workstreams" {% block nav_workstreams_current %}{% endblock %}><span aria-hidden="true">⑂</span>{{ i18n.text("web-workstreams") }}</a>
+      <a href="search" data-nav="search"><span aria-hidden="true">⌕</span>{{ i18n.text("web-search-memory") }}</a>
+      <a href="graph" data-nav="graph" {% block nav_graph_current %}{% endblock %}><span aria-hidden="true">⌘</span>{{ i18n.text("web-knowledge-graph") }}</a>
+      <p class="nav-label">{{ i18n.text("web-observe-improve") }}</p>
+      <a href="pending" data-nav="pending" {% block nav_pending_current %}{% endblock %}><span aria-hidden="true">☷</span>{{ i18n.text("web-learning-review") }}</a>
+      <a href="health" data-nav="health" {% block nav_health_current %}{% endblock %}><span aria-hidden="true">⌁</span>{{ i18n.text("web-server-health") }}</a>
+      <p class="nav-label">{{ i18n.text("web-resources") }}</p>
+      <a href="docs" data-nav="docs" {% block nav_docs_current %}{% endblock %}><span aria-hidden="true">▤</span>{{ i18n.text("web-documentation") }}</a>
+      <a href="docs/changelog" data-nav="changelog" {% block nav_changelog_current %}{% endblock %}><span aria-hidden="true">↻</span>{{ i18n.text("web-changelog") }}</a>
     </nav>
-    <div class="nav-bottom"><span class="nav-orbit" aria-hidden="true">◈</span><strong>Context that stays.<small>Across agents. Across sessions.</small></strong></div>
+    <div class="nav-bottom"><span class="nav-orbit" aria-hidden="true">◈</span><strong>{{ i18n.text("web-context-that-stays") }}<small>{{ i18n.text("web-across-agents-across-sessions") }}</small></strong></div>
   </aside>
-  <button class="nav-backdrop" id="nav-backdrop" aria-label="Close navigation" hidden></button>
+  <button class="nav-backdrop" id="nav-backdrop" aria-label="{{ i18n.text("web-close-navigation") }}" hidden></button>
   <header class="app-topbar">
     <div class="app-topbar-content">
-      <button class="menu-button" id="nav-toggle" aria-controls="app-navigation" aria-expanded="false" aria-label="Open navigation">☰</button>
-      <span class="topbar-caption">Workspace <span aria-hidden="true">/</span> <strong>Agent operations</strong></span>
+      <button class="menu-button" id="nav-toggle" aria-controls="app-navigation" aria-expanded="false" aria-label="{{ i18n.text("web-open-navigation") }}">☰</button>
+      <span class="topbar-caption">{{ i18n.text("web-workspace-base") }} <span aria-hidden="true">/</span> <strong>{{ i18n.text("web-agent-operations") }}</strong></span>
       <div class="topbar-spacer"></div>
       {% block header_actions %}
       {% block header_search %}
-      <form action="search" method="get" class="topbar-search"><label for="header-search" class="sr-only">Search pages</label><input id="header-search" name="q" type="search" placeholder="Search memory…"><span aria-hidden="true">⌕</span></form>
+      <form action="search" method="get" class="topbar-search"><label for="header-search" class="sr-only">{{ i18n.text("web-search-pages") }}</label><input id="header-search" name="q" type="search" placeholder="{{ i18n.text("web-search-memory-base") }}"><span aria-hidden="true">⌕</span></form>
       {% endblock %}
-      <button type="button" id="ai-memory-logout" class="quiet-button">Log out</button>
+      <button type="button" id="ai-memory-logout" class="quiet-button">{{ i18n.text("web-log-out") }}</button>
       {% endblock %}
-      <div class="theme-switch" role="group" aria-label="Color theme">
-        <button type="button" data-theme-choice="light" aria-pressed="false" title="Light theme">Light</button>
-        <button type="button" data-theme-choice="dark" aria-pressed="false" title="Dark theme">Dark</button>
-        <button type="button" data-theme-choice="system" aria-pressed="false" title="Follow system theme">System</button>
+      <label for="interface-language" class="sr-only">{{ i18n.text("web-language") }}</label>
+      <select id="interface-language" aria-label="{{ i18n.text("web-language") }}">
+        <option value="en" lang="en" {% if i18n.tag() == "en" %}selected{% endif %}>English</option>
+        <option value="pt-BR" lang="pt-BR" {% if i18n.tag() == "pt-BR" %}selected{% endif %}>Português (Brasil)</option>
+      </select>
+      <div class="theme-switch" role="group" aria-label="{{ i18n.text("web-color-theme") }}">
+        <button type="button" data-theme-choice="light" aria-pressed="false" title="{{ i18n.text("web-light-theme") }}">{{ i18n.text("web-light") }}</button>
+        <button type="button" data-theme-choice="dark" aria-pressed="false" title="{{ i18n.text("web-dark-theme") }}">{{ i18n.text("web-dark") }}</button>
+        <button type="button" data-theme-choice="system" aria-pressed="false" title="{{ i18n.text("web-follow-system-theme") }}">{{ i18n.text("web-system") }}</button>
       </div>
     </div>
   </header>
   <main id="main-content" tabindex="-1" class="app-content">{% block content %}{% endblock %}</main>
-  <footer class="app-footer"><span>ai-memory <span aria-hidden="true">·</span> Project memory &amp; agent operations</span>{% block footer_version %}<span>v{{ crate::templates::VERSION }}</span>{% endblock %}</footer>
+  <footer class="app-footer"><span>ai-memory <span aria-hidden="true">·</span> {{ i18n.text("web-project-memory-agent-operations") }}</span>{% block footer_version %}<span>v{{ crate::templates::VERSION }}</span>{% endblock %}</footer>
   <script>
   (function(){
     document.getElementById("skip-link").href=location.href.split("#")[0]+"#main-content";
@@ -61,6 +66,11 @@
     backdrop.addEventListener("click",close);
     document.addEventListener("keydown",function(e){if(e.key==="Escape"&&document.body.classList.contains("nav-open")){close();toggle.focus();}});
     nav.querySelectorAll("a[data-nav]").forEach(function(a){var path=new URL(a.href).pathname.replace(/\/$/,"");var current=location.pathname.replace(/\/$/,"");if(path===current||(a.dataset.nav==="projects"&&current.indexOf(path+"/w/")===0))a.setAttribute("aria-current","page");a.addEventListener("click",close);});
+    document.getElementById("interface-language").addEventListener("change",function(event){
+      var base=document.querySelector('meta[name="ai-memory-base-path"]')?.content||"";
+      document.cookie="ai_memory_language="+encodeURIComponent(event.target.value)+"; Path="+(base||"")+"/; Max-Age=31536000; SameSite=Lax"+(location.protocol==="https:"?"; Secure":"");
+      location.reload();
+    });
     var btn=document.getElementById("ai-memory-logout");
     if(btn){ {% include "_js_cookie.html" %}
       btn.addEventListener("click",function(){var base=document.querySelector('meta[name="ai-memory-base-path"]')?.content||"";var login=document.querySelector('meta[name="ai-memory-login-path"]')?.content||(base+"/web/login");fetch(base+"/auth/logout",{method:"POST",credentials:"include",headers:{"Accept":"application/json","X-CSRF-Token":decodeURIComponent(cookie("ai_memory_csrf")||"")}}).finally(function(){location.assign(login);});});

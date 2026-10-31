@@ -85,6 +85,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// `ReaderPool::search_pages_with_meta`. No viewer (no database users, or
 /// root) reads everything, as before.
 pub(crate) async fn handler(
+    axum::Extension(i18n): axum::Extension<ai_memory_core::i18n::Localizer>,
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     actor: Option<axum::Extension<ai_memory_core::ActorContext>>,
@@ -163,7 +164,7 @@ pub(crate) async fn handler(
             let resolved = match super::resolve_read_scope(&state, viewer, workspace, project).await
             {
                 Ok(resolved) => resolved,
-                Err(refusal) => return super::page::refusal_response(&refusal),
+                Err(refusal) => return super::page::localized_refusal_response(&i18n, &refusal),
             };
             // Scope lookup accepts canonical and legacy keys, but page URLs
             // use the exact stored name. Resolve it only after authorization,
@@ -174,7 +175,7 @@ pub(crate) async fn handler(
                 .await
             {
                 Ok(Some(name)) => name,
-                Ok(None) => return super::page::not_found_response(),
+                Ok(None) => return super::page::not_found_response(&i18n),
                 Err(error) => return internal(error),
             };
             if !query.is_empty() {
@@ -315,6 +316,7 @@ pub(crate) async fn handler(
         }
     }
     let view = SearchView {
+        i18n: i18n.clone(),
         global_href,
         project_href: project_href(&workspace, &project),
         scope_groups,

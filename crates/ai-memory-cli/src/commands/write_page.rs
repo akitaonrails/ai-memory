@@ -47,17 +47,21 @@ struct WritePageResponseBody {
 /// stdin cannot be read (when `body == "-"`), or if the POST to
 /// `/admin/write-page` fails.
 pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
+    let i18n = &config.i18n;
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     super::refuse_empty_explicit(args.project.as_deref(), "--project")?;
     if args.path.trim().is_empty() {
-        bail!("--path was passed empty; specify the wiki page path to write");
+        bail!(
+            "{}",
+            i18n.text("cli-write-page-path-was-passed-empty-specify-the-wiki-page-path-to-write")
+        );
     }
 
     let body_text = if args.body == "-" {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
-            .context("reading body from stdin")?;
+            .context(i18n.text("cli-write-page-reading-body-from-stdin"))?;
         buf
     } else {
         args.body
@@ -88,17 +92,28 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
         },
     )
     .await
-    .context("writing page via server")?;
+    .context(i18n.text("cli-write-page-writing-page-via-server"))?;
 
     if let Some(warning) = resp.manifest_warning.as_deref() {
-        eprintln!("ai-memory: warning: {warning}");
+        eprintln!(
+            "{}",
+            i18n.format(
+                "cli-move-project-ai-memory-warning-warning",
+                &[("value0", warning.to_string())]
+            )
+        );
     }
     println!(
-        "✓ wrote {} (page_id={}) under {}/{}",
-        resp.path,
-        short_page_id(&resp.page_id),
-        workspace,
-        project
+        "{}",
+        i18n.format(
+            "cli-write-page-wrote-page-id-under",
+            &[
+                ("value0", resp.path.to_string()),
+                ("value1", short_page_id(&resp.page_id).to_string()),
+                ("value2", workspace.to_string()),
+                ("value3", project.to_string())
+            ]
+        )
     );
     Ok(())
 }

@@ -643,6 +643,13 @@ readable wiki pages; the next session starts with a handoff.
 Search modes, entities, feedback, briefings, and the web API are covered in [`docs/usage.md`](docs/usage.md) and
 [`docs/use-cases.md`](docs/use-cases.md).
 
+### Interface language
+
+Use `ai-memory --language pt-BR status` or set `AI_MEMORY_LANGUAGE=pt-BR`
+for Brazilian Portuguese. The web interface follows the browser's language
+and offers an independent language selector. See [interface languages](docs/localization.md)
+for configuration, translation boundaries and contributor instructions.
+
 ## Teams and multiple machines
 
 Run the server somewhere reachable, such as a homelab box or a LAN host, and

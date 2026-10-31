@@ -36,6 +36,7 @@ struct OpenHandoffsResponse {
 /// Returns [`anyhow::Error`] when the scope cannot be resolved, the server is
 /// unreachable, or it answers non-2xx.
 pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
@@ -61,7 +62,16 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     }
 
     if response.handoffs.is_empty() {
-        println!("No open handoffs for {workspace}/{project}.");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-handoffs-no-open-handoffs-for-workspace-project",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string())
+                ]
+            )
+        );
         return Ok(());
     }
 
@@ -69,25 +79,32 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "Open handoffs for {workspace}/{project} (oldest first):"
+        "{}",
+        i18n.diagnostic(&format!(
+            "Open handoffs for {workspace}/{project} (oldest first):"
+        ))
     );
     for h in &response.handoffs {
         let target = h.to_agent.as_deref().unwrap_or("any agent");
         let _ = writeln!(
             out,
-            "  {}  from {} -> {}",
-            super::humanize_age_secs(now_ms.saturating_sub(h.created_at_ms) / 1_000),
-            h.from_agent,
-            target
+            "{}",
+            i18n.diagnostic(&format!(
+                "  {}  from {} -> {}",
+                i18n.age(now_ms.saturating_sub(h.created_at_ms) / 1_000),
+                h.from_agent,
+                target
+            ))
         );
-        let _ = writeln!(out, "    id: {}", h.id);
+        let _ = writeln!(out, "{}", i18n.diagnostic(&format!("    id: {}", h.id)));
         if let Some(cwd) = h.cwd.as_deref() {
-            let _ = writeln!(out, "    cwd: {cwd}");
+            let _ = writeln!(out, "{}", i18n.diagnostic(&format!("    cwd: {cwd}")));
         }
     }
     let _ = writeln!(
         out,
-        "\nCancel one with the MCP tool `memory_handoff_cancel`, passing its id."
+        "{}",
+        i18n.diagnostic("\nCancel one with the MCP tool `memory_handoff_cancel`, passing its id.")
     );
     print!("{out}");
     Ok(())

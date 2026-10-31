@@ -825,6 +825,9 @@ Additional boundary rules:
   external lifecycle event contract.
 - [`docs/lifecycle-ops.md`](docs/lifecycle-ops.md) — read before touching
   purge/rename/backup/restore/reset/reindex/restore-page.
+- [`docs/localization.md`](docs/localization.md) — interface languages, the
+  translation boundary, and the Fluent catalog rules; read before adding CLI or
+  web text.
 - [`docs/auto-improvement-loop.md`](docs/auto-improvement-loop.md) —
   learning-loop design, approval gates, curator boundaries.
 - [`docs/users.md`](docs/users.md) — multi-user attribution and the

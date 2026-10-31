@@ -55,23 +55,20 @@ use crate::config::{Config, DEFAULT_SERVER_URL};
 /// destination directory can't be created, any script copy fails,
 /// or the JSON config can't be serialised.
 pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
+    let i18n = &config.i18n;
     args.agent = match (args.agent, args.opencode_dialect) {
         (AgentChoice::OpenCode, Some(choice)) => match choice.dialect() {
             ai_memory_workstream::OpenCodeDialect::V1 => AgentChoice::OpenCode,
             ai_memory_workstream::OpenCodeDialect::V2 => AgentChoice::OpenCode2,
         },
         (AgentChoice::OpenCode, None) => bail!(
-            "setup-agent --agent opencode requires --opencode-dialect v1|v2 because a container cannot inspect the host executable"
-        ),
+            "{}", i18n.text("cli-setup-agent-setup-agent-agent-opencode-requires-opencode-dialect-v1-v2-because-a-contain")),
         (AgentChoice::OpenCode2, None) => AgentChoice::OpenCode2,
         (AgentChoice::OpenCode2, Some(_)) => bail!(
-            "--opencode-dialect cannot be combined with the force-V2 opencode2 compatibility alias"
-        ),
+            "{}", i18n.text("cli-setup-agent-opencode-dialect-cannot-be-combined-with-the-force-v2-opencode2-compatibilit")),
         (agent, None) => agent,
         (agent, Some(_)) => bail!(
-            "--opencode-dialect is valid only with --agent opencode, not {}",
-            agent.kind().as_str()
-        ),
+            "{}", i18n.format("cli-setup-agent-opencode-dialect-is-valid-only-with-agent-opencode-not", &[("value0", agent.kind().as_str().to_string())])),
     };
     let server_url = if args.server_url == DEFAULT_SERVER_URL && config.server_url_configured() {
         normalise_hook_server_url(&config.server_url)
@@ -138,8 +135,7 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
     }
     if matches!(args.agent, AgentChoice::Cline) {
         bail!(
-            "Cline discovers generated hook files in the host user's hook directory; run `ai-memory install-hooks --agent cline --apply` on that host"
-        );
+            "{}", i18n.text("cli-setup-agent-cline-discovers-generated-hook-files-in-the-host-user-s-hook-directory-run-a"));
     }
     // Qwen Code too: ~/.qwen/settings.json runs the native `hook` command.
     if matches!(args.agent, AgentChoice::QwenCode) {
@@ -147,11 +143,10 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         return Ok(());
     }
     let Some(agent_sub) = args.agent.script_hook_subdir() else {
-        bail!("internal: generated integration should have returned before staging hooks")
+        bail!("{}", i18n.text("cli-setup-agent-internal-generated-integration-should-have-returned-before-staging-hooks"))
     };
     eprintln!(
-        "[ai-memory] setup-agent emits shell/PowerShell hook bundles for {agent_sub}; these remote/compatibility bundles do not enforce capture-policy capability v1. Install local native hooks instead when policy enforcement is required."
-    );
+        "{}", i18n.format("cli-setup-agent-ai-memory-setup-agent-emits-shell-powershell-hook-bundles-for-agent-sub-thes", &[("value0", agent_sub.to_string())]));
 
     let source = resolve_source(args.source.as_deref(), agent_sub)?;
     let dest_dir = args.to.join(agent_sub);
@@ -188,9 +183,15 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
     copy_support_hook_scripts(&source, &dest_dir)?;
 
     eprintln!(
-        "✓ Extracted {copied} hook script(s) from {} to {}",
-        source.display(),
-        dest_dir.display(),
+        "{}",
+        i18n.format(
+            "cli-setup-agent-extracted-copied-hook-script-s-from-to",
+            &[
+                ("value0", format!("{}", copied)),
+                ("value1", format!("{}", source.display())),
+                ("value2", format!("{}", dest_dir.display()))
+            ]
+        )
     );
 
     // The path the rendered JSON should reference. Defaults to where
@@ -206,15 +207,38 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         AgentChoice::ClaudeCode => emit_claude_code(&emit_root, &args)?,
         AgentChoice::Grok => emit_grok(&emit_root, &args)?,
         AgentChoice::Devin => emit_devin(&emit_root, &args)?,
-        AgentChoice::Codex => emit_other(&emit_root, agent_sub, &args, &[CODEX_PROFILE.events]),
-        AgentChoice::CommandCode => {
-            emit_other(&emit_root, agent_sub, &args, &[COMMAND_CODE_PROFILE.events])
-        }
-        AgentChoice::Cursor => emit_other(&emit_root, agent_sub, &args, &[CURSOR_PROFILE.events]),
+        AgentChoice::Codex => emit_other(
+            &config.i18n,
+            &emit_root,
+            agent_sub,
+            &args,
+            &[CODEX_PROFILE.events],
+        ),
+        AgentChoice::CommandCode => emit_other(
+            &config.i18n,
+            &emit_root,
+            agent_sub,
+            &args,
+            &[COMMAND_CODE_PROFILE.events],
+        ),
+        AgentChoice::Cursor => emit_other(
+            &config.i18n,
+            &emit_root,
+            agent_sub,
+            &args,
+            &[CURSOR_PROFILE.events],
+        ),
         AgentChoice::GeminiCli => {
-            emit_other(&emit_root, agent_sub, &args, &[GEMINI_PROFILE.events]);
+            emit_other(
+                &config.i18n,
+                &emit_root,
+                agent_sub,
+                &args,
+                &[GEMINI_PROFILE.events],
+            );
         }
         AgentChoice::AntigravityCli => emit_other(
+            &config.i18n,
             &emit_root,
             agent_sub,
             &args,
@@ -223,17 +247,41 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         // Kimi's success and failure post-tool events share one script. The
         // script listing is deduplicated below; apply-mode owns the exact
         // `[[hooks]]` TOML merge into the user's config.toml.
-        AgentChoice::KimiCode => emit_other(&emit_root, agent_sub, &args, &[&KIMI_CODE_EVENTS]),
+        AgentChoice::KimiCode => emit_other(
+            &config.i18n,
+            &emit_root,
+            agent_sub,
+            &args,
+            &[&KIMI_CODE_EVENTS],
+        ),
         AgentChoice::KiroCli => {
-            emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V2_EVENTS]);
+            emit_other(
+                &config.i18n,
+                &emit_root,
+                agent_sub,
+                &args,
+                &[&KIRO_CLI_V2_EVENTS],
+            );
         }
         AgentChoice::KiroCliV3 => {
-            emit_other(&emit_root, agent_sub, &args, &[&KIRO_CLI_V3_EVENTS]);
+            emit_other(
+                &config.i18n,
+                &emit_root,
+                agent_sub,
+                &args,
+                &[&KIRO_CLI_V3_EVENTS],
+            );
         }
         AgentChoice::Pool => emit_pool(&emit_root, &args),
         AgentChoice::Dsh => emit_dsh(&emit_root, &args),
         AgentChoice::CopilotCli => {
-            emit_other(&emit_root, agent_sub, &args, &[COPILOT_CLI_PROFILE.events]);
+            emit_other(
+                &config.i18n,
+                &emit_root,
+                agent_sub,
+                &args,
+                &[COPILOT_CLI_PROFILE.events],
+            );
         }
         AgentChoice::OpenCode
         | AgentChoice::OpenCode2
@@ -251,8 +299,7 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::QwenCode
         | AgentChoice::Qoder => {
             bail!(
-                "internal: generated integration should have returned before emitting staged hooks"
-            )
+                "{}", i18n.text("cli-setup-agent-internal-generated-integration-should-have-returned-before-emitting-staged-h"))
         }
     }
     Ok(())
@@ -519,15 +566,23 @@ fn extension_setup_metadata(
 }
 
 fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let (label, agent, restart_note, mcp_client) = extension_setup_metadata(args.agent)?;
-    println!("# {label} uses a TypeScript extension/plugin, not extracted shell scripts.");
     println!(
-        "# Capture-policy capability v1 requires a freshly generated integration; re-run --apply after upgrades."
+        "{}",
+        i18n.format(
+            "cli-setup-agent-label-uses-a-typescript-extension-plugin-not-extracted-shell-scripts",
+            &[("value0", label.to_string())]
+        )
     );
     println!(
-        "# Legacy shell/PowerShell and remote-only paths are unsupported compatibility modes."
+        "{}", i18n.text("cli-setup-agent-capture-policy-capability-v1-requires-a-freshly-generated-integration-re-run"));
+    println!(
+        "{}", i18n.text("cli-setup-agent-legacy-shell-powershell-and-remote-only-paths-are-unsupported-compatibility"));
+    println!(
+        "{}",
+        i18n.text("cli-setup-agent-install-it-directly-instead")
     );
-    println!("# Install it directly instead:");
     if matches!(args.agent, AgentChoice::OpenCode | AgentChoice::OpenCode2) {
         let dialect = if args.agent == AgentChoice::OpenCode {
             ai_memory_workstream::OpenCodeDialect::V1
@@ -577,20 +632,34 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
     }
     println!("ai-memory install-hooks --agent {agent} --apply \\");
     if args.auth_token.is_some() {
-        println!("  --server-url {} \\", args.server_url);
-        println!("  --auth-token <token>");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-setup-agent-server-url",
+                &[("value0", args.server_url.to_string())]
+            )
+        );
+        println!("{}", i18n.text("cli-setup-agent-auth-token-token"));
     } else {
-        println!("  --server-url {}", args.server_url);
-        println!("  # add --auth-token <token> if the server requires bearer auth");
+        println!(
+            "{}",
+            i18n.format(
+                "cli-setup-agent-server-url-2",
+                &[("value0", args.server_url.to_string())]
+            )
+        );
+        println!(
+            "{}",
+            i18n.text("cli-setup-agent-add-auth-token-token-if-the-server-requires-bearer-auth")
+        );
     }
     println!();
     println!("{restart_note}");
     if matches!(args.agent, AgentChoice::Pi) {
         println!(
-            "MCP tools come through the same generated Pi bridge extension; no native mcp.json is written."
-        );
+            "{}", i18n.text("cli-setup-agent-mcp-tools-come-through-the-same-generated-pi-bridge-extension-no-native-mcp"));
     } else {
-        println!("Also run `ai-memory install-mcp --client {mcp_client}` to wire MCP separately.");
+        println!("{}", i18n.format("cli-setup-agent-also-run-ai-memory-install-mcp-client-mcp-client-to-wire-mcp-separately", &[("value0", mcp_client.to_string())]));
     }
     Ok(())
 }
@@ -741,6 +810,7 @@ fn render_devin_setup_output(emit_root: &Path, args: &SetupAgentArgs) -> Result<
 }
 
 fn emit_other(
+    i18n: &ai_memory_core::i18n::Localizer,
     emit_root: &Path,
     label: &str,
     args: &SetupAgentArgs,
@@ -761,8 +831,18 @@ fn emit_other(
         println!("- {}", path.display());
     }
     println!();
-    println!("Set AI_MEMORY_HOOK_URL in each hook's environment to override the default.");
-    println!("Also run `ai-memory install-mcp --client {label}` to wire MCP separately.");
+    println!(
+        "{}",
+        i18n.diagnostic(
+            "Set AI_MEMORY_HOOK_URL in each hook's environment to override the default."
+        )
+    );
+    println!(
+        "{}",
+        i18n.diagnostic(&format!(
+            "Also run `ai-memory install-mcp --client {label}` to wire MCP separately."
+        ))
+    );
 }
 
 fn event_script_paths(emit_root: &Path, event_lists: &[&[(&str, &str)]]) -> Vec<PathBuf> {

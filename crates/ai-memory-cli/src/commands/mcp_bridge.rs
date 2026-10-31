@@ -288,6 +288,7 @@ fn bridge_base_url<'a>(flag: Option<&'a str>, configured: &'a str) -> &'a str {
 /// key is the user's own, which the hooks already send to a remote server
 /// (#1490). The discovered root key never leaves loopback.
 fn bridge_bearer(config: &Config, server_url: &str) -> Result<Option<String>> {
+    let i18n = &config.i18n;
     let usable = |token: &str| !token.trim().is_empty();
     if let Some(token) = config
         .auth
@@ -304,9 +305,7 @@ fn bridge_bearer(config: &Config, server_url: &str) -> Result<Option<String>> {
             let token = raw.trim();
             if token.is_empty() {
                 anyhow::bail!(
-                    "stored bridge credential {} is blank; repair or remove it instead of falling back to root",
-                    stored_path.display()
-                );
+                    "{}", i18n.format("cli-mcp-bridge-stored-bridge-credential-is-blank-repair-or-remove-it-instead-of-falling-bac", &[("value0", format!("{}", stored_path.display()))]));
             }
             return Ok(Some(token.to_owned()));
         }
