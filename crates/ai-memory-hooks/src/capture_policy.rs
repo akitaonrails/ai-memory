@@ -344,6 +344,10 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // Kiro v2/v3 tool hooks use `tool_name` + `tool_input`. Unknown payload
         // shapes fail safe to metadata-only under an active policy.
         AgentKind::KiroCli => (object.get("tool_name")?.as_str()?, None),
+        // Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+        // `tool_input` but no tool-call id (docs/hooks/reference.md and
+        // `hookEventHandler.ts`, v0.66.0).
+        AgentKind::GeminiCli => (object.get("tool_name")?.as_str()?, None),
         AgentKind::AntigravityCli => (object.get("toolCall")?.get("name")?.as_str()?, None),
         AgentKind::Hermes => (
             object.get("tool_name")?.as_str()?,
@@ -417,6 +421,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::CodeBuddy
                             | AgentKind::IbmBob
                             | AgentKind::Dsh
+                            | AgentKind::GeminiCli
                             | AgentKind::QwenCode
                             | AgentKind::Qoder
                     ) {
@@ -465,6 +470,17 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         {
             Some(true) => ToolOutcome::Success,
             Some(false) => ToolOutcome::Error,
+            None => ToolOutcome::Unknown,
+        },
+        // Gemini CLI's AfterTool `tool_response` has an `error` object only
+        // when the call failed: "If this property is present, the tool call
+        // is considered a failure" (`ToolResult`, packages/core/src/tools/
+        // tools.ts, v0.66.0). A payload without `tool_response` proves nothing.
+        AgentKind::GeminiCli => match raw.get("tool_response").and_then(Value::as_object) {
+            Some(response) => match response.get("error") {
+                None | Some(Value::Null) => ToolOutcome::Success,
+                Some(_) => ToolOutcome::Error,
+            },
             None => ToolOutcome::Unknown,
         },
         AgentKind::AntigravityCli
@@ -5318,6 +5334,71 @@ mod tests {
         assert_eq!(
             disposition(AgentKind::Other, &shell("cat docs/adr/1.md")).disposition(),
             CaptureDisposition::Keep
+        );
+    }
+
+    /// Gemini CLI's BeforeTool and AfterTool carry `tool_name` and
+    /// `tool_input` but no tool-call id, so the observation metadata reads the
+    /// name alone, and only a BeforeTool with `tool_input` proves its input.
+    #[test]
+    fn gemini_cli_tool_payload_fields_have_no_call_id() {
+        let before = json!({
+            "session_id": "gemini-session",
+            "hook_event_name": "BeforeTool",
+            "tool_name": "run_shell_command",
+            "tool_input": {"command": "ls", "dir_path": "src"}
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::GeminiCli, &before),
+            Some(("run_shell_command", None))
+        );
+        let metadata = tool_observation_metadata(AgentKind::GeminiCli, &before, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id, None);
+        let no_input = json!({"tool_name": "read_file"});
+        assert!(tool_observation_metadata(AgentKind::GeminiCli, &no_input, true).is_none());
+        let after = tool_observation_metadata(AgentKind::GeminiCli, &no_input, false).unwrap();
+        assert_eq!(after.tool_family, ToolFamily::File);
+    }
+
+    /// A Gemini CLI `tool_response` proves its outcome by the presence of
+    /// `error`; a payload without a `tool_response` proves nothing.
+    #[test]
+    fn gemini_cli_tool_response_error_decides_the_outcome() {
+        let failed = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "missing.md"},
+            "tool_response": {
+                "llmContent": "File not found: missing.md",
+                "returnDisplay": "File not found.",
+                "error": {"message": "File not found: missing.md", "type": "FILE_NOT_FOUND"}
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &failed),
+            ToolOutcome::Error
+        );
+        let succeeded = json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "read_file",
+            "tool_input": {"file_path": "README.md"},
+            "tool_response": {"llmContent": "# Title", "returnDisplay": ""}
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &succeeded),
+            ToolOutcome::Success
+        );
+        let null_error = json!({"tool_response": {"llmContent": "ok", "error": null}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &null_error),
+            ToolOutcome::Success
+        );
+        // Control: a BeforeTool has no `tool_response`.
+        let before = json!({"tool_name": "read_file", "tool_input": {"file_path": "README.md"}});
+        assert_eq!(
+            tool_observation_outcome(AgentKind::GeminiCli, &before),
+            ToolOutcome::Unknown
         );
     }
 
