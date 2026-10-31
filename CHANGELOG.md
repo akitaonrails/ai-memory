@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `bootstrap` now waits for a provider's `Retry-After` before retrying a
+  chunk, capped at 32 s like the remote embedders (#1397). It retried after a
+  fixed 2 s and gave up after three attempts, so a rate-limited hosted API
+  (DeepSeek, OpenAI) failed the run while it was still asking the client to
+  wait. Without a hint the fixed 2 s delay is unchanged (#1889).
 - `GET /handoff` (the `session-start` hook) returns again on large projects.
   On a store without planner statistics, the unfinished-session recovery
   lookup walked every observation in the project and rescanned the project for
