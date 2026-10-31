@@ -206,8 +206,9 @@ explicitly rejects the schema-constrained shape.
 `AI_MEMORY_LLM_COMPAT_STREAM` controls the `stream` field on
 `openai-compat` Chat Completions requests. Leave it unset to omit the field,
 preserving the existing request shape. Set it to `false` when an endpoint
-defaults an omitted field to Server-Sent Events. The value is passed through
-verbatim; this transport expects one JSON response and does not decode SSE.
+defaults an omitted field to Server-Sent Events. Setting it to `true` is
+rejected before any request because this transport expects one JSON response
+and does not decode SSE. Use `false` or leave the setting unset.
 
 The `docker/.env.production.example` file in the repo ships with an OpenRouter
 setup pre-filled, with `moonshotai/kimi-k2.6` as the sample model (see the

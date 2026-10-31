@@ -34,7 +34,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `llm_base_url` | unset | `AI_MEMORY_LLM_BASE_URL` | Endpoint override for the LLM provider. Required for `openai-compat`. |
 | `llm_compat_strict` | `true` | `AI_MEMORY_LLM_COMPAT_STRICT` | Send `response_format=json_schema` (strict) to the `openai-compat` provider. |
 | `llm_compat_disable_thinking` | `false` | `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` | Send `chat_template_kwargs: {"enable_thinking": false}` on every `openai-compat` chat request. |
-| `llm_compat_stream` | unset | `AI_MEMORY_LLM_COMPAT_STREAM` | Optional `stream` field for `openai-compat` Chat Completions requests. |
+| `llm_compat_stream` | unset | `AI_MEMORY_LLM_COMPAT_STREAM` | Set `false` to request non-streaming JSON from `openai-compat`; `true` is rejected because SSE is unsupported. |
 | `llm_timeout_secs` | `300` (`ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS`) | `AI_MEMORY_LLM_TIMEOUT_SECS` | Per-request timeout for chat completions and the Copilot token exchange. The openai-oauth token refresh keeps its own ceiling. |
 | `llm_reasoning_effort` | unset (the model default applies) | `AI_MEMORY_LLM_REASONING_EFFORT` | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` or `persistent`. |
 | `llm_headers` | `[]` | `AI_MEMORY_LLM_HEADERS` | Extra HTTP headers on every LLM chat request, as `Name: Value` or `Name=Value` entries. |

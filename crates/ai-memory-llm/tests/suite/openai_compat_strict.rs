@@ -216,6 +216,7 @@ async fn stream_setting_recovers_endpoint_that_defaults_to_sse() {
 
     let value = strict_provider(server.uri())
         .with_stream(Some(false))
+        .expect("non-streaming configuration is supported")
         .complete_structured_raw(tiny_request(), tiny_schema())
         .await
         .expect("non-streaming JSON response");

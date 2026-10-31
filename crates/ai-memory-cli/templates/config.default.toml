@@ -131,7 +131,8 @@ log_level = "info"
 # llm_compat_disable_thinking = false
 
 # openai-compat only: explicitly set the `stream` field on Chat Completions
-# requests (e.g. `stream = false` to prevent gateways defaulting to SSE).
+# requests. Set to false to prevent gateways defaulting to SSE. Setting true
+# is rejected because this transport cannot decode SSE responses.
 # Unset by default (omits the field). Env equivalent:
 # `AI_MEMORY_LLM_COMPAT_STREAM`.
 #   llm_compat_stream = false

@@ -370,7 +370,8 @@ pub struct Config {
     /// `llm_compat_disable_thinking = true` in `config.toml`).
     pub llm_compat_disable_thinking: bool,
     /// Optional `stream` field sent by the `openai-compat` Chat Completions
-    /// transport. Unset preserves omission. Set with
+    /// transport. Unset preserves omission; only `false` is supported.
+    /// `true` is rejected before any request. Set with
     /// `AI_MEMORY_LLM_COMPAT_STREAM`.
     pub llm_compat_stream: Option<bool>,
     /// Per-request timeout (seconds) applied to every chat

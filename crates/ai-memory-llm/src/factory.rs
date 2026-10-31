@@ -137,7 +137,8 @@ pub struct ProviderConfig {
     /// `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` by `Config::load`.
     pub compat_disable_thinking: bool,
     /// Optional `stream` field for `openai-compat` Chat Completions requests.
-    /// `None` preserves omission; `Some(value)` sends the operator's value.
+    /// `None` preserves omission; `Some(false)` requests non-streaming JSON.
+    /// `Some(true)` is rejected; other providers ignore this setting.
     /// Sourced once from `AI_MEMORY_LLM_COMPAT_STREAM` by `Config::load`.
     pub compat_stream: Option<bool>,
     /// Per-request timeout for every chat provider, in seconds.
@@ -445,7 +446,7 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
                     .with_strict(config.compat_strict)
                     .with_disable_thinking(config.compat_disable_thinking)
-                    .with_stream(config.compat_stream)
+                    .with_stream(config.compat_stream)?
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers)
@@ -709,6 +710,29 @@ mod tests {
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers,
+        }
+    }
+
+    #[test]
+    fn openai_compat_rejects_streaming_configuration() {
+        let mut config = compat_config(crate::ExtraHeaders::default());
+        config.compat_stream = Some(true);
+        let error = build_provider(config)
+            .err()
+            .expect("streaming must be rejected before any request");
+        assert!(matches!(error, LlmError::NotConfigured(_)));
+        let message = error.to_string();
+        assert!(message.contains("AI_MEMORY_LLM_COMPAT_STREAM"), "{message}");
+        assert!(message.contains("false or unset"), "{message}");
+        assert!(message.contains("SSE"), "{message}");
+    }
+
+    #[test]
+    fn openai_compat_accepts_non_streaming_and_omission() {
+        for stream in [None, Some(false)] {
+            let mut config = compat_config(crate::ExtraHeaders::default());
+            config.compat_stream = stream;
+            assert!(build_provider(config).is_ok());
         }
     }
 

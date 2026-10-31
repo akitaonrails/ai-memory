@@ -183,11 +183,21 @@ impl OpenAiCompatProvider {
         self
     }
 
-    /// Set the optional Chat Completions `stream` request field.
-    #[must_use]
-    pub fn with_stream(mut self, stream: Option<bool>) -> Self {
+    /// Omit `stream` or explicitly request a non-streaming JSON response.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] for `Some(true)` because this
+    /// Chat Completions transport cannot decode SSE responses.
+    pub fn with_stream(mut self, stream: Option<bool>) -> LlmResult<Self> {
+        if stream == Some(true) {
+            return Err(LlmError::NotConfigured(
+                "AI_MEMORY_LLM_COMPAT_STREAM (llm_compat_stream) must be false or unset: \
+                 openai-compat Chat Completions does not support SSE responses"
+                    .into(),
+            ));
+        }
         self.inner = self.inner.with_stream(stream);
-        self
+        Ok(self)
     }
 
     /// Forward reasoning effort to the inner Chat Completions client.
@@ -672,6 +682,17 @@ mod tests {
         assert!(!p.inner.disable_thinking());
         let p = p.with_disable_thinking(true);
         assert!(p.inner.disable_thinking());
+    }
+
+    #[test]
+    fn compat_stream_builder_rejects_sse() {
+        let provider = OpenAiCompatProvider::new("http://localhost:11434/v1", None, "model-x")
+            .expect("provider builds");
+        let error = provider
+            .with_stream(Some(true))
+            .err()
+            .expect("SSE must be refused before any request");
+        assert!(matches!(error, LlmError::NotConfigured(_)));
     }
 
     #[test]
