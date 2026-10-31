@@ -14394,7 +14394,10 @@ fn session_counts_by_agent_sql(has_since: bool, owner_filter: &OwnerFilter) -> S
 /// #1257). `INDEXED BY` bounds each probe to one session. `handoffs` has no
 /// index on its source session, so the scope's handoffs are reduced to the
 /// newest per source session in one pass instead of being searched once per
-/// session.
+/// session. Only a handoff at or after a session's newest work can cover it,
+/// so that pass starts at the oldest such work among the sessions still
+/// eligible; unbounded, it sorted the project's whole handoff history on
+/// every call.
 fn latest_interrupted_session_candidate_sql(
     owner_filter: &OwnerFilter,
     has_receiver: bool,
@@ -14427,6 +14430,8 @@ fn latest_interrupted_session_candidate_sql(
            SELECT from_session_id, MAX(created_at) AS last_handoff \
            FROM handoffs \
            WHERE workspace_id = :ws AND project_id = :proj AND from_session_id IS NOT NULL \
+             AND created_at >= (SELECT MIN(last_work) FROM candidates \
+                                WHERE ended_at IS NULL OR last_work > ended_at) \
            GROUP BY from_session_id \
          ) \
          SELECT c.id, c.agent_kind, c.last_activity, c.cwd \
@@ -16751,6 +16756,14 @@ mod tests {
                 assert!(
                     handoff_reads.len() == 1 && handoff_reads[0].2.starts_with("SEARCH handoffs "),
                     "{label}: the scope's handoffs must be read once through a scope index: \
+                     {plan:?}"
+                );
+                // Only a handoff at or after some candidate's newest work can
+                // cover it; without the bound the read sorts the project's
+                // whole handoff history.
+                assert!(
+                    handoff_reads[0].2.contains("created_at>?"),
+                    "{label}: the handoffs read must be bounded by the oldest candidate work: \
                      {plan:?}"
                 );
                 let mut parent = handoff_reads[0].1;
