@@ -20,7 +20,7 @@ version in [`docs/changelog/`](docs/changelog/):
   follows `Accept-Language` and has a language selector that saves a cookie.
   Help, prompts, status lines and command errors are translated at the display
   boundary; JSON, MCP payloads, logs, stored content and generated configuration
-  keep their existing representation. See `docs/localization.md`.
+  keep their existing representation. See `docs/localization.md` (#1912).
 
 - Made the profile's LLM output budget configurable through
   `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
