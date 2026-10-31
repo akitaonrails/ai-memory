@@ -929,6 +929,9 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // PostToolUse.
             | AgentKind::Dsh
             | AgentKind::Cline
+            // Gemini CLI's BeforeTool and AfterTool carry Claude Code's
+            // `tool_name` and `tool_input`, plus a `tool_response` object.
+            | AgentKind::GeminiCli
             | AgentKind::QwenCode
             | AgentKind::Qoder
     )
@@ -1077,6 +1080,19 @@ fn safe_tool_body(
                 raw.pointer("/tool_result/output")
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/tool_result/error").and_then(value_to_text))
+            } else if agent == AgentKind::GeminiCli {
+                // Gemini CLI's `AfterTool` `tool_response` holds the model's
+                // copy of the result in `llmContent` (a string or a Part
+                // list) beside `returnDisplay`, the terminal rendering, which
+                // for an edit is a diff object carrying both whole versions of
+                // the file. Read only the model's text, then the error message
+                // (`ToolResult`, packages/core/src/tools/tools.ts, v0.66.0).
+                raw.pointer("/tool_response/llmContent")
+                    .and_then(value_to_text)
+                    .or_else(|| {
+                        raw.pointer("/tool_response/error/message")
+                            .and_then(value_to_text)
+                    })
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
