@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The generated OpenCode, OpenCode 2, OMP, Pi and OpenClaw integrations no
+  longer follow HTTP redirects, matching the native hook client (#1818).
+  Behind an SSO gateway, proxy or captive portal that redirects to a login
+  page, the page's `200` counted as a delivery: the spool drain deleted
+  spooled events and new ones were never spooled, the login page's HTML was
+  injected as the session's handoff, and a `307` or `308` replayed event
+  bodies to the redirect target. A redirect now fails the request like an
+  unreachable server, so the event stays spooled and no handoff is injected.
+  `ai-memory upgrade` refreshes installed integrations (#1902).
 - `ai-memory-wikisync` no longer refuses a destination as "already being
   modified" right after its own run released it. On Unix a child forked by
   another thread inherits the lock until it calls `exec`, so the next run
