@@ -3123,8 +3123,11 @@ async function drainHookSpool(): Promise<void> {
       if (entry.token) headers["Authorization"] = `Bearer ${entry.token}`;
       // Bun reads HTTP(S)_PROXY and ALL_PROXY even for a loopback URL;
       // `proxy: false` connects directly. Node's fetch ignores the key.
+      // A redirect is refused, not followed: a gateway's login page answers
+      // 200, and the entry would be deleted as delivered.
       const resp = await fetch(entry.url, {
         proxy: false,
+        redirect: "error",
         method: "POST",
         headers,
         body: entry.body,
@@ -3260,6 +3263,14 @@ fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
         assert!(
             call.contains("proxy: false,"),
             "{name}: a fetch that can reach an environment proxy:\n{call}"
+        );
+        // A followed redirect lets a gateway's login page count as a
+        // delivery (deleting a spooled event) or arrive as the handoff, and a
+        // 307 or 308 replays the body to the redirect target. The native hook
+        // client refuses redirects for the same reasons (#1818).
+        assert!(
+            call.contains("redirect: \"error\","),
+            "{name}: a fetch that follows redirects:\n{call}"
         );
     }
     assert!(
