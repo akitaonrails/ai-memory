@@ -75,6 +75,46 @@ where
     }
 }
 
+/// `fs::rename`, retrying a transient sharing violation `attempts` times
+/// with a linear backoff from `base_delay`. Off Windows nothing is transient.
+///
+/// # Errors
+/// The final `fs::rename` error.
+pub fn rename_with_retry(
+    from: &Path,
+    to: &Path,
+    attempts: u32,
+    base_delay: Duration,
+) -> std::io::Result<()> {
+    retry_transient(attempts, base_delay, is_transient_sharing_violation, || {
+        std::fs::rename(from, to)
+    })
+}
+
+/// Retry `attempt_fn` while `transient` says so, at most `attempts` times.
+fn retry_transient<T, F, P>(
+    attempts: u32,
+    base_delay: Duration,
+    transient: P,
+    mut attempt_fn: F,
+) -> std::io::Result<T>
+where
+    F: FnMut() -> std::io::Result<T>,
+    P: Fn(&std::io::Error) -> bool,
+{
+    let mut attempt = 0u32;
+    loop {
+        match attempt_fn() {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < attempts && transient(&err) => {
+                attempt += 1;
+                std::thread::sleep(base_delay * attempt);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// Windows: sharing (32) and lock (33) violations are transient third-party
 /// holds. Everything else — including `ACCESS_DENIED`, which is usually a
 /// real permissions problem — propagates immediately. Elsewhere: nothing is
@@ -234,6 +274,97 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(calls, 1, "no retry when the predicate says non-transient");
+    }
+
+    /// Absorbs a transient hold, stops at the budget, never retries a real
+    /// error.
+    #[test]
+    fn rename_retry_absorbs_transient_holds_within_its_budget() {
+        let mut failures_left = 3;
+        let mut calls = 0u32;
+        let result = retry_transient(
+            5,
+            Duration::ZERO,
+            |_| true,
+            || {
+                calls += 1;
+                if failures_left > 0 {
+                    failures_left -= 1;
+                    Err(std::io::Error::from_raw_os_error(32))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, 4, "three transient failures, then success");
+
+        let mut calls = 0u32;
+        let result: std::io::Result<()> = retry_transient(
+            5,
+            Duration::ZERO,
+            |_| true,
+            || {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(32))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 6, "initial attempt plus five retries, then stop");
+
+        let mut calls = 0u32;
+        let result: std::io::Result<()> = retry_transient(
+            5,
+            Duration::ZERO,
+            |_| false,
+            || {
+                calls += 1;
+                Err(std::io::Error::from_raw_os_error(32))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "no retry when the predicate says non-transient");
+    }
+
+    #[test]
+    fn rename_with_retry_moves_the_file_and_reports_a_missing_source() {
+        let dir = TempDir::new().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        std::fs::write(&from, b"bytes").unwrap();
+        rename_with_retry(&from, &to, 5, Duration::ZERO).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"bytes");
+        let err = rename_with_retry(&from, &to, 5, Duration::ZERO).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// A real sharing hold: a handle without `FILE_SHARE_DELETE`, as a
+    /// scanner holds a file.
+    #[cfg(windows)]
+    #[test]
+    fn rename_with_retry_outlasts_a_real_sharing_hold() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ: u32 = 1;
+
+        let dir = TempDir::new().unwrap();
+        let from = dir.path().join("held.exe");
+        let to = dir.path().join("held.old");
+        std::fs::write(&from, b"image").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&from)
+            .unwrap();
+        let err = std::fs::rename(&from, &to).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(32), "the hold must be real: {err}");
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(holder);
+        });
+        rename_with_retry(&from, &to, 20, Duration::from_millis(50)).unwrap();
+        release.join().unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"image");
     }
 
     /// Pins the production classifier per platform: on Unix nothing is

@@ -689,18 +689,31 @@ fn replace_file_atomic(src: &Path, dest: &Path) -> Result<()> {
     }
 }
 
+/// Linear backoff, 100 ms + 200 ms + … + 1.2 s: a scanner holds a fresh
+/// 100 MB binary for a few seconds.
+#[cfg(windows)]
+const SWAP_RETRY_ATTEMPTS: u32 = 12;
+#[cfg(windows)]
+const SWAP_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
 /// Windows allows renaming a running image aside, but not overwriting it.
 /// Stage to `.new`, move live `dest` → `.old`, promote `.new` → `dest`, then
 /// best-effort delete `.old` (often fails while this process still maps it).
+///
+/// Both renames retry a sharing violation: a scanner holding the running
+/// binary or the fresh `.new` used to fail the upgrade.
 #[cfg(windows)]
 fn replace_file_windows_rename_aside(tmp: &Path, dest: &Path) -> Result<()> {
+    let rename = |from: &Path, to: &Path| {
+        ai_memory_wiki::rename_with_retry(from, to, SWAP_RETRY_ATTEMPTS, SWAP_RETRY_BASE_DELAY)
+    };
     let old = dest.with_extension("old");
     if old.exists() {
         let _ = fs::remove_file(&old);
     }
     let had_dest = dest.exists();
     if had_dest {
-        fs::rename(dest, &old).with_context(|| {
+        rename(dest, &old).with_context(|| {
             format!(
                 "moving running binary aside {} -> {}",
                 dest.display(),
@@ -708,9 +721,9 @@ fn replace_file_windows_rename_aside(tmp: &Path, dest: &Path) -> Result<()> {
             )
         })?;
     }
-    if let Err(err) = fs::rename(tmp, dest) {
+    if let Err(err) = rename(tmp, dest) {
         if had_dest {
-            let _ = fs::rename(&old, dest);
+            let _ = rename(&old, dest);
         }
         return Err(err).with_context(|| {
             format!(
@@ -1719,6 +1732,43 @@ mod tests {
         if old.exists() {
             assert_eq!(fs::read(&old)?, b"old");
         }
+        Ok(())
+    }
+
+    /// A scanner holds the running binary when the swap moves it aside; the
+    /// swap waits it out. Fails without the retry.
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_atomic_waits_out_a_transient_hold_on_the_running_binary() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ: u32 = 1;
+
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join(shipped_binary_name());
+        let src = dir.path().join("fresh");
+        fs::write(&dest, b"old")?;
+        fs::write(&src, b"new")?;
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&dest)?;
+        assert_eq!(
+            fs::rename(&dest, dest.with_extension("probe"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(32),
+            "the hold must be a real sharing violation"
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(holder);
+        });
+
+        replace_file_atomic(&src, &dest)?;
+
+        release.join().expect("release thread");
+        assert_eq!(fs::read(&dest)?, b"new");
+        assert!(!dest.with_extension("new").exists());
         Ok(())
     }
 
