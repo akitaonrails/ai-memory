@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory upgrade` on Windows now waits for a scanner to release the
+  running or the freshly written binary before swapping them, instead of
+  failing with "being used by another process". The swap retries that
+  sharing violation for about eight seconds, as the wiki's atomic writes
+  already did (#1895).
 - Project search links now use the project's current stored name after
   resolving a canonical or legacy key. Results, breadcrumbs, and the scope
   selector stay on that project without renaming it (#1875).
