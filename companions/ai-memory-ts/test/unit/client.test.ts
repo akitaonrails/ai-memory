@@ -463,6 +463,8 @@ describe("messages", () => {
     server.tools.set("memory_message_send", () => ({ message_id: payloads.MESSAGE_ID }));
     const sent = await memory.messages.send({
       to: OTHER,
+      toAgent: "codex",
+      fromAgent: "claude-code",
       body: "please do X",
       subject: "hi",
       nature: "measured",
@@ -471,8 +473,10 @@ describe("messages", () => {
     assert.deepEqual(server.lastArgs(), {
       to_workspace: "demo",
       to_project: "other",
+      to_agent: "codex",
       from_workspace: "demo",
       from_project: "app",
+      from_agent: "claude-code",
       body: "please do X",
       subject: "hi",
       nature: "measured",
@@ -813,7 +817,9 @@ describe("wire names", () => {
       memory.handoffs.cancel({ handoffId: "h", anyOwner: true }),
       memory.messages.send({
         to: OTHER,
+        toAgent: "codex",
         from: SCOPE,
+        fromAgent: "claude-code",
         body: "b",
         subject: "s",
         nature: "measured",

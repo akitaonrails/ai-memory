@@ -143,8 +143,10 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     sends: [
       "to_workspace",
       "to_project",
+      "to_agent",
       "from_workspace",
       "from_project",
+      "from_agent",
       "body",
       "subject",
       "nature",

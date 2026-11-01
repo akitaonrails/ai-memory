@@ -295,19 +295,23 @@ again, and say which you applied.\n\
   and marks it expired so the next session will not consume it. \
   `any_owner=true` is root-only recovery and requires an explicit user request.\n\
 - `memory_message_send` — when the user asks to \"send a report\", \"notify\", \
-  or \"leave a message for\" the agent in ANOTHER project/repo, or wants an \
-  agent there to do something and you should not pull that project's \
-  context in here. This is the ONLY tool that lands anything in a \
+  or \"leave a message for\" an agent in another project/repo or this same \
+  project, or wants an agent to receive a request through the inbox. This is \
+  the ONLY tool that lands anything in a \
   project's inbox: a wiki page written into the target project with \
   `memory_write_page` is NOT a message and is never surfaced as one, so a \
   \"report\" written as a page sits unread. Addresses a directed, claim-once \
   message to the \
-  REQUIRED `to_workspace` + `to_project` inbox; compose a self-contained \
-  request in `body`. The recipient must already exist (unknown target is \
+  REQUIRED `to_workspace` + `to_project` inbox; same-project delivery is \
+  allowed. Optional `to_agent` restricts claiming to that registered harness; \
+  omit it for shared project mail. Compose a self-contained request in `body`. \
+  The recipient must already exist (unknown target is \
   rejected, not created). This is the ONE tool that crosses project \
-  isolation on purpose. Unless your client is session-aware, name the \
+  isolation on purpose when the recipient is another project. Unless your \
+  client is session-aware, name the \
   sender with `from_workspace` + `from_project`; a send whose sender the \
-  server would have to guess is refused.\n\
+  server would have to guess is refused. `from_agent` is for static clients \
+  whose session does not record the sender harness.\n\
 - `memory_message_list` — READ-ONLY: show pending mail for this project. \
   `box=\"inbox\"` (default) is mail addressed here (poppable); \
   `box=\"outbox\"` is mail this project sent (cancellable). Bodies are \
@@ -1567,6 +1571,12 @@ struct MessageSendArgs {
     to_workspace: String,
     /// Recipient project, together with `to_workspace`. REQUIRED.
     to_project: String,
+    /// Optional harness that alone may claim the message (`codex`, `grok`,
+    /// `claude-code`, ...). Other harnesses in the recipient project cannot
+    /// pop it, even by id. Omit for shared project mail. The harness must
+    /// have at least one registered session in the recipient project.
+    #[serde(default)]
+    to_agent: Option<String>,
     /// The message body: the request for the recipient agent. Compose a
     /// self-contained prompt — the recipient works from this alone, without
     /// your project's context.
@@ -1582,6 +1592,10 @@ struct MessageSendArgs {
     /// Required and non-empty when `nature` is `measured`.
     #[serde(default)]
     evidence: Option<String>,
+    /// Sender harness, for static MCP clients whose session the server cannot
+    /// see. Ignored when the caller's own session already records its harness.
+    #[serde(default)]
+    from_agent: Option<String>,
     /// Sender project override. Session-aware clients may omit it to send from
     /// the current project. Static MCP clients pass it with `from_workspace` to
     /// name the sending project explicitly.
@@ -7031,7 +7045,7 @@ impl AiMemoryServer {
         ok_json(&result)
     }
 
-    /// Send a cross-project message into another project's inbox (V64).
+    /// Send a project message into an ai-memory inbox (V64).
     #[tool(
         annotations(
             title = "Send project message",
@@ -7040,8 +7054,8 @@ impl AiMemoryServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        description = "Send a message to ANOTHER project's ai-memory inbox — \
-        directed cross-project agent-to-agent messaging. Use this when the user \
+        description = "Send a message to an ai-memory project inbox. Same-project \
+        delivery is allowed. Use this when the user \
         asks to \"send a report\", \"notify\", or \"leave a message for\" the \
         agent working in a different project/repo, or wants an agent there to \
         do something and you should NOT pull that project's context into this \
@@ -7050,7 +7064,9 @@ impl AiMemoryServer {
         memory_write_page is NOT a message and is never surfaced as one. \
         Compose a \
         SELF-CONTAINED request in `body` (the recipient works from it alone) and \
-        address it with the REQUIRED `to_workspace` + `to_project`. The recipient \
+        address it with the REQUIRED `to_workspace` + `to_project`. Optional \
+        `to_agent` restricts claiming to that registered harness; the recipient \
+        project must have a session for it. Omit it for shared project mail. The recipient \
         project must already exist — an unknown target is rejected, not created. \
         The message waits in the recipient's inbox until a session there pops it \
         exactly once (memory_message_pop) or you retract it (memory_message_cancel). \
@@ -7058,7 +7074,8 @@ impl AiMemoryServer {
         `unknown` (the default); `measured` requires non-empty bounded \
         `evidence`. Sender is the current project only for session-aware clients; static \
         MCP clients MUST set `from_workspace`+`from_project` (a guessed sender \
-        is refused). Body is secret-scrubbed and size-capped. \
+        is refused). `from_agent` is for static clients whose session does not \
+        record the sender harness. Body is secret-scrubbed and size-capped. \
         Returns `{ \"message_id\": ... }`."
     )]
     async fn memory_message_send(
@@ -7100,8 +7117,36 @@ impl AiMemoryServer {
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
+        let to_agent_raw = args
+            .to_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let to_agent = if let Some(raw) = to_agent_raw {
+            let agent = AgentKind::from_wire(raw);
+            if agent.as_str() != raw {
+                return Err(McpError::invalid_params(
+                    "unknown to_agent: name a registered harness such as codex, grok or claude-code",
+                    None,
+                ));
+            }
+            let usage = self
+                .reader
+                .agent_usage(to_ws, to_proj, ai_memory_core::OwnerFilter::Any)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if !usage.iter().any(|usage| usage.agent == raw) {
+                return Err(McpError::invalid_params(
+                    format!("to_agent {raw} has no registered session in the recipient project"),
+                    None,
+                ));
+            }
+            Some(agent)
+        } else {
+            None
+        };
         // Messages bypass `Wiki::write_page`, so scrub the agent-supplied text
-        // here — a body crossing into another agent's live context must not
+        // here — a body crossing into the recipient agent's live context must not
         // carry secrets.
         let s = &self.sanitizer;
         let body =
@@ -7127,16 +7172,47 @@ impl AiMemoryServer {
             ));
         }
         let sender = crate::actor::actor_from_parts(&parts);
+        let candidate_session = aps_actor.session_id.as_deref().map(SessionId::from_native);
+        let recorded_agent = match candidate_session {
+            Some(sid) => self
+                .reader
+                .session_agent_kind(sid)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+            None => None,
+        };
+        let declared_agent = args
+            .from_agent
+            .as_deref()
+            .map(|raw| {
+                let raw = raw.trim();
+                let agent = AgentKind::from_wire(raw);
+                if agent == AgentKind::Other && raw != "other" {
+                    Err(McpError::invalid_params("unknown from_agent", None))
+                } else {
+                    Ok(agent)
+                }
+            })
+            .transpose()?;
+        let recorded_session = recorded_agent.is_some();
+        let from_agent = recorded_agent
+            .or(declared_agent)
+            .or_else(|| sender.agent.as_deref().map(AgentKind::from_wire))
+            .unwrap_or(AgentKind::Other);
+        // Only a session that already exists can be stored as provenance.
+        let from_session_id = candidate_session.filter(|_| recorded_session);
         let from_owner_user = sender.identity_key().map(|key| key.storage_key());
+        let effective_from_agent = from_agent.as_str().to_owned();
+        let effective_to_agent = to_agent.as_ref().map(|agent| agent.as_str().to_owned());
         let message = ai_memory_core::NewAgentMessage {
             from_workspace_id: from_ws,
             from_project_id: from_proj,
-            from_agent: AgentKind::Other,
-            from_session_id: None,
+            from_agent,
+            from_session_id,
             from_owner_user,
             to_workspace_id: to_ws,
             to_project_id: to_proj,
-            to_agent: None,
+            to_agent,
             subject,
             body,
             nature: args.nature,
@@ -7159,7 +7235,11 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.notify_operation_observers(admission.as_ref());
-        ok_json(&serde_json::json!({ "message_id": id.to_string() }))
+        ok_json(&serde_json::json!({
+            "message_id": id.to_string(),
+            "from_agent": effective_from_agent,
+            "to_agent": effective_to_agent,
+        }))
     }
 
     /// List pending inbox/outbox messages without consuming them.
@@ -11206,10 +11286,12 @@ mod tests {
                     Parameters(MessageSendArgs {
                         to_workspace: "default".into(),
                         to_project: "project-b".into(),
+                        to_agent: None,
                         body: "please add the /v1/export endpoint".into(),
                         subject: Some("export".into()),
                         nature: ai_memory_core::MessageNature::Unknown,
                         evidence: None,
+                        from_agent: None,
                         from_project: Some("scratch".into()),
                         from_workspace: Some("default".into()),
                     }),
@@ -11290,6 +11372,375 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_send_with_to_agent_is_claimable_only_by_that_harness() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        let recipient = store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: SessionId::new(),
+                workspace_id: ws,
+                project_id: recipient,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+            })
+            .await
+            .unwrap();
+        let sent = call_tool_json(
+            server
+                .memory_message_send(
+                    Parameters(MessageSendArgs {
+                        to_workspace: "default".into(),
+                        to_project: "project-b".into(),
+                        to_agent: Some("codex".into()),
+                        body: "please inspect this".into(),
+                        subject: None,
+                        nature: ai_memory_core::MessageNature::Unknown,
+                        evidence: None,
+                        from_agent: None,
+                        from_project: Some("scratch".into()),
+                        from_workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        let message_id = sent["message_id"].as_str().unwrap().to_owned();
+
+        let claude = call_tool_json(
+            server
+                .memory_message_pop(
+                    Parameters(MessagePopArgs {
+                        agent: Some("claude-code".into()),
+                        message_id: Some(message_id.clone()),
+                        project: Some("project-b".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(claude["message"].is_null());
+
+        let codex = call_tool_json(
+            server
+                .memory_message_pop(
+                    Parameters(MessagePopArgs {
+                        agent: Some("codex".into()),
+                        message_id: Some(message_id),
+                        project: Some("project-b".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(codex["message"]["to_agent"], "codex");
+    }
+
+    #[tokio::test]
+    async fn message_send_rejects_unknown_to_agent() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        let error = server
+            .memory_message_send(
+                Parameters(MessageSendArgs {
+                    to_workspace: "default".into(),
+                    to_project: "project-b".into(),
+                    to_agent: Some("foo".into()),
+                    body: "please inspect this".into(),
+                    subject: None,
+                    nature: ai_memory_core::MessageNature::Unknown,
+                    evidence: None,
+                    from_agent: None,
+                    from_project: Some("scratch".into()),
+                    from_workspace: Some("default".into()),
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        let inbox = call_tool_json(
+            server
+                .memory_message_list(
+                    Parameters(MessageListArgs {
+                        r#box: None,
+                        limit: None,
+                        project: Some("project-b".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(inbox["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_send_rejects_to_agent_without_session_in_recipient_project() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        let error = server
+            .memory_message_send(
+                Parameters(MessageSendArgs {
+                    to_workspace: "default".into(),
+                    to_project: "project-b".into(),
+                    to_agent: Some("grok".into()),
+                    body: "please inspect this".into(),
+                    subject: None,
+                    nature: ai_memory_core::MessageNature::Unknown,
+                    evidence: None,
+                    from_agent: None,
+                    from_project: Some("scratch".into()),
+                    from_workspace: Some("default".into()),
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        let inbox = call_tool_json(
+            server
+                .memory_message_list(
+                    Parameters(MessageListArgs {
+                        r#box: None,
+                        limit: None,
+                        project: Some("project-b".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(inbox["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_send_records_declared_from_agent() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        server
+            .memory_message_send(
+                Parameters(MessageSendArgs {
+                    to_workspace: "default".into(),
+                    to_project: "project-b".into(),
+                    to_agent: None,
+                    body: "please inspect this".into(),
+                    subject: None,
+                    nature: ai_memory_core::MessageNature::Unknown,
+                    evidence: None,
+                    from_agent: Some("grok".into()),
+                    from_project: Some("scratch".into()),
+                    from_workspace: Some("default".into()),
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .unwrap();
+        let inbox = call_tool_json(
+            server
+                .memory_message_list(
+                    Parameters(MessageListArgs {
+                        r#box: None,
+                        limit: None,
+                        project: Some("project-b".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(inbox["messages"][0]["from_agent"], "grok");
+    }
+
+    #[tokio::test]
+    async fn message_send_rejects_unknown_from_agent() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        let error = server
+            .memory_message_send(
+                Parameters(MessageSendArgs {
+                    to_workspace: "default".into(),
+                    to_project: "project-b".into(),
+                    to_agent: None,
+                    body: "please inspect this".into(),
+                    subject: None,
+                    nature: ai_memory_core::MessageNature::Unknown,
+                    evidence: None,
+                    from_agent: Some("foo".into()),
+                    from_project: Some("scratch".into()),
+                    from_workspace: Some("default".into()),
+                }),
+                test_optional_parts(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        let inbox = call_tool_json(
+            server
+                .memory_message_list(
+                    Parameters(MessageListArgs {
+                        r#box: None,
+                        limit: None,
+                        project: Some("project-b".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(inbox["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_send_to_same_project_is_accepted() {
+        let (_tmp, _store, server, _ws, _scratch) = setup_server().await;
+        let sent = call_tool_json(
+            server
+                .memory_message_send(
+                    Parameters(MessageSendArgs {
+                        to_workspace: "default".into(),
+                        to_project: "scratch".into(),
+                        to_agent: Some("  \t ".into()),
+                        body: "please inspect this project".into(),
+                        subject: None,
+                        nature: ai_memory_core::MessageNature::Unknown,
+                        evidence: None,
+                        from_agent: Some("codex".into()),
+                        from_project: Some("scratch".into()),
+                        from_workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(sent["from_agent"], "codex");
+        assert!(sent["to_agent"].is_null());
+        let inbox = call_tool_json(
+            server
+                .memory_message_list(
+                    Parameters(MessageListArgs {
+                        r#box: None,
+                        limit: None,
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(inbox["messages"][0]["from_agent"], "codex");
+    }
+
+    #[tokio::test]
+    async fn message_send_prefers_recorded_session_agent_over_declared() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: _scratch,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+            })
+            .await
+            .unwrap();
+        let mut parts = test_parts_default();
+        parts.headers.insert(
+            "x-memory-actor-session-id",
+            session_id.to_string().parse().unwrap(),
+        );
+        server
+            .memory_message_send(
+                Parameters(MessageSendArgs {
+                    to_workspace: "default".into(),
+                    to_project: "project-b".into(),
+                    to_agent: None,
+                    body: "please inspect this".into(),
+                    subject: None,
+                    nature: ai_memory_core::MessageNature::Unknown,
+                    evidence: None,
+                    from_agent: Some("grok".into()),
+                    from_project: Some("scratch".into()),
+                    from_workspace: Some("default".into()),
+                }),
+                OptionalParts(parts),
+            )
+            .await
+            .unwrap();
+        let inbox = call_tool_json(
+            server
+                .memory_message_list(
+                    Parameters(MessageListArgs {
+                        r#box: None,
+                        limit: None,
+                        project: Some("project-b".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(inbox["messages"][0]["from_agent"], "codex");
+        // The list surface does not expose provenance; check the stored row.
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let stored: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT from_session_id FROM agent_messages WHERE body = 'please inspect this'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(session_id.as_bytes().as_slice()));
+    }
+
+    #[tokio::test]
     async fn message_send_to_unknown_recipient_fails_closed() {
         let (_tmp, _store, server, _ws, _proj) = setup_server().await;
         let result = server
@@ -11297,10 +11748,12 @@ mod tests {
                 Parameters(MessageSendArgs {
                     to_workspace: "default".into(),
                     to_project: "does-not-exist".into(),
+                    to_agent: None,
                     body: "hello?".into(),
                     subject: None,
                     nature: ai_memory_core::MessageNature::Unknown,
                     evidence: None,
+                    from_agent: None,
                     from_project: Some("scratch".into()),
                     from_workspace: Some("default".into()),
                 }),
@@ -11369,10 +11822,12 @@ mod tests {
                         Parameters(MessageSendArgs {
                             to_workspace: "default".into(),
                             to_project: to.into(),
+                            to_agent: None,
                             body: "please look at this".into(),
                             subject: None,
                             nature: ai_memory_core::MessageNature::Unknown,
                             evidence: None,
+                            from_agent: None,
                             from_project: Some(from.into()),
                             from_workspace: Some("default".into()),
                         }),

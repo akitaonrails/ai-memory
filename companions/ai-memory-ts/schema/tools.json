@@ -529,6 +529,12 @@
           "string"
         ]
       },
+      "from_agent": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "from_project": {
         "type": [
           "null",
@@ -551,6 +557,12 @@
         "type": "string"
       },
       "subject": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "to_agent": {
         "type": [
           "null",
           "string"
