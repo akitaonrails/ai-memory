@@ -141,7 +141,7 @@ impl ServerEndpoint {
     ///    container as `serve`, which already reads the same env var via
     ///    clap to nest its router).
     pub async fn from_config_resolving_auth(config: &Config) -> Self {
-        let client = reqwest::Client::new();
+        let client = http_client();
         let token = crate::auth_bearer::resolve_bearer(
             &client,
             &config.oidc_device_token_path(),
@@ -304,6 +304,17 @@ pub(crate) fn is_loopback_url(url: &str) -> bool {
         .map_or(host == "localhost", |ip| ip.is_loopback())
 }
 
+/// Shared reqwest client for thin-client CLI subcommands. Redirects are
+/// disabled so a 3xx from an SSO portal or proxy cannot be followed: JSON
+/// GET/POST would otherwise consume a login page, a 307/308 would replay the
+/// body, and [`post_to_file`] would write that page as a backup tarball.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// GET `<endpoint>{path}` with optional query params, deserialise JSON.
 ///
 /// # Errors
@@ -314,7 +325,7 @@ pub async fn get_json<T: DeserializeOwned>(
     path: &str,
     query: &[(&str, &str)],
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let mut req = client.get(&url);
     if !query.is_empty() {
@@ -340,7 +351,7 @@ pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
     path: &str,
     body: &B,
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.patch(&url).json(body));
     let resp = req
@@ -371,7 +382,7 @@ pub async fn post_json_no_content<B: Serialize>(
     path: &str,
     body: &B,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url).json(body));
     let resp = req
@@ -384,7 +395,7 @@ pub async fn post_json_no_content<B: Serialize>(
 
 /// POST an empty body and require a successful response.
 pub async fn post_empty(endpoint: &ServerEndpoint, path: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
     let resp = req
@@ -405,7 +416,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
     query: &[(&str, &str)],
     body: &B,
 ) -> Result<T> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = build_url_with_query(endpoint, path, query)?;
     let req = client.post(&url);
     let req = endpoint.authenticate(req.json(body));
@@ -549,7 +560,7 @@ pub(crate) async fn probe_server(endpoint: &ServerEndpoint) -> ServerProbe {
 }
 
 async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration) -> ServerProbe {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url("/healthz");
     match client.get(&url).timeout(timeout).send().await {
         Ok(_) => ServerProbe::Reachable,
@@ -571,7 +582,7 @@ async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration)
 /// Returns an error when the connection fails, the response is non-2xx,
 /// or the body cannot be read or written.
 pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) -> Result<u64> {
-    let client = reqwest::Client::new();
+    let client = http_client();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
     let resp = req
