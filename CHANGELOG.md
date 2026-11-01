@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The thin CLI HTTP client no longer follows redirects, matching the native
+  hook client (#1818) and `ai-memory auth` (`Policy::none()`). Behind an SSO
+  gateway, proxy or captive portal, `reqwest::Client::new()` followed a 302
+  to a login page: `ai-memory backup` wrote that HTML as the gzip tarball,
+  JSON helpers parsed the page instead of reporting the 302, and a `307` or
+  `308` replayed the request body to the `Location` origin. A 3xx now fails
+  closed and the previous backup file is left in place (#1932).
+
 ## [3.3.1] - 2026-11-01
 
 ### Fixed
