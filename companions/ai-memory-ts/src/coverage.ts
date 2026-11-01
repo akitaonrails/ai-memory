@@ -173,7 +173,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["briefing"],
     phase: 2,
-    sends: [...SCOPE, "recent_pages_limit", "settled_first"],
+    sends: [...SCOPE, "recent_pages_limit", "recent_sessions_limit", "settled_first"],
   },
   memory_explore: {
     status: "wrapped",

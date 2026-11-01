@@ -315,6 +315,7 @@ scope names, never captured text, and points at
 `memory_read_session_observations`. A client that re-fetches on every prompt
 sends `profile_digest=0` after the first, which also stops the notice.
 `memory_briefing` lists the same ordering as `recent_sessions`, and
+defaults to five entries; `recent_sessions_limit` raises that limit up to 50.
 `memory_handoff_list` names the session as `newer_unended_session` when it is
 newer than every open handoff. `memory_read_session_observations` without a
 `session_id` reads from the same ordering: the newest other session in the

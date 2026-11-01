@@ -62,6 +62,8 @@ version in [`docs/changelog/`](docs/changelog/):
   and its backfill marker without closing the source session. Handoffs,
   managed context, briefs, the profile digest and the inbox notice remain
   independent and unchanged (#1865).
+- Allowed `memory_briefing` callers to include up to 50 recent sessions so
+  agents can see active harnesses in a busy project (#1934).
 
 ## [3.3.1] - 2026-11-01
 
