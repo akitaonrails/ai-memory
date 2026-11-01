@@ -6,11 +6,11 @@ description: "Use this skill for cross-project agent-to-agent messaging: sending
 
 # ai-memory cross-project messaging
 
-Use this skill when work needs to move between two DIFFERENT projects without pulling one project's context into the other's session. It is a directed, claim-once inbox/queue: an agent in project A drops a self-contained request into project B's inbox; a session in B pops it exactly once and acts on it. This is distinct from handoffs, which are same-project session continuity.
+Use this skill for cross-project messaging and for directed harness mail sent to the current project. Cross-project messages carry a self-contained request without pulling the other project's context into this session. It is a directed, claim-once inbox/queue: a recipient session pops the message exactly once and acts on it. This is distinct from handoffs, which are same-project session continuity.
 
 ## Tools in this cluster
 
-- `memory_message_send` sends a message to another project's inbox. Requires `to_workspace` + `to_project` (the recipient must already exist — an unknown target is rejected, never created). Put a SELF-CONTAINED request in `body`: the recipient works from it alone, without your project's context. Use it when the user wants an agent in another repo to do something and you should not learn that repo here. The sender (`from_workspace` + `from_project`) is the provenance the recipient judges your request by: static clients must name it, and a send whose sender the server would have to guess is refused.
+- `memory_message_send` sends a message to a project's inbox. Requires `to_workspace` + `to_project` (the recipient must already exist — an unknown target is rejected, never created); the sender may target its own project. Optional `to_agent` limits claiming to a registered harness in the recipient project; that project must have at least one session for the harness. Omit it for shared project mail. Put a SELF-CONTAINED request in `body`: the recipient works from it alone, without your project's context. Use it when the user wants an agent in another repo to do something and you should not learn that repo here. The sender (`from_workspace` + `from_project`) is the provenance the recipient judges your request by: static clients must name it, and a send whose sender the server would have to guess is refused. `from_agent` supplies sender-harness provenance for static clients when the caller's session does not record it; a recorded session takes precedence.
 - `memory_message_list` is the read-only inspect path. `box="inbox"` (default) shows mail addressed to this project (what you can pop); `box="outbox"` shows mail this project has sent (what you can cancel). Nothing is consumed. When the call named no project and was not bound to your hook session, the response adds `resolved_scope`, `scope_source`, and `hint`: check that `resolved_scope` is the mailbox you meant before acting on the list.
 - `memory_message_pop` claims ONE message exactly once — the oldest, or a specific `message_id`. Use it when the user asks to check the inbox or the session-start notice reports waiting mail; pass the `workspace` and `project` that notice (or the project briefing's `scope` field) names. A pop whose inbox the server would have to guess is refused and claims nothing. A later pop returns null once the inbox is empty.
 - `memory_message_cancel` retracts pending mail you SENT: a specific `message_id`, or every pending message this project sent when omitted. Use it when the user gives up on a request. It only affects your own outbound mail, and like pop it refuses a guessed project.
@@ -42,5 +42,7 @@ mail. Call `memory_message_pop` with `agent: "codex"` or your own harness kind
 when native session metadata does not identify it. A different harness cannot
 claim addressed mail, even by message id. The inbox notice is filtered to the
 receiving harness. Sending queues a request; it does not launch an agent or
-authorize execution. The existing project grants and untrusted-message rules
-apply to shared and addressed mail alike.
+authorize execution. The MCP `memory_message_send` tool also accepts
+`to_agent`; a send to the same project is valid, provided the selected harness
+has a registered session there. The existing project grants and
+untrusted-message rules apply to shared and addressed mail alike.

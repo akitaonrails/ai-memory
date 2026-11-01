@@ -1,8 +1,9 @@
 # Cross-project agent messaging (inbox/queue)
 
-Direct, claim-once messaging between two projects, so an agent in one repo can
-ask an agent in another repo to do something **without pulling that repo's
-context into its own session**. Added in 2.3 (migration V64).
+Direct, claim-once messaging between projects, so an agent in one repo can ask
+an agent in another repo to do something **without pulling that repo's context
+into its own session**. The MCP send tool also accepts the same project as its
+recipient. Added in 2.3 (migration V64).
 
 The motivating case: you have Kimi open in `Projects/A` and Claude open in
 `Projects/B`. A needs a change from B. You don't want Kimi to read and reason
@@ -10,9 +11,10 @@ about B (wasted tokens, polluted memory). Instead Kimi writes a self-contained
 request and drops it into B's inbox through ai-memory; later, in B, you tell
 Claude to check its inbox, it pops the message, and works from it.
 
-This is the one place ai-memory deliberately crosses its per-project isolation
-boundary. The crossing is explicit and bidirectionally scoped: a project only
-ever sees mail addressed **to** it (its inbox) or sent **from** it (its outbox).
+Cross-project messages deliberately cross ai-memory's per-project isolation
+boundary. The destination is explicit and bidirectionally scoped: a project
+only ever sees mail addressed **to** it (its inbox) or sent **from** it (its
+outbox).
 
 ## The model
 
@@ -50,7 +52,7 @@ Four MCP tools (documented in the installed `ai-memory-messaging` skill):
 
 | Tool | Role |
 |---|---|
-| `memory_message_send` | Send a message to `to_workspace` + `to_project`'s inbox. |
+| `memory_message_send` | Send to `to_workspace` + `to_project`'s inbox; optional `to_agent` restricts claiming to a registered harness. The same project is a valid recipient. |
 | `memory_message_list` | List pending mail. `box="inbox"` (default) or `box="outbox"`. Read-only. |
 | `memory_message_pop` | Claim the next inbox message (oldest, or a specific `message_id`). |
 | `memory_message_cancel` | Retract a sent message (`message_id`), or clear the whole outbox. |
@@ -67,6 +69,13 @@ complete prompt, because the recipient cannot see project A. When the body
 states a direct measurement, also send `nature: "measured"` and evidence such
 as the command, query, `file:line`, or source message id. Relayed claims should
 remain `reported` unless the sender measures them again.
+
+Set `to_agent` to a registered harness such as `codex` when only that harness
+may claim the message; the recipient project must have a session recorded for
+it. Omit `to_agent` for shared project mail. The MCP tool accepts the sender's
+own project as the recipient too. Static MCP clients can set `from_agent` when
+the caller's session does not record its harness; a recorded session takes
+precedence.
 
 **In Claude (project B), receiving:**
 
