@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Hook spool batch drains no longer stop forever behind an event whose managed
+  run permanently rejects its agent, owner, native session, checkout, or
+  terminal state; that event is dropped and later entries continue. A lease
+  lapse on an otherwise-valid active run stays retryable instead, so a later
+  heartbeat can restore the lease and let the same event through (#1892).
+- Cline capture-policy routing now reads canonical `workspaceRoots` and
+  `taskId` fields as well as their legacy aliases, so allowlisted projects keep
+  their lifecycle events and separate Cline tasks no longer collide (#1888).
 - Removed numeric `format` annotations from strict OpenAI-shaped JSON Schemas,
   including nullable number and integer fields, while preserving string
   formats. OpenCode Go Muse rejected schemars' `float` hint before running the
