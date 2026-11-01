@@ -678,9 +678,12 @@ fn output_parent(path: &Path) -> &Path {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The host checked must be the host a request reaches: user
     /// information before an `@` is refused, never read as the host.
@@ -1268,5 +1271,126 @@ mod tests {
             .unwrap();
 
         assert_eq!(auth, "Bearer oidc-access");
+    }
+
+    // ----------------------------------------------------------------
+    // Redirect refusal (parity with hook_capture::build_client)
+    // ----------------------------------------------------------------
+
+    async fn redirect_server(status: &'static str, target_url: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let target = target_url.to_owned();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// An origin that answers `200` with HTML if anyone connects, so a test
+    /// that accidentally follows the redirect fails closed instead of hanging.
+    async fn login_origin() -> (String, Arc<AtomicBool>) {
+        let contacted = Arc::new(AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/login", listener.local_addr().unwrap());
+        let flag = Arc::clone(&contacted);
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                flag.store(true, Ordering::SeqCst);
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = "<html>login</html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (url, contacted)
+    }
+
+    #[tokio::test]
+    async fn http_client_refuses_redirects() {
+        let (target_url, contacted) = login_origin().await;
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+
+        let response = http_client().get(&source_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_json_does_not_follow_redirect() {
+        let (target_url, contacted) = login_origin().await;
+        let source_url = redirect_server("302 Found", &target_url).await;
+        let endpoint = ServerEndpoint::from_pair(Some(source_url), None);
+        let err = get_json::<serde_json::Value>(&endpoint, "/admin/status", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<ServerResponseError>()
+                .is_some_and(|error| error.status() == reqwest::StatusCode::FOUND),
+            "302 must fail closed, got: {err:#}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_json_no_content_does_not_follow_redirect() {
+        let (target_url, contacted) = login_origin().await;
+        let source_url = redirect_server("307 Temporary Redirect", &target_url).await;
+        let endpoint = ServerEndpoint::from_pair(Some(source_url), None);
+        let err = post_json_no_content(&endpoint, "/admin/write-page", &())
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<ServerResponseError>()
+                .is_some_and(|error| error.status() == reqwest::StatusCode::TEMPORARY_REDIRECT),
+            "307 must fail closed, got: {err:#}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_to_file_does_not_follow_a_redirect_or_write_the_target_body() {
+        let (target_url, contacted) = login_origin().await;
+        let source_url = redirect_server("302 Found", &target_url).await;
+        let endpoint = ServerEndpoint::from_pair(Some(source_url), None);
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("backup.tar.gz");
+        std::fs::write(&dest, b"previous usable archive").unwrap();
+        let err = post_to_file(&endpoint, "/admin/backup", &dest)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<ServerResponseError>()
+                .is_some_and(|error| error.status() == reqwest::StatusCode::FOUND),
+            "302 must fail closed, got: {err:#}"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"previous usable archive");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "redirect target must never be contacted"
+        );
     }
 }
