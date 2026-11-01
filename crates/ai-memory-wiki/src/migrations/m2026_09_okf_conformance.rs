@@ -156,7 +156,7 @@ impl WikiMigration for OkfConformance {
         // 2. Checkpoint whatever the tree holds before touching it.
         let git = crate::git::GitAdapter::open_or_init(wiki_root)?;
         crate::confinement::inspect_git_directory(wiki_root)?;
-        git.commit_all("pre-okf-migration checkpoint")?;
+        commit_unless_not_owner(&git, "pre-okf-migration checkpoint")?;
 
         // 3. DB pass — in place, through the single writer.
         let migrated = writer.okf_migrate_latest_pages().await?;
@@ -182,7 +182,7 @@ impl WikiMigration for OkfConformance {
 
         // 5. One commit for the whole rewrite.
         crate::confinement::inspect_git_directory(wiki_root)?;
-        git.commit_all("okf-migration: conform wiki to OKF v0.2")?;
+        commit_unless_not_owner(&git, "okf-migration: conform wiki to OKF v0.2")?;
         tracing::info!(
             rows = migrated.len(),
             "OKF migration complete; homepage will show the backup notice \
@@ -193,6 +193,19 @@ impl WikiMigration for OkfConformance {
 }
 
 /// Wiki-relative paths of `.md` files that still need the file pass.
+/// Commit, but treat a wiki owned by another account as "no git history", like
+/// startup does (#1923): the pre-migration backup is the safety net there.
+fn commit_unless_not_owner(git: &crate::git::GitAdapter, message: &str) -> WikiResult<()> {
+    match git.commit_all(message) {
+        Ok(_) => Ok(()),
+        Err(WikiError::GitOwner(error)) => {
+            tracing::warn!(%error, message, "wiki owned by another account; skipping migration commit");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn nonconformant_files(wiki_root: &Path) -> WikiResult<Vec<PathBuf>> {
     let mut pending = Vec::new();
     let mut stack = vec![wiki_root.to_path_buf()];

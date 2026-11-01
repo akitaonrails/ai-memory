@@ -190,15 +190,27 @@ fn map_open_error(error: OpenRepositoryError) -> WikiError {
     }
 }
 
-/// The validated repository, or `None` when libgit2 cannot open it and the
-/// Windows git CLI fallback will serve it instead.
-fn validate_repository_or_allow_cli_fallback(root: &Path) -> WikiResult<Option<Repository>> {
-    match open_validated_repository(root) {
+/// The validated repository, or `None` when libgit2 cannot open it: the Windows
+/// git CLI fallback serves it, or (any platform) the wiki is owned by another
+/// account and every git call fails with `GitOwner`.
+fn open_result_or_fallback_on(
+    windows: bool,
+    root: &Path,
+    opened: Result<Repository, OpenRepositoryError>,
+) -> WikiResult<Option<Repository>> {
+    match opened {
         Ok(repo) => Ok(Some(repo)),
         Err(OpenRepositoryError::Git(error))
-            if cfg!(windows) && should_try_commit_cli_fallback(&error) =>
+            if windows && should_try_commit_cli_fallback_on(windows, &error) =>
         {
             validate_cli_fallback_root(root).map(|()| None)
+        }
+        // An ownership refusal must not stop the server: capture and search work
+        // without wiki git history, and every later git call reports `GitOwner`
+        // (startup logs it at ERROR with the remedy).
+        Err(OpenRepositoryError::Git(error)) if matches!(error.code(), ErrorCode::Owner) => {
+            debug!(root = %root.display(), %error, "wiki repository not owned by this account");
+            Ok(None)
         }
         Err(error) => Err(map_open_error(error)),
     }
@@ -416,6 +428,15 @@ impl GitAdapter {
     /// # Errors
     /// Propagates any underlying libgit2 error.
     pub fn open_or_init(root: &Path) -> WikiResult<Self> {
+        Self::open_or_init_with(root, open_validated_repository)
+    }
+
+    /// [`Self::open_or_init`] with the repository opener injected, so a test
+    /// can stand in for a repository owned by another account.
+    fn open_or_init_with(
+        root: &Path,
+        open: impl FnOnce(&Path) -> Result<Repository, OpenRepositoryError>,
+    ) -> WikiResult<Self> {
         let root = repository_root(root)?;
         match std::fs::symlink_metadata(root.join(".git")) {
             Ok(_) => debug!(root = %root.display(), "wiki repo already initialised"),
@@ -426,7 +447,7 @@ impl GitAdapter {
             Err(error) => return Err(error.into()),
         }
         write_libgit2_config(&crate::confinement::inspect_git_directory(&root)?)?;
-        if let Some(repo) = validate_repository_or_allow_cli_fallback(&root)? {
+        if let Some(repo) = open_result_or_fallback_on(cfg!(windows), &root, open(&root))? {
             check_repository_durability(&root, &repo);
         }
         Ok(Self {
@@ -1209,6 +1230,7 @@ where
     }
 }
 
+#[cfg(windows)]
 fn should_try_commit_cli_fallback(error: &git2::Error) -> bool {
     should_try_commit_cli_fallback_on(cfg!(windows), error)
 }
@@ -1510,7 +1532,9 @@ fn map_git_err(e: git2::Error) -> WikiError {
     // an actionable fix instead of burying it in a generic WARN. Everything
     // else stays an opaque I/O error, matching prior behaviour.
     if matches!(e.code(), ErrorCode::Owner) {
-        warn!(error = %e, "libgit2 wiki owner-validation error");
+        // Debug: every wiki write would otherwise log it again. Startup logs the
+        // actionable ERROR once; callers get the error.
+        debug!(error = %e, "libgit2 wiki owner-validation error");
         return WikiError::GitOwner(e.to_string());
     }
     warn!(error = %e, "libgit2 error");
@@ -2676,6 +2700,61 @@ mod tests {
             "failed to open",
         );
         assert!(!is_racy_read(&other_message));
+    }
+
+    #[test]
+    fn owner_failure_on_open_is_not_fatal() {
+        let tmp = tempdir();
+        let owner = || {
+            git2::Error::new(
+                ErrorCode::Owner,
+                git2::ErrorClass::Config,
+                "repository path is not owned by current user",
+            )
+        };
+        for windows in [false, true] {
+            let opened = open_result_or_fallback_on(
+                windows,
+                tmp.path(),
+                Err(OpenRepositoryError::Git(owner())),
+            );
+            assert!(matches!(opened, Ok(None)), "windows={windows}");
+        }
+        // Control: any other open failure still stops startup.
+        let other = git2::Error::new(
+            ErrorCode::GenericError,
+            git2::ErrorClass::Os,
+            "some other failure",
+        );
+        assert!(matches!(
+            open_result_or_fallback_on(false, tmp.path(), Err(OpenRepositoryError::Git(other))),
+            Err(WikiError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn open_or_init_survives_a_repository_owned_by_another_account() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = |_: &Path| {
+            Err(OpenRepositoryError::Git(git2::Error::new(
+                ErrorCode::Owner,
+                git2::ErrorClass::Config,
+                "repository path is not owned by current user",
+            )))
+        };
+        let adapter = GitAdapter::open_or_init_with(&root, owner).unwrap();
+        assert_eq!(adapter.root, repository_root(&root).unwrap());
+        // Control: a failure other than ownership still stops the open.
+        let other = |_: &Path| {
+            Err(OpenRepositoryError::Git(git2::Error::new(
+                ErrorCode::GenericError,
+                git2::ErrorClass::Os,
+                "some other failure",
+            )))
+        };
+        assert!(GitAdapter::open_or_init_with(&root, other).is_err());
     }
 
     #[test]
