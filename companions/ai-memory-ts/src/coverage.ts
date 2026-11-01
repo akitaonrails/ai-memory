@@ -36,6 +36,18 @@ const SCOPE = ["workspace", "project"] as const;
 
 /** Every MCP tool the server lists, keyed by tool name. */
 export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
+  memory_resolve_write_target: {
+    status: "wrapped",
+    methods: ["pages.resolveWriteTarget"],
+    phase: 2,
+    sends: ["workspace", "project", "project_id"],
+  },
+  memory_write_pages_batch: {
+    status: "wrapped",
+    methods: ["pages.writeBatch"],
+    phase: 2,
+    sends: ["workspace", "project", "project_id", "pages"],
+  },
   memory_write_page: {
     status: "wrapped",
     methods: ["pages.write", "pages.update"],

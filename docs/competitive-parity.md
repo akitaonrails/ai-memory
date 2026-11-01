@@ -308,7 +308,7 @@ invariants), **ALREADY** (we have it and should say so).
 | Importing old transcripts | ALREADY | `backfill` replays native transcripts through `/hook`, sanitized, on by default |
 | Commit ↔ session linking | MEASURE-FIRST (demand) | Managed runs already record git checkpoints |
 | Project profile resource | ALREADY | `memory_briefing` plus the cross-project profile |
-| Migration importers from other tools | SHIPPED (3.0) for one tool's vault/export plus a `doctor` check for its leftovers; others on demand | Importers live in the `ai-memory-importer` companion, never in core |
+| Migration importers from other tools | SHIPPED for agentmemory vault/export (3.0) and supported claude-mem SQLite families (3.4), plus a `doctor` check for agentmemory leftovers; others on demand | Importers live in the `ai-memory-importer` companion, never in core; the claude-mem route maps to an existing project and uses bounded atomic writes |
 | Benchmark rigor | ADOPT | Publish pipeline and component numbers separately, keep run receipts, add strict recall-all@5 beside hit@5, report models and versions per result file; claim no cross-tool ranking without a shared harness |
 
 ### Step up, borrow, ignore

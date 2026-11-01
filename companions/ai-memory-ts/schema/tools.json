@@ -750,6 +750,12 @@
           "string"
         ]
       },
+      "project_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "query": {
         "type": [
           "null",
@@ -861,6 +867,28 @@
       }
     },
     "required": []
+  },
+  "memory_resolve_write_target": {
+    "properties": {
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "workspace"
+    ]
   },
   "memory_restore_page": {
     "properties": {
@@ -975,6 +1003,12 @@
           "string"
         ]
       },
+      "project_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "relations": {
         "additionalProperties": {
           "items": {
@@ -1024,6 +1058,122 @@
     "required": [
       "body",
       "path"
+    ]
+  },
+  "memory_write_pages_batch": {
+    "properties": {
+      "pages": {
+        "items": {
+          "properties": {
+            "abstract": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "applies_to": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "body": {
+              "type": "string"
+            },
+            "create_only": {
+              "type": "boolean"
+            },
+            "enforced_by": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "entities": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "expected_page_id": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "expires_at": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "kind": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "pinned": {
+              "type": "boolean"
+            },
+            "relations": {
+              "additionalProperties": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            "tags": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "tier": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "title": {
+              "type": [
+                "null",
+                "string"
+              ]
+            }
+          },
+          "required": [
+            "body",
+            "path"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "project_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "pages",
+      "workspace"
     ]
   }
 }

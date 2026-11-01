@@ -100,6 +100,7 @@ pub(crate) async fn run(args: VaultArgs) -> Result<()> {
             128,
         )?
         .to_owned(),
+        project_id: None,
         project: validate_label(
             args.project.as_deref().unwrap_or("DRY-RUN-PROJECT"),
             "project",
@@ -421,6 +422,7 @@ pub(crate) mod tests {
         Destination {
             workspace: "w".into(),
             project: "p".into(),
+            project_id: None,
         }
     }
 
@@ -681,6 +683,18 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(error.to_string().contains(">= 3.0"), "{error:#}");
         assert_eq!(server.state().write_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn established_routes_do_not_require_the_new_batch_tool() {
+        let td = tempdir().unwrap();
+        fixture_vault(td.path());
+        let server = MockServer::start(&[("w", "p")]);
+        server.state().batch = false;
+        let manifest = td.path().join("manifest.json");
+        run(args(td.path(), &server.url, &manifest)).await.unwrap();
+        assert_eq!(server.state().stored_versions(), 5);
+        assert_eq!(server.state().batch_calls, 0);
     }
 
     #[tokio::test]

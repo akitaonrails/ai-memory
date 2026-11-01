@@ -147,6 +147,7 @@ impl Mapping {
             Ok(Destination {
                 workspace: validate_label(&target.workspace, "mapping workspace", 128)?.to_owned(),
                 project: validate_label(&target.project, "mapping project", 128)?.to_owned(),
+                project_id: None,
             })
         };
         Ok(Self {

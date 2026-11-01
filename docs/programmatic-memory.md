@@ -117,6 +117,29 @@ call fails with JSON-RPC `invalid_request` whose `data` is
 "current_page_id"}`; re-read the page and decide. A caller without write access
 gets the usual authorization error, never the current version.
 
+Exact `memory_read_page` and `memory_write_page` calls can select an existing
+destination by stable id with `workspace` + `project_id`. This is mutually
+exclusive with `project` and `scope`; it never creates a name-only project.
+
+Bulk importers can use `memory_write_pages_batch` for 1-100 page versions in
+one existing destination. Every entry must set exactly one of `create_only`
+or `expected_page_id`. The server refuses duplicate paths, bodies over 1 MiB,
+or more than 8 MiB of bodies in one call. Admission and persistence are
+atomic: any rejected entry or stale precondition writes nothing. A stale
+entry returns `reason: "precondition_failed"`, its zero-based `index`, path,
+and current page id. A successful response returns ordered `pages` containing
+the corresponding path and new page id, plus one git checkpoint for the
+batch.
+
+Before planning a multi-destination import, call
+`memory_resolve_write_target` once for every mapped destination. It requires
+`workspace` and exactly one existing `project` or `project_id`, checks write
+authorization without falling back, creating, or promoting anything, and
+returns the canonical workspace/project names plus stable project id. Resolve
+the complete mapping before the first batch so an invalid or unauthorized
+destination cannot leave an otherwise valid earlier destination partially
+imported.
+
 ## Read changed pages
 
 These JSON endpoints require `serve --enable-api` (or `--enable-web`, which

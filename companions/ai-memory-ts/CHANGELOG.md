@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
+  GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
+  Node 22 and 24.
+
 - Capability initialization is owned by the client rather than its first
   caller. Concurrent callers now wait with independent abort signals and
   deadlines; cancelling one does not fail or delay the others. (#1815)
@@ -19,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still skip `tools/list` and schema checks. (#1816)
 
 ### Added
+
+- `pages.resolveWriteTarget` preflights an exact existing writable project by
+  name or stable id, and `pages.writeBatch` commits up to 100 conditional page
+  versions atomically. These wrappers cover the bulk-import tools added for
+  ai-memory 3.4.
 
 - Decoded optional query-answer context admission receipts as `answerContext` (#1684).
 

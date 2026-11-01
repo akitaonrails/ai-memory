@@ -6517,6 +6517,9 @@ mod tests {
              approval_mode = \"prompt\"\n\
              \n\
              [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_write_pages_batch]\n\
              approval_mode = \"prompt\"\n"
         );
 
@@ -6560,6 +6563,9 @@ mod tests {
              approval_mode = \"prompt\"\n\
              \n\
              [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+             approval_mode = \"prompt\"\n\
+             \n\
+             [mcp_servers.ai-memory.tools.memory_write_pages_batch]\n\
              approval_mode = \"prompt\"\n\
              # Alternative (avoids embedding the literal token):\n\
              # bearer_token_env_var = \"AI_MEMORY_AUTH_TOKEN\"\n\
@@ -6606,6 +6612,9 @@ mod tests {
                  approval_mode = \"prompt\"\n\
                  \n\
                  [mcp_servers.ai-memory.tools.memory_restore_page]\n\
+                 approval_mode = \"prompt\"\n\
+                 \n\
+                 [mcp_servers.ai-memory.tools.memory_write_pages_batch]\n\
                  approval_mode = \"prompt\"\n\
                  # The token is read from ${PRIME_AGENT_TOKEN_ENV}; export it where you launch codex.\n"
             )

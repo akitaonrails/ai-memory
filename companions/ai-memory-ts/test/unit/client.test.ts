@@ -27,6 +27,62 @@ function setup(): { server: FakeServer; memory: AiMemoryClient } {
 }
 
 describe("pages", () => {
+  it("preflights an existing target by name or stable id", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_resolve_write_target", () => payloads.resolvedWriteTarget);
+    const resolved = await memory.pages.resolveWriteTarget({
+      target: { workspace: "demo", project: "app" },
+    });
+    assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app" });
+    assert.equal(resolved.projectId, payloads.resolvedWriteTarget.project_id);
+    await memory.pages.resolveWriteTarget({
+      target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project_id: payloads.resolvedWriteTarget.project_id,
+    });
+    const before = server.requests.length;
+    await assert.rejects(
+      memory.pages.resolveWriteTarget({
+        target: { workspace: "demo", project: "app", projectId: "also" },
+      } as never),
+      ArgumentError,
+    );
+    assert.equal(server.requests.length, before);
+  });
+
+  it("writes conditional pages as one exact atomic batch", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_write_pages_batch", () => payloads.batchWrite);
+    const result = await memory.pages.writeBatch({
+      target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
+      pages: [
+        { path: "notes/a.md", body: "# A", createOnly: true, tags: ["import"] },
+        { path: "notes/b.md", body: "# B", expectedPageId: payloads.PAGE_ID },
+      ],
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project_id: payloads.resolvedWriteTarget.project_id,
+      pages: [
+        { path: "notes/a.md", body: "# A", create_only: true, tags: ["import"] },
+        { path: "notes/b.md", body: "# B", expected_page_id: payloads.PAGE_ID },
+      ],
+    });
+    assert.equal(result.pages[1]?.pageId, payloads.NEXT_PAGE_ID);
+    assert.equal(result.checkpoint, "c04d2f91");
+    const before = server.requests.length;
+    await assert.rejects(
+      memory.pages.writeBatch({
+        target: { workspace: "demo", project: "app" },
+        pages: [{ path: "notes/a.md", body: "# A" }],
+      } as never),
+      ArgumentError,
+    );
+    assert.equal(server.requests.length, before);
+  });
+
   it("write sends wire names, omits unset options and decodes the result", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_write_page", () => payloads.write);
@@ -673,6 +729,18 @@ describe("wire names", () => {
     // Call every wrapper with every option set; decoding failures are
     // expected because the fake answers `{}`.
     const calls: Promise<unknown>[] = [
+      memory.pages.resolveWriteTarget({ target: { workspace: "demo", project: "app" } }),
+      memory.pages.resolveWriteTarget({
+        target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
+      }),
+      memory.pages.writeBatch({
+        target: { workspace: "demo", project: "app" },
+        pages: [{ path: "p", body: "b", createOnly: true }],
+      }),
+      memory.pages.writeBatch({
+        target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
+        pages: [{ path: "p", body: "b", expectedPageId: "v" }],
+      }),
       memory.pages.write({
         path: "p",
         body: "b",

@@ -10,7 +10,13 @@ Use this skill only for deliberate durable wiki mutations. Routine session captu
 
 ## Tools in this cluster
 
+- `memory_resolve_write_target` validates and canonicalizes an exact existing
+  writable destination without creating or changing it. Bulk importers use it
+  before their first write.
 - `memory_write_page` writes or replaces a durable wiki page for permanent project knowledge.
+- `memory_write_pages_batch` writes a bounded set of complete page versions
+  atomically for a bulk importer. Every entry must be conditional; do not use
+  it for routine notes.
 - `memory_patch_page` atomically changes named Markdown sections in an existing
   page without re-emitting its frontmatter or unrelated body.
 - `memory_delete_page` removes a durable wiki page by exact path.

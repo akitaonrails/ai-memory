@@ -44,6 +44,25 @@ export interface ScopedArgs {
   scope?: Scope;
 }
 
+/** An existing project selected by name or by its stable id. */
+export type ExistingProjectTarget =
+  | {
+      /** Existing workspace name. */
+      workspace: string;
+      /** Existing project name. */
+      project: string;
+      /** Not allowed together with `project`. */
+      projectId?: never;
+    }
+  | {
+      /** Existing workspace name. */
+      workspace: string;
+      /** Stable id of an existing project in the workspace. */
+      projectId: string;
+      /** Not allowed together with `projectId`. */
+      project?: never;
+    };
+
 // ---------------------------------------------------------------------------
 // Pages
 // ---------------------------------------------------------------------------
@@ -97,6 +116,76 @@ export interface WritePageResult {
   /** Canonical wiki path written. */
   readonly path: string;
   /** Git checkpoint of the write, when the server reported one. */
+  readonly checkpoint: string | null;
+  /** The server's decoded JSON. */
+  readonly raw: Raw;
+}
+
+/** Arguments of {@link PagesNamespace.resolveWriteTarget}. */
+export interface ResolveWriteTargetArgs {
+  /** Exact existing destination; this operation never creates a scope. */
+  target: ExistingProjectTarget;
+}
+
+/** Canonical existing destination returned by a write-access preflight. */
+export interface ResolvedWriteTarget {
+  /** Canonical workspace name. */
+  readonly workspace: string;
+  /** Canonical project name. */
+  readonly project: string;
+  /** Stable project id. */
+  readonly projectId: string;
+  /** The server's decoded JSON. */
+  readonly raw: Raw;
+}
+
+/** One complete, conditional page version in an atomic batch. */
+export type BatchWritePage = PageMetadata & {
+  /** Relative wiki path. */
+  path: string;
+  /** Complete Markdown body for this version. */
+  body: string;
+} &
+  (
+    | {
+        /** Require this latest page version. */
+        expectedPageId: string;
+        /** Not allowed together with `expectedPageId`. */
+        createOnly?: never;
+      }
+    | {
+        /** Require the path to be absent. */
+        createOnly: true;
+        /** Not allowed together with `createOnly`. */
+        expectedPageId?: never;
+      }
+  );
+
+/** Arguments of {@link PagesNamespace.writeBatch}. */
+export interface WritePagesBatchArgs {
+  /** Exact existing destination; batch writes never create a scope. */
+  target: ExistingProjectTarget;
+  /** One to 100 complete page versions, committed atomically. */
+  pages: readonly BatchWritePage[];
+}
+
+/** One page written by {@link PagesNamespace.writeBatch}. */
+export interface BatchWritePageResult {
+  /** Zero-based request position. */
+  readonly index: number;
+  /** Canonical wiki path written. */
+  readonly path: string;
+  /** New page version id. */
+  readonly pageId: string;
+  /** The server's decoded item JSON. */
+  readonly raw: Raw;
+}
+
+/** Result of {@link PagesNamespace.writeBatch}. */
+export interface WritePagesBatchResult {
+  /** Results in request order. */
+  readonly pages: readonly BatchWritePageResult[];
+  /** One git checkpoint for the whole batch, when reported. */
   readonly checkpoint: string | null;
   /** The server's decoded JSON. */
   readonly raw: Raw;

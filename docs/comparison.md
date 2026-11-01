@@ -236,7 +236,10 @@ ships something ai-memory does not, it is named.
   past observations it shows when the agent opens a file, and v14's polished
   local “My Work” dashboard. TeamBrain adds optional paid shared-work and
   collision views; ai-memory shares project memory without that cloud layer
-  but has no equivalent human work queue yet.
+  but has no equivalent human work queue yet. The optional
+  `ai-memory-importer claude-mem` command can plan or migrate supported local
+  claude-mem SQLite schema families into explicitly mapped existing projects;
+  sensitive rows are excluded and live writes use bounded atomic batches.
 - **From MemPalace:** you keep hook capture for Claude Code, Codex and Cursor
   and a shared server. You gain git-versioned markdown pages as the source
   of truth, claim-once handoffs, typed cross-project messaging, and the auth

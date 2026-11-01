@@ -22,6 +22,42 @@ before(async () => {
 after(async () => server.stop());
 
 describe("pages against a real server", () => {
+  it("preflights a stable destination and commits a conditional batch atomically", async () => {
+    await memory.pages.write({ path: "notes/batch-existing.md", body: "# Existing\nv1" });
+    const target = await memory.pages.resolveWriteTarget({
+      target: { workspace: scope.workspace, project: scope.project },
+    });
+    assert.equal(target.workspace, scope.workspace);
+    assert.equal(target.project, scope.project);
+    assert.match(target.projectId, /^[0-9a-f-]{36}$/);
+
+    const written = await memory.pages.writeBatch({
+      target: { workspace: scope.workspace, projectId: target.projectId },
+      pages: [
+        { path: "notes/batch-a.md", body: "# Batch A", createOnly: true },
+        { path: "notes/batch-b.md", body: "# Batch B", createOnly: true },
+      ],
+    });
+    assert.deepEqual(
+      written.pages.map((page) => page.path),
+      ["notes/batch-a.md", "notes/batch-b.md"],
+    );
+    assert.equal(typeof written.checkpoint, "string");
+
+    await assert.rejects(
+      memory.pages.writeBatch({
+        target: { workspace: scope.workspace, projectId: target.projectId },
+        pages: [
+          { path: "notes/batch-a.md", body: "# Clobber", createOnly: true },
+          { path: "notes/batch-never.md", body: "# Must not land", createOnly: true },
+        ],
+      }),
+      PreconditionFailedError,
+    );
+    assert.equal((await memory.pages.read({ path: "notes/batch-a.md" })).body, "# Batch A");
+    await assert.rejects(memory.pages.read({ path: "notes/batch-never.md" }), RpcError);
+  });
+
   it("writes, reads, queries and deletes a page with every promised field", async () => {
     const written = await memory.pages.write({
       path: "notes/retries.md",
