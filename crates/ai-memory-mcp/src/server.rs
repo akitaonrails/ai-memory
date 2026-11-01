@@ -1653,6 +1653,10 @@ struct BriefingArgs {
     /// How many recently-updated pages to include (default 10, max 100).
     #[serde(default)]
     recent_pages_limit: Option<usize>,
+    /// How many sessions to include in `recent_sessions` (default 5, max 50).
+    /// Raise it to see every harness active in a busy project before addressing a message.
+    #[serde(default)]
+    recent_sessions_limit: Option<usize>,
     /// Project to brief on. Session-aware clients may omit it for the current
     /// project. Static MCP clients must pass it together with `workspace` for
     /// every project-scoped call.
@@ -7465,8 +7469,10 @@ impl AiMemoryServer {
         WITHOUT any LLM call: lifetime counts, 7-day and 30-day activity \
         windows, last-observation timestamp, pending handoff count, \
         current `_rules/` pages, recent-page list, and `recent_sessions`: \
-        the sessions with the newest captured work, newest first. A \
-        session there with `ended: false` that is not `current` was cut \
+        the sessions with the newest captured work, newest first. Pass \
+        `recent_sessions_limit` (default 5, max 50) to include more when \
+        checking active harnesses in a busy project. A session there with \
+        `ended: false` that is not `current` was cut \
         off (a quota limit, a crash) or is still running; when the user \
         asks to continue, read it with memory_read_session_observations \
         (order `desc`) before older handoffs or pages. Cheap, fast, \
@@ -7486,6 +7492,10 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.recent_pages_limit.unwrap_or(10);
+        let sessions_limit = args
+            .recent_sessions_limit
+            .unwrap_or(BRIEFING_RECENT_SESSIONS)
+            .clamp(1, 50);
         let settled_first = args.settled_first.unwrap_or(false);
         let ((ws, proj), source) = self
             .traced_ids_for_read_args(
@@ -7515,7 +7525,7 @@ impl AiMemoryServer {
                 ws,
                 proj,
                 ai_memory_core::OwnerFilter::for_actor_context(&actor),
-                BRIEFING_RECENT_SESSIONS,
+                sessions_limit,
             )
             .await?
             .into_iter()
@@ -16872,6 +16882,31 @@ mod tests {
         }
     }
 
+    async fn seed_seven_briefing_sessions(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+    ) -> Vec<SessionId> {
+        let start = now_us() - 3_600_000_000;
+        let mut sessions = Vec::with_capacity(7);
+        for index in 0..7 {
+            let session_id = SessionId::new();
+            seed_session_at(
+                store,
+                ws,
+                proj,
+                session_id,
+                AgentKind::ClaudeCode,
+                start + index * 1_000_000,
+                &[ObservationKind::UserPrompt],
+                true,
+            )
+            .await;
+            sessions.push(session_id);
+        }
+        sessions
+    }
+
     fn now_us() -> i64 {
         jiff::Timestamp::now().as_microsecond()
     }
@@ -16962,6 +16997,7 @@ mod tests {
                 .memory_briefing(
                     Parameters(BriefingArgs {
                         recent_pages_limit: None,
+                        recent_sessions_limit: None,
                         project: None,
                         workspace: None,
                         settled_first: None,
@@ -16992,6 +17028,100 @@ mod tests {
             "{briefing}"
         );
         assert_eq!(sessions[0]["session_id"], cut_off.to_string());
+    }
+
+    #[tokio::test]
+    async fn briefing_recent_sessions_defaults_to_five() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let session_ids = seed_seven_briefing_sessions(&store, ws, proj).await;
+        let briefing = call_tool_json(
+            server
+                .memory_briefing(
+                    Parameters(BriefingArgs {
+                        recent_pages_limit: None,
+                        recent_sessions_limit: None,
+                        project: None,
+                        workspace: None,
+                        settled_first: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let sessions = briefing["recent_sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 5, "{briefing}");
+        let listed: Vec<String> = sessions
+            .iter()
+            .map(|entry| entry["session_id"].as_str().unwrap().to_owned())
+            .collect();
+        let expected: Vec<String> = session_ids[2..]
+            .iter()
+            .rev()
+            .map(|session_id| session_id.to_string())
+            .collect();
+        assert_eq!(listed, expected, "{briefing}");
+    }
+
+    #[tokio::test]
+    async fn briefing_recent_sessions_limit_is_honoured() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        seed_seven_briefing_sessions(&store, ws, proj).await;
+        let briefing = call_tool_json(
+            server
+                .memory_briefing(
+                    Parameters(BriefingArgs {
+                        recent_pages_limit: None,
+                        recent_sessions_limit: Some(10),
+                        project: None,
+                        workspace: None,
+                        settled_first: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(briefing["recent_sessions"].as_array().unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn briefing_recent_sessions_limit_is_clamped() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        seed_seven_briefing_sessions(&store, ws, proj).await;
+        let one = call_tool_json(
+            server
+                .memory_briefing(
+                    Parameters(BriefingArgs {
+                        recent_pages_limit: None,
+                        recent_sessions_limit: Some(0),
+                        project: None,
+                        workspace: None,
+                        settled_first: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(one["recent_sessions"].as_array().unwrap().len(), 1);
+
+        let all = call_tool_json(
+            server
+                .memory_briefing(
+                    Parameters(BriefingArgs {
+                        recent_pages_limit: None,
+                        recent_sessions_limit: Some(999),
+                        project: None,
+                        workspace: None,
+                        settled_first: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(all["recent_sessions"].as_array().unwrap().len(), 7);
     }
 
     /// `memory_handoff_list` names a cut-off session only while it is newer
@@ -18066,6 +18196,7 @@ mod tests {
             .memory_briefing(
                 Parameters(BriefingArgs {
                     recent_pages_limit: Some(5),
+                    recent_sessions_limit: None,
                     project: None,
                     workspace: None,
                     settled_first: None,
@@ -18139,6 +18270,7 @@ mod tests {
             .memory_briefing(
                 Parameters(BriefingArgs {
                     recent_pages_limit: Some(5),
+                    recent_sessions_limit: None,
                     project: None,
                     workspace: None,
                     settled_first: Some(true),
@@ -23210,6 +23342,7 @@ mod tests {
             .memory_briefing(
                 Parameters(BriefingArgs {
                     recent_pages_limit: Some(5),
+                    recent_sessions_limit: None,
                     project: None,
                     workspace: None,
                     settled_first: None,
@@ -24074,6 +24207,7 @@ mod tests {
             .memory_briefing(
                 Parameters(BriefingArgs {
                     recent_pages_limit: Some(5),
+                    recent_sessions_limit: None,
                     project: None,
                     workspace: None,
                     settled_first: None,
@@ -24115,6 +24249,7 @@ mod tests {
             .memory_briefing(
                 Parameters(BriefingArgs {
                     recent_pages_limit: Some(5),
+                    recent_sessions_limit: None,
                     project: None,
                     workspace: None,
                     settled_first: None,
