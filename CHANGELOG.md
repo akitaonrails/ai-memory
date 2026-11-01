@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-11-01
+
 ### Fixed
 
 - Hook spool batch drains no longer stop forever behind an event whose managed
@@ -3676,7 +3678,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.1...HEAD
+[3.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.1
 [3.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.0
 [3.2.10]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.10
 [3.2.9]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.9
