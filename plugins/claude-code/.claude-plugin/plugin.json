@@ -1,7 +1,7 @@
 {
   "name": "ai-memory",
   "displayName": "ai-memory",
-  "version": "3.3.0",
+  "version": "3.3.1",
   "description": "Long-term memory across sessions and harnesses. Hands each lifecycle event to the installed ai-memory binary, which applies your capture exclusions and sends a sanitized record only to your ai-memory server (default http://127.0.0.1:49374). Adds the ai-memory MCP tools. No telemetry. Requires the ai-memory binary, 3.0 or later. In Cowork, capture runs on your computer and needs ai-memory installed there; the memory tools still work.",
   "author": {
     "name": "AkitaOnRails",

@@ -175,8 +175,9 @@ pub enum StoreError {
     SessionPurged(String),
 
     /// A hook named an ID-selected managed run whose boundary refuses it: the
-    /// run is no longer active or leased, or the hook's agent, owner, native
-    /// session or checkout does not match the run. Typed apart from
+    /// run is no longer active, or the hook's agent, owner, native session or
+    /// checkout does not match the run. A lapsed renewable lease has its own
+    /// retryable error below. Typed apart from
     /// `InvalidState` because the refusal is permanent for that event, so a
     /// spool drain must drop it rather than stop behind it (#1892).
     #[error("ID-selected managed run boundary mismatch")]

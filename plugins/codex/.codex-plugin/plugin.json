@@ -1,6 +1,6 @@
 {
   "name": "ai-memory",
-  "version": "3.3.0",
+  "version": "3.3.1",
   "description": "Long-term memory across sessions and harnesses, backed by the installed ai-memory binary (3.0 or later) and your ai-memory server. No telemetry. Codex runs the hooks only after you trust them in /hooks.",
   "author": {
     "name": "AkitaOnRails",

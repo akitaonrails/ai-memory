@@ -63,8 +63,18 @@ version in [`docs/changelog/`](docs/changelog/):
   managed context, briefs, the profile digest and the inbox notice remain
   independent and unchanged (#1865).
 
+## [3.3.1] - 2026-11-01
+
 ### Fixed
 
+- Hook spool batch drains no longer stop forever behind an event whose managed
+  run permanently rejects its agent, owner, native session, checkout, or
+  terminal state; that event is dropped and later entries continue. A lease
+  lapse on an otherwise-valid active run stays retryable instead, so a later
+  heartbeat can restore the lease and let the same event through (#1892).
+- Cline capture-policy routing now reads canonical `workspaceRoots` and
+  `taskId` fields as well as their legacy aliases, so allowlisted projects keep
+  their lifecycle events and separate Cline tasks no longer collide (#1888).
 - Removed numeric `format` annotations from strict OpenAI-shaped JSON Schemas,
   including nullable number and integer fields, while preserving string
   formats. OpenCode Go Muse rejected schemars' `float` hint before running the
@@ -3720,7 +3730,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.1...HEAD
+[3.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.1
 [3.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.0
 [3.2.10]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.10
 [3.2.9]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.9
