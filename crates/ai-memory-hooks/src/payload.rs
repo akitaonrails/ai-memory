@@ -3845,7 +3845,11 @@ mod tests {
             }),
         );
         assert_eq!(documented_pre.title_hint.as_deref(), Some("tool file"));
-        assert!(documented_pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+        assert!(
+            documented_pre
+                .body_excerpt
+                .is_some_and(|body| !body.is_empty())
+        );
     }
 
     /// Claude Code's Windows `PowerShell` tool shares Bash's payload shape but

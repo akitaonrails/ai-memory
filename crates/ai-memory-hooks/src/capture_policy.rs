@@ -289,9 +289,7 @@ impl ToolOutcome {
 /// documented envelope uses `preToolUse` / `postToolUse` with `toolName` (or
 /// the older `tool`) and `parameters` (ClineignoreGuard.sh handles both).
 /// Prefer the nested call when it names the tool so the call id is kept.
-fn cline_tool_fields(
-    object: &Map<String, Value>,
-) -> Option<(&str, Option<&str>, Option<&Value>)> {
+fn cline_tool_fields(object: &Map<String, Value>) -> Option<(&str, Option<&str>, Option<&Value>)> {
     let nested = object
         .get("tool_call")
         .or_else(|| object.get("tool_result"))
@@ -1519,13 +1517,8 @@ fn agent_family(agent: AgentKind, name: &str) -> ToolFamily {
         match name.to_ascii_lowercase().as_str() {
             "read_files" | "editor" | "replace_in_file" => return ToolFamily::File,
             "search_codebase" => return ToolFamily::SearchList,
-            "run_commands"
-            | "execute_command"
-            | "fetch_web_content"
-            | "skills"
-            | "use_skill"
-            | "ask_question"
-            | "submit_and_exit" => return ToolFamily::NonFile,
+            "run_commands" | "execute_command" | "fetch_web_content" | "skills" | "use_skill"
+            | "ask_question" | "submit_and_exit" => return ToolFamily::NonFile,
             _ => {}
         }
     }
@@ -5748,8 +5741,11 @@ mod tests {
             CaptureDisposition::Drop
         );
         assert_eq!(
-            disposition(&call("run_commands", json!({"commands": ["cat src/lib.rs"]})))
-                .disposition(),
+            disposition(&call(
+                "run_commands",
+                json!({"commands": ["cat src/lib.rs"]})
+            ))
+            .disposition(),
             CaptureDisposition::Keep
         );
         assert_eq!(
@@ -5781,10 +5777,7 @@ mod tests {
             policy
                 .inspect(
                     AgentKind::Other,
-                    &call(
-                        "run_commands",
-                        json!({"commands": ["cat docs/adr/1.md"]}),
-                    ),
+                    &call("run_commands", json!({"commands": ["cat docs/adr/1.md"]}),),
                     "/repo",
                 )
                 .protocol()
