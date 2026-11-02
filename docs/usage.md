@@ -459,11 +459,16 @@ immediately before patching, then call `memory_patch_page` with that required
 
 Use `target: "end_of_page"` with no anchor to append at EOF. `add_section`
 requires an ATX level 2-6 heading such as `## Decisions` and rejects a heading
-that already exists after whitespace/case normalization. Duplicate headings,
-stale page or section tokens, overlapping targets, failed admission, or a
-concurrent writer reject the whole batch. Existing frontmatter is preserved;
-the final body still passes through the normal sanitizer, admission,
-attribution, versioning, index and git-checkpoint path.
+that already exists after whitespace/case normalization. Edits that land at the
+same place keep where they resolved in the page you read, whatever their order
+in `edits`: an append to the last section stays in that section, an
+`end_of_page` append follows it, and new sections come last. Replacing a
+section also replaces the sections nested in it, so another edit to one of
+those is an overlapping target. Duplicate headings, stale page or section
+tokens, overlapping targets, failed admission, or a concurrent writer reject
+the whole batch. Existing frontmatter is preserved; the final body still passes
+through the normal sanitizer, admission, attribution, versioning, index and
+git-checkpoint path.
 
 ## Install the routing snippet and Agent Skills
 

@@ -83,10 +83,26 @@ struct Section {
     content: Range<usize>,
 }
 
+/// Where an insertion goes among others at the same offset. Every edit
+/// resolves against the captured body, so text for an existing section comes
+/// first, then an `end_of_page` append, then new headings. Request order alone
+/// would put a section append that follows an `add_section` under the new
+/// heading whenever both land at the end of the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Placement {
+    Section,
+    EndOfPage,
+    NewSection,
+}
+
 #[derive(Debug)]
 struct Change {
     range: Range<usize>,
     replacement: String,
+    placement: Placement,
+    /// Where the heading of the existing section this edit writes into
+    /// starts; `None` for an `end_of_page` append and a new section.
+    heading: Option<usize>,
 }
 
 pub(crate) fn section_hashes(body: &str) -> (Vec<SectionHash>, bool) {
@@ -137,6 +153,8 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 Change {
                     range: body.len()..body.len(),
                     replacement: appended(body, content),
+                    placement: Placement::EndOfPage,
+                    heading: None,
                 }
             }
             PagePatchEdit::Append {
@@ -152,6 +170,8 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 Change {
                     range: section.whole.end..section.whole.end,
                     replacement: appended(&body[section.whole.clone()], content),
+                    placement: Placement::Section,
+                    heading: Some(section.whole.start),
                 }
             }
             PagePatchEdit::AddSection { anchor, content } => {
@@ -166,6 +186,8 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 Change {
                     range: body.len()..body.len(),
                     replacement: appended(body, &format!("{heading}\n{content}")),
+                    placement: Placement::NewSection,
+                    heading: None,
                 }
             }
             PagePatchEdit::ReplaceSection {
@@ -188,13 +210,28 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 Change {
                     range: section.content.clone(),
                     replacement: section_content(content),
+                    placement: Placement::Section,
+                    heading: Some(section.whole.start),
                 }
             }
         };
         changes.push(change);
     }
 
-    changes.sort_by_key(|change| (change.range.start, change.range.end));
+    // A replacement deletes every section nested in it, so no other edit may
+    // write into one of those. An append to the last nested section inserts
+    // exactly where the replaced range ends, which the range check below lets
+    // through.
+    if changes.iter().any(|replaced| {
+        changes
+            .iter()
+            .filter_map(|change| change.heading)
+            .any(|heading| replaced.range.contains(&heading))
+    }) {
+        return Err(PatchError::Overlapping);
+    }
+
+    changes.sort_by_key(|change| (change.range.start, change.range.end, change.placement));
     let mut merged: Vec<Change> = Vec::with_capacity(changes.len());
     for change in changes {
         if let Some(previous) = merged.last_mut()
@@ -499,6 +536,164 @@ mod tests {
             patched,
             "# T\n## Log\none\nnext\n## Tail\ntwo\n## Fresh\nnew\n"
         );
+    }
+
+    /// An append to the last section, an `end_of_page` append and a new
+    /// section all insert at the end of the page. Each still lands where its
+    /// anchor resolved in the captured body, whatever the request order.
+    #[test]
+    fn same_offset_edits_land_where_they_resolved_in_any_order() {
+        let body = "# Status\n## Log\nold\n";
+        let edits = [
+            PagePatchEdit::Append {
+                target: AppendTarget::Section,
+                anchor: Some("Log".into()),
+                content: "entry".into(),
+            },
+            PagePatchEdit::Append {
+                target: AppendTarget::EndOfPage,
+                anchor: None,
+                content: "footer".into(),
+            },
+            PagePatchEdit::AddSection {
+                anchor: "## Decisions".into(),
+                content: "d1".into(),
+            },
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let batch = order.map(|index| edits[index].clone());
+            assert_eq!(
+                apply(body, &batch).unwrap(),
+                "# Status\n## Log\nold\nentry\nfooter\n## Decisions\nd1\n",
+                "request order {order:?}"
+            );
+        }
+
+        // New sections keep the order the request gave them.
+        let added = |title: &str| PagePatchEdit::AddSection {
+            anchor: format!("## {title}"),
+            content: title.to_lowercase(),
+        };
+        assert_eq!(
+            apply(body, &[added("Beta"), added("Alpha")]).unwrap(),
+            "# Status\n## Log\nold\n## Beta\nbeta\n## Alpha\nalpha\n"
+        );
+    }
+
+    /// Replacing a section deletes the sections nested in it, so an edit to
+    /// one of them overlaps the replacement, also when it inserts exactly
+    /// where the replaced range ends. Edits outside the replaced section
+    /// still apply.
+    #[test]
+    fn edits_to_sections_inside_a_replaced_one_overlap_it() {
+        let replace = |body: &str, anchor: &str, content: &str| PagePatchEdit::ReplaceSection {
+            anchor: anchor.into(),
+            section_sha256: section_hashes(body)
+                .0
+                .into_iter()
+                .find(|section| section.anchor == anchor)
+                .unwrap()
+                .sha256,
+            content: content.into(),
+        };
+        let append = |anchor: &str| PagePatchEdit::Append {
+            target: AppendTarget::Section,
+            anchor: Some(anchor.into()),
+            content: "x".into(),
+        };
+
+        // `### Child` is the last section inside `## One`.
+        let body = "# T\n## One\nold\n### Child\nkept\n## Two\nother\n";
+        let replace_one = replace(body, "One", "new");
+        for batch in [
+            [replace_one.clone(), append("Child")],
+            [append("Child"), replace_one.clone()],
+        ] {
+            assert_eq!(apply(body, &batch), Err(PatchError::Overlapping));
+        }
+        // A nested section with no text of its own is replaced in place too.
+        let empty_child = "# T\n## One\nold\n### Child\n## Two\nother\n";
+        assert_eq!(
+            apply(
+                empty_child,
+                &[
+                    replace(empty_child, "One", "new"),
+                    replace(empty_child, "Child", "y"),
+                ]
+            ),
+            Err(PatchError::Overlapping)
+        );
+
+        // Controls: the next section and the page title are not inside it.
+        assert_eq!(
+            apply(body, &[replace_one.clone(), append("Two")]).unwrap(),
+            "# T\n## One\nnew\n## Two\nother\nx\n"
+        );
+        assert_eq!(
+            apply(body, &[replace_one, append("T")]).unwrap(),
+            "# T\n## One\nnew\n## Two\nother\nx\n"
+        );
+        // When the replaced section ends the page, the end of the page and a
+        // new section still follow it.
+        let last = "# T\n## Zero\nz\n## One\nold\n### Child\nkept\n";
+        let end_of_page = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        let next = PagePatchEdit::AddSection {
+            anchor: "## Next".into(),
+            content: "n".into(),
+        };
+        assert_eq!(
+            apply(last, &[replace(last, "One", "new"), end_of_page, next]).unwrap(),
+            "# T\n## Zero\nz\n## One\nnew\nfooter\n## Next\nn\n"
+        );
+        assert_eq!(
+            apply(last, &[replace(last, "One", "new"), append("Child")]),
+            Err(PatchError::Overlapping)
+        );
+    }
+
+    /// The durable-pages skill tells agents how to write these edits, so every
+    /// op it names has to be one the tool accepts. It once named
+    /// `append_to_section`, which fails to deserialize.
+    #[test]
+    fn the_durable_pages_skill_names_only_ops_the_tool_accepts() {
+        let skill = ai_memory_core::routing_skills::MANAGED_SKILLS
+            .iter()
+            .find(|skill| skill.name == "ai-memory-durable-pages")
+            .expect("the durable-pages skill is bundled")
+            .content;
+        let mut named = skill
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| *word == "append" || word.ends_with("_section"))
+            .collect::<Vec<_>>();
+        named.sort_unstable();
+        named.dedup();
+        for op in ["append", "add_section", "replace_section"] {
+            assert!(named.contains(&op), "the skill never names `{op}`");
+        }
+        for op in named {
+            let edit = serde_json::json!({
+                "op": op,
+                "target": "section",
+                "anchor": "## Notes",
+                "section_sha256": "0",
+                "content": "x",
+            });
+            assert!(
+                serde_json::from_value::<PagePatchEdit>(edit).is_ok(),
+                "the skill names `{op}`, which memory_patch_page rejects"
+            );
+        }
     }
 
     #[test]
