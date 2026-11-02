@@ -32,6 +32,17 @@ version in [`docs/changelog/`](docs/changelog/):
   fallback chain (#1619). A rate-limited provider answering `429` with a hint
   longer than the fixed 2-second delay is no longer retried prematurely before
   its window has reset (#1928).
+
+- The PowerShell hook bundle no longer follows HTTP redirects, matching the
+  native hook client (#1818) and the generated TypeScript integrations
+  (#1903). Behind an SSO gateway, proxy or captive portal that redirects to
+  a login page, `Invoke-WebRequest`'s default of five hops treated the page's
+  `200` as a delivery: the spool drain deleted the event, a `307` or `308`
+  replayed the POST (and `Authorization`) to the redirect target, and a `302`
+  body could be injected as a handoff. The bundle now sets
+  `MaximumRedirection` to 0 and treats a non-2xx status as undelivered, so
+  the event stays spooled and no handoff is injected (#1930).
+
 ## [3.3.1] - 2026-11-01
 
 ### Fixed
