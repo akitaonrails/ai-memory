@@ -184,7 +184,7 @@ async function main() {
   await cdp.send('Emulation.setDeviceMetricsOverride', {width: 1440, height: 1100, deviceScaleFactor: 1, mobile: false});
   {
     const change = mutation && mutations[mutation];
-    cdp.listeners.set('Fetch.requestPaused', async message => {
+    const paused = async message => {
       const p = message.params;
       if (cdp.notificationStatus && p.responseStatusCode && new URL(p.request.url).pathname === '/web/inbox/notifications') {
         await cdp.send('Fetch.fulfillRequest', {requestId:p.requestId,responseCode:cdp.notificationStatus,responseHeaders:[{name:'Content-Type',value:'application/json'}],body:Buffer.from('{}').toString('base64')});return;
@@ -198,7 +198,10 @@ async function main() {
         if (html.includes(change.from)) {html = html.split(change.from).join(change.to);report.mutationApplied++;}
         await cdp.send('Fetch.fulfillRequest', {requestId: p.requestId, responseCode: 200, responseHeaders: p.responseHeaders.filter(h => !['content-length','content-encoding'].includes(h.name.toLowerCase())), body: Buffer.from(html).toString('base64')});
       } else await cdp.send('Fetch.continueRequest', {requestId: p.requestId});
-    });
+    };
+    // A Page.reload, or the notification poll's own 5s abort, can cancel a paused request before
+    // this handler resumes it; Chromium then answers "Invalid InterceptionId." and nothing is left to resume.
+    cdp.listeners.set('Fetch.requestPaused', message => paused(message).catch(error => {if (error.message !== 'Invalid InterceptionId.') throw error;}));
     await cdp.send('Fetch.enable', {patterns: [...(mutation ? [{urlPattern: '*', requestStage: 'Response'}] : [{urlPattern:base+'/web/inbox/notifications',requestStage:'Response'}]), {urlPattern: base + '/web/messages', requestStage: 'Request'}]});
   }
   const project = base + '/web/w/team/app';
