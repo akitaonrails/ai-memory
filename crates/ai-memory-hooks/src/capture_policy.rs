@@ -538,6 +538,26 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             }
             None => ToolOutcome::Unknown,
         },
+        // Cursor fires `postToolUseFailure` "when a tool fails, times out, or
+        // is denied", with an `error_message` and a `failure_type` of
+        // `error`, `timeout` or `permission_denied`
+        // (<https://cursor.com/docs/agent/hooks>). An error or a timeout is a
+        // failed call; a denied call is not a tool failure, as for Copilot
+        // CLI, and a future type proves nothing. A message with no type
+        // still names a failure. Its `postToolUse` stays unknown, as Claude
+        // Code's does.
+        AgentKind::Cursor => match raw.get("failure_type").and_then(Value::as_str) {
+            Some("error" | "timeout") => ToolOutcome::Error,
+            Some(_) => ToolOutcome::Unknown,
+            None if raw
+                .get("error_message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| !message.is_empty()) =>
+            {
+                ToolOutcome::Error
+            }
+            None => ToolOutcome::Unknown,
+        },
         // Hermes mirrors the call status in `extra.status` (`ok` | `error`,
         // set by `model_tools.py::_emit_post_tool_call_hook` from the same
         // result the model sees). `ok` proves success and a non-empty
