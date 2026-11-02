@@ -22,6 +22,7 @@ mod multi_machine;
 mod observation_retention;
 mod profile_harvest;
 mod recall_eval;
+mod rule_slug_collisions;
 mod search_quality;
 mod typed_edges;
 mod verbatim_residue_consolidation;
