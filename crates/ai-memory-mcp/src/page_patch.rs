@@ -518,6 +518,55 @@ mod tests {
         );
     }
 
+    /// An append to the last section, an `end_of_page` append and a new
+    /// section all insert at the end of the page. Each still lands where its
+    /// anchor resolved in the captured body, whatever the request order.
+    #[test]
+    fn same_offset_edits_land_where_they_resolved_in_any_order() {
+        let body = "# Status\n## Log\nold\n";
+        let edits = [
+            PagePatchEdit::Append {
+                target: AppendTarget::Section,
+                anchor: Some("Log".into()),
+                content: "entry".into(),
+            },
+            PagePatchEdit::Append {
+                target: AppendTarget::EndOfPage,
+                anchor: None,
+                content: "footer".into(),
+            },
+            PagePatchEdit::AddSection {
+                anchor: "## Decisions".into(),
+                content: "d1".into(),
+            },
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let batch = order.map(|index| edits[index].clone());
+            assert_eq!(
+                apply(body, &batch).unwrap(),
+                "# Status\n## Log\nold\nentry\nfooter\n## Decisions\nd1\n",
+                "request order {order:?}"
+            );
+        }
+
+        // New sections keep the order the request gave them.
+        let added = |title: &str| PagePatchEdit::AddSection {
+            anchor: format!("## {title}"),
+            content: title.to_lowercase(),
+        };
+        assert_eq!(
+            apply(body, &[added("Beta"), added("Alpha")]).unwrap(),
+            "# Status\n## Log\nold\n## Beta\nbeta\n## Alpha\nalpha\n"
+        );
+    }
+
     #[test]
     fn a_trailing_hash_closes_a_heading_only_after_a_space() {
         let body = "# T\n## Notes on C#\nold\n## Tail ##\nend\n";
