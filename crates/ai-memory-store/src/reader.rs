@@ -1535,6 +1535,9 @@ pub struct SessionActivity {
 pub struct SessionSummary {
     /// Session id.
     pub session_id: SessionId,
+    /// Harness label in the session's own scope, for the dashboard.
+    #[serde(skip)]
+    pub display_name: Option<String>,
     /// Captured session cwd, if available.
     pub cwd: Option<String>,
     /// `AgentKind` as stored (`claude-code`, `cursor`, ...).
@@ -6097,6 +6100,7 @@ impl ReaderPool {
                     model,
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<u32>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
                 ))
             })?;
             let mut out = Vec::new();
@@ -6116,6 +6120,7 @@ impl ReaderPool {
                     model,
                     state,
                     attempts,
+                    display_name,
                 ) = row?;
                 let started_at = jiff::Timestamp::from_microsecond(started_us)
                     .map(|ts| ts.to_string())
@@ -6137,6 +6142,7 @@ impl ReaderPool {
                 });
                 out.push(SessionSummary {
                     session_id: SessionId::from_slice(&id_bytes)?,
+                    display_name,
                     cwd,
                     agent_kind,
                     started_at,
@@ -14552,7 +14558,8 @@ fn sessions_for_scope_sql(
                  WHERE o.session_id = s.id \
                    AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
                 u.input_tokens, u.output_tokens, u.cache_write_tokens, u.cache_read_tokens, u.model, \
-                j.state, j.attempts \
+                j.state, j.attempts, \
+                CASE WHEN s.workspace_id = :ws AND s.project_id = :proj THEN s.display_name END \
          FROM sessions s \
          LEFT JOIN session_usage u ON u.session_id = s.id \
          LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \

@@ -836,19 +836,16 @@ impl HookEnvelope {
     /// fire-and-forget, so this never errors.
     #[must_use]
     pub fn occurred_at_micros(&self) -> Option<i64> {
-        let parsed = self
-            .occurred_at
-            .as_deref()?
-            .parse::<jiff::Timestamp>()
-            .ok()?
-            .as_microsecond();
-        let now = jiff::Timestamp::now().as_microsecond();
-        if parsed > 0 && parsed <= now.saturating_add(MAX_OCCURRED_AT_FUTURE_SKEW_MICROS) {
-            Some(parsed)
-        } else {
-            None
-        }
+        bounded_hook_timestamp(self.occurred_at.as_deref()?).map(|ts| ts.as_microsecond())
     }
+}
+
+/// Accept a native timestamp only within the hook clock-skew allowance.
+pub(crate) fn bounded_hook_timestamp(raw: &str) -> Option<jiff::Timestamp> {
+    let ts = raw.parse::<jiff::Timestamp>().ok()?;
+    let micros = ts.as_microsecond();
+    let now = jiff::Timestamp::now().as_microsecond();
+    (micros > 0 && micros <= now.saturating_add(MAX_OCCURRED_AT_FUTURE_SKEW_MICROS)).then_some(ts)
 }
 
 /// How far ahead of server time a client-supplied `occurred_at` may sit

@@ -13,6 +13,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Showed the harness's session name beside its short ID in the agent dashboard.
+  Codex reports names and renames at the end of a turn (#1948).
 - Added a guarded `memory_write_pages_batch` MCP tool for companion imports:
   1-100 conditional page versions are admitted and persisted atomically in one
   existing project, with bounded bodies, duplicate-path rejection, ordered
