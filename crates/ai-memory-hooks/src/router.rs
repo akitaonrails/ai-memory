@@ -2112,6 +2112,7 @@ struct ManagedHookHint<'a> {
     cwd: Option<&'a str>,
     native_session: Option<&'a str>,
     session_start: bool,
+    claude_clear: bool,
 }
 
 /// Only a run prepared through the ID selector may supply its stored scope.
@@ -2141,6 +2142,7 @@ async fn pinned_managed_hook_scope(
             native_session_id: hint.native_session.unwrap_or_default().to_owned(),
             owner_user: owner_user.clone(),
             session_start: hint.session_start,
+            claude_clear: hint.claude_clear,
         })
         .await?;
     let Some((workspace_id, project_id)) = scope else {
@@ -2161,17 +2163,32 @@ async fn pinned_managed_hook_scope(
         ai_memory_store::ProjectAccess::Write,
     )
     .await?;
-    let linked = state
-        .writer
-        .link_managed_run_session_in_scope(ai_memory_store::LinkManagedRunSessionInScope {
-            run_id,
-            workspace_id,
-            project_id,
-            agent: hint.agent,
-            native_session_id: native.into_string(),
-            owner_user,
-        })
-        .await?;
+    let linked = if hint.claude_clear {
+        state
+            .writer
+            .relink_managed_claude_clear(ai_memory_store::LinkOrAdoptManagedRunSession {
+                supplied_run_id: run_id,
+                workspace_id,
+                project_id,
+                cwd: hint.cwd.unwrap_or_default().to_owned(),
+                agent: hint.agent,
+                native_session_id: native.into_string(),
+                owner_user,
+            })
+            .await?
+    } else {
+        state
+            .writer
+            .link_managed_run_session_in_scope(ai_memory_store::LinkManagedRunSessionInScope {
+                run_id,
+                workspace_id,
+                project_id,
+                agent: hint.agent,
+                native_session_id: native.into_string(),
+                owner_user,
+            })
+            .await?
+    };
     if linked != ai_memory_store::ManagedRunSessionLink::Exact(run_id) {
         return Err(anyhow::anyhow!(
             "ID-selected managed run no longer admits this native session"
@@ -2196,6 +2213,7 @@ async fn resolve_authorized_startup_scope(
             cwd: query.cwd.as_deref(),
             native_session: query.session_id.as_deref(),
             session_start: true,
+            claude_clear: false,
         },
         actor,
         viewer,
@@ -4701,6 +4719,11 @@ async fn process_authorized(
             cwd: env.cwd.as_deref(),
             native_session: env.session_id.as_deref(),
             session_start: env.event == HookEvent::SessionStart,
+            // Claude documents `clear` separately from startup/resume/compact/fork:
+            // https://code.claude.com/docs/en/hooks#sessionstart-input
+            claude_clear: env.agent == AgentKind::ClaudeCode
+                && env.event == HookEvent::SessionStart
+                && env.raw.get("source").and_then(serde_json::Value::as_str) == Some("clear"),
         },
         actor.as_ref(),
         viewer,
@@ -14502,6 +14525,291 @@ pub(crate) mod tests {
             run_native_session(&state, run.run_id).await.as_deref(),
             Some("alice-native"),
             "the run's own operator links its session"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_claude_clear_keeps_capturing_without_rewinding_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let run = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "clear-repo".into(),
+                worktree_fingerprint: "clear-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "clear-test".into(),
+            })
+            .await
+            .unwrap();
+        let event = |kind: &str, native: &str, source: &str| {
+            let mut event = session_envelope(kind, native, "/tmp/scratch");
+            event.managed_run = Some(run.run_id.to_string());
+            event.raw["source"] = serde_json::json!(source);
+            event
+        };
+        process(
+            &state,
+            event("session-start", "before-clear", "startup"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .accept_managed_run_context(run.run_id)
+            .await
+            .unwrap();
+        let batch = vec![
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=session-start&agent=claude-code&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({"session_id":"after-clear", "cwd":"/tmp/scratch", "source":"clear"}),
+            },
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=user-prompt-submit&agent=claude-code&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({"session_id":"after-clear", "cwd":"/tmp/scratch", "prompt":"continue after clear"}),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(batch),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 2);
+        assert_eq!(state.ingest_metrics.snapshot().dropped_invalid, 0);
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("after-clear")
+        );
+        let prompt = event("user-prompt-submit", "after-clear", "");
+        let session = resolve_session_id(&prompt).unwrap();
+        process(&state, prompt, None, Vec::new()).await.unwrap();
+        assert!(
+            !state
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A lost acknowledgement may replay the current boundary, but an old
+        // boundary must never repoint the run to its abandoned conversation.
+        process(
+            &state,
+            event("session-start", "after-clear", "clear"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            process(
+                &state,
+                event("session-start", "before-clear", "clear"),
+                None,
+                Vec::new()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            process(
+                &state,
+                event("user-prompt-submit", "unrelated", "clear"),
+                None,
+                Vec::new()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("after-clear")
+        );
+        process(
+            &state,
+            event("session-start", "second-clear", "clear"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("second-clear")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_claude_clear_refuses_non_clear_events_and_foreign_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let alice = IdentityKey::User("alice".into());
+        let run = state
+            .writer
+            .prepare_workstream_run_owned(
+                PrepareWorkstreamRun {
+                    scope_by_id: true,
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    repo_fingerprint: "clear-repo".into(),
+                    worktree_fingerprint: "clear-tree".into(),
+                    cwd: "/tmp/scratch".into(),
+                    agent: AgentKind::ClaudeCode,
+                    automatic_harness: false,
+                    available_agents: Vec::new(),
+                    selection: WorkstreamSelection::Current,
+                    lease_owner: "clear-test".into(),
+                },
+                Some(alice.storage_key()),
+            )
+            .await
+            .unwrap();
+        let event = |native: &str| {
+            let mut e = session_envelope("session-start", native, "/tmp/scratch");
+            e.managed_run = Some(run.run_id.to_string());
+            e.raw["source"] = serde_json::json!("clear");
+            e
+        };
+        process(&state, event("original"), Some(alice.clone()), Vec::new())
+            .await
+            .unwrap();
+        for source in ["startup", "resume", "compact", "fork", "", "CLEAR"] {
+            let mut e = event(source);
+            e.raw["source"] = serde_json::json!(source);
+            assert!(
+                process(&state, e, Some(alice.clone()), Vec::new())
+                    .await
+                    .is_err(),
+                "{source}"
+            );
+        }
+        for case in [
+            "owner",
+            "cwd",
+            "agent",
+            "event",
+            "missing-cwd",
+            "missing-source",
+        ] {
+            let mut e = event(case);
+            let mut owner = alice.clone();
+            match case {
+                "owner" => owner = IdentityKey::User("bob".into()),
+                "cwd" => e.cwd = Some("/foreign".into()),
+                "agent" => e.agent = AgentKind::Codex,
+                "event" => e.event = HookEvent::UserPrompt,
+                "missing-cwd" => e.cwd = None,
+                "missing-source" => {
+                    e.raw.as_object_mut().unwrap().remove("source");
+                }
+                _ => unreachable!(),
+            }
+            let session = resolve_session_id(&e).unwrap();
+            assert!(
+                process(&state, e, Some(owner), Vec::new()).await.is_err(),
+                "{case}"
+            );
+            assert!(
+                state
+                    .reader
+                    .find_session_scope(session)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{case}"
+            );
+        }
+        let mut foreign = session_envelope("user-prompt-submit", "foreign-clear", "/foreign");
+        foreign.project_override = Some("foreign".into());
+        process(&state, foreign, Some(alice.clone()), Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            process(
+                &state,
+                event("foreign-clear"),
+                Some(alice.clone()),
+                Vec::new()
+            )
+            .await
+            .is_err()
+        );
+        let user = user_holding(
+            &state,
+            "alice",
+            state.project_id,
+            Some(ai_memory_store::GrantLevel::Read),
+        )
+        .await;
+        state
+            .writer
+            .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        assert!(
+            process_authorized(
+                &state,
+                event("read-only"),
+                Some(alice.clone()),
+                ai_memory_core::AuthLevel::User,
+                Vec::new(),
+                Some(user)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("original")
+        );
+        state
+            .writer
+            .grant_memory(
+                user,
+                state.project_id,
+                ai_memory_store::GrantLevel::Write,
+                None,
+            )
+            .await
+            .unwrap();
+        process_authorized(
+            &state,
+            event("allowed-clear"),
+            Some(alice),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            Some(user),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("allowed-clear")
         );
     }
 

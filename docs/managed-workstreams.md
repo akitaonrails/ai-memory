@@ -654,8 +654,16 @@ another workstream; adoption stays a bootstrap operation.
    non-final ledger segment, and only then finalizes the run on the newest
    session. Thus pre-clear turns keep their original native-session identity,
    while the next managed launch still resumes the conversation after the last
-   `/clear`. Each delivered
-   workstream packet begins with a versioned origin marker. If Claude Code
+   `/clear`.
+
+   For ID-selected runs, Claude's `SessionStart` with `source: "clear"` also
+   updates the live hook binding, so capture continues before the launcher
+   exits. The transition requires the same operator, harness and checkout,
+   an active lease and current Write access. Ordinary events cannot change
+   the binding; a replay for an abandoned native session is refused. The
+   previous transcript remains in the workstream's native-session history.
+
+   Each delivered workstream packet begins with a versioned origin marker. If Claude Code
    persists that packet and its `Read` tool returns it, the Claude transcript
    normalizer excludes the marked result instead of feeding delivered history
    into the ledger again. It also recognizes the pre-marker packet header for

@@ -6813,6 +6813,7 @@ mod tests {
             native_session_id: "native-session".into(),
             owner_user: None,
             session_start: true,
+            claude_clear: false,
         };
 
         set_managed_run_lease(store.db_path(), run.run_id, 1);
@@ -6840,6 +6841,7 @@ mod tests {
                     native_session_id: "native-session".into(),
                     owner_user: None,
                     session_start: true,
+                    claude_clear: false,
                 })
                 .await
                 .unwrap(),
