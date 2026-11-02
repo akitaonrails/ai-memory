@@ -49,7 +49,9 @@ version in [`docs/changelog/`](docs/changelog/):
   to a login page: `ai-memory backup` wrote that HTML as the gzip tarball,
   JSON helpers parsed the page instead of reporting the 302, and a `307` or
   `308` replayed the request body to the `Location` origin. A 3xx now fails
-  closed and the previous backup file is left in place (#1932).
+  closed and the previous backup file is left in place; session finalization
+  and backfill's explicit-server bearer resolution share the same client
+  (#1932).
 
 ## [3.3.1] - 2026-11-01
 

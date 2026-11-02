@@ -308,7 +308,7 @@ pub(crate) fn is_loopback_url(url: &str) -> bool {
 /// disabled so a 3xx from an SSO portal or proxy cannot be followed: JSON
 /// GET/POST would otherwise consume a login page, a 307/308 would replay the
 /// body, and [`post_to_file`] would write that page as a backup tarball.
-fn http_client() -> reqwest::Client {
+pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
