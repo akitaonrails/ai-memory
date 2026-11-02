@@ -3632,7 +3632,11 @@ async fn two_harnesses_of_one_operator_share_one_private_profile() {
     .expect("the other harness finds the same profile");
     let entries = store
         .reader
-        .profile_entries(seen_by_codex.workspace_id, seen_by_codex.project_id, Some(10))
+        .profile_entries(
+            seen_by_codex.workspace_id,
+            seen_by_codex.project_id,
+            Some(10),
+        )
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);

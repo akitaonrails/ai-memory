@@ -372,11 +372,7 @@ async fn handle_apply(
         }
         None => match state
             .reader
-            .profile_entries(
-                profile_scope.workspace_id,
-                profile_scope.project_id,
-                None,
-            )
+            .profile_entries(profile_scope.workspace_id, profile_scope.project_id, None)
             .await
         {
             Ok(entries) => (entries, BTreeSet::new()),
