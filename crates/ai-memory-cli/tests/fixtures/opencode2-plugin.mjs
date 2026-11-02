@@ -12,6 +12,10 @@ globalThis.fetch = async (input, options = {}) => {
   options.signal?.throwIfAborted();
   const url = new URL(input);
   requests.push({ url, payload: options.body ? JSON.parse(options.body) : undefined });
+  // A server slower than the plugin's timeout: the fetch rejects like an abort.
+  if (url.pathname === "/handoff" && url.searchParams.get("session_id") === "root-slow") {
+    throw new DOMException("The operation timed out.", "TimeoutError");
+  }
   return new Response(url.pathname === "/handoff" ? "Remember the verified handoff." : "{}");
 };
 const { default: plugin } = await import(pathToFileURL(process.argv[2]).href);
@@ -69,7 +73,7 @@ async function until(predicate, message) {
 const root = process.cwd();
 const info = (id, parentID) => ({ id, title: id, location: { directory: root }, parentID });
 const records = new Map([["root-a", info("root-a")], ["root-b", { ...info("root-b"), location: { directory: root + "/beta" } }],
-  ["child", info("child", "root-a")]]);
+  ["child", info("child", "root-a")], ["root-slow", info("root-slow")]]);
 const a = host(root, records);
 const b = host(root + "/beta", records);
 const disposeA = await plugin.setup(a.ctx);
@@ -90,6 +94,16 @@ try {
   await a.hooks.get("session.context")(child);
   assert.equal(child.system.length, 0);
   assert.equal(requests.filter((r) => r.url.pathname === "/handoff").length, 1, "child must not claim");
+
+  // A failed startup-context fetch is retried on a later model request, but a
+  // bounded number of times: the context hook fires on every model call.
+  const slowHandoffs = () => requests.filter((r) => r.url.pathname === "/handoff" && r.url.searchParams.get("session_id") === "root-slow").length;
+  for (let i = 0; i < 6; i++) {
+    const slow = { sessionID: "root-slow", system: [] };
+    await a.hooks.get("session.context")(slow);
+    assert.equal(slow.system.length, 0);
+  }
+  assert.equal(slowHandoffs(), 3, "a failing handoff fetch must stop retrying after its attempt budget");
 
   await a.hooks.get("tool.execute.after")({ sessionID: "root-a", tool: "example", id: "t1", input: {},
     status: "completed", result: { content: "content-only tool evidence" } });
@@ -117,7 +131,7 @@ try {
   await disposeA();
   assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-a"), "eviction unload must not end a live session");
   assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-b"), "location cleanup must not close another instance");
-  console.log("PASS: resumed sessions, retained handoff, child isolation, terminal events, deletion ends, unload does not");
+  console.log("PASS: resumed sessions, retained handoff, child isolation, bounded handoff retries, terminal events, deletion ends, unload does not");
 } finally {
   await disposeB();
 }
