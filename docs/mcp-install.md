@@ -344,7 +344,11 @@ there. The Codex plugin likewise registers `ai-memory mcp-bridge
 - Cursor hooks live in `~/.cursor/hooks.json` or `.cursor/hooks.json`.
   ai-memory maps `sessionStart`, `sessionEnd`, `beforeSubmitPrompt`,
   `preToolUse`, `postToolUse`, `postToolUseFailure`, `preCompact`, and
-  `stop` to the shared capture path.
+  `stop` to the shared capture path. Cursor fires `postToolUseFailure`
+  instead of `postToolUse` when a tool fails, times out or is denied. A
+  failed or timed-out call is stored as `outcome: error` with Cursor's
+  `error_message`, so the session page counts it and the handoff names it;
+  a denied call keeps its message but stays `outcome: unknown`.
 - Cursor watches `hooks.json` on save. For MCP config changes, restart
   Cursor or toggle the server off+on in **Settings → MCP**.
 - Sources: <https://cursor.com/docs/mcp>, <https://cursor.com/docs/hooks.md>
