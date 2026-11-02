@@ -41,8 +41,11 @@ two preconditions.
 
 For a targeted edit, prefer `memory_patch_page`: read the page, pass its
 required `page_id` as `expected_page_id`, and submit one bounded batch.
-`append_to_section` and `add_section` use heading anchors from the read
-response; `replace_section` must also carry that section's returned `sha256`.
+`append` with `target: "section"` takes a heading `anchor` from the read
+response, and with `target: "end_of_page"` takes none; `add_section` takes a
+new level 2-6 heading such as `## Decisions`; `replace_section` takes an
+`anchor` and must also carry that section's returned `sha256` as
+`section_sha256`.
 All edits resolve against the same captured body and either commit together or
 write nothing. Missing, duplicate, stale, or conflicting anchors fail closed.
 Use `memory_write_page` when replacing the whole document.
