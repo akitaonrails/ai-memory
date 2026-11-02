@@ -266,7 +266,7 @@ async fn a_habit_from_two_projects_becomes_a_global_entry_once() {
     let entries = fx
         .store
         .reader
-        .profile_entries(global.workspace_id, global.project_id, 50)
+        .profile_entries(global.workspace_id, global.project_id, Some(50))
         .await
         .unwrap();
     let digest = render_digest(&entries, &Default::default(), 3_000, false, false).unwrap();
@@ -1320,7 +1320,7 @@ async fn injected_instructions_stay_data() {
     let entries = fx
         .store
         .reader
-        .profile_entries(global.workspace_id, global.project_id, 50)
+        .profile_entries(global.workspace_id, global.project_id, Some(50))
         .await
         .unwrap();
     let digest = render_digest(&entries, &Default::default(), 3_000, false, false).unwrap();

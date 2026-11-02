@@ -1,6 +1,6 @@
 //! Store side of the cross-project profile
 //! (`docs/design-cross-project-profile.md`): the per-project `[profile]`
-//! flags (V74) and the bounded reads the SessionStart digest needs.
+//! flags (V74) and the reads the SessionStart digest and the harvester need.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -13,10 +13,6 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::error::StoreResult;
 use crate::reader::{not_expired, now_us};
-
-/// Most profile entries one digest read loads; the byte budget usually cuts
-/// far earlier, and the read stays bounded however large a profile grows.
-pub const PROFILE_ENTRIES_LIMIT: usize = 200;
 
 /// Recent observations scanned for stack signals. Bounded so the scan costs
 /// the same on a project with a long history as on a new one.
@@ -120,14 +116,20 @@ pub(crate) fn contribute_opt_outs(conn: &Connection) -> StoreResult<Vec<ProfileO
 }
 
 /// The current, unexpired `profile/` pages of a scope, as digest entries.
-/// Pages with nothing to state are skipped.
+/// Pages with nothing to state are skipped. `limit` caps the SQL read when
+/// set; `None` returns every matching page. SQLite treats a negative LIMIT as
+/// unbounded, which is how the digest, list, status and apply paths load a
+/// scope that has grown past the old 200-row cap (#1946).
 pub(crate) fn profile_entries(
     conn: &Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-    limit: usize,
+    limit: Option<usize>,
 ) -> StoreResult<Vec<ProfileEntry>> {
-    let limit = i64::try_from(limit.clamp(1, PROFILE_ENTRIES_LIMIT)).unwrap_or(1);
+    let limit = match limit {
+        Some(n) => i64::try_from(n.max(1)).unwrap_or(i64::MAX),
+        None => -1,
+    };
     let sql = format!(
         "SELECT path, title, body, frontmatter_json FROM pages \
          WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
@@ -733,7 +735,9 @@ pub(crate) fn record_profile_entries(
     Ok(())
 }
 
-/// Every current, unexpired `profile/` page of a scope, raw.
+/// Every current, unexpired `profile/` page of a scope, raw. Convergence
+/// treats a ledger path missing from this list as removed by the user, so the
+/// read must not stop at a row cap (#1946).
 pub(crate) fn profile_scope_pages(
     conn: &Connection,
     workspace_id: WorkspaceId,
@@ -743,7 +747,7 @@ pub(crate) fn profile_scope_pages(
         "SELECT path, title, body, frontmatter_json FROM pages \
          WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
            AND path GLOB ?3{not_expired} \
-         ORDER BY path ASC LIMIT ?5",
+         ORDER BY path ASC",
         not_expired = not_expired("pages", "?4"),
     );
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -752,8 +756,7 @@ pub(crate) fn profile_scope_pages(
             workspace_id.as_bytes(),
             project_id.as_bytes(),
             format!("{PROFILE_PATH_PREFIX}*"),
-            now_us(),
-            i64::try_from(PROFILE_ENTRIES_LIMIT).unwrap_or(i64::MAX)
+            now_us()
         ],
         |row| {
             Ok((
