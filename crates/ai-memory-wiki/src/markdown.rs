@@ -6,7 +6,7 @@
 //! basic-memory hit (#528). Reading through [`crate::frontmatter_yaml`] and
 //! writing through `serde-saphyr` directly keeps the round-trip predictable.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use ai_memory_core::{DEFAULT_WORKSPACE_NAME, GLOBAL_SCOPE_PROJECT, LinkTarget, PagePath};
@@ -644,6 +644,120 @@ fn delink_wikilinks_in_segment(
                 .filter(|l| !l.is_empty())
                 .unwrap_or(unlabelled);
             out.push_str(text);
+        } else {
+            out.push_str("[[");
+            out.push_str(raw);
+            out.push_str("]]");
+        }
+        rest = &after_start[end + 2..];
+    }
+}
+
+/// Normalise a bare same-project path exactly as [`extract_links`]
+/// normalises a wikilink target: trimmed, an extension-less final
+/// segment gains `.md`, a non-`.md` extension and a target that cannot
+/// name a page are rejected, and `.`/`..` resolve from the wiki root (a
+/// wikilink target is root-relative whatever page it sits on, so no
+/// source page is needed). The consolidation batch path keys its
+/// proposed-to-final redirects with this so a sibling wikilink and the
+/// proposal it points at normalise to one key (#1943).
+pub fn normalize_wikilink_path(raw: &str) -> Option<PagePath> {
+    // `page_path` is unused for wikilink targets (root-relative), so a
+    // placeholder stands in for the missing source page.
+    let placeholder = PagePath::new("placeholder.md").ok()?;
+    let normalized = normalize_link_target(raw, &placeholder, true)?;
+    PagePath::new(normalized).ok()
+}
+
+/// Rewrite `body`'s same-project wikilinks whose normalised path is a key
+/// in `redirects`, replacing the target with the mapped path and keeping
+/// any `|label`. Scope-qualified links, fenced code blocks and inline
+/// code spans are copied byte-identically, exactly as [`delink_wikilinks`]
+/// treats them, and so is every link whose target is not in the map.
+///
+/// The consolidation batch path uses this to repoint sibling links at a
+/// Rule page's final path after the `_rules/<slug>` routing or the
+/// same-batch collision resolver moved it away from the path the model
+/// proposed (#1943): left alone, those links target a page that never
+/// exists, and same-project links are by design allowed to dangle, so no
+/// later pass repairs them.
+#[must_use]
+pub fn rewrite_wikilink_targets(
+    body: &str,
+    page_path: &PagePath,
+    redirects: &BTreeMap<String, String>,
+) -> String {
+    if redirects.is_empty() {
+        return body.to_string();
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<CodeFence> = None;
+    for raw_line in body.split_inclusive('\n') {
+        let (line, terminator) = split_line_terminator(raw_line);
+        let (next_fence, is_fence_or_code) = CodeFence::step(fence, line);
+        fence = next_fence;
+        if is_fence_or_code {
+            out.push_str(line);
+            out.push_str(terminator);
+            continue;
+        }
+        let code_spans = inline_code_spans(line);
+        let mut pos = 0;
+        for span in &code_spans {
+            rewrite_wikilink_targets_in_segment(
+                &line[pos..span.start],
+                page_path,
+                redirects,
+                &mut out,
+            );
+            out.push_str(&line[span.clone()]);
+            pos = span.end;
+        }
+        rewrite_wikilink_targets_in_segment(&line[pos..], page_path, redirects, &mut out);
+        out.push_str(terminator);
+    }
+    out
+}
+
+fn rewrite_wikilink_targets_in_segment(
+    seg: &str,
+    page_path: &PagePath,
+    redirects: &BTreeMap<String, String>,
+    out: &mut String,
+) {
+    let mut rest = seg;
+    loop {
+        let Some(start) = rest.find("[[") else {
+            out.push_str(rest);
+            return;
+        };
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            out.push_str(&rest[start..]);
+            return;
+        };
+        let raw = &after_start[..end];
+        // Parse exactly as `extract_wikilinks` does, mirroring
+        // `delink_wikilinks_in_segment`, so the occurrence matched here is
+        // the occurrence the extractor indexed.
+        let (target_part, label) = raw
+            .split_once('|')
+            .map_or((raw, None), |(t, l)| (t, Some(l)));
+        let unlabelled = target_part.trim();
+        let (workspace, project, path_part) = split_scope(unlabelled);
+        let redirected = (workspace.is_none() && project.is_none())
+            .then(|| normalize_link_target(&path_part, page_path, true))
+            .flatten()
+            .and_then(|path| redirects.get(&path).cloned());
+        if let Some(target) = redirected {
+            out.push_str("[[");
+            out.push_str(&target);
+            if let Some(label) = label {
+                out.push('|');
+                out.push_str(label);
+            }
+            out.push_str("]]");
         } else {
             out.push_str("[[");
             out.push_str(raw);
@@ -1827,6 +1941,57 @@ mod tests {
         );
         // An empty set must be a byte-identical no-op.
         assert_eq!(delink_wikilinks(body, &page, &BTreeSet::new()), body);
+    }
+
+    /// #1943: the redirect keys normalise exactly as a wikilink the
+    /// extractor reads, whatever the model's proposed path looked like.
+    #[test]
+    fn normalize_wikilink_path_matches_the_extractor_fold() {
+        for raw in ["_rules/acme", "_rules/acme.md"] {
+            assert_eq!(
+                normalize_wikilink_path(raw).map(|p| p.as_str().to_owned()),
+                Some("_rules/acme.md".to_owned()),
+                "{raw:?}"
+            );
+        }
+        // A non-md extension, a directory and an escaping target are not
+        // pages, and neither is anything above the root.
+        assert_eq!(normalize_wikilink_path("notes/a.txt"), None);
+        assert_eq!(normalize_wikilink_path("notes/"), None);
+        assert_eq!(normalize_wikilink_path("../escape.md"), None);
+        // Whatever page a link sits on, a wikilink target is root-relative.
+        for source in ["notes/a.md", "deep/dir/b.md"] {
+            let body = "See [[_rules/acme]].";
+            let from = extract_links(body, &PagePath::new(source).unwrap());
+            assert_eq!(from[0].path.as_str(), "_rules/acme.md");
+        }
+    }
+
+    /// #1943: only same-project links whose normalised target is a key in
+    /// the map move; labels, code, scope-qualified links and unmatched
+    /// targets are copied byte-identically.
+    #[test]
+    fn rewrite_wikilink_targets_repoints_only_listed_same_project_links() {
+        let page = PagePath::new("sessions/a.md").unwrap();
+        let redirects = BTreeMap::from([(
+            "_rules/acme.md".to_owned(),
+            "_rules/acme-c230fc38.md".to_owned(),
+        )]);
+        let body = "See [[_rules/acme]], [[_rules/acme|the rule]] and \
+                    [[infra:_rules/acme]]; keep [[notes/pending]] too.\n\
+                    `[_rules/acme]` stays code.\n";
+        let out = rewrite_wikilink_targets(body, &page, &redirects);
+        assert_eq!(
+            out,
+            "See [[_rules/acme-c230fc38.md]], [[_rules/acme-c230fc38.md|the rule]] and \
+             [[infra:_rules/acme]]; keep [[notes/pending]] too.\n\
+             `[_rules/acme]` stays code.\n"
+        );
+        // An empty map is a byte-identical no-op.
+        assert_eq!(
+            rewrite_wikilink_targets(body, &page, &BTreeMap::new()),
+            body
+        );
     }
 
     #[test]
