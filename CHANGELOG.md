@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Profile harvest, list, status and the session-start digest read every
+  current `profile/` page in the scope. The previous 200-row path-order cap
+  dropped later categories from those views and made the harvester treat the
+  unread pages as forgotten (#1946).
+
 ## [3.3.1] - 2026-11-01
 
 ### Fixed
