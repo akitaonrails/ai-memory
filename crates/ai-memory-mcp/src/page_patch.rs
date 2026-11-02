@@ -587,6 +587,81 @@ mod tests {
         );
     }
 
+    /// Replacing a section deletes the sections nested in it, so an edit to
+    /// one of them overlaps the replacement, also when it inserts exactly
+    /// where the replaced range ends. Edits outside the replaced section
+    /// still apply.
+    #[test]
+    fn edits_to_sections_inside_a_replaced_one_overlap_it() {
+        let replace = |body: &str, anchor: &str, content: &str| PagePatchEdit::ReplaceSection {
+            anchor: anchor.into(),
+            section_sha256: section_hashes(body)
+                .0
+                .into_iter()
+                .find(|section| section.anchor == anchor)
+                .unwrap()
+                .sha256,
+            content: content.into(),
+        };
+        let append = |anchor: &str| PagePatchEdit::Append {
+            target: AppendTarget::Section,
+            anchor: Some(anchor.into()),
+            content: "x".into(),
+        };
+
+        // `### Child` is the last section inside `## One`.
+        let body = "# T\n## One\nold\n### Child\nkept\n## Two\nother\n";
+        let replace_one = replace(body, "One", "new");
+        for batch in [
+            [replace_one.clone(), append("Child")],
+            [append("Child"), replace_one.clone()],
+        ] {
+            assert_eq!(apply(body, &batch), Err(PatchError::Overlapping));
+        }
+        // A nested section with no text of its own is replaced in place too.
+        let empty_child = "# T\n## One\nold\n### Child\n## Two\nother\n";
+        assert_eq!(
+            apply(
+                empty_child,
+                &[
+                    replace(empty_child, "One", "new"),
+                    replace(empty_child, "Child", "y"),
+                ]
+            ),
+            Err(PatchError::Overlapping)
+        );
+
+        // Controls: the next section and the page title are not inside it.
+        assert_eq!(
+            apply(body, &[replace_one.clone(), append("Two")]).unwrap(),
+            "# T\n## One\nnew\n## Two\nother\nx\n"
+        );
+        assert_eq!(
+            apply(body, &[replace_one, append("T")]).unwrap(),
+            "# T\n## One\nnew\n## Two\nother\nx\n"
+        );
+        // When the replaced section ends the page, the end of the page and a
+        // new section still follow it.
+        let last = "# T\n## Zero\nz\n## One\nold\n### Child\nkept\n";
+        let end_of_page = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        let next = PagePatchEdit::AddSection {
+            anchor: "## Next".into(),
+            content: "n".into(),
+        };
+        assert_eq!(
+            apply(last, &[replace(last, "One", "new"), end_of_page, next]).unwrap(),
+            "# T\n## Zero\nz\n## One\nnew\nfooter\n## Next\nn\n"
+        );
+        assert_eq!(
+            apply(last, &[replace(last, "One", "new"), append("Child")]),
+            Err(PatchError::Overlapping)
+        );
+    }
+
     #[test]
     fn a_trailing_hash_closes_a_heading_only_after_a_space() {
         let body = "# T\n## Notes on C#\nold\n## Tail ##\nend\n";
