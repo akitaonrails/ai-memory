@@ -272,6 +272,8 @@ pub struct ManagedRunHookIdentity {
     pub owner_user: Option<String>,
     /// Startup always checks the checkout, even for an already linked session.
     pub session_start: bool,
+    /// A Claude SessionStart whose documented source is `clear`.
+    pub claude_clear: bool,
 }
 
 /// Read the opt-in scope without turning an arbitrary run ID into authority.
@@ -298,7 +300,9 @@ pub(crate) fn pinned_hook_scope(
     if run.state != "active"
         || run.agent != input.agent.as_str()
         || run.owner_user != input.owner_user
-        || ((linked || delivered) && run.native_session.as_deref() != Some(native.as_str()))
+        || ((linked || delivered)
+            && run.native_session.as_deref() != Some(native.as_str())
+            && !(input.claude_clear && input.session_start && input.agent == AgentKind::ClaudeCode))
         || ((input.session_start || !linked) && input.cwd.as_deref() != Some(run.cwd.as_str()))
     {
         return Err(refused());
@@ -936,7 +940,8 @@ pub(crate) fn link_native_session(
         };
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let linked = link_native_session_in_transaction(&tx, run_id, agent, &native_identity, now)?;
+    let linked =
+        link_native_session_in_transaction(&tx, run_id, agent, &native_identity, now, false)?;
     tx.commit()?;
     Ok(linked)
 }
@@ -947,6 +952,7 @@ fn link_native_session_in_transaction(
     agent: AgentKind,
     native_session_id: &NativeSessionIdentity,
     now: i64,
+    claude_clear: bool,
 ) -> StoreResult<bool> {
     let native_session_id = native_session_id.as_str();
     let run: Option<LinkRunRow> = tx
@@ -998,7 +1004,20 @@ fn link_native_session_in_transaction(
             .as_deref()
             .is_some_and(|linked| linked != native_session_id)
     {
-        return Ok(false);
+        if !claude_clear || !run.scope_by_id || agent != AgentKind::ClaudeCode {
+            return Ok(false);
+        }
+        // A clear starts a fresh conversation. Refuse an old binding (including
+        // another workstream's) so a delayed spool replay cannot rewind the run.
+        let known: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workstream_native_sessions \
+             WHERE agent_kind = ?1 AND native_session_id = ?2)",
+            params![agent.as_str(), native_session_id],
+            |row| row.get(0),
+        )?;
+        if known {
+            return Ok(false);
+        }
     }
     let workstream = run.workstream;
     let sync_through = run.sync_through;
@@ -1051,6 +1070,7 @@ fn link_native_session_in_transaction(
 pub(crate) fn link_or_adopt_native_session(
     conn: &mut Connection,
     input: &LinkOrAdoptManagedRunSession,
+    claude_clear: bool,
 ) -> StoreResult<ManagedRunSessionLink> {
     if input.native_session_id.trim().is_empty()
         || input.cwd.trim().is_empty()
@@ -1070,6 +1090,18 @@ pub(crate) fn link_or_adopt_native_session(
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
     let supplied = ManagedRunBoundaryRow::read(&tx, input.supplied_run_id)?;
+
+    if claude_clear {
+        let live_pin: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM managed_runs WHERE id = ?1 \
+             AND state = 'active' AND scope_by_id = 1 AND lease_expires_at > ?2)",
+            params![input.supplied_run_id.as_bytes(), now],
+            |row| row.get(0),
+        )?;
+        if input.agent != AgentKind::ClaudeCode || !live_pin {
+            return Ok(ManagedRunSessionLink::Refused);
+        }
+    }
 
     let selected = match supplied {
         Some(run) if run.state == "active" => {
@@ -1126,7 +1158,14 @@ pub(crate) fn link_or_adopt_native_session(
         }
     };
 
-    if !link_native_session_in_transaction(&tx, selected.0, input.agent, &native_identity, now)? {
+    if !link_native_session_in_transaction(
+        &tx,
+        selected.0,
+        input.agent,
+        &native_identity,
+        now,
+        claude_clear,
+    )? {
         tx.commit()?;
         return Ok(ManagedRunSessionLink::Refused);
     }
@@ -1184,8 +1223,14 @@ pub(crate) fn link_native_session_in_scope(
             },
         );
     }
-    let linked =
-        link_native_session_in_transaction(&tx, input.run_id, input.agent, &native_identity, now)?;
+    let linked = link_native_session_in_transaction(
+        &tx,
+        input.run_id,
+        input.agent,
+        &native_identity,
+        now,
+        false,
+    )?;
     tx.commit()?;
     Ok(if linked {
         ManagedRunSessionLink::Exact(input.run_id)

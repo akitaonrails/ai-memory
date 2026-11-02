@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept real-time hook capture working after Claude Code `/clear` in an
+  ID-selected managed run. The clear boundary links the new native session
+  while preserving checkout, operator, project and lease checks; replaying an
+  older session cannot move the run backward (#1936).
+
 ## [3.3.1] - 2026-11-01
 
 ### Fixed
