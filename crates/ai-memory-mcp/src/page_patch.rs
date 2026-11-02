@@ -83,10 +83,23 @@ struct Section {
     content: Range<usize>,
 }
 
+/// Where an insertion goes among others at the same offset. Every edit
+/// resolves against the captured body, so text for an existing section comes
+/// first, then an `end_of_page` append, then new headings. Request order alone
+/// would put a section append that follows an `add_section` under the new
+/// heading whenever both land at the end of the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Placement {
+    Section,
+    EndOfPage,
+    NewSection,
+}
+
 #[derive(Debug)]
 struct Change {
     range: Range<usize>,
     replacement: String,
+    placement: Placement,
 }
 
 pub(crate) fn section_hashes(body: &str) -> (Vec<SectionHash>, bool) {
@@ -137,6 +150,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 Change {
                     range: body.len()..body.len(),
                     replacement: appended(body, content),
+                    placement: Placement::EndOfPage,
                 }
             }
             PagePatchEdit::Append {
@@ -152,6 +166,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 Change {
                     range: section.whole.end..section.whole.end,
                     replacement: appended(&body[section.whole.clone()], content),
+                    placement: Placement::Section,
                 }
             }
             PagePatchEdit::AddSection { anchor, content } => {
@@ -166,6 +181,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 Change {
                     range: body.len()..body.len(),
                     replacement: appended(body, &format!("{heading}\n{content}")),
+                    placement: Placement::NewSection,
                 }
             }
             PagePatchEdit::ReplaceSection {
@@ -188,13 +204,14 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 Change {
                     range: section.content.clone(),
                     replacement: section_content(content),
+                    placement: Placement::Section,
                 }
             }
         };
         changes.push(change);
     }
 
-    changes.sort_by_key(|change| (change.range.start, change.range.end));
+    changes.sort_by_key(|change| (change.range.start, change.range.end, change.placement));
     let mut merged: Vec<Change> = Vec::with_capacity(changes.len());
     for change in changes {
         if let Some(previous) = merged.last_mut()
