@@ -5946,6 +5946,72 @@ mod tests {
         assert_eq!(outcome(json!({"tool_name": "bash"})), ToolOutcome::Unknown);
     }
 
+    /// Cursor's documented `postToolUseFailure` payload
+    /// (<https://cursor.com/docs/agent/hooks>) proves an error when the call
+    /// failed or timed out; a denied call, an undocumented failure type and
+    /// the `postToolUse` payload prove nothing.
+    #[test]
+    fn cursor_post_tool_use_failure_maps_to_error_outcome() {
+        let outcome = |raw: Value| tool_observation_outcome(AgentKind::Cursor, &raw);
+        let failure = |failure_type: &str, error_message: &str| {
+            json!({
+                "conversation_id": "conv-1",
+                "hook_event_name": "postToolUseFailure",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "npm test"},
+                "tool_use_id": "abc123",
+                "cwd": "/project",
+                "error_message": error_message,
+                "failure_type": failure_type,
+                "duration": 5000,
+                "is_interrupt": false
+            })
+        };
+        assert_eq!(
+            outcome(failure("error", "Exit code 1: Cannot find module")),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            outcome(failure("timeout", "Command timed out after 30s")),
+            ToolOutcome::Error
+        );
+        // A denied call is not a tool failure, and a future type proves
+        // nothing.
+        assert_eq!(
+            outcome(failure("permission_denied", "Denied by the user")),
+            ToolOutcome::Unknown
+        );
+        assert_eq!(
+            outcome(failure("cancelled", "Stopped")),
+            ToolOutcome::Unknown
+        );
+        // A message with no type still names a failure; an empty one does not.
+        assert_eq!(
+            outcome(json!({"tool_name": "Shell", "error_message": "Exit code 1"})),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            outcome(json!({"tool_name": "Shell", "error_message": ""})),
+            ToolOutcome::Unknown
+        );
+        // Control: the success payload stays unknown.
+        assert_eq!(
+            outcome(json!({
+                "conversation_id": "conv-1",
+                "hook_event_name": "postToolUse",
+                "cursor_version": "3.24.9",
+                "tool_name": "Shell",
+                "tool_input": {"command": "npm test"},
+                "tool_output": "{\"exitCode\":0,\"stdout\":\"All tests passed\"}",
+                "tool_use_id": "abc123",
+                "cwd": "/project",
+                "duration": 5432
+            })),
+            ToolOutcome::Unknown
+        );
+    }
+
     #[test]
     fn copilot_cli_tool_metadata_uses_the_claude_compatible_keys() {
         let pre = json!({
