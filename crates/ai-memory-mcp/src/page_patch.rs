@@ -662,6 +662,40 @@ mod tests {
         );
     }
 
+    /// The durable-pages skill tells agents how to write these edits, so every
+    /// op it names has to be one the tool accepts. It once named
+    /// `append_to_section`, which fails to deserialize.
+    #[test]
+    fn the_durable_pages_skill_names_only_ops_the_tool_accepts() {
+        let skill = ai_memory_core::routing_skills::MANAGED_SKILLS
+            .iter()
+            .find(|skill| skill.name == "ai-memory-durable-pages")
+            .expect("the durable-pages skill is bundled")
+            .content;
+        let mut named = skill
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| *word == "append" || word.ends_with("_section"))
+            .collect::<Vec<_>>();
+        named.sort_unstable();
+        named.dedup();
+        for op in ["append", "add_section", "replace_section"] {
+            assert!(named.contains(&op), "the skill never names `{op}`");
+        }
+        for op in named {
+            let edit = serde_json::json!({
+                "op": op,
+                "target": "section",
+                "anchor": "## Notes",
+                "section_sha256": "0",
+                "content": "x",
+            });
+            assert!(
+                serde_json::from_value::<PagePatchEdit>(edit).is_ok(),
+                "the skill names `{op}`, which memory_patch_page rejects"
+            );
+        }
+    }
+
     #[test]
     fn a_trailing_hash_closes_a_heading_only_after_a_space() {
         let body = "# T\n## Notes on C#\nold\n## Tail ##\nend\n";
