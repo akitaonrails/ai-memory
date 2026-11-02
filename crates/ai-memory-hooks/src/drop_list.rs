@@ -377,6 +377,37 @@ mod tests {
             serde_json::json!({ "session_id": "s", "hook_event_name": "BeforeTool", "tool_name": "read_file", "tool_input": { "file_path": "a" }, "tool_use_id": "plugin-6" }),
         );
         assert!(!list.matches(&gemini_kept));
+        // Cline CLI nests the call id at `tool_call.id`; the documented
+        // envelope names the tool at `preToolUse.toolName` and has no id.
+        let cline = agent_event(
+            "cline",
+            "pre-tool-use",
+            serde_json::json!({
+                "taskId": "s",
+                "preToolUse": {"toolName": "run_commands", "parameters": {"commands": ["ls"]}},
+                "tool_call": {"id": "plugin-8", "name": "run_commands", "input": {"commands": ["ls"]}}
+            }),
+        );
+        assert!(list.matches(&cline));
+        let cline_by_name = agent_event(
+            "cline",
+            "pre-tool-use",
+            serde_json::json!({
+                "taskId": "s",
+                "preToolUse": {"toolName": "noisy_poll", "parameters": {}}
+            }),
+        );
+        assert!(list.matches(&cline_by_name));
+        let cline_kept = agent_event(
+            "cline",
+            "post-tool-use",
+            serde_json::json!({
+                "taskId": "s",
+                "tool_call": {"id": "toolu_8", "name": "run_commands", "input": {"commands": ["ls"]}},
+                "tool_result": {"id": "toolu_8", "name": "run_commands", "output": "ok"}
+            }),
+        );
+        assert!(!list.matches(&cline_kept));
         // Controls: the same agents with ordinary ids and names stay.
         let kept = agent_event(
             "opencode",

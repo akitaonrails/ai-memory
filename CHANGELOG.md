@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Cline 3.0.74 tool observations now classify ClineCore names (`read_files`,
+  `run_commands`, `editor`, and the other built-ins) so they store as
+  `tool file` / `tool non-file` with bounded output instead of `tool unknown`.
+  Capture also reads the documented `preToolUse.toolName` / `parameters`
+  envelope beside the CLI `tool_call` shape, and `[capture] ignore_paths`
+  matches `read_files` `files[].path` and `run_commands` `commands` (#1950).
+
 ## [3.3.1] - 2026-11-01
 
 ### Fixed
