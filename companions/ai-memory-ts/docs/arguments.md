@@ -233,6 +233,7 @@ Methods: `briefing`
 | `workspace` | `workspace` |
 | `project` | `project` |
 | `recent_pages_limit` | `recentPagesLimit` |
+| `recent_sessions_limit` | `recentSessionsLimit` |
 | `settled_first` | `settledFirst` |
 
 ## `memory_explore`

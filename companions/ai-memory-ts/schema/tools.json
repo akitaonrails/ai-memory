@@ -72,6 +72,12 @@
           "null"
         ]
       },
+      "recent_sessions_limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
       "settled_first": {
         "type": [
           "boolean",

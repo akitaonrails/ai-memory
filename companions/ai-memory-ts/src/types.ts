@@ -651,6 +651,8 @@ export interface SessionActivity {
 export interface BriefingArgs extends ScopedArgs {
   /** How many recent pages to include (default 10, max 100). */
   recentPagesLimit?: number;
+  /** How many recent sessions to include (default 5, max 50). */
+  recentSessionsLimit?: number;
   /** Lead with the project's settled rule and decision pages. */
   settledFirst?: boolean;
 }

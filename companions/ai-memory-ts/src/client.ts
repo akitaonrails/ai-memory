@@ -1004,6 +1004,7 @@ export class AiMemoryClient {
       wire({
         ...scopeWire(scope),
         recent_pages_limit: a.recentPagesLimit,
+        recent_sessions_limit: a.recentSessionsLimit,
         settled_first: a.settledFirst === true ? true : undefined,
       }),
       false,
