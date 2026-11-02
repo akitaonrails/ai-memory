@@ -185,8 +185,10 @@ Methods: `messages.send`
 |---|---|
 | `to_workspace` | `toWorkspace` |
 | `to_project` | `toProject` |
+| `to_agent` | `toAgent` |
 | `from_workspace` | `fromWorkspace` |
 | `from_project` | `fromProject` |
+| `from_agent` | `fromAgent` |
 | `body` | `body` |
 | `subject` | `subject` |
 | `nature` | `nature` |

@@ -699,8 +699,10 @@ export class MessagesNamespace {
       wire({
         to_workspace: to.workspace,
         to_project: to.project,
+        to_agent: a.toAgent,
         from_workspace: from.workspace,
         from_project: from.project,
+        from_agent: a.fromAgent,
         body: a.body,
         subject: a.subject,
         nature: a.nature,

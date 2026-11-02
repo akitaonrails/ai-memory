@@ -65,6 +65,9 @@ version in [`docs/changelog/`](docs/changelog/):
 - Allowed `memory_briefing` callers to include up to 50 recent sessions so
   agents can see active harnesses in a busy project (#1934).
 
+- Allowed MCP agents to address messages to a registered harness and record
+  the sender harness (#1935).
+
 ## [3.3.1] - 2026-11-01
 
 ### Fixed
