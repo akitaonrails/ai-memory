@@ -192,7 +192,6 @@ impl WikiMigration for OkfConformance {
     }
 }
 
-/// Wiki-relative paths of `.md` files that still need the file pass.
 /// Commit, but treat a wiki owned by another account as "no git history", like
 /// startup does (#1923): the pre-migration backup is the safety net there.
 fn commit_unless_not_owner(git: &crate::git::GitAdapter, message: &str) -> WikiResult<()> {
@@ -206,6 +205,7 @@ fn commit_unless_not_owner(git: &crate::git::GitAdapter, message: &str) -> WikiR
     }
 }
 
+/// Wiki-relative paths of `.md` files that still need the file pass.
 fn nonconformant_files(wiki_root: &Path) -> WikiResult<Vec<PathBuf>> {
     let mut pending = Vec::new();
     let mut stack = vec![wiki_root.to_path_buf()];
