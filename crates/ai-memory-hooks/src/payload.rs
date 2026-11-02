@@ -1097,6 +1097,7 @@ fn safe_tool_body(
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
+                    .or_else(|| cursor_failure_message(agent, raw))
                     .or_else(|| antigravity_edit_content(agent, raw))
             }
             .unwrap_or_else(|| "(no output captured)".into());
@@ -1106,6 +1107,15 @@ fn safe_tool_body(
         }
         _ => None,
     }
+}
+
+/// Cursor's `postToolUseFailure` has no `tool_output`; what went wrong is in
+/// its top-level `error_message` (<https://cursor.com/docs/agent/hooks>).
+fn cursor_failure_message(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    if agent != AgentKind::Cursor {
+        return None;
+    }
+    raw.get("error_message").and_then(value_to_text)
 }
 
 fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
