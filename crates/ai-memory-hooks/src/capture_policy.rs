@@ -5722,7 +5722,8 @@ mod tests {
             "/repo",
             None,
         );
-        let disposition = |raw: &Value| policy.inspect(AgentKind::Cline, raw, "/repo").protocol();
+        let disposition =
+            |raw: &Value| policy.inspect(AgentKind::Cline, raw, "/repo").protocol().clone();
         let call = |name: &str, input: Value| {
             json!({
                 "tool_call": {
