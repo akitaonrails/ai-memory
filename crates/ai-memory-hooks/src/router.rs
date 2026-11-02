@@ -25184,6 +25184,108 @@ pub(crate) mod tests {
         assert_eq!(handoff.next_steps, vec!["Tools used: Bash".to_string()]);
     }
 
+    /// A Cursor session whose tool call failed, posted the way the Cursor
+    /// hook posts `postToolUseFailure` (<https://cursor.com/docs/agent/hooks>),
+    /// ends with the failure counted and quoted on its session page and named
+    /// in its handoff, as a Claude Code failure is.
+    #[tokio::test]
+    async fn cursor_tool_failure_reaches_the_session_page_and_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = SessionId::new().to_string();
+        let cursor_event = |event: &str, fields: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "conversation_id": session,
+                "session_id": session,
+                "generation_id": "gen-1",
+                "cursor_version": "3.24.9",
+                "workspace_roots": [],
+            });
+            if let (Some(body), Some(fields)) = (body.as_object_mut(), fields.as_object()) {
+                body.extend(fields.clone());
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("cursor".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        let events = [
+            (
+                "user-prompt",
+                serde_json::json!({
+                    "hook_event_name": "beforeSubmitPrompt",
+                    "prompt": "Run the test suite",
+                }),
+            ),
+            (
+                "post-tool-use",
+                serde_json::json!({
+                    "hook_event_name": "postToolUseFailure",
+                    "tool_name": "Shell",
+                    "tool_input": {"command": "npm test"},
+                    "tool_use_id": "abc123",
+                    "error_message": "Command timed out after 30s",
+                    "failure_type": "timeout",
+                    "duration": 30000,
+                    "is_interrupt": false,
+                }),
+            ),
+            ("stop", serde_json::json!({"hook_event_name": "stop"})),
+            (
+                "session-end",
+                serde_json::json!({"hook_event_name": "sessionEnd"}),
+            ),
+        ];
+        for (event, fields) in events {
+            process(&state, cursor_event(event, fields), None, Vec::new())
+                .await
+                .unwrap();
+        }
+
+        let pages = session_pages(&state).await;
+        assert_eq!(pages.len(), 1, "{pages:?}");
+        let body = state
+            .wiki
+            .read_page(
+                state.workspace_id,
+                state.project_id,
+                &ai_memory_core::PagePath::new(pages[0].clone()).unwrap(),
+            )
+            .unwrap()
+            .body;
+        assert!(
+            body.contains(
+                "## Failed tool calls\n\n- **count:** 1\n\
+                 - **last:** Command timed out after 30s\n"
+            ),
+            "{body}"
+        );
+        let handoff = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .expect("a Cursor session leaves a baton");
+        assert!(
+            handoff
+                .content
+                .next_steps
+                .iter()
+                .any(|step| step == "Last failed tool call: Command timed out after 30s"),
+            "{:?}",
+            handoff.content.next_steps
+        );
+    }
+
     /// `[ingest] record_tool_names` titles (`tool <family>: <name>`) list by
     /// their name in `Tools used:`, while the family they still carry keeps
     /// the file-activity heuristic firing.
