@@ -353,7 +353,7 @@ async fn m8_retention_lifecycle_end_to_end() {
     );
 
     // Hot + semantic + pinned pages should still be searchable.
-    // Note on FTS5: our tokenizer is `unicode61 tokenchars '/_-'`, so
+    // Note on FTS5: our tokenizer is `unicode61 tokenchars '_-'`, so
     // `writer-actor` and `single-writer` are *single* tokens. We pick
     // distinct standalone keywords to test each page independently.
     let backpressure_hits = store

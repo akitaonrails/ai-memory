@@ -30,9 +30,9 @@ Checked against `main` at `ac699b56`. References name the file and the symbol.
 
 | Part | Where | Fact |
 |---|---|---|
-| Table | `crates/ai-memory-store/migrations/V01__init.sql`, `V10__observation_extension_events.sql` | `observations` keys every row by `session_id`, `workspace_id` and `project_id`, all `ON DELETE CASCADE`. No path column. V10 added two nullable columns (`extension`, `source_event`) and a partial index `WHERE extension IS NOT NULL AND source_event IS NOT NULL` scoped by `(workspace_id, project_id, ...)`. The highest migration is V96. |
+| Table | `crates/ai-memory-store/migrations/V01__init.sql`, `V10__observation_extension_events.sql` | `observations` keys every row by `session_id`, `workspace_id` and `project_id`, all `ON DELETE CASCADE`. No path column. V10 added two nullable columns (`extension`, `source_event`) and a partial index `WHERE extension IS NOT NULL AND source_event IS NOT NULL` scoped by `(workspace_id, project_id, ...)`. The highest migration is V97. |
 | Body | `crates/ai-memory-hooks/src/payload.rs` `safe_tool_body`, `closed_tool_agent`; `capture_policy.rs` `tool_observation_metadata` | Closed schema for the agents in `closed_tool_agent`. `tool_observation_metadata` keeps family, call id and MCP names; it never reads a path field. |
-| FTS | `crates/ai-memory-store/migrations/V12__fts_remove_diacritics.sql` (`observations_fts`) | The tokenizer keeps `/`, `_` and `-` inside tokens. An absolute path in tool output (`/repo/src/lib.rs`) does not match a query for `src/lib.rs`. The CJK index added in V87 covers only unspaced Han, Kana and Hangul. |
+| FTS | `crates/ai-memory-store/migrations/V97__fts_split_path_separators.sql` (`observations_fts`) | The tokenizer keeps `_` and `-` inside tokens and splits on `/`, so an absolute path in tool output (`/repo/src/lib.rs`) matches a query for `lib.rs`, `lib` or `src/lib.rs`. Before V97 `/` was a token character and only a bare `lib.rs` mention matched. The CJK index added in V87 covers only unspaced Han, Kana and Hangul. |
 | Client policy | `crates/ai-memory-cli/src/commands/hook.rs` `run_with_payload_in_home` | The native client applies `[capture] ignore_paths` before the spool: Drop sends nothing, MetadataOnly rebuilds the body, Keep under an active or invalid policy attaches `_ai_memory_capture`. Keep under an **inactive** policy (no marker, or no `ignore_paths`, the common case) attaches nothing. |
 | TS policy | `crates/ai-memory-cli/src/commands/render_shared.rs` `ts_capture_policy_v1` | The generated integrations (OpenCode, OMP, Pi, OpenClaw) implement the same table and return early on an inactive policy, also without a claim. The template is generated from `capture_policy.rs` so the two front doors cannot drift. |
 | `apply_patch` | `capture_policy.rs` `extract`, `patch_paths` | Codex `apply_patch` and Droid `ApplyPatch` carry no direct path field. `patch_paths` reads the `Add File`, `Update File`, `Delete File` and `Move to` headers, and feeds only the cross-checkout lookup. A file call without a direct path is `MissingOrMalformed`, so under an active policy it becomes metadata-only, whatever the paths. |
@@ -315,9 +315,11 @@ section 10, question 7.
 
 ## 9. Alternatives
 
-- **Text matching only (option A in #1843):** no storage change, but the
-  tokenizer misses absolute paths in tool output and coverage without LLM
-  consolidation is low. Rejected by the maintainer as a basis for delivery.
+- **Text matching only (option A in #1843):** no storage change. Since V97
+  the tokenizer finds a file by name inside an absolute path, but a hit is
+  still incidental text, not a structured per-file record, and coverage
+  without LLM consolidation is low. Rejected by the maintainer as a basis for
+  delivery.
 - **A side table:** fits several paths per call (a multi-file `apply_patch`), at
   the cost of a join and its own lifecycle. Deferred until multi-file calls are
   in scope.
