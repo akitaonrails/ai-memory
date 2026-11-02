@@ -100,6 +100,9 @@ struct Change {
     range: Range<usize>,
     replacement: String,
     placement: Placement,
+    /// Where the heading of the existing section this edit writes into
+    /// starts; `None` for an `end_of_page` append and a new section.
+    heading: Option<usize>,
 }
 
 pub(crate) fn section_hashes(body: &str) -> (Vec<SectionHash>, bool) {
@@ -151,6 +154,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                     range: body.len()..body.len(),
                     replacement: appended(body, content),
                     placement: Placement::EndOfPage,
+                    heading: None,
                 }
             }
             PagePatchEdit::Append {
@@ -167,6 +171,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                     range: section.whole.end..section.whole.end,
                     replacement: appended(&body[section.whole.clone()], content),
                     placement: Placement::Section,
+                    heading: Some(section.whole.start),
                 }
             }
             PagePatchEdit::AddSection { anchor, content } => {
@@ -182,6 +187,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                     range: body.len()..body.len(),
                     replacement: appended(body, &format!("{heading}\n{content}")),
                     placement: Placement::NewSection,
+                    heading: None,
                 }
             }
             PagePatchEdit::ReplaceSection {
@@ -205,10 +211,24 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                     range: section.content.clone(),
                     replacement: section_content(content),
                     placement: Placement::Section,
+                    heading: Some(section.whole.start),
                 }
             }
         };
         changes.push(change);
+    }
+
+    // A replacement deletes every section nested in it, so no other edit may
+    // write into one of those. An append to the last nested section inserts
+    // exactly where the replaced range ends, which the range check below lets
+    // through.
+    if changes.iter().any(|replaced| {
+        changes
+            .iter()
+            .filter_map(|change| change.heading)
+            .any(|heading| replaced.range.contains(&heading))
+    }) {
+        return Err(PatchError::Overlapping);
     }
 
     changes.sort_by_key(|change| (change.range.start, change.range.end, change.placement));
