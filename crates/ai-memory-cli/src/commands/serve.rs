@@ -1606,8 +1606,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             // are pure request-response and project resolution rides the
             // in-process `ActiveProject` pointer, not the transport
             // session — so session mode buys us nothing. `--http-stateful`
-            // restores rmcp's session+SSE behaviour for clients that want
-            // it.
+            // restores rmcp's session+SSE behaviour for legacy clients
+            // that want it. rmcp 3 renamed the switch to
+            // `legacy_session_mode` and scoped it: under the 2026-07-28
+            // revision (SEP-2567) sessions no longer exist, so requests
+            // negotiating that version are always served statelessly and
+            // the flag only governs `initialize`-era versions.
             info!(
                 stateful = args.http_stateful,
                 "MCP Streamable HTTP transport mode"
@@ -1618,7 +1622,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 StreamableHttpServerConfig::default()
                     .with_cancellation_token(cancel.child_token())
                     .with_allowed_hosts(config.allowed_hosts.clone())
-                    .with_stateful_mode(args.http_stateful)
+                    .with_legacy_session_mode(args.http_stateful)
                     .with_json_response(!args.http_stateful),
             );
             // Shared per-cwd project cache: the hook router owns it; the admin

@@ -115,7 +115,7 @@ async fn harness() -> Harness {
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     let users = Arc::new(HashMap::from([
@@ -415,7 +415,7 @@ async fn page_write_failure_after_promotion_preserves_manifest_warning() {
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     let router = Router::new().nest_service("/mcp", service);
@@ -488,7 +488,7 @@ async fn handoff_failure_after_promotion_preserves_manifest_warning() {
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     let router = Router::new().nest_service("/mcp", service);

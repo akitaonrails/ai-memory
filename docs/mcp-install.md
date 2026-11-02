@@ -54,7 +54,10 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > supports stdio servers; session state has nothing to do with it. If you run a
 > client that *requires* MCP session continuity or server-initiated SSE
 > streams, start the server with `ai-memory serve --transport http
-> --http-stateful` to restore rmcp's session mode.
+> --http-stateful` to restore the legacy initialize-era session mode. Clients
+> that speak MCP 2026-07-28 use `server/discover` and per-request version
+> metadata, both served without a session; clients that send the older
+> `initialize` handshake keep working.
 
 This page documents how to register ai-memory as an MCP server with
 agent CLIs beyond the README quick start. For OpenCode, the generic

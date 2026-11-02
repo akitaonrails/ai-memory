@@ -2,16 +2,20 @@
 //! in-process upstream MCP server.
 //!
 //! A dual-era client (Antigravity CLI 1.4, the Antigravity 2.24 app) probes
-//! with `server/discover` before anything else and falls back to `initialize`
-//! when a legacy server answers with any error or not at all:
+//! with `server/discover` before anything else and falls back to
+//! `initialize` when a legacy server answers with any error or not at all:
 //! <https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio#backward-compatibility>.
-//! The bridge used to exit on the probe, so the fallback hit a closed pipe.
+//! Since the rmcp 3 bump (#1924) the bridge answers the probe itself — both
+//! lifecycles work — while still absorbing the probe-cancel notification a
+//! client that already gave up on it sends next.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use rmcp::model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool};
+use rmcp::model::{
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -26,8 +30,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
 struct OneTool;
 
 impl ServerHandler for OneTool {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -53,7 +57,7 @@ async fn upstream() -> (String, tokio::task::JoinHandle<()>) {
         || Ok(OneTool),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -109,11 +113,11 @@ fn spawn_bridge(url: &str, home: &std::path::Path, env: &[(&str, &str)]) -> toki
         .expect("spawn mcp-bridge")
 }
 
-/// The probe, a cancellation of it, a ping and an era-ambiguous `tools/list`
-/// before `initialize` each leave the bridge running: requests get a
-/// non-modern error (not `-32022` UnsupportedProtocolVersion, which would stop
-/// the fallback), the notification gets nothing, and the handshake that
-/// follows reaches the upstream tools.
+/// The modern and legacy lifecycles both reach the upstream tools. A
+/// `server/discover` probe is answered, the cancellation a client sends after
+/// giving up on it is absorbed, a request with complete 2026-07-28 `_meta` is
+/// served without a handshake, and a separate legacy client still starts at
+/// `initialize` and lists the same tool.
 #[tokio::test]
 async fn a_server_discover_probe_is_answered_and_initialize_still_works() {
     let (url, server) = upstream().await;
@@ -134,8 +138,21 @@ async fn a_server_discover_probe_is_answered_and_initialize_still_works() {
     )
     .await;
     let discover = reply(&mut stdout, json!(1)).await;
-    assert!(discover.get("result").is_none(), "{discover}");
-    assert_eq!(discover["error"]["code"], json!(-32601), "{discover}");
+    assert_eq!(
+        discover["result"]["resultType"],
+        json!("complete"),
+        "{discover}"
+    );
+    assert!(
+        discover["result"]["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.contains(&json!("2026-07-28"))),
+        "{discover}"
+    );
+    assert!(
+        discover["result"]["capabilities"]["tools"].is_object(),
+        "{discover}"
+    );
 
     send(
         &mut stdin,
@@ -158,43 +175,58 @@ async fn a_server_discover_probe_is_answered_and_initialize_still_works() {
     )
     .await;
     let early = reply(&mut stdout, json!(2)).await;
-    assert!(early.get("result").is_none(), "{early}");
-    assert_eq!(early["error"]["code"], json!(-32601), "{early}");
+    assert_eq!(
+        early["result"]["tools"][0]["name"],
+        json!("probe_tool"),
+        "a request with complete 2026-07-28 meta is served statelessly: {early}"
+    );
 
+    drop(stdin);
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("the modern bridge exits when stdin closes")
+        .unwrap();
+    assert!(status.success(), "{status}");
+
+    // A legacy client never probes: it starts at `initialize`, and rmcp 3
+    // must still complete that handshake and serve the same upstream tools.
+    let mut legacy_child = spawn_bridge(&url, home.path(), &[]);
+    let mut legacy_stdin = legacy_child.stdin.take().unwrap();
+    let mut legacy_stdout = BufReader::new(legacy_child.stdout.take().unwrap()).lines();
     send(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "id": 3, "method": "initialize",
+        &mut legacy_stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                           "clientInfo": {"name": "dual-era-e2e", "version": "0"}}}),
     )
     .await;
-    let init = reply(&mut stdout, json!(3)).await;
+    let init = reply(&mut legacy_stdout, json!(1)).await;
     assert_eq!(
         init["result"]["protocolVersion"],
         json!("2025-06-18"),
         "{init}"
     );
     send(
-        &mut stdin,
+        &mut legacy_stdin,
         json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     )
     .await;
     send(
-        &mut stdin,
-        json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}}),
+        &mut legacy_stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
     )
     .await;
-    let tools = reply(&mut stdout, json!(4)).await;
+    let tools = reply(&mut legacy_stdout, json!(2)).await;
     assert_eq!(
         tools["result"]["tools"][0]["name"],
         json!("probe_tool"),
         "{tools}"
     );
 
-    drop(stdin);
-    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+    drop(legacy_stdin);
+    let status = tokio::time::timeout(Duration::from_secs(20), legacy_child.wait())
         .await
-        .expect("the bridge exits when stdin closes")
+        .expect("the legacy bridge exits when stdin closes")
         .unwrap();
     assert!(status.success(), "{status}");
     server.abort();

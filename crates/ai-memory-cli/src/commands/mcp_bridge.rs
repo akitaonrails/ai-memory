@@ -41,8 +41,8 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ClientRequest, ErrorCode,
-    ListToolsResult, PaginatedRequestParams, ServerInfo, ServerJsonRpcMessage,
+    CallToolRequestParams, CallToolResponse, ClientJsonRpcMessage, ClientRequest, ListToolsResult,
+    PaginatedRequestParams, ServerConfig, ServerJsonRpcMessage, ServerPeerInfo,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, ServiceError};
 use rmcp::transport::async_rw::AsyncRwTransport;
@@ -59,12 +59,12 @@ const ACTOR_SESSION_HEADER: HeaderName = HeaderName::from_static("x-memory-actor
 #[derive(Clone)]
 struct SessionAwareBridge {
     upstream: Peer<RoleClient>,
-    server_info: ServerInfo,
+    server_config: ServerConfig,
 }
 
 impl ServerHandler for SessionAwareBridge {
-    fn get_info(&self) -> ServerInfo {
-        self.server_info.clone()
+    fn get_info(&self) -> ServerConfig {
+        self.server_config.clone()
     }
 
     async fn list_tools(
@@ -82,12 +82,34 @@ impl ServerHandler for SessionAwareBridge {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
+        // `call_tool_once` forwards the upstream's answer verbatim, so an
+        // MRTR `input_required` or task result (SEP-2322/SEP-2663) reaches
+        // the downstream client with its shape intact instead of the
+        // round-driving `call_tool` helper resolving it against this
+        // handler-less bridge.
         self.upstream
-            .call_tool(request)
+            .call_tool_once(request)
             .await
             .map_err(upstream_error)
     }
+}
+
+/// Downgrade the negotiated upstream peer info to the config this bridge
+/// advertises downstream. rmcp 3's [`ServerPeerInfo`] makes the server
+/// identity optional (a discovery-only server may omit it) while
+/// [`ServerConfig`] requires one, so the builder default stands in on the
+/// unreachable `None` path.
+fn bridge_config(info: ServerPeerInfo) -> ServerConfig {
+    let mut config =
+        ServerConfig::new(info.capabilities).with_protocol_version(info.protocol_version);
+    if let Some(implementation) = info.server_info {
+        config = config.with_server_info(implementation);
+    }
+    if let Some(instructions) = info.instructions {
+        config = config.with_instructions(instructions);
+    }
+    config
 }
 
 fn upstream_error(error: ServiceError) -> McpError {
@@ -97,37 +119,40 @@ fn upstream_error(error: ServiceError) -> McpError {
     }
 }
 
-/// The stdio transport, kept open through a dual-era client's version probe.
+/// The stdio transport, shielded through rmcp's lifecycle bootstrap.
 ///
-/// rmcp 2.2's server handshake answers `ping` before `initialize` and ends
-/// the session on any other message. A client that speaks both the 2026-07-28
-/// revision and the `initialize` handshake (Antigravity CLI 1.4, the
-/// Antigravity 2.24 app) first sends `server/discover`, and falls back to
-/// `initialize` when the server answers with any error or not at all
+/// rmcp 3's server handshake answers a dual-era client's `server/discover`
+/// probe itself (modelcontextprotocol/rust-sdk#1248) and stays open for
+/// either lifecycle, so — unlike the rmcp 2.2 bridge — every request passes
+/// through unchanged: `ping` and `server/discover` are answered inline, a
+/// request carrying complete 2026-07-28 per-request `_meta` is served
+/// statelessly (SEP-2567), and `initialize` runs the legacy handshake a
+/// client falls back to
 /// (<https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio#backward-compatibility>).
-/// Exiting instead closes the pipe under that fallback. Until `initialize`
-/// arrives this answers every other request with Method not found, so the
-/// client sees a legacy server, and drops notifications: a client that stopped
-/// waiting for its probe may cancel it. From `initialize` on, every message
-/// passes through to rmcp unchanged.
 ///
-/// Revisit on an rmcp 3.x bump: its handshake answers the probe itself
-/// (modelcontextprotocol/rust-sdk#1248).
-struct PreInitializeGate<T> {
+/// What rmcp 3 still does not survive is a *notification* while its
+/// bootstrap loop is selecting a lifecycle: it treats any non-request there
+/// as a fatal "expected initialize" error, and a dual-era client that gave
+/// up waiting on its probe cancels it with `notifications/cancelled`. So
+/// until a lifecycle-selecting request (`initialize`, or any request other
+/// than `ping`/`server/discover`, which rmcp answers without leaving the
+/// bootstrap loop) has passed, this gate drops notifications and client
+/// responses; from then on every message passes through unchanged.
+struct PreLifecycleGate<T> {
     inner: T,
-    initialize_seen: bool,
+    lifecycle_selected: bool,
 }
 
-impl<T> PreInitializeGate<T> {
+impl<T> PreLifecycleGate<T> {
     fn new(inner: T) -> Self {
         Self {
             inner,
-            initialize_seen: false,
+            lifecycle_selected: false,
         }
     }
 }
 
-impl<T: Transport<RoleServer>> Transport<RoleServer> for PreInitializeGate<T> {
+impl<T: Transport<RoleServer>> Transport<RoleServer> for PreLifecycleGate<T> {
     type Error = T::Error;
 
     fn send(
@@ -138,28 +163,22 @@ impl<T: Transport<RoleServer>> Transport<RoleServer> for PreInitializeGate<T> {
     }
 
     async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
-        while !self.initialize_seen {
+        while !self.lifecycle_selected {
             let ClientJsonRpcMessage::Request(request) = self.inner.receive().await? else {
+                // rmcp's bootstrap loop treats any non-request before a
+                // lifecycle is selected as fatal; dropping it here keeps the
+                // transport open for the initialize that may follow.
                 continue;
             };
             match request.request {
-                ClientRequest::InitializeRequest(_) => self.initialize_seen = true,
-                ClientRequest::PingRequest(_) => {}
-                _ => {
-                    let error = McpError::new(
-                        ErrorCode::METHOD_NOT_FOUND,
-                        format!(
-                            "{} is not available before initialize",
-                            request.request.method()
-                        ),
-                        None,
-                    );
-                    self.inner
-                        .send(ServerJsonRpcMessage::error(error, Some(request.id)))
-                        .await
-                        .ok()?;
-                    continue;
-                }
+                // Answered by rmcp inside the bootstrap loop: neither ends
+                // lifecycle selection, so neither unlatches this gate.
+                ClientRequest::PingRequest(_) | ClientRequest::DiscoverRequest(_) => {}
+                // `initialize` selects the legacy lifecycle; any other
+                // request is dispatched by rmcp (served statelessly under
+                // complete 2026-07-28 `_meta`, or answered with a
+                // recoverable error), ending the bootstrap loop either way.
+                _ => self.lifecycle_selected = true,
             }
             return Some(ClientJsonRpcMessage::Request(request));
         }
@@ -371,17 +390,17 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
             });
         }
     };
-    let server_info = upstream
+    let server_config = upstream
         .peer_info()
-        .map(|info| (*info).clone())
+        .map(|info| bridge_config((*info).clone()))
         .context("upstream MCP server completed initialization without server info")?;
     let bridge = SessionAwareBridge {
         upstream: upstream.peer().clone(),
-        server_info,
+        server_config,
     };
     let (stdin, stdout) = stdio();
     let downstream = bridge
-        .serve(PreInitializeGate::new(AsyncRwTransport::new_server(
+        .serve(PreLifecycleGate::new(AsyncRwTransport::new_server(
             stdin, stdout,
         )))
         .await
@@ -452,7 +471,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::Router;
-    use rmcp::model::{ContentBlock as Content, ServerCapabilities, Tool};
+    use rmcp::model::{CallToolResult, ContentBlock as Content, ServerCapabilities, Tool};
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -464,8 +483,8 @@ mod tests {
     }
 
     impl ServerHandler for EchoServer {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
         }
 
         async fn list_tools(
@@ -487,7 +506,7 @@ mod tests {
             &self,
             request: CallToolRequestParams,
             context: RequestContext<RoleServer>,
-        ) -> Result<CallToolResult, McpError> {
+        ) -> Result<CallToolResponse, McpError> {
             let session = context
                 .extensions
                 .get::<axum::http::request::Parts>()
@@ -495,10 +514,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
             *self.seen_session.lock().unwrap() = session;
-            Ok(CallToolResult::success(vec![Content::text(format!(
-                "echo:{}",
-                request.name
-            ))]))
+            Ok(
+                CallToolResult::success(vec![Content::text(format!("echo:{}", request.name))])
+                    .into(),
+            )
         }
     }
 
@@ -630,7 +649,7 @@ mod tests {
                 move || Ok(echo.clone()),
                 LocalSessionManager::default().into(),
                 StreamableHttpServerConfig::default()
-                    .with_stateful_mode(stateful)
+                    .with_legacy_session_mode(stateful)
                     .with_json_response(!stateful),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -650,7 +669,10 @@ mod tests {
         let upstream = ().serve(upstream_transport).await.unwrap();
         let bridge = SessionAwareBridge {
             upstream: upstream.peer().clone(),
-            server_info: upstream.peer_info().map(|info| (*info).clone()).unwrap(),
+            server_config: upstream
+                .peer_info()
+                .map(|info| bridge_config((*info).clone()))
+                .unwrap(),
         };
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let downstream_server = tokio::spawn(async move { bridge.serve(server_io).await.unwrap() });
