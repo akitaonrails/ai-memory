@@ -12,6 +12,8 @@
 //! whose validated paths cannot escape the destination directory, and are
 //! never executed or rendered.
 
+mod atomic;
+
 pub mod bidi;
 pub mod client;
 pub mod hook;

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::STATE_DIR;
+use crate::atomic;
 
 const STATE_FILE: &str = "state.json";
 const IGNORE_FILE: &str = ".gitignore";
@@ -30,7 +31,6 @@ const LOCK_FILE: &str = "write.lock";
 /// baselines.
 const IGNORE_ALL: &[u8] = b"# Written by ai-memory-wikisync: export state is per clone.\n*\n";
 const STATE_VERSION: u32 = 1;
-const TMP_SUFFIX: &str = ".tmp";
 
 /// SHA-256 of `bytes` as lowercase hex.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -269,10 +269,13 @@ pub fn load(dest_root: &Path) -> Result<SyncState> {
     Ok(state)
 }
 
-/// Atomically persist the state: tmp file in the same directory, fsync,
-/// rename over the old file. Called once after each successful write batch,
-/// so a crash mid-batch leaves the previous state intact and the next run
-/// re-classifies through the three-way comparison instead of trusting it.
+/// Atomically persist the state: an unpredictably named, exclusively
+/// created tmp file in the same directory, fsync, rename over the old file.
+/// Called once after each successful write batch, so a crash mid-batch
+/// leaves the previous state intact and the next run re-classifies through
+/// the three-way comparison instead of trusting it. The staging name is
+/// unpredictable (GHSA-jr85-7366-xrm2), so nothing writable ever sits at a
+/// name a teammate could plant or race.
 pub fn save(dest_root: &Path, state: &SyncState) -> Result<()> {
     let path = state_path(dest_root);
     let dir = path.parent().unwrap_or(dest_root);
@@ -286,33 +289,7 @@ pub fn save(dest_root: &Path, state: &SyncState) -> Result<()> {
     }
     ignore_state_dir(dir)?;
     let json = serde_json::to_vec_pretty(state).context("cannot serialize state")?;
-    let tmp = PathBuf::from(format!("{}{TMP_SUFFIX}", path.display()));
-    // Leftover tmp from a crashed run is ours by name; clear it.
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::new(e))
-                .context(format!("cannot clear stale {}", tmp.display()));
-        }
-    }
-    {
-        let mut file =
-            fs::File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("cannot restrict permissions on {}", tmp.display()))?;
-        }
-        file.write_all(&json)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("cannot sync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, &path)
-        .with_context(|| format!("cannot move {} over {}", tmp.display(), path.display()))?;
-    Ok(())
+    atomic::write_atomic(&path, &json, atomic::KeepMode::Exact(0o600))
 }
 
 /// Keep the state directory out of git. An existing `.gitignore` is left as
@@ -571,14 +548,54 @@ mod tests {
         }
     }
 
+    /// A `state.json.tmp` left by a pre-fix crashed run is inert: never
+    /// read, never cleared. Since GHSA-jr85-7366-xrm2 the staging name is
+    /// unpredictable, so nothing touches the predictable one at all.
     #[test]
-    fn save_survives_a_stale_tmp_file() {
+    fn a_legacy_tmp_file_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         fs::create_dir_all(root.join(STATE_DIR)).unwrap();
         fs::write(root.join(STATE_DIR).join("state.json.tmp"), b"junk").unwrap();
         save(&root, &SyncState::default()).unwrap();
         assert!(load(&root).unwrap() == SyncState::default());
+        assert_eq!(
+            fs::read(root.join(STATE_DIR).join("state.json.tmp")).unwrap(),
+            b"junk"
+        );
+    }
+
+    /// GHSA-jr85-7366-xrm2: `save` staged at `state.json.tmp` — predictable,
+    /// cleared with remove-then-create, so a re-planted symlink won the race
+    /// and `File::create` followed it. The staging name is unpredictable and
+    /// exclusively created now: the canary keeps its bytes, the state still
+    /// saves, and the plant is never even removed.
+    #[cfg(unix)]
+    #[test]
+    fn save_ignores_a_symlink_planted_at_the_old_staging_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join(STATE_DIR)).unwrap();
+        let victim = tmp.path().join("victim.json");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(STATE_DIR).join("state.json.tmp")).unwrap();
+
+        let mut state = SyncState::default();
+        state
+            .pages
+            .insert("notes/a.md".to_string(), page(&"a".repeat(64), None));
+        save(&root, &state).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(load(&root).unwrap(), state);
+        // The plant survives: no remove-then-create dance ran at a
+        // predictable name, so the race window is gone with it.
+        assert!(
+            fs::symlink_metadata(root.join(STATE_DIR).join("state.json.tmp"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
