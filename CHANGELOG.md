@@ -99,6 +99,18 @@ version in [`docs/changelog/`](docs/changelog/):
   while preserving checkout, operator, project and lease checks; replaying an
   older session cannot move the run backward (#1936).
 
+### Security
+
+- `ai-memory-wikisync` now stages every file it replaces (exported pages,
+  the export state file and the git `post-merge` hook) under an
+  unpredictable name created exclusively, instead of a fixed staging name
+  opened with `File::create` or a remove-then-create pair. In a
+  destination shared with other accounts, a symlink planted at one of the
+  old predictable staging names could make an apply overwrite a file of
+  the planter's choosing, or win the narrow race those two writes left;
+  planted symlinks are now neither followed nor raced.
+  ([GHSA-jr85-7366-xrm2](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jr85-7366-xrm2))
+
 ## [3.3.1] - 2026-11-01
 
 ### Fixed
