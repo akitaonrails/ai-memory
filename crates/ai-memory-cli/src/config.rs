@@ -2095,6 +2095,16 @@ pub struct RetrievalSettings {
     /// `sessions/<id>.md` page in the same project. Read-only; the wiki is
     /// not enlarged. ON by default; `false` restores the previous ranking.
     pub observation_stream: bool,
+    /// Weight subtracted from the authority factor of a page whose current
+    /// version carries open `stale`/`wrong` feedback (#1941). `0.0` (the
+    /// default) is inert. Positive demotes the flagged page inside the
+    /// existing authority bounds until a rewrite clears the feedback.
+    pub feedback_demotion: f64,
+    /// Weight of the query-scoped implicit-signal boost (#1941): a page that
+    /// was read (or marked `helpful`) after a similar earlier query gains up
+    /// to `weight * similarity` in authority. `0.0` (the default) is inert —
+    /// nothing is captured and nothing is boosted.
+    pub query_signal_weight: f64,
 }
 
 impl Default for RetrievalSettings {
@@ -2106,6 +2116,8 @@ impl Default for RetrievalSettings {
             abstract_vectors: base.abstract_vectors,
             belief_authority_weight: base.belief_authority_weight,
             observation_stream: base.observation_stream,
+            feedback_demotion: base.feedback_demotion,
+            query_signal_weight: base.query_signal_weight,
         }
     }
 }
@@ -2123,6 +2135,11 @@ impl RetrievalSettings {
             // inverted.
             belief_authority_weight: self.belief_authority_weight.max(0.0),
             observation_stream: self.observation_stream,
+            // Same clamp for the two feedback-informed weights: a negative
+            // demotion would *promote* flagged pages and a negative signal
+            // weight would penalize confirmed ones.
+            feedback_demotion: self.feedback_demotion.max(0.0),
+            query_signal_weight: self.query_signal_weight.max(0.0),
         }
     }
 }
@@ -4498,6 +4515,61 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains("observation-stream-env-applied"),
             "child stdout: {}",
             String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn retrieval_feedback_signals_default_off_load_and_clamp() {
+        let defaults = Config::default().retrieval.tuning();
+        assert_eq!(defaults.feedback_demotion, 0.0);
+        assert_eq!(defaults.query_signal_weight, 0.0);
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[retrieval]\nfeedback_demotion = 0.3\nquery_signal_weight = -1.0\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        let tuning = config.retrieval.tuning();
+        assert_eq!(tuning.feedback_demotion, 0.3);
+        assert_eq!(
+            tuning.query_signal_weight, 0.0,
+            "a negative signal weight must not penalize confirmed pages"
+        );
+    }
+
+    #[test]
+    fn retrieval_feedback_signal_env_overrides_config() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_FEEDBACK_SIGNAL_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, "[retrieval]\nfeedback_demotion = 0.0\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            let tuning = config.retrieval.tuning();
+            assert_eq!(tuning.feedback_demotion, 0.7);
+            assert_eq!(tuning.query_signal_weight, 0.8);
+            println!("feedback-signal-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::retrieval_feedback_signal_env_overrides_config")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_RETRIEVAL__FEEDBACK_DEMOTION", "0.7")
+            .env("AI_MEMORY_RETRIEVAL__QUERY_SIGNAL_WEIGHT", "0.8")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

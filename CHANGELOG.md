@@ -57,6 +57,17 @@ version in [`docs/changelog/`](docs/changelog/):
 - Made workspace, project, and agent dashboard metric cards link to the
   project list, session/event tables, Knowledge view, or harness-filtered
   Token usage view that explains each count (#1868).
+- Added two off-by-default retrieval signals. `[retrieval] feedback_demotion`
+  lowers the authority of a current page version carrying open `stale` or
+  `wrong` feedback until a rewrite supersedes it. `[retrieval]
+  query_signal_weight` records a sanitized, project-scoped association when
+  the same session reads a query hit or marks it helpful, then boosts that
+  page for later similar queries; the boost is capped by lexical similarity
+  and the number of distinct sessions, and a rewrite clears it. Only callers
+  with write access record associations, `not_helpful` withdraws one, and
+  purging a session deletes the ones it wrote. Both
+  contributions appear in `memory_query(explain=true)`, and both weights
+  default to `0.0`, leaving ranking and capture unchanged (#1941).
 - Added `[recovery] deliver_on_session_start = false` to `.ai-memory.toml`.
   The per-project opt-out suppresses the unfinished-session recovery snapshot
   and its backfill marker without closing the source session. Handoffs,
