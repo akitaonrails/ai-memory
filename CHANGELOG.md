@@ -25,6 +25,13 @@ version in [`docs/changelog/`](docs/changelog/):
   while the OKF wiki migration is pending. Capture and search keep working, as
   `docs/windows.md` describes, and startup logs the owner failure at ERROR with
   the remedy; wiki commits keep failing until ownership is fixed (#1923).
+
+- Consolidation now waits for an LLM provider's `Retry-After` hint before
+  retrying after a rate limit or transient error, capped at 32 seconds, matching
+  the policy used by bootstrap chunks (#1889), remote embedders (#1397) and the
+  fallback chain (#1619). A rate-limited provider answering `429` with a hint
+  longer than the fixed 2-second delay is no longer retried prematurely before
+  its window has reset (#1928).
 ## [3.3.1] - 2026-11-01
 
 ### Fixed

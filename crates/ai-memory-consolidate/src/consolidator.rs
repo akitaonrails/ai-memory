@@ -113,6 +113,19 @@ const CONSOLIDATION_LLM_MAX_ATTEMPTS: u32 = 3;
 /// tenacity-style escalating backoff — see the cognee #2840 lesson in
 /// `ai-memory-llm`; the same policy `bootstrap.rs` applies to its chunks.
 const CONSOLIDATION_LLM_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Ceiling on a provider-requested wait, the same one the remote embedders
+/// apply to `Retry-After` (#1397) and `bootstrap.rs` applies to its chunks
+/// (#1889), so one bad hint cannot park consolidation.
+const CONSOLIDATION_LLM_MAX_RETRY_AFTER: Duration = Duration::from_secs(32);
+
+/// Wait before retrying consolidation after `err`. A provider that names its
+/// own delay is waited for, up to [`CONSOLIDATION_LLM_MAX_RETRY_AFTER`]:
+/// retrying sooner than a rate-limited provider asked only spends the attempt
+/// on another `429`. Without a hint the fixed `fallback` applies, as before.
+fn consolidation_retry_wait(err: &LlmError, fallback: Duration) -> Duration {
+    err.retry_after()
+        .map_or(fallback, |hint| hint.min(CONSOLIDATION_LLM_MAX_RETRY_AFTER))
+}
 
 /// Run one consolidation structured call with a short, bounded retry.
 ///
@@ -137,17 +150,19 @@ where
         match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
             Ok(value) => return Ok(value),
             Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
+                let wait = consolidation_retry_wait(&e, retry_delay);
                 // Redacted fields only: this log line is on the consolidation
                 // path, and the `Display` of a provider failure carries the
                 // response body while an HTTP error's can carry the URL.
                 warn!(
                     attempt,
                     max = CONSOLIDATION_LLM_MAX_ATTEMPTS,
+                    wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                     error_class = %e.class(),
                     error_status = ?e.http_status(),
                     "consolidation hit a transient LLM error; retrying shortly",
                 );
-                tokio::time::sleep(retry_delay).await;
+                tokio::time::sleep(wait).await;
                 attempt += 1;
             }
             Err(e) => return Err(e),
@@ -4644,6 +4659,7 @@ mod tests {
         calls: AtomicUsize,
         failures: usize,
         failure: ScriptedFailure,
+        retry_after: Option<Duration>,
         response: serde_json::Value,
     }
 
@@ -4672,7 +4688,7 @@ mod tests {
                     ScriptedFailure::Transient => LlmError::Provider {
                         status: 503,
                         body: "This model is currently experiencing high demand.".into(),
-                        retry_after: None,
+                        retry_after: self.retry_after,
                     },
                     ScriptedFailure::Deterministic => LlmError::Auth("expired".into()),
                 });
@@ -4754,6 +4770,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             failures: 2, // fails twice, answers on the 3rd (= the budget)
             failure: ScriptedFailure::Transient,
+            retry_after: None,
             response: scripted_page(),
         };
 
@@ -4782,6 +4799,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             failures: usize::MAX, // never clears
             failure: ScriptedFailure::Transient,
+            retry_after: None,
             response: scripted_page(),
         };
 
@@ -4802,6 +4820,61 @@ mod tests {
         );
     }
 
+    /// A provider hint replaces the fixed delay, clamped to the same ceiling
+    /// the remote embedders and bootstrap use; without one the fixed delay is
+    /// unchanged.
+    #[test]
+    fn consolidation_retry_wait_honours_a_capped_provider_hint() {
+        let hinted = |hint| LlmError::Provider {
+            status: 429,
+            body: "slow down".into(),
+            retry_after: Some(hint),
+        };
+        let fixed = Duration::from_secs(2);
+        assert_eq!(
+            consolidation_retry_wait(&LlmError::Auth("x".into()), fixed),
+            fixed
+        );
+        assert_eq!(
+            consolidation_retry_wait(&hinted(Duration::from_secs(10)), fixed),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            consolidation_retry_wait(&hinted(Duration::from_secs(3600)), fixed),
+            CONSOLIDATION_LLM_MAX_RETRY_AFTER,
+            "a huge hint must not park consolidation"
+        );
+    }
+
+    /// A rate-limited provider that says when to come back is not retried
+    /// before then, even when the fixed delay is zero: retrying earlier only
+    /// spends the attempt on another 429.
+    #[tokio::test]
+    async fn consolidation_retry_waits_for_the_providers_retry_after() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: 1,
+            failure: ScriptedFailure::Transient,
+            retry_after: Some(Duration::from_millis(150)),
+            response: scripted_page(),
+        };
+        let started = std::time::Instant::now();
+        complete_structured_with_retry::<ConsolidatedPage>(
+            &llm,
+            ChatRequest::user_prompt("consolidate"),
+            ai_memory_llm::LlmOperationId::default(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("the retry after the hinted wait succeeds");
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "retried after {:?}, before the provider's Retry-After",
+            started.elapsed()
+        );
+    }
+
     /// A deterministic failure is not retried, and a consolidation whose
     /// completion never arrives writes no page.
     #[tokio::test]
@@ -4812,6 +4885,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             failures: usize::MAX,
             failure: ScriptedFailure::Deterministic,
+            retry_after: None,
             response: scripted_page(),
         });
 
