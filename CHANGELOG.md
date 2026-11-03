@@ -11,6 +11,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Security
+
+- A password or API key printed by a tool is now redacted when the result
+  arrives as an object, the shape Claude Code's Bash `PostToolUse` always
+  takes (`{"stdout", "stderr", "interrupted"}`). Such a result is stored as
+  compact JSON, so the sanitizer saw `\"` and `\n` where its rules expected
+  a quote and a line break: a `"db_password": "..."` in a printed config, a
+  quoted TOML or YAML value, `"Authorization": "Basic ..."` and any `.env`
+  key past the first line were stored in clear while the same text as a
+  plain body was redacted. The sanitizer now matches through JSON string
+  escapes as it already did through invisible characters, a redaction stops
+  at the end of its line instead of swallowing the rest of the result, and
+  what counts as a key or a value is unchanged (#1963).
+
 ## [3.3.2] - 2026-11-03
 
 ### Fixed

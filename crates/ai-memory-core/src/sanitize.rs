@@ -123,42 +123,99 @@ fn emoji_tag_run_len(rest: &str) -> usize {
     0
 }
 
-/// `text` with every [`is_default_ignorable`] character removed, plus the
-/// original byte offset of each byte kept, so a match found in the shadow
-/// maps back to the span it covers in `text`.
+/// `text` seen through its transport encoding: every [`is_default_ignorable`]
+/// character dropped and every JSON string escape decoded, plus the span of
+/// `text` each byte of the view came from, so a match found in the view maps
+/// back to the bytes it covers. The escapes are the one layer ai-memory adds
+/// itself, when an object-shaped tool result is stored as compact JSON;
+/// encodings the tool produced (HTML entities, percent-encoding, base64) are
+/// content and stay as written.
 struct Shadow {
     text: String,
-    origin: Vec<usize>,
+    origin: Vec<(usize, usize)>,
 }
 
 impl Shadow {
-    fn new(text: &str) -> Self {
+    /// The view of `text`, or `None` when `text` reads the same without one.
+    fn of(text: &str) -> Option<Self> {
+        if !text.contains(|c: char| c == '\\' || is_default_ignorable(c)) {
+            return None;
+        }
         let mut shadow = String::with_capacity(text.len());
         let mut origin = Vec::with_capacity(text.len());
-        for (index, c) in text.char_indices() {
-            if is_default_ignorable(c) {
-                continue;
+        let mut index = 0;
+        while let Some(c) = text[index..].chars().next() {
+            let (c, end) = match json_escape_at(text.as_bytes(), index) {
+                Some((decoded, len)) => (decoded, index + len),
+                None => (c, index + c.len_utf8()),
+            };
+            if !is_default_ignorable(c) {
+                shadow.push(c);
+                origin.extend(std::iter::repeat_n((index, end), c.len_utf8()));
             }
-            shadow.push(c);
-            origin.extend(index..index + c.len_utf8());
+            index = end;
         }
-        Self {
+        Some(Self {
             text: shadow,
             origin,
-        }
+        })
     }
 
-    /// The span of `text` a shadow match `start..end` covers: from its first
-    /// visible character through its last, invisible characters between them
-    /// included.
+    /// The span of `text` a view match `start..end` covers: from the first
+    /// byte of its first character through the last byte of its last,
+    /// invisible characters between them and the escapes they were decoded
+    /// from included.
     fn original_span(&self, text_len: usize, start: usize, end: usize) -> (usize, usize) {
-        let from = self.origin.get(start).copied().unwrap_or(text_len);
+        let from = self.origin.get(start).map_or(text_len, |span| span.0);
         let to = match end.checked_sub(1).and_then(|last| self.origin.get(last)) {
-            Some(last) if end > start => last + 1,
+            Some(last) if end > start => last.1,
             _ => from,
         };
         (from, to)
     }
+}
+
+/// The character the JSON string escape at `bytes[index..]` stands for and
+/// the escape's byte length. Anything else, a lone surrogate included, is
+/// text.
+fn json_escape_at(bytes: &[u8], index: usize) -> Option<(char, usize)> {
+    if bytes.get(index) != Some(&b'\\') {
+        return None;
+    }
+    let decoded = match bytes.get(index + 1)? {
+        b'"' => ('"', 2),
+        b'\\' => ('\\', 2),
+        b'/' => ('/', 2),
+        b'b' => ('\u{8}', 2),
+        b'f' => ('\u{c}', 2),
+        b'n' => ('\n', 2),
+        b'r' => ('\r', 2),
+        b't' => ('\t', 2),
+        b'u' => json_unicode_escape_at(bytes, index)?,
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+/// `\uXXXX`, or a `\uXXXX\uXXXX` surrogate pair, at `bytes[index..]`.
+fn json_unicode_escape_at(bytes: &[u8], index: usize) -> Option<(char, usize)> {
+    let unit = json_hex_unit(bytes, index + 2)?;
+    if !(0xD800..=0xDBFF).contains(&unit) {
+        return Some((char::from_u32(unit)?, 6));
+    }
+    if bytes.get(index + 6..index + 8)? != b"\\u" {
+        return None;
+    }
+    let low = json_hex_unit(bytes, index + 8).filter(|low| (0xDC00..=0xDFFF).contains(low))?;
+    let code = 0x1_0000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+    Some((char::from_u32(code)?, 12))
+}
+
+/// The four hex digits at `bytes[at..]` as a UTF-16 code unit.
+fn json_hex_unit(bytes: &[u8], at: usize) -> Option<u32> {
+    bytes.get(at..at + 4)?.iter().try_fold(0, |unit, b| {
+        Some((unit << 4) | char::from(*b).to_digit(16)?)
+    })
 }
 
 /// Compile-time list of redaction patterns. Order is intentional:
@@ -289,21 +346,26 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // `Access-Control-Allow-Credentials: true` intact. It is not what
     // protects an already-redacted value: `[REDACTED]` starts with `[`,
     // which the value character class excludes outright.
+    //
+    // The view decodes one level of JSON escaping. JSON printed inside a JSON
+    // string (`\\\"`) still reaches the rule with backslashes before its
+    // quotes, so the quote around a key or value accepts them; a `.env`
+    // nested that deep is not covered (#1963).
     (
-        r#"(?i)\b[A-Za-z0-9_-]*(?:authentication|authorization|credentials?|password|passwd|apikey|accountkey|authtoken|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))"?\s*[=:]\s*(?:(?:basic|bearer|digest|token|apikey)\s+)?"?[A-Za-z0-9._~+/=-]{8,}"#,
+        r#"(?i)\b[A-Za-z0-9_-]*(?:authentication|authorization|credentials?|password|passwd|apikey|accountkey|authtoken|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))(?:\\*")?\s*[=:]\s*(?:\\*")?(?:(?:basic|bearer|digest|token|apikey)\s+)?"?[A-Za-z0-9._~+/=-]{8,}"#,
         "auth_header",
     ),
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
     // even without `sk-` shape).
     (
-        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)"?\s*[=:]\s*\S+"#,
+        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)(?:\\*")?\s*[=:]\s*\S+"#,
         "env_secret",
     ),
     // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
     // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
     (
-        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)"?\s*[=:]\s*\S+"#,
+        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)(?:\\*")?\s*[=:]\s*\S+"#,
         "env_secret",
     ),
     // The suffixes one step outside those: `*_KEY_ID` (the other half of an
@@ -313,7 +375,7 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // convention: as code identifiers (`api_key_id`, `password_salt`) they are
     // ordinary column and field names, and redaction is irreversible.
     (
-        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)"?\s*[=:]\s*\S+"#,
+        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)(?:\\*")?\s*[=:]\s*\S+"#,
         "env_secret",
     ),
     // Filesystem paths that commonly contain credentials. The separator
@@ -448,24 +510,34 @@ impl Sanitizer {
         // Before the redaction passes: an escape inside a secret would
         // otherwise split it out of reach of every pattern below.
         let mut out = self.strip_control(input);
+        // Each pattern first looks through the transport encoding (invisible
+        // characters, JSON string escapes), so a secret split by one or quoted
+        // by the other is redacted whole rather than losing only the part
+        // before the split. The plain pass then still finds a match that
+        // needs an invisible character as its word boundary.
+        let mut shadow = Shadow::of(&out);
         for pattern in &self.inner.patterns {
-            // When invisible characters are present, the pass that looks
-            // through them goes first, so a split secret is redacted whole
-            // rather than losing only the part before the split. The plain
-            // pass then still finds a match that needs an invisible character
-            // as its word boundary.
-            if out.contains(is_default_ignorable) {
-                let shadow = Shadow::new(&out);
-                out = self.redact(&out, Some(&shadow), pattern);
+            let mut changed = false;
+            if let Some(view) = &shadow
+                && let Some(redacted) = self.redact(&out, Some(view), pattern)
+            {
+                out = redacted;
+                changed = true;
             }
-            out = self.redact(&out, None, pattern);
+            if let Some(redacted) = self.redact(&out, None, pattern) {
+                out = redacted;
+                changed = true;
+            }
+            if changed {
+                shadow = Shadow::of(&out);
+            }
         }
         out
     }
 
     /// One pattern over `text`, or over `shadow` with each match mapped back
-    /// to the span of `text` it covers.
-    fn redact(&self, text: &str, shadow: Option<&Shadow>, pattern: &Pattern) -> String {
+    /// to the span of `text` it covers. `None` when nothing matched.
+    fn redact(&self, text: &str, shadow: Option<&Shadow>, pattern: &Pattern) -> Option<String> {
         let view = shadow.map_or(text, |shadow| shadow.text.as_str());
         let spans: Vec<regex::Match<'_>> = if pattern.secret_group {
             pattern
@@ -499,14 +571,16 @@ impl Sanitizer {
             redacted = true;
         }
         if !redacted {
-            return text.to_string();
+            return None;
         }
         out.push_str(&text[copied..]);
-        out
+        Some(out)
     }
 
     /// Whether an allowlist entry exempts `matched`. Compared with invisible
-    /// characters removed, so they neither break nor fake an entry.
+    /// characters removed, so they neither break nor fake an entry. The plain
+    /// pass matches the raw escapes, so an entry holding a quote or backslash
+    /// exempts plain text only.
     fn allowlisted(&self, label: &str, matched: &str) -> bool {
         if label == PRIVATE_KEY_LABEL || self.inner.allowlist.is_empty() {
             return false;
@@ -1615,6 +1689,98 @@ mod tests {
                 out.contains("[REDACTED:"),
                 "JSON-quoted secret must be redacted: {raw} -> {out}"
             );
+        }
+    }
+
+    /// A tool result stored as compact JSON carries the printed file with its
+    /// quotes, newlines and tabs escaped. The same secrets unescaped are
+    /// covered above; here each sits inside a Claude Code Bash `tool_response`
+    /// string (#1963).
+    #[test]
+    fn scrubs_secret_values_inside_an_escaped_json_tool_result() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, secret) in [
+            (
+                r#"{"stdout":"{\"db_password\": \"correct-horse-battery\"}\n","stderr":"","interrupted":false}"#,
+                "correct-horse-battery",
+            ),
+            (
+                r#"{"stdout":"{\"OPENAI_API_KEY\": \"FAKEfake0123456789abcd\"}\n"}"#,
+                "FAKEfake0123456789abcd",
+            ),
+            (
+                r#"{"stdout":"password = \"correct-horse-battery\"\n"}"#,
+                "correct-horse-battery",
+            ),
+            (
+                r#"{"stdout":"{\"Authorization\": \"Basic YWRtaW46c2VjcmV0cGFzc3dvcmQ=\"}\n"}"#,
+                "YWRtaW46c2VjcmV0cGFzc3dvcmQ=",
+            ),
+            (
+                r#"{"stdout":"{\u0022api_key\u0022: \u0022FAKEfake0123456789abcdef\u0022}"}"#,
+                "FAKEfake0123456789abcdef",
+            ),
+            // JSON inside a JSON string inside the printed file.
+            (
+                r#"{"stdout":"{\"env\": \"{\\\"db_password\\\":\\\"correct-horse-battery\\\"}\"}\n"}"#,
+                "correct-horse-battery",
+            ),
+            // Line two of a `.env`: the escaped newline is the word boundary
+            // the case-sensitive rules need.
+            (
+                r#"{"stdout":"DB_HOST=localhost\nLITESTREAM_ACCESS_KEY_ID=fake0000fake0000fake0000fake0000\n"}"#,
+                "fake0000fake0000fake0000fake0000",
+            ),
+            (
+                r#"{"stdout":"region=us-east-1\nAKIAFAKEFAKEFAKEFAKE\n"}"#,
+                "AKIAFAKEFAKEFAKEFAKE",
+            ),
+            // A tab between header name and value, as `curl -v` prints it.
+            (
+                r#"{"stdout":"> X-Api-Key:\tFAKEfake0123456789abcdef\n"}"#,
+                "FAKEfake0123456789abcdef",
+            ),
+        ] {
+            let out = s.scrub(raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret),
+                "escaped JSON secret must be redacted: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// The view hands the rules the real line break, so a value stops at the
+    /// end of its line instead of swallowing the rest of the result, and a
+    /// match that ends on an escape covers the whole escape.
+    #[test]
+    fn a_redaction_inside_an_escaped_json_tool_result_keeps_the_rest() {
+        let s = s();
+        assert_eq!(
+            s.scrub(
+                r#"{"stdout":"DB_PASSWORD=hunter2hunter2\nPORT=5432\n","stderr":"","interrupted":false}"#
+            ),
+            r#"{"stdout":"[REDACTED:auth_header]\nPORT=5432\n","stderr":"","interrupted":false}"#
+        );
+        assert_eq!(
+            s.scrub(r#"{"stdout":"{\"db_password\": \"correct-horse-battery\/\"}"}"#),
+            r#"{"stdout":"{\"[REDACTED:auth_header]\"}"}"#
+        );
+    }
+
+    /// Decoding widens only what the rules see through, never what counts as
+    /// a key or a value; a malformed escape is text.
+    #[test]
+    fn an_escaped_json_tool_result_without_a_secret_is_left_alone() {
+        let s = s();
+        for raw in [
+            r#"{"stdout":"{\"Idempotency-Key\": \"00000000-0000-0000-0000-000000000000\"}\n"}"#,
+            r#"{"stdout":"{\"Access-Control-Allow-Credentials\": true}\n"}"#,
+            r#"{"stdout":"{\"password_hint\": \"see 1Password\"}\n"}"#,
+            r#"{"stdout":"C:\\Users\\me\\token.txt\n"}"#,
+            r#"{"stdout":"\ud83d\ude00 \udead \u12 \x41 \"}"#,
+        ] {
+            assert_eq!(s.scrub(raw), raw, "must be left alone: {raw}");
         }
     }
 
