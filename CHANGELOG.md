@@ -14,10 +14,10 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Added
 
 - Added per-task LLM provider and fallback profiles for consolidation, bootstrap,
-  auto-improve, experience, dream, lint, profile, rerank, and query answers and
-  explore. Tasks without an override share the default provider; an override
-  uses only its own fallback chain and can run without a global provider
-  (#PR_NUMBER).
+  auto-improve, experience, dream, lint, profile, rerank, and query answers
+  (including explore). Tasks without an override share the default provider;
+  an override uses only its own fallback chain and can run without a global
+  provider. CLI and web health identify each configured task (#1969).
 
 - Added a per-execution opt-out of the automatic handoff: a session whose
   hooks run with `AI_MEMORY_AUTO_HANDOFF=off` still gets its summary page and
