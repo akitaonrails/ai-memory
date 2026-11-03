@@ -155,10 +155,10 @@ if selected:
     CASES = [case for case in CASES if case["name"] == selected]
 
 
-def run(command, log_name):
+def run(command, log_name, timeout=300):
     log = OUT / (log_name + ".log")
     with log.open("w") as output:
-        result = subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, timeout=300)
+        result = subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, timeout=timeout)
     return result.returncode, log.read_text(errors="replace")
 
 
@@ -174,6 +174,13 @@ def replace_bytes(path, contents):
 
 with LOCK.open("x"):
     try:
+        # Build each package's test binary first with no time limit: on a
+        # cold cache (any branch but main restores a stale or empty one) the
+        # first compile alone can take longer than a test run's budget.
+        for target in dict.fromkeys(tuple(case["command"][:-1]) for case in CASES):
+            name = "-".join(target[3:]).replace("--", "")
+            code, _ = run([*target, "--no-run"], name + "-build", timeout=None)
+            assert code == 0, name + ": test build failed"
         # The source is the same for every baseline, so each distinct test
         # command runs once, before any file is touched.
         for command in {tuple(case["command"]): case["command"] for case in CASES}.values():
