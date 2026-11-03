@@ -35,7 +35,13 @@ Optional top-level metadata: `kind` (64 characters), `entities` (10 names,
 and `relations` (an object mapping `causes`, `fixes`, or `contradicts` to page
 target arrays, 32 targets total, 1,024 characters each). Relation targets use
 `path`, `project:path`, or `workspace/project:path`; extensionless page paths
-resolve with `.md`, and scope components must already be trimmed. Limits apply
+resolve with `.md`, and scope components must already be trimmed. A page that
+describes repository files can name them in `source_files`: up to 16
+`{path, commit}` entries, each a repository-relative `/`-separated path and the
+7-64 hex commit (`git rev-parse HEAD`) the page was checked against. The server
+never reads those files; when one changed since its commit, a client records
+`memory_feedback` with `signal: "stale"`, and rewriting the page with the new
+commit clears the flag. Limits apply
 to raw values before trimming, normalization or deduplication. Arbitrary
 frontmatter and author fields are not editable.
 Every `memory_write_page` call replaces the whole page and its metadata;
