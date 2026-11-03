@@ -135,6 +135,25 @@ pub fn mine_residue_tokens(body: &str, max_tokens: usize) -> Vec<String> {
     mine(&RESIDUE_PATTERNS, body, max_tokens)
 }
 
+/// Keep-tokens mined from `sources` that `rewrite` no longer contains.
+///
+/// Presence is a substring test, not a second mine: [`mine_keep_tokens`] caps
+/// its output, so a long rewrite that keeps a token past the cap must not count
+/// it as dropped. shortcut: a token that survives only inside a longer one
+/// counts as kept, so this can under-report; report-only callers accept that.
+#[must_use]
+pub(crate) fn dropped_keep_tokens<'a>(
+    sources: impl IntoIterator<Item = &'a str>,
+    rewrite: &str,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    sources
+        .into_iter()
+        .flat_map(mine_keep_tokens)
+        .filter(|token| !rewrite.contains(token.as_str()) && seen.insert(token.clone()))
+        .collect()
+}
+
 pub(crate) fn has_residue_error_line(body: &str) -> bool {
     RESIDUE_PATTERNS[0].re.is_match(body)
 }
@@ -196,6 +215,19 @@ fn trim_token(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_keep_tokens_names_source_facts_missing_from_the_rewrite() {
+        let a = "Fixed in crates/store/src/ops.rs with `retry_budget`.";
+        let b = "Same flake, culprit crates/store/src/reader.rs (E0433).";
+        let faithful = "ops.rs fix at crates/store/src/ops.rs and \
+             crates/store/src/reader.rs, `retry_budget`, E0433.";
+        assert!(dropped_keep_tokens([a, b], faithful).is_empty());
+        assert_eq!(
+            dropped_keep_tokens([a, b], "Fixed crates/store/src/ops.rs via retry_budget."),
+            ["crates/store/src/reader.rs", "reader.rs", "E0433"]
+        );
+    }
 
     #[test]
     fn fix_note_keeps_paths_error_codes_and_urls() {

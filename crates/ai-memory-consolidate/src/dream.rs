@@ -263,6 +263,11 @@ pub struct DreamMerge {
     /// Identifier of the new merged survivor version once the rewrite lands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_survivor_id: Option<PageId>,
+    /// Keep-tokens (paths, identifiers, error codes, URLs) a member body had and
+    /// the merged body lacks. Report-only: the merge still lands, and every
+    /// source stays recoverable with `restore-page` (invariant #16).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dropped_keep_tokens: Vec<String>,
 }
 
 /// Outcome of one dream run. Reported in every mode so a bad or empty run is
@@ -521,6 +526,7 @@ pub async fn run_dream_pass(
                 surprisal: f64::from(p.surprisal),
                 applied: false,
                 new_survivor_id: None,
+                dropped_keep_tokens: Vec::new(),
             })
             .collect();
         return Ok(report);
@@ -538,7 +544,11 @@ pub async fn run_dream_pass(
             MergeOutcome::Applied {
                 new_survivor_id,
                 superseded,
+                dropped_keep_tokens,
             } => {
+                if !dropped_keep_tokens.is_empty() {
+                    tracing::warn!(path = %plan.survivor.path.as_str(), dropped = ?dropped_keep_tokens, "dream pass: merged body lacks keep-tokens its sources had; restore-page recovers them");
+                }
                 report.clusters_merged += 1;
                 report.pages_rewritten += 1;
                 report.pages_superseded += superseded;
@@ -553,6 +563,7 @@ pub async fn run_dream_pass(
                     surprisal: f64::from(plan.surprisal),
                     applied: true,
                     new_survivor_id: Some(new_survivor_id),
+                    dropped_keep_tokens,
                 });
             }
             MergeOutcome::Skipped => report.skipped += 1,
@@ -566,6 +577,7 @@ enum MergeOutcome {
     Applied {
         new_survivor_id: PageId,
         superseded: usize,
+        dropped_keep_tokens: Vec<String>,
     },
     Skipped,
 }
@@ -640,6 +652,12 @@ async fn merge_one_cluster(
             return MergeOutcome::Skipped;
         }
     };
+    // A3 keeps the keep-token union by construction; B2 must at least say when
+    // the model's prose rewrite did not. Measured before the merge-note footer.
+    let dropped_keep_tokens = crate::keep_tokens::dropped_keep_tokens(
+        member_bodies.iter().map(|(_, body)| body.as_str()),
+        &merged.body_markdown,
+    );
 
     // Build the survivor rewrite + loser merge-note stubs.
     let loser_paths: Vec<String> = plan
@@ -791,6 +809,7 @@ async fn merge_one_cluster(
             Some(new_survivor_id) => MergeOutcome::Applied {
                 new_survivor_id,
                 superseded,
+                dropped_keep_tokens,
             },
             None => MergeOutcome::Skipped,
         },

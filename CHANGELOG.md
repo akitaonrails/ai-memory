@@ -27,6 +27,11 @@ version in [`docs/changelog/`](docs/changelog/):
   reads those files; a client compares each entry with its checkout and records
   `stale` feedback when one changed. The TypeScript SDK sends it as
   `sourceFiles` and `pages.update` carries it over (#1957).
+- The opt-in dream pass now reports, per applied merge, the keep-tokens (file
+  paths, identifiers, error codes, URLs) that a source page had and the merged
+  survivor lacks, as `dropped_keep_tokens` on `DreamReport.merges` and as one
+  server warning naming the survivor. Merges still land; every source stays
+  recoverable with `restore-page` (#1958).
 - Added a guarded `memory_write_pages_batch` MCP tool for companion imports:
   1-100 conditional page versions are admitted and persisted atomically in one
   existing project, with bounded bodies, duplicate-path rejection, ordered
