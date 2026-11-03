@@ -226,9 +226,100 @@ fn json_hex_unit(bytes: &[u8], at: usize) -> Option<u32> {
     })
 }
 
+/// Spans sorted by start, answering "does this span overlap any of them"
+/// in logarithmic time.
+struct SortedSpans {
+    starts: Vec<usize>,
+    /// The furthest end among the spans up to each index.
+    reach: Vec<usize>,
+}
+
+impl SortedSpans {
+    fn new(spans: &[(usize, usize)]) -> Self {
+        let mut sorted = spans.to_vec();
+        sorted.sort_unstable();
+        let reach = sorted
+            .iter()
+            .scan(0, |reach, &(_, end)| {
+                *reach = end.max(*reach);
+                Some(*reach)
+            })
+            .collect();
+        Self {
+            starts: sorted.into_iter().map(|(start, _)| start).collect(),
+            reach,
+        }
+    }
+
+    fn overlaps(&self, (start, end): (usize, usize)) -> bool {
+        let before = self.starts.partition_point(|&s| s < end);
+        before > 0 && self.reach[before - 1] > start
+    }
+}
+
+/// Which lines of a text parse as JSON, each line checked once.
+struct JsonLines<'a> {
+    text: &'a str,
+    /// The offset of every `\n`, found on first use.
+    breaks: Option<Vec<usize>>,
+    checked: std::collections::HashMap<usize, bool>,
+}
+
+impl<'a> JsonLines<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            breaks: None,
+            checked: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether the line holding byte `at` is a JSON value with an escape in
+    /// it, the shape a stringified tool result takes.
+    fn contains(&mut self, at: usize) -> bool {
+        let text = self.text;
+        let breaks = self
+            .breaks
+            .get_or_insert_with(|| text.match_indices('\n').map(|(i, _)| i).collect());
+        let line = breaks.partition_point(|&i| i < at);
+        let start = line.checked_sub(1).map_or(0, |prev| breaks[prev] + 1);
+        let end = breaks.get(line).copied().unwrap_or(text.len());
+        *self.checked.entry(start).or_insert_with(|| {
+            let line = text[start..end].trim_end_matches('\r');
+            line.contains('\\') && serde_json::from_str::<serde::de::IgnoredAny>(line).is_ok()
+        })
+    }
+}
+
+/// `span` widened so neither end falls between a backslash and the character
+/// it escapes, which would leave an invalid escape behind.
+fn whole_escapes(text: &str, (mut start, mut end): (usize, usize)) -> (usize, usize) {
+    let bytes = text.as_bytes();
+    let odd_run_before = |at: usize| {
+        bytes[..at]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count()
+            % 2
+            == 1
+    };
+    if start > 0 && odd_run_before(start) {
+        start -= 1;
+    }
+    if end > start && end < bytes.len() && odd_run_before(end) {
+        end = (end - 1 + source_len_at(text, end - 1)).max(end);
+    }
+    (start, end)
+}
+
 /// `text` with each span replaced by `[REDACTED:<label>]`, overlapping
 /// spans merged into one.
-fn redact_spans(text: &str, mut spans: Vec<(usize, usize)>, label: &str) -> String {
+fn redact_spans(text: &str, spans: Vec<(usize, usize)>, label: &str) -> String {
+    let mut spans: Vec<_> = spans
+        .into_iter()
+        .map(|span| whole_escapes(text, span))
+        .collect();
     spans.sort_unstable();
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
@@ -553,14 +644,26 @@ impl Sanitizer {
         // characters, JSON string escapes), so a secret split by one or quoted
         // by the other is redacted whole, and over the text as written, which
         // finds a match that needs an invisible character as its word
-        // boundary. Overlapping spans merge to the widest, so the view only
-        // ever widens a redaction: plain text holding a literal `\n` or `\"`
-        // ends a value early in the view but not in the text as written.
+        // boundary. Outside JSON, overlapping spans merge to the widest, so
+        // the view only ever widens a redaction: plain text holding a literal
+        // `\n` or `\"` ends a value early in the view but not as written. In
+        // a line that parses as JSON the escapes are JSON's own and the view
+        // is exact, so a plain match the view already covers is dropped there
+        // rather than run past an escaped line break.
         let mut shadow = Shadow::of(&out);
         for pattern in &self.inner.patterns {
             let mut spans = self.spans(&out, shadow.as_ref(), pattern);
             if shadow.is_some() {
-                spans.extend(self.spans(&out, None, pattern));
+                let plain = self.spans(&out, None, pattern);
+                if !plain.is_empty() {
+                    let view = SortedSpans::new(&spans);
+                    let mut json_lines = JsonLines::new(&out);
+                    let kept: Vec<_> = plain
+                        .into_iter()
+                        .filter(|&span| !(view.overlaps(span) && json_lines.contains(span.0)))
+                        .collect();
+                    spans.extend(kept);
+                }
             }
             if spans.is_empty() {
                 continue;
@@ -1867,6 +1970,68 @@ mod tests {
                 "tail of the secret stored in clear: {raw} -> {out}"
             );
         }
+    }
+
+    /// In a compact JSON line the escapes are JSON's own, so the view is
+    /// exact there: the text as written must neither start a redaction
+    /// inside an escape (`x\[REDACTED…]`) nor run an unquoted value past the
+    /// escaped line break to the end of the result.
+    #[test]
+    fn a_secret_in_a_compact_json_line_keeps_the_rest_valid() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, secret, survivor) in [
+            (
+                r#"{"stdout":"DB_HOST=x\nDB_PASSWORD=hunter2hunter2\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "hunter2hunter2",
+                r"\nPORT=5432\n",
+            ),
+            (
+                r#"{"stdout":"DB_HOST=x\nSTRIPE_SECRET=abcFAKEfake0123456789\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "abcFAKEfake0123456789",
+                r"\nPORT=5432\n",
+            ),
+            (
+                r#"{"stdout":"STRIPE_SECRET=abcFAKEfake0123456789\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "abcFAKEfake0123456789",
+                r"\nPORT=5432\n",
+            ),
+            (
+                r#"{"stdout":"x\napi_key: FAKEfake0123456789abcdef\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "FAKEfake0123456789abcdef",
+                r"\nPORT=5432\n",
+            ),
+            (
+                r#"{"stdout":"{\"STRIPE_SECRET\":\"abcFAKEfake0123456789\",\"next\":\"keep\"}","stderr":"","interrupted":false}"#,
+                "abcFAKEfake0123456789",
+                r#",\"next\":\"keep\"}"#,
+            ),
+            // Scrubbed a second time: the marker is no secret to run past.
+            (
+                r#"{"stdout":"STRIPE_SECRET=[REDACTED:env_secret]\nPORT=5432\n","stderr":"","interrupted":false}"#,
+                "STRIPE_SECRET",
+                r"\nPORT=5432\n",
+            ),
+        ] {
+            let out = s.scrub(raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret) && out.contains(survivor),
+                "{raw} -> {out}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {raw} -> {out}"));
+            assert_eq!(parsed["interrupted"], false, "{raw} -> {out}");
+        }
+    }
+
+    /// Outside JSON, a redaction never starts between a backslash and the
+    /// character it escapes.
+    #[test]
+    fn a_redaction_never_starts_inside_an_escape() {
+        let s = s();
+        let out = s.scrub(r"note: DB_HOST=x\nDB_PASSWORD=hunter2hunter2 done");
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(!out.contains(r"x\["), "{out}");
     }
 
     /// Decoding widens only what the rules see through, never what counts as

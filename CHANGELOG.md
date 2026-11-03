@@ -21,14 +21,15 @@ version in [`docs/changelog/`](docs/changelog/):
   quoted TOML or YAML value, `"Authorization": "Basic ..."` and any `.env`
   key past the first line were stored in clear while the same text as a
   plain body was redacted. The sanitizer now matches through JSON string
-  escapes as it already did through invisible characters, and a redaction
-  still covers at least what the text as written matches, so a literal `\n`
-  or `\"` in a plain `.env` value cannot cut it short. Inside a stored
-  result, a quoted `KEY=value` or `"KEY":"value"` value stops at its closing
-  quote and a value followed by a line break stops there, so the rest of the
-  result stays readable and valid JSON. An unquoted value at the very end of
-  a string with no line break after it still redacts the rest of the result,
-  as before. A quoted plain-text value with spaces, such as
+  escapes as it already did through invisible characters. In text that is
+  not JSON, a redaction still covers at least what the text as written
+  matches, so a literal `\n` or `\"` in a plain `.env` value cannot cut it
+  short. In a line that parses as JSON, such as a stored tool result, a
+  quoted `KEY=value` or `"KEY":"value"` value stops at its closing quote, a
+  value followed by an escaped line break stops there, and no redaction
+  starts or ends inside an escape, so the rest of the result stays readable
+  and valid JSON. An unquoted value at the very end of a string with no line
+  break after it still redacts the rest of the result, as before. A quoted plain-text value with spaces, such as
   `DB_PASSWORD="two words"`, is now redacted whole instead of up to its
   first space. What counts as a key is unchanged (#1963).
 

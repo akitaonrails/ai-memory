@@ -73,6 +73,12 @@ async fn every_object_shaped_tool_result_is_redacted_in_the_stored_tool_body() {
             r#""interrupted":false"#,
         ),
         (
+            "a .env past its first line in a claude code bash result",
+            "claude-code",
+            serde_json::json!({"stdout": format!("DB_HOST=x\nSTRIPE_SECRET={SECRET}\nPORT=5432\n"), "stderr": "", "interrupted": false}),
+            r#"\nPORT=5432\n","stderr":"","interrupted":false"#,
+        ),
+        (
             "stdout only, grok aliases",
             "grok",
             serde_json::json!({"stdout": format!("{{\"api_key\": \"{SECRET}\"}}\n"), "truncated": false}),
