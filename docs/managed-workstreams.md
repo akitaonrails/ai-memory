@@ -154,6 +154,8 @@ tells the agent to read that session with `memory_read_session_observations`,
 newest first. `memory_briefing` (`recent_sessions`) and `memory_handoff_list`
 (`newer_unended_session`) expose the same pointer to clients whose session start
 injects nothing.
+Pass `recent_sessions_limit` to `memory_briefing` to raise its default five
+entries (clamped to 1–50) when checking active harnesses in a busy project.
 
 The dossier is evidence, not instructions: it is fenced as untrusted history,
 contains no hidden reasoning or unsupported/private records, and disappears

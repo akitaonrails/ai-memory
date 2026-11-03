@@ -185,8 +185,10 @@ Methods: `messages.send`
 |---|---|
 | `to_workspace` | `toWorkspace` |
 | `to_project` | `toProject` |
+| `to_agent` | `toAgent` |
 | `from_workspace` | `fromWorkspace` |
 | `from_project` | `fromProject` |
+| `from_agent` | `fromAgent` |
 | `body` | `body` |
 | `subject` | `subject` |
 | `nature` | `nature` |
@@ -233,6 +235,7 @@ Methods: `briefing`
 | `workspace` | `workspace` |
 | `project` | `project` |
 | `recent_pages_limit` | `recentPagesLimit` |
+| `recent_sessions_limit` | `recentSessionsLimit` |
 | `settled_first` | `settledFirst` |
 
 ## `memory_explore`

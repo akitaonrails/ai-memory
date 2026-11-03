@@ -651,6 +651,8 @@ export interface SessionActivity {
 export interface BriefingArgs extends ScopedArgs {
   /** How many recent pages to include (default 10, max 100). */
   recentPagesLimit?: number;
+  /** How many recent sessions to include (default 5, max 50). */
+  recentSessionsLimit?: number;
   /** Lead with the project's settled rule and decision pages. */
   settledFirst?: boolean;
 }
@@ -924,6 +926,17 @@ export interface SendMessageArgs {
   to: Scope;
   /** Sending project. Defaults to the client's `scope`. */
   from?: Scope;
+  /**
+   * Restrict claiming to this registered harness in the recipient project
+   * (for example `codex` or `claude-code`); the server refuses a harness with
+   * no session there. Omit for shared project mail.
+   */
+  toAgent?: string;
+  /**
+   * The sending harness (for example `claude-code`), for a client whose
+   * session metadata does not record it. Carried as the message's `fromAgent`.
+   */
+  fromAgent?: string;
   /** Self-contained request for the recipient's agent. */
   body: string;
   /** Optional one-line subject. */

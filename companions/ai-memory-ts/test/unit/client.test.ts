@@ -463,6 +463,8 @@ describe("messages", () => {
     server.tools.set("memory_message_send", () => ({ message_id: payloads.MESSAGE_ID }));
     const sent = await memory.messages.send({
       to: OTHER,
+      toAgent: "codex",
+      fromAgent: "claude-code",
       body: "please do X",
       subject: "hi",
       nature: "measured",
@@ -471,8 +473,10 @@ describe("messages", () => {
     assert.deepEqual(server.lastArgs(), {
       to_workspace: "demo",
       to_project: "other",
+      to_agent: "codex",
       from_workspace: "demo",
       from_project: "app",
+      from_agent: "claude-code",
       body: "please do X",
       subject: "hi",
       nature: "measured",
@@ -530,11 +534,16 @@ describe("reads", () => {
     const recent = await memory.recent({ limit: 3 });
     assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app", limit: 3 });
     assert.equal(recent.hits[0]?.path, "notes/retries.md");
-    const briefing = await memory.briefing({ recentPagesLimit: 2, settledFirst: true });
+    const briefing = await memory.briefing({
+      recentPagesLimit: 2,
+      recentSessionsLimit: 3,
+      settledFirst: true,
+    });
     assert.deepEqual(server.lastArgs(), {
       workspace: "demo",
       project: "app",
       recent_pages_limit: 2,
+      recent_sessions_limit: 3,
       settled_first: true,
     });
     assert.equal(briefing.activity7d.pagesUpdated, 1);
@@ -789,7 +798,7 @@ describe("wire names", () => {
       memory.query({ query: "q", global: true }),
       memory.status(),
       memory.recent({ limit: 1 }),
-      memory.briefing({ recentPagesLimit: 1, settledFirst: true }),
+      memory.briefing({ recentPagesLimit: 1, recentSessionsLimit: 1, settledFirst: true }),
       memory.explore({ focus: "f", recentPagesLimit: 1, reasoning: "low" }),
       memory.observations({
         sessionId: "s",
@@ -813,7 +822,9 @@ describe("wire names", () => {
       memory.handoffs.cancel({ handoffId: "h", anyOwner: true }),
       memory.messages.send({
         to: OTHER,
+        toAgent: "codex",
         from: SCOPE,
+        fromAgent: "claude-code",
         body: "b",
         subject: "s",
         nature: "measured",
