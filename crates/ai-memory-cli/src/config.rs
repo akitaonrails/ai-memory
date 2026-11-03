@@ -3677,7 +3677,7 @@ pub(crate) fn default_data_dir() -> PathBuf {
         .join("ai-memory")
 }
 
-fn canonicalise_or_keep(p: &Path) -> PathBuf {
+pub(crate) fn canonicalise_or_keep(p: &Path) -> PathBuf {
     if let Ok(canon) = p.canonicalize() {
         return canon;
     }
