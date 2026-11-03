@@ -4055,11 +4055,11 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
         }
         _ => (None, None),
     };
-    conn.execute(
+    let result = conn.execute(
         "INSERT INTO observations \
          (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
-          importance, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+          importance, created_at, file_path) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             id.as_bytes(),
             obs.session_id.as_bytes(),
@@ -4072,8 +4072,42 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
             obs.body,
             importance,
             now,
+            obs.file_path,
         ],
-    )?;
+    );
+    // Historical migration tests stop before V99 and exercise this helper
+    // against that frozen schema, as with `finish_cjk_index_write`. A real
+    // Store migrates first, so a missing column stays a fatal error in every
+    // production build.
+    #[cfg(test)]
+    let result = match result {
+        Err(error)
+            if obs.file_path.is_none()
+                && error.to_string().contains("no column named file_path") =>
+        {
+            conn.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                  title, body, importance, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    id.as_bytes(),
+                    obs.session_id.as_bytes(),
+                    obs.workspace_id.as_bytes(),
+                    obs.project_id.as_bytes(),
+                    kind,
+                    extension,
+                    source_event,
+                    obs.title,
+                    obs.body,
+                    importance,
+                    now,
+                ],
+            )
+        }
+        other => other,
+    };
+    result?;
     index_observation_cjk(conn, conn.last_insert_rowid(), &obs.title, &obs.body)?;
     Ok(id)
 }

@@ -5524,3 +5524,188 @@ async fn interrupted_recovery_ignores_foreign_scope_work_and_batons_with_control
         "control: work resumed in this scope reopens it"
     );
 }
+
+/// Store one PostToolUse naming `file_path`, at `occurred_at` microseconds.
+async fn file_observation(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    session: SessionId,
+    file_path: Option<&str>,
+    occurred_at: i64,
+) -> ai_memory_core::ObservationId {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: Some(occurred_at),
+                session_id: session,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool file".into(),
+                body: "tool_family: file\noutcome: ok".into(),
+                importance: 5,
+                file_path: file_path.map(str::to_owned),
+            },
+            &Sanitizer::default(),
+        ))
+        .await
+        .unwrap()
+}
+
+/// #1843: a file path query never crosses a project or a workspace. The same
+/// path in a sibling project and in another workspace stays there. Control:
+/// the home project returns its own session. Fails with the scope predicate
+/// removed from `observations_for_file`.
+#[tokio::test]
+async fn observations_for_file_never_crosses_a_project_or_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, home) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling".to_string(), None)
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("other".to_string())
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+    let mine = open_session(&store, ws, home, AgentKind::Codex).await;
+    file_observation(&store, ws, home, mine, Some("src/lib.rs"), 1_000).await;
+    for (w, p) in [(ws, sibling), (other_ws, foreign)] {
+        let theirs = open_session(&store, w, p, AgentKind::Codex).await;
+        file_observation(&store, w, p, theirs, Some("src/lib.rs"), 2_000).await;
+    }
+
+    let hits = store
+        .reader
+        .observations_for_file(ws, home, OwnerFilter::Any, "src/lib.rs".into(), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, mine);
+}
+
+/// #1843: "this session touched this file" comes from the observation, so it
+/// follows the observation's owner, and the owner rule runs before the limit.
+/// With `limit = 1`, operator B's newer owned session neither appears for A
+/// nor takes A's slot; a shared session is visible to both. Controls: B sees
+/// its own session, and `OwnerFilter::Any` sees all three. Fails with the
+/// owner clause removed, or applied after the limit.
+#[tokio::test]
+async fn observations_for_file_follows_the_session_owner_before_the_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = owned_session(&store, ws, proj, Some(operator("alice"))).await;
+    let bob = owned_session(&store, ws, proj, Some(operator("bob"))).await;
+    let shared = owned_session(&store, ws, proj, None).await;
+    file_observation(&store, ws, proj, alice, Some("src/lib.rs"), 1_000).await;
+    file_observation(&store, ws, proj, shared, Some("src/lib.rs"), 2_000).await;
+    file_observation(&store, ws, proj, bob, Some("src/lib.rs"), 3_000).await;
+    let sessions = |owner: OwnerFilter, limit: usize| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .observations_for_file(ws, proj, owner, "src/lib.rs".into(), limit)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.session_id)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let as_alice = OwnerFilter::User(operator("alice"));
+    assert_eq!(sessions(as_alice.clone(), 1).await, vec![shared]);
+    assert_eq!(sessions(as_alice, 10).await, vec![shared, alice]);
+    assert_eq!(sessions(OwnerFilter::Unattributed, 10).await, vec![shared]);
+    assert_eq!(
+        sessions(OwnerFilter::User(operator("bob")), 1).await,
+        vec![bob]
+    );
+    assert_eq!(
+        sessions(OwnerFilter::Any, 10).await,
+        vec![bob, shared, alice]
+    );
+}
+
+/// #1843: every entry points at a target an agent can read. A session with
+/// a `sessions/<id>.md` page carries it; an open session, or one whose page
+/// expired, carries none and is read by `session_id` at `last_offset`,
+/// which lands on the newest observation naming the file.
+#[tokio::test]
+async fn observations_for_file_maps_sessions_to_readable_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let paged = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let open = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let expired = open_session(&store, ws, proj, AgentKind::Codex).await;
+    file_observation(&store, ws, proj, paged, Some("src/lib.rs"), 1_000).await;
+    file_observation(&store, ws, proj, open, None, 2_000).await;
+    file_observation(&store, ws, proj, open, Some("src/lib.rs"), 3_000).await;
+    file_observation(&store, ws, proj, open, None, 4_000).await;
+    let newest = file_observation(&store, ws, proj, open, Some("src/lib.rs"), 5_000).await;
+    file_observation(&store, ws, proj, open, Some("other.rs"), 6_000).await;
+    file_observation(&store, ws, proj, expired, Some("src/lib.rs"), 7_000).await;
+    let session_page = |session: SessionId| format!("sessions/{session}.md");
+    store
+        .writer
+        .upsert_page(page(ws, proj, &session_page(paged), "Session", "summary"))
+        .await
+        .unwrap();
+    let mut gone = page(ws, proj, &session_page(expired), "Session", "summary");
+    gone.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(gone).await.unwrap();
+
+    let hits = store
+        .reader
+        .observations_for_file(ws, proj, OwnerFilter::Any, "src/lib.rs".into(), 10)
+        .await
+        .unwrap();
+    let by_session =
+        |session: SessionId| hits.iter().find(|hit| hit.session_id == session).unwrap();
+    assert_eq!(hits.len(), 3);
+    assert_eq!(
+        by_session(paged).page.as_ref().map(PagePath::as_str),
+        Some(session_page(paged).as_str())
+    );
+    assert_eq!(
+        by_session(expired).page,
+        None,
+        "an expired page counts as none"
+    );
+    let open_hit = by_session(open);
+    assert_eq!((open_hit.page.as_ref(), open_hit.hits), (None, 2));
+    assert_eq!(open_hit.last_seen.as_microsecond(), 5_000);
+
+    let read = store
+        .reader
+        .session_observations_scoped(
+            ws,
+            proj,
+            open,
+            ai_memory_store::ObservationPage {
+                limit: 1,
+                offset: usize::try_from(open_hit.last_offset).unwrap(),
+                order: ai_memory_store::ObservationOrder::Asc,
+                kinds: None,
+                query: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.records[0].id, newest);
+}
