@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.3.3] - 2026-11-03
+
 ### Fixed
 
 - The observation prune (`[decay] observation_retention_days`) checked "summary
@@ -3886,7 +3888,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.3...HEAD
+[3.3.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.3
 [3.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.2
 [3.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.1
 [3.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.0
