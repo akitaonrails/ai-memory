@@ -1,8 +1,8 @@
 # Design proposal: opt-in file path index (#1843)
 
-**Status: the index is implemented for the native hook client on `release/3.4`
-(migration V99); the generated TypeScript integrations, the measurement and
-delivery are open.** Issue
+**Status: the index is implemented for the native hook client and the
+generated TypeScript integrations on `release/3.4` (migration V99); the
+measurement and delivery are open.** Issue
 [#1843](https://github.com/akitaonrails/ai-memory/issues/1843) remains open,
 and the index alone does not close it.
 
@@ -137,10 +137,18 @@ of the event:
 
 1. Make the tool path absolute against the event's cwd with the existing
    lexical helper `absolute_normalized` in the CLI crate, already
-   `pub(crate)`; no second normalizer.
+   `pub(crate)`; no second normalizer in Rust. The generated TS integrations
+   cannot call it, so `ts_capture_policy_v1` ports the same steps
+   (`captureFileParts`, `captureFileRelative`): `\` separates only on a
+   Windows host, as for `Path`, so they do not reuse the policy's
+   `captureNormalize`, which folds `\` on every host for `ignore_paths`.
 2. Strip the `checkout_root` prefix. A path outside the checkout is not indexed;
    the client sends `skipped: outside_checkout`, or `no_checkout` when no
-   checkout root exists.
+   checkout root exists. The checkout is the one the event is routed to: the
+   native client reroutes a tool event whose absolute target lies in another
+   repository (`tool_location_routing_cwd`) and keys the path to that one,
+   while the TS integrations do not reroute, so for them the same target is
+   `outside_checkout`.
 3. Use `/` as the separator; keep case as given.
 4. Refuse: an empty result, a leading `/` or drive letter, any `..` segment, more
    than 512 characters (the bound `HANDOFF_FILE_MAX_CHARS` uses for stored
@@ -481,7 +489,10 @@ policy already places in the client.
   failed observation insert that leaves no `file_path` behind (AGENTS.md: new
   disk+SQL mutations need recovery and rollback tests).
 - `crates/ai-memory-cli/tests/suite/external_capture_ts.rs`: the generated
-  plugin, run in Node against a real server, stores the path.
+  plugin, run in Node against a loopback stand-in for the server, sends the
+  field with the checkout-relative path. That the server stores the path from
+  these integrations' payloads is checked by the OpenCode run of the live
+  harness in this section, not by an automated test.
 
 **Live harness (manual, recorded in the implementation PR's test plan).** The
 existing smoke tests fire no tool event: `tests/e2e/claude_plugin_smoke.py`
