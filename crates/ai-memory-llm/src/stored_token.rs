@@ -51,6 +51,58 @@ pub(crate) fn credential_endpoint(context: &str, url: &str) -> LlmResult<Credent
     }
 }
 
+/// Validate an operator-configured LLM or embedder base URL before any request
+/// is sent to it.
+///
+/// This mirrors [`credential_endpoint`]'s scheme policy — provider credentials
+/// (`api_key`, operator headers from `llm_headers`) travel in headers that the
+/// default reqwest redirect policy does not strip on cross-origin hops, so an
+/// operator setting `LLM_BASE_URL=http://169.254.169.254/latest/meta-data/`
+/// or pointing at an internal service would hand their API key to that host.
+///
+/// Allows:
+/// * `https://...` — any host, any port.
+/// * `http://localhost` / `http://127.0.0.1` / `http://[::1]` — loopback only,
+///   so local development servers (Ollama on 11434, LM Studio on 1234, vLLM on
+///   8000) keep working without TLS.
+///
+/// Rejects `file://`, `ftp://`, `gopher://`, `http://[private-ip]`, URLs with
+/// embedded credentials (they would surface in error logs), and any URL that
+/// does not parse at all.
+pub(crate) fn validate_base_url(context: &str, url: &str) -> LlmResult<()> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        LlmError::NotConfigured(format!("{context} {url:?} is not a valid URL: {e}"))
+    })?;
+
+    // Reject URLs with embedded credentials — they have no place in a
+    // configured base URL and would surface in error logs.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(LlmError::NotConfigured(format!(
+            "{context} {url:?} must not contain embedded credentials"
+        )));
+    }
+
+    let loopback = parsed.host_str().is_some_and(|host| {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        other => Err(LlmError::NotConfigured(format!(
+            "{context} {url:?} uses the {other:?} scheme; only https (or plain http \
+             on localhost/127.0.0.1/::1) is accepted"
+        ))),
+    }
+}
+
 /// Refresh once the access token is within this margin of expiry.
 const REFRESH_MARGIN_MS: u64 = 60_000;
 

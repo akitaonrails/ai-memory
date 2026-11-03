@@ -252,6 +252,9 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
     }
     let arc: Arc<dyn Embedder> = match config.provider {
         EmbedderChoice::OpenAi => {
+            if let Some(url) = &config.base_url {
+                crate::stored_token::validate_base_url("embedding base_url", url)?;
+            }
             let mut e = OpenAiEmbedder::new(config.api_key, config.model, config.dim)?
                 .with_prefixes(config.query_prefix, config.document_prefix);
             if let Some(url) = config.base_url {
@@ -260,6 +263,9 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             Arc::new(e)
         }
         EmbedderChoice::Voyage => {
+            if let Some(url) = &config.base_url {
+                crate::stored_token::validate_base_url("embedding base_url", url)?;
+            }
             let mut e = VoyageEmbedder::new(config.api_key, config.model, config.dim)?;
             if let Some(url) = config.base_url {
                 e = e.with_base_url(url);
@@ -267,6 +273,9 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             Arc::new(e)
         }
         EmbedderChoice::Google => {
+            if let Some(url) = &config.base_url {
+                crate::stored_token::validate_base_url("embedding base_url", url)?;
+            }
             let mut e = GoogleEmbedder::new(config.api_key, config.model, config.dim)?;
             if let Some(url) = config.base_url {
                 e = e.with_base_url(url);
@@ -277,6 +286,10 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             let base = config
                 .base_url
                 .ok_or_else(|| LlmError::NotConfigured("AI_MEMORY_EMBEDDING_BASE_URL".into()))?;
+            // Operator-chosen embedding endpoint — same SSRF risk as the LLM
+            // side: the embedder request carries the API key in headers, and
+            // a misconfigured base URL would hand it to the wrong host.
+            crate::stored_token::validate_base_url("AI_MEMORY_EMBEDDING_BASE_URL", &base)?;
             let api_key = (!config.api_key.expose_secret().is_empty()).then_some(config.api_key);
             Arc::new(
                 OpenAiCompatEmbedder::new(base, api_key, config.model, config.dim)?
@@ -384,6 +397,9 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
     match config.provider {
         ProviderChoice::Anthropic => {
             let key = config.auth.require_api_key()?;
+            if let Some(url) = &config.base_url {
+                crate::stored_token::validate_base_url("llm base_url", url)?;
+            }
             let mut provider = AnthropicProvider::new(key, config.model)?;
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
@@ -397,6 +413,9 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         }
         ProviderChoice::OpenAi => {
             let key = config.auth.require_api_key()?;
+            if let Some(url) = &config.base_url {
+                crate::stored_token::validate_base_url("llm base_url", url)?;
+            }
             let mut provider = OpenAiProvider::new(key, config.model)?;
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
@@ -410,6 +429,9 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         }
         ProviderChoice::Gemini => {
             let key = config.auth.require_api_key()?;
+            if let Some(url) = &config.base_url {
+                crate::stored_token::validate_base_url("llm base_url", url)?;
+            }
             let mut provider = GeminiProvider::new(key, config.model)?;
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
@@ -424,6 +446,11 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             let base = config
                 .base_url
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
+            // Operator-chosen endpoint — validate scheme before any request
+            // so misconfiguration (http://169.254.169.254/… or embedded
+            // credentials) surfaces at startup instead of handing the API
+            // key to the wrong host on the first call.
+            crate::stored_token::validate_base_url("LLM_BASE_URL", &base)?;
             // The openai-compat provider sends `x-request-id` itself, with
             // the logical operation id on every chat attempt. A static
             // operator value cannot serve that role, and `reqwest` would
@@ -475,6 +502,9 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         }
         ProviderChoice::AnthropicOAuth => {
             let token = config.auth.require_anthropic_oauth_token()?;
+            if let Some(url) = &config.base_url {
+                crate::stored_token::validate_base_url("llm base_url", url)?;
+            }
             let mut provider = AnthropicProvider::new_oauth(token, config.model)?;
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
@@ -494,6 +524,9 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
         }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
+            if let Some(url) = &config.base_url {
+                crate::stored_token::validate_base_url("llm base_url", url)?;
+            }
             // Defaults to Go; an operator reaches Zen's general catalogue
             // through AI_MEMORY_LLM_BASE_URL. Silently dropping the override
             // (as this arm used to) left `provider=opencode` unable to speak
