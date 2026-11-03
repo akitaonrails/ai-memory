@@ -27,6 +27,15 @@ version in [`docs/changelog/`](docs/changelog/):
   them now use the helper the `mcp-bridge` connection errors adopted in 3.3.2
   (#1960).
 
+- `install-hooks --agent cursor` no longer writes the default data dir into
+  `~/.cursor/hooks.json` when that path needs quoting. On macOS the default is
+  `~/Library/Application Support/ai-memory`, and a headless `cursor-agent -p`
+  run whose commands carried that quoted path captured nothing. The hook finds
+  the default itself, so those commands need no quoting. A space-free default,
+  such as the usual Linux path, and any custom data dir are still passed.
+  `ai-memory upgrade`, or re-running `install-hooks --agent cursor --apply`,
+  replaces the old entries (#1949).
+
 ### Security
 
 - A password or API key printed by a tool is now redacted when the result
