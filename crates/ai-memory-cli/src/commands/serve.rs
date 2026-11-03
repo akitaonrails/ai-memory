@@ -2465,10 +2465,11 @@ async fn start_maintenance_scheduler(
     }
 
     let scheduler = auto_improve.scheduler.clone();
-    if !scheduler.enabled || scheduler.interval_secs == 0 {
+    // `max_sessions_per_tick = 0` is the documented off switch for the whole
+    // scheduler, experience pass included; a task provider must not revive it.
+    if !scheduler.enabled || scheduler.interval_secs == 0 || scheduler.max_sessions_per_tick == 0 {
         info!("auto-improve scheduler disabled; manual auto-improve remains available");
-    } else if (scheduler.max_sessions_per_tick > 0
-        && llm_providers.get(LlmWorkload::AutoImprove).is_some())
+    } else if llm_providers.get(LlmWorkload::AutoImprove).is_some()
         || (scheduler.experience_every_sessions > 0
             && llm_providers.get(LlmWorkload::Experience).is_some())
     {
@@ -4624,42 +4625,54 @@ mod tests {
         }
     }
 
+    /// An experience-only task provider starts the scheduler, but never past
+    /// the documented `max_sessions_per_tick = 0` off switch or with the
+    /// experience cadence off.
     #[tokio::test]
-    async fn experience_only_provider_starts_scheduler_without_session_reviews() {
-        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
-        let mut auto_improve = AutoImproveSettings::default();
-        auto_improve.scheduler.enabled = true;
-        auto_improve.scheduler.interval_secs = 60;
-        auto_improve.scheduler.max_sessions_per_tick = 0;
-        auto_improve.scheduler.experience_every_sessions = 1;
-        let mut providers = LlmProviders::default();
-        providers
-            .overrides
-            .insert(LlmWorkload::Experience, Arc::new(PanicLlm));
-        let tasks = start_maintenance_scheduler(
-            MaintenanceSettings {
-                enabled: false,
-                ..MaintenanceSettings::default()
-            },
-            auto_improve,
-            store.reader.clone(),
-            store.writer.clone(),
-            wiki,
-            None,
-            providers,
-            crate::config::DecaySettings::default(),
-            crate::config::SessionsSettings::default(),
-            crate::config::DreamSettings::default(),
-            ai_memory_consolidate::ActivityClock::default(),
-            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
-            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
-            false,
-            false,
-        )
-        .await;
-        assert_eq!(tasks.len(), 1);
-        for task in tasks {
-            task.abort();
+    async fn experience_only_provider_starts_scheduler_within_its_switches() {
+        for (max_sessions_per_tick, experience_every_sessions, expected) in
+            [(1, 1, 1), (0, 1, 0), (1, 0, 0)]
+        {
+            let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+            let mut auto_improve = AutoImproveSettings::default();
+            auto_improve.scheduler.enabled = true;
+            auto_improve.scheduler.interval_secs = 60;
+            auto_improve.scheduler.max_sessions_per_tick = max_sessions_per_tick;
+            auto_improve.scheduler.experience_every_sessions = experience_every_sessions;
+            let mut providers = LlmProviders::default();
+            providers
+                .overrides
+                .insert(LlmWorkload::Experience, Arc::new(PanicLlm));
+            let tasks = start_maintenance_scheduler(
+                MaintenanceSettings {
+                    enabled: false,
+                    ..MaintenanceSettings::default()
+                },
+                auto_improve,
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki,
+                None,
+                providers,
+                crate::config::DecaySettings::default(),
+                crate::config::SessionsSettings::default(),
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                false,
+                false,
+            )
+            .await;
+            assert_eq!(
+                tasks.len(),
+                expected,
+                "max_sessions_per_tick={max_sessions_per_tick} \
+                 experience_every_sessions={experience_every_sessions}"
+            );
+            for task in tasks {
+                task.abort();
+            }
         }
     }
 
