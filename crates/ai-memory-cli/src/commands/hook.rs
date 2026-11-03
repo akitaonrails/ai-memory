@@ -20,9 +20,10 @@ use std::time::Duration;
 use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
-    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, GlobStep,
-    GlobWalk, HookEvent, PolicyState, absolute_tool_location_paths, capture_lookup_locations,
-    glob_segment_matches, glob_walk, repository_admits_capture,
+    CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, FILE_FIELD_KEY,
+    FileSkip, FileTarget, GlobStep, GlobWalk, HookEvent, PolicyState, absolute_tool_location_paths,
+    capture_lookup_locations, file_field, file_target, glob_segment_matches, glob_walk,
+    repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
@@ -1839,18 +1840,30 @@ where
                 );
                 payload = serde_json::to_string(&json)?;
             }
-            CaptureDisposition::Keep
-                if decision.protocol().policy_state() != PolicyState::Inactive =>
-            {
-                if let Some(object) = json.as_object_mut() {
-                    object.insert(
-                        "_ai_memory_capture".into(),
-                        serde_json::to_value(decision.protocol())?,
-                    );
+            CaptureDisposition::Keep => {
+                let claim = decision.protocol().policy_state() != PolicyState::Inactive;
+                let file = (hook_event == HookEvent::PostToolUse)
+                    .then(|| {
+                        inspection_cwd
+                            .as_deref()
+                            .and_then(|cwd| file_path_field(agent_kind, &json, cwd))
+                    })
+                    .flatten();
+                if (claim || file.is_some())
+                    && let Some(object) = json.as_object_mut()
+                {
+                    if claim {
+                        object.insert(
+                            "_ai_memory_capture".into(),
+                            serde_json::to_value(decision.protocol())?,
+                        );
+                    }
+                    if let Some(file) = file {
+                        object.insert(FILE_FIELD_KEY.into(), file);
+                    }
                     payload = serde_json::to_string(&json)?;
                 }
             }
-            CaptureDisposition::Keep => {}
         }
     }
 
@@ -3131,6 +3144,37 @@ pub(crate) fn lexical_capture_cwd(cwd: &str) -> String {
         .into_os_string()
         .into_string()
         .unwrap_or_else(|_| cwd.to_owned())
+}
+
+/// The `_ai_memory_file` field for a kept file-tool PostToolUse (#1843): the
+/// one file the call names, relative to the checkout root of `cwd` (the
+/// lexical inspection cwd) and `/`-separated, or why the client has none.
+/// `None` when the call names no single file. Lexical like the capture
+/// policy, so a symlinked cwd is not resolved; relative to the checkout root
+/// rather than the marker, so two worktrees produce the same key.
+fn file_path_field(
+    agent: AgentKind,
+    raw: &serde_json::Value,
+    cwd: &str,
+) -> Option<serde_json::Value> {
+    let FileTarget::One(path) = file_target(agent, raw)? else {
+        return None;
+    };
+    let cwd = Path::new(cwd);
+    let Some(root) = crate::marker::checkout_root(cwd) else {
+        return Some(file_field(Err(FileSkip::NoCheckout)));
+    };
+    let absolute = crate::marker::absolute_normalized(&cwd.join(path));
+    let Ok(relative) = absolute.strip_prefix(&root) else {
+        return Some(file_field(Err(FileSkip::OutsideCheckout)));
+    };
+    let key = relative
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .map(|segments| segments.join("/"))
+        .filter(|key| ai_memory_core::valid_file_path_key(key));
+    Some(file_field(key.as_deref().ok_or(FileSkip::Refused)))
 }
 
 /// File under the data dir holding the per-install capture mode (#446).
@@ -6956,7 +7000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactive_preserves_bytes_and_active_keep_adds_protocol() {
+    async fn inactive_appends_only_the_file_field_and_active_keep_adds_protocol() {
         let tmp = tempfile::tempdir().unwrap();
         let inactive_data = tmp.path().join("inactive-data");
         let inactive_payload =
@@ -6972,9 +7016,16 @@ mod tests {
         )
         .await
         .unwrap();
+        // A file-tool PostToolUse now carries the file path field (#1843),
+        // appended; no claim is attached under an inactive policy and every
+        // other byte is as the harness sent it.
+        let expected = format!(
+            r#"{},"_ai_memory_file":{{"version":1,"skipped":"no_checkout"}}}}"#,
+            inactive_payload.strip_suffix('}').unwrap()
+        );
         assert_eq!(
             read_spooled_entries(&hook_spool::spool_dir(&inactive_data))[0].body,
-            inactive_payload
+            expected
         );
 
         std::fs::write(
@@ -6999,6 +7050,202 @@ mod tests {
         .unwrap();
         assert_eq!(body["_ai_memory_capture"]["disposition"], "keep");
         assert_eq!(body["_ai_memory_capture"]["policy_state"], "active");
+    }
+
+    /// Run one native hook event into its own data dir and return the spooled
+    /// body, or `None` when nothing was spooled.
+    async fn spooled_body(
+        data: PathBuf,
+        event: &str,
+        agent: &str,
+        payload: serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let mut args = devin_hook_args(event);
+        args.agent = agent.into();
+        run_with_payload(
+            Some(data.clone()),
+            args,
+            payload.to_string(),
+            &mut Vec::new(),
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let spool = hook_spool::spool_dir(&data);
+        if !spool.exists() {
+            return None;
+        }
+        read_spooled_entries(&spool)
+            .first()
+            .map(|entry| serde_json::from_str(&entry.body).unwrap())
+    }
+
+    /// #1843: a kept file-tool PostToolUse carries `_ai_memory_file` with the
+    /// one file's checkout-relative path, under an inactive or an active
+    /// policy, or why it has none. A PreToolUse, a two-file patch and a
+    /// metadata-only event carry no field, and an ignored path is not sent.
+    #[tokio::test]
+    async fn post_tool_use_carries_the_file_field_or_its_skip_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("crates")).unwrap();
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../repo/.git/worktrees/w\n").unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let active = tmp.path().join("active");
+        std::fs::create_dir_all(active.join(".git")).unwrap();
+        std::fs::write(
+            active.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secret/**\"]\n",
+        )
+        .unwrap();
+        let read = |cwd: &Path, path: &str| {
+            serde_json::json!({
+                "session_id": "file-field", "cwd": cwd, "tool_name": "Read",
+                "tool_input": { "file_path": path }, "tool_response": { "content": "x" },
+            })
+        };
+        let patch = |cwd: &Path, headers: &str| {
+            let mut body = ai_memory_hooks::tool_call_payload(
+                AgentKind::Codex,
+                "apply_patch",
+                Some(&serde_json::json!({
+                    "input": format!("*** Begin Patch\n{headers}*** End Patch")
+                })),
+                None,
+            );
+            body["session_id"] = "file-field".into();
+            body["cwd"] = cwd.to_string_lossy().as_ref().into();
+            body
+        };
+        let path = |p: &str| Some(serde_json::json!({ "version": 1, "path": p }));
+        let skipped = |r: &str| Some(serde_json::json!({ "version": 1, "skipped": r }));
+        let absolute = repo.join("src/a.rs").to_string_lossy().into_owned();
+        let long = "a".repeat(ai_memory_core::FILE_PATH_MAX_CHARS + 1);
+        let cases = [
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo, "src/lib.rs"),
+                path("src/lib.rs"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo.join("crates"), "../README.md"),
+                path("README.md"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo, &absolute),
+                path("src/a.rs"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&worktree, "x.rs"),
+                path("x.rs"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo, "/etc/hosts"),
+                skipped("outside_checkout"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&plain, "x.rs"),
+                skipped("no_checkout"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&repo, &long),
+                skipped("refused"),
+            ),
+            (
+                "pre-tool-use",
+                "claude-code",
+                read(&repo, "src/lib.rs"),
+                None,
+            ),
+            (
+                "post-tool-use",
+                "codex",
+                patch(&repo, "*** Update File: a.rs\n*** Delete File: b.rs\n"),
+                None,
+            ),
+            (
+                "post-tool-use",
+                "codex",
+                patch(&repo, "*** Update File: one.rs\n"),
+                path("one.rs"),
+            ),
+            (
+                "post-tool-use",
+                "claude-code",
+                read(&active, "src/lib.rs"),
+                path("src/lib.rs"),
+            ),
+            (
+                "post-tool-use",
+                "codex",
+                patch(&active, "*** Update File: one.rs\n"),
+                None,
+            ),
+        ];
+        for (index, (event, agent, payload, expected)) in cases.into_iter().enumerate() {
+            let body = spooled_body(
+                tmp.path().join(format!("data-{index}")),
+                event,
+                agent,
+                payload,
+            )
+            .await
+            .unwrap_or_else(|| panic!("case {index}: nothing spooled"));
+            assert_eq!(body.get(FILE_FIELD_KEY).cloned(), expected, "case {index}");
+        }
+
+        // A symlinked cwd is not resolved: a path under the link keys from the
+        // link, and the target's own absolute path is outside the checkout
+        // the lexical cwd names.
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link");
+            std::os::unix::fs::symlink(&repo, &link).unwrap();
+            for (name, payload, expected) in [
+                ("under", read(&link, "src/lib.rs"), path("src/lib.rs")),
+                (
+                    "target",
+                    read(&link, &absolute),
+                    skipped("outside_checkout"),
+                ),
+            ] {
+                let body = spooled_body(
+                    tmp.path().join(format!("data-link-{name}")),
+                    "post-tool-use",
+                    "claude-code",
+                    payload,
+                )
+                .await
+                .unwrap();
+                assert_eq!(body.get(FILE_FIELD_KEY).cloned(), expected, "{name}");
+            }
+        }
+
+        let ignored = spooled_body(
+            tmp.path().join("data-ignored"),
+            "post-tool-use",
+            "claude-code",
+            read(&active, "secret/key.pem"),
+        )
+        .await;
+        assert_eq!(ignored, None, "an ignored path never leaves the machine");
     }
 
     #[tokio::test]
