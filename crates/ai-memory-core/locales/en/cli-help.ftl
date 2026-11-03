@@ -285,6 +285,7 @@ cli-help-root-mcp-bridge-about = { "Internal stdio-to-HTTP MCP bridge: session-a
 cli-help-root-mcp-bridge-server-url-help = { "Remote ai-memory base URL or full `/mcp` endpoint" }
 cli-help-root-mcp-bridge-no-session-id-help = { "Run as a plain stdio-to-HTTP bridge that forwards no session identity, for MCP clients other than Claude Code and Muse Code. Without it the bridge forwards the session id of the `--agent` that launched it and refuses to start when it is missing" }
 cli-help-root-mcp-bridge-agent-help = { "The harness that launches this session-aware bridge, which names the one variable its session id is read from: `claude-code` (the default) reads `CLAUDE_CODE_SESSION_ID`, `muse` reads `MUSE_SESSION_ID`. The other variable is never consulted, so an id inherited from a different harness's terminal is not forwarded" }
+cli-help-root-mcp-bridge-channel-help = { "Opt the bridge into one push channel for the launching session. `inbox` declares Claude's experimental `claude/channel` capability and pushes a count-only pending-mail notice into the running session when the count changes. Off by default: Claude channels are a research preview, and this bridge is not on Claude's allowlist, so it only loads with `--dangerously-load-development-channels server:<name>`; the flag is explicit" }
 cli-help-root-commit-about = { "Stage + commit the wiki tree under git" }
 cli-help-root-commit-message-help = { "Commit message" }
 cli-help-root-checkpoints-about = { "List recent wiki git checkpoints for recovery" }

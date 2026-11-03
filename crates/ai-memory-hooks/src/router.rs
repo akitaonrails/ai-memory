@@ -1712,6 +1712,16 @@ pub struct HandoffQuery {
     /// unfinished-session recovery snapshot and its backfill marker. Absent or
     /// anything else delivers recovery as before.
     pub recovery: Option<String>,
+    /// Truthy from the mid-session inbox notice clients (the Claude Code
+    /// `UserPromptSubmit` notice and `mcp-bridge --channel inbox`, #1942).
+    /// The response is then only the count-only inbox notice, whatever the
+    /// other flags say: no handoff read or claim, no recovery packet, no
+    /// brief, no profile digest or `[profile]` write, no managed ledger, and
+    /// no active-project publish, so a background poll cannot move the
+    /// caller's "current project" pointer. A server that predates the flag
+    /// ignores it; the clients also send `handoff=0&recovery=0&profile_digest=0`
+    /// so that server still returns only the notice.
+    pub inbox_only: Option<String>,
 }
 
 impl HandoffQuery {
@@ -1808,6 +1818,12 @@ async fn fetch_and_accept_handoff_at(
     // repository does not become the caller's default for later calls.
     let (ws, proj) =
         resolve_authorized_startup_scope(state, &query, actor.as_ref(), viewer).await?;
+    // Mid-session notice poll (#1942): authorized like a session start, then
+    // read-only. Returning here skips every claim, write and pointer publish
+    // below.
+    if crate::payload::query_flag_truthy(query.inbox_only.as_deref()) {
+        return Ok(pending_inbox_notice(state, ws, proj, agent).await);
+    }
     // A managed run's ledger is additive, not a replacement. Resolve and
     // authorize the request's repository before interpreting the run id: a
     // shared Codex daemon may carry a terminal id from another checkout, and
@@ -2067,25 +2083,7 @@ async fn fetch_and_accept_handoff_at(
     // text (no subject, no sender string) — so a hostile message cannot inject
     // text into the on-start context. Nothing is popped here; the agent pops
     // deliberately via memory_message_pop.
-    let inbox_notice = match state
-        .reader
-        .pending_messages_for_agent(ws, proj, agent)
-        .await
-    {
-        Ok(0) => None,
-        Ok(count) => {
-            let names = inbox_scope_names(state, ws, proj).await;
-            render_inbox_notice(
-                count,
-                names
-                    .as_ref()
-                    .map(|(ws_name, proj_name)| (ws_name.as_str(), proj_name.as_str())),
-            )
-        }
-        // A notice is a convenience; never fail the whole SessionStart fetch
-        // because the count could not be read.
-        Err(_) => None,
-    };
+    let inbox_notice = pending_inbox_notice(state, ws, proj, agent).await;
     // A delivered baton supplies the recovery body. Keep another session's
     // uncovered work as a metadata-only pointer instead of mixing its live
     // transcript into the baton the receiver actually claimed.
@@ -2420,6 +2418,36 @@ fn humanize_handoff_age_secs(seconds: i64) -> String {
         v => (v / 2_592_000, "month"),
     };
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+}
+
+/// The count-only inbox notice for mail `agent` could claim in `(ws, proj)`,
+/// or `None` for an empty inbox. Shared by the session-start fetch and the
+/// `inbox_only` mid-session poll (#1942), so both render the same text.
+async fn pending_inbox_notice(
+    state: &HookState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    agent: AgentKind,
+) -> Option<String> {
+    match state
+        .reader
+        .pending_messages_for_agent(ws, proj, agent)
+        .await
+    {
+        Ok(0) => None,
+        Ok(count) => {
+            let names = inbox_scope_names(state, ws, proj).await;
+            render_inbox_notice(
+                count,
+                names
+                    .as_ref()
+                    .map(|(ws_name, proj_name)| (ws_name.as_str(), proj_name.as_str())),
+            )
+        }
+        // A notice is a convenience; never fail the whole fetch because the
+        // count could not be read.
+        Err(_) => None,
+    }
 }
 
 /// Workspace and project names of the inbox the notice counts, or `None` when
@@ -6322,6 +6350,13 @@ pub(crate) mod tests {
     /// project, so it needs a distinct sender coordinate). Returns nothing; the
     /// point is only that the recipient now has pending mail.
     async fn seed_inbox(state: &HookState, count: usize) {
+        seed_inbox_addressed(state, count, None).await;
+    }
+
+    /// [`seed_inbox`] with the harness-addressing column set: `to_agent`
+    /// `None` is shared project mail, `Some(kind)` is addressed to that
+    /// harness alone.
+    async fn seed_inbox_addressed(state: &HookState, count: usize, to_agent: Option<AgentKind>) {
         let sender = state
             .writer
             .get_or_create_project(state.workspace_id, "sender-proj".to_string(), None)
@@ -6338,7 +6373,7 @@ pub(crate) mod tests {
                     from_owner_user: None,
                     to_workspace_id: state.workspace_id,
                     to_project_id: state.project_id,
-                    to_agent: None,
+                    to_agent,
                     subject: Some(format!("subject {i}")),
                     body: format!("please do task {i}"),
                     nature: ai_memory_core::MessageNature::Unknown,
@@ -6356,6 +6391,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.to_string()),
             workspace: Some("default".into()),
@@ -6464,6 +6500,313 @@ pub(crate) mod tests {
             popped.is_some(),
             "a message the notice reported must still be poppable afterwards",
         );
+    }
+
+    /// The mid-session inbox notice (#1942) rides `GET /handoff` with every
+    /// other section suppressed (`handoff=0&recovery=0&profile_digest=0`, no
+    /// `briefing`): the Claude Code `UserPromptSubmit` hook re-fetches the
+    /// same count-only notice a session start got, without claiming a baton,
+    /// recomposing a brief, or touching recovery. The response must then be
+    /// exactly the inbox notice — and, like the pop it advertises, it must
+    /// respect `to_agent`: mail addressed to another harness does not count.
+    #[tokio::test]
+    async fn suppressed_handoff_fetch_returns_only_the_agent_scoped_inbox_notice() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Shared mail counts for every harness; the codex-addressed copy
+        // never reaches a claude-code notice.
+        seed_inbox(&state, 1).await;
+        seed_inbox_addressed(&state, 2, Some(AgentKind::Codex)).await;
+        // An open baton and an open recovery window must both survive the
+        // fetch untouched.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "MUST-STAY-OPEN".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+
+        let query = HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            handoff: Some("0".into()),
+            recovery: Some("0".into()),
+            profile_digest: Some("0".into()),
+            ..session_start_query("")
+        };
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(query),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Count-only and agent-scoped: the one shared message, not three.
+        assert!(
+            body.contains("1 cross-project message waiting"),
+            "the notice must count only shared plus claude-code-addressed mail: {body}",
+        );
+        // Nothing but the notice: no handoff markdown, no summary text, no
+        // recovery scaffold, no brief header.
+        for forbidden in [
+            "MUST-STAY-OPEN",
+            "recovery snapshot",
+            "## ",
+            "subject 0",
+            "please do task",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "a suppressed fetch must not carry {forbidden:?}: {body}",
+            );
+        }
+
+        // Non-claiming on every axis: the baton is still open, the mail is
+        // still pending, and a deliberate pop still finds the shared message.
+        let handoffs = state
+            .reader
+            .list_handoffs(
+                state.workspace_id,
+                state.project_id,
+                Some(ai_memory_core::HandoffState::Open),
+                ai_memory_core::OwnerFilter::Any,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(handoffs.len(), 1, "the suppressed fetch must claim nothing");
+        let popped = state
+            .writer
+            .pop_message(
+                ai_memory_core::MessageClaim {
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    claiming_agent: AgentKind::ClaudeCode,
+                    claiming_session: None,
+                    claiming_user: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(popped.is_some(), "the mail must stay claimable");
+    }
+
+    /// The same suppressed fetch on an empty inbox returns an empty body, the
+    /// client's signal that the count is zero (and its cue to reset its
+    /// dedup state so a later arrival notifies again).
+    #[tokio::test]
+    async fn suppressed_handoff_fetch_is_empty_when_no_mail_is_agent_visible() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        // Only harness-addressed mail for another agent: invisible here.
+        seed_inbox_addressed(&state, 3, Some(AgentKind::Codex)).await;
+        let state = Arc::new(state);
+
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(HandoffQuery {
+                    agent: Some("claude-code".into()),
+                    cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    handoff: Some("0".into()),
+                    recovery: Some("0".into()),
+                    profile_digest: Some("0".into()),
+                    ..session_start_query("")
+                }),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "", "an invisible inbox must render no notice");
+    }
+
+    /// `inbox_only=1` (#1942) is the background-poll form of the notice
+    /// fetch: it must stay read-only even when the caller leaves every other
+    /// section on. No baton claim, and no active-project publish, so a bridge
+    /// polling repository A every few seconds cannot keep steering an
+    /// operator's unscoped calls in repository B back to A. The control is a
+    /// plain session start on the same state, which does publish and claim.
+    #[tokio::test]
+    async fn inbox_only_fetch_claims_nothing_and_publishes_no_active_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        seed_inbox(&state, 2).await;
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "INBOX-ONLY-BATON".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let fetch = |inbox_only: Option<&'static str>| {
+            let state = state.clone();
+            let query = HandoffQuery {
+                inbox_only: inbox_only.map(Into::into),
+                ..session_start_query(&cwd)
+            };
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        None,
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, body) = fetch(Some("1")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("2 cross-project messages waiting"), "{body}");
+        assert!(!body.contains("INBOX-ONLY-BATON"), "{body}");
+        assert!(
+            open_handoff_exists(&state).await,
+            "inbox_only claimed the baton"
+        );
+        assert_eq!(
+            state.active_project.get(),
+            None,
+            "inbox_only published the caller's active project"
+        );
+
+        // Control: the same query without the flag is a real session start.
+        let (status, body) = fetch(None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("INBOX-ONLY-BATON"), "{body}");
+        assert_eq!(
+            state.active_project.get(),
+            Some((state.workspace_id, state.project_id))
+        );
+    }
+
+    /// The notice poll is authorized like a session start: a viewer with no
+    /// grant on a restricted project gets a 403 and no count, so the poll
+    /// cannot be used to watch another team's inbox. A granted reader is the
+    /// control and sees the count.
+    #[tokio::test]
+    async fn inbox_only_fetch_refuses_a_viewer_without_read_access() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        state
+            .writer
+            .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        seed_inbox(&state, 1).await;
+        let human = |name: &'static str| {
+            let writer = state.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let reader = human("reader").await;
+        let outsider = human("outsider").await;
+        state
+            .writer
+            .grant_memory(
+                reader,
+                state.project_id,
+                ai_memory_store::GrantLevel::Read,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let poll = |viewer: ai_memory_core::UserId| {
+            let state = state.clone();
+            let query = HandoffQuery {
+                inbox_only: Some("1".into()),
+                handoff: Some("0".into()),
+                recovery: Some("0".into()),
+                profile_digest: Some("0".into()),
+                ..session_start_query(&cwd)
+            };
+            async move {
+                read_handoff_response(
+                    handle_handoff(
+                        State(state),
+                        Query(query),
+                        None,
+                        None,
+                        Some(axum::Extension(AuthorizedViewer(viewer))),
+                        HeaderMap::new(),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, body) = poll(outsider).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            !body.contains("message waiting"),
+            "leaked the count: {body}"
+        );
+
+        let (status, body) = poll(reader).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("1 cross-project message waiting"), "{body}");
     }
 
     /// A resumed session that had already ended may not take a baton
@@ -7171,6 +7514,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             identity: Some(identity.to_owned()),
             identity_src: Some(source.to_owned()),
             aliases: None,
@@ -16577,6 +16921,7 @@ pub(crate) mod tests {
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
+                inbox_only: None,
                 workspace: Some("checkpoint-workspace".into()),
                 project: Some(project.into()),
                 agent: Some("codex".into()),
@@ -16657,6 +17002,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("opencode2".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -16892,6 +17238,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some(agent.into()),
             session_id: Some(session_id),
             ..Default::default()
@@ -17084,6 +17431,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             session_id: Some(SessionId::new().to_string()),
             ..Default::default()
@@ -18463,6 +18811,7 @@ pub(crate) mod tests {
                     profile_digest: None,
                     handoff: None,
                     recovery: None,
+                    inbox_only: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
                     workspace: Some("default".into()),
@@ -19085,6 +19434,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -19176,6 +19526,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -19286,6 +19637,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -19483,6 +19835,7 @@ pub(crate) mod tests {
                     profile_digest: None,
                     handoff: handoff.map(str::to_string),
                     recovery: None,
+                    inbox_only: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
                     workspace: Some("default".into()),
@@ -20579,6 +20932,7 @@ pub(crate) mod tests {
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
+                inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: Some("acme".into()),
@@ -20664,6 +21018,7 @@ pub(crate) mod tests {
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
+                inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some("/repo/api/src".into()),
                 workspace: Some("default".into()),
@@ -20741,6 +21096,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("codex".into()),
             cwd: Some(cwd.clone()),
             workspace: Some("default".into()),
@@ -20899,6 +21255,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("codex".into()),
             cwd: Some(cwd),
             workspace: Some("default".into()),
@@ -21023,6 +21380,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -21109,6 +21467,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -21541,6 +21900,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
             workspace: None,
@@ -21709,6 +22069,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some("kimi-code".into()),
             cwd: Some("/repo".into()),
             workspace: Some("default".into()),
@@ -22566,6 +22927,7 @@ pub(crate) mod tests {
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
+                inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
                 workspace: None,
@@ -26209,6 +26571,7 @@ pub(crate) mod tests {
                     profile_digest: None,
                     handoff: None,
                     recovery: None,
+                    inbox_only: None,
                     managed_run: Some(run.run_id.to_string()),
                     session_id: Some("private-vendor".into()),
                     cwd: Some(cwd.clone()),
@@ -26281,6 +26644,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            inbox_only: None,
             agent: Some(agent.into()),
             cwd: Some(cwd.into()),
             workspace: None,

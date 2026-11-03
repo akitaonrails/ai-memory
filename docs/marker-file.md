@@ -221,6 +221,14 @@ deliver_on_session_start = false
 [recovery]
 deliver_on_session_start = false
 
+# Optional. Show Claude Code the count-only pending-inbox notice on every
+# user prompt while the count or the inbox's names change, instead of only
+# at session start. The notice never carries message text; the agent still
+# pops and reviews the message itself. A marker that sets only [messaging]
+# is a settings boundary. Off by default.
+[messaging]
+inbox_notice_on_prompt = "true"
+
 # Optional. The cross-project profile (docs/cross-project-profile.md): your
 # usual choices from other projects, delivered at session start as defaults
 # below this repository's rules file. Both keys default to on.
@@ -292,8 +300,8 @@ in the home marker remain the fallback, followed by the default remote-path
 identity and then the installed/cwd fallback; explicit CLI scope always wins. A matched route replaces
 only the root `workspace`, `project`, `identity`, `identity_style`, `aliases`, and
 `project_strategy` routing fields. Root `server`, `drop_subagent_captures`,
-`[recall]`, `[briefing]`, `[profile]`, `[handoff]`, and `[recovery]` settings
-still apply.
+`[recall]`, `[briefing]`, `[profile]`, `[handoff]`, `[recovery]`, and
+`[messaging]` settings still apply.
 
 A home route map is bounded to 64 routes, a 64 KiB file, 512 UTF-8 bytes per
 selector, and 512 UTF-8 bytes per scalar value. Its portable grammar permits
@@ -352,7 +360,8 @@ scoped to the current project and cover every project only when you pass
 [usage.md](usage.md#search-from-the-terminal) and
 [usage.md](usage.md#recent-pages-from-the-terminal)).
 
-`default_global`, `inject_on_session_start` and `inject_on_subagent_start` accept a truthy value
+`default_global`, `inject_on_session_start`, `inject_on_subagent_start` and
+`inbox_notice_on_prompt` accept a truthy value
 (`true` / `1` / `yes` / `on`, quoted or bare; section-style keys are
 parsed leniently); anything else behaves as absent. `max_chars` is a
 plain integer.
