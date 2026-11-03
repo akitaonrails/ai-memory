@@ -131,6 +131,7 @@ async fn session(store: &Store, ws: WorkspaceId, proj: ProjectId, n: u8, body: &
                     title: format!("obs {n}-{i}"),
                     body: body.to_string(),
                     importance: 5,
+                    file_path: None,
                 },
                 &sanitizer,
             ))

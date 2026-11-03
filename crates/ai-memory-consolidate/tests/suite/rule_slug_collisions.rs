@@ -77,6 +77,7 @@ async fn fixture(tmp: &std::path::Path) -> (Store, Wiki, SessionId) {
                 title: "convention".to_string(),
                 body: "set the deploy convention".to_string(),
                 importance: 3,
+                file_path: None,
             },
             &sanitizer,
         ))

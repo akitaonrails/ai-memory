@@ -110,6 +110,7 @@ async fn session_end_readers_refuse_foreign_session_ids() {
                 title: "private prompt".into(),
                 body: "foreign scopes must not read this".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -198,6 +199,7 @@ async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
                         title: "routine".into(),
                         body: format!("{tag} row {i}"),
                         importance: 1,
+                        file_path: None,
                     },
                     &sanitizer,
                 ))
@@ -1799,6 +1801,7 @@ async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
                     importance: 5,
 
                     occurred_at: None,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4584,6 +4587,7 @@ async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control()
         body: "must survive a self-service purge".into(),
         importance: 5,
         occurred_at: None,
+        file_path: None,
     };
     store
         .writer
@@ -5332,6 +5336,7 @@ async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_cont
                     title: format!("{owner} unfinished task"),
                     body: format!("private evidence {index}"),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5437,6 +5442,7 @@ async fn interrupted_recovery_ignores_foreign_scope_work_and_batons_with_control
                 title: "unfinished task".into(),
                 body: "private evidence".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         )

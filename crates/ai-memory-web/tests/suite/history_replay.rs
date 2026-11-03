@@ -145,6 +145,7 @@ impl Fixture {
                         title: (*title).to_owned(),
                         body: (*body).to_owned(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))

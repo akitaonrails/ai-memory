@@ -142,6 +142,7 @@ async fn observe(state: &HookState, sid: SessionId, kind: ObservationKind, at: i
                 body: body.into(),
                 importance: 5,
                 occurred_at: Some(at),
+                file_path: None,
             },
             &state.sanitizer,
         ))

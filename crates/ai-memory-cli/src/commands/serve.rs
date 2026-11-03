@@ -4814,6 +4814,7 @@ mod tests {
                     body: "prompt two hours ago".into(),
                     importance: 5,
                     occurred_at: Some(last_activity),
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5287,6 +5288,7 @@ mod tests {
                     title: "work".into(),
                     body: "the session that outlived the daemon".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5390,6 +5392,7 @@ mod tests {
                     title: "work".into(),
                     body: "activity the seed would otherwise reach for".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5454,6 +5457,7 @@ mod tests {
                     title: "finish".into(),
                     body: "complete the durable job".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5561,6 +5565,7 @@ mod tests {
                     title: "checkpoint".into(),
                     body: "open session still running".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5666,6 +5671,7 @@ mod tests {
                     title: "checkpoint".into(),
                     body: "owned session still running".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5766,6 +5772,7 @@ mod tests {
                     title: "finish".into(),
                     body: "end the session".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5906,6 +5913,7 @@ mod tests {
                     title: "finish".into(),
                     body: "complete the durable job".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6110,6 +6118,7 @@ mod tests {
                     title: "finish".into(),
                     body: "end the session".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))

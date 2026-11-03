@@ -46,6 +46,7 @@ fn observation(session: &NewSession, kind: ObservationKind, body: &str) -> NewOb
         title: kind.as_str().into(),
         body: body.into(),
         importance: 5,
+        file_path: None,
     }
 }
 

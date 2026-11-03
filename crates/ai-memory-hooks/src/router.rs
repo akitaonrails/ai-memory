@@ -4968,6 +4968,7 @@ async fn process_authorized(
             body: durable_body(env.event, env.body_excerpt.as_deref(), &state.sanitizer),
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
+            file_path: None,
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -10673,6 +10674,7 @@ pub(crate) mod tests {
                     title: "pending replay".into(),
                     body: "hello".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &state.sanitizer,
             )
@@ -15684,6 +15686,7 @@ pub(crate) mod tests {
                                 title: "probe".into(),
                                 body: String::new(),
                                 importance: 1,
+                                file_path: None,
                             },
                             &state.sanitizer
                         ),
@@ -20975,6 +20978,7 @@ pub(crate) mod tests {
                     title: "session-end".into(),
                     body: "finish".into(),
                     importance: 7,
+                    file_path: None,
                 },
                 &state.sanitizer,
             )
@@ -27678,6 +27682,7 @@ pub(crate) mod tests {
                         title: "prompt".into(),
                         body: habit.into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &ai_memory_core::Sanitizer::builtin(),
                 ))

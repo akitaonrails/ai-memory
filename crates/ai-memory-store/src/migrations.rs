@@ -764,6 +764,7 @@ mod tests {
                 title: "prompt".into(),
                 body: "continue".into(),
                 importance: 8,
+                file_path: None,
             },
         )
         .unwrap();
@@ -2524,6 +2525,7 @@ mod tests {
             title: "tool file".into(),
             body: body.into(),
             importance: 5,
+            file_path: None,
         };
         let body = "edited crates/ai-memory-store/src/reader.rs in ai-memory";
         let page = [4_u8; 16];

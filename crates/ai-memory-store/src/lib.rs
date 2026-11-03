@@ -2913,6 +2913,7 @@ mod tests {
                     title: "tool file".into(),
                     body: DIRECTORY_PATH_BODY.into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3775,6 +3776,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "the raw-only zebra detail lives here".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3838,6 +3840,7 @@ mod tests {
                     body: "leaked Authorization: Bearer abcdef0123456789ABCDEF0123456789 in transcript"
                         .into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3916,6 +3919,7 @@ mod tests {
             title: "prompt".into(),
             body: "hello".into(),
             importance: 5,
+            file_path: None,
         };
 
         let first = store
@@ -4280,6 +4284,7 @@ mod tests {
                     title: "first".into(),
                     body: "initial work".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4324,6 +4329,7 @@ mod tests {
                     title: "resumed".into(),
                     body: "new work".into(),
                     importance: 7,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4992,6 +4998,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "upgrade observation survives".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();

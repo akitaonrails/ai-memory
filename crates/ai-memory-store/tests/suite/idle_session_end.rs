@@ -95,6 +95,7 @@ fn observation(
         body: body.into(),
         importance: 5,
         occurred_at: Some(at_us),
+        file_path: None,
     }
 }
 

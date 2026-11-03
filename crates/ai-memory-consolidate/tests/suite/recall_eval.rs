@@ -496,6 +496,7 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
                 title: "raw prompt".into(),
                 body: "raw fallback detail mentions capybara exactly once".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -583,6 +584,7 @@ async fn profile_recall_across_projects() {
                     title: "prompt".into(),
                     body: prompt.into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))

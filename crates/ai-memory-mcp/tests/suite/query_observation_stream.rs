@@ -109,6 +109,7 @@ async fn seed_session(
                        because the default pool lacks the GPU driver."
                     .into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

@@ -391,6 +391,7 @@ async fn digest_inputs_read_entries_stack_and_newness() {
                 body: String::new(),
                 importance: 5,
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

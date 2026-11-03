@@ -837,6 +837,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
                 title: "prompt".into(),
                 body: "do the thing".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2288,6 +2289,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2650,6 +2652,7 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2777,6 +2780,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2865,6 +2869,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2905,6 +2910,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
