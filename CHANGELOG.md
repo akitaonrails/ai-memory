@@ -46,6 +46,7 @@ version in [`docs/changelog/`](docs/changelog/):
   at <url>` with a pointer to check the server, instead of rmcp's
   `error sending request ... when send initialize request` under a bearer
   token hint that had nothing to do with it (#1947).
+
 - Rule pages whose titles mix scripts no longer share one path. The rule
   slugger kept only a title's ASCII letters and digits, so `ACME 客户周报的
   格式与范围` and every other rule whose title shared the word `ACME` collapsed
@@ -54,7 +55,9 @@ version in [`docs/changelog/`](docs/changelog/):
   carries an 8-hex digest of the title (the same mechanism as the
   `rule-<hex>` fallback): different titles keep different pages, a
   restatement keeps updating its own, and a pure-ASCII title keeps its old
-  slug. Profile entry slugs take the same digest and now fold Latin
+  slug. A rule written before this change keeps its unsuffixed page: when
+  the old path holds the same title, the restatement updates it there
+  instead of forking a second live copy at the new path. Profile entry slugs take the same digest and now fold Latin
   diacritics like rule titles do; a statement with no ASCII at all names
   itself by digest instead of every such statement landing on `entry`. Two
   rules in one batch that still slug alike, such as two long titles
