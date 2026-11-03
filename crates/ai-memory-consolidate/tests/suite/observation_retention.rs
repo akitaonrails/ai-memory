@@ -61,13 +61,21 @@ async fn seed(store: &Store) -> Fixture {
     let evicted = session(store, ws, proj, 3, EVICTED_BODY).await;
 
     // Only the first two ends link a page; the third's page is evicted below.
-    let page = write_page(&store.writer, ws, proj, "sessions/consolidated.md").await;
+    let page = write_page(
+        &store.writer,
+        ws,
+        proj,
+        "sessions/consolidated.md",
+        "distilled",
+    )
+    .await;
     store
         .writer
         .end_session(consolidated, Some(page))
         .await
         .expect("end consolidated");
-    let evicted_page = write_page(&store.writer, ws, proj, "sessions/evicted.md").await;
+    let evicted_page =
+        write_page(&store.writer, ws, proj, "sessions/evicted.md", "distilled").await;
     store
         .writer
         .end_session(evicted, Some(evicted_page))
@@ -140,14 +148,20 @@ async fn session(store: &Store, ws: WorkspaceId, proj: ProjectId, n: u8, body: &
     id
 }
 
-async fn write_page(writer: &WriterHandle, ws: WorkspaceId, proj: ProjectId, path: &str) -> PageId {
+async fn write_page(
+    writer: &WriterHandle,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    path: &str,
+    body: &str,
+) -> PageId {
     writer
         .upsert_page(NewPage {
             workspace_id: ws,
             project_id: proj,
             path: PagePath::new(path.to_string()).expect("path"),
             title: path.into(),
-            body: "distilled".into(),
+            body: body.into(),
             tier: Tier::Episodic,
             frontmatter_json: serde_json::json!({}),
             pinned: false,
@@ -554,4 +568,74 @@ async fn a_negative_retention_age_stops_the_sweep() {
     .await
     .expect_err("a negative retention age must fail closed");
     assert!(error.to_string().contains("observation_retention_days"));
+}
+
+/// SessionEnd links the heuristic page, the LLM worker rewrites it as a new
+/// version, decay evicts that version: the raw capture is the last copy.
+#[tokio::test]
+async fn a_session_whose_rewritten_page_was_evicted_keeps_its_observations() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .expect("ws");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "retention".to_string(), None)
+        .await
+        .expect("proj");
+    let sid = session(&store, ws, proj, 7, "rewritten evicted capture zebrafinch").await;
+    let path = "sessions/rewritten.md";
+
+    let heuristic = write_page(&store.writer, ws, proj, path, "distilled").await;
+    store
+        .writer
+        .end_session(sid, Some(heuristic))
+        .await
+        .expect("end session");
+    let rewritten = write_page(&store.writer, ws, proj, path, "llm distilled").await;
+    assert_ne!(heuristic, rewritten, "the rewrite must be a new version");
+
+    let evicted = store
+        .writer
+        .soft_delete_for_decay_if_latest(
+            ws,
+            proj,
+            PagePath::new(path.to_string()).expect("path"),
+            rewritten,
+        )
+        .await
+        .expect("evict");
+    assert!(evicted, "the current version must be the one evicted");
+
+    let conn = aux(&store);
+    let then_us = jiff::Timestamp::now().as_microsecond() - OBS_AGE_DAYS * US_PER_DAY;
+    conn.execute("UPDATE observations SET created_at = ?1", params![then_us])
+        .expect("backdate observations");
+
+    let report = run_sweep_with_options(
+        &store.reader,
+        &store.writer,
+        None,
+        ws,
+        proj,
+        &DecayParams::default(),
+        0.0,
+        enabled(),
+        false,
+    )
+    .await
+    .expect("sweep");
+
+    assert_eq!(
+        report.observations_prunable, 0,
+        "the dry run must not count the last copy"
+    );
+    assert_eq!(
+        observations_for(&conn, sid),
+        3,
+        "raw capture whose rewritten summary page decay evicted is the last copy"
+    );
 }
