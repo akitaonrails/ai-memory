@@ -852,7 +852,7 @@ pub(crate) enum WriteCmd {
     },
     LinkOrAdoptManagedRunSession {
         input: LinkOrAdoptManagedRunSession,
-        claude_clear: bool,
+        boundary: crate::workstream::ClaudeSessionBoundary,
         reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
     LinkManagedRunSessionInScope {
@@ -3729,24 +3729,27 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::LinkOrAdoptManagedRunSession {
             input,
-            claude_clear: false,
+            boundary: crate::workstream::ClaudeSessionBoundary::Other,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Relink an ID-selected Claude run after an authorized SessionStart clear.
-    /// Rechecks the checkout, operator, live lease and native-session boundary
-    /// in the same transaction that publishes the new current session.
-    pub async fn relink_managed_claude_clear(
+    /// Relink an ID-selected Claude run after an authorized SessionStart
+    /// `clear` (to a never-seen native id) or `resume` (to one this
+    /// workstream held and no other live run holds). Rechecks the checkout,
+    /// operator, live lease and native-session boundary in the same
+    /// transaction that publishes the new current session.
+    pub async fn relink_managed_claude_session(
         &self,
         input: LinkOrAdoptManagedRunSession,
+        boundary: crate::workstream::ClaudeSessionBoundary,
     ) -> StoreResult<ManagedRunSessionLink> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::LinkOrAdoptManagedRunSession {
             input,
-            claude_clear: true,
+            boundary,
             reply: tx,
         })
         .await?;
@@ -5273,14 +5276,11 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             }
             WriteCmd::LinkOrAdoptManagedRunSession {
                 input,
-                claude_clear,
+                boundary,
                 reply,
             } => {
-                let result = crate::workstream::link_or_adopt_native_session(
-                    &mut conn,
-                    &input,
-                    claude_clear,
-                );
+                let result =
+                    crate::workstream::link_or_adopt_native_session(&mut conn, &input, boundary);
                 send_or_warn(reply, result, "link_or_adopt_managed_run_session");
             }
             WriteCmd::LinkManagedRunSessionInScope { input, reply } => {

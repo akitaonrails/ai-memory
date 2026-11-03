@@ -140,6 +140,15 @@ version in [`docs/changelog/`](docs/changelog/):
   while preserving checkout, operator, project and lease checks; replaying an
   older session cannot move the run backward (#1936).
 
+- An in-session `/resume` back to the conversation from before a `/clear` no
+  longer stops capture in an ID-selected managed run. The clear relink above
+  left the old native id refused for good, so Claude's `SessionStart` with
+  `source: "resume"` was rejected and the resumed conversation went
+  uncaptured. A resume now relinks the run to a native session its own
+  workstream already held, under the same checkout, operator, project, lease
+  and Write checks, and only when no other live run holds that session; a
+  replayed `clear` still cannot move the run backward (#1936, #1944).
+
 ### Security
 
 - `ai-memory-wikisync` now stages every file it replaces (exported pages,

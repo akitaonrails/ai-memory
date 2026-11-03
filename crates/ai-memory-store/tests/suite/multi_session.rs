@@ -22,8 +22,9 @@ use ai_memory_core::{
     UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::{
-    ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
-    PagePrecondition, PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
+    ClaudeSessionBoundary, ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession,
+    ManagedRunSessionLink, PagePrecondition, PrepareWorkstreamRun, Store, StoreError,
+    WorkstreamSelection,
 };
 
 fn operator(name: &str) -> String {
@@ -2048,7 +2049,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
         assert_eq!(
             store
                 .writer
-                .relink_managed_claude_clear(rejected)
+                .relink_managed_claude_session(rejected, ClaudeSessionBoundary::Clear)
                 .await
                 .unwrap(),
             ManagedRunSessionLink::Refused,
@@ -2076,7 +2077,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_clear(input("expired"))
+            .relink_managed_claude_session(input("expired"), ClaudeSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
@@ -2089,7 +2090,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_clear(input("cleared"))
+            .relink_managed_claude_session(input("cleared"), ClaudeSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Exact(run.run_id)
@@ -2103,7 +2104,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_clear(input("original"))
+            .relink_managed_claude_session(input("original"), ClaudeSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
@@ -2112,10 +2113,229 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_clear(input("terminal"))
+            .relink_managed_claude_session(input("terminal"), ClaudeSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
+    );
+}
+
+/// An in-session `/resume` after `/clear` returns the run to a conversation
+/// its workstream already held (#1944 follow-up): SessionStart `resume` may
+/// relink to such an id, and capture continues. It never reaches further: a
+/// never-held id, another operator, another checkout, a lapsed lease, an id
+/// only another workstream held, and an id a parallel live run currently
+/// holds are all refused, and a `clear` still never rewinds to a known id.
+#[tokio::test]
+async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let prepare = |tree: &str, lease: &str, owner: String| {
+        let store = &store;
+        let tree = tree.to_owned();
+        let lease = lease.to_owned();
+        async move {
+            store
+                .writer
+                .prepare_workstream_run_owned(
+                    PrepareWorkstreamRun {
+                        scope_by_id: true,
+                        workspace_id: ws,
+                        project_id: proj,
+                        repo_fingerprint: "resume-repo".into(),
+                        worktree_fingerprint: tree,
+                        cwd: "/repo".into(),
+                        agent: AgentKind::ClaudeCode,
+                        automatic_harness: false,
+                        available_agents: Vec::new(),
+                        selection: WorkstreamSelection::Current,
+                        lease_owner: lease,
+                    },
+                    Some(owner),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let run = prepare("resume-tree", "resume-a", alice.clone()).await;
+    let input = |run_id, native: &str, owner: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run_id,
+        workspace_id: ws,
+        project_id: proj,
+        cwd: "/repo".into(),
+        agent: AgentKind::ClaudeCode,
+        native_session_id: native.into(),
+        owner_user: Some(owner.to_owned()),
+    };
+    let link = |i: LinkOrAdoptManagedRunSession, boundary| {
+        let store = &store;
+        async move {
+            store
+                .writer
+                .relink_managed_claude_session(i, boundary)
+                .await
+                .unwrap()
+        }
+    };
+    let current = |run_id| {
+        let store = &store;
+        async move {
+            store
+                .reader
+                .managed_run_status(run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+        }
+    };
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(run.run_id, "original", &alice))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    store
+        .writer
+        .accept_managed_run_context(run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Clear
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+
+    // Adversarial: none of these may move the run off `cleared`.
+    for (case, i) in [
+        ("never-held", input(run.run_id, "never-held", &alice)),
+        (
+            "other-operator",
+            input(run.run_id, "original", &operator("bob")),
+        ),
+        ("other-checkout", {
+            let mut i = input(run.run_id, "original", &alice);
+            i.cwd = "/other-checkout".into();
+            i
+        }),
+    ] {
+        assert_eq!(
+            link(i, ClaudeSessionBoundary::Resume).await,
+            ManagedRunSessionLink::Refused,
+            "{case}"
+        );
+        assert_eq!(
+            current(run.run_id).await.as_deref(),
+            Some("cleared"),
+            "{case}"
+        );
+    }
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Clear
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "a clear (or its delayed replay) never rewinds to a known id"
+    );
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+        [run.run_id.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "lapsed lease"
+    );
+    store
+        .writer
+        .heartbeat_managed_run(run.run_id)
+        .await
+        .unwrap();
+
+    // Control: the run's own operator resumes the pre-clear conversation.
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("original"));
+
+    // A run in another workstream cannot resume into this one's history.
+    let other = prepare("other-tree", "resume-b", alice.clone()).await;
+    assert_ne!(other.workstream_id, run.workstream_id);
+    store
+        .writer
+        .link_or_adopt_managed_run_session(input(other.run_id, "other-native", &alice))
+        .await
+        .unwrap();
+    store
+        .writer
+        .accept_managed_run_context(other.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(other.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "an id only another workstream held"
+    );
+    assert_eq!(current(other.run_id).await.as_deref(), Some("other-native"));
+
+    // A parallel live run that holds one of this workstream's earlier ids
+    // keeps it: a resume never takes a session another live run captures.
+    let parallel = prepare("parallel-tree", "resume-c", alice.clone()).await;
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(parallel.run_id, "cleared", &alice))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(parallel.run_id)
+    );
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "an id a parallel live run holds"
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("original"));
+    store
+        .writer
+        .cancel_managed_run(parallel.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id),
+        "once the parallel run ends, the held id resumes again"
     );
 }
 
