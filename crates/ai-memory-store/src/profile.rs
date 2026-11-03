@@ -14,6 +14,13 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use crate::error::StoreResult;
 use crate::reader::{not_expired, now_us};
 
+/// Most profile pages the session-start digest reads. A digest budget holds
+/// a few dozen lines, so this cap sits far above anything a digest can show;
+/// it only keeps the first prompt of a session from loading an unbounded
+/// profile. It is not a correctness input: the digest still reports what it
+/// leaves out, and the harvester reads the scope uncapped.
+pub const PROFILE_DIGEST_READ_CAP: usize = 2_000;
+
 /// Recent observations scanned for stack signals. Bounded so the scan costs
 /// the same on a project with a long history as on a new one.
 const STACK_SIGNAL_OBSERVATIONS: i64 = 2_000;
@@ -116,19 +123,24 @@ pub(crate) fn contribute_opt_outs(conn: &Connection) -> StoreResult<Vec<ProfileO
 }
 
 /// The current, unexpired `profile/` pages of a scope, as digest entries.
-/// Pages with nothing to state are skipped. The read has no row cap: list,
-/// status and apply show the whole scope, and the digest's byte budget, not
-/// path order, decides what a session start leaves out (#1946).
+/// Pages with nothing to state are skipped. `limit` caps the rows read:
+/// `None` (list, status, apply) shows the whole scope (#1946), and the
+/// session-start digest passes [`PROFILE_DIGEST_READ_CAP`] so the first
+/// prompt of a session never loads an unbounded profile. Neither cap feeds
+/// the harvester, whose convergence reads [`profile_scope_pages`].
 pub(crate) fn profile_entries(
     conn: &Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
+    limit: Option<usize>,
 ) -> StoreResult<Vec<ProfileEntry>> {
+    // SQLite reads a negative LIMIT as "no limit".
+    let limit = limit.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
     let sql = format!(
         "SELECT path, title, body, frontmatter_json FROM pages \
          WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
            AND path GLOB ?3{not_expired} \
-         ORDER BY path ASC",
+         ORDER BY path ASC LIMIT ?5",
         not_expired = not_expired("pages", "?4"),
     );
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -137,7 +149,8 @@ pub(crate) fn profile_entries(
             workspace_id.as_bytes(),
             project_id.as_bytes(),
             format!("{PROFILE_PATH_PREFIX}*"),
-            now_us()
+            now_us(),
+            limit
         ],
         |row| {
             Ok((
