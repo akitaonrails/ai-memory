@@ -578,6 +578,58 @@ impl Consolidator {
     /// request carries no pin of its own, so writing it would replace the
     /// body and drop the pin. `_slots/` are pinned automatically and keep
     /// the state/invariant regime above, so they are not skipped here.
+    /// #1943 gave mixed-script rule titles a `-<8 hex>` slug suffix, so a
+    /// rule written before it lives at the unsuffixed `_rules/<slug>.md`.
+    /// When that page exists and holds this rule's own title, keep writing
+    /// there instead of forking a second live copy at the new path. A page
+    /// there with a different title (the collision #1943 fixed) is left
+    /// alone and the rule keeps its digested path.
+    fn keep_legacy_rule_path(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        req: &mut WritePageRequest,
+        outcome: &mut ConsolidationOutcome,
+    ) {
+        if !is_rule_request(req) {
+            return;
+        }
+        let Some(title) = req.frontmatter.get("title").and_then(|t| t.as_str()) else {
+            return;
+        };
+        let Some(legacy) = legacy_rule_slug(title)
+            .and_then(|slug| PagePath::new(format!("_rules/{slug}.md")).ok())
+        else {
+            return;
+        };
+        let same_rule = match self.wiki.read_page(workspace_id, project_id, &legacy) {
+            Ok(md) => md
+                .frontmatter
+                .get("title")
+                .and_then(|t| t.as_str())
+                .is_some_and(|existing| {
+                    title_collision_key(existing) == title_collision_key(title)
+                }),
+            Err(ai_memory_wiki::WikiError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                false
+            }
+            Err(err) => {
+                warn!(
+                    path = %legacy.as_str(),
+                    error = %err,
+                    "could not read the pre-#1943 rule path; writing the rule at its new path",
+                );
+                false
+            }
+        };
+        if same_rule {
+            req.path = legacy.clone();
+            outcome.path = legacy;
+        }
+    }
+
     fn should_skip_pinned_page_update(
         &self,
         workspace_id: WorkspaceId,
@@ -916,6 +968,7 @@ impl Consolidator {
                     }
                 }
             }
+            self.keep_legacy_rule_path(ws, proj, &mut req, &mut outcome);
             if self.should_skip_high_resistance_slot_update(ws, proj, &req)? {
                 warn!(
                     path = %req.path.as_str(),
@@ -2178,6 +2231,19 @@ fn indent_for_prompt(s: &str) -> String {
 /// titles cannot share a path, a restated title keeps updating its own
 /// page, and a pure-ASCII title keeps its exact old slug.
 fn slugify_for_rule(title: &str) -> String {
+    fold_rule_slug(title, true)
+}
+
+/// The slug a rule title took before #1943 added the fold-loss digest, when
+/// it differs from today's. An upgrade must not fork an existing rule onto
+/// a second path, so a write whose legacy page holds the same title keeps
+/// updating that page (see `Consolidator::keep_legacy_rule_path`).
+fn legacy_rule_slug(title: &str) -> Option<String> {
+    let legacy = fold_rule_slug(title, false);
+    (legacy != slugify_for_rule(title)).then_some(legacy)
+}
+
+fn fold_rule_slug(title: &str, digest_fold_loss: bool) -> String {
     // NFD decomposition splits `é` into `e` + U+0301 (combining acute),
     // `ç` into `c` + U+0327, etc. Reuses ai-memory-core's icu_normalizer.
     let decomposed = icu_normalizer::DecomposingNormalizer::new_nfd().normalize(title);
@@ -2225,7 +2291,7 @@ fn slugify_for_rule(title: &str) -> String {
     }
     // The suffix rides inside the 60-char cap, so the ASCII part folds to
     // a 51-char budget when one is coming.
-    let suffix = if dropped_alnum {
+    let suffix = if dropped_alnum && digest_fold_loss {
         digest.map(|hex| format!("-{hex}"))
     } else {
         None

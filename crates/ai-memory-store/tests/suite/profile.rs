@@ -541,3 +541,58 @@ async fn profile_reads_keep_pages_past_the_old_two_hundred_path_cap() {
             .any(|entry| entry.path == "profile/workflow/ship.md")
     );
 }
+
+/// The session-start digest runs on the first prompt of every session, so its
+/// read of the profile is bounded even after #1946 lifted the old 200-row cap.
+/// The cap sits far above what a digest budget can show, and it never reaches
+/// the harvester or the list/status/apply views: those still read every page.
+#[tokio::test]
+async fn session_start_digest_read_is_bounded_but_scope_reads_are_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let global = ai_memory_store::create_global_scope(&store.writer)
+        .await
+        .unwrap();
+    let cap = ai_memory_store::PROFILE_DIGEST_READ_CAP;
+    assert!(cap > 200, "the cap must sit well above the old 200-row cap");
+
+    let pages: Vec<NewPage> = (0..=cap)
+        .map(|i| {
+            profile_page(
+                global.workspace_id,
+                global.project_id,
+                &format!("profile/habits/h{i:05}.md"),
+                "Always keep pull requests small.",
+            )
+        })
+        .collect();
+    store.writer.upsert_pages_batch(pages).await.unwrap();
+
+    let inputs = store
+        .reader
+        .profile_digest_inputs(global.as_tuple(), global.as_tuple())
+        .await
+        .unwrap();
+    assert_eq!(
+        inputs.entries.len(),
+        cap,
+        "digest read must stop at the cap"
+    );
+
+    let all = store
+        .reader
+        .profile_entries(global.workspace_id, global.project_id)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), cap + 1, "list/status/apply read the whole scope");
+    let (scope_pages, _) = store
+        .reader
+        .profile_scope_pages(global.workspace_id, global.project_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        scope_pages.len(),
+        cap + 1,
+        "the harvester's convergence read stays uncapped"
+    );
+}

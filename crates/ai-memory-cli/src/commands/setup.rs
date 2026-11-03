@@ -1204,9 +1204,11 @@ async fn self_check(config: &Config, endpoint: &ServerEndpoint) -> Vec<String> {
 
 /// Setup needs the health response before it can leave an existing server
 /// in charge or report success. The shared launch probe remains presence-only
-/// for compatibility with servers that predate `/healthz`.
+/// for compatibility with servers that predate `/healthz`. The probe shares
+/// the thin client's no-redirect policy (#1932): a portal answering 3xx is
+/// reported, never followed to a page that could pass as healthy.
 async fn probe_setup_server(endpoint: &ServerEndpoint) -> SetupProbe {
-    let response = reqwest::Client::new()
+    let response = crate::http_client::http_client()
         .get(endpoint.build_url("/healthz"))
         .timeout(Duration::from_secs(5))
         .send()
@@ -1222,6 +1224,12 @@ async fn probe_setup_server(endpoint: &ServerEndpoint) -> SetupProbe {
 }
 
 async fn validate_healthz(mut response: reqwest::Response) -> Result<(), String> {
+    if response.status().is_redirection() {
+        return Err(format!(
+            "HTTP {} redirect, which ai-memory does not follow",
+            response.status()
+        ));
+    }
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
@@ -2049,6 +2057,61 @@ mod tests {
                 assert!(matches!(probe, SetupProbe::Unexpected(_)), "{probe:?}");
             }
         }
+    }
+
+    /// The setup probe must not follow a redirect (#1932): a portal or proxy
+    /// that answers `307` toward another origin's healthy `/healthz` would
+    /// otherwise make setup trust a server it never reached. The redirect is
+    /// reported as unexpected and the target is never contacted.
+    #[tokio::test]
+    async fn setup_health_probe_does_not_follow_a_redirect() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let contacted = Arc::new(AtomicBool::new(false));
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/healthz", target_listener.local_addr().unwrap());
+        let flag = Arc::clone(&contacted);
+        let target_app = axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(move || {
+                flag.store(true, Ordering::SeqCst);
+                async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"status":"ok"}"#,
+                    )
+                }
+            }),
+        );
+        let target_server =
+            tokio::spawn(async move { axum::serve(target_listener, target_app).await.unwrap() });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/healthz",
+            axum::routing::get(move || async move {
+                (
+                    axum::http::StatusCode::TEMPORARY_REDIRECT,
+                    [(axum::http::header::LOCATION, target)],
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+        let probe = probe_setup_server(&endpoint).await;
+        server.abort();
+        target_server.abort();
+
+        assert!(
+            matches!(&probe, SetupProbe::Unexpected(reason) if reason.contains("307") && reason.contains("redirect")),
+            "{probe:?}"
+        );
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "the redirect target must never be contacted"
+        );
     }
 
     /// An unhealthy response still means the port is occupied. Do not

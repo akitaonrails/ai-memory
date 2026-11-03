@@ -91,8 +91,11 @@ impl McpClient {
         let mut url =
             Url::parse(server).map_err(|e| anyhow!("invalid --server {server:?}: {e}"))?;
         url.set_path("/mcp");
+        // Never follow a redirect: a 307/308 would replay the bearer POST,
+        // page body included, to the `Location` origin (#1932).
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| anyhow!("cannot build HTTP client: {e}"))?;
         Ok(Self { http, url, token })
@@ -214,6 +217,12 @@ impl McpClient {
             .await
             .map_err(|e| anyhow!("MCP {method} request to {} failed: {e}", self.url))?;
         let status = response.status();
+        if status.is_redirection() {
+            bail!(
+                "MCP {method} returned HTTP {status}, a redirect wikisync does not follow; \
+                 point --server at the ai-memory server itself, not a proxy or login portal"
+            );
+        }
         let text = response
             .text()
             .await

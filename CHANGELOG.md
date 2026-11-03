@@ -111,12 +111,16 @@ version in [`docs/changelog/`](docs/changelog/):
 - Allowed MCP agents to address messages to a registered harness and record
   the sender harness (#1935).
 
+## [3.3.2] - 2026-11-03
+
 ### Fixed
 
-- Profile harvest, list, status and the session-start digest read every
-  current `profile/` page in the scope. The previous 200-row path-order cap
-  dropped later categories from those views and made the harvester treat the
-  unread pages as forgotten (#1946, #1955).
+- Profile harvest, list and status read every current `profile/` page in the
+  scope. The previous 200-row path-order cap dropped later categories from
+  those views and made the harvester treat the unread pages as forgotten. The
+  session-start digest, which runs on the first prompt of every session, reads
+  up to 2,000 pages: far more than its byte budget can show, and still a
+  bounded read (#1946, #1955).
 
 - Cline 3.0.74 tool observations now classify ClineCore names (`read_files`,
   `run_commands`, `editor`, and the other built-ins) so they store as
@@ -141,9 +145,11 @@ version in [`docs/changelog/`](docs/changelog/):
   a client opened during a service restart lost its memory tools for the whole
   session. The bridge now retries a refused connection for up to 3 seconds,
   and when nothing answers it reports `could not reach the ai-memory server
-  at <url>` with a pointer to check the server, instead of rmcp's
+  at <url>` (with any `user:pass@` stripped from the URL) and a pointer to
+  check the server, instead of rmcp's
   `error sending request ... when send initialize request` under a bearer
   token hint that had nothing to do with it (#1947).
+
 - Rule pages whose titles mix scripts no longer share one path. The rule
   slugger kept only a title's ASCII letters and digits, so `ACME 客户周报的
   格式与范围` and every other rule whose title shared the word `ACME` collapsed
@@ -152,7 +158,9 @@ version in [`docs/changelog/`](docs/changelog/):
   carries an 8-hex digest of the title (the same mechanism as the
   `rule-<hex>` fallback): different titles keep different pages, a
   restatement keeps updating its own, and a pure-ASCII title keeps its old
-  slug. Profile entry slugs take the same digest and now fold Latin
+  slug. A rule written before this change keeps its unsuffixed page: when
+  the old path holds the same title, the restatement updates it there
+  instead of forking a second live copy at the new path. Profile entry slugs take the same digest and now fold Latin
   diacritics like rule titles do; a statement with no ASCII at all names
   itself by digest instead of every such statement landing on `entry`. Two
   rules in one batch that still slug alike, such as two long titles
@@ -205,6 +213,14 @@ version in [`docs/changelog/`](docs/changelog/):
   and backfill's explicit-server bearer resolution share the same client
   (#1932).
 
+- `ai-memory setup`'s health probe, `ai-memory-wikisync` and
+  `ai-memory-importer` no longer follow HTTP redirects either, completing the
+  thin-client change above. A proxy or login portal answering `307` toward
+  another origin's healthy `/healthz` made setup trust a server it never
+  reached, and the companions' bearer reads and write POSTs were replayed to
+  the `Location` origin. Each now reports the 3xx as a redirect it does not
+  follow (#1932).
+
 - Recorded failed Cursor tool calls as failures. Cursor's
   `postToolUseFailure` carries `error_message` and `failure_type`, not the
   `error` string ai-memory read, so a call that failed or timed out was stored
@@ -229,6 +245,15 @@ version in [`docs/changelog/`](docs/changelog/):
   ID-selected managed run. The clear boundary links the new native session
   while preserving checkout, operator, project and lease checks; replaying an
   older session cannot move the run backward (#1936).
+
+- An in-session `/resume` back to the conversation from before a `/clear` no
+  longer stops capture in an ID-selected managed run. The clear relink above
+  left the old native id refused for good, so Claude's `SessionStart` with
+  `source: "resume"` was rejected and the resumed conversation went
+  uncaptured. A resume now relinks the run to a native session its own
+  workstream already held, under the same checkout, operator, project, lease
+  and Write checks, and only when no other live run holds that session; a
+  replayed `clear` still cannot move the run backward (#1936, #1944).
 
 ### Security
 
@@ -3909,7 +3934,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.2...HEAD
+[3.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.2
 [3.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.1
 [3.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.0
 [3.2.10]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.10

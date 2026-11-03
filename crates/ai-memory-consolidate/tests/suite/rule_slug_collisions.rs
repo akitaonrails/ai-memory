@@ -482,3 +482,128 @@ async fn sibling_links_to_a_rerouted_rule_are_rewritten() {
         "the stable page is live at its proposed path"
     );
 }
+
+/// Run one scripted rule batch and return the path each rule landed on.
+async fn consolidate_rules(
+    store: &Store,
+    wiki: &Wiki,
+    session: SessionId,
+    rules: Vec<Value>,
+) -> Vec<PagePath> {
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    Consolidator::new(
+        store.reader.clone(),
+        store.writer.clone(),
+        wiki.clone(),
+        Arc::new(ScriptedLlm(json!({"rationale": "rules", "updates": rules}))),
+        ws,
+        proj,
+    )
+    .consolidate_session_multi(session, false, ActorContext::anonymous(), None, None)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|o| o.path)
+    .collect()
+}
+
+/// An upgrade must not fork a rule written before #1943. A mixed-script rule
+/// then lived at the unsuffixed `_rules/acme.md`; its restatement keeps
+/// updating that page instead of creating a second live copy at the new
+/// digested path. A different title that folds to the same legacy slug (the
+/// collision #1943 fixed) still takes its own digested page and leaves the
+/// existing rule untouched.
+#[tokio::test]
+async fn restating_a_pre_digest_rule_keeps_its_legacy_path() {
+    const TITLE: &str = "ACME 客户周报的格式与范围";
+    // Where a brand-new rule with this title lands today.
+    let fresh = TempDir::new().unwrap();
+    let (fresh_store, fresh_wiki, fresh_session) = fixture(fresh.path()).await;
+    let new_path = consolidate_rules(
+        &fresh_store,
+        &fresh_wiki,
+        fresh_session,
+        vec![rule_update(TITLE, "Rule for the report.", &[])],
+    )
+    .await
+    .remove(0);
+    let legacy = PagePath::new("_rules/acme.md").unwrap();
+    assert_ne!(new_path, legacy, "the title is digested today");
+
+    let tmp = TempDir::new().unwrap();
+    let (store, wiki, session) = fixture(tmp.path()).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: legacy.clone(),
+        frontmatter: json!({"title": TITLE, "kind": "rule", "consolidated": true}),
+        body: "Old rule body.".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: Some(TITLE.into()),
+        admission_ctx: None,
+        author_id: None,
+        actor: ActorContext::anonymous(),
+        evidence: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    // Restatement (case and spacing differ): updates the legacy page.
+    let paths = consolidate_rules(
+        &store,
+        &wiki,
+        session,
+        vec![rule_update(
+            "acme  客户周报的格式与范围",
+            "Restated rule body.",
+            &[],
+        )],
+    )
+    .await;
+    assert_eq!(paths, vec![legacy.clone()]);
+    assert_eq!(
+        wiki.read_page(ws, proj, &legacy).unwrap().body.trim(),
+        "Restated rule body."
+    );
+    assert!(
+        wiki.read_page(ws, proj, &new_path).is_err(),
+        "no second live copy at the digested path"
+    );
+
+    // A different title on the same legacy slug keeps the #1943 split.
+    let paths = consolidate_rules(
+        &store,
+        &wiki,
+        session,
+        vec![rule_update("ACME 其他报告", "Other rule.", &[])],
+    )
+    .await;
+    assert_eq!(paths.len(), 1);
+    assert_ne!(paths[0], legacy);
+    assert!(paths[0].as_str().starts_with("_rules/acme-"));
+    assert_eq!(
+        wiki.read_page(ws, proj, &legacy).unwrap().body.trim(),
+        "Restated rule body.",
+        "the existing rule is not overwritten by a different title"
+    );
+}

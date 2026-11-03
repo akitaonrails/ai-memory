@@ -14374,8 +14374,10 @@ impl ReaderPool {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
     ) -> StoreResult<Vec<ai_memory_core::profile::ProfileEntry>> {
-        self.with_conn(move |conn| crate::profile::profile_entries(conn, workspace_id, project_id))
-            .await
+        self.with_conn(move |conn| {
+            crate::profile::profile_entries(conn, workspace_id, project_id, None)
+        })
+        .await
     }
 
     /// Every project the profile harvester may read, with its marks.
@@ -14474,7 +14476,8 @@ impl ReaderPool {
     }
 
     /// The digest inputs for a session in `project` reading the profile held
-    /// in `profile_scope`, from one connection checkout.
+    /// in `profile_scope`, from one connection checkout. The entry read stops
+    /// at [`crate::PROFILE_DIGEST_READ_CAP`] rows, in path order.
     ///
     /// # Errors
     /// Propagates SQL or pool errors.
@@ -14485,7 +14488,12 @@ impl ReaderPool {
     ) -> StoreResult<crate::ProfileDigestInputs> {
         self.with_conn(move |conn| {
             Ok(crate::ProfileDigestInputs {
-                entries: crate::profile::profile_entries(conn, profile_scope.0, profile_scope.1)?,
+                entries: crate::profile::profile_entries(
+                    conn,
+                    profile_scope.0,
+                    profile_scope.1,
+                    Some(crate::profile::PROFILE_DIGEST_READ_CAP),
+                )?,
                 project_tags: crate::profile::project_stack_tags(conn, project.0, project.1)?,
                 project_has_pages: crate::profile::project_has_pages(conn, project.0, project.1)?,
             })

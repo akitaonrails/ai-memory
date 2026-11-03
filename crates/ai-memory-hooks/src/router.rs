@@ -2114,7 +2114,7 @@ struct ManagedHookHint<'a> {
     cwd: Option<&'a str>,
     native_session: Option<&'a str>,
     session_start: bool,
-    claude_clear: bool,
+    claude_boundary: ai_memory_store::ClaudeSessionBoundary,
 }
 
 /// Only a run prepared through the ID selector may supply its stored scope.
@@ -2144,7 +2144,7 @@ async fn pinned_managed_hook_scope(
             native_session_id: hint.native_session.unwrap_or_default().to_owned(),
             owner_user: owner_user.clone(),
             session_start: hint.session_start,
-            claude_clear: hint.claude_clear,
+            claude_boundary: hint.claude_boundary,
         })
         .await?;
     let Some((workspace_id, project_id)) = scope else {
@@ -2165,18 +2165,21 @@ async fn pinned_managed_hook_scope(
         ai_memory_store::ProjectAccess::Write,
     )
     .await?;
-    let linked = if hint.claude_clear {
+    let linked = if hint.claude_boundary != ai_memory_store::ClaudeSessionBoundary::Other {
         state
             .writer
-            .relink_managed_claude_clear(ai_memory_store::LinkOrAdoptManagedRunSession {
-                supplied_run_id: run_id,
-                workspace_id,
-                project_id,
-                cwd: hint.cwd.unwrap_or_default().to_owned(),
-                agent: hint.agent,
-                native_session_id: native.into_string(),
-                owner_user,
-            })
+            .relink_managed_claude_session(
+                ai_memory_store::LinkOrAdoptManagedRunSession {
+                    supplied_run_id: run_id,
+                    workspace_id,
+                    project_id,
+                    cwd: hint.cwd.unwrap_or_default().to_owned(),
+                    agent: hint.agent,
+                    native_session_id: native.into_string(),
+                    owner_user,
+                },
+                hint.claude_boundary,
+            )
             .await?
     } else {
         state
@@ -2215,7 +2218,7 @@ async fn resolve_authorized_startup_scope(
             cwd: query.cwd.as_deref(),
             native_session: query.session_id.as_deref(),
             session_start: true,
-            claude_clear: false,
+            claude_boundary: ai_memory_store::ClaudeSessionBoundary::Other,
         },
         actor,
         viewer,
@@ -4751,11 +4754,13 @@ async fn process_authorized(
             cwd: env.cwd.as_deref(),
             native_session: env.session_id.as_deref(),
             session_start: env.event == HookEvent::SessionStart,
-            // Claude documents `clear` separately from startup/resume/compact/fork:
-            // https://code.claude.com/docs/en/hooks#sessionstart-input
-            claude_clear: env.agent == AgentKind::ClaudeCode
-                && env.event == HookEvent::SessionStart
-                && env.raw.get("source").and_then(serde_json::Value::as_str) == Some("clear"),
+            // Claude documents `clear` and `resume` separately from startup
+            // and compact: https://code.claude.com/docs/en/hooks#sessionstart-input
+            claude_boundary: ai_memory_store::ClaudeSessionBoundary::from_session_start(
+                env.agent,
+                env.event == HookEvent::SessionStart,
+                env.raw.get("source").and_then(serde_json::Value::as_str),
+            ),
         },
         actor.as_ref(),
         viewer,
@@ -15020,6 +15025,98 @@ pub(crate) mod tests {
         assert_eq!(
             run_native_session(&state, run.run_id).await.as_deref(),
             Some("second-clear")
+        );
+    }
+
+    /// `/clear` then an in-session `/resume` back to the pre-clear
+    /// conversation: Claude sends SessionStart `resume` with the old id, the
+    /// run follows it and capture continues there. A `resume` to an id the
+    /// run's workstream never held stays refused.
+    #[tokio::test]
+    async fn managed_claude_resume_after_clear_keeps_capturing_the_resumed_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let run = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "resume-repo".into(),
+                worktree_fingerprint: "resume-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "resume-test".into(),
+            })
+            .await
+            .unwrap();
+        let event = |kind: &str, native: &str, source: &str| {
+            let mut event = session_envelope(kind, native, "/tmp/scratch");
+            event.managed_run = Some(run.run_id.to_string());
+            event.raw["source"] = serde_json::json!(source);
+            event
+        };
+        process(
+            &state,
+            event("session-start", "before-clear", "startup"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .accept_managed_run_context(run.run_id)
+            .await
+            .unwrap();
+        process(
+            &state,
+            event("session-start", "after-clear", "clear"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            process(
+                &state,
+                event("session-start", "never-held", "resume"),
+                None,
+                Vec::new()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("after-clear")
+        );
+        process(
+            &state,
+            event("session-start", "before-clear", "resume"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("before-clear")
+        );
+        let prompt = event("user-prompt-submit", "before-clear", "");
+        let session = resolve_session_id(&prompt).unwrap();
+        process(&state, prompt, None, Vec::new()).await.unwrap();
+        assert!(
+            !state
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap()
+                .is_empty(),
+            "capture continues in the resumed conversation"
         );
     }
 

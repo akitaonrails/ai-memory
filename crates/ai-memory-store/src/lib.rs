@@ -79,9 +79,10 @@ pub use ops::{
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
-    NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_HARVEST_BATCH, ProfileCandidateRow,
-    ProfileDigestInputs, ProfileHarvestMark, ProfileHarvestProject, ProfileLedgerEntry,
-    ProfileOptOut, ProfilePageRow, ProfilePromptRow, ProfileScopePage, ProjectProfileFlags,
+    NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_DIGEST_READ_CAP, PROFILE_HARVEST_BATCH,
+    ProfileCandidateRow, ProfileDigestInputs, ProfileHarvestMark, ProfileHarvestProject,
+    ProfileLedgerEntry, ProfileOptOut, ProfilePageRow, ProfilePromptRow, ProfileScopePage,
+    ProjectProfileFlags,
 };
 pub use project_authz::{
     AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
@@ -130,11 +131,12 @@ pub use session_consolidation::{
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
-    LinkOrAdoptManagedRunSession, ManagedRunAuthority, ManagedRunContext, ManagedRunHookIdentity,
-    ManagedRunSessionLink, OperationalWorkstreamSummary, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus,
-    StoredWorkstreamSummary, WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
+    ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
+    LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, OperationalWorkstreamSummary,
+    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamOperationalStatus,
+    WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -6817,7 +6819,7 @@ mod tests {
             native_session_id: "native-session".into(),
             owner_user: None,
             session_start: true,
-            claude_clear: false,
+            claude_boundary: ClaudeSessionBoundary::Other,
         };
 
         set_managed_run_lease(store.db_path(), run.run_id, 1);
@@ -6845,7 +6847,7 @@ mod tests {
                     native_session_id: "native-session".into(),
                     owner_user: None,
                     session_start: true,
-                    claude_clear: false,
+                    claude_boundary: ClaudeSessionBoundary::Other,
                 })
                 .await
                 .unwrap(),

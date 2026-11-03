@@ -65,6 +65,9 @@ prompt that can be cached:
   no activity yet gets every entry.
 - **Bounded.** The section stays within `digest_max_bytes` (default 3,000
   bytes); entries that do not fit are counted, and `memory_query` finds them.
+  The read behind it stops at 2,000 profile pages in path order, far more
+  than any budget can show; `profile list`, `status` and the harvester read
+  every page.
 - **Stable.** The order is fixed (category, then path) and nothing
   time-dependent is printed, so the text is byte-identical between sessions
   until the profile changes, which keeps it in the harness's cached prompt.
