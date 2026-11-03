@@ -163,9 +163,6 @@ jobs:
         env:
           AI_MEMORY_BIN: ${{ github.workspace }}/target/debug/ai-memory
         run: node tests/e2e/web_dashboard_mutations.mjs
-      - name: Dashboard Rust mutation checks
-        if: matrix.os == 'ubuntu-latest'
-        run: python3 scripts/check-dashboard-core-mutations.py
       - name: Generated capture-policy TypeScript runtime evidence
         if: matrix.os == 'ubuntu-latest'
         # `--workspace` reuses the test binaries built above instead of
@@ -188,6 +185,20 @@ jobs:
       - name: Vendored tailwind.css is current
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css
+
+  # The script edits tracked source and rebuilds target/ once per mutant, so
+  # it runs alone: no later step consumes the binary it leaves behind, and a
+  # surviving mutant fails this check rather than the test suite (#1967).
+  mutation-checks:
+    name: dashboard mutation checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: python3 scripts/check-dashboard-core-mutations.py
 
   # Native Windows *test* coverage lives in `.github/workflows/windows.yml`: it
   # runs nightly, on demand, and on any pull request carrying the `windows`
