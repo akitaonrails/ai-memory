@@ -226,44 +226,34 @@ fn json_hex_unit(bytes: &[u8], at: usize) -> Option<u32> {
     })
 }
 
-/// Spans sorted by start, answering "does this span overlap any of them"
-/// in logarithmic time.
-struct SortedSpans {
-    starts: Vec<usize>,
-    /// The furthest end among the spans up to each index.
-    reach: Vec<usize>,
-}
+/// Disjoint spans sorted by start, answering "which of them overlap this
+/// span" in logarithmic time.
+struct SortedSpans(Vec<(usize, usize)>);
 
 impl SortedSpans {
     fn new(spans: &[(usize, usize)]) -> Self {
         let mut sorted = spans.to_vec();
         sorted.sort_unstable();
-        let reach = sorted
-            .iter()
-            .scan(0, |reach, &(_, end)| {
-                *reach = end.max(*reach);
-                Some(*reach)
-            })
-            .collect();
-        Self {
-            starts: sorted.into_iter().map(|(start, _)| start).collect(),
-            reach,
-        }
+        Self(sorted)
     }
 
-    /// The furthest end of the spans that overlap `span`, if any do.
-    fn reach_over(&self, (start, end): (usize, usize)) -> Option<usize> {
-        let before = self.starts.partition_point(|&s| s < end);
-        let reach = *self.reach.get(before.checked_sub(1)?)?;
-        (reach > start).then_some(reach)
+    /// The spans that overlap `span`. One pattern's view matches never
+    /// overlap one another, so their ends rise with their starts.
+    fn overlapping(&self, (start, end): (usize, usize)) -> &[(usize, usize)] {
+        let from = self.0.partition_point(|&(_, e)| e <= start);
+        let to = self.0.partition_point(|&(s, _)| s < end);
+        self.0.get(from..to).unwrap_or_default()
     }
 }
 
 /// Where a value the view cut short at `from` really ends inside a JSON line:
 /// at the end of its JSON string, at an escaped quote (the view's own
-/// closing quote), or at an escaped line break that starts a new
-/// `KEY=value` / `key: value` line, as in a printed `.env`. An escaped tab or
-/// a line break followed by anything else stays part of the value (#1974).
+/// closing quote), or at an escaped line break. An escaped tab stays part of
+/// the value, and so does a line break whose continuation is the string's
+/// last line and is not a `KEY=value`, `key: value` or `#` comment line
+/// (#1974). A longer continuation is ambiguous with the next lines of a
+/// printed `.env`, which must survive, so the value stops at its first line
+/// break.
 fn json_value_end(text: &str, from: usize) -> usize {
     let bytes = text.as_bytes();
     let mut at = from;
@@ -272,11 +262,12 @@ fn json_value_end(text: &str, from: usize) -> usize {
             b'"' => break,
             b'\\' => {
                 let next = bytes.get(at + 1).copied();
-                let len = source_len_at(text, at).max(1);
-                if next == Some(b'"')
-                    || (matches!(next, Some(b'n' | b'r')) && starts_assignment(&text[at + len..]))
-                {
+                if next == Some(b'"') {
                     break;
+                }
+                let len = source_len_at(text, at).max(1);
+                if matches!(next, Some(b'n' | b'r')) {
+                    return last_line_end(text, at + len).unwrap_or(at);
                 }
                 at += len;
             }
@@ -284,6 +275,33 @@ fn json_value_end(text: &str, from: usize) -> usize {
         }
     }
     at
+}
+
+/// The end of the continuation that starts at `from`, just after an escaped
+/// line break, when it is the last line of its JSON string and holds a value
+/// rather than a new `.env` line; otherwise `None`.
+fn last_line_end(text: &str, mut from: usize) -> Option<usize> {
+    if text[from..].starts_with("\\n") {
+        from += 2;
+    }
+    let rest = &text[from..];
+    if starts_assignment(rest) || rest.starts_with('#') {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'"' => break,
+            b'\\' => match bytes.get(at + 1) {
+                Some(b'"') => break,
+                Some(b'n' | b'r') => return None,
+                _ => at += source_len_at(text, at).max(1),
+            },
+            _ => at += text[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    (at > from).then_some(at)
 }
 
 /// Whether `rest` opens with `KEY=value` or `key: value`, an optional
@@ -696,9 +714,9 @@ impl Sanitizer {
         // the view only ever widens a redaction: plain text holding a literal
         // `\n` or `\"` ends a value early in the view but not as written. In
         // a line that parses as JSON the escapes are JSON's own, so a plain
-        // match the view already covers reaches only as far as
-        // `json_value_end` allows: never past its JSON string or onto the
-        // next `.env` line.
+        // match the view already covers only lets each view value's tail
+        // grow as far as `json_value_end` allows: never past its JSON string
+        // or onto the next `.env` line.
         let mut shadow = Shadow::of(&out);
         for pattern in &self.inner.patterns {
             let mut spans = self.spans(&out, shadow.as_ref(), pattern);
@@ -709,12 +727,18 @@ impl Sanitizer {
                     let mut json_lines = JsonLines::new(&out);
                     let kept: Vec<_> = plain
                         .into_iter()
-                        .filter_map(|span| match view.reach_over(span) {
-                            Some(reach) if json_lines.contains(span.0) => {
-                                let end = json_value_end(&out, reach).min(span.1);
-                                (end > reach).then_some((span.0, end))
+                        .flat_map(|span| {
+                            let covered = view.overlapping(span);
+                            if covered.is_empty() || !json_lines.contains(span.0) {
+                                return vec![span];
                             }
-                            _ => Some(span),
+                            // Only each view value's own tail grows; the
+                            // view spans already cover the rest.
+                            covered
+                                .iter()
+                                .map(|&(_, end)| (end, json_value_end(&out, end).min(span.1)))
+                                .filter(|&(start, end)| end > start)
+                                .collect()
                         })
                         .collect();
                     spans.extend(kept);
@@ -2118,6 +2142,59 @@ mod tests {
                 assert!(out.contains(r#","keep"]"#), "{raw} -> {out}");
             }
         }
+    }
+
+    /// Compact JSON has no whitespace, so one plain match can span several
+    /// `.env` lines and their secrets. Only each secret's own tail is
+    /// extended; the lines between and after them survive (#1974).
+    #[test]
+    fn lines_between_secrets_in_a_compact_json_line_survive() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, secrets, survivors) in [
+            (
+                r#"{"stdout":"STRIPE_SECRET=abcFAKEfake0123\nPORT=5432\nOTHER_SECRET=defFAKEfake0123\n","x":"keep"}"#,
+                &["abcFAKEfake0123", "defFAKEfake0123"][..],
+                &[r"\nPORT=5432\n", r#""x":"keep""#][..],
+            ),
+            (
+                r#"{"stdout":"STRIPE_SECRET=abcFAKEfake0123\r\nPORT=5432\r\nOTHER_SECRET=defFAKEfake0123\r\n","x":"keep"}"#,
+                &["abcFAKEfake0123", "defFAKEfake0123"][..],
+                &[r"\r\nPORT=5432\r\n", r#""x":"keep""#][..],
+            ),
+            (
+                r#"{"stdout":"A_SECRET=xFAKEfake0123\nyyyy\nzz\n","x":"keep"}"#,
+                &["xFAKEfake0123"][..],
+                &[r"\nyyyy\nzz\n", r#""x":"keep""#][..],
+            ),
+            (
+                r#"{"stdout":"DB_HOST=x\nSTRIPE_SECRET=abcFAKEfake0123\n# comment keep\n","x":"keep"}"#,
+                &["abcFAKEfake0123"][..],
+                &[r"DB_HOST=x\n", r"\n# comment keep\n", r#""x":"keep""#][..],
+            ),
+        ] {
+            let out = s.scrub(raw);
+            assert!(out.contains("[REDACTED:"), "{raw} -> {out}");
+            for secret in secrets {
+                assert!(!out.contains(secret), "{secret} kept: {raw} -> {out}");
+            }
+            for survivor in survivors {
+                assert!(out.contains(survivor), "{survivor} lost: {raw} -> {out}");
+            }
+            assert!(
+                serde_json::from_str::<serde::de::IgnoredAny>(&out).is_ok(),
+                "redaction broke the JSON: {raw} -> {out}"
+            );
+        }
+        // At scale: the lines after the secret keep their size.
+        let raw = serde_json::json!({"stdout": format!("A_SECRET=xFAKEfake0123\n{}", "yyyy\nzz\n".repeat(100_000))})
+            .to_string();
+        let out = s.scrub(&raw);
+        assert!(
+            !out.contains("xFAKEfake0123") && out.len() > raw.len() - 64,
+            "{}",
+            out.len()
+        );
     }
 
     /// Outside JSON, a redaction never starts between a backslash and the

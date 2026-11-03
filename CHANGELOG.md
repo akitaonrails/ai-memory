@@ -26,10 +26,12 @@ version in [`docs/changelog/`](docs/changelog/):
   matches, so a literal `\n` or `\"` in a plain `.env` value cannot cut it
   short. In a line that parses as JSON, such as a stored tool result, a
   quoted `KEY=value` or `"KEY":"value"` value stops at its closing quote,
-  and a value stops at an escaped line break that opens a new `KEY=value`
-  line, so the rest of the result stays readable and valid JSON. Any other
-  escaped tab or line break stays part of the value, up to the end of its
-  JSON string, and no redaction starts or ends inside an escape. An unquoted
+  and a value stops at an escaped line break, so the lines around it stay
+  readable and the result stays valid JSON. An escaped tab stays part of the
+  value, and so does a line break before the string's last line when that
+  line is not a new `KEY=value`, `key: value` or `#` line. A secret that
+  continues over more lines, or past an escaped quote, is redacted only up
+  to that point. No redaction starts or ends inside an escape. An unquoted
   value at the very end of a string with no line break after it still
   redacts the rest of the result, as before. A quoted plain-text value with
   spaces, such as `DB_PASSWORD="two words"`, is now redacted whole instead
