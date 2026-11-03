@@ -1949,6 +1949,33 @@ fn native_path(candidate: Normalized) -> String {
 /// tool call.
 pub const MAX_LOOKUP_LOCATIONS: usize = 4_096;
 
+/// How many files a file-tool call names, for the file path index (#1843).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTarget {
+    /// No target the extraction can read.
+    NoFile,
+    /// Exactly one literal file, as the tool spelled it.
+    One(String),
+    /// More than one file, a move, or a glob.
+    Many,
+}
+
+/// The file a file-tool call names, or `None` for any other tool. Reads the
+/// direct path arguments, else an `apply_patch` envelope's headers, where a
+/// `Move to` header adds the destination, so a move is [`FileTarget::Many`].
+#[must_use]
+pub fn file_target(agent: AgentKind, raw: &Value) -> Option<FileTarget> {
+    let extracted = extract(agent, raw);
+    if extracted.family != ToolFamily::File {
+        return None;
+    }
+    Some(match extracted.paths.or(extracted.patch_paths).as_deref() {
+        None | Some([]) => FileTarget::NoFile,
+        Some([path]) if !extracted.globs => FileTarget::One(path.clone()),
+        Some(_) => FileTarget::Many,
+    })
+}
+
 /// The absolute locations a recognized file, search/list or shell tool call
 /// names, in their own separator style, for a hook client to find the marker
 /// that governs each: every file-tool target (for `apply_patch`, the files its
@@ -8857,6 +8884,102 @@ mod tests {
                 CaptureDisposition::Keep,
                 "{command}"
             );
+        }
+    }
+
+    /// The file path index takes only a call that names one literal file: a
+    /// direct path, or an `apply_patch` with one header. Two files, a move, a
+    /// glob or an unreadable target never yield a path, and any other tool is
+    /// not a file call at all.
+    #[test]
+    fn file_target_is_one_literal_file_or_nothing() {
+        let call = |agent, name, args: Value| tool_call_payload(agent, name, Some(&args), None);
+        let patch = |headers: &str| format!("*** Begin Patch\n{headers}*** End Patch");
+        let one = |path: &str| Some(FileTarget::One(path.into()));
+        for (agent, raw, expected) in [
+            (
+                AgentKind::ClaudeCode,
+                call(
+                    AgentKind::ClaudeCode,
+                    "Read",
+                    json!({"file_path": "src/lib.rs"}),
+                ),
+                one("src/lib.rs"),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                call(
+                    AgentKind::ClaudeCode,
+                    "Edit",
+                    json!({"file_path": "/repo/a.rs"}),
+                ),
+                one("/repo/a.rs"),
+            ),
+            (
+                AgentKind::Codex,
+                call(
+                    AgentKind::Codex,
+                    "apply_patch",
+                    json!({"input": patch("*** Update File: src/a.rs\n@@\n-a\n+b\n")}),
+                ),
+                one("src/a.rs"),
+            ),
+            (
+                AgentKind::Droid,
+                call(
+                    AgentKind::Droid,
+                    "ApplyPatch",
+                    json!({"input": patch("*** Add File: new.rs\n+x\n")}),
+                ),
+                one("new.rs"),
+            ),
+            (
+                AgentKind::Codex,
+                call(
+                    AgentKind::Codex,
+                    "apply_patch",
+                    json!({"input": patch("*** Update File: a.rs\n*** Delete File: b.rs\n")}),
+                ),
+                Some(FileTarget::Many),
+            ),
+            (
+                AgentKind::Codex,
+                call(
+                    AgentKind::Codex,
+                    "apply_patch",
+                    json!({"input": patch("*** Update File: a.rs\n*** Move to: b.rs\n")}),
+                ),
+                Some(FileTarget::Many),
+            ),
+            (
+                AgentKind::GeminiCli,
+                call(
+                    AgentKind::GeminiCli,
+                    "read_many_files",
+                    json!({"paths": ["src/*.rs"]}),
+                ),
+                Some(FileTarget::Many),
+            ),
+            (
+                AgentKind::Codex,
+                call(
+                    AgentKind::Codex,
+                    "apply_patch",
+                    json!({"input": "not a patch"}),
+                ),
+                Some(FileTarget::NoFile),
+            ),
+            (
+                AgentKind::ClaudeCode,
+                call(
+                    AgentKind::ClaudeCode,
+                    "Bash",
+                    json!({"command": "cat src/lib.rs"}),
+                ),
+                None,
+            ),
+        ] {
+            assert_eq!(file_target(agent, &raw), expected, "{raw}");
         }
     }
 }

@@ -123,6 +123,7 @@ async fn observation_fts_rows_report_index_drift() {
                 title: "prompt".into(),
                 body: "bravo zebra".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

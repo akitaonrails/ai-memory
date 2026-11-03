@@ -864,6 +864,7 @@ mod tests {
                             title: kind.as_str().into(),
                             body: (*body).into(),
                             importance: 5,
+                            file_path: None,
                         },
                         &Sanitizer::builtin(),
                     ))

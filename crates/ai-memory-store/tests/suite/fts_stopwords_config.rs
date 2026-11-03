@@ -302,6 +302,7 @@ async fn configured_stopword_list_removes_noise_from_observation_search() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &sanitizer,
         ))
@@ -322,6 +323,7 @@ async fn configured_stopword_list_removes_noise_from_observation_search() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &sanitizer,
         ))

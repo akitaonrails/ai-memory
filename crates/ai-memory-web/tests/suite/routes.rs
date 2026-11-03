@@ -1897,6 +1897,7 @@ async fn seed_session(
                     title: (*title).to_owned(),
                     body: (*body).to_owned(),
                     importance: 5,
+                    file_path: None,
                 },
                 &ai_memory_core::Sanitizer::builtin(),
             ))

@@ -14,10 +14,11 @@ use std::sync::{Arc, Weak};
 
 use ai_memory_consolidate::Consolidator;
 use ai_memory_core::{
-    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, Handoff, IdentityKey,
-    MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff, NewObservation,
-    NewSession, NewSessionUsage, ObservationKind, PageId, PagePath, ProjectId, Sanitized,
-    Sanitizer, SessionId, WorkspaceId, WorkstreamEvent, WorkstreamEventKind, truncate_utf8_bytes,
+    ActiveProject, ActorKey, AgentKind, DEFAULT_WORKSPACE_NAME, FilePathOutcome, Handoff,
+    IdentityKey, MANAGED_WORKSTREAM_PACKET_MARKER, ManagedRunId, MidSessionRouting, NewHandoff,
+    NewObservation, NewSession, NewSessionUsage, ObservationKind, PageId, PagePath, ProjectId,
+    Sanitized, Sanitizer, SessionId, WorkspaceId, WorkstreamEvent, WorkstreamEventKind,
+    truncate_utf8_bytes,
 };
 use ai_memory_store::{
     HookSessionAdmission, IngestObservationOutcome, InterruptedSessionCandidate, ObservationOrder,
@@ -648,6 +649,10 @@ pub struct HookState {
     /// subagent it ran) instead of only its family. Never its arguments.
     /// Held here because the hooks crate makes no config reads.
     pub record_tool_names: bool,
+    /// `[ingest] index_file_paths` (default `false`): store the
+    /// checkout-relative path of the one file a kept file-tool PostToolUse
+    /// named, and count why the others got none (#1843).
+    pub index_file_paths: bool,
     /// Benchmark escape hatch (`AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1`, set
     /// only by the retrieval-benchmark harness in `evals/`): skip the
     /// SessionEnd auto-commits of the wiki git tree. The LongMemEval replay
@@ -828,6 +833,7 @@ async fn admit_hook(
     // `Value` before it becomes a `HookEnvelope`, so the field can never reach
     // `body_excerpt`, tracing, or the store — regardless of client version.
     crate::assistant_capture::strip_assistant_message_raw(&mut body);
+    let file_claim = crate::file_field::take_file_claim(&mut body);
     let mut env = HookEnvelope::from_query_and_body(query, body);
     // Consume the opt-in `_ai_memory_assistant` marker and, when both opt-ins are
     // on for a supported Stop, populate the Stop body with the sanitized excerpt.
@@ -845,6 +851,7 @@ async fn admit_hook(
     if state.record_tool_names {
         env.record_tool_name();
     }
+    env.classify_file_path(state.index_file_paths, file_claim, &state.sanitizer);
     if is_cursor_draft_placeholder(&env) {
         HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
         return (StatusCode::ACCEPTED, "cursor draft placeholder dropped");
@@ -966,6 +973,18 @@ impl HookProcessingOutcome {
             Self::DroppedUnauthorized => metrics.record_dropped_unauthorized(),
             Self::DroppedInvalid => metrics.record_dropped_invalid(),
             Self::DroppedCollision => metrics.record_dropped_collision(),
+        }
+    }
+
+    /// Count the delivery's file path outcome (#1843) only when it stored a
+    /// new observation: a replay, a shed retry or a drop moves nothing.
+    fn record_file_path(
+        self,
+        metrics: &ai_memory_core::IngestMetrics,
+        file_path: Option<FilePathOutcome>,
+    ) {
+        if let (Self::Stored, Some(file_path)) = (self, file_path) {
+            metrics.record_file_path(file_path);
         }
     }
 }
@@ -1099,6 +1118,7 @@ async fn handle_hook_batch(
         // Same unconditional assistant-message backstop as `handle_hook`, applied
         // per item before the envelope is built (#196).
         crate::assistant_capture::strip_assistant_message_raw(&mut item.body);
+        let file_claim = crate::file_field::take_file_claim(&mut item.body);
         let query = parse_hook_query(&item.url);
         let mut env = HookEnvelope::from_query_and_body(query, item.body);
         crate::assistant_capture::apply_assistant_backstop(
@@ -1129,6 +1149,7 @@ async fn handle_hook_batch(
         if state.record_tool_names {
             env.record_tool_name();
         }
+        env.classify_file_path(state.index_file_paths, file_claim, &state.sanitizer);
         if is_cursor_draft_placeholder(&env) {
             HookProcessingOutcome::DroppedInvalid.record(&state.ingest_metrics);
             results.push(HookBatchResult {
@@ -1223,6 +1244,7 @@ async fn handle_hook_batch(
         let _permit = permit;
         state.ingest_metrics.record_accepted();
         let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
+        let file_path = env.file_path_outcome;
         let outcome = match process_authorized(
             &state,
             env,
@@ -1275,6 +1297,7 @@ async fn handle_hook_batch(
             }
         };
         outcome.record(&state.ingest_metrics);
+        outcome.record_file_path(&state.ingest_metrics, file_path);
         results.push(HookBatchResult {
             index: idx,
             outcome,
@@ -1305,7 +1328,12 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
         // fallback.
         let decision = direct(PolicyState::Invalid);
         if decision.protocol().disposition() == CaptureDisposition::MetadataOnly {
-            return Some(metadata_envelope(env, &decision, None));
+            let file = decision.protocol().tool_family() == ToolFamily::File;
+            let mut env = metadata_envelope(env, &decision, None);
+            if file {
+                env.file_path_outcome = Some(FilePathOutcome::InvalidClaim);
+            }
+            return Some(env);
         }
         return Some(env);
     };
@@ -1317,7 +1345,14 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
     }
 
     if protocol.disposition() == CaptureDisposition::MetadataOnly {
-        return metadata_only_protocol_envelope(env, &protocol);
+        // The client already stripped the arguments, so the family comes from
+        // the claim, which `metadata_protocol_is_legal` checks.
+        return metadata_only_protocol_envelope(env, &protocol).map(|mut env| {
+            if protocol.tool_family() == ToolFamily::File {
+                env.file_path_outcome = Some(FilePathOutcome::MetadataOnly);
+            }
+            env
+        });
     }
 
     let decision = direct(protocol.policy_state());
@@ -1329,8 +1364,13 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
         // invalid/metadata-only protocol rather than echoing the bad claim.
         if protocol.tool_family() == ToolFamily::File || inspected.tool_family() == ToolFamily::File
         {
+            let file = inspected.tool_family() == ToolFamily::File;
             let fallback = direct(PolicyState::Invalid);
-            return Some(metadata_envelope(env, &fallback, None));
+            let mut env = metadata_envelope(env, &fallback, None);
+            if file {
+                env.file_path_outcome = Some(FilePathOutcome::InvalidClaim);
+            }
+            return Some(env);
         }
         return match inspected.disposition() {
             CaptureDisposition::Drop => None,
@@ -4492,6 +4532,7 @@ async fn process_envelope(
     viewer: Option<ai_memory_core::UserId>,
 ) -> Option<HookProcessingOutcome> {
     let (session, agent, event) = (resolve_session_id(&env).ok(), env.agent, env.event);
+    let file_path = env.file_path_outcome;
     let outcome = match process_authorized(&state, env, actor, level, skip_webhooks, viewer).await {
         Ok(outcome) => outcome,
         Err(e) if e.downcast_ref::<CaptureNotAuthorized>().is_some() => {
@@ -4548,6 +4589,7 @@ async fn process_envelope(
         }
     };
     outcome.record(&state.ingest_metrics);
+    outcome.record_file_path(&state.ingest_metrics, file_path);
     Some(outcome)
 }
 
@@ -4968,6 +5010,7 @@ async fn process_authorized(
             body: durable_body(env.event, env.body_excerpt.as_deref(), &state.sanitizer),
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
+            file_path: env.file_path.clone(),
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -8520,6 +8563,7 @@ pub(crate) mod tests {
             ingest_drop_list: crate::drop_list::IngestDropList::default(),
             record_tool_names: false,
             skip_wiki_checkpoints: false,
+            index_file_paths: false,
         }
     }
 
@@ -10673,6 +10717,7 @@ pub(crate) mod tests {
                     title: "pending replay".into(),
                     body: "hello".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &state.sanitizer,
             )
@@ -15684,6 +15729,7 @@ pub(crate) mod tests {
                                 title: "probe".into(),
                                 body: String::new(),
                                 importance: 1,
+                                file_path: None,
                             },
                             &state.sanitizer
                         ),
@@ -20975,6 +21021,7 @@ pub(crate) mod tests {
                     title: "session-end".into(),
                     body: "finish".into(),
                     importance: 7,
+                    file_path: None,
                 },
                 &state.sanitizer,
             )
@@ -25820,6 +25867,372 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// One batch of `(url query, body)` items after a session start; returns the
+    /// stored PostToolUse observations.
+    async fn file_path_batch(
+        state: &Arc<HookState>,
+        agent: &str,
+        session: &str,
+        items: Vec<(&str, serde_json::Value)>,
+    ) -> Vec<ai_memory_core::Observation> {
+        let mut batch = vec![HookBatchItem {
+            url: format!("http://h/hook?event=session-start&agent={agent}"),
+            body: serde_json::json!({ "session_id": session }),
+        }];
+        batch.extend(items.into_iter().map(|(query, mut body)| {
+            body["session_id"] = session.into();
+            HookBatchItem {
+                url: format!("http://h/hook?{query}"),
+                body,
+            }
+        }));
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(batch),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        state
+            .reader
+            .observations_for_session(SessionId::from_native(session))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == ObservationKind::PostToolUse)
+            .collect()
+    }
+
+    fn read_call(path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "tool_name": "Read", "tool_use_id": "toolu_f",
+            "tool_input": { "file_path": path }, "tool_response": { "content": "x" },
+        })
+    }
+
+    fn with_file_field(mut body: serde_json::Value, field: serde_json::Value) -> serde_json::Value {
+        body[crate::file_field::FILE_FIELD_KEY] = field;
+        body
+    }
+
+    /// #1843: with `[ingest] index_file_paths` on, each stored file-tool
+    /// PostToolUse moves exactly its own `file_path_*` counter and no other,
+    /// only a valid path for a single file is stored, and the observation is
+    /// kept whatever the field says. A PreToolUse, a non-file call (even with a
+    /// valid field) and a backfill import move none. Each case is delivered on
+    /// its own and checked against the counter delta it caused.
+    #[tokio::test]
+    async fn file_path_index_counts_each_reason_and_stores_only_a_valid_path() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.index_file_paths = true;
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let post = "event=post-tool-use&agent=claude-code";
+        let codex = "event=post-tool-use&agent=codex";
+        let field = |path: &str| crate::file_field::file_field(Ok(path));
+        let skipped = |reason: &str| serde_json::json!({ "version": 1, "skipped": reason });
+        let patch = |headers: &str| {
+            let mut body = crate::capture_policy::tool_call_payload(
+                AgentKind::Codex,
+                "apply_patch",
+                Some(&serde_json::json!({
+                    "input": format!("*** Begin Patch\n{headers}*** End Patch")
+                })),
+                None,
+            );
+            body["tool_response"] = "done".into();
+            body
+        };
+        let cases: Vec<(&str, serde_json::Value, Option<&str>)> = vec![
+            (
+                post,
+                with_file_field(read_call("src/lib.rs"), field("src/lib.rs")),
+                Some("indexed"),
+            ),
+            (
+                codex,
+                with_file_field(patch("*** Update File: one.rs\n"), field("one.rs")),
+                Some("indexed"),
+            ),
+            (post, read_call("src/a.rs"), Some("field_absent")),
+            (
+                post,
+                with_file_field(read_call("src/a.rs"), serde_json::json!({"version": 2})),
+                Some("unknown_version"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), skipped("outside_checkout")),
+                Some("skipped_outside_checkout"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), skipped("no_checkout")),
+                Some("skipped_no_checkout"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), skipped("refused")),
+                Some("skipped_refused"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), skipped("symlinked_cwd")),
+                Some("skipped_other"),
+            ),
+            (
+                post,
+                with_file_field(read_call("/etc/passwd"), field("/etc/passwd")),
+                Some("server_rejected"),
+            ),
+            (
+                post,
+                with_file_field(read_call(".ssh/config"), field(".ssh/config")),
+                Some("server_rejected"),
+            ),
+            (
+                post,
+                with_file_field(read_call("a"), serde_json::json!({"version": 1})),
+                Some("server_rejected"),
+            ),
+            (
+                post,
+                serde_json::json!({
+                    "tool_name": "Read", "tool_input": { "file_path": "secret/x" },
+                    "_ai_memory_capture": "not a protocol",
+                    "_ai_memory_file": field("secret/x"),
+                }),
+                Some("invalid_claim"),
+            ),
+            (
+                post,
+                serde_json::json!({
+                    "tool_family": "file", "tool_name": "file",
+                    "_ai_memory_capture": capture_protocol("metadata-only", "active", "file", 1, "extracted"),
+                }),
+                Some("metadata_only"),
+            ),
+            (
+                codex,
+                with_file_field(
+                    patch("*** Update File: a.rs\n*** Delete File: b.rs\n"),
+                    field("a.rs"),
+                ),
+                Some("multi_file"),
+            ),
+            (
+                codex,
+                with_file_field(patch(""), field("x.rs")),
+                Some("no_file"),
+            ),
+            (
+                "event=pre-tool-use&agent=claude-code",
+                with_file_field(read_call("src/lib.rs"), field("src/lib.rs")),
+                None,
+            ),
+            (
+                post,
+                with_file_field(
+                    serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }),
+                    field("src/lib.rs"),
+                ),
+                None,
+            ),
+            (
+                "event=post-tool-use&agent=claude-code&extension=ai-memory-backfill&source_event=backfill.tool_call",
+                with_file_field(read_call("src/lib.rs"), field("src/lib.rs")),
+                None,
+            ),
+        ];
+        let mut first = None;
+        for (index, (query, body, expected)) in cases.into_iter().enumerate() {
+            let agent = if query.contains("agent=codex") {
+                "codex"
+            } else {
+                "claude-code"
+            };
+            let before = metrics.snapshot().file_paths();
+            let session = format!("file-index-{index}");
+            let stored = file_path_batch(&state, agent, &session, vec![(query, body)]).await;
+            let moved: Vec<(&str, u64)> = metrics
+                .snapshot()
+                .file_paths()
+                .iter()
+                .zip(before)
+                .filter(|((_, after), (_, before))| after != before)
+                .map(|((label, after), (_, before))| (*label, after - before))
+                .collect();
+            assert_eq!(
+                moved,
+                expected
+                    .map(|label| (label, 1))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "case {index}"
+            );
+            if !query.contains("pre-tool-use") {
+                assert_eq!(stored.len(), 1, "case {index}: the observation is kept");
+            }
+            first = first.or(stored.into_iter().next());
+        }
+
+        let first = first.unwrap();
+        for (path, sessions) in [
+            ("src/lib.rs", 1),
+            ("one.rs", 1),
+            ("/etc/passwd", 0),
+            ("a.rs", 0),
+        ] {
+            let hits = state
+                .reader
+                .observations_for_file(
+                    first.workspace_id,
+                    first.project_id,
+                    ai_memory_core::OwnerFilter::Any,
+                    path.into(),
+                    10,
+                )
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), sessions, "{path}");
+        }
+    }
+
+    /// Control for the above: with the key off (the default) a valid field is
+    /// still stripped, but nothing is stored and no counter moves.
+    #[tokio::test]
+    async fn file_path_index_off_means_off() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        assert!(!state.index_file_paths);
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let field = crate::file_field::file_field(Ok("src/lib.rs"));
+        let stored = file_path_batch(
+            &state,
+            "claude-code",
+            "file-index-off",
+            vec![(
+                "event=post-tool-use&agent=claude-code",
+                with_file_field(read_call("src/lib.rs"), field),
+            )],
+        )
+        .await;
+        assert_eq!(stored.len(), 1);
+        assert!(metrics.snapshot().file_paths().iter().all(|(_, n)| *n == 0));
+        let hits = state
+            .reader
+            .observations_for_file(
+                stored[0].workspace_id,
+                stored[0].project_id,
+                ai_memory_core::OwnerFilter::Any,
+                "src/lib.rs".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// The single route counts only a stored delivery: a 429 the client
+    /// retries counts nothing until it is stored, and a keyed replay of the
+    /// same event counts nothing more.
+    #[tokio::test]
+    async fn file_path_counters_move_once_per_stored_delivery_on_the_single_route() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.index_file_paths = true;
+        let metrics = state.ingest_metrics.clone();
+        let semaphore = state.ingest_semaphore.clone();
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut state = Arc::new(state);
+        let body = with_file_field(
+            serde_json::json!({ "session_id": "single-file", "tool_name": "Read", "tool_input": { "file_path": "src/lib.rs" } }),
+            crate::file_field::file_field(Ok("src/lib.rs")),
+        );
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ingest_key: Some("file-key-1".into()),
+            ..Default::default()
+        };
+        let post = |state: Arc<HookState>| {
+            admit_hook(
+                state,
+                query(),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                body.clone(),
+            )
+        };
+        assert_eq!(post(state.clone()).await.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metrics.snapshot().file_path_indexed,
+            0,
+            "a shed event counts nothing"
+        );
+
+        Arc::get_mut(&mut state).unwrap().ingest_semaphore = semaphore;
+        assert_eq!(post(state.clone()).await.0, StatusCode::ACCEPTED);
+        wait_for_kinds(&state, "single-file", &[ObservationKind::PostToolUse]).await;
+        for _ in 0..300 {
+            if metrics.snapshot().file_path_indexed == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(metrics.snapshot().file_path_indexed, 1);
+
+        assert_eq!(post(state.clone()).await.0, StatusCode::ACCEPTED);
+        for _ in 0..300 {
+            if metrics.snapshot().replayed == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(metrics.snapshot().replayed, 1);
+        assert_eq!(
+            metrics.snapshot().file_path_indexed,
+            1,
+            "a replay counts nothing more"
+        );
+    }
+
+    /// The batch route counts the same way: a keyed item delivered in a second
+    /// batch is a replay and counts nothing more.
+    #[tokio::test]
+    async fn file_path_counters_move_once_per_stored_delivery_on_the_batch_route() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.index_file_paths = true;
+        let metrics = state.ingest_metrics.clone();
+        let state = Arc::new(state);
+        let item = (
+            "event=post-tool-use&agent=claude-code&ingest_key=file-key-2",
+            with_file_field(
+                read_call("src/lib.rs"),
+                crate::file_field::file_field(Ok("src/lib.rs")),
+            ),
+        );
+        file_path_batch(&state, "claude-code", "batch-file", vec![item.clone()]).await;
+        assert_eq!(metrics.snapshot().file_path_indexed, 1);
+
+        file_path_batch(&state, "claude-code", "batch-file", vec![item]).await;
+        assert_eq!(metrics.snapshot().replayed, 1);
+        assert_eq!(
+            metrics.snapshot().file_path_indexed,
+            1,
+            "a replay counts nothing more"
+        );
+    }
+
     /// `[ingest] record_tool_names` names a kept call, and never a call a
     /// capture policy reduced to metadata: not one the client stripped, and
     /// not a shell call the server strips itself because its marker is
@@ -27678,6 +28091,7 @@ pub(crate) mod tests {
                         title: "prompt".into(),
                         body: habit.into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &ai_memory_core::Sanitizer::builtin(),
                 ))

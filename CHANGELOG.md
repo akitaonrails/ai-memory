@@ -19,6 +19,18 @@ version in [`docs/changelog/`](docs/changelog/):
   an override uses only its own fallback chain and can run without a global
   provider. CLI and web health identify each configured task (#1969).
 
+- Added an opt-in file path index, `[ingest] index_file_paths` (off by
+  default). The native hook client sends the checkout-relative path of the
+  one file a kept file-tool PostToolUse named, in a versioned
+  `_ai_memory_file` field the server always strips, and the server stores it
+  on the observation after its own capture inspection and the sanitizer
+  check. An `ignore_paths` exclusion never sends a path. A set of
+  `file_path_*` counters in `/admin/status` and `/admin/metrics`
+  (`ai_memory_hook_file_paths_total`) records why each other file-tool event
+  got none, with no path or scope label; `/admin/status` also reports when
+  the counters started (`started_ms`). A new internal store read maps a path
+  to the sessions the caller may read. The generated TypeScript integrations
+  follow separately (#1843).
 - Added a per-execution opt-out of the automatic handoff: a session whose
   hooks run with `AI_MEMORY_AUTO_HANDOFF=off` still gets its summary page and
   consolidation but leaves no baton at its end or turn checkpoint, while every

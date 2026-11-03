@@ -432,3 +432,36 @@ async fn the_prune_requires_a_live_head_at_the_summary_path() {
         assert_eq!(m.count_after, 0, "dry run after the prune for {shape:?}");
     }
 }
+
+/// #1843: the retention prune deletes a file index entry with its row, so a
+/// pruned session no longer answers a path query. Control: both sessions
+/// answer it before the prune.
+#[tokio::test]
+async fn the_prune_takes_the_file_path_with_the_row() {
+    let (_tmp, store) = open_seeded(None);
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+    conn.execute("UPDATE observations SET file_path = 'src/lib.rs'", [])
+        .unwrap();
+    let sessions = || {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .observations_for_file(
+                    ws(),
+                    proj(),
+                    ai_memory_core::OwnerFilter::Any,
+                    "src/lib.rs".into(),
+                    10,
+                )
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!(sessions().await, 2);
+
+    let measured = measure(&store).await;
+    assert_eq!(measured.deleted, 6);
+    assert_eq!(sessions().await, 0);
+}

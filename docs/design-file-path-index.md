@@ -1,9 +1,10 @@
 # Design proposal: opt-in file path index (#1843)
 
-**Status: open design proposal, not implemented, with no assigned release.**
-Issue [#1843](https://github.com/akitaonrails/ai-memory/issues/1843) remains
-open, and the index alone does not close it. Any implementation must rebase the
-migration number and branch assumptions below against the then-current tree.
+**Status: the index is implemented for the native hook client on `release/3.4`
+(migration V99); the generated TypeScript integrations, the measurement and
+delivery are open.** Issue
+[#1843](https://github.com/akitaonrails/ai-memory/issues/1843) remains open,
+and the index alone does not close it.
 
 The maintainer set the order in
 [#1843](https://github.com/akitaonrails/ai-memory/issues/1843#issuecomment-6508464269):
@@ -135,10 +136,8 @@ The client computes the path, because only the client knows the checkout root
 of the event:
 
 1. Make the tool path absolute against the event's cwd with the existing
-   lexical helpers (`absolute_normalized` in the CLI crate,
-   `normalize_segments` in the hooks crate). Both are private today; the
-   implementation widens the visibility it needs and adds no second
-   normalizer.
+   lexical helper `absolute_normalized` in the CLI crate, already
+   `pub(crate)`; no second normalizer.
 2. Strip the `checkout_root` prefix. A path outside the checkout is not indexed;
    the client sends `skipped: outside_checkout`, or `no_checkout` when no
    checkout root exists.
@@ -216,8 +215,9 @@ One internal store function, with no MCP tool, HTTP route or CLI command in
 this step:
 
 ```rust
-observations_for_file(scope: (WorkspaceId, ProjectId), owner: &OwnerFilter,
-                      file_path: &str, limit: usize) -> Vec<FileSessionRef>
+async fn observations_for_file(&self, workspace_id: WorkspaceId, project_id: ProjectId,
+                               owner_filter: OwnerFilter, file_path: String, limit: usize)
+    -> StoreResult<Vec<FileSessionRef>>
 ```
 
 - `FileSessionRef` is a new type with one entry per session, newest first:
@@ -278,9 +278,9 @@ before the field exists. The key lands in `config.default.toml` and
 `file_path IS NULL` cannot say why a row has no path, so the server counts the
 reason when it records the delivery (section 3.4). New scalars in
 `IngestMetrics`, one per outcome, plus `started_ms` (the process start time) in
-the snapshot. They reach the same readers as the existing counters:
-`/admin/status`, the web health panel, and `/admin/metrics`, where
-`render_prometheus` renders them as one compile-time family,
+the snapshot. They reach `/admin/status`, which serializes the whole
+snapshot, and `/admin/metrics`, where `render_prometheus` renders them as one
+compile-time family,
 `ai_memory_hook_file_paths_total`, under the existing `outcome` label. All are
 root-only on a multi-user server, server-wide, with no scope, path or
 client-supplied label. Row 3d of `docs/security-boundaries.md` is updated in
@@ -295,7 +295,7 @@ counter; the first matching row wins:
 | 1 | `file_path_invalid_claim` | the claim does not parse, or the server's inspection disagrees with it |
 | 2 | `file_path_metadata_only` | a valid claim whose disposition is MetadataOnly: a file call with no readable path under an active policy, an output-spool read, a match that could not be proven, or a broken marker (`PolicyState::Invalid`) |
 | 3 | `file_path_no_file` | the call names no file the server can read (an empty or malformed patch) |
-| 4 | `file_path_multi_file` | the call names more than one file |
+| 4 | `file_path_multi_file` | the call names more than one file, a move, or a glob |
 | 5 | `file_path_field_absent` | no `_ai_memory_file` field (an older or unsupported client) |
 | 6 | `file_path_unknown_version` | a field version this server does not read (a newer client) |
 | 7 | `file_path_skipped_outside_checkout`, `_no_checkout`, `_refused`, `_other` | the field carries `skipped` |
@@ -415,7 +415,7 @@ removed and passes with it:
 | A forged or malformed field is not stored | server checks in section 3.4 | Absolute, `..`, over-long, credential-directory, wrong-version and non-file-family fields are dropped, as is a field on a patch that names two files; the observation is kept and the field never reaches storage. |
 | Off means off | section 3.4 key check | With the key off, a valid field stores nothing and no `file_path_*` counter moves. |
 | A hidden session takes no slot | owner join applied before `limit` in `observations_for_file` | With `limit = 1`, operator B's newer session and A's older one touch the same path; A gets its own session, not an empty result. Control: `OwnerFilter::Any` sees both. |
-| Counters carry no path | fixed scalars in `IngestMetrics`; one compile-time family under the `outcome` label in `render_prometheus`; `skipped` parsed into a closed set | `metrics_count_queries_and_hooks_without_leaking_any_content` extended with a file-tool event carrying a planted path and a planted unknown `skipped` value: neither appears in `/admin/metrics`, `/admin/status` or the health panel, and every label key stays in the closed set. `snapshot_is_content_free` lists the new keys. Control: the `file_path_*` counters move by exactly what was sent. |
+| Counters carry no path | fixed scalars in `IngestMetrics`; one compile-time family under the `outcome` label in `render_prometheus`; `skipped` parsed into a closed set | `admin_metrics.rs` `file_path_counters_carry_no_path_or_skip_reason`: a file-tool event carrying a planted path and one carrying a planted unknown `skipped` value; neither appears in `/admin/metrics` or `/admin/status`. `snapshot_is_content_free` lists the new keys. Control: the `file_path_*` counters move by exactly what was sent. |
 
 A client can still lie about a path inside its own project, as it can about any
 captured text today. The server cannot verify that a path was not ignored,
@@ -517,8 +517,10 @@ section 10, question 7.
 2. Index, against the standing feature branch (currently `release/3.4`):
    migration, both front doors including `skipped`, server acceptance and the
    section 3.8 counters, `observations_for_file`, config key and docs, the
-   section 5 rows and the section 7 tests, CHANGELOG. Off by default.
-3. Measurement on a real store, published with the PR or right after it.
+   section 5 rows and the section 7 tests, CHANGELOG. Off by default. Split in
+   two: the server and the native client first, then the generated TS
+   integrations, whose file events count as `field_absent` until then.
+3. Measurement on a real store, once both front doors ship.
 4. Delivery: a separate design note, starting with PostToolUse in one harness,
    once per path per session, untrusted-data framing, no global broadening,
    fail-open with a latency budget.

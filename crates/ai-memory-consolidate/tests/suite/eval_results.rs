@@ -90,6 +90,7 @@ async fn eval_reason_is_sanitized_before_pending_storage_with_legitimate_control
                     title: "workflow".into(),
                     body: "retain the checked workflow".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))

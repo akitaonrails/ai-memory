@@ -46,6 +46,7 @@ fn observation(session: &NewSession, kind: ObservationKind, body: &str) -> NewOb
         title: kind.as_str().into(),
         body: body.into(),
         importance: 5,
+        file_path: None,
     }
 }
 
@@ -276,4 +277,50 @@ async fn a_moved_sessions_profile_candidate_follows_the_target_projects_governan
         Some(("open-target".to_owned(), false)),
         "control: a candidate moved into an open project still counts, from there"
     );
+}
+
+/// #1843: the file path index follows its observation when the session
+/// moves. A path query in the source project finds the session before the
+/// move and nothing after; the target finds it after (control).
+#[tokio::test]
+async fn a_moved_session_takes_its_file_paths_along() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_owned())
+        .await
+        .unwrap();
+    let source = project(&store, ws, "source").await;
+    let target = project(&store, ws, "target").await;
+    let sid = SessionId::new();
+    let session = hook_session(sid, ws, source);
+    store.writer.begin_session(session.clone()).await.unwrap();
+    let mut edit = observation(&session, ObservationKind::PostToolUse, "tool_family: file");
+    edit.file_path = Some("src/lib.rs".into());
+    store
+        .writer
+        .insert_observation(sanitized(edit))
+        .await
+        .unwrap();
+    let sessions = |proj| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .observations_for_file(ws, proj, OwnerFilter::Any, "src/lib.rs".into(), 10)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    assert_eq!(sessions(source).await, 1);
+
+    store
+        .writer
+        .move_session(sid, ws, target, PagesMode::Move, None, true)
+        .await
+        .unwrap();
+
+    assert_eq!(sessions(source).await, 0);
+    assert_eq!(sessions(target).await, 1);
 }

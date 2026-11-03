@@ -114,6 +114,7 @@ async fn say(
                 title: "obs".into(),
                 body: body.into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

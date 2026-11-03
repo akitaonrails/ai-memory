@@ -755,6 +755,17 @@ impl Sanitizer {
         out
     }
 
+    /// Whether `path` may be stored as a file index key: a valid key
+    /// ([`crate::valid_file_path_key`]) that scrubbing leaves unchanged.
+    /// Checked with a leading `/` because the credential-directory patterns
+    /// need a separator before the directory, so `.ssh/config` at the
+    /// checkout root would otherwise pass.
+    #[must_use]
+    pub fn admits_file_path(&self, path: &str) -> bool {
+        let rooted = format!("/{path}");
+        crate::valid_file_path_key(path) && self.scrub(&rooted) == rooted
+    }
+
     /// The spans of `text` one pattern matches, allowlisted matches left out:
     /// over `shadow` when there is one, each match mapped back to the span of
     /// `text` it covers, else over `text` itself.
@@ -879,6 +890,9 @@ impl Sanitized<NewObservation> {
         obs.title = truncate_for_title(&sanitizer.scrub(&obs.title));
         obs.body =
             truncate_utf8_bytes_head_tail(&sanitizer.scrub(&obs.body), OBSERVATION_BODY_MAX_BYTES);
+        obs.file_path = obs
+            .file_path
+            .filter(|path| sanitizer.admits_file_path(path));
         Self(obs)
     }
 }
@@ -1464,10 +1478,52 @@ mod tests {
             title: "OPENAI_API_KEY=sk-leak-1234567890abcdef".into(),
             body: "see /home/user/.ssh/id_ed25519".into(),
             importance: 5,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.title.contains("[REDACTED:"));
         assert!(scrubbed.body.contains("[REDACTED:"));
+    }
+
+    /// The file index key reaches the store only through `Sanitized::new`,
+    /// which clears a rooted, `..`, over-long, credential-directory or
+    /// control-character path and keeps a plain checkout-relative one.
+    #[test]
+    fn observation_file_path_is_cleared_unless_admitted() {
+        let observation = |file_path: &str| NewObservation {
+            occurred_at: None,
+            session_id: SessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            project_id: ProjectId::new(),
+            kind: ObservationKind::PostToolUse,
+            extension: None,
+            source_event: None,
+            title: "tool file".into(),
+            body: String::new(),
+            importance: 5,
+            file_path: Some(file_path.into()),
+        };
+        let longest = "a".repeat(crate::FILE_PATH_MAX_CHARS);
+        for kept in ["src/lib.rs", "docs/a b.md", longest.as_str()] {
+            let stored = Sanitized::new(observation(kept), &s()).into_inner();
+            assert_eq!(stored.file_path.as_deref(), Some(kept));
+        }
+        let too_long = "a".repeat(crate::FILE_PATH_MAX_CHARS + 1);
+        for refused in [
+            "",
+            "/etc/passwd",
+            "\\\\share\\x",
+            "C:/repo/x",
+            "src/../secret",
+            "..",
+            ".ssh/config",
+            "home/.aws/credentials",
+            "src/\u{1b}[31mx",
+            too_long.as_str(),
+        ] {
+            let stored = Sanitized::new(observation(refused), &s()).into_inner();
+            assert_eq!(stored.file_path, None, "{refused:?}");
+        }
     }
 
     #[test]
@@ -1487,6 +1543,7 @@ mod tests {
                 "é".repeat(OBSERVATION_BODY_MAX_BYTES)
             ),
             importance: 8,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &s()).into_inner();
         assert!(scrubbed.body.len() <= OBSERVATION_BODY_MAX_BYTES);
@@ -1523,6 +1580,7 @@ mod tests {
             title: format!("{} {secret}", "x".repeat(70)),
             body: String::new(),
             importance: 5,
+            file_path: None,
         };
         let scrubbed = Sanitized::new(raw, &sanitizer).into_inner();
         assert!(

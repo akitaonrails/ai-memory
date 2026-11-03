@@ -346,6 +346,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 title: "alpha prompt".into(),
                 body: "".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -380,6 +381,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 title: "beta prompt".into(),
                 body: "".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

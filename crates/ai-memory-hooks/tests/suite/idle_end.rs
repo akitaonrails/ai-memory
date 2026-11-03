@@ -87,6 +87,7 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         ingest_drop_list: crate::drop_list::IngestDropList::default(),
         record_tool_names: false,
         skip_wiki_checkpoints: false,
+        index_file_paths: false,
     };
     (tmp, store, wiki, state)
 }
@@ -142,6 +143,7 @@ async fn observe(state: &HookState, sid: SessionId, kind: ObservationKind, at: i
                 body: body.into(),
                 importance: 5,
                 occurred_at: Some(at),
+                file_path: None,
             },
             &state.sanitizer,
         ))

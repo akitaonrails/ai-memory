@@ -11095,6 +11095,7 @@ mod tests {
                     title: title.into(),
                     body: body.into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -14820,6 +14821,7 @@ mod tests {
                     title: "raw prompt".into(),
                     body: "raw fallback contains quokka only detail".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -14953,6 +14955,7 @@ mod tests {
                     title: "raw prompt".into(),
                     body: "the api listens on quokka port 8088".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -15392,6 +15395,7 @@ mod tests {
                             title: "prompt".into(),
                             body: body.into(),
                             importance: 5,
+                            file_path: None,
                         },
                         &Sanitizer::builtin(),
                     ))
@@ -15540,6 +15544,7 @@ mod tests {
                     title: "raw prompt".into(),
                     body: "raw fallback contains quokka only detail".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -17383,6 +17388,7 @@ mod tests {
                         title: (*title).into(),
                         body: (*body).into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -17445,6 +17451,7 @@ mod tests {
                     title: "elsewhere".into(),
                     body: "other scope".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -17645,6 +17652,7 @@ mod tests {
                         title: format!("{kind:?}"),
                         body: "router ipv6".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -18050,6 +18058,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "work".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -19292,6 +19301,7 @@ mod tests {
                     title: "finish".into(),
                     body: "end the session".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -23219,6 +23229,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "the zircon day rate for this client is confidential".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -26021,6 +26032,7 @@ mod tests {
                     title: "session start".into(),
                     body: String::new(),
                     importance: 1,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -26437,6 +26449,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "durable lesson worth capturing".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -26624,6 +26637,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "durable lesson worth capturing".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
