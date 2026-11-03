@@ -174,9 +174,9 @@ pub const MAX_PAGE_APPLIES_TO: usize = 16;
 pub const MAX_PAGE_APPLIES_TO_TAG_LEN: usize = 32;
 /// Maximum raw characters in `enforced_by`, before trimming.
 pub const MAX_PAGE_ENFORCED_BY_LEN: usize = 256;
-/// Maximum `sources` entries in one write.
+/// Maximum `source_files` entries in one write.
 pub const MAX_PAGE_SOURCES: usize = 16;
-/// Maximum raw characters in one `sources` path, before trimming.
+/// Maximum raw characters in one `source_files` path, before trimming.
 pub const MAX_PAGE_SOURCE_PATH_LEN: usize = 1024;
 
 /// A repository file a page describes, and the commit the page was last
@@ -231,10 +231,11 @@ pub struct PageWriteMetadata {
     /// Repository files this page describes, each with the commit it was
     /// checked against. Up to 16. Stored as-is; the server never reads the
     /// files: a client compares each entry with its checkout and records
-    /// `stale` feedback when one changed.
+    /// `stale` feedback when one changed. Not OKF `sources`, which holds the
+    /// page's session provenance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 16))]
-    pub sources: Vec<PageSource>,
+    pub source_files: Vec<PageSource>,
 }
 
 impl PageWriteMetadata {
@@ -369,11 +370,11 @@ impl PageWriteMetadata {
         if !applies_to.is_empty() {
             fm.insert("applies_to".into(), serde_json::json!(applies_to));
         }
-        if self.sources.len() > MAX_PAGE_SOURCES {
-            return Err(invalid("sources"));
+        if self.source_files.len() > MAX_PAGE_SOURCES {
+            return Err(invalid("source_files"));
         }
-        let mut sources = Vec::with_capacity(self.sources.len());
-        for source in self.sources {
+        let mut sources = Vec::with_capacity(self.source_files.len());
+        for source in self.source_files {
             let path = source.path.trim();
             let commit = source.commit.trim().to_ascii_lowercase();
             if !valid_text(&source.path, MAX_PAGE_SOURCE_PATH_LEN)
@@ -383,12 +384,12 @@ impl PageWriteMetadata {
                 || !(7..=64).contains(&commit.len())
                 || !commit.bytes().all(|b| b.is_ascii_hexdigit())
             {
-                return Err(invalid("sources"));
+                return Err(invalid("source_files"));
             }
             sources.push(serde_json::json!({ "path": path, "commit": commit }));
         }
         if !sources.is_empty() {
-            fm.insert("sources".into(), serde_json::Value::Array(sources));
+            fm.insert("source_files".into(), serde_json::Value::Array(sources));
         }
         Ok(fm)
     }
@@ -878,9 +879,9 @@ mod tests {
     }
 
     #[test]
-    fn page_write_metadata_sources_are_validated_and_normalized() {
+    fn page_write_metadata_source_files_are_validated_and_normalized() {
         let parse = |sources: serde_json::Value| -> PageWriteMetadata {
-            serde_json::from_value(serde_json::json!({ "sources": sources })).unwrap()
+            serde_json::from_value(serde_json::json!({ "source_files": sources })).unwrap()
         };
         let ok = serde_json::json!({"path": "src/a.rs", "commit": "3f2a9c1"});
         let fm = parse(serde_json::json!([
@@ -890,10 +891,11 @@ mod tests {
         .into_frontmatter()
         .unwrap();
         assert_eq!(
-            fm["sources"][0],
+            fm["source_files"][0],
             serde_json::json!({"path": "bin/deploy.sh", "commit": "3f2a9c1"})
         );
-        assert_eq!(fm["sources"][1]["commit"], "a".repeat(64));
+        assert_eq!(fm["source_files"][1]["commit"], "a".repeat(64));
+        assert!(fm.get("sources").is_none(), "OKF `sources` stays untouched");
         assert!(
             parse(serde_json::json!(vec![ok.clone(); MAX_PAGE_SOURCES]))
                 .into_frontmatter()
