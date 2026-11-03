@@ -284,6 +284,36 @@ impl ToolOutcome {
     }
 }
 
+/// Cline CLI/SDK hooks nest the call at `tool_call` / `tool_result` (`name`,
+/// `id`, `input`; live Cline CLI 3.0.74 in #1950). The VS Code extension's
+/// documented envelope uses `preToolUse` / `postToolUse` with `toolName` (or
+/// the older `tool`) and `parameters` (ClineignoreGuard.sh handles both).
+/// Prefer the nested call when it names the tool so the call id is kept.
+fn cline_tool_fields(object: &Map<String, Value>) -> Option<(&str, Option<&str>, Option<&Value>)> {
+    let nested = object
+        .get("tool_call")
+        .or_else(|| object.get("tool_result"))
+        .and_then(Value::as_object);
+    if let Some(tool) = nested
+        && let Some(name) = tool.get("name").and_then(Value::as_str)
+    {
+        return Some((
+            name,
+            tool.get("id").and_then(Value::as_str),
+            tool.get("input"),
+        ));
+    }
+    let envelope = object
+        .get("preToolUse")
+        .or_else(|| object.get("postToolUse"))
+        .and_then(Value::as_object)?;
+    let name = envelope
+        .get("toolName")
+        .or_else(|| envelope.get("tool"))
+        .and_then(Value::as_str)?;
+    Some((name, None, envelope.get("parameters")))
+}
+
 /// The raw tool name and tool-call id of a tool payload, per agent.
 ///
 /// Both the tool observation metadata and the server-side drop list (#1241)
@@ -368,14 +398,8 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         // #1240).
         AgentKind::Droid => (object.get("tool_name")?.as_str()?, None),
         AgentKind::Cline => {
-            let tool = object
-                .get("tool_call")
-                .or_else(|| object.get("tool_result"))?
-                .as_object()?;
-            (
-                tool.get("name")?.as_str()?,
-                tool.get("id").and_then(Value::as_str),
-            )
+            let (name, id, _) = cline_tool_fields(object)?;
+            (name, id)
         }
         _ => return None,
     };
@@ -396,10 +420,8 @@ pub(crate) fn tool_observation_metadata(
     let has_args = !require_input
         || match agent {
             AgentKind::AntigravityCli => object.get("toolCall")?.get("args").is_some(),
-            AgentKind::Cline => object
-                .get("tool_call")
-                .and_then(Value::as_object)
-                .and_then(|tool| tool.get("input"))
+            AgentKind::Cline => cline_tool_fields(object)
+                .and_then(|(_, _, input)| input)
                 .is_some(),
             _ => object
                 .get(
@@ -454,15 +476,30 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
             Some(false) => ToolOutcome::Success,
             None => ToolOutcome::Unknown,
         },
-        AgentKind::Cline => match raw
-            .get("tool_result")
-            .and_then(Value::as_object)
-            .and_then(|tool| tool.get("error"))
-        {
-            Some(Value::Null) | None => ToolOutcome::Success,
-            Some(Value::String(error)) if error.is_empty() => ToolOutcome::Success,
-            Some(_) => ToolOutcome::Error,
-        },
+        AgentKind::Cline => {
+            if raw.get("tool_result").is_some() {
+                match raw
+                    .get("tool_result")
+                    .and_then(Value::as_object)
+                    .and_then(|tool| tool.get("error"))
+                {
+                    Some(Value::Null) | None => ToolOutcome::Success,
+                    Some(Value::String(error)) if error.is_empty() => ToolOutcome::Success,
+                    Some(_) => ToolOutcome::Error,
+                }
+            } else {
+                match raw
+                    .get("postToolUse")
+                    .and_then(Value::as_object)
+                    .and_then(|tool| tool.get("success"))
+                    .and_then(Value::as_bool)
+                {
+                    Some(true) => ToolOutcome::Success,
+                    Some(false) => ToolOutcome::Error,
+                    None => ToolOutcome::Success,
+                }
+            }
+        }
         AgentKind::KiroCli => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
@@ -1287,11 +1324,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             .get("toolCall")
             .and_then(Value::as_object)
             .and_then(|call| Some((call.get("name")?.as_str()?, call.get("args")))),
-        AgentKind::Cline => object
-            .get("tool_call")
-            .or_else(|| object.get("tool_result"))
-            .and_then(Value::as_object)
-            .and_then(|call| Some((call.get("name")?.as_str()?, call.get("input")))),
+        AgentKind::Cline => cline_tool_fields(object).map(|(name, _, input)| (name, input)),
         AgentKind::Grok => object
             .get("tool_name")
             .or_else(|| object.get("toolName"))
@@ -1358,6 +1391,8 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
                     && MUSE_MEMORY_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str())
                 {
                     muse_memory_paths(value)
+                } else if agent == AgentKind::Cline {
+                    extract_paths(name, value).or_else(|| cline_file_paths(value))
                 } else {
                     extract_paths(name, value)
                 }
@@ -1365,7 +1400,15 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         })
         .flatten();
     let command = (family == ToolFamily::NonFile)
-        .then(|| args.and_then(shell_command))
+        .then(|| {
+            args.and_then(|value| {
+                if agent == AgentKind::Cline {
+                    cline_shell_command(value).or_else(|| shell_command(value))
+                } else {
+                    shell_command(value)
+                }
+            })
+        })
         .flatten();
     let search_paths = (family == ToolFamily::SearchList)
         .then(|| args.and_then(|value| search_direct_paths(agent, value.as_object()?)))
@@ -1482,6 +1525,20 @@ fn agent_family(agent: AgentKind, name: &str) -> ToolFamily {
         // `Execute` already carry shared names.
         match name.to_ascii_lowercase().as_str() {
             "create" | "applypatch" => return ToolFamily::File,
+            _ => {}
+        }
+    }
+    if agent == AgentKind::Cline {
+        // ClineCore built-ins (https://docs.cline.bot/tools-reference/all-cline-tools,
+        // Cline CLI 3.0.74). Shared names (`read_file`, `apply_patch`,
+        // `write_to_file`) stay with [`family`]. Agent-only names stay here so
+        // a same-named tool of another agent is not reclassified (`editor`,
+        // `skills`).
+        match name.to_ascii_lowercase().as_str() {
+            "read_files" | "editor" | "replace_in_file" => return ToolFamily::File,
+            "search_codebase" => return ToolFamily::SearchList,
+            "run_commands" | "execute_command" | "fetch_web_content" | "skills" | "use_skill"
+            | "ask_question" | "submit_and_exit" => return ToolFamily::NonFile,
             _ => {}
         }
     }
@@ -2555,6 +2612,41 @@ fn muse_memory_paths(args: &Value) -> Option<Vec<String>> {
     Some(vec![format!(".agents/memory/{path}")])
 }
 
+/// ClineCore `read_files` names files in `files[].path` (ReadFilesInputSchema
+/// and ClineignoreGuard.sh). Shared `path` / `paths` for `editor` already go
+/// through [`extract_paths`].
+fn cline_file_paths(args: &Value) -> Option<Vec<String>> {
+    let object = args.as_object()?;
+    let mut paths = direct_paths(object).unwrap_or_default();
+    if let Some(files) = object.get("files") {
+        let entries = files.as_array()?;
+        if entries.len() > MAX_CAPTURE_CANDIDATES
+            || paths.len().checked_add(entries.len())? > MAX_CAPTURE_CANDIDATES
+        {
+            return None;
+        }
+        for entry in entries {
+            match entry {
+                Value::String(path) => paths.push(path.clone()),
+                Value::Object(obj) => {
+                    let path = obj
+                        .get("path")
+                        .or_else(|| obj.get("file_path"))
+                        .or_else(|| obj.get("filePath"))?
+                        .as_str()?;
+                    paths.push(path.to_owned());
+                }
+                _ => return None,
+            }
+        }
+    }
+    (!paths.is_empty()
+        && paths.iter().all(|path| {
+            !path.trim().is_empty() && path.chars().count() <= MAX_CANDIDATE_PATH_CHARS
+        }))
+    .then_some(paths)
+}
+
 /// Directory arguments of Factory Droid's search/list tools: `LS` lists
 /// `directory_path` and `Glob` searches below `folder` (#1240).
 const DROID_SEARCH_ROOT_KEYS: [&str; 2] = ["directory_path", "folder"];
@@ -3187,6 +3279,35 @@ fn shell_command(args: &Value) -> Option<ShellCommand<'_>> {
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()
             .map(ShellCommand::Argv),
+        _ => None,
+    }
+}
+
+/// ClineCore `run_commands` takes `{commands: ["ls", ...]}` (CLI 3.0.74 live
+/// payload in #1950 and `RunCommandsInputSchema`). Each entry is a complete
+/// command string, or an object with a `command` field. Shared `command` /
+/// `cmd` keys still go through [`shell_command`].
+fn cline_shell_command(args: &Value) -> Option<ShellCommand<'_>> {
+    match args.get("commands") {
+        Some(Value::Array(items)) => {
+            if items.is_empty() || items.len() > MAX_CAPTURE_CANDIDATES {
+                return None;
+            }
+            let mut lines = Vec::with_capacity(items.len());
+            for item in items {
+                let line = match item {
+                    Value::String(s) => s.as_str(),
+                    Value::Object(obj) => obj.get("command")?.as_str()?,
+                    _ => return None,
+                };
+                if line.trim().is_empty() {
+                    return None;
+                }
+                lines.push(line);
+            }
+            Some(ShellCommand::Argv(lines))
+        }
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(ShellCommand::Line(s)),
         _ => None,
     }
 }
@@ -5496,6 +5617,198 @@ mod tests {
             ToolOutcome::Error
         );
         assert_eq!(tool_payload_fields(AgentKind::Other, &pre), None);
+    }
+
+    /// ClineCore built-in names (Cline CLI 3.0.74, docs.cline.bot tools
+    /// reference) are not on the shared family lists, so they classified as
+    /// unknown and closed-tool observations stored `tool unknown` with no
+    /// output (#1950). The CLI nests the call at `tool_call`; the VS Code
+    /// extension uses `preToolUse.toolName` + `parameters` (ClineignoreGuard).
+    #[test]
+    fn cline_core_tool_names_are_classified_and_honor_capture_exclusions() {
+        for (tool, expected) in [
+            ("read_files", ToolFamily::File),
+            ("editor", ToolFamily::File),
+            ("replace_in_file", ToolFamily::File),
+            ("apply_patch", ToolFamily::File),
+            ("read_file", ToolFamily::File),
+            ("search_codebase", ToolFamily::SearchList),
+            ("run_commands", ToolFamily::NonFile),
+            ("execute_command", ToolFamily::NonFile),
+            ("fetch_web_content", ToolFamily::NonFile),
+            ("skills", ToolFamily::NonFile),
+            ("use_skill", ToolFamily::NonFile),
+            ("ask_question", ToolFamily::NonFile),
+            ("submit_and_exit", ToolFamily::NonFile),
+        ] {
+            assert_eq!(agent_family(AgentKind::Cline, tool), expected, "{tool}");
+        }
+        // Cline-only names keep their classification for other agents.
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "read_files"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "editor"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "run_commands"),
+            ToolFamily::Unknown
+        );
+        assert_eq!(
+            agent_family(AgentKind::ClaudeCode, "skills"),
+            ToolFamily::Unknown
+        );
+
+        // Live Cline CLI 3.0.74 PreToolUse: both envelopes, `run_commands`
+        // with `commands[0]` (#1950).
+        let live = json!({
+            "hookName": "PreToolUse",
+            "taskId": "cline-task-1",
+            "preToolUse": {
+                "toolName": "run_commands",
+                "parameters": {"commands": ["cat docs/adr/1.md"]}
+            },
+            "tool_call": {
+                "id": "toolu_01live",
+                "name": "run_commands",
+                "input": {"commands": ["cat docs/adr/1.md"]}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &live),
+            Some(("run_commands", Some("toolu_01live")))
+        );
+        let metadata = tool_observation_metadata(AgentKind::Cline, &live, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("toolu_01live"));
+
+        // Documented VS Code envelope with no `tool_call`.
+        let documented = json!({
+            "preToolUse": {
+                "toolName": "read_files",
+                "parameters": {"files": [{"path": "src/lib.rs"}]}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &documented),
+            Some(("read_files", None))
+        );
+        let documented_meta =
+            tool_observation_metadata(AgentKind::Cline, &documented, true).unwrap();
+        assert_eq!(documented_meta.tool_family, ToolFamily::File);
+        assert_eq!(documented_meta.tool_call_id, None);
+
+        let older_tool_key = json!({
+            "preToolUse": {
+                "tool": "write_to_file",
+                "parameters": {"path": "src/config.ts"}
+            }
+        });
+        assert_eq!(
+            tool_payload_fields(AgentKind::Cline, &older_tool_key),
+            Some(("write_to_file", None))
+        );
+
+        let documented_failure = json!({
+            "postToolUse": {
+                "toolName": "run_commands",
+                "parameters": {"commands": ["ls"]},
+                "result": "denied",
+                "success": false
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &documented_failure),
+            ToolOutcome::Error
+        );
+        let documented_success = json!({
+            "postToolUse": {
+                "toolName": "run_commands",
+                "result": "ok",
+                "success": true
+            }
+        });
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Cline, &documented_success),
+            ToolOutcome::Success
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let disposition = |raw: &Value| {
+            policy
+                .inspect(AgentKind::Cline, raw, "/repo")
+                .protocol()
+                .clone()
+        };
+        let call = |name: &str, input: Value| {
+            json!({
+                "tool_call": {
+                    "id": "toolu_01policy",
+                    "name": name,
+                    "input": input,
+                }
+            })
+        };
+        assert_eq!(
+            disposition(&call(
+                "run_commands",
+                json!({"commands": ["cat docs/adr/1.md"]})
+            ))
+            .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call(
+                "run_commands",
+                json!({"commands": ["cat src/lib.rs"]})
+            ))
+            .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(&call(
+                "read_files",
+                json!({"files": [{"path": "docs/adr/1.md"}]})
+            ))
+            .disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call(
+                "read_files",
+                json!({"files": [{"path": "src/lib.rs"}]})
+            ))
+            .disposition(),
+            CaptureDisposition::Keep
+        );
+        assert_eq!(
+            disposition(&call("editor", json!({"path": "docs/adr/1.md"}))).disposition(),
+            CaptureDisposition::Drop
+        );
+        assert_eq!(
+            disposition(&call("search_codebase", json!({"query": "TODO"}))).disposition(),
+            CaptureDisposition::Drop
+        );
+        // Without the Cline mapping the same payloads stay unrecognized.
+        assert_eq!(
+            policy
+                .inspect(
+                    AgentKind::Other,
+                    &call("run_commands", json!({"commands": ["cat docs/adr/1.md"]}),),
+                    "/repo",
+                )
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
+        );
     }
 
     /// Meta Muse Code's tool calls, in the shapes captured offline from Muse

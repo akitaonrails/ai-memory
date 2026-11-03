@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Cline 3.0.74 tool observations now classify ClineCore names (`read_files`,
+  `run_commands`, `editor`, and the other built-ins) so they store as
+  `tool file` / `tool non-file` with bounded output instead of `tool unknown`.
+  Capture also reads the documented `preToolUse.toolName` / `parameters`
+  envelope beside the CLI `tool_call` shape, and `[capture] ignore_paths`
+  matches `read_files` `files[].path` and `run_commands` `commands`. A
+  headless `cline -y` task still records no prompt: Cline seeds its first
+  prompt without firing `UserPromptSubmit`, and `TaskStart` carries no task
+  text (#1950, #1954).
+
 - The generated OpenCode 2 plugin now retries a failed startup-context
   (`/handoff`) fetch at most three times per root session. It used to retry on
   every model request, and the `context` hook fires on each one, so a server

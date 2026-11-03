@@ -1081,6 +1081,7 @@ fn safe_tool_body(
                 raw.pointer("/tool_result/output")
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/tool_result/error").and_then(value_to_text))
+                    .or_else(|| raw.pointer("/postToolUse/result").and_then(value_to_text))
             } else if agent == AgentKind::GeminiCli {
                 // Gemini CLI's `AfterTool` `tool_response` holds the model's
                 // copy of the result in `llmContent` (a string or a Part
@@ -3806,6 +3807,119 @@ mod tests {
         );
         assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
         assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+    }
+
+    /// Cline CLI 3.0.74 PreToolUse/PostToolUse carry ClineCore names at
+    /// `tool_call.name` (and the documented `preToolUse.toolName` envelope).
+    /// Those names were unknown, so every observation stored as `tool unknown`
+    /// with no output (#1950).
+    #[test]
+    fn cline_tool_events_keep_their_family_title_and_output() {
+        let live_post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hookName": "PostToolUse",
+                "taskId": "cline-task-1",
+                "preToolUse": {
+                    "toolName": "run_commands",
+                    "parameters": {"commands": ["ls"]}
+                },
+                "tool_call": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "input": {"commands": ["ls"]}
+                },
+                "tool_result": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "output": "MARKER_CLINE_OUTPUT"
+                }
+            }),
+        );
+        assert_eq!(live_post.agent, AgentKind::Cline);
+        assert_eq!(live_post.title_hint.as_deref(), Some("tool non-file"));
+        let body = live_post.body_excerpt.expect("cline live post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("tool_call_id: toolu_01cline"), "{body:?}");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(body.contains("MARKER_CLINE_OUTPUT"), "{body:?}");
+
+        let live_pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hookName": "PreToolUse",
+                "taskId": "cline-task-1",
+                "preToolUse": {
+                    "toolName": "run_commands",
+                    "parameters": {"commands": ["ls"]}
+                },
+                "tool_call": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "input": {"commands": ["ls"]}
+                }
+            }),
+        );
+        assert_eq!(live_pre.title_hint.as_deref(), Some("tool non-file"));
+        let pre_body = live_pre.body_excerpt.expect("cline live pre-tool body");
+        assert!(pre_body.contains("tool_family: non-file"), "{pre_body:?}");
+        assert!(!pre_body.contains("ls"), "{pre_body:?}");
+
+        let documented_post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "postToolUse": {
+                    "toolName": "read_files",
+                    "parameters": {"files": [{"path": "src/lib.rs"}]},
+                    "result": "MARKER_CLINE_DOCUMENTED",
+                    "success": true
+                }
+            }),
+        );
+        assert_eq!(documented_post.title_hint.as_deref(), Some("tool file"));
+        let documented_body = documented_post
+            .body_excerpt
+            .expect("cline documented post-tool body");
+        assert!(
+            documented_body.contains("outcome: success"),
+            "{documented_body:?}"
+        );
+        assert!(
+            documented_body.contains("MARKER_CLINE_DOCUMENTED"),
+            "{documented_body:?}"
+        );
+
+        let documented_pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "preToolUse": {
+                    "toolName": "read_files",
+                    "parameters": {"files": [{"path": "src/lib.rs"}]}
+                }
+            }),
+        );
+        assert_eq!(documented_pre.title_hint.as_deref(), Some("tool file"));
+        assert!(
+            documented_pre
+                .body_excerpt
+                .is_some_and(|body| !body.is_empty())
+        );
     }
 
     /// Claude Code's Windows `PowerShell` tool shares Bash's payload shape but
