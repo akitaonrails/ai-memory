@@ -192,6 +192,7 @@ impl MultiUserHarness {
             )),
             home_dir: None,
             trusted_proxy_identity: false,
+            index_file_paths: false,
         });
 
         // Production-equivalent Bearer middleware. Pepper + reader are

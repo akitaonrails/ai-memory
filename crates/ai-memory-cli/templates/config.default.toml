@@ -410,6 +410,14 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 # reduced to metadata stays unnamed. Off by default.
 # Env equivalent: AI_MEMORY_INGEST__RECORD_TOOL_NAMES=true
 # record_tool_names = true
+#
+# Store the checkout-relative path of the one file a kept file-tool call named
+# (native hook client only), so the store can answer which sessions touched a
+# file. A path an `ignore_paths` entry excludes never leaves the machine. The
+# `file_path_*` counters in `/admin/status` and `/admin/metrics` say why the
+# other file-tool events got no path. Off by default.
+# Env equivalent: AI_MEMORY_INGEST__INDEX_FILE_PATHS=true
+# index_file_paths = true
 
 # Privacy strip.
 #

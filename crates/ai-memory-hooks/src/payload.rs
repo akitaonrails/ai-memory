@@ -1,14 +1,16 @@
 //! Wire envelope received on `POST /hook`.
 
 use ai_memory_core::{
-    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, TOOL_BODY_SEPARATOR,
-    TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
+    AgentKind, FilePathOutcome, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer,
+    TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
-    ToolFamily, ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
+    FileTarget, ToolFamily, ToolObservationMetadata, file_target, tool_observation_metadata,
+    tool_observation_outcome,
 };
+use crate::file_field::{FileClaim, FileSkip};
 
 /// Durable excerpt ceiling for user prompts. Prompts retain more working
 /// context than tool/notification summaries while remaining bounded.
@@ -23,6 +25,10 @@ pub const NOTIFICATION_EXCERPT_MAX_BYTES: usize = 2_000;
 /// Durable excerpt ceiling for tool I/O summaries and short excerpts
 /// (tool results, extension bodies, Stop assistant excerpts).
 pub const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
+
+/// The extension label backfilled non-user events (assistant/tool) are recorded
+/// under, mirroring the companion importer's replay-through-`/hook` mechanism.
+pub const BACKFILL_EXTENSION: &str = "ai-memory-backfill";
 
 /// Durable body ceiling the ingest funnel applies to an event's excerpt
 /// **after** the sanitizer has scrubbed the full text.
@@ -223,6 +229,14 @@ pub struct HookEnvelope {
     /// The metadata-only rebuilds clear it.
     #[serde(skip)]
     pub(crate) recorded_tool: Option<crate::capture_policy::RecordedToolName>,
+    /// Why this file-tool PostToolUse did or did not get a `file_path`
+    /// (`[ingest] index_file_paths`, #1843); counted once the delivery is
+    /// stored.
+    #[serde(skip)]
+    pub(crate) file_path_outcome: Option<ai_memory_core::FilePathOutcome>,
+    /// The path to store, set only with [`FilePathOutcome::Indexed`].
+    #[serde(skip)]
+    pub(crate) file_path: Option<String>,
     /// The agent's raw JSON, kept for forensics.
     pub raw: serde_json::Value,
 }
@@ -790,8 +804,55 @@ impl HookEnvelope {
             body_excerpt,
             occurred_at,
             recorded_tool,
+            file_path_outcome: None,
+            file_path: None,
             raw,
         }
+    }
+
+    /// Decide whether this event stores a `file_path` and why, when
+    /// `[ingest] index_file_paths` is on (#1843). Only a live PostToolUse of a
+    /// file tool is classified; capture inspection has already set an
+    /// invalid-claim or metadata-only outcome. The path check is the one
+    /// `Sanitized::new` repeats on insert, so the two cannot disagree.
+    pub(crate) fn classify_file_path(
+        &mut self,
+        enabled: bool,
+        claim: FileClaim,
+        sanitizer: &Sanitizer,
+    ) {
+        if !enabled
+            || self.event != HookEvent::PostToolUse
+            || self.extension.as_deref() == Some(BACKFILL_EXTENSION)
+        {
+            self.file_path_outcome = None;
+            return;
+        }
+        if self.file_path_outcome.is_some() {
+            return;
+        }
+        let Some(target) = file_target(self.agent, &self.raw) else {
+            return;
+        };
+        self.file_path_outcome = Some(match (target, claim) {
+            (FileTarget::NoFile, _) => FilePathOutcome::NoFile,
+            (FileTarget::Many, _) => FilePathOutcome::MultiFile,
+            (FileTarget::One(_), FileClaim::Absent) => FilePathOutcome::FieldAbsent,
+            (FileTarget::One(_), FileClaim::UnknownVersion) => FilePathOutcome::UnknownVersion,
+            (FileTarget::One(_), FileClaim::Skipped(skip)) => match skip {
+                Some(FileSkip::OutsideCheckout) => FilePathOutcome::SkippedOutsideCheckout,
+                Some(FileSkip::NoCheckout) => FilePathOutcome::SkippedNoCheckout,
+                Some(FileSkip::Refused) => FilePathOutcome::SkippedRefused,
+                None => FilePathOutcome::SkippedOther,
+            },
+            (FileTarget::One(_), FileClaim::Path(path)) if sanitizer.admits_file_path(&path) => {
+                self.file_path = Some(path);
+                FilePathOutcome::Indexed
+            }
+            (FileTarget::One(_), FileClaim::Path(_) | FileClaim::Malformed) => {
+                FilePathOutcome::ServerRejected
+            }
+        });
     }
 
     /// Name a closed-tool call (`[ingest] record_tool_names`): the title

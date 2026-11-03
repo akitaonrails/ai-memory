@@ -180,6 +180,7 @@ impl Harness {
             )),
             home_dir: None,
             trusted_proxy_identity: false,
+            index_file_paths: false,
         });
 
         let router = Router::new()

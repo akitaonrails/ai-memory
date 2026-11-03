@@ -1382,6 +1382,10 @@ pub struct IngestSettings {
     /// tool's arguments, and a call a capture policy reduced to metadata stays
     /// unnamed. Off by default (`AI_MEMORY_INGEST__RECORD_TOOL_NAMES`).
     pub record_tool_names: bool,
+    /// Store the checkout-relative path of the one file a kept file-tool
+    /// call named, and count why the others got none (#1843). Off by default
+    /// (`AI_MEMORY_INGEST__INDEX_FILE_PATHS`).
+    pub index_file_paths: bool,
     /// The validated list the hook router checks. Set by [`Config::load`];
     /// never read from or written to a config file. Kept off the `Config`
     /// stack frame because that value is constructed in short-stack CLI
@@ -5568,6 +5572,20 @@ input_token_safety_margin = {margin}
         std::fs::write(&config_path, "[ingest]\nrecord_tool_names = true\n").unwrap();
         let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert!(config.ingest.record_tool_names);
+    }
+
+    /// `[ingest] index_file_paths` is off unless the file turns it on.
+    #[test]
+    fn ingest_index_file_paths_defaults_off_and_loads_from_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!config.ingest.index_file_paths);
+
+        std::fs::write(&config_path, "[ingest]\nindex_file_paths = true\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.ingest.index_file_paths);
     }
 
     /// The env form of `[ingest] record_tool_names`. Same child-process marker

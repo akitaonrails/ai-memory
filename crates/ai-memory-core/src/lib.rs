@@ -14,7 +14,7 @@ pub mod excerpt;
 pub mod fix_lines;
 pub mod handoff;
 pub mod ingest_metrics;
-pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
+pub use ingest_metrics::{FilePathOutcome, IngestMetrics, IngestMetricsSnapshot};
 pub mod i18n;
 pub mod ids;
 pub mod latency;
