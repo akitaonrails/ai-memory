@@ -251,10 +251,58 @@ impl SortedSpans {
         }
     }
 
-    fn overlaps(&self, (start, end): (usize, usize)) -> bool {
+    /// The furthest end of the spans that overlap `span`, if any do.
+    fn reach_over(&self, (start, end): (usize, usize)) -> Option<usize> {
         let before = self.starts.partition_point(|&s| s < end);
-        before > 0 && self.reach[before - 1] > start
+        let reach = *self.reach.get(before.checked_sub(1)?)?;
+        (reach > start).then_some(reach)
     }
+}
+
+/// Where a value the view cut short at `from` really ends inside a JSON line:
+/// at the end of its JSON string, at an escaped quote (the view's own
+/// closing quote), or at an escaped line break that starts a new
+/// `KEY=value` / `key: value` line, as in a printed `.env`. An escaped tab or
+/// a line break followed by anything else stays part of the value (#1974).
+fn json_value_end(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'"' => break,
+            b'\\' => {
+                let next = bytes.get(at + 1).copied();
+                let len = source_len_at(text, at).max(1);
+                if next == Some(b'"')
+                    || (matches!(next, Some(b'n' | b'r')) && starts_assignment(&text[at + len..]))
+                {
+                    break;
+                }
+                at += len;
+            }
+            _ => at += text[at..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    at
+}
+
+/// Whether `rest` opens with `KEY=value` or `key: value`, an optional
+/// `export ` first. The separator must be followed by a value, so base64
+/// padding (`...cmQ=`) at the end of a string is no assignment.
+fn starts_assignment(rest: &str) -> bool {
+    let rest = rest.strip_prefix("export ").unwrap_or(rest);
+    let key_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        .count();
+    if key_len == 0 || rest.as_bytes()[0].is_ascii_digit() {
+        return false;
+    }
+    let mut after = rest[key_len..].trim_start_matches([' ', '\t']).bytes();
+    matches!(after.next(), Some(b'=' | b':'))
+        && after
+            .next()
+            .is_some_and(|b| !matches!(b, b'=' | b'"' | b'\\'))
 }
 
 /// Which lines of a text parse as JSON, each line checked once.
@@ -647,9 +695,10 @@ impl Sanitizer {
         // boundary. Outside JSON, overlapping spans merge to the widest, so
         // the view only ever widens a redaction: plain text holding a literal
         // `\n` or `\"` ends a value early in the view but not as written. In
-        // a line that parses as JSON the escapes are JSON's own and the view
-        // is exact, so a plain match the view already covers is dropped there
-        // rather than run past an escaped line break.
+        // a line that parses as JSON the escapes are JSON's own, so a plain
+        // match the view already covers reaches only as far as
+        // `json_value_end` allows: never past its JSON string or onto the
+        // next `.env` line.
         let mut shadow = Shadow::of(&out);
         for pattern in &self.inner.patterns {
             let mut spans = self.spans(&out, shadow.as_ref(), pattern);
@@ -660,7 +709,13 @@ impl Sanitizer {
                     let mut json_lines = JsonLines::new(&out);
                     let kept: Vec<_> = plain
                         .into_iter()
-                        .filter(|&span| !(view.overlaps(span) && json_lines.contains(span.0)))
+                        .filter_map(|span| match view.reach_over(span) {
+                            Some(reach) if json_lines.contains(span.0) => {
+                                let end = json_value_end(&out, reach).min(span.1);
+                                (end > reach).then_some((span.0, end))
+                            }
+                            _ => Some(span),
+                        })
                         .collect();
                     spans.extend(kept);
                 }
@@ -2021,6 +2076,47 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_str(&out)
                 .unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {raw} -> {out}"));
             assert_eq!(parsed["interrupted"], false, "{raw} -> {out}");
+        }
+    }
+
+    /// A body that is itself one line of JSON (a minified file, a JSON
+    /// literal in a prompt) can hold a value whose escaped tab or line break
+    /// is part of the secret. The view stops the value there; the rest of
+    /// that JSON string is still redacted, and no further (#1974).
+    #[test]
+    fn a_secret_continued_past_an_escape_in_a_json_body_is_redacted_whole() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        let deep = format!(
+            "{}\"JWT_SECRET=firstHALF\\nSECONDHALFsecret\"{}",
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        for raw in [
+            r#"{"JWT_SECRET":"firstHALF\nSECONDHALFsecret"}"#.to_string(),
+            r#""JWT_SECRET=firstHALF\nSECONDHALFsecret""#.to_string(),
+            r#"["STRIPE_SECRET_KEY=sk_live_FAKE\tSECONDHALFsecret"]"#.to_string(),
+            r#"["JWT_SECRET=firstHALF\r\nSECONDHALFsecret","keep"]"#.to_string(),
+            // Base64 padding is no `KEY=` line.
+            r#""JWT_SECRET=firstHALF\nSECONDHALFsecretcmQ=""#.to_string(),
+            deep,
+        ] {
+            let out = s.scrub(&raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains("SECONDHALF"),
+                "tail of the secret stored in clear: {raw} -> {out}"
+            );
+            // The key and its value are one match, so redacting a quoted
+            // key's pair removes the `":"` between them, as it always has.
+            if !raw.starts_with('{') {
+                assert!(
+                    serde_json::from_str::<serde::de::IgnoredAny>(&out).is_ok(),
+                    "redaction broke the JSON: {raw} -> {out}"
+                );
+            }
+            if raw.contains("keep") {
+                assert!(out.contains(r#","keep"]"#), "{raw} -> {out}");
+            }
         }
     }
 
