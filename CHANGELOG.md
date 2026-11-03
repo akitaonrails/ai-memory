@@ -16,7 +16,8 @@ version in [`docs/changelog/`](docs/changelog/):
 - The `ai-memory starting` line that every command logs at startup no longer
   prints the `user:pass@` part of a configured server URL. Neither do the
   thin-client errors for an unreachable server or a failed request, `setup`'s
-  MCP check, or the warning about an ignored ambient `LLM_BASE_URL`. All of
+  MCP check, the warning about an ignored ambient `LLM_BASE_URL`, or the
+  `auth enable` line for an MCP entry that targets another server. All of
   them now use the helper the `mcp-bridge` connection errors adopted in 3.3.2
   (#1960).
 

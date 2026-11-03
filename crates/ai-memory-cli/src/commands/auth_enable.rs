@@ -26,6 +26,7 @@ use crate::cli::{AuthEnableArgs, InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::install_mcp::{self, mcp_server_url_from_base};
 use crate::commands::path_util::display_path;
 use crate::config::Config;
+use crate::http_client::display_url;
 use crate::local_auth::{self, HookCredential};
 use crate::server_profiles::{self, ProfileName};
 
@@ -342,7 +343,10 @@ fn print_outcome(outcome: &EnableOutcome) {
                 display_path(&line.path)
             ),
             Wiring::OtherServer(url) => {
-                println!("mcp {client}: targets {url}, another server; left unchanged");
+                println!(
+                    "mcp {client}: targets {}, another server; left unchanged",
+                    display_url(url)
+                );
             }
             Wiring::Manual(reason) => {
                 println!("mcp {client}: needs a manual change: {reason}");
