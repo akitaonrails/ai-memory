@@ -547,7 +547,18 @@ pub async fn run_dream_pass(
                 dropped_keep_tokens,
             } => {
                 if !dropped_keep_tokens.is_empty() {
-                    tracing::warn!(path = %plan.survivor.path.as_str(), dropped = ?dropped_keep_tokens, "dream pass: merged body lacks keep-tokens its sources had; restore-page recovers them");
+                    // The count at warn; the tokens are page text, so they stay
+                    // at debug and in the returned report.
+                    tracing::warn!(
+                        path = %plan.survivor.path.as_str(),
+                        dropped = dropped_keep_tokens.len(),
+                        "dream pass: merged body lacks keep-tokens its sources had; restore-page recovers them"
+                    );
+                    tracing::debug!(
+                        path = %plan.survivor.path.as_str(),
+                        tokens = ?dropped_keep_tokens,
+                        "dream pass: dropped keep-tokens"
+                    );
                 }
                 report.clusters_merged += 1;
                 report.pages_rewritten += 1;
