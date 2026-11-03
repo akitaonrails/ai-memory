@@ -3668,7 +3668,10 @@ fn default_patchable_page_prefixes() -> Vec<String> {
         .collect()
 }
 
-fn default_data_dir() -> PathBuf {
+/// The data dir every entry point falls back to with no `--data-dir`, no
+/// `AI_MEMORY_DATA_DIR` and no config override. The hook resolves the same
+/// path, which lets `install-hooks` leave the flag out of a command (#1949).
+pub(crate) fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ai-memory")

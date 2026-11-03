@@ -3018,7 +3018,7 @@ fn apply_to_cursor_settings(
         &command_dir,
         server_url,
         auth_token,
-        data_dir,
+        cursor_command_data_dir(data_dir, &crate::config::default_data_dir()),
         strategy,
         &path,
     )?;
@@ -3086,11 +3086,35 @@ fn unrecognized_ai_memory_hook_entries(root: &serde_json::Value) -> Vec<(String,
     found
 }
 
+/// The `--data-dir` to bake into Cursor's hook commands: `None` when it is the
+/// platform default, which `ai-memory hook` resolves by itself.
+///
+/// The macOS default is `~/Library/Application Support/ai-memory`. The quoted
+/// form of that path is the one difference the reporter found between a
+/// headless `cursor-agent -p` run that captured nothing and one that worked
+/// (#1949). Cursor documents no quoting rules for a hook `command`: it "can be
+/// a shell string, an absolute path, or a relative path"
+/// (<https://cursor.com/docs/agent/hooks>). Leaving the flag out keeps the
+/// default install's command free of anything that needs quoting, however the
+/// runner splits it. The 2026.10.22 CLI bundle passes the string to the
+/// user's shell (`builtin eval` under zsh or bash, `sh -c` otherwise; a
+/// PowerShell `&` pipeline on Windows), all of which honour quotes, so this
+/// removes the dependency rather than working around a confirmed split. A
+/// custom data dir must still be passed, so it stays.
+///
+/// `data_dir` arrives canonicalized from `Config::load`, so the default is
+/// compared both as spelled and canonicalized (`\\?\` on Windows).
+fn cursor_command_data_dir<'a>(data_dir: &'a Path, default: &Path) -> Option<&'a Path> {
+    let is_default = data_dir == default
+        || std::fs::canonicalize(default).is_ok_and(|canonical| data_dir == canonical);
+    (!is_default).then_some(data_dir)
+}
+
 fn merge_cursor_hooks(
     staged: &Path,
     server_url: &str,
     auth_token: Option<&str>,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     project_strategy: Option<&str>,
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
@@ -3100,7 +3124,7 @@ fn merge_cursor_hooks(
         server_url,
         auth_token,
         "cursor",
-        Some(data_dir),
+        data_dir,
         project_strategy,
         false,
     );
@@ -15380,7 +15404,7 @@ process.exit(0);
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
-            config_tmp.path(),
+            Some(config_tmp.path()),
             None,
             &config_path,
         )
@@ -15403,6 +15427,128 @@ process.exit(0);
             parsed["version"], 1,
             "version: 1 must be set at the top level"
         );
+    }
+
+    /// #1949: the default data dir is left to the hook's own resolution, so a
+    /// macOS `Application Support` path never needs quoting in hooks.json.
+    #[test]
+    fn cursor_command_data_dir_omits_only_the_default() {
+        let tmp = TempDir::new().unwrap();
+        let default = tmp.path().join("Application Support").join("ai-memory");
+        fs::create_dir_all(&default).unwrap();
+        assert_eq!(cursor_command_data_dir(&default, &default), None);
+        let canonical = fs::canonicalize(&default).unwrap();
+        assert_eq!(
+            cursor_command_data_dir(&canonical, &default),
+            None,
+            "Config::load hands over the canonical spelling"
+        );
+        let custom = tmp.path().join("custom dir").join("ai-memory");
+        assert_eq!(
+            cursor_command_data_dir(&custom, &default),
+            Some(custom.as_path()),
+            "a non-default data dir must still be baked in"
+        );
+    }
+
+    fn cursor_ai_memory_commands(config_path: &Path) -> Vec<(String, String)> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+        let mut out = Vec::new();
+        for (event, entries) in parsed["hooks"].as_object().unwrap() {
+            for entry in entries.as_array().into_iter().flatten() {
+                if is_ai_memory_hook_entry(entry) {
+                    out.push((
+                        event.clone(),
+                        entry["command"].as_str().unwrap().to_string(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// #1949 upgrade path: an install that baked the quoted default data dir
+    /// is rewritten in place, once per event, keeping third-party hooks.
+    #[test]
+    fn cursor_reapply_replaces_quoted_default_data_dir_entries() {
+        let hooks_tmp = TempDir::new().unwrap();
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let old = "/Users/me/.local/lib/ai-memory/ai-memory --data-dir \
+                   '/Users/me/Library/Application Support/ai-memory' hook --event {event} \
+                   --agent cursor --server-url http://127.0.0.1:49374";
+        let old_entry = |event: &str| serde_json::json!({"type": "command", "command": old.replace("{event}", event), "matcher": ""});
+        let existing = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "sessionStart": [
+                    {"type": "command", "command": "/opt/other-tool --flag"},
+                    old_entry("session-start"),
+                ],
+                "stop": [old_entry("stop")],
+            }
+        });
+        fs::write(&config_path, existing.to_string()).unwrap();
+
+        merge_cursor_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            &config_path,
+        )
+        .unwrap();
+
+        let ours = cursor_ai_memory_commands(&config_path);
+        assert_eq!(ours.len(), CURSOR_PROFILE.events.len(), "{ours:?}");
+        for (event, command) in &ours {
+            assert!(
+                !command.contains("--data-dir") && !command.contains("Application Support"),
+                "{event}: stale data dir survived: {command}"
+            );
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["hooks"]["sessionStart"][0]["command"], "/opt/other-tool --flag",
+            "third-party hook is kept"
+        );
+        assert_eq!(
+            merge_cursor_hooks(
+                hooks_tmp.path(),
+                "http://127.0.0.1:49374",
+                None,
+                None,
+                None,
+                &config_path,
+            )
+            .unwrap(),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// A custom data dir with a space is still passed, quoted for the platform.
+    #[test]
+    fn cursor_custom_data_dir_with_space_is_still_passed() {
+        let hooks_tmp = TempDir::new().unwrap();
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let data_dir = config_tmp.path().join("my data");
+        merge_cursor_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            Some(&data_dir),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        for (event, command) in cursor_ai_memory_commands(&config_path) {
+            assert!(command.contains("--data-dir"), "{event}: {command}");
+            assert!(command.contains("my data"), "{event}: {command}");
+        }
     }
 
     #[test]
@@ -15503,7 +15649,7 @@ process.exit(0);
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
-            config_tmp.path(),
+            Some(config_tmp.path()),
             None,
             &config_path,
         )
@@ -15518,7 +15664,7 @@ process.exit(0);
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
-            config_tmp.path(),
+            Some(config_tmp.path()),
             None,
             &config_path,
         )

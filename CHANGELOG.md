@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `install-hooks --agent cursor` no longer bakes the default data dir into
+  `~/.cursor/hooks.json`. On macOS that path is
+  `~/Library/Application Support/ai-memory`, and with the quoted path in its
+  commands a headless `cursor-agent -p` run captured nothing. The hook now
+  resolves the default itself, so the command needs no quoting. A custom data
+  dir is still passed. `ai-memory upgrade`, or re-running
+  `install-hooks --agent cursor --apply`, replaces the old entries (#1949).
+
 ## [3.3.2] - 2026-11-03
 
 ### Fixed

@@ -358,6 +358,13 @@ there. The Codex plugin likewise registers `ai-memory mcp-bridge
   failed or timed-out call is stored as `outcome: error` with Cursor's
   `error_message`, so the session page counts it and the handoff names it;
   a denied call keeps its message but stays `outcome: unknown`.
+- With the default data dir, `install-hooks --agent cursor` leaves
+  `--data-dir` out of each hook command and the hook finds that directory
+  itself. On macOS the default is `~/Library/Application Support/ai-memory`,
+  so the command then holds no quoted path. A custom data dir is still
+  passed, quoted. `ai-memory upgrade` rewrites entries an older install
+  wrote; so does running `ai-memory install-hooks --agent cursor --apply`
+  again (#1949).
 - Cursor watches `hooks.json` on save. For MCP config changes, restart
   Cursor or toggle the server off+on in **Settings → MCP**.
 - Sources: <https://cursor.com/docs/mcp>, <https://cursor.com/docs/hooks.md>
