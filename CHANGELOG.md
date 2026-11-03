@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.3.2] - 2026-11-03
+
 ### Fixed
 
 - Profile harvest, list and status read every current `profile/` page in the
@@ -3832,7 +3834,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.2...HEAD
+[3.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.2
 [3.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.1
 [3.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.0
 [3.2.10]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.10
