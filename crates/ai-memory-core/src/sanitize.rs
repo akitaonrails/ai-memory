@@ -226,6 +226,32 @@ fn json_hex_unit(bytes: &[u8], at: usize) -> Option<u32> {
     })
 }
 
+/// `text` with each span replaced by `[REDACTED:<label>]`, overlapping
+/// spans merged into one.
+fn redact_spans(text: &str, mut spans: Vec<(usize, usize)>, label: &str) -> String {
+    spans.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut spans = spans.into_iter().peekable();
+    while let Some((start, mut end)) = spans.next() {
+        while let Some(&(next_start, next_end)) = spans.peek() {
+            if next_start >= end {
+                break;
+            }
+            end = end.max(next_end);
+            spans.next();
+        }
+        debug!(label, "sanitize: redacted match");
+        out.push_str(&text[copied..start]);
+        out.push_str("[REDACTED:");
+        out.push_str(label);
+        out.push(']');
+        copied = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// Compile-time list of redaction patterns. Order is intentional:
 /// more-specific patterns first. False positives are acceptable —
 /// better to redact a stray hash than to leak a credential.
@@ -368,15 +394,17 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // even without `sk-` shape). In this rule and the two below, a quoted
     // value ends at its closing quote, escapes inside it included: compact
     // JSON has no whitespace for `\S+` to stop at, so it would redact the
-    // rest of the stored result and leave it unparseable.
+    // rest of the stored result and leave it unparseable. Text glued to the
+    // closing quote (`"abc"tail`, shell concatenation) stays part of the
+    // value; a JSON delimiter after the quote ends it.
     (
-        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+|\S+)"#,
+        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+(?:"[^\s"\\,;}\]]+)*|\S+)"#,
         "env_secret",
     ),
     // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
     // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
     (
-        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+|\S+)"#,
+        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+(?:"[^\s"\\,;}\]]+)*|\S+)"#,
         "env_secret",
     ),
     // The suffixes one step outside those: `*_KEY_ID` (the other half of an
@@ -386,7 +414,7 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // convention: as code identifiers (`api_key_id`, `password_salt`) they are
     // ordinary column and field names, and redaction is irreversible.
     (
-        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+|\S+)"#,
+        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+(?:"[^\s"\\,;}\]]+)*|\S+)"#,
         "env_secret",
     ),
     // Filesystem paths that commonly contain credentials. The separator
@@ -521,38 +549,36 @@ impl Sanitizer {
         // Before the redaction passes: an escape inside a secret would
         // otherwise split it out of reach of every pattern below.
         let mut out = self.strip_control(input);
-        // Each pattern first looks through the transport encoding (invisible
+        // Each pattern runs twice: through the transport encoding (invisible
         // characters, JSON string escapes), so a secret split by one or quoted
-        // by the other is redacted whole rather than losing only the part
-        // before the split. The plain pass then still finds a match that
-        // needs an invisible character as its word boundary.
+        // by the other is redacted whole, and over the text as written, which
+        // finds a match that needs an invisible character as its word
+        // boundary. Overlapping spans merge to the widest, so the view only
+        // ever widens a redaction: plain text holding a literal `\n` or `\"`
+        // ends a value early in the view but not in the text as written.
         let mut shadow = Shadow::of(&out);
         for pattern in &self.inner.patterns {
-            let mut changed = false;
-            if let Some(view) = &shadow
-                && let Some(redacted) = self.redact(&out, Some(view), pattern)
-            {
-                out = redacted;
-                changed = true;
+            let mut spans = self.spans(&out, shadow.as_ref(), pattern);
+            if shadow.is_some() {
+                spans.extend(self.spans(&out, None, pattern));
             }
-            if let Some(redacted) = self.redact(&out, None, pattern) {
-                out = redacted;
-                changed = true;
+            if spans.is_empty() {
+                continue;
             }
-            if changed {
-                // Dropped first, so two views of a large result never coexist.
-                drop(shadow.take());
-                shadow = Shadow::of(&out);
-            }
+            out = redact_spans(&out, spans, pattern.label);
+            // Dropped first, so two views of a large result never coexist.
+            drop(shadow.take());
+            shadow = Shadow::of(&out);
         }
         out
     }
 
-    /// One pattern over `text`, or over `shadow` with each match mapped back
-    /// to the span of `text` it covers. `None` when nothing matched.
-    fn redact(&self, text: &str, shadow: Option<&Shadow>, pattern: &Pattern) -> Option<String> {
+    /// The spans of `text` one pattern matches, allowlisted matches left out:
+    /// over `shadow` when there is one, each match mapped back to the span of
+    /// `text` it covers, else over `text` itself.
+    fn spans(&self, text: &str, shadow: Option<&Shadow>, pattern: &Pattern) -> Vec<(usize, usize)> {
         let view = shadow.map_or(text, |shadow| shadow.text.as_str());
-        let spans: Vec<regex::Match<'_>> = if pattern.secret_group {
+        let matches: Vec<regex::Match<'_>> = if pattern.secret_group {
             pattern
                 .re
                 .captures_iter(view)
@@ -561,33 +587,14 @@ impl Sanitizer {
         } else {
             pattern.re.find_iter(view).collect()
         };
-        let mut out = String::new();
-        let mut copied = 0;
-        let mut redacted = false;
-        for m in spans {
-            if self.allowlisted(pattern.label, m.as_str()) {
-                continue;
-            }
-            let (start, end) = match shadow {
+        matches
+            .into_iter()
+            .filter(|m| !self.allowlisted(pattern.label, m.as_str()))
+            .map(|m| match shadow {
                 Some(shadow) => shadow.original_span(text, m.start(), m.end()),
                 None => (m.start(), m.end()),
-            };
-            if start < copied {
-                continue;
-            }
-            debug!(pattern = pattern.re.as_str(), "sanitize: redacted match");
-            out.push_str(&text[copied..start]);
-            out.push_str("[REDACTED:");
-            out.push_str(pattern.label);
-            out.push(']');
-            copied = end;
-            redacted = true;
-        }
-        if !redacted {
-            return None;
-        }
-        out.push_str(&text[copied..]);
-        Some(out)
+            })
+            .collect()
     }
 
     /// Whether an allowlist entry exempts `matched`. Compared with invisible
@@ -1827,6 +1834,39 @@ mod tests {
         // redacted whole instead of up to its first space.
         let out = s.scrub("DB_PASSWORD=\"correct horse battery\"\nPORT=5432");
         assert_eq!(out, "[REDACTED:env_secret]\"\nPORT=5432");
+    }
+
+    /// Plain text with a literal escape (a dotenv multi-line value, a shell
+    /// string with `\"`) reads differently through the decoded view, where
+    /// the escape ends the value early. The view only ever widens a
+    /// redaction: each one still covers at least what the plain text match
+    /// covers.
+    #[test]
+    fn a_literal_escape_in_plain_text_never_shortens_a_redaction() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, tail) in [
+            (
+                r#"JWT_SECRET="firstHALF\nSECONDHALFsecret""#,
+                "SECONDHALFsecret",
+            ),
+            (
+                r#"export WEBHOOK_SECRET="abc\"SECONDHALFsecret""#,
+                "SECONDHALFsecret",
+            ),
+            (
+                r"STRIPE_SECRET_KEY=sk_live_FAKE\tSECONDHALFsecret",
+                "SECONDHALFsecret",
+            ),
+            (r#"DB_PASSWORD="abc"SECRETTAIL"#, "SECRETTAIL"),
+            (r#"DB_PASSWORD="abc"SECRETTAIL"more"#, "SECRETTAIL"),
+        ] {
+            let out = s.scrub(raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(tail),
+                "tail of the secret stored in clear: {raw} -> {out}"
+            );
+        }
     }
 
     /// Decoding widens only what the rules see through, never what counts as
