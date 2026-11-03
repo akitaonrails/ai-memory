@@ -720,6 +720,8 @@ cli-presentation-capture-mode-allowlist-repositories-without-a-ai-memory-toml-ma
 cli-presentation-optional-models = Optional models
 cli-presentation-providers = { "  " }providers:
 cli-presentation-llm = { "    " }llm:       { $value0 }
+cli-presentation-llm-default = { "    " }llm (default): { $value0 }
+cli-presentation-llm-task = { "    " }llm ({ $value0 }): { $value1 } · { $value2 }
 cli-presentation-embedding = { "    " }embedding: { $value0 }
 cli-presentation-retry-hint = { "    " }retry:     { $value0 }
 cli-presentation-fallback-chain = { "    " }fallback chain:

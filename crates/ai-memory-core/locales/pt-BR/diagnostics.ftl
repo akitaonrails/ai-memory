@@ -966,3 +966,12 @@ diag-refusing-to-other-processes-running = recusando { $verb ->
        *[other] { $verb }
     }: { $value0 } outro(s) processo(s) do ai-memory em execução (pids: { $value1 }). Encerre-os e execute novamente.
 diag-web-all-projects-total = Todos os projetos ({ $total })
+diag-unknown-llm-task = tarefa LLM desconhecida llm.{ $name }
+diag-llm-task-provider-empty = { $path }.provider não pode estar vazio
+diag-llm-task-provider-unsupported = { $path }.provider={ $raw } não é um provedor compatível
+diag-validating-profile = validando perfil de tarefa LLM { $path }
+diag-validating-fallback-profile = validando perfil alternativo LLM { $item }
+diag-building-profile = criando provedor alternativo LLM { $item }
+diag-profile-api-key-unsupported = provedor não configurado: api_key_env não é compatível com o provedor { $provider }
+diag-building-llm-provider-chains = criando cadeias de provedores LLM a partir da configuração
+diag-reranker-llm-provider-required = AI_MEMORY_RERANKER=llm requer AI_MEMORY_LLM_PROVIDER ou um provedor llm.rerank

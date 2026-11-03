@@ -1671,8 +1671,10 @@ api_key_env = "GEMINI_API_KEY"
 which may run keyless). It is never inherited from the primary's own
 fixed env var, so a fallback cannot look configured while actually
 resolving no credential. It is optional only for a provider with a native
-credential source (`openai-oauth`, `copilot`, `anthropic-oauth`), which
-shares the primary's process-wide token material. `Config::load` validates
+credential source (`openai-oauth`, `codex`, `copilot`, `anthropic-oauth`,
+`cursor`), which then shares the primary's process-wide token material. When
+set, `copilot` and `anthropic-oauth` use the named key instead, and
+`openai-oauth`, `codex` and `cursor` reject it at load. `Config::load` validates
 every profile and resolves its credential once, at startup: a
 missing/empty provider or model, an unknown provider, or a missing
 credential fails startup rather than leaving a latent fallback that only
@@ -1680,6 +1682,16 @@ fails once the primary is already down. Each candidate carries its own
 30s in-memory circuit (`ai_memory_llm::fallback::CIRCUIT_COOLDOWN`): a
 transient failure opens it, a success closes it, and a restart clears all
 circuit state. There is no durable circuit or forced chain-wide deadline.
+
+**Per-workload provider chains** (opt-in, `[llm.<task>]`, #1969): a task
+table (`consolidation`, `bootstrap`, `auto_improve`, `experience`, `dream`,
+`lint`, `profile`, `rerank`, `query_answer`) builds its own primary and
+`fallbacks` chain at startup with the same validation and credential rules.
+`ai_memory_llm::LlmProviders::get(workload)` returns that chain or, for a task
+without a table, the shared default chain. A task chain never appends the
+global fallbacks or inherits the global endpoint, and a task table works with
+no global provider without enabling the other tasks. Health reports each task
+chain under `llm_task_chains`.
 
 `GET /admin/status` (`ai-memory status`) reports an `llm_candidates` list
 alongside the existing `llm`/`embedding` roles: each candidate's

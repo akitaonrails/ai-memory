@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use ai_memory_llm::{
     AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, CursorAuth, EmbedderChoice, EmbedderConfig,
-    ExtraHeaders, FallbackLlmProvider, LlmError, LlmProvider, LlmResult, OPENCODE_DEFAULT_MODEL,
-    ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort, build_provider,
-    cursor_executable,
+    ExtraHeaders, FallbackLlmProvider, LlmError, LlmProvider, LlmProviders, LlmResult, LlmWorkload,
+    OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort,
+    build_provider, cursor_executable,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -262,6 +262,24 @@ pub struct FallbackProfile {
     pub api_key_env: Option<String>,
 }
 
+/// Provider and exclusive fallback chain for one LLM workload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskLlmSettings {
+    pub provider: String,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub fallbacks: Vec<FallbackProfile>,
+}
+
+/// Load-time provider settings, including credentials, never serialized.
+#[derive(Debug, Clone)]
+pub struct ResolvedTaskLlm {
+    pub primary: ProviderConfig,
+    pub fallbacks: Vec<ProviderConfig>,
+}
+
 /// Top-level runtime configuration.
 ///
 /// `deny_unknown_fields` is intentionally NOT set: figment's
@@ -438,6 +456,10 @@ pub struct Config {
     /// per-profile credential names into one env var would be ambiguous.
     #[serde(default)]
     pub llm_fallbacks: Vec<FallbackProfile>,
+    /// Per-workload provider overrides.
+    pub llm: BTreeMap<String, TaskLlmSettings>,
+    #[serde(skip)]
+    pub llm_task_configs: BTreeMap<String, ResolvedTaskLlm>,
     /// Validated [`ProviderConfig`] for each `llm_fallbacks` entry
     /// (credentials included), resolved once by `Config::load` in
     /// declaration order. Not a config-file key — see
@@ -1452,6 +1474,8 @@ impl Default for Config {
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
             llm_fallbacks: Vec::new(),
+            llm: BTreeMap::new(),
+            llm_task_configs: BTreeMap::new(),
             llm_fallback_configs: Vec::new(),
             llm_fallback_unresolved: Vec::new(),
             consolidate_on_session_end: false,
@@ -2799,39 +2823,45 @@ impl Config {
         // `ai-memory status`. It is recorded here and enforced by
         // `require_llm_fallback_credentials` at `serve` startup and by
         // `llm_provider_chain`, so the server still fails closed.
-        let mut fallback_configs = Vec::with_capacity(config.llm_fallbacks.len());
         let mut unresolved = Vec::new();
-        for (i, profile) in config.llm_fallbacks.iter().enumerate() {
-            let (resolved_key, missing) = match non_empty(profile.api_key_env.as_deref()) {
-                Some(name) => match env_string(name) {
-                    Some(key) => (Some(SecretString::from(key)), None),
-                    None => (
-                        // Stands in for the absent key so the rest of the
-                        // profile is still validated eagerly below; the
-                        // config built from it is discarded.
-                        Some(SecretString::from(UNRESOLVED_FALLBACK_KEY)),
-                        Some(format!(
-                            "llm_fallbacks[{i}].api_key_env={name} is set but the \
-                             environment variable is missing or empty"
-                        )),
-                    ),
-                },
-                None => (None, None),
-            };
-            let provider_cfg = config
-                .fallback_provider_config(i, profile, resolved_key)
-                .with_context(|| format!("validating llm_fallbacks[{i}]"))?;
-            // Constructed and discarded so a malformed profile (missing
-            // base_url, bad credential shape) fails startup instead of
-            // silently sitting unused until the primary has an outage.
-            build_provider(provider_cfg.clone())
-                .with_context(|| format!("building llm_fallbacks[{i}]"))?;
-            match missing {
-                Some(message) => unresolved.push(message),
-                None => fallback_configs.push(provider_cfg),
+        config.llm_fallback_configs =
+            config.resolve_fallbacks("llm_fallbacks", &config.llm_fallbacks, &mut unresolved)?;
+        let mut tasks = BTreeMap::new();
+        for (name, task) in &config.llm {
+            if LlmWorkload::from_config_key(name).is_none() {
+                anyhow::bail!("unknown LLM task llm.{name}");
             }
+            let path = format!("llm.{name}");
+            let raw = non_empty(Some(&task.provider))
+                .ok_or_else(|| anyhow::anyhow!("{path}.provider must not be empty"))?;
+            let provider = provider_choice_from_str(raw).ok_or_else(|| {
+                anyhow::anyhow!("{path}.provider={raw} is not a supported provider")
+            })?;
+            let explicit_key = task.api_key_env.is_some();
+            let key = if explicit_key {
+                config.resolve_profile_key(&path, task.api_key_env.as_deref(), &mut unresolved)
+            } else {
+                config.provider_api_key(provider)
+            };
+            let auth = config
+                .profile_provider_auth(provider, explicit_key, key, task.base_url.as_deref())
+                .with_context(|| format!("validating LLM task profile {path}"))?;
+            let primary = config
+                .make_provider_config(
+                    provider,
+                    task.model.as_deref(),
+                    auth,
+                    non_empty(task.base_url.as_deref()).map(str::to_string),
+                )
+                .with_context(|| format!("validating LLM task profile {path}"))?;
+            let fallbacks = config.resolve_fallbacks(
+                &format!("{path}.fallbacks"),
+                &task.fallbacks,
+                &mut unresolved,
+            )?;
+            tasks.insert(name.clone(), ResolvedTaskLlm { primary, fallbacks });
         }
-        config.llm_fallback_configs = fallback_configs;
+        config.llm_task_configs = tasks;
         config.llm_fallback_unresolved = unresolved;
 
         Ok(config)
@@ -2878,7 +2908,23 @@ impl Config {
                  anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
-        let model = match non_empty(self.llm_model.as_deref()) {
+        self.make_provider_config(
+            provider,
+            self.llm_model.as_deref(),
+            self.provider_auth(provider, None),
+            self.resolve_base_url(provider),
+        )
+        .map(Some)
+    }
+
+    fn make_provider_config(
+        &self,
+        provider: ProviderChoice,
+        model: Option<&str>,
+        auth: ProviderAuth,
+        base_url: Option<String>,
+    ) -> LlmResult<ProviderConfig> {
+        let model = match non_empty(model) {
             Some(s) => s.to_string(),
             None => match provider {
                 ProviderChoice::Anthropic => "claude-haiku-4-5".to_string(),
@@ -2899,18 +2945,61 @@ impl Config {
                 ProviderChoice::Cursor => CURSOR_DEFAULT_MODEL.to_string(),
             },
         };
-        Ok(Some(ProviderConfig {
+        Ok(ProviderConfig {
             provider,
             model,
-            auth: self.provider_auth(provider, None),
-            base_url: self.resolve_base_url(provider),
+            auth,
+            base_url,
             compat_strict: self.llm_compat_strict,
             compat_disable_thinking: self.llm_compat_disable_thinking,
             compat_stream: self.llm_compat_stream,
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
-        }))
+        })
+    }
+
+    fn resolve_profile_key(
+        &self,
+        path: &str,
+        name: Option<&str>,
+        unresolved: &mut Vec<String>,
+    ) -> Option<SecretString> {
+        let name = name?;
+        let value = self
+            .runtime_env
+            .var_os(name)
+            .and_then(|v| v.into_string().ok());
+        if let Some(value) = non_empty(value.as_deref()) {
+            return Some(SecretString::from(value.to_string()));
+        }
+        unresolved.push(format!(
+            "{path}.api_key_env={name} is set but the environment variable is missing or empty"
+        ));
+        Some(SecretString::from(UNRESOLVED_FALLBACK_KEY))
+    }
+
+    fn resolve_fallbacks(
+        &self,
+        path: &str,
+        profiles: &[FallbackProfile],
+        unresolved: &mut Vec<String>,
+    ) -> Result<Vec<ProviderConfig>> {
+        let mut configs = Vec::with_capacity(profiles.len());
+        for (i, profile) in profiles.iter().enumerate() {
+            let item = format!("{path}[{i}]");
+            let before = unresolved.len();
+            let key = self.resolve_profile_key(&item, profile.api_key_env.as_deref(), unresolved);
+            let cfg = self
+                .fallback_provider_config_named(&item, profile, key)
+                .with_context(|| format!("validating LLM fallback profile {item}"))?;
+            build_provider(cfg.clone())
+                .with_context(|| format!("building LLM fallback provider {item}"))?;
+            if before == unresolved.len() {
+                configs.push(cfg);
+            }
+        }
+        Ok(configs)
     }
 
     /// Resolve one `[[llm_fallbacks]]` profile into a validated
@@ -2926,25 +3015,36 @@ impl Config {
     /// Returns [`LlmError::NotConfigured`] for an empty provider/model, an
     /// unknown provider, or a `RequiredApiKey` provider with no resolved
     /// credential.
+    #[cfg(test)]
     fn fallback_provider_config(
         &self,
         index: usize,
         profile: &FallbackProfile,
         resolved_key: Option<SecretString>,
     ) -> LlmResult<ProviderConfig> {
-        let provider_raw = non_empty(Some(profile.provider.as_str())).ok_or_else(|| {
-            LlmError::NotConfigured(format!("llm_fallbacks[{index}].provider must not be empty"))
-        })?;
+        self.fallback_provider_config_named(
+            &format!("llm_fallbacks[{index}]"),
+            profile,
+            resolved_key,
+        )
+    }
+
+    fn fallback_provider_config_named(
+        &self,
+        path: &str,
+        profile: &FallbackProfile,
+        resolved_key: Option<SecretString>,
+    ) -> LlmResult<ProviderConfig> {
+        let provider_raw = non_empty(Some(profile.provider.as_str()))
+            .ok_or_else(|| LlmError::NotConfigured(format!("{path}.provider must not be empty")))?;
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
-                "llm_fallbacks[{index}].provider={provider_raw} is not one of \
+                "{path}.provider={provider_raw} is not one of \
                  anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         let model = non_empty(Some(profile.model.as_str()))
-            .ok_or_else(|| {
-                LlmError::NotConfigured(format!("llm_fallbacks[{index}].model must not be empty"))
-            })?
+            .ok_or_else(|| LlmError::NotConfigured(format!("{path}.model must not be empty")))?
             .to_string();
         if resolved_key.is_none()
             && matches!(
@@ -2953,69 +3053,72 @@ impl Config {
             )
         {
             return Err(LlmError::NotConfigured(format!(
-                "llm_fallbacks[{index}] provider={provider_raw} requires api_key_env \
+                "{path} provider={provider_raw} requires api_key_env \
                  (no native credential source for this provider)"
             )));
         }
-        Ok(ProviderConfig {
+        let auth = self
+            .profile_provider_auth(
+                provider,
+                profile.api_key_env.is_some(),
+                resolved_key,
+                profile.base_url.as_deref(),
+            )
+            .map_err(|error| LlmError::NotConfigured(format!("{path}: {error}")))?;
+        self.make_provider_config(
             provider,
-            model,
-            auth: self.fallback_provider_auth(provider, resolved_key),
-            base_url: non_empty(profile.base_url.as_deref()).map(str::to_string),
-            compat_strict: self.llm_compat_strict,
-            compat_disable_thinking: self.llm_compat_disable_thinking,
-            compat_stream: self.llm_compat_stream,
-            request_timeout_secs: self.llm_timeout_secs,
-            reasoning_effort: self.llm_reasoning_effort,
-            extra_headers: self.llm_extra_headers()?,
-        })
+            Some(&model),
+            auth,
+            non_empty(profile.base_url.as_deref()).map(str::to_string),
+        )
     }
 
-    /// Auth resolution for a fallback profile. Deliberately distinct from
-    /// [`Self::provider_auth`]: that method falls back to the *primary*
-    /// provider's own fixed env var
-    /// (e.g. `ANTHROPIC_API_KEY`) when no override is given, which would let
-    /// a fallback profile silently reuse the primary's credential even
-    /// though it omitted `api_key_env` — defeating the "fails startup"
-    /// validation in [`Self::fallback_provider_config`]. Native credential
-    /// sources (OpenAI OAuth, Copilot, Anthropic OAuth) are process-wide by
-    /// nature and are still shared with the primary provider.
-    fn fallback_provider_auth(
+    /// Resolve profile auth without inheriting the global provider's endpoint.
+    fn profile_provider_auth(
         &self,
         provider: ProviderChoice,
+        explicit_key: bool,
         resolved_key: Option<SecretString>,
-    ) -> ProviderAuth {
-        match provider.auth_requirement() {
+        base_url: Option<&str>,
+    ) -> LlmResult<ProviderAuth> {
+        Ok(match provider.auth_requirement() {
             AuthRequirement::RequiredApiKey { env_var } => {
                 ProviderAuth::required_api_key_from_env(env_var, resolved_key)
             }
             AuthRequirement::OptionalApiKey { env_var } => {
                 ProviderAuth::optional_api_key_from_env(env_var, resolved_key)
             }
-            AuthRequirement::OpenAiOAuthToken => {
-                ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
-            }
-            AuthRequirement::CodexAuthFile => ProviderAuth::codex(
-                resolve_codex_auth_file(
-                    self.runtime_env.codex_home.as_deref(),
-                    self.runtime_env.platform_home.as_deref(),
-                ),
-                self.runtime_env
-                    .codex_executable
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("codex")),
-            ),
             AuthRequirement::CopilotToken => ProviderAuth::copilot(
                 self.copilot_token_path(),
-                self.runtime_env.copilot_github_token.clone(),
-                self.runtime_env.github_copilot_api_token.clone(),
-                self.runtime_env.copilot_api_url.clone(),
+                if explicit_key {
+                    None
+                } else {
+                    self.runtime_env.copilot_github_token.clone()
+                },
+                if explicit_key {
+                    resolved_key
+                } else {
+                    self.runtime_env.github_copilot_api_token.clone()
+                },
+                self.runtime_env
+                    .copilot_api_url
+                    .clone()
+                    .or_else(|| non_empty(base_url).map(str::to_string)),
             ),
-            AuthRequirement::AnthropicOAuthToken => {
-                ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
+            AuthRequirement::AnthropicOAuthToken if explicit_key => {
+                ProviderAuth::anthropic_oauth_token(resolved_key)
             }
-            AuthRequirement::CursorCli => ProviderAuth::cursor(self.cursor_auth()),
-        }
+            AuthRequirement::OpenAiOAuthToken
+            | AuthRequirement::CodexAuthFile
+            | AuthRequirement::CursorCli
+                if explicit_key =>
+            {
+                return Err(LlmError::NotConfigured(format!(
+                    "api_key_env is not supported by provider {provider:?}"
+                )));
+            }
+            _ => self.provider_auth(provider, None),
+        })
     }
 
     /// Fail when an `llm_fallbacks` credential named by `api_key_env` is
@@ -3057,23 +3160,25 @@ impl Config {
         let Some(primary_cfg) = self.llm_provider_config()? else {
             return Ok(None);
         };
-        if self.llm_fallback_configs.is_empty() {
-            return Ok(Some(build_provider(primary_cfg)?));
+        build_llm_chain(primary_cfg, &self.llm_fallback_configs).map(Some)
+    }
+
+    /// Construct the default chain and each independently configured workload chain.
+    pub fn llm_providers(&self) -> LlmResult<LlmProviders> {
+        if let Some(message) = self.llm_fallback_unresolved.first() {
+            return Err(LlmError::NotConfigured(message.clone()));
         }
-        let mut candidates = Vec::with_capacity(1 + self.llm_fallback_configs.len());
-        candidates.push(Candidate::new(
-            primary_cfg.provider.name(),
-            primary_cfg.model.clone(),
-            build_provider(primary_cfg)?,
-        ));
-        for cfg in &self.llm_fallback_configs {
-            candidates.push(Candidate::new(
-                cfg.provider.name(),
-                cfg.model.clone(),
-                build_provider(cfg.clone())?,
-            ));
+        let default = self.llm_provider_chain()?;
+        let mut overrides = std::collections::HashMap::new();
+        for (name, task) in &self.llm_task_configs {
+            let workload = LlmWorkload::from_config_key(name)
+                .ok_or_else(|| LlmError::NotConfigured(format!("unknown LLM task llm.{name}")))?;
+            overrides.insert(
+                workload,
+                build_llm_chain(task.primary.clone(), &task.fallbacks)?,
+            );
         }
-        Ok(Some(Arc::new(FallbackLlmProvider::new(candidates))))
+        Ok(LlmProviders { default, overrides })
     }
 
     /// OpenAI-compatible embedding key. `EMBEDDING_API_KEY` is checked first
@@ -3413,6 +3518,29 @@ impl Config {
     pub fn llm_test_base_url(&self, provider: ProviderChoice) -> Option<String> {
         self.resolve_base_url(provider)
     }
+}
+
+fn build_llm_chain(
+    primary: ProviderConfig,
+    fallbacks: &[ProviderConfig],
+) -> LlmResult<Arc<dyn LlmProvider>> {
+    if fallbacks.is_empty() {
+        return build_provider(primary);
+    }
+    let mut candidates = Vec::with_capacity(1 + fallbacks.len());
+    candidates.push(Candidate::new(
+        primary.provider.name(),
+        primary.model.clone(),
+        build_provider(primary)?,
+    ));
+    for cfg in fallbacks {
+        candidates.push(Candidate::new(
+            cfg.provider.name(),
+            cfg.model.clone(),
+            build_provider(cfg.clone())?,
+        ));
+    }
+    Ok(Arc::new(FallbackLlmProvider::new(candidates)))
 }
 
 /// Wire-name parsing shared by `llm_provider` and `llm_fallbacks[].provider`.
@@ -7119,6 +7247,174 @@ input_token_safety_margin = {margin}
         Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
     }
 
+    fn load_with_oauth_fixture(tmp: &TempDir, toml: &str) -> Config {
+        ai_memory_llm::OpenAiOAuthToken::from_token_response(
+            "test-access",
+            "test-refresh",
+            3600,
+            None,
+            None,
+        )
+        .save(&tmp.path().join("auth.json"))
+        .unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, toml).unwrap();
+        Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn task_chain_is_independent_and_uses_provider_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = load_with_oauth_fixture(
+            &tmp,
+            "llm_provider = 'openai-compat'\nllm_model = 'global'\n\
+             llm_base_url = 'http://127.0.0.1:9'\n\
+             [llm.consolidation]\nprovider = 'openai-oauth'\n\
+             [[llm.consolidation.fallbacks]]\nprovider = 'openai-compat'\n\
+             model = 'backup'\nbase_url = 'http://127.0.0.1:10'\n",
+        );
+        let task = &cfg.llm_task_configs["consolidation"];
+        assert_eq!(task.primary.model, "gpt-5.5");
+        assert_eq!(task.primary.base_url, None);
+        let routes = cfg.llm_providers().unwrap();
+        let selected = routes.get(LlmWorkload::Consolidation).unwrap();
+        assert_eq!(selected.model(), "gpt-5.5");
+        assert_eq!(selected.candidate_health().len(), 2);
+        assert_eq!(selected.candidate_health()[1].model, "backup");
+        assert!(Arc::ptr_eq(
+            routes.default.as_ref().unwrap(),
+            routes.get(LlmWorkload::Lint).unwrap()
+        ));
+    }
+
+    #[test]
+    fn task_copilot_auth_never_inherits_global_endpoint() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "llm_base_url = 'https://global.example'\n\
+             [llm.lint]\nprovider = 'copilot'\n\
+             [llm.profile]\nprovider = 'copilot'\nbase_url = 'https://task.example'\n",
+        )
+        .unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        let lint = &cfg.llm_task_configs["lint"].primary;
+        let profile = &cfg.llm_task_configs["profile"].primary;
+        assert_eq!(lint.base_url, None);
+        assert_eq!(lint.auth.require_copilot_auth().unwrap().api_base_url, None);
+        assert_eq!(profile.base_url.as_deref(), Some("https://task.example"));
+        assert_eq!(
+            profile
+                .auth
+                .require_copilot_auth()
+                .unwrap()
+                .api_base_url
+                .as_deref(),
+            Some("https://task.example")
+        );
+    }
+
+    #[test]
+    fn task_only_does_not_enable_unrelated_workloads() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = load_with_oauth_fixture(&tmp, "[llm.lint]\nprovider = 'openai-oauth'\n");
+        let routes = cfg.llm_providers().unwrap();
+        assert!(routes.default.is_none());
+        assert!(routes.get(LlmWorkload::Lint).is_some());
+        assert!(routes.get(LlmWorkload::Consolidation).is_none());
+    }
+
+    #[test]
+    fn task_configuration_rejects_unknown_or_malformed_input() {
+        for text in [
+            "[llm.unspecified]\nprovider = 'openai'\n",
+            "[llm.typo]\nprovider = 'openai'\n",
+            "[llm.lint]\nmodel = 'x'\n",
+            "[llm.lint]\nprovider = ' '\n",
+            "[llm.lint]\nprovider = 'not-a-provider'\n",
+            "[llm.lint]\nprovider = 'openai'\nmodle = 'x'\n",
+            "[llm.lint]\nprovider = 'openai-compat'\n",
+        ] {
+            assert!(load_with_toml(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn task_explicit_missing_key_does_not_inherit_native_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[llm.lint]\nprovider = 'openai'\n\
+            api_key_env = 'MISSING_TASK_TEST_KEY'\n",
+        )
+        .unwrap();
+        let env = RuntimeEnv {
+            openai_api_key: Some(SecretString::from("native-key")),
+            ..RuntimeEnv::default()
+        };
+        let cfg = Config::load_with_runtime_env(Some(&path), Some(tmp.path().to_path_buf()), env)
+            .unwrap();
+        assert!(cfg.require_llm_fallback_credentials().is_err());
+        assert!(cfg.llm_providers().is_err());
+        assert!(!serde_json::to_string(&cfg).unwrap().contains("native-key"));
+    }
+
+    #[test]
+    fn task_explicit_keys_use_injected_environment() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[llm.lint]\nprovider = 'openai'\napi_key_env = 'TASK_KEY'\n",
+        )
+        .unwrap();
+        let env = RuntimeEnv {
+            process_env: CapturedProcessEnv(vec![("TASK_KEY".into(), "custom-key".into())]),
+            openai_api_key: Some(SecretString::from("native-key")),
+            ..RuntimeEnv::default()
+        };
+        let cfg = Config::load_with_runtime_env(Some(&path), Some(tmp.path().to_path_buf()), env)
+            .unwrap();
+        assert_eq!(
+            cfg.llm_task_configs["lint"]
+                .primary
+                .auth
+                .require_api_key()
+                .unwrap()
+                .expose_secret(),
+            "custom-key"
+        );
+        assert!(!serde_json::to_string(&cfg).unwrap().contains("custom-key"));
+    }
+
+    #[test]
+    fn task_nested_environment_shape_overrides_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[llm.lint]\nprovider = 'openai'\nmodel = 'old'\n").unwrap();
+        // The split env provider produces this same nested dictionary.
+        let overlay = serde_json::json!({"llm": {"lint": {"model": "new"}}});
+        let cfg: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::file(&path))
+            .merge(Serialized::defaults(overlay))
+            .extract()
+            .unwrap();
+        assert_eq!(cfg.llm["lint"].provider, "openai");
+        assert_eq!(cfg.llm["lint"].model.as_deref(), Some("new"));
+    }
+
     #[test]
     fn llm_fallbacks_default_to_empty_and_no_behavior_change() {
         let cfg = Config::default();
@@ -7326,9 +7622,163 @@ input_token_safety_margin = {margin}
         );
     }
 
-    /// `openai-oauth`/`copilot`/`anthropic-oauth` are native credential
-    /// sources: no `api_key_env` is required, and the fallback shares the
-    /// same process-wide token material as the primary.
+    #[test]
+    fn native_profile_overrides_use_named_credentials_and_profile_endpoints() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "llm_base_url = 'https://global.example'\n\
+             [[llm_fallbacks]]\nprovider = 'copilot'\nmodel = 'm'\n\
+             api_key_env = 'COPILOT_TEST_KEY'\nbase_url = 'https://fallback.example'\n\
+             [llm.lint]\nprovider = 'anthropic-oauth'\napi_key_env = 'OAUTH_TEST_KEY'\n\
+             [[llm.lint.fallbacks]]\nprovider = 'anthropic-oauth'\nmodel = 'm'\n\
+             api_key_env = 'OAUTH_TEST_KEY'\n\
+             [llm.profile]\nprovider = 'copilot'\napi_key_env = 'COPILOT_TEST_KEY'\n\
+             base_url = 'https://task.example'\n",
+        )
+        .unwrap();
+        let env = RuntimeEnv {
+            process_env: CapturedProcessEnv(vec![
+                ("COPILOT_TEST_KEY".into(), "copilot-override".into()),
+                ("OAUTH_TEST_KEY".into(), "oauth-override".into()),
+            ]),
+            copilot_github_token: Some(SecretString::from("native-github")),
+            github_copilot_api_token: Some(SecretString::from("native-copilot")),
+            anthropic_oauth_token: Some(SecretString::from("native-oauth")),
+            ..RuntimeEnv::default()
+        };
+        let cfg = Config::load_with_runtime_env(Some(&path), Some(tmp.path().to_path_buf()), env)
+            .unwrap();
+        let copilot = cfg.llm_fallback_configs[0]
+            .auth
+            .require_copilot_auth()
+            .unwrap();
+        assert!(copilot.github_token.is_none());
+        assert_eq!(
+            copilot.direct_api_token.unwrap().expose_secret(),
+            "copilot-override"
+        );
+        assert_eq!(
+            copilot.api_base_url.as_deref(),
+            Some("https://fallback.example")
+        );
+        let task_copilot = cfg.llm_task_configs["profile"]
+            .primary
+            .auth
+            .require_copilot_auth()
+            .unwrap();
+        assert!(task_copilot.github_token.is_none());
+        assert_eq!(
+            task_copilot.direct_api_token.unwrap().expose_secret(),
+            "copilot-override"
+        );
+        assert_eq!(
+            task_copilot.api_base_url.as_deref(),
+            Some("https://task.example")
+        );
+        let task = &cfg.llm_task_configs["lint"];
+        for auth in [&task.primary.auth, &task.fallbacks[0].auth] {
+            assert_eq!(
+                auth.require_anthropic_oauth_token()
+                    .unwrap()
+                    .expose_secret(),
+                "oauth-override"
+            );
+        }
+    }
+
+    #[test]
+    fn native_profiles_reject_unsupported_named_credentials() {
+        for provider in ["openai-oauth", "codex", "cursor"] {
+            for profile in [
+                format!("[llm.lint]\nprovider = '{provider}'\napi_key_env = 'KEY'\n"),
+                format!(
+                    "[[llm_fallbacks]]\nprovider = '{provider}'\nmodel = 'm'\napi_key_env = 'KEY'\n"
+                ),
+            ] {
+                let error = load_with_toml(&profile).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("api_key_env is not supported"),
+                    "{provider}: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_profile_missing_named_credentials_are_deferred_without_inheritance() {
+        for provider in ["copilot", "anthropic-oauth"] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!(
+                    "[llm.lint]\nprovider = '{provider}'\napi_key_env = 'MISSING_KEY'\n\
+                     [[llm.lint.fallbacks]]\nprovider = '{provider}'\nmodel = 'm'\n\
+                     api_key_env = 'MISSING_KEY'\n"
+                ),
+            )
+            .unwrap();
+            let env = RuntimeEnv {
+                copilot_github_token: Some(SecretString::from("native-github")),
+                github_copilot_api_token: Some(SecretString::from("native-copilot")),
+                anthropic_oauth_token: Some(SecretString::from("native-oauth")),
+                ..RuntimeEnv::default()
+            };
+            let cfg =
+                Config::load_with_runtime_env(Some(&path), Some(tmp.path().to_path_buf()), env)
+                    .unwrap();
+            assert!(cfg.require_llm_fallback_credentials().is_err());
+            assert!(cfg.llm_task_configs["lint"].fallbacks.is_empty());
+            let auth = &cfg.llm_task_configs["lint"].primary.auth;
+            if provider == "copilot" {
+                let copilot = auth.require_copilot_auth().unwrap();
+                assert!(copilot.github_token.is_none());
+                assert_eq!(
+                    copilot.direct_api_token.unwrap().expose_secret(),
+                    UNRESOLVED_FALLBACK_KEY
+                );
+            } else {
+                assert_eq!(
+                    auth.require_anthropic_oauth_token()
+                        .unwrap()
+                        .expose_secret(),
+                    UNRESOLVED_FALLBACK_KEY
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_copilot_endpoint_uses_profile_and_copilot_env_precedence() {
+        let profile = FallbackProfile {
+            provider: "copilot".into(),
+            model: "m".into(),
+            base_url: Some("https://fallback.example".into()),
+            api_key_env: None,
+        };
+        let cfg = Config {
+            llm_base_url: Some("https://global.example".into()),
+            runtime_env: RuntimeEnv {
+                copilot_api_url: Some("https://copilot-env.example".into()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+        let auth = cfg
+            .fallback_provider_config(0, &profile, None)
+            .unwrap()
+            .auth
+            .require_copilot_auth()
+            .unwrap();
+        assert_eq!(
+            auth.api_base_url.as_deref(),
+            Some("https://copilot-env.example")
+        );
+    }
+
+    /// Native providers can use their process-wide credential without an override.
     #[test]
     fn fallback_provider_config_allows_no_api_key_env_for_a_native_credential_provider() {
         let cfg = Config::default();

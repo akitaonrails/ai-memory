@@ -19,9 +19,8 @@ pub struct LlmOperationId {
 
 /// Closed workload labels for passive LLM telemetry.
 ///
-/// These labels describe why ai-memory made a call. They are not provider
-/// routes and do not select a model. Keeping the set closed prevents prompts,
-/// project names, or other caller-controlled text from becoming metric keys.
+/// These closed labels select provider routes and prevent prompts, project
+/// names, or other caller-controlled text from becoming metric keys.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[repr(u8)]
@@ -63,6 +62,40 @@ impl LlmWorkload {
         Self::Dream,
         Self::Experience,
     ];
+
+    /// Parse one of the supported snake-case task configuration keys.
+    #[must_use]
+    pub fn from_config_key(key: &str) -> Option<Self> {
+        match key {
+            "consolidation" => Some(Self::Consolidation),
+            "rerank" => Some(Self::Rerank),
+            "auto_improve" => Some(Self::AutoImprove),
+            "bootstrap" => Some(Self::Bootstrap),
+            "query_answer" => Some(Self::QueryAnswer),
+            "lint" => Some(Self::Lint),
+            "profile" => Some(Self::Profile),
+            "dream" => Some(Self::Dream),
+            "experience" => Some(Self::Experience),
+            _ => None,
+        }
+    }
+
+    /// Stable snake-case configuration key, including the unspecified label.
+    #[must_use]
+    pub const fn config_key(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Consolidation => "consolidation",
+            Self::Rerank => "rerank",
+            Self::AutoImprove => "auto_improve",
+            Self::Bootstrap => "bootstrap",
+            Self::QueryAnswer => "query_answer",
+            Self::Lint => "lint",
+            Self::Profile => "profile",
+            Self::Dream => "dream",
+            Self::Experience => "experience",
+        }
+    }
 
     /// Stable kebab-case label.
     #[must_use]
@@ -524,6 +557,19 @@ mod tests {
             );
             assert!(!wire_id.contains(workload.as_str()));
         }
+    }
+
+    #[test]
+    fn task_config_keys_are_exact_and_reversible() {
+        for workload in LlmWorkload::ALL {
+            let expected = (workload != LlmWorkload::Unspecified).then_some(workload);
+            assert_eq!(
+                LlmWorkload::from_config_key(workload.config_key()),
+                expected
+            );
+        }
+        assert_eq!(LlmWorkload::from_config_key("auto-improve"), None);
+        assert_eq!(LlmWorkload::from_config_key("Query_Answer"), None);
     }
 
     #[test]

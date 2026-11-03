@@ -13,7 +13,9 @@ use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
     ProjectId, Sanitizer, SessionId, Tier, WorkspaceId,
 };
-use ai_memory_llm::{Embedder, LlmProvider};
+#[cfg(test)]
+use ai_memory_llm::LlmProvider;
+use ai_memory_llm::{Embedder, LlmProviders, LlmWorkload};
 use ai_memory_store::{
     AutoImproveProposalOperation, CLIENT_ACTIVITY_MAX_CLIENTS_PER_DAY,
     CLIENT_ACTIVITY_MAX_NAME_CHARS, CLIENT_ACTIVITY_OVERFLOW_CLIENT, NewAutoImproveProposal,
@@ -542,9 +544,8 @@ pub struct AiMemoryServer {
     /// Optional LLM consolidator. When `None`, `memory_consolidate`
     /// returns a "not configured" error.
     consolidator: Option<Arc<Consolidator>>,
-    /// Optional LLM provider for the lint contradiction pass. When
-    /// `None`, lint runs only the rule-based checks.
-    llm: Option<Arc<dyn LlmProvider>>,
+    /// Providers for non-consolidation LLM workloads.
+    llm_providers: LlmProviders,
     /// Wiki handle (needed by the sweep / lint tools to read pages +
     /// write the lint report). `None` when the server was built
     /// without one — older `new()` callers stay safe.
@@ -2215,7 +2216,7 @@ impl AiMemoryServer {
             default_limit: 10,
             answer_max_context_tokens: None,
             consolidator: None,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             wiki: None,
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
@@ -2962,22 +2963,17 @@ impl AiMemoryServer {
         self.rerank.clone()
     }
 
-    /// Attach a bare LLM provider so `memory_query(answer=true)` can synthesize
-    /// a cited answer over the retrieved hits, without the full consolidation
-    /// pipeline that [`with_consolidator_arc`](Self::with_consolidator_arc)
-    /// wires.
-    ///
-    /// Production startup always populates `self.llm` through
-    /// `with_consolidator_arc` (a provider without a consolidator has no
-    /// production use), so this thin builder exists only for the query-answer
-    /// tests, which need a provider but not the rest of that machinery — hence
-    /// `#[cfg(test)]`. It is behavior-preserving: it only sets the same
-    /// `self.llm` field the production builder does, and `answer` defaults off
-    /// so an attached provider is never called unless the caller opts in.
+    /// Attach providers for query answers, explore, lint, and auto-improvement.
+    #[must_use]
+    pub fn with_llm_providers(mut self, providers: LlmProviders) -> Self {
+        self.llm_providers = providers;
+        self
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
-        self.llm = Some(llm);
+        self.llm_providers.default = Some(llm);
         self
     }
 
@@ -3043,24 +3039,25 @@ impl AiMemoryServer {
         self
     }
 
-    /// Attach an LLM-backed consolidator. Without this, the
-    /// `memory_consolidate` tool errors with "not configured". Also
-    /// stores the LLM provider so `memory_lint` can run its
-    /// contradiction pass. Accepts a pre-built `Arc<Consolidator>` so
-    /// the same consolidator can be shared with another subsystem
-    /// (e.g. the hook router's PreCompact branch) and both paths see
-    /// the same handle.
+    /// Attach a shared consolidator and wiki without changing workload providers.
     #[must_use]
-    pub fn with_consolidator_arc(
+    pub fn with_consolidator(mut self, wiki: Wiki, consolidator: Arc<Consolidator>) -> Self {
+        self.consolidator = Some(consolidator);
+        self.wiki = Some(wiki);
+        self
+    }
+
+    /// Attach a consolidator and use its provider as the default for other workloads.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_consolidator_arc(
         mut self,
         wiki: Wiki,
         llm: Arc<dyn LlmProvider>,
         consolidator: Arc<Consolidator>,
     ) -> Self {
-        self.consolidator = Some(consolidator);
-        self.llm = Some(llm);
-        self.wiki = Some(wiki);
-        self
+        self.llm_providers.default = Some(llm);
+        self.with_consolidator(wiki, consolidator)
     }
 
     /// Search the compiled wiki via FTS5/entity/vector/graph retrieval. Default,
@@ -3594,7 +3591,7 @@ impl AiMemoryServer {
         // `answer_unavailable` note rather than erroring.
         let mut answer_context = None;
         let (answer, answer_unavailable) = if args.answer.unwrap_or(false) {
-            match self.llm.as_ref() {
+            match self.llm_providers.get(LlmWorkload::QueryAnswer) {
                 Some(llm) => {
                     if self
                         .answer_max_context_tokens
@@ -4236,7 +4233,7 @@ impl AiMemoryServer {
         let report = run_lint(
             &self.reader,
             wiki,
-            self.llm.as_ref(),
+            self.llm_providers.get(LlmWorkload::Lint),
             ws,
             proj,
             ai_memory_consolidate::LintOptions {
@@ -4582,7 +4579,7 @@ impl AiMemoryServer {
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        let Some(llm) = self.llm.as_ref() else {
+        let Some(llm) = self.llm_providers.get(LlmWorkload::AutoImprove) else {
             return Err(McpError::internal_error(
                 "memory_auto_improve not configured (set AI_MEMORY_LLM_PROVIDER on the server)",
                 None,
@@ -7774,7 +7771,7 @@ impl AiMemoryServer {
             self.spawn_access_bump(ids, Self::bump_actor_from_parts(&parts).as_ref());
         }
 
-        let Some(llm) = &self.consolidator else {
+        let Some(provider) = self.llm_providers.get(LlmWorkload::QueryAnswer) else {
             // No LLM configured — return the structured snapshot.
             // Caller can render prose itself if it wants.
             return ok_json(&serde_json::json!({
@@ -7791,7 +7788,6 @@ impl AiMemoryServer {
             args.focus.as_deref(),
             args.reasoning.unwrap_or_default(),
         );
-        let provider = llm.llm();
         let text = match provider
             .complete_with_operation_id(
                 request,
@@ -19120,8 +19116,12 @@ mod tests {
     /// summary only, mirroring the `memory_consolidate` redaction tests.
     #[tokio::test]
     async fn memory_explore_degrades_with_redacted_summary_not_provider_body() {
-        let (tmp, store, _server, ws, proj) = setup_server().await;
-        let server = consolidating_server_failing_with_private_body(&tmp, &store, ws, proj).await;
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        let mut providers = LlmProviders::default();
+        providers
+            .overrides
+            .insert(LlmWorkload::QueryAnswer, Arc::new(ConsolidationBodyFailure));
+        let server = server.with_llm_providers(providers);
 
         let result = server
             .memory_explore(
@@ -26445,9 +26445,7 @@ mod tests {
         session_id
     }
 
-    /// Build the server fixture the auto-improve tests share: real store and
-    /// wiki, the sentinel provider, and a consolidator so `self.llm`/`self.wiki`
-    /// are set.
+    /// Build the server fixture the auto-improve tests share.
     async fn auto_improve_server_with_sentinel_llm() -> (
         TempDir,
         Store,
@@ -26473,16 +26471,11 @@ mod tests {
             .unwrap();
         let session_id = seeded_auto_improve_session(&store, ws, proj).await;
         let llm: Arc<dyn LlmProvider> = Arc::new(AutoImproveSentinelLlm);
-        let consolidator = Arc::new(Consolidator::new(
-            store.reader.clone(),
-            store.writer.clone(),
-            wiki.clone(),
-            llm.clone(),
-            ws,
-            proj,
-        ));
+        let mut providers = LlmProviders::default();
+        providers.overrides.insert(LlmWorkload::AutoImprove, llm);
         let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
-            .with_consolidator_arc(wiki, llm, consolidator);
+            .with_wiki(wiki)
+            .with_llm_providers(providers);
         (tmp, store, server, ws, proj, session_id)
     }
 

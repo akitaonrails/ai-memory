@@ -120,7 +120,7 @@ async fn distinct_projects_bootstrap_concurrently_up_to_the_limit() {
     let tmp = TempDir::new().unwrap();
     let mut state = make_admin_state(&tmp).await;
     let llm = OverlapLlm::new(2, std::time::Duration::from_secs(10));
-    state.llm = Some(llm.clone());
+    state.llm_providers.default = Some(llm.clone());
     state.bootstrap_gate = ai_memory_mcp::BootstrapGate::new(2);
 
     let statuses = concurrent_bootstraps(state, ["alpha", "beta"]).await;
@@ -139,7 +139,7 @@ async fn default_gate_still_runs_one_bootstrap_at_a_time() {
     let tmp = TempDir::new().unwrap();
     let mut state = make_admin_state(&tmp).await;
     let llm = OverlapLlm::new(2, std::time::Duration::from_millis(200));
-    state.llm = Some(llm.clone());
+    state.llm_providers.default = Some(llm.clone());
 
     let statuses = concurrent_bootstraps(state, ["alpha", "beta"]).await;
 
@@ -155,7 +155,7 @@ async fn same_project_bootstraps_stay_serialised_with_free_slots() {
     let tmp = TempDir::new().unwrap();
     let mut state = make_admin_state(&tmp).await;
     let llm = OverlapLlm::new(2, std::time::Duration::from_millis(200));
-    state.llm = Some(llm.clone());
+    state.llm_providers.default = Some(llm.clone());
     state.bootstrap_gate = ai_memory_mcp::BootstrapGate::new(4);
 
     let mut statuses = concurrent_bootstraps(state, ["alpha", "alpha"]).await;
@@ -182,7 +182,10 @@ async fn make_admin_state(tmp: &TempDir) -> AdminState {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None, // no LLM — bootstrap report path only
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        }, // no LLM — bootstrap report path only
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -233,6 +236,77 @@ async fn post_bootstrap(state: AdminState, body: serde_json::Value) -> axum::res
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     router.oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn override_only_bootstrap_provider_does_not_bypass_root_auth() {
+    use ai_memory_core::{ApiCredentialId, NewUser, UserRole};
+    use ai_memory_llm::LlmWorkload;
+    use ai_memory_mcp::{auth::AuthState, require_dual_auth};
+    use ai_memory_store::{TokenPepper, generate_api_key, hash_token};
+
+    let tmp = TempDir::new().unwrap();
+    let mut state = make_admin_state(&tmp).await;
+    let pepper = TokenPepper::new("bootstrap-test-pepper");
+    let user = state
+        .writer
+        .create_human_user(
+            NewUser {
+                username: "alice".into(),
+                name: None,
+                email: None,
+            },
+            UserRole::User,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let user_token = generate_api_key().unwrap();
+    state
+        .writer
+        .create_api_credential(
+            ApiCredentialId::new(),
+            user,
+            "test".into(),
+            hash_token(&user_token, &pepper),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let llm = OverlapLlm::new(1, std::time::Duration::from_secs(1));
+    state
+        .llm_providers
+        .overrides
+        .insert(LlmWorkload::Bootstrap, llm.clone());
+    state.token_pepper = Some(pepper.clone());
+    let auth = Arc::new(AuthState::new(Some("root-token".into())).with_multiuser(
+        pepper,
+        state.reader.clone(),
+        state.writer.clone(),
+    ));
+    let router = admin_router(state).layer(axum::middleware::from_fn_with_state(
+        auth,
+        require_dual_auth,
+    ));
+
+    for (token, expected) in [
+        (user_token.as_str(), StatusCode::FORBIDDEN),
+        ("unknown-token", StatusCode::UNAUTHORIZED),
+        ("root-token", StatusCode::OK),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/bootstrap")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(live_bootstrap_body("auth-test").to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(llm.peak(), usize::from(expected == StatusCode::OK));
+    }
 }
 
 /// Dry-run with no LLM returns a valid [`BootstrapOutcome`] with
@@ -301,7 +375,7 @@ async fn dry_run_honours_sources_collected_hint() {
 async fn bootstrap_surfaces_manifest_failure_after_promotion() {
     let tmp = TempDir::new().unwrap();
     let mut state = make_admin_state(&tmp).await;
-    state.llm = Some(Arc::new(EmptyBootstrapLlm));
+    state.llm_providers.default = Some(Arc::new(EmptyBootstrapLlm));
     let workspace = state
         .writer
         .get_or_create_workspace("default")
