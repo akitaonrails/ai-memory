@@ -19,6 +19,14 @@ version in [`docs/changelog/`](docs/changelog/):
   rewrite the prune deleted the session's last copy, and the dry run counted
   it. The check now asks for a live head at the page's path (#1961).
 
+- The `ai-memory starting` line that every command logs at startup no longer
+  prints the `user:pass@` part of a configured server URL. Neither do the
+  thin-client errors for an unreachable server or a failed request, `setup`'s
+  MCP check, the warning about an ignored ambient `LLM_BASE_URL`, or the
+  `auth enable` line for an MCP entry that targets another server. All of
+  them now use the helper the `mcp-bridge` connection errors adopted in 3.3.2
+  (#1960).
+
 ### Security
 
 - A password or API key printed by a tool is now redacted when the result
