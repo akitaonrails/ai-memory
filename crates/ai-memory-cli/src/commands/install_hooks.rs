@@ -4652,6 +4652,9 @@ pub(crate) fn ts_apply_marker_params(
     let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): boolean {
   const managedRun = process.env.AI_MEMORY_RUN_ID;
   if (managedRun) url.searchParams.set("managed_run", managedRun);
+  if (/^(0|false|no|off)$/.test((process.env.AI_MEMORY_AUTO_HANDOFF ?? "").trim().toLowerCase())) {
+    url.searchParams.set("auto_handoff", "0");
+  }
   if (!cwd) return true;
   url.searchParams.set("cwd", cwd);
   let workspace: string | undefined;
@@ -18075,6 +18078,53 @@ mod identity_parity_tests {
                 result.starts_with(&expected),
                 "{}: {result:?}",
                 case["name"]
+            );
+        }
+    }
+
+    /// #1951: the generated TypeScript adapters forward
+    /// `AI_MEMORY_AUTO_HANDOFF=off` as `auto_handoff=0`, like the native hook
+    /// and the shell bundles, and send nothing for any other value.
+    #[test]
+    fn ts_apply_marker_params_forwards_only_an_auto_handoff_opt_out() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let module = tmp.path().join("auto-handoff.ts");
+        std::fs::write(
+            &module,
+            format!(
+                "{}\nconst url = new URL(\"http://127.0.0.1/hook\");\napplyMarkerParams(url, undefined);\nprocess.stdout.write(url.search);\n",
+                super::ts_apply_marker_params(None, false)
+            ),
+        )
+        .unwrap();
+        for (value, expected) in [
+            (Some(" Off "), "?auto_handoff=0"),
+            (Some("0"), "?auto_handoff=0"),
+            (Some("on"), ""),
+            (None, ""),
+        ] {
+            let mut command = Command::new("node");
+            command
+                .args(["--experimental-strip-types", "--no-warnings"])
+                .arg(&module)
+                .env_remove("AI_MEMORY_RUN_ID")
+                .env_remove("AI_MEMORY_AUTO_HANDOFF");
+            if let Some(value) = value {
+                command.env("AI_MEMORY_AUTO_HANDOFF", value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                expected,
+                "{value:?}"
             );
         }
     }

@@ -60,6 +60,9 @@ const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGE
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
+/// Per-execution opt-out of the automatic handoff (#1951): a falsy value
+/// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
+const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
 const CAPTURE_OWNER_ENV: &str = "AI_MEMORY_CAPTURE_OWNER";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
@@ -736,6 +739,18 @@ fn managed_run_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<Stri
 
 fn managed_run_query_suffix() -> String {
     managed_run_query_suffix_with(env_lookup)
+}
+
+/// `&auto_handoff=0` when `AI_MEMORY_AUTO_HANDOFF` turns the automatic
+/// handoff off for this execution. Inherited execution context, like
+/// `AI_MEMORY_RUN_ID`; anything but an explicit falsy value sends nothing, so
+/// the server's `[handoff] create_on_session_end` decides.
+fn auto_handoff_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
+    if env_lookup(AUTO_HANDOFF_ENV).is_some_and(|value| crate::marker::is_falsy(&value)) {
+        "&auto_handoff=0".to_owned()
+    } else {
+        String::new()
+    }
 }
 
 /// Read a positive-integer minute override from `name`, falling back to the
@@ -1856,7 +1871,8 @@ where
     let mut incremental_background_drain = false;
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
     let managed_qs = managed_run_query_suffix();
-    let hook_qs = format!("{qs}{session_qs}{managed_qs}");
+    let auto_handoff_qs = auto_handoff_query_suffix_with(env_lookup);
+    let hook_qs = format!("{qs}{session_qs}{managed_qs}{auto_handoff_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
     // mode is decided without a round-trip: an explicit `--auth-token` is
@@ -3083,6 +3099,28 @@ fn resolve_data_dir_with(data_dir: Option<&Path>, runtime_env: &RuntimeEnv) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_handoff_env_forwards_only_an_explicit_opt_out() {
+        let lookup = |value: Option<&'static str>| {
+            move |name: &str| {
+                (name == AUTO_HANDOFF_ENV)
+                    .then_some(value)
+                    .flatten()
+                    .map(str::to_owned)
+            }
+        };
+        for off in ["off", "0", "false", "NO", " Off "] {
+            assert_eq!(
+                auto_handoff_query_suffix_with(lookup(Some(off))),
+                "&auto_handoff=0",
+                "{off}"
+            );
+        }
+        for keep in [None, Some(""), Some("on"), Some("1"), Some("maybe")] {
+            assert_eq!(auto_handoff_query_suffix_with(lookup(keep)), "", "{keep:?}");
+        }
+    }
 
     /// The regression this whole change exists for. `inspect` runs only for
     /// tool events, so a gate expressed through `CaptureDisposition` would
