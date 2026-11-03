@@ -1982,3 +1982,73 @@ async fn install_hook_never_writes_a_token() {
     assert!(!hook.contains("AI_MEMORY_AUTH_TOKEN"), "{hook}");
     assert!(!out.contains("sekrit"), "{out}");
 }
+
+/// A server that sets `contacted` and answers 200 to anything, and a second
+/// one that answers every request with `307` to it, keeping the path. A
+/// client that follows the redirect reaches the first.
+async fn redirect_pair() -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::AtomicBool;
+
+    let contacted = Arc::new(AtomicBool::new(false));
+    let flag = contacted.clone();
+    let target = Router::new().fallback(move || {
+        flag.store(true, Ordering::SeqCst);
+        async {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                "[]",
+            )
+        }
+    });
+    let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(target_listener, target).await.unwrap() });
+
+    let redirect = Router::new().fallback(move |uri: axum::http::Uri| async move {
+        let location = format!("http://{target_addr}{}", uri.path());
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            [(header::LOCATION, location)],
+        )
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, redirect).await.unwrap() });
+    (format!("http://{addr}"), contacted)
+}
+
+/// The page reads never follow a redirect (#1932): the bearer GET stays at
+/// the configured origin and the 3xx is reported as a redirect.
+#[tokio::test]
+async fn api_client_does_not_follow_a_redirect() {
+    let (server, contacted) = redirect_pair().await;
+    let client =
+        ai_memory_wikisync::client::ApiClient::new(&server, Some("secret".into())).unwrap();
+    let error = client.list_pages("demo", "app").await.unwrap_err();
+    assert!(
+        error.to_string().contains("redirect"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !contacted.load(Ordering::SeqCst),
+        "the redirect target must never be contacted"
+    );
+}
+
+/// The MCP writes never follow a redirect (#1932): a 307 would replay the
+/// bearer POST and its body to the `Location` origin.
+#[tokio::test]
+async fn mcp_client_does_not_follow_a_redirect() {
+    let (server, contacted) = redirect_pair().await;
+    let client = ai_memory_wikisync::mcp::McpClient::new(&server, Some("secret".into())).unwrap();
+    let error = client.ensure_conditional_writes().await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("redirect"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !contacted.load(Ordering::SeqCst),
+        "the redirect target must never be contacted"
+    );
+}

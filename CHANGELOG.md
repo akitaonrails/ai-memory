@@ -107,6 +107,14 @@ version in [`docs/changelog/`](docs/changelog/):
   and backfill's explicit-server bearer resolution share the same client
   (#1932).
 
+- `ai-memory setup`'s health probe, `ai-memory-wikisync` and
+  `ai-memory-importer` no longer follow HTTP redirects either, completing the
+  thin-client change above. A proxy or login portal answering `307` toward
+  another origin's healthy `/healthz` made setup trust a server it never
+  reached, and the companions' bearer reads and write POSTs were replayed to
+  the `Location` origin. Each now reports the 3xx as a redirect it does not
+  follow (#1932).
+
 - Recorded failed Cursor tool calls as failures. Cursor's
   `postToolUseFailure` carries `error_message` and `failure_type`, not the
   `error` string ai-memory read, so a call that failed or timed out was stored

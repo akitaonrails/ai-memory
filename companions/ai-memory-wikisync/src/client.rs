@@ -101,8 +101,13 @@ impl ApiClient {
             bail!("server URL must not carry a query or fragment");
         }
         base.set_path("");
+        // Never follow a redirect: a proxy or SSO portal answering 3xx would
+        // otherwise receive the bearer token's request at another origin, or
+        // hand back a login page as the listing (the server's thin-client
+        // policy, #1932).
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context_build()?;
         Ok(Self { http, base, token })
@@ -309,6 +314,11 @@ fn check_status(
         ),
         StatusCode::NOT_FOUND => bail!(
             "GET {} returned 404 Not Found — {not_found_hint}",
+            url.as_str()
+        ),
+        status if status.is_redirection() => bail!(
+            "GET {} returned {status}, a redirect wikisync does not follow — point \
+             --server at the ai-memory server itself, not a proxy or login portal",
             url.as_str()
         ),
         status => bail!("GET {} returned unexpected status {status}", url.as_str()),

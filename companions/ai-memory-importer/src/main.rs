@@ -1317,8 +1317,13 @@ impl ImportClient {
             base_path
         };
         Ok(Self {
+            // Never follow a redirect: a proxy or SSO portal answering 3xx
+            // would get the bearer request replayed at another origin, or
+            // hand back a login page as a result (the server's thin-client
+            // policy, #1932). `send` reports the 3xx instead.
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             origin,
             base_path,
@@ -1340,6 +1345,20 @@ impl ImportClient {
             req
         }
     }
+    /// Send a request, refusing a redirect answer with a message that names
+    /// it, so no caller mistakes a 3xx for its own status handling.
+    async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let resp = request.send().await?;
+        let status = resp.status();
+        if status.is_redirection() {
+            bail!(
+                "{} answered HTTP {status}, a redirect the importer does not follow; point \
+                 --server-url at the ai-memory server itself, not a proxy or login portal",
+                self.origin
+            );
+        }
+        Ok(resp)
+    }
     async fn preflight_project(
         &self,
         workspace: &str,
@@ -1347,15 +1366,14 @@ impl ImportClient {
         create: bool,
     ) -> Result<bool> {
         let resp = self
-            .request(
+            .send(self.request(
                 reqwest::Method::GET,
                 &format!(
                     "/api/v1/workspaces/{}/projects/{}/pages",
                     enc(workspace),
                     enc(project)
                 ),
-            )
-            .send()
+            ))
             .await?;
         if resp.status().is_success() {
             Ok(true)
@@ -1370,15 +1388,14 @@ impl ImportClient {
     }
     async fn existing_paths(&self, workspace: &str, project: &str) -> Result<HashMap<String, ()>> {
         let resp = self
-            .request(
+            .send(self.request(
                 reqwest::Method::GET,
                 &format!(
                     "/api/v1/workspaces/{}/projects/{}/pages",
                     enc(workspace),
                     enc(project)
                 ),
-            )
-            .send()
+            ))
             .await?;
         if !resp.status().is_success() {
             bail!("list destination pages failed: HTTP {}", resp.status());
@@ -1392,7 +1409,7 @@ impl ImportClient {
     }
     async fn page_exists(&self, workspace: &str, project: &str, path: &str) -> Result<bool> {
         let resp = self
-            .request(
+            .send(self.request(
                 reqwest::Method::GET,
                 &format!(
                     "/api/v1/workspaces/{}/projects/{}/pages/{}",
@@ -1400,8 +1417,7 @@ impl ImportClient {
                     enc(project),
                     enc_path(path)
                 ),
-            )
-            .send()
+            ))
             .await?;
         match resp.status() {
             StatusCode::OK => Ok(true),
@@ -1411,9 +1427,10 @@ impl ImportClient {
     }
     async fn write_page(&self, req: &WritePageRequest) -> Result<WritePageResponse> {
         let resp = self
-            .request(reqwest::Method::POST, "/admin/write-page")
-            .json(req)
-            .send()
+            .send(
+                self.request(reqwest::Method::POST, "/admin/write-page")
+                    .json(req),
+            )
             .await?;
         if !resp.status().is_success() {
             bail!("write-page failed: HTTP {}", resp.status());
@@ -1434,9 +1451,10 @@ impl ImportClient {
             })
             .collect();
         let resp = self
-            .request(reqwest::Method::POST, "/hook/batch")
-            .json(&items)
-            .send()
+            .send(
+                self.request(reqwest::Method::POST, "/hook/batch")
+                    .json(&items),
+            )
             .await?;
         let status = resp.status();
         let ack = resp
@@ -1666,6 +1684,71 @@ mod tests {
         let pages = plan_omc_wiki(td.path(), "w", "p", false, false).unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].request.workspace, "w");
+    }
+
+    /// The importer never follows a redirect (#1932). A server answering a
+    /// GET with `302` and a POST with `307` must not get the request replayed
+    /// at the `Location` origin, which answers a healthy-looking `200` to
+    /// anything, and the error names the redirect.
+    #[tokio::test]
+    async fn import_client_does_not_follow_a_redirect() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_url = format!("http://{}", target.local_addr().unwrap());
+        let contacted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&contacted);
+        thread::spawn(move || {
+            for stream in target.incoming() {
+                let Ok(mut socket) = stream else { return };
+                flag.store(true, Ordering::SeqCst);
+                read_http_request(&mut socket);
+                respond_json(
+                    &mut socket,
+                    "200 OK",
+                    r#"{"page_id":"x","path":"omc/n.md","checkpoint":null}"#,
+                );
+            }
+        });
+        let source = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", source.local_addr().unwrap());
+        thread::spawn(move || {
+            for status in ["302 Found", "307 Temporary Redirect"] {
+                let (mut socket, _) = source.accept().unwrap();
+                let (headers, _) = read_http_request(&mut socket);
+                let path = headers.split_whitespace().nth(1).unwrap().to_owned();
+                write!(
+                    socket,
+                    "HTTP/1.1 {status}\r\nlocation: {target_url}{path}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+
+        let client = ImportClient::new(&base).unwrap();
+        let get = client.page_exists("w", "p", "omc/n.md").await.unwrap_err();
+        assert!(get.to_string().contains("redirect"), "{get:#}");
+        let post = client
+            .write_page(&WritePageRequest {
+                workspace: "w".into(),
+                project: "p".into(),
+                path: "omc/n.md".into(),
+                body: "# N".into(),
+                title: None,
+                kind: None,
+                tier: "semantic".into(),
+                tags: Vec::new(),
+                pinned: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(post.to_string().contains("redirect"), "{post:#}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "the redirect target must never be contacted"
+        );
     }
 
     #[test]
