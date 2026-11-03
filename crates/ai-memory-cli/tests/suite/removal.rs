@@ -36,6 +36,12 @@ fn command_with_home(home: &Path) -> Command {
         .env("AI_MEMORY_HOME", home)
         .env("AI_MEMORY_DATA_DIR", home.join(".ai-memory-data"))
         .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+        // libgit2 on Windows finds the home through HOMEDRIVE + HOMEPATH before
+        // HOME, so the host's global git excludes (Claude Code adds
+        // `**/.claude/settings.local.json` there) would leak into the
+        // project-scope ignore check.
+        .env_remove("HOMEDRIVE")
+        .env_remove("HOMEPATH")
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("AI_MEMORY_AUTH_TOKEN")
         // A host-level KIMI_CODE_HOME would pull uninstall's kimi-code

@@ -96,7 +96,7 @@ jobs:
       # cores; `cargo test` ran the binaries one after another, which was most
       # of this job's wall clock. Profile `ci` (.config/nextest.toml) runs every
       # tier, including slow::/stress::, with no retries.
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --all-targets --profile ci
@@ -104,7 +104,7 @@ jobs:
       # block that fails to compile (e.g. an indented shell example rustdoc
       # reads as Rust) shipped unnoticed. Run them explicitly.
       - run: cargo test --workspace --doc
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: false
       - name: Build the external lifecycle relay
@@ -333,7 +333,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo build --release --bin ai-memory
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ci-ai-memory-${{ matrix.artifact }}
           path: target/release/ai-memory
@@ -446,7 +446,7 @@ jobs:
     needs: release-build
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ci-ai-memory-linux-x86_64
           path: dist/docker/ai-memory-linux-x86_64

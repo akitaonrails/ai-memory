@@ -14190,8 +14190,8 @@ impl ReaderPool {
         self.with_conn(crate::profile::contribute_opt_outs).await
     }
 
-    /// The current entries of a profile scope, at most `limit`
-    /// ([`crate::PROFILE_ENTRIES_LIMIT`] caps it).
+    /// Every current entry of a profile scope, with no row cap, so list,
+    /// status and apply see the whole scope (#1946).
     ///
     /// # Errors
     /// Propagates SQL or pool errors.
@@ -14199,12 +14199,9 @@ impl ReaderPool {
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
-        limit: usize,
     ) -> StoreResult<Vec<ai_memory_core::profile::ProfileEntry>> {
-        self.with_conn(move |conn| {
-            crate::profile::profile_entries(conn, workspace_id, project_id, limit)
-        })
-        .await
+        self.with_conn(move |conn| crate::profile::profile_entries(conn, workspace_id, project_id))
+            .await
     }
 
     /// Every project the profile harvester may read, with its marks.
@@ -14314,12 +14311,7 @@ impl ReaderPool {
     ) -> StoreResult<crate::ProfileDigestInputs> {
         self.with_conn(move |conn| {
             Ok(crate::ProfileDigestInputs {
-                entries: crate::profile::profile_entries(
-                    conn,
-                    profile_scope.0,
-                    profile_scope.1,
-                    crate::PROFILE_ENTRIES_LIMIT,
-                )?,
+                entries: crate::profile::profile_entries(conn, profile_scope.0, profile_scope.1)?,
                 project_tags: crate::profile::project_stack_tags(conn, project.0, project.1)?,
                 project_has_pages: crate::profile::project_has_pages(conn, project.0, project.1)?,
             })

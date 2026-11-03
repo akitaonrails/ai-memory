@@ -9,11 +9,11 @@
 //! a consistent (old) state that the next run re-classifies safely.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::atomic;
 use crate::client::{ApiClient, ApiPage, PageSummary};
 use crate::page_file::{self, PageMeta};
 use crate::paths;
@@ -309,34 +309,17 @@ fn preview(line: Option<&[u8]>) -> String {
     format!("{text:?}")
 }
 
-/// Atomic file replacement inside the destination: write a hidden tmp file
-/// next to the target, fsync, rename. The tmp name is namespaced by this
-/// tool so a crash never leaves an ambiguous artifact next to page files.
+/// Atomic file replacement inside the destination: an unpredictably named,
+/// exclusively created staging file next to the target, fsync, rename. A
+/// crash's leftover is visibly this tool's by prefix, and a symlink planted
+/// in the destination is neither followed nor raced (GHSA-jr85-7366-xrm2).
 pub fn atomic_write(dest_root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
     let target = paths::secure_join(dest_root, rel)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create directory {}", parent.display()))?;
     }
-    let file_name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "page.md".to_string());
-    let tmp = target
-        .parent()
-        .unwrap_or(dest_root)
-        .join(format!(".wikisync-tmp-{file_name}"));
-    {
-        let mut file =
-            fs::File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
-        file.write_all(bytes)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("cannot sync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, &target)
-        .with_context(|| format!("cannot move {} into place", tmp.display()))?;
-    Ok(())
+    atomic::write_atomic(&target, bytes, atomic::KeepMode::UmaskDefault)
 }
 
 /// Validate the allowlist: explicit, concrete families only.
@@ -878,6 +861,39 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["a.md".to_string()]);
+    }
+
+    /// GHSA-jr85-7366-xrm2: the staging name used to be
+    /// `.wikisync-tmp-<file>`, computable in advance, and `File::create`
+    /// followed a symlink planted there. A plant at that exact name must be
+    /// inert now: the canary keeps its bytes, the page is still written, and
+    /// the plant is never even removed. With the old code this fails on the
+    /// canary: the write goes straight through the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_ignores_a_symlink_planted_at_the_old_staging_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        let victim = tmp.path().join("victim.md");
+        fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("notes/.wikisync-tmp-a.md")).unwrap();
+
+        atomic_write(&root, "notes/a.md", b"server body").unwrap();
+
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"untouched",
+            "the planted symlink was followed"
+        );
+        assert_eq!(fs::read(root.join("notes/a.md")).unwrap(), b"server body");
+        assert!(
+            fs::symlink_metadata(root.join("notes/.wikisync-tmp-a.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the predictable staging name was touched"
+        );
     }
 
     #[test]

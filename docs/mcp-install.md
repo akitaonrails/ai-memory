@@ -45,6 +45,15 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > config already resolves a bearer, a different key is stored, the hooks
 > sign in with OIDC, or the snippet is only printed.
 
+> **A bridge started while the server restarts waits for it.** A stdio
+> client does not relaunch an MCP server that exited, so `mcp-bridge` waits
+> up to 3 seconds for a server whose port refuses connections (a service
+> restarting after an upgrade or a reboot) before it gives up. When nothing
+> answers, it exits with `could not reach the ai-memory server at <url>` and
+> says to check that the server is running and that the entry points at it.
+> Other connection failures, such as a host name that does not resolve, are
+> reported at once.
+
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
 > required), so any client that points a remote URL at `/mcp`, including
@@ -344,7 +353,11 @@ there. The Codex plugin likewise registers `ai-memory mcp-bridge
 - Cursor hooks live in `~/.cursor/hooks.json` or `.cursor/hooks.json`.
   ai-memory maps `sessionStart`, `sessionEnd`, `beforeSubmitPrompt`,
   `preToolUse`, `postToolUse`, `postToolUseFailure`, `preCompact`, and
-  `stop` to the shared capture path.
+  `stop` to the shared capture path. Cursor fires `postToolUseFailure`
+  instead of `postToolUse` when a tool fails, times out or is denied. A
+  failed or timed-out call is stored as `outcome: error` with Cursor's
+  `error_message`, so the session page counts it and the handoff names it;
+  a denied call keeps its message but stays `outcome: unknown`.
 - Cursor watches `hooks.json` on save. For MCP config changes, restart
   Cursor or toggle the server off+on in **Settings → MCP**.
 - Sources: <https://cursor.com/docs/mcp>, <https://cursor.com/docs/hooks.md>

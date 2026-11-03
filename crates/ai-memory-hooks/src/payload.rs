@@ -1093,6 +1093,7 @@ fn safe_tool_body(
                 raw.pointer("/tool_result/output")
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/tool_result/error").and_then(value_to_text))
+                    .or_else(|| raw.pointer("/postToolUse/result").and_then(value_to_text))
             } else if agent == AgentKind::GeminiCli {
                 // Gemini CLI's `AfterTool` `tool_response` holds the model's
                 // copy of the result in `llmContent` (a string or a Part
@@ -1109,6 +1110,7 @@ fn safe_tool_body(
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
+                    .or_else(|| cursor_failure_message(agent, raw))
                     .or_else(|| antigravity_edit_content(agent, raw))
             }
             .unwrap_or_else(|| "(no output captured)".into());
@@ -1118,6 +1120,15 @@ fn safe_tool_body(
         }
         _ => None,
     }
+}
+
+/// Cursor's `postToolUseFailure` has no `tool_output`; what went wrong is in
+/// its top-level `error_message` (<https://cursor.com/docs/agent/hooks>).
+fn cursor_failure_message(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    if agent != AgentKind::Cursor {
+        return None;
+    }
+    raw.get("error_message").and_then(value_to_text)
 }
 
 fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
@@ -3583,6 +3594,66 @@ mod tests {
         assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
     }
 
+    /// Cursor fires `postToolUseFailure` instead of `postToolUse` when a tool
+    /// fails, times out or is denied: no `tool_output`, an `error_message`
+    /// and a `failure_type` (<https://cursor.com/docs/agent/hooks>). The hook
+    /// posts it as a post-tool-use, and the body keeps the outcome and the
+    /// error text, never the tool's input.
+    #[test]
+    fn cursor_post_tool_use_failure_records_the_error_outcome_and_text() {
+        let failure = |failure_type: &str, error_message: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("cursor".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "conversation_id": "conv-1",
+                    "generation_id": "gen-1",
+                    "session_id": "conv-1",
+                    "hook_event_name": "postToolUseFailure",
+                    "cursor_version": "3.24.9",
+                    "workspace_roots": ["/project"],
+                    "tool_name": "Shell",
+                    "tool_input": {"command": "npm test SENTINEL_COMMAND"},
+                    "tool_use_id": "abc123",
+                    "cwd": "/project",
+                    "error_message": error_message,
+                    "failure_type": failure_type,
+                    "duration": 5000,
+                    "is_interrupt": false,
+                }),
+            )
+        };
+
+        let timeout = failure("timeout", "Command timed out after 30s");
+        assert_eq!(timeout.agent, AgentKind::Cursor);
+        assert_eq!(timeout.event, HookEvent::PostToolUse);
+        assert_eq!(timeout.title_hint.as_deref(), Some("tool non-file"));
+        assert_eq!(
+            timeout.body_excerpt.as_deref(),
+            Some(
+                "tool_family: non-file\ntool_call_id: abc123\noutcome: error\n---\n\
+                 Command timed out after 30s"
+            )
+        );
+
+        let error = failure("error", "Exit code 1: Cannot find module 'express'");
+        let body = error.body_excerpt.expect("cursor failure body");
+        assert!(body.contains("\noutcome: error\n---\n"), "{body:?}");
+        assert!(body.contains("Cannot find module 'express'"), "{body:?}");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
+
+        // A denied call keeps its message but is not a failed call.
+        let denied = failure("permission_denied", "Denied by the user");
+        let body = denied.body_excerpt.expect("cursor denied body");
+        assert!(
+            body.ends_with("\noutcome: unknown\n---\nDenied by the user"),
+            "{body:?}"
+        );
+    }
+
     /// Kiro CLI's tool hooks carry `tool_name` and `tool_input`, and its
     /// `PostToolUse` adds `tool_response`: a plain string on the v3 engine
     /// (live capture, Kiro CLI 2.16.2) and an object with a `success` flag on
@@ -3748,6 +3819,119 @@ mod tests {
         );
         assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
         assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+    }
+
+    /// Cline CLI 3.0.74 PreToolUse/PostToolUse carry ClineCore names at
+    /// `tool_call.name` (and the documented `preToolUse.toolName` envelope).
+    /// Those names were unknown, so every observation stored as `tool unknown`
+    /// with no output (#1950).
+    #[test]
+    fn cline_tool_events_keep_their_family_title_and_output() {
+        let live_post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hookName": "PostToolUse",
+                "taskId": "cline-task-1",
+                "preToolUse": {
+                    "toolName": "run_commands",
+                    "parameters": {"commands": ["ls"]}
+                },
+                "tool_call": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "input": {"commands": ["ls"]}
+                },
+                "tool_result": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "output": "MARKER_CLINE_OUTPUT"
+                }
+            }),
+        );
+        assert_eq!(live_post.agent, AgentKind::Cline);
+        assert_eq!(live_post.title_hint.as_deref(), Some("tool non-file"));
+        let body = live_post.body_excerpt.expect("cline live post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("tool_call_id: toolu_01cline"), "{body:?}");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(body.contains("MARKER_CLINE_OUTPUT"), "{body:?}");
+
+        let live_pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hookName": "PreToolUse",
+                "taskId": "cline-task-1",
+                "preToolUse": {
+                    "toolName": "run_commands",
+                    "parameters": {"commands": ["ls"]}
+                },
+                "tool_call": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "input": {"commands": ["ls"]}
+                }
+            }),
+        );
+        assert_eq!(live_pre.title_hint.as_deref(), Some("tool non-file"));
+        let pre_body = live_pre.body_excerpt.expect("cline live pre-tool body");
+        assert!(pre_body.contains("tool_family: non-file"), "{pre_body:?}");
+        assert!(!pre_body.contains("ls"), "{pre_body:?}");
+
+        let documented_post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "postToolUse": {
+                    "toolName": "read_files",
+                    "parameters": {"files": [{"path": "src/lib.rs"}]},
+                    "result": "MARKER_CLINE_DOCUMENTED",
+                    "success": true
+                }
+            }),
+        );
+        assert_eq!(documented_post.title_hint.as_deref(), Some("tool file"));
+        let documented_body = documented_post
+            .body_excerpt
+            .expect("cline documented post-tool body");
+        assert!(
+            documented_body.contains("outcome: success"),
+            "{documented_body:?}"
+        );
+        assert!(
+            documented_body.contains("MARKER_CLINE_DOCUMENTED"),
+            "{documented_body:?}"
+        );
+
+        let documented_pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "preToolUse": {
+                    "toolName": "read_files",
+                    "parameters": {"files": [{"path": "src/lib.rs"}]}
+                }
+            }),
+        );
+        assert_eq!(documented_pre.title_hint.as_deref(), Some("tool file"));
+        assert!(
+            documented_pre
+                .body_excerpt
+                .is_some_and(|body| !body.is_empty())
+        );
     }
 
     /// Claude Code's Windows `PowerShell` tool shares Bash's payload shape but

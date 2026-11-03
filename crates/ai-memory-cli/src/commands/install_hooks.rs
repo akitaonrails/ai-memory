@@ -4327,6 +4327,13 @@ const OPENCODE2_BINDING: &str = r#"
     type SessionInfo = Awaited<ReturnType<typeof ctx.session.get>>;
     const sessions = new Map<SessionID, Promise<SessionInfo>>();
     const assistantText = new Map<SessionID, string>();
+    // Failed startup-context fetches per root session. A failure is retried on
+    // the next model request, but only a few times: the `context` hook fires on
+    // every model call, and a server slower than the fetch timeout keeps
+    // working on each abandoned request, so an unbounded retry turns one slow
+    // lookup into a request (and a server worker) per model call.
+    const handoffFailures = new Map<SessionID, number>();
+    const HANDOFF_MAX_ATTEMPTS = 3;
     // Stops listening on unload. Deliveries keep `hookAbort` until the queued
     // events have had their drain budget.
     const unload = new AbortController();
@@ -4354,6 +4361,7 @@ const OPENCODE2_BINDING: &str = r#"
       sessions.delete(id);
       assistantText.delete(id);
       handoffFetches.delete(id);
+      handoffFailures.delete(id);
     }
 
     async function ensureSession(id: SessionID): Promise<SessionInfo | undefined> {
@@ -4494,7 +4502,13 @@ const OPENCODE2_BINDING: &str = r#"
         handoffFetches.set(id, pending);
       }
       const handoff = await pending;
-      if (handoff === undefined) handoffFetches.delete(id);
+      if (handoff === undefined) {
+        const failures = (handoffFailures.get(id) ?? 0) + 1;
+        handoffFailures.set(id, failures);
+        // Keep the settled failure cached once the budget is spent, so later
+        // model requests stop re-asking the server.
+        if (failures < HANDOFF_MAX_ATTEMPTS) handoffFetches.delete(id);
+      }
       if (handoff) {
         event.system.push({ type: "text", text: handoff });
       }

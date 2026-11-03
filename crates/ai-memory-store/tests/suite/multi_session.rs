@@ -1965,6 +1965,160 @@ async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
     );
 }
 
+/// The clear transition rechecks authority in its writer transaction, even
+/// when the caller has already passed a read-side scope check.
+#[tokio::test]
+async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let alice = operator("alice");
+    let run = store
+        .writer
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: ws,
+                project_id: proj,
+                repo_fingerprint: "clear-repo".into(),
+                worktree_fingerprint: "clear-tree".into(),
+                cwd: "/repo".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "clear-test".into(),
+            },
+            Some(alice.clone()),
+        )
+        .await
+        .unwrap();
+    let input = |native: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run.run_id,
+        workspace_id: ws,
+        project_id: proj,
+        cwd: "/repo".into(),
+        agent: AgentKind::ClaudeCode,
+        native_session_id: native.into(),
+        owner_user: Some(alice.clone()),
+    };
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input("original"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    store
+        .writer
+        .accept_managed_run_context(run.run_id)
+        .await
+        .unwrap();
+    for case in [
+        "workspace",
+        "project",
+        "owner",
+        "shared",
+        "cwd",
+        "agent",
+        "dirty-id",
+    ] {
+        let mut rejected = input(case);
+        match case {
+            "workspace" => rejected.workspace_id = other_ws,
+            "project" => rejected.project_id = other_proj,
+            "owner" => rejected.owner_user = Some(operator("bob")),
+            "shared" => rejected.owner_user = None,
+            "cwd" => rejected.cwd = "/other-checkout".into(),
+            "agent" => rejected.agent = AgentKind::Codex,
+            "dirty-id" => rejected.native_session_id = "sk-abcdefghijklmnopqrstuvwx".into(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store
+                .writer
+                .relink_managed_claude_clear(rejected)
+                .await
+                .unwrap(),
+            ManagedRunSessionLink::Refused,
+            "{case}"
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("original"),
+            "{case}"
+        );
+    }
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+        [run.run_id.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_clear(input("expired"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+    store
+        .writer
+        .heartbeat_managed_run(run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_clear(input("cleared"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    let history: Vec<(String, bool)> = conn.prepare("SELECT native_session_id, is_current FROM workstream_native_sessions WHERE workstream_id = ?1 ORDER BY native_session_id").unwrap()
+        .query_map([run.workstream_id.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(
+        history,
+        vec![("cleared".into(), true), ("original".into(), false)]
+    );
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_clear(input("original"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+    store.writer.cancel_managed_run(run.run_id).await.unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_clear(input("terminal"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+}
+
 /// Stale-run recovery is a scoped, owned, single-candidate operation. The
 /// controls prove that the same candidate is usable once every boundary
 /// matches, while foreign owners/projects and a second linker cannot take it.
@@ -3632,7 +3786,7 @@ async fn two_harnesses_of_one_operator_share_one_private_profile() {
     .expect("the other harness finds the same profile");
     let entries = store
         .reader
-        .profile_entries(seen_by_codex.workspace_id, seen_by_codex.project_id, 10)
+        .profile_entries(seen_by_codex.workspace_id, seen_by_codex.project_id)
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);
