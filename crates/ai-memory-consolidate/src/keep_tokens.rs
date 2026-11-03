@@ -135,6 +135,42 @@ pub fn mine_residue_tokens(body: &str, max_tokens: usize) -> Vec<String> {
     mine(&RESIDUE_PATTERNS, body, max_tokens)
 }
 
+/// Keep-tokens mined from `sources` that `rewrite` no longer contains.
+///
+/// Presence is a search of the rewrite, not a second mine: [`mine_keep_tokens`]
+/// caps its output, so a long rewrite that keeps a token past the cap must not
+/// count it as dropped. The search needs a word boundary wherever the token
+/// starts or ends with a word character, so `ops.rs` is not kept by `myops.rs`
+/// nor `retry` by `retry_budget`.
+#[must_use]
+pub(crate) fn dropped_keep_tokens<'a>(
+    sources: impl IntoIterator<Item = &'a str>,
+    rewrite: &str,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    sources
+        .into_iter()
+        .flat_map(mine_keep_tokens)
+        .filter(|token| !contains_token(rewrite, token) && seen.insert(token.clone()))
+        .collect()
+}
+
+/// Whether `token` occurs in `text` as a whole token: an occurrence counts only
+/// when no word character (`[A-Za-z0-9_]`) touches a word-character edge of it.
+fn contains_token(text: &str, token: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let (Some(first), Some(last)) = (token.chars().next(), token.chars().next_back()) else {
+        return false;
+    };
+    text.match_indices(token).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + token.len()..].chars().next();
+        let glued_before = is_word(first) && before.is_some_and(is_word);
+        let glued_after = is_word(last) && after.is_some_and(is_word);
+        !(glued_before || glued_after)
+    })
+}
+
 pub(crate) fn has_residue_error_line(body: &str) -> bool {
     RESIDUE_PATTERNS[0].re.is_match(body)
 }
@@ -196,6 +232,34 @@ fn trim_token(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_keep_tokens_names_source_facts_missing_from_the_rewrite() {
+        let a = "Fixed in crates/store/src/ops.rs with `retry_budget`.";
+        let b = "Same flake, culprit crates/store/src/reader.rs (E0433).";
+        let faithful = "ops.rs fix at crates/store/src/ops.rs and \
+             crates/store/src/reader.rs, `retry_budget`, E0433.";
+        assert!(dropped_keep_tokens([a, b], faithful).is_empty());
+        assert_eq!(
+            dropped_keep_tokens([a, b], "Fixed crates/store/src/ops.rs via retry_budget."),
+            ["crates/store/src/reader.rs", "reader.rs", "E0433"]
+        );
+    }
+
+    /// A token survives only as a whole token: one that appears in the rewrite
+    /// only inside a longer word is dropped, while punctuation or a path
+    /// separator next to it still counts as kept.
+    #[test]
+    fn dropped_keep_tokens_needs_a_whole_token_in_the_rewrite() {
+        let source = "Touched ops.rs and `retry` for E0433.";
+        assert_eq!(
+            dropped_keep_tokens([source], "Touched myops.rs, retry_budget, E04331."),
+            ["ops.rs", "E0433", "retry"]
+        );
+        assert!(
+            dropped_keep_tokens([source], "See src/ops.rs; (`retry`) E0433: fixed.").is_empty()
+        );
+    }
 
     #[test]
     fn fix_note_keeps_paths_error_codes_and_urls() {

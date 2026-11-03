@@ -48,6 +48,8 @@ struct FakeMergeLlm {
     saw_schema_field: Arc<AtomicUsize>,
     cancel_after_first: Option<DreamCancel>,
     edit_during_merge: Option<(Wiki, WorkspaceId, ProjectId, String)>,
+    /// Replaces the echoed prompt, to model a rewrite that drops a fact.
+    fixed_body: Option<&'static str>,
 }
 
 impl FakeMergeLlm {
@@ -57,6 +59,7 @@ impl FakeMergeLlm {
             saw_schema_field: Arc::new(AtomicUsize::new(0)),
             cancel_after_first: None,
             edit_during_merge: None,
+            fixed_body: None,
         }
     }
 }
@@ -97,6 +100,7 @@ impl LlmProvider for FakeMergeLlm {
         let saw_schema = self.saw_schema_field.clone();
         let cancel = self.cancel_after_first.clone();
         let edit = self.edit_during_merge.clone();
+        let fixed_body = self.fixed_body;
         Box::pin(async move {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             // Invariant #7: the merge must be a JSON-schema structured call, and
@@ -139,9 +143,13 @@ impl LlmProvider for FakeMergeLlm {
                 .first()
                 .map(|m| m.content.clone())
                 .unwrap_or_default();
+            let body = fixed_body.map_or_else(
+                || format!("Dream-merged coherent page.\n\n{prompt}"),
+                str::to_string,
+            );
             Ok(serde_json::json!({
                 "title": "Dream Merge",
-                "body_markdown": format!("Dream-merged coherent page.\n\n{prompt}"),
+                "body_markdown": body,
             }))
         })
     }
@@ -614,6 +622,46 @@ async fn flag_on_merges_a_pair_with_no_other_cold_page() {
         survivor_body.contains("crates/ai-memory-store/src/ops.rs")
             && survivor_body.contains("crates/ai-memory-store/src/reader.rs"),
         "survivor keeps every source fact: {survivor_body}"
+    );
+    assert!(report.merges[0].dropped_keep_tokens.is_empty());
+}
+
+/// The fake above echoes every source, so the survivor keeps both paths by
+/// construction. A real model can drop one; the report must name it, and the
+/// merge must still land (report-only).
+#[tokio::test]
+async fn merge_that_drops_a_source_fact_reports_it() {
+    let fx = seed_fixture(true).await;
+    write(&fx, "sessions/a.md", DUP_A).await;
+    write(&fx, "sessions/b.md", DUP_B).await;
+    for p in ["sessions/a.md", "sessions/b.md"] {
+        backdate_latest(&fx, p, COLD_DAYS);
+    }
+
+    let mut llm = FakeMergeLlm::new();
+    llm.fixed_body = Some("Flaky retention sweep; culprit crates/ai-memory-store/src/ops.rs.");
+    let report = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &dream_on(),
+        &DreamCancel::new(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.clusters_merged, 1,
+        "the merge still lands: {report:?}"
+    );
+    assert_eq!(
+        report.merges[0].dropped_keep_tokens,
+        ["crates/ai-memory-store/src/reader.rs", "reader.rs"]
     );
 }
 
