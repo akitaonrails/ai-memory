@@ -95,6 +95,7 @@ pub mod openai_oauth;
 pub mod opencode;
 pub mod provider;
 pub mod reranker;
+pub mod routes;
 pub mod types;
 
 mod auth_file;
@@ -132,8 +133,9 @@ pub use fallback::{CIRCUIT_COOLDOWN, Candidate, FallbackLlmProvider};
 pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{
-    CandidateHealth, LlmWorkloadHealthSnapshot, ProviderHealth, ProviderHealthSnapshot,
-    ProviderHealthStatus, ProviderRoleHealthSnapshot, error_status_and_message,
+    CandidateHealth, LlmTaskChainHealthSnapshot, LlmWorkloadHealthSnapshot, ProviderHealth,
+    ProviderHealthSnapshot, ProviderHealthStatus, ProviderRoleHealthSnapshot,
+    error_status_and_message,
 };
 #[cfg(feature = "local-embeddings")]
 pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
@@ -155,6 +157,7 @@ pub use opencode::{
 pub use provider::{LlmProvider, complete_structured, complete_structured_with_operation_id};
 pub use reranker::{LlmReranker, RerankCandidate, RerankScore, RerankStage, Reranker};
 pub use response::{provider_error, provider_error_body};
+pub use routes::LlmProviders;
 pub use stored_token::StoredOAuthToken;
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, LlmWorkload,

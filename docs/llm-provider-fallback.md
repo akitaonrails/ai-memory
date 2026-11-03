@@ -1,18 +1,55 @@
-# Proposed LLM provider fallback chains
+# LLM provider fallback chains
 
 Issue: #648
 
-## Problem
+The top-level LLM provider can use an ordered fallback chain. Individual tasks
+can also select their own provider and fallback chain.
 
-The server currently constructs one `Arc<dyn LlmProvider>` for every LLM-backed
-operation. Existing retry loops can retry a transient failure against that same
-provider, but cannot use a second configured provider. A temporary rate limit
-or upstream outage can therefore degrade a bootstrap, consolidation, lint, or
-review even when another provider is healthy.
+## Task-specific providers
 
-This proposal introduces an opt-in ordered chain behind the existing
-`LlmProvider` trait. It deliberately leaves the zero-LLM and existing
-single-provider paths unchanged.
+Configure an optional `[llm.<task>]` table for any of these tasks:
+`consolidation`, `bootstrap`, `auto_improve`, `experience`, `dream`, `lint`,
+`profile`, `rerank`, and `query_answer`. The `query_answer` provider handles
+both `memory_query(answer=true)` and `memory_explore`. Scheduled lint remains
+rule-only.
+
+```toml
+[llm.bootstrap]
+provider = "openai-compat"
+model = "local-model"
+base_url = "http://127.0.0.1:49375/v1"
+api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"
+
+[[llm.bootstrap.fallbacks]]
+provider = "gemini"
+model = "gemini-3.5-flash"
+api_key_env = "GEMINI_API_KEY"
+```
+
+The task's `provider` is required and nonblank. `model` defaults to that
+provider's default model, except `openai-compat` requires both `model` and
+`base_url`. A task never inherits the global endpoint. `api_key_env` names an
+environment variable, not a credential value. Without it, the provider uses
+its normal credential source. OpenAI OAuth, Codex and Cursor keep their
+native login files or CLI and reject `api_key_env`. An explicitly named
+variable that is missing fails `ai-memory serve` startup and never falls
+back to the default provider's key.
+
+When a task has no profile, it shares the same default provider instance and
+fallback chain. A task profile replaces that chain with its own primary and
+ordered fallbacks; global fallbacks are not appended. Task profiles work when
+the global provider is unset, without enabling other tasks. Existing timeout,
+compatibility, header and reasoning settings apply globally.
+
+Scalar fields have nested environment forms, such as
+`AI_MEMORY_LLM__BOOTSTRAP__PROVIDER` and `AI_MEMORY_LLM__BOOTSTRAP__MODEL`.
+Fallback lists are configured in `config.toml`, not through environment
+variables. For each fallback's required fields, see
+[`config-properties.md`](config-properties.md#llm_fallbacks).
+
+## Original chain design
+
+The following describes the original global fallback chain.
 
 ## Goals
 
@@ -22,8 +59,7 @@ single-provider paths unchanged.
   candidate attempt.
 - Keep credentials in the existing one-time configuration load and out of logs,
   status payloads, and persisted state.
-- Avoid a global timeout policy. Each candidate uses its own configured request
-  timeout.
+- Use the configured global request timeout for each candidate.
 - Make the selected candidate and failover outcome observable through passive
   provider-health reporting.
 
@@ -69,9 +105,8 @@ status` and the other thin clients never build the chain, so the variable only
 has to be in the server's environment (for example a service wrapper's env
 block), not exported in every shell.
 
-The proposed initial semantics are append-only: the primary runs first, then
-the fallbacks in declaration order. No environment-variable shorthand is added
-until it can encode profile boundaries and credential names unambiguously.
+The primary runs first, then the fallbacks in declaration order. Fallback
+profiles have no environment-variable shorthand.
 
 ## Implementation boundary
 
@@ -133,9 +168,11 @@ or secrets.
 
 ## Health reporting
 
-`ProviderHealth` currently represents one LLM role. Extend its LLM snapshot
-with a candidate list while preserving the existing top-level active
-provider/model fields for compatibility. Per-candidate state contains:
+`ProviderHealth` preserves the global LLM role and its candidate list.
+The `llm_task_chains` field reports each explicit task override separately,
+with its provider, model, status and candidate list. Task-only configurations
+keep the global role disabled while recording their own workload metrics.
+Per-candidate state contains:
 
 - provider and model;
 - configured / last-selected state;

@@ -170,7 +170,10 @@ fn admin_state(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: true,
         auto_improve_review_config: Default::default(),
         embedder: None,

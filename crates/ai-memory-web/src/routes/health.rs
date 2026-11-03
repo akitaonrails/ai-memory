@@ -371,7 +371,11 @@ fn sections(
         ),
         row(
             i18n,
-            "web-health-label-llm-provider",
+            if s.providers.llm_task_chains.is_empty() {
+                "web-health-label-llm-provider"
+            } else {
+                "web-health-label-llm-default-provider"
+            },
             provider_line(i18n, &s.providers.llm),
         ),
         row(
@@ -395,6 +399,20 @@ fn sections(
             ),
         ),
     ];
+    for chain in &s.providers.llm_task_chains {
+        models.push(HealthRow {
+            label: i18n.format(
+                "web-health-label-llm-task-provider",
+                &[("value0", chain.task.config_key().to_owned())],
+            ),
+            value: format!(
+                "{} · {}/{}",
+                i18n.status(chain.status.as_str()),
+                chain.provider,
+                chain.model
+            ),
+        });
+    }
     for triple in &s.derived.embedding_triples {
         models.push(row(
             i18n,

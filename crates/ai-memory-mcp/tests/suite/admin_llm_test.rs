@@ -78,7 +78,10 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: llm,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -162,21 +165,20 @@ async fn a_failing_probe_reports_the_class_without_the_provider_body() {
     );
 }
 
-/// A server with no provider configured says so, instead of reporting a probe
-/// failure the operator would read as a broken provider.
+/// The default-only probe stays unavailable even if a task provider is healthy.
 #[tokio::test]
-async fn a_server_without_a_provider_answers_service_unavailable() {
-    let tmp = TempDir::new().unwrap();
-    let state = make_admin_state(&tmp, None).await;
+async fn a_server_without_a_default_provider_answers_service_unavailable() {
+    for with_task_provider in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_admin_state(&tmp, None).await;
+        if with_task_provider {
+            state.llm_providers.overrides.insert(
+                ai_memory_llm::LlmWorkload::Bootstrap,
+                Arc::new(ProbeProvider { reply: Ok("pong") }),
+            );
+        }
 
-    let (status, body) = probe(state).await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("no LLM provider configured"),
-        "{body}"
-    );
+        let (status, body) = probe(state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    }
 }

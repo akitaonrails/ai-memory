@@ -1,6 +1,6 @@
 # ai-memory configuration.
 #
-# All values can also be overridden via environment variables prefixed
+# Scalar values can also be overridden via environment variables prefixed
 # `AI_MEMORY_` (e.g. `AI_MEMORY_BIND=0.0.0.0:49374`).
 #
 # `data_dir` is intentionally absent here: it's set by `--data-dir`
@@ -112,9 +112,9 @@ log_level = "info"
 # rerank_timeout_secs = 20
 
 # --- LLM provider (consolidation, auto-improve, reranker) -----------------
-# Unset = zero-LLM: session pages are written heuristically and search needs no
-# provider. Setting a provider turns on the LLM features that need one. Each key
-# has an `AI_MEMORY_` environment equivalent (`AI_MEMORY_LLM_PROVIDER`, ...).
+# With no global or per-task provider, session pages are written heuristically
+# and search needs no provider. A task profile can enable its own LLM features
+# independently. Top-level keys have `AI_MEMORY_` environment equivalents.
 #   llm_provider = "anthropic"   # or openai | gemini | openai-compat |
 #                                # openai-oauth | anthropic-oauth | codex |
 #                                # copilot | opencode | cursor
@@ -351,6 +351,34 @@ ledger_retention_months = 0        # 0 = never delete hook event ledgers
 #   [decay.half_life_days]
 #   episodic = 180.0
 
+# Per-task LLM profiles are optional. Tasks: consolidation, bootstrap,
+# auto_improve, experience, dream, lint, profile, rerank and query_answer.
+# query_answer covers memory_query(answer=true) and memory_explore.
+# An unset task shares the default provider and its fallback chain. A task
+# profile can also work without a global llm_provider; unrelated tasks remain
+# without a provider. Each task chain uses only its own fallbacks.
+#
+# provider is required and nonblank. model defaults to the selected provider's
+# model; openai-compat requires both model and base_url. A task does not inherit
+# the global endpoint. api_key_env names an environment variable, never a key
+# value; when omitted, the provider uses its normal credential source. OpenAI
+# OAuth, Codex and Cursor reject api_key_env and keep their native login.
+# A named variable that is missing fails serve startup. Timeout, compatibility
+# options, headers and reasoning effort remain global.
+#
+# Nested scalar environment overrides use double underscores, for example
+# AI_MEMORY_LLM__BOOTSTRAP__PROVIDER. Fallback lists are config-only.
+#   [llm.bootstrap]
+#   provider = "openai-compat"
+#   model = "local-model"
+#   base_url = "http://127.0.0.1:49375/v1"
+#   api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"
+#
+#   [[llm.bootstrap.fallbacks]]
+#   provider = "gemini"
+#   model = "gemini-3.5-flash"
+#   api_key_env = "GEMINI_API_KEY"
+#
 # NOTE: commented example tables stay below the first real table, where the
 # top-level keys have ended. A `[table]` header owns every key after it, so an
 # example table uncommented above a top-level key would silently capture it.
