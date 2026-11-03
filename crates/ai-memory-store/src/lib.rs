@@ -31,6 +31,7 @@ mod provenance;
 pub use provenance::{PageDisagreement, PageProvenance, PageSource};
 mod project_authz;
 mod project_coordinates;
+pub mod query_signals;
 mod reader;
 mod retrieval_tuning;
 mod scope;
@@ -85,6 +86,10 @@ pub use profile::{
 pub use project_authz::{
     AccessMode, GrantLevel, ProjectAccess, ProjectAuthz, ProjectPrincipal,
     RESTRICTED_PROJECT_FORBIDDEN, authorize_project, resolve_project_authz,
+};
+pub use query_signals::{
+    QUERY_SIGNAL_COUNT_CAP, QUERY_SIGNAL_TEXT_MAX_CHARS, QuerySignalRow, normalize_query,
+    query_hash, query_signal_boost,
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AnswerEvidenceMeta, AuditEvent, AuditLogFilter,

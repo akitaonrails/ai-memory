@@ -509,6 +509,18 @@ Skills so the guidance survives across sessions. From the agent: ask \
 `target_hints`. From the terminal: `ai-memory install-instructions` \
 (or `ai-memory install-skills` to refresh only the skill files).";
 
+/// The last single-project `memory_query` whose hits may still be paired with
+/// a later read or helpful signal (#1941). One per actor session; a later
+/// query replaces it, so only the immediately preceding query can contribute.
+#[derive(Clone)]
+struct PendingQuerySignal {
+    query: String,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_ids: HashSet<PageId>,
+    recorded_at: Instant,
+}
+
 /// MCP server backed by the ai-memory store.
 #[derive(Clone)]
 pub struct AiMemoryServer {
@@ -613,6 +625,9 @@ pub struct AiMemoryServer {
     /// counter measures "distinct minutes in which SOMEBODY read this",
     /// undercounting in proportion to team size.
     access_bump_seen: Arc<Mutex<AccessBumpSeen>>,
+    /// Last query per actor session, for the opt-in read-after-query signal
+    /// (#1941). Empty and never written while `query_signal_weight` is 0.
+    pending_query_signals: Arc<Mutex<HashMap<ai_memory_core::ActorKey, PendingQuerySignal>>>,
     /// True when a trusted authenticating proxy is configured to assert end-user
     /// identities (`[auth].actor_proxy_bearer_token`).
     ///
@@ -645,6 +660,12 @@ pub struct AiMemoryServer {
 const MAX_QUERY_SCOPES: usize = 25;
 const MAX_QUERY_PATH_PREFIX_LEN: usize = 1_024;
 const MAX_QUERY_TAG_LEN: usize = 128;
+/// Bound on concurrently remembered read-after-query pairs (#1941). Old
+/// entries are evicted at the cap, so a long-lived server cannot accumulate
+/// one per session it has ever seen.
+const PENDING_QUERY_SIGNALS_MAX: usize = 1_024;
+/// A query older than this no longer speaks to the caller's current intent.
+const PENDING_QUERY_SIGNALS_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Upper bound on how many pinned latest pages `memory_query(pin_first=true)`
 /// prepends, so standing context never crowds out the search result entirely.
@@ -2214,6 +2235,7 @@ impl AiMemoryServer {
             auto_improve_review_config: default_auto_improve_review_config(),
             schema_dialect: SchemaDialect::default(),
             access_bump_seen: Arc::new(Mutex::new(HashMap::new())),
+            pending_query_signals: Arc::new(Mutex::new(HashMap::new())),
             trusted_proxy_identity: false,
             per_user_slots: false,
             profile: ai_memory_core::profile::ProfileSettings::default(),
@@ -3276,6 +3298,7 @@ impl AiMemoryServer {
             owner: &owner_filter,
             filter,
         };
+        let mut query_signal_scope = None;
         let hits = if let Some(scopes) = &resolved_scopes {
             self.search_scopes(scopes, options).await
         } else {
@@ -3287,6 +3310,7 @@ impl AiMemoryServer {
                     Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
+            query_signal_scope = Some((ws, proj));
             self.search_project(ws, proj, options).await
         }
         .map(|outcome| {
@@ -3552,6 +3576,15 @@ impl AiMemoryServer {
         } else {
             hits
         };
+        if let Some((ws, proj)) = query_signal_scope {
+            self.remember_query_signal(
+                &aps_actor,
+                &args.query,
+                ws,
+                proj,
+                hits.iter().map(|hit| hit.hit.id).collect(),
+            );
+        }
         // Opt-in dialectic answer (off by default). Only when the caller set
         // `answer=true` do we touch the LLM at all — this is the invariant-#13
         // guard: with `answer` unset/false the provider (if any) is never
@@ -3783,14 +3816,33 @@ impl AiMemoryServer {
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         match recorded {
-            Some((page_id, salience)) => ok_json(&serde_json::json!({
-                "recorded": true,
-                "path": path.as_str(),
-                "page_id": page_id.to_string(),
-                "signal": kind.as_str(),
-                "salience": salience,
-                "routed_to_lint": kind.routes_to_lint(),
-            })),
+            Some((page_id, salience)) => {
+                // `helpful` confirms the preceding query's hit; `not_helpful`
+                // withdraws that association. `stale`/`wrong` are page-level
+                // and handled by `feedback_demotion` instead.
+                match kind {
+                    FeedbackKind::Helpful | FeedbackKind::NotHelpful => {
+                        self.spawn_query_signal(
+                            &aps_actor,
+                            Self::viewer_from_parts(Some(&parts)),
+                            ws,
+                            proj,
+                            page_id,
+                            kind == FeedbackKind::Helpful,
+                        )
+                        .await;
+                    }
+                    FeedbackKind::Stale | FeedbackKind::Wrong => {}
+                }
+                ok_json(&serde_json::json!({
+                    "recorded": true,
+                    "path": path.as_str(),
+                    "page_id": page_id.to_string(),
+                    "signal": kind.as_str(),
+                    "salience": salience,
+                    "routed_to_lint": kind.routes_to_lint(),
+                }))
+            }
             // An absent caller-supplied path is the request being wrong, not
             // the server failing: the write call itself succeeded and found
             // nothing to attach the signal to. `internal_error` tells a client
@@ -6038,6 +6090,17 @@ impl AiMemoryServer {
         };
         if result.is_ok() {
             self.spawn_access_bump(bump_ids, bump_actor.as_ref());
+            if let Some(page_id) = page_id {
+                self.spawn_query_signal(
+                    &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
+                    ws,
+                    proj,
+                    page_id,
+                    true,
+                )
+                .await;
+            }
         }
         result
     }
@@ -8524,6 +8587,155 @@ impl AiMemoryServer {
             }
         });
     }
+
+    /// Remember one actor session's last single-project query for the opt-in
+    /// read-after-query signal (#1941). The query is scrubbed here, before it
+    /// reaches either this cache or the store.
+    fn remember_query_signal(
+        &self,
+        actor: &ai_memory_core::ActorKey,
+        query: &str,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_ids: Vec<PageId>,
+    ) {
+        if self.reader.retrieval_tuning().query_signal_weight <= 0.0
+            || actor.session_id.is_none()
+            || page_ids.is_empty()
+        {
+            return;
+        }
+        let query = self.sanitizer.scrub(query);
+        let query: String = query
+            .chars()
+            .take(ai_memory_store::QUERY_SIGNAL_TEXT_MAX_CHARS)
+            .collect();
+        if query.trim().is_empty() {
+            return;
+        }
+        let mut signals = self
+            .pending_query_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        signals.retain(|_, pending| pending.recorded_at.elapsed() < PENDING_QUERY_SIGNALS_TTL);
+        if signals.len() >= PENDING_QUERY_SIGNALS_MAX {
+            let oldest = signals
+                .iter()
+                .min_by_key(|(_, pending)| pending.recorded_at)
+                .map(|(actor, _)| actor.clone());
+            if let Some(oldest) = oldest {
+                signals.remove(&oldest);
+            }
+        }
+        signals.insert(
+            actor.clone(),
+            PendingQuerySignal {
+                query,
+                workspace_id,
+                project_id,
+                page_ids: page_ids.into_iter().collect(),
+                recorded_at: now,
+            },
+        );
+    }
+
+    /// The scrubbed query paired with this page in the actor's immediately
+    /// preceding single-project query, if any. The association is kept: a
+    /// read followed by `helpful` feedback writes the same (session, query,
+    /// page) pair twice, and the writer's dedup makes the second write inert.
+    fn matching_query_signal(
+        &self,
+        actor: &ai_memory_core::ActorKey,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+    ) -> Option<String> {
+        let mut signals = self
+            .pending_query_signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expired = signals
+            .get(actor)
+            .is_some_and(|pending| pending.recorded_at.elapsed() >= PENDING_QUERY_SIGNALS_TTL);
+        if expired {
+            signals.remove(actor);
+            return None;
+        }
+        signals.get(actor).and_then(|pending| {
+            (pending.workspace_id == workspace_id
+                && pending.project_id == project_id
+                && pending.page_ids.contains(&page_id))
+            .then(|| pending.query.clone())
+        })
+    }
+
+    /// Fire-and-forget one implicit (query → page) association, or, for
+    /// `positive = false` (a `not_helpful` signal), drop it. The helper is
+    /// inert unless the feature is on, the page came from that session's last
+    /// query, and the scope still matches, so an unrelated read stores nothing.
+    ///
+    /// A signal changes later ranking for everyone in the project, so it
+    /// needs Write on the project, as `memory_feedback` does. A read is only
+    /// Read-authorized, so the Write check runs here, before anything is
+    /// spawned: a read-only grantee's reads never steer ranking.
+    async fn spawn_query_signal(
+        &self,
+        actor: &ai_memory_core::ActorKey,
+        viewer: Option<ai_memory_core::UserId>,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        positive: bool,
+    ) {
+        if self.reader.retrieval_tuning().query_signal_weight <= 0.0 {
+            return;
+        }
+        let Some(query) = self.matching_query_signal(actor, workspace_id, project_id, page_id)
+        else {
+            return;
+        };
+        let Some(session) = actor.session_id.clone() else {
+            return;
+        };
+        let authorized = ai_memory_store::authorize_scope_for(
+            &self.reader,
+            Some(&self.writer),
+            ai_memory_store::ResolvedScope {
+                workspace_id,
+                project_id,
+            },
+            viewer,
+            ai_memory_store::ProjectAccess::Write,
+        )
+        .await;
+        if authorized.is_err() {
+            return;
+        }
+        let writer = self.writer.clone();
+        tokio::spawn(async move {
+            let result = if positive {
+                writer
+                    .record_query_page_signal(
+                        workspace_id,
+                        project_id,
+                        page_id,
+                        query,
+                        Some(session),
+                    )
+                    .await
+                    .map(drop)
+            } else {
+                writer
+                    .forget_query_page_signal(workspace_id, project_id, page_id, query)
+                    .await
+                    .map(drop)
+            };
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "query signal failed");
+            }
+        });
+    }
 }
 
 /// True when the caller explicitly scoped the read by name — a non-empty
@@ -9260,6 +9472,15 @@ fn test_parts_default() -> axum::http::request::Parts {
 #[cfg(test)]
 fn test_optional_parts() -> OptionalParts {
     OptionalParts(test_parts_default())
+}
+
+#[cfg(test)]
+fn test_parts_with_session(session: &str) -> OptionalParts {
+    let mut parts = test_parts_default();
+    parts
+        .headers
+        .insert("x-memory-actor-session-id", session.parse().unwrap());
+    OptionalParts(parts)
 }
 
 #[cfg(test)]
@@ -13932,6 +14153,90 @@ mod tests {
                 .all(|ms| ms.as_f64().is_some_and(|ms| ms >= 0.0)),
             "{value}"
         );
+    }
+
+    #[tokio::test]
+    async fn memory_read_page_records_the_opt_in_query_signal() {
+        let (tmp, mut store, _default_server, ws, proj) = setup_server().await;
+        store
+            .reader
+            .set_retrieval_tuning(ai_memory_store::RetrievalTuning {
+                query_signal_weight: 1.0,
+                ..ai_memory_store::RetrievalTuning::default()
+            });
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let foo_id = store
+            .reader
+            .decay_candidates(ws, proj)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.path.as_str() == "foo.md")
+            .unwrap()
+            .id;
+
+        server
+            .memory_query(
+                Parameters(query_in("scratch", "karpathy")),
+                test_parts_with_session("query-signal-session"),
+            )
+            .await
+            .unwrap();
+        let actor = ai_memory_core::ActorKey {
+            user: None,
+            session_id: Some("query-signal-session".into()),
+        };
+        assert!(
+            server
+                .matching_query_signal(&actor, ws, proj, foo_id)
+                .is_some(),
+            "the query hit must be paired with its page for the session"
+        );
+        assert!(
+            server
+                .matching_query_signal(&actor, ws, proj, PageId::new())
+                .is_none(),
+            "a page the query did not return must not gain an association"
+        );
+
+        server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("foo.md".into()),
+                    project: Some("scratch".into()),
+                    project_id: None,
+                    workspace: Some("default".into()),
+                    scope: None,
+                    include_related: false,
+                    related_depth: None,
+                    max_chars: None,
+                }),
+                test_parts_with_session("query-signal-session"),
+            )
+            .await
+            .unwrap();
+
+        let rows = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let rows = store
+                    .reader
+                    .query_signals_for_pages(ws, proj, vec![foo_id])
+                    .await
+                    .unwrap()
+                    .remove(&foo_id)
+                    .unwrap_or_default();
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the read-after-query signal should land");
+        assert_eq!(rows[0].query_text, "karpathy");
+        assert_eq!(rows[0].signal_count, 1);
     }
 
     /// `rerank_ms` appears with a reranker attached, and only on an explained
@@ -20893,6 +21198,194 @@ mod tests {
 
     fn grant_writer(db: &std::path::Path, user: ai_memory_core::UserId, repository: ProjectId) {
         grant_role(db, user, repository, "write");
+    }
+
+    /// The read-after-query signal changes later ranking for everyone in the
+    /// project, so it is a write (#1941). A Read-only grantee in a restricted
+    /// project may query and read but records nothing; a Write grantee doing
+    /// the same records the association. A later `not_helpful` from the
+    /// writer withdraws it.
+    #[tokio::test]
+    async fn query_signals_need_write_access_and_not_helpful_withdraws_them() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store
+            .writer
+            .set_new_project_mode(ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        store
+            .reader
+            .set_retrieval_tuning(ai_memory_store::RetrievalTuning {
+                query_signal_weight: 1.0,
+                ..ai_memory_store::RetrievalTuning::default()
+            });
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "client-work", None)
+            .await
+            .unwrap();
+        let user = |name: &'static str| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        ai_memory_core::UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let reader_user = user("ray").await;
+        let writer_user = user("wendy").await;
+        grant_role(store.db_path(), reader_user, proj, "read");
+        grant_writer(store.db_path(), writer_user, proj);
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "notes/caddy.md".into(),
+                    body: "# Caddy\n\nCaddy reloads its TLS config on SIGUSR1.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec![],
+                    pinned: false,
+                    project: Some("client-work".into()),
+                    project_id: None,
+                    workspace: Some("default".into()),
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("operator seeds the page");
+        let page_id = store
+            .reader
+            .latest_page_id_by_ids(ws, proj, "notes/caddy.md".into())
+            .await
+            .unwrap()
+            .expect("the seeded page");
+        let parts_as = |user: ai_memory_core::UserId, session: &str| {
+            let OptionalParts(mut parts) = test_parts_with_session(session);
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(user);
+            parts
+                .extensions
+                .insert(ai_memory_core::AuthorizedViewer(user));
+            OptionalParts(parts)
+        };
+        let read_args = || ReadPageArgs {
+            query: None,
+            path: Some("notes/caddy.md".into()),
+            project: Some("client-work".into()),
+            project_id: None,
+            workspace: Some("default".into()),
+            scope: None,
+            include_related: false,
+            related_depth: None,
+            max_chars: None,
+        };
+        let rows = || async {
+            store
+                .reader
+                .query_signals_for_pages(ws, proj, vec![page_id])
+                .await
+                .unwrap()
+                .remove(&page_id)
+                .unwrap_or_default()
+        };
+
+        // The reader's query and read succeed, and record nothing. The Write
+        // check runs before anything is spawned, so there is no task to wait
+        // for.
+        server
+            .memory_query(
+                Parameters(query_in("client-work", "caddy tls")),
+                parts_as(reader_user, "reader-session"),
+            )
+            .await
+            .expect("a reader may query");
+        server
+            .memory_read_page(
+                Parameters(read_args()),
+                parts_as(reader_user, "reader-session"),
+            )
+            .await
+            .expect("a reader may read");
+
+        // Control: the writer's pair records its association. A different
+        // query keeps the two rows apart; the writer's task is spawned after
+        // any the reader could have spawned, so once it lands the reader's
+        // would have too.
+        server
+            .memory_query(
+                Parameters(query_in("client-work", "caddy reload")),
+                parts_as(writer_user, "writer-session"),
+            )
+            .await
+            .unwrap();
+        server
+            .memory_read_page(
+                Parameters(read_args()),
+                parts_as(writer_user, "writer-session"),
+            )
+            .await
+            .unwrap();
+        let recorded = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = rows().await;
+                if rows.iter().any(|row| row.query_text == "caddy reload") {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the writer's read-after-query signal should land");
+        assert!(
+            recorded.iter().all(|row| row.query_text != "caddy tls"),
+            "a read-only grantee's read must not record a signal: {recorded:?}"
+        );
+
+        // `not_helpful` after the same query withdraws the association.
+        server
+            .memory_feedback(
+                Parameters(FeedbackArgs {
+                    path: "notes/caddy.md".into(),
+                    signal: FeedbackKind::NotHelpful,
+                    reason: None,
+                    project: Some("client-work".into()),
+                    workspace: Some("default".into()),
+                }),
+                parts_as(writer_user, "writer-session"),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !rows().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("not_helpful should withdraw the association");
     }
 
     /// A reader-only grant must not be able to change anything.

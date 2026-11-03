@@ -4472,6 +4472,124 @@ pub fn record_page_feedback(
     Ok(Some((page_id, next_salience)))
 }
 
+/// Record one implicit (normalized query → page) association (#1941, slice 2)
+/// and return the association's signal count after the upsert.
+///
+/// The upsert keys on `(workspace, project, query hash, page version)` and
+/// increments `signal_count` only when the writing session differs from
+/// `last_session`, so one session repeating the same read contributes at most
+/// one association. Like the access-bump reinforcement this is an implicit
+/// signal, so it writes no audit row. A `page_id` that is no longer the
+/// current version in this scope — rewritten, purged or deleted between the
+/// read and this detached write — is a no-op returning `0`, never an error:
+/// the association attaches to the version exactly as explicit feedback does.
+pub fn record_query_page_signal(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_id: PageId,
+    query_text: &str,
+    session: Option<&str>,
+) -> StoreResult<u32> {
+    let normalized = crate::query_signals::normalize_query(query_text);
+    if normalized.is_empty() {
+        return Ok(0);
+    }
+    let hash = crate::query_signals::query_hash(&normalized);
+    // Session keys are client-supplied strings. Store the same `SessionId`
+    // the hook ingress derives for that native id: it is bounded (a UUID),
+    // and it is what lets `purge_session` find this row and delete the query
+    // text the purged session wrote.
+    let session: Option<String> =
+        session.map(|s| ai_memory_core::SessionId::from_native(s).to_string());
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    // The EXISTS guard is the FK lesson from `bump_access_for_pages_for_actor`:
+    // this write is detached from the read that triggered it, so the page may
+    // be gone. It must also still be the CURRENT version — an association
+    // pointing at a superseded version never boosts anything, and recording
+    // one would only orphan text.
+    let is_current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pages \
+          WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND is_latest = 1)",
+        params![
+            page_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    if !is_current {
+        tx.rollback()?;
+        return Ok(0);
+    }
+    tx.execute(
+        "INSERT INTO query_page_signals \
+           (workspace_id, project_id, query_hash, page_id, query_text, signal_count, last_session, last_seen) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7) \
+         ON CONFLICT(workspace_id, project_id, query_hash, page_id) DO UPDATE SET \
+           signal_count = CASE WHEN query_page_signals.last_session IS ?6 \
+                               THEN query_page_signals.signal_count \
+                               ELSE query_page_signals.signal_count + 1 END, \
+           query_text = excluded.query_text, \
+           last_session = excluded.last_session, \
+           last_seen = excluded.last_seen",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes(),
+            normalized,
+            session,
+            now,
+        ],
+    )?;
+    let count: i64 = tx.query_row(
+        "SELECT signal_count FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND query_hash = ?3 AND page_id = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Drop one implicit (normalized query → page) association (#1941): the
+/// negative signal a `not_helpful` feedback right after the query sends.
+/// Returns whether a row was removed. Removing the row (rather than storing a
+/// negative count) keeps the boost one-sided: an association can lose its
+/// boost, but a page can never be pushed below where plain ranking put it by
+/// this signal.
+pub fn forget_query_page_signal(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_id: PageId,
+    query_text: &str,
+) -> StoreResult<bool> {
+    let normalized = crate::query_signals::normalize_query(query_text);
+    if normalized.is_empty() {
+        return Ok(false);
+    }
+    let hash = crate::query_signals::query_hash(&normalized);
+    let removed = conn.execute(
+        "DELETE FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND query_hash = ?3 AND page_id = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes()
+        ],
+    )?;
+    Ok(removed > 0)
+}
+
 /// Mark the expected latest page as evicted by the forget sweep.
 ///
 /// The full identity and latest-id check share one transaction so a stale
@@ -7266,6 +7384,16 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![format!("session:{session_id}")],
     )?;
 
+    // Query-signal associations (#1941) this session wrote last carry its
+    // query text. The row goes with the session, even when earlier sessions
+    // also confirmed it: the text is the user's, and the boost is a
+    // convenience that the next confirming session rebuilds.
+    tx.execute(
+        "DELETE FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND last_session = ?3",
+        rusqlite::params![&wid[..], &pid[..], session_id.to_string()],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -8129,6 +8257,7 @@ pub fn move_project_workspace(
         "profile_candidates",
         "profile_entry_ledger",
         "profile_harvest_marks",
+        "query_page_signals",
     ] {
         tx.execute(
             &format!(
@@ -8392,6 +8521,7 @@ pub fn merge_project(
         "session_consolidation_jobs",
         "page_feedback",
         "purged_sessions",
+        "query_page_signals",
     ] {
         tx.execute(
             &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),

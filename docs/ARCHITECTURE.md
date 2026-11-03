@@ -193,7 +193,12 @@ from hook paths.
    page kind, tier, `pinned`, and explicit positive/negative frontmatter tags.
    It favors maintained rules, decisions, procedures, and gotchas in close
    contests while keeping episodic, historical, lint, and test evidence
-   searchable. No query-intent regex or hard exclusion participates. An
+   searchable. Two opt-in feedback adjustments join that same authority
+   clamp: open `stale`/`wrong` feedback can demote a current page version,
+   and a prior read-after-query or helpful association can boost it for a
+   similar query. Both default to zero, clear on rewrite, and appear in
+   `explain=true` score details. No query-intent regex or hard exclusion
+   participates. An
    optional `AI_MEMORY_RERANKER=llm` pass sends a bounded query plus up to 30
    bounded titles/snippets to the configured provider after project/scope
    fusion; it is limited to one call per query and four calls in flight, and any
@@ -630,6 +635,7 @@ prunable rather than only after it ages in place.
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
+| `query_page_signals` | Opt-in (`[retrieval] query_signal_weight > 0`) query-scoped ranking associations (V98): one row per `(workspace, project, normalized-query hash, page version)` with the sanitized query text (≤256 chars), a distinct-session `signal_count` and the last writing session. Written only for write-authorized, session-aware callers after a read or `helpful` of the preceding query's hit; `not_helpful` deletes the row, `purge_session` deletes rows the session wrote last, and the project and page FKs cascade. |
 | `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
 | `page_evidence` | V63 append-only record of what produced or reaffirmed each page version: consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Feeds a read-time, zero-LLM **belief-strength `confidence`** (`ai_memory_store::belief`, B1 / `docs/design-hindsight-borrowings.md` P2): a bounded `[0.0, 0.95]` function of distinct supporting sessions (breadth, not raw count), recency of the newest sighting, and live `contradicts` count. Exposed as `confidence` + `evidence_count` in `memory_query(explain=true)`, as `evidence_rows` in `memory_status`, and used to order the opt-in `settled_first` briefing, all **ranking-inert**. It folds into `PageAuthority` only behind `[retrieval] belief_authority_weight` (**default `0.0`/OFF, R2-gated**), as one bounded factor inside the `[0.55, 1.50]` clamp; a supersession always wins regardless of evidence (a superseded version is never boosted). |
 | `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`), extended by V90 with optional epistemic nature/evidence. Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
@@ -1421,6 +1427,15 @@ observation_stream = true         # R1 observation-evidence stream: FTS over obs
                                   # the raw_hits fallback; global=true unchanged. DEFAULT ON;
                                   # false restores the previous ranking byte for byte.
                                   # Env: AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=false
+# feedback_demotion = 0.0          # subtract this much authority from a current page
+#                                  # version carrying open stale/wrong feedback. A rewrite
+#                                  # supersedes the version and clears the penalty. 0.0 is off.
+# query_signal_weight = 0.0        # boost a page from a prior read-after-query or helpful
+#                                  # association, capped by query similarity and distinct
+#                                  # sessions. Recorded only for write-authorized,
+#                                  # session-aware callers; not_helpful withdraws one and a
+#                                  # session purge deletes its rows. 0.0 disables both
+#                                  # capture and ranking.
 
 [search.fts]                      # FTS5 query-preparation tuning (contrast with [retrieval]:
                                   # this is not a ranking signal). Omit the whole section for

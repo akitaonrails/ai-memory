@@ -158,6 +158,8 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | `abstract_vectors` | `false` | `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS` | Add the L0 abstract embedding stream to the rank fusion. |
 | `belief_authority_weight` | `0.0` | `AI_MEMORY_RETRIEVAL__BELIEF_AUTHORITY_WEIGHT` | Weight of a page's evidence-derived confidence in its authority. 0 is inert and negatives clamp to 0. |
 | `observation_stream` | `true` | `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM` | Add the observation evidence stream, where matching observation bodies vote for their session's page. |
+| `feedback_demotion` | `0.0` | `AI_MEMORY_RETRIEVAL__FEEDBACK_DEMOTION` | Authority subtracted from a page whose current version carries open `stale`/`wrong` feedback, until a rewrite clears it. 0 is inert and negatives clamp to 0. |
+| `query_signal_weight` | `0.0` | `AI_MEMORY_RETRIEVAL__QUERY_SIGNAL_WEIGHT` | Similarity-capped authority boost from (query → page) associations captured when a session-aware caller with write access read a query hit or marked it helpful; `not_helpful` withdraws one and a session purge deletes its rows. 0 disables both capture and boost. |
 
 ## `[search.fts]`
 

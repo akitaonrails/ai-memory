@@ -28,6 +28,18 @@
 //!   no page contributes nothing (the raw fallback still covers it). On by
 //!   default since it met its measured success criteria.
 //!
+//! * **Feedback-informed authority** (both OFF by default, #1941) — two
+//!   bounded adjustments folded inside the existing authority clamp rather
+//!   than new multipliers. `feedback_demotion` subtracts its weight from
+//!   the authority factor of a *current* page version carrying open
+//!   `stale`/`wrong` feedback, until a rewrite supersedes that version
+//!   (feedback attaches to the version, so the penalty clears with it).
+//!   `query_signal_weight` boosts a page whose current version carries a
+//!   (normalized query → page) association recorded from an earlier
+//!   read-after-query or `helpful` signal; the boost scales with the
+//!   lexical similarity between the stored and current queries, so it is
+//!   capped by similarity and never fires for unrelated queries.
+//!
 //! Every signal is reported in `SearchExplain`, so an `explain=true`
 //! query can account for the returned rank.
 
@@ -66,6 +78,34 @@ pub struct RetrievalTuning {
     /// retrieval eval it lifted zero-LLM hit@5 without breaking the latency or
     /// token budgets. `false` restores the previous ranking byte for byte.
     pub observation_stream: bool,
+    /// Weight subtracted from the authority factor of a page whose *current*
+    /// version carries open `stale`/`wrong` feedback (#1941). `0.0` (the
+    /// default) is inert — no feedback lookup runs and ranking is
+    /// byte-identical. When positive, the weight is subtracted inside the
+    /// existing `[0.55, 1.50]` authority clamp, and only while the feedback
+    /// points at the current version: rewriting the page supersedes that
+    /// version, which clears the penalty exactly as it clears the lint
+    /// finding. `helpful`/`not_helpful` never demote.
+    ///
+    /// Ships OFF: this changes retrieval ranking, so per the design it must
+    /// not default on without a positive measured delta (`ai-memory-eval`).
+    pub feedback_demotion: f64,
+    /// Weight of the query-scoped implicit-signal boost (#1941): a page whose
+    /// current version carries a (normalized query → page) association —
+    /// recorded when a `memory_query` hit was followed in the same session by
+    /// a `memory_read_page` of that path or a `helpful` feedback signal —
+    /// gains up to `weight * similarity * count_saturation` added to its
+    /// authority factor, inside the existing `[0.55, 1.50]` clamp. The
+    /// similarity between the stored and current queries (a Dice coefficient
+    /// over their token sets) caps the boost, so an unrelated query gains
+    /// nothing and an identical one gains the full amount; the count saturates
+    /// after [`crate::query_signals::QUERY_SIGNAL_COUNT_CAP`] distinct
+    /// sessions, which bounds the read-more→boost-more loop.
+    ///
+    /// `0.0` (the default) is inert: no association lookup runs, ranking is
+    /// byte-identical, and the server-side capture writes nothing. Ships OFF
+    /// for the same measured-delta reason as `feedback_demotion`.
+    pub query_signal_weight: f64,
 }
 
 impl Default for RetrievalTuning {
@@ -84,6 +124,11 @@ impl Default for RetrievalTuning {
             // R2-gated (see the field doc).
             belief_authority_weight: 0.0,
             observation_stream: true,
+            // OFF by default (#1941): both feedback-informed signals must
+            // earn their default with a measured eval before they can ship
+            // on.
+            feedback_demotion: 0.0,
+            query_signal_weight: 0.0,
         }
     }
 }
@@ -190,6 +235,8 @@ mod tests {
         assert!(!t.abstract_vectors);
         assert_eq!(t.belief_authority_weight, 0.0);
         assert!(t.observation_stream);
+        assert_eq!(t.feedback_demotion, 0.0);
+        assert_eq!(t.query_signal_weight, 0.0);
     }
 
     #[test]

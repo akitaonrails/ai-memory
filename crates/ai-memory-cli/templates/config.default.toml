@@ -720,12 +720,31 @@ mid_session = "follow-cwd"
 # observation_stream lets matching observation bodies vote, once per session,
 # for that session's latest `sessions/<id>.md` page in the same project. It
 # reads observations and writes nothing. False restores the previous ranking.
+#
+# feedback_demotion subtracts its weight from the authority factor of a page
+# whose current version carries open `stale`/`wrong` feedback, until a rewrite
+# supersedes that version and clears the flag with it. helpful and not_helpful
+# never demote. 0.0 (the default) is inert and negative values are clamped to 0.
+#
+# query_signal_weight is the query-scoped implicit-signal boost: when a
+# memory_query hit is followed in the same agent session by a memory_read_page
+# of that path (or a `helpful` feedback signal), the pair is stored as a
+# (normalized query -> page) association — sanitized, scoped to the project and
+# purged with it or with the session that wrote it. Only callers with write
+# access to the project record one, only session-aware MCP clients (those that
+# send a session id) produce them, and `not_helpful` right after the query
+# withdraws it. A later query lexically similar to a stored query gives that
+# page up to `weight * similarity` in authority, similarity-capped, so an
+# unrelated query gains nothing. 0.0 (the default) also stops the capture: no
+# queries are stored while the boost is off.
 # [retrieval]
 # query_intent = false
 # session_recall_bonus = 0.25
 # abstract_vectors = false
 # belief_authority_weight = 0.0
 # observation_stream = true
+# feedback_demotion = 0.0
+# query_signal_weight = 0.0
 
 # Words dropped from a bare natural-language FTS query before the terms are
 # OR-joined. Unset uses the built-in English list. `[]` turns the filter off. A
