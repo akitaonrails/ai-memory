@@ -427,3 +427,59 @@ into a resuming agent. The names are there so a static client can pass them to
 the pop; if they cannot be looked up, the notice falls back to "this project's
 inbox". The count is also available on demand via `memory_briefing`
 (`pending_message_count`), whose `scope` names the project it counted.
+
+### Mid-session notices for Claude Code
+
+A repository can opt into the same count-only notice while a Claude Code
+session runs:
+
+```toml
+[messaging]
+inbox_notice_on_prompt = true
+```
+
+The `UserPromptSubmit` hook then fetches `GET /handoff?inbox_only=1`. The
+server authorizes it like a session start and returns only the count-only
+notice: it claims no handoff, builds no recovery snapshot, brief or profile
+digest, records nothing, and leaves the caller's active project alone. The
+hook prints the notice only when the count or the inbox names change, so a
+busy session is not reminded on every prompt. The message body still never
+leaves `memory_message_pop`. The notice counts only mail this harness could
+pop: shared project mail plus mail addressed to Claude Code.
+
+A hook only runs when you submit a prompt. To reach an idle session, the
+session-aware `mcp-bridge` can also act as a
+[Claude Code channel](https://code.claude.com/docs/en/channels-reference).
+Add `--channel inbox` to the bridge's entry:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "command": "/path/to/ai-memory",
+      "args": ["mcp-bridge", "--channel", "inbox"]
+    }
+  }
+}
+```
+
+and start Claude with the entry's name:
+
+```bash
+claude --dangerously-load-development-channels server:ai-memory
+```
+
+The bridge advertises `claude/channel`, polls the same `inbox_only` notice
+(every 5 seconds after a change, backing off to once a minute while nothing
+changes), and sends `notifications/claude/channel` only when the text
+changes. The event body is that notice and nothing else. Claude channels are a
+research preview: the ai-memory bridge is not on Claude's channel allowlist,
+so it loads only through the development flag above, only in an interactive
+session, and only where an organization has not turned channels off
+(`channelsEnabled`). That is why the bridge flag is explicit and off by
+default; without it the bridge behaves exactly as before.
+
+Both notice clients need a server with this release. An older server ignores
+`inbox_only` and still returns only the notice (the clients also send
+`handoff=0&recovery=0&profile_digest=0`), but it republishes the active
+project on each fetch.

@@ -285,6 +285,7 @@ cli-help-root-mcp-bridge-about = { "Ponte MCP interna de stdio para HTTP: com se
 cli-help-root-mcp-bridge-server-url-help = { "URL base remota do ai-memory ou endpoint `/mcp` completo" }
 cli-help-root-mcp-bridge-no-session-id-help = { "Executar como ponte stdio para HTTP sem encaminhar identidade de sessão, para clientes diferentes de Claude Code e Muse Code. Sem esta opção, encaminha o ID de sessão do `--agent` iniciador e recusa iniciar se ele estiver ausente" }
 cli-help-root-mcp-bridge-agent-help = { "Cliente que inicia esta ponte com sessão, determinando a variável lida: `claude-code` (padrão) lê `CLAUDE_CODE_SESSION_ID`; `muse` lê `MUSE_SESSION_ID`. A outra variável nunca é consultada para não encaminhar um ID herdado do terminal de outro cliente" }
+cli-help-root-mcp-bridge-channel-help = { "Ativa um canal de envio para a sessão que inicia a ponte. `inbox` declara o canal experimental `claude/channel` do Claude e envia apenas a contagem de mensagens pendentes quando ela muda. Desligado por padrão: canais do Claude são uma prévia de pesquisa e esta ponte não está na lista de permissões do Claude, então só carrega com `--dangerously-load-development-channels server:<nome>`; a flag é explícita" }
 cli-help-root-commit-about = { "Preparar e registrar em commit a árvore da wiki no git" }
 cli-help-root-commit-message-help = { "Mensagem do commit" }
 cli-help-root-checkpoints-about = { "Listar checkpoints git recentes da wiki para recuperação" }

@@ -91,6 +91,15 @@ version in [`docs/changelog/`](docs/changelog/):
   purging a session deletes the ones it wrote. Both
   contributions appear in `memory_query(explain=true)`, and both weights
   default to `0.0`, leaving ranking and capture unchanged (#1941).
+- Added `[messaging] inbox_notice_on_prompt` to `.ai-memory.toml`. A Claude
+  Code session in an opted-in project receives the count-only pending-mail
+  notice on prompts, deduplicated until the count or inbox names change. A
+  session-aware `mcp-bridge --channel inbox` can push the same notice into an
+  idle session through Claude's experimental `claude/channel` (loaded with
+  `claude --dangerously-load-development-channels server:<name>`); the flag
+  stays off by default while channels remain a research preview. Both poll a
+  new read-only `GET /handoff?inbox_only=1` form that claims nothing and
+  leaves the active project alone. Message text never enters a notice (#1942).
 - Added `[recovery] deliver_on_session_start = false` to `.ai-memory.toml`.
   The per-project opt-out suppresses the unfinished-session recovery snapshot
   and its backfill marker without closing the source session. Handoffs,

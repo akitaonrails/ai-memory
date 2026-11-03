@@ -3623,6 +3623,22 @@ pub struct McpBridgeArgs {
     /// different harness's terminal is not forwarded.
     #[arg(long, value_enum, default_value_t = BridgeAgent::ClaudeCode)]
     pub agent: BridgeAgent,
+    /// Opt the bridge into one push channel for the launching session.
+    /// `inbox` declares Claude's experimental `claude/channel` capability and
+    /// pushes a count-only pending-mail notice into the running session when
+    /// the count changes. Off by default: Claude channels are a research
+    /// preview, and this bridge is not on Claude's allowlist, so it only loads
+    /// with `--dangerously-load-development-channels server:<name>`; the flag
+    /// is explicit.
+    #[arg(long, value_enum)]
+    pub channel: Option<BridgeChannel>,
+}
+
+/// A push channel the bridge may declare and emit (#1942).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BridgeChannel {
+    /// Count-only pending-inbox notices as `notifications/claude/channel`.
+    Inbox,
 }
 
 /// The harness a session-aware `mcp-bridge` forwards the session id of.

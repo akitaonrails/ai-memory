@@ -54,6 +54,14 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > Other connection failures, such as a host name that does not resolve, are
 > reported at once.
 
+> **Inbox push is explicit.** A session-aware Claude Code bridge can add
+> `--channel inbox` to advertise Claude's experimental `claude/channel`
+> capability and push a count-only pending-mail notice when it changes.
+> Claude loads it only when started with
+> `claude --dangerously-load-development-channels server:<entry name>`, since
+> the ai-memory bridge is not on Claude's channel allowlist. See
+> [`agent-messaging.md`](agent-messaging.md#mid-session-notices-for-claude-code).
+
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
 > required), so any client that points a remote URL at `/mcp`, including

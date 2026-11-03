@@ -35,7 +35,7 @@ use sha2::{Digest as _, Sha256};
 use super::hook_capture::{
     HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
     hook_scope, marker_capture_policy, marker_query_suffix, marker_query_suffix_for_subagent_brief,
-    marker_query_suffix_without_briefing, marker_requests_briefing,
+    marker_query_suffix_without_briefing, marker_requests_briefing, marker_requests_inbox_notice,
     marker_requests_subagent_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
@@ -447,7 +447,17 @@ fn briefed_marker_path(
     session_id: Option<&str>,
     cwd: Option<&str>,
 ) -> PathBuf {
-    let key = session_id.map_or_else(
+    data_dir
+        .join("briefed")
+        .join(briefed_session_key(agent, session_id, cwd))
+}
+
+/// The per-session key the `briefed`, `inbox-notice` and sibling state files
+/// share: the payload's canonical session id when the harness supplies one,
+/// else a stable hash of agent+cwd so a session-less agent still gets
+/// once-per-checkout behavior. Sanitized to a safe file name.
+fn briefed_session_key(agent: &str, session_id: Option<&str>, cwd: Option<&str>) -> String {
+    session_id.map_or_else(
         || {
             format!(
                 "{:x}",
@@ -455,8 +465,7 @@ fn briefed_marker_path(
             )
         },
         sanitize_briefed_key,
-    );
-    data_dir.join("briefed").join(key)
+    )
 }
 
 /// The once-per-session profile-digest marker beside a brief marker: same
@@ -482,17 +491,53 @@ fn sanitize_briefed_key(raw: &str) -> String {
         .collect()
 }
 
-/// Best-effort marker write with bounded retention: on failure the worst case
-/// is a re-brief on the next prompt, which is acceptable.
-fn mark_briefed(path: &Path) {
+/// `<data_dir>/inbox-notice/<key>` — the last mid-session inbox notice this
+/// session was shown (#1942), keyed like the briefed markers (native session
+/// id when the payload carries one, else a stable hash of agent+cwd, so a
+/// session-less checkout still deduplicates per checkout). Holds the notice
+/// text itself, bounded by [`INBOX_NOTICE_STATE_MAX_BYTES`]: text equality is
+/// count equality plus the inbox's own names, so a change in either re-notifies.
+fn inbox_notice_state_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    data_dir
+        .join("inbox-notice")
+        .join(briefed_session_key(agent, session_id, cwd))
+}
+
+/// The storage bound for a dedup state file. The notice is a fixed scaffold
+/// around a count and two names, always far below this; the cap only stops a
+/// hostile server from parking unbounded text on disk through this path.
+const INBOX_NOTICE_STATE_MAX_BYTES: usize = 1024;
+
+fn inbox_notice_already_shown(path: &Path, notice: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|shown| shown == notice)
+}
+
+/// Best-effort dedup write with bounded retention: on failure the worst case
+/// is the same notice re-delivered on the next prompt, which is acceptable.
+fn mark_inbox_notice_shown(path: &Path, notice: &str) {
     let Some(parent) = path.parent() else {
         return;
     };
-    if fs::create_dir_all(parent).is_err() || fs::write(path, b"").is_err() {
+    if fs::create_dir_all(parent).is_err() {
         return;
     }
+    let bounded = &notice.as_bytes()[..notice.len().min(INBOX_NOTICE_STATE_MAX_BYTES)];
+    if fs::write(path, bounded).is_err() {
+        return;
+    }
+    prune_to_newest_files(parent, path, MAX_BRIEFED_MARKERS);
+}
 
-    let Ok(entries) = fs::read_dir(parent) else {
+/// Keep only the `keep` newest files in `dir` (plus `except`, always kept):
+/// per-session state directories are bounded so a long-lived install does
+/// not accumulate one small file per session it has ever run.
+fn prune_to_newest_files(dir: &Path, except: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let mut stale_candidates = entries
@@ -505,13 +550,25 @@ fn mark_briefed(path: &Path) {
                 entry.path(),
             ))
         })
-        .filter(|(_, _, candidate)| candidate != path)
+        .filter(|(_, _, candidate)| candidate != except)
         .collect::<Vec<_>>();
     stale_candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    let keep_others = MAX_BRIEFED_MARKERS.saturating_sub(1);
+    let keep_others = keep.saturating_sub(1);
     for (_, _, stale) in stale_candidates.into_iter().skip(keep_others) {
         let _ = fs::remove_file(stale);
     }
+}
+
+/// Best-effort marker write with bounded retention: on failure the worst case
+/// is a re-brief on the next prompt, which is acceptable.
+fn mark_briefed(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() || fs::write(path, b"").is_err() {
+        return;
+    }
+    prune_to_newest_files(parent, path, MAX_BRIEFED_MARKERS);
 }
 
 fn fresh_session_id(data_dir: &Path, agent: AgentKind) -> String {
@@ -1240,11 +1297,14 @@ fn recap_url(base: &str, agent: &str, session_id: &str, budget: Option<usize>) -
     )
 }
 
-fn user_prompt_recap_envelope(recap: &str) -> serde_json::Value {
+/// A `UserPromptSubmit` hook's `hookSpecificOutput.additionalContext`:
+/// Claude Code places it alongside the submitted prompt (used for both the
+/// compaction recap and the mid-session inbox notice, #1942).
+fn user_prompt_context_envelope(context: &str) -> serde_json::Value {
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": recap,
+            "additionalContext": context,
         }
     })
 }
@@ -2156,7 +2216,7 @@ where
         let url = recap_url(base, &args.agent, session_id, budget);
         if let Some(recap) = get_handoff(&client, &url, bearer.as_deref(), handoff_timeout()).await
         {
-            writeln!(stdout, "{}", user_prompt_recap_envelope(&recap))?;
+            writeln!(stdout, "{}", user_prompt_context_envelope(&recap))?;
             return Ok(());
         }
     }
@@ -2267,6 +2327,65 @@ where
         // text. Empty handoff or any fetch error means print nothing at all
         // (kimi ignores empty stdout; warnings go to stderr).
         return Ok(());
+    }
+
+    // user-prompt, Claude Code only: a repository that opted into
+    // `[messaging] inbox_notice_on_prompt` (#1942) gets the same count-only
+    // inbox notice a session start appends, on every prompt, deduplicated on
+    // count change. `inbox_only=1` makes the server return only that notice
+    // and skip every claim, write and active-project publish; `handoff=0`,
+    // `recovery=0`, `profile_digest=0` and no `briefing` keep an older server
+    // that ignores the flag to the same body (the baton stays unclaimed,
+    // unlike the kimi path above, which is Claude's baton-delivery
+    // substitute). The response is a count and the inbox's own names, never
+    // message text. Cursor runs these hook settings too; its handling of the
+    // envelope is unverified, so a Cursor payload gets nothing (same guard
+    // as the recap above).
+    if hook_event == HookEvent::UserPrompt
+        && agent_kind == AgentKind::ClaudeCode
+        && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
+        && let Some(cwd) = policy_cwd.as_deref()
+        && marker_requests_inbox_notice(cwd)
+    {
+        let client = build_client();
+        let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+        let native_session_qs = canonical_session_id
+            .as_deref()
+            .map_or_else(String::new, |session_id| {
+                format!("&session_id={}", url_encode(session_id))
+            });
+        let notice_url = format!(
+            "{base}/handoff?agent={}{qs}&inbox_only=1&handoff=0&recovery=0&profile_digest=0{native_session_qs}",
+            args.agent,
+            qs = marker_query_suffix_without_briefing(
+                cwd,
+                args.project_strategy.and_then(|s| s.baked()),
+            ),
+        );
+        let notice = get_handoff(&client, &notice_url, bearer.as_deref(), handoff_timeout()).await;
+        let shown = inbox_notice_state_path(
+            &dd,
+            &args.agent,
+            canonical_session_id.as_deref(),
+            policy_cwd.as_deref(),
+        );
+        match notice.as_deref() {
+            // Zero agent-visible mail (or a failed fetch — indistinguishable
+            // here, which only ever costs one re-notice after an outage):
+            // clear the dedup state so the next rise notifies again, and say
+            // nothing.
+            None => {
+                let _ = fs::remove_file(&shown);
+            }
+            // Same notice as last time: the count (and the inbox's own
+            // names) have not changed, so the prompt stays quiet.
+            Some(notice) if inbox_notice_already_shown(&shown, notice) => {}
+            Some(notice) => {
+                mark_inbox_notice_shown(&shown, notice);
+                writeln!(stdout, "{}", user_prompt_context_envelope(notice))?;
+                return Ok(());
+            }
+        }
     }
 
     // user-prompt: Hermes ignores `on_session_start` stdout, but adds a
@@ -9095,6 +9214,75 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn claude_user_prompt_injects_a_deduplicated_inbox_notice_after_opt_in() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = true\n",
+        )
+        .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let notice = "1 cross-project message waiting in default/app";
+        let (base, mut requests) = serve_requests("200 OK", notice).await;
+        let make_args = |server: &str| {
+            let mut args = kimi_hook_args("user-prompt-submit", server);
+            args.agent = "claude-code".into();
+            args
+        };
+        let payload = serde_json::json!({
+            "session_id": "claude-session",
+            "cwd": repo.path(),
+            "prompt": "check the inbox"
+        })
+        .to_string();
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data.path().to_path_buf()),
+            make_args(&base),
+            payload.clone(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let output = String::from_utf8_lossy(&stdout);
+        let envelope: serde_json::Value =
+            serde_json::from_str(output.trim_end()).expect("the notice is one JSON envelope");
+        assert_eq!(
+            envelope["hookSpecificOutput"]["additionalContext"], notice,
+            "{envelope}"
+        );
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+        assert!(
+            request.contains("agent=claude-code")
+                && request.contains("inbox_only=1")
+                && request.contains("handoff=0")
+                && request.contains("recovery=0")
+                && request.contains("profile_digest=0"),
+            "{request}"
+        );
+
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data.path().to_path_buf()),
+            make_args(&base),
+            payload,
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stdout, b"{}\n",
+            "an unchanged count must stay quiet; got {stdout:?}"
+        );
+        let request = first_request(&mut requests).await.unwrap();
+        assert!(request.starts_with("GET /handoff?"), "{request}");
+    }
+
     fn hermes_args(event: &str, server_url: &str) -> HookArgs {
         let mut args = kimi_hook_args(event, server_url);
         args.agent = "hermes".into();
@@ -10260,6 +10448,26 @@ mod tests {
                 .is_file()
         );
     }
+    #[test]
+    fn inbox_notice_state_is_per_session_and_deduplicates_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first =
+            inbox_notice_state_path(tmp.path(), "claude-code", Some("session-a"), Some("/repo"));
+        let same =
+            inbox_notice_state_path(tmp.path(), "claude-code", Some("session-a"), Some("/repo"));
+        let second =
+            inbox_notice_state_path(tmp.path(), "claude-code", Some("session-b"), Some("/repo"));
+        assert_eq!(first, same);
+        assert_ne!(first, second);
+
+        assert!(!inbox_notice_already_shown(&first, "1 message"));
+        mark_inbox_notice_shown(&first, "1 message");
+        assert!(inbox_notice_already_shown(&first, "1 message"));
+        assert!(!inbox_notice_already_shown(&first, "2 messages"));
+        mark_inbox_notice_shown(&first, "2 messages");
+        assert!(inbox_notice_already_shown(&first, "2 messages"));
+    }
+
     fn codex_args(event: &str, server_url: &str) -> HookArgs {
         let mut args = claude_args(event, server_url);
         args.agent = "codex".into();
