@@ -267,3 +267,31 @@ async fn a_proxy_in_the_environment_is_not_used_for_the_server() {
     proxy.abort();
     server.abort();
 }
+
+/// #1960: neither the `ai-memory starting` line every command logs nor a thin
+/// client's unreachable-server error prints the `user:pass@` userinfo a
+/// configured server URL may carry.
+#[test]
+fn startup_log_and_unreachable_error_strip_userinfo_from_the_server_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(BIN)
+        .arg("--data-dir")
+        .arg(tmp.path())
+        .arg("status")
+        .env("AI_MEMORY_DATA_DIR", tmp.path())
+        .env("AI_MEMORY_SERVER_URL", "http://alice:hunter2@127.0.0.1:9")
+        .env("AI_MEMORY_EMBEDDING_PROVIDER", "none")
+        .env("RUST_LOG", "info")
+        .env_remove("AI_MEMORY_HOOK_URL")
+        .env_remove("AI_MEMORY_AUTH_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ai-memory starting") && stderr.contains("http://127.0.0.1:9/"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("hunter2"), "{stderr}");
+    assert!(!stderr.contains("alice"), "{stderr}");
+}

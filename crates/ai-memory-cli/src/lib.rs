@@ -82,7 +82,7 @@ pub async fn run() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        server_url = %config.server_url,
+        server_url = %http_client::display_url(&config.server_url),
         data_dir = %commands::path_util::display_path(&config.data_dir),
         bind = %config.bind,
         "ai-memory starting",

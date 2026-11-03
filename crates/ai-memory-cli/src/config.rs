@@ -3344,7 +3344,7 @@ impl Config {
         }
         tracing::warn!(
             provider = provider.name(),
-            base_url = ambient,
+            base_url = %crate::http_client::display_url(ambient),
             "ignoring ambient LLM_BASE_URL: this provider talks to a fixed vendor \
              endpoint. Set llm_base_url (or AI_MEMORY_LLM_BASE_URL) to point it \
              somewhere else on purpose."

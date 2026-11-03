@@ -1181,7 +1181,10 @@ async fn memory_status(config: &Config) -> Result<()> {
     let url = install_mcp::mcp_server_url_from_base(&config.server_url);
     let transport =
         super::mcp_bridge::upstream_transport(&url, None, config.auth.bearer_token.as_deref())?;
-    let client = ().serve(transport).await.with_context(|| format!("connecting to {url}"))?;
+    let client = ()
+        .serve(transport)
+        .await
+        .with_context(|| format!("connecting to {}", crate::http_client::display_url(&url)))?;
     let result = client
         .peer()
         .call_tool(CallToolRequestParams::new("memory_status"))
