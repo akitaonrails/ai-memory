@@ -45,6 +45,15 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > config already resolves a bearer, a different key is stored, the hooks
 > sign in with OIDC, or the snippet is only printed.
 
+> **A bridge started while the server restarts waits for it.** A stdio
+> client does not relaunch an MCP server that exited, so `mcp-bridge` waits
+> up to 3 seconds for a server whose port refuses connections (a service
+> restarting after an upgrade or a reboot) before it gives up. When nothing
+> answers, it exits with `could not reach the ai-memory server at <url>` and
+> says to check that the server is running and that the entry points at it.
+> Other connection failures, such as a host name that does not resolve, are
+> reported at once.
+
 > **Transport is stateless by default.** Since v0.1.2 the HTTP transport
 > answers each request independently (plain JSON, no `Mcp-Session-Id`
 > required), so any client that points a remote URL at `/mcp`, including
