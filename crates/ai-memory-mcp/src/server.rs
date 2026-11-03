@@ -25,7 +25,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock as Content, Implementation, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -162,7 +162,8 @@ fn push_handoff_omission_marker(
     out.push(marker);
 }
 
-/// Instructions surfaced to clients via `ServerInfo`. Sent on every
+/// Instructions surfaced to clients via `initialize` (as `ServerConfig`)
+/// and, under the MCP 2026-07-28 lifecycle, `server/discover`. Sent on every
 /// MCP handshake so Claude Code / Codex / OpenCode see this in their
 /// session preamble. Maps conversational triggers to tool names so
 /// the agent can route natural-language requests without the user
@@ -7967,14 +7968,19 @@ fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
 
 #[tool_handler]
 impl ServerHandler for AiMemoryServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // `Implementation::from_build_env()` reads CARGO_PKG_NAME/VERSION
         // from *rmcp's* compilation unit, not ours. Patch the fields
         // post-construction so the wire protocol surfaces "ai-memory".
         let mut implementation = Implementation::from_build_env();
         implementation.name = "ai-memory".into();
         implementation.version = env!("CARGO_PKG_VERSION").into();
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        // The pinned version is only the *fallback* rmcp 3 negotiates away
+        // from: a client that `initialize`s with any version this SDK knows
+        // gets its own back, and 2026-07-28 clients never handshake at all
+        // (they `server/discover`, served from `supported_protocol_versions`,
+        // which stays at the SDK default of every known version).
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(implementation)
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(MEMORY_INSTRUCTIONS.to_string())
@@ -7984,11 +7990,14 @@ impl ServerHandler for AiMemoryServer {
     // `call_tool`: every tool invocation passes through here once, which
     // is the single choke point where the caller's client identity is
     // still attached (issue-style: guard the door, not each room).
+    // rmcp 3 widens the return type to the MRTR-aware `CallToolResponse`
+    // (SEP-2322): every tool here completes synchronously, so the router's
+    // `Complete(CallToolResult)` answers pass through unchanged.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         mut context: rmcp::service::RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, McpError> {
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
         // rmcp moves params._meta into RequestContext before dispatch.
         attach_native_session(&mut context.extensions, &context.meta);
         self.record_client_activity(&request.name, &context);
@@ -9417,7 +9426,10 @@ fn default_parts() -> axum::http::request::Parts {
 #[derive(Clone)]
 struct NativeSessionId(String);
 
-fn attach_native_session(extensions: &mut rmcp::model::Extensions, meta: &rmcp::model::Meta) {
+fn attach_native_session(
+    extensions: &mut rmcp::model::Extensions,
+    meta: &rmcp::model::RequestMetaObject,
+) {
     // OpenCode 2 (2.0.4+) sends this on every tools/call, never on
     // initialize. Its transport session is shared per (server, directory).
     let Some(session_id) = meta

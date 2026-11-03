@@ -62,7 +62,7 @@ async fn seeded_with(observation_stream: Option<bool>, session_page: bool) -> Se
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     Seeded {

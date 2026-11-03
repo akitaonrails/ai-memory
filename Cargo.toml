@@ -148,7 +148,10 @@ winapi-util = "0.1"
 # `aws_lc_rs`, which is exactly the C/JNI toolchain the bridge avoids by using
 # rmcp's `reqwest-tls-no-provider`. `ring` is already in the lockfile via reqwest 0.12.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+# rmcp 3.x speaks the MCP 2026-07-28 revision (stateless `server/discover`,
+# per-request `_meta` negotiation) while keeping the legacy `initialize`
+# handshake, so both-era clients connect without a shim (#1924).
+rmcp = { version = "3.8", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Same `http` 1.x rmcp/axum use, so handlers can read the injected

@@ -49,6 +49,15 @@ version in [`docs/changelog/`](docs/changelog/):
   while many repositories bootstrapped. Runs for the same project still wait
   for each other, and the wiki's own commit lock still serialises the git
   commit (#1890).
+- Added MCP 2026-07-28 lifecycle support by moving the server and stdio
+  bridge to rmcp 3.8. The HTTP transport answers `server/discover` and serves
+  requests carrying complete per-request version metadata statelessly, while
+  the legacy `initialize` handshake keeps working for 2024-11-05, 2025-03-26
+  and 2025-06-18 clients; `--http-stateful` now governs only that legacy
+  session mode, and rejects a session-less request with 400 instead of 422. `mcp-bridge` answers a dual-era
+  client's discovery probe itself, absorbs the cancellation such a client can
+  send after timing the probe out, and forwards multi-round tool results
+  without resolving them locally (#1924).
 - Supported optional `AI_MEMORY_LLM_COMPAT_STREAM` (`llm_compat_stream` in `config.toml`)
   to explicitly set the `stream` field for `openai-compat` Chat Completions requests,
   preventing gateways from defaulting to SSE. Both Docker wrappers forward the

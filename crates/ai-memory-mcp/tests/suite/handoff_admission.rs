@@ -170,7 +170,7 @@ async fn build_harness(chain: ai_memory_wiki::AdmissionChain, proxy_auth: bool) 
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true),
     );
     let mut router = Router::new().nest_service("/mcp", mcp_service);
