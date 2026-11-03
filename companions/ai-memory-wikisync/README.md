@@ -126,7 +126,10 @@ This section describes `plan` and `export`; `sync` adds the rules under
   names, `.md` leaf, bounded depth/length) before it is joined onto
   `--dest`; case-fold collisions are refused; symlinked destinations,
   symlinked components and symlinked state directories are refused; files
-  are replaced atomically (tmp + rename + fsync).
+  are replaced atomically through an unpredictably named, exclusively
+  created staging file (tmp + rename + fsync), so a symlink planted in a
+  shared destination can be neither followed nor raced
+  (GHSA-jr85-7366-xrm2).
   On Windows, ordinary absolute and relative destinations are accepted;
   directory junctions and paths through them are still refused.
 - **Local edits win until forced.** Each page is compared three ways:
@@ -260,8 +263,9 @@ ai-memory-wikisync uninstall-hook --dest docs/wiki [--hooks-dir DIR]
   manager.
 - No token is ever written (`--token` is refused; the hook reads
   `AI_MEMORY_AUTH_TOKEN` when it runs), every argument is single-quoted, and
-  newlines or NUL are refused. The file is replaced atomically with mode
-  0755; a symlinked hook is refused, and an existing hook without the block
+  newlines or NUL are refused. The file is replaced atomically, with mode
+  0755, through an unpredictably named, exclusively created staging file;
+  a symlinked hook is refused, and an existing hook without the block
   is refused unless `--append` is given and its shebang is a POSIX shell.
   The companion never runs git.
 

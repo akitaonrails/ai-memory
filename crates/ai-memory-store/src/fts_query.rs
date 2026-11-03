@@ -476,11 +476,11 @@ fn quote_fts5_token(token: &str) -> String {
     // Otherwise emit BOTH the whole token and a punctuation-stripped sub-token
     // phrase, OR'd, because the content tokenizer and the path index disagree
     // on punctuation:
-    //   tokenize = "unicode61 remove_diacritics 2 tokenchars '/_-'"
-    // keeps `/ _ -` INSIDE tokens (so a body mention of `ai-memory` indexes as
+    //   tokenize = "unicode61 remove_diacritics 2 tokenchars '_-'"
+    // keeps `_ -` INSIDE tokens (so a body mention of `ai-memory` indexes as
     // the single token `ai-memory`), while `ops::path_search_text` pre-expands
     // `/ . - _` to spaces in the path index (so a path `ui-refresh-…` indexes
-    // the sub-tokens `ui`, `refresh`, …). `.` is a separator either way.
+    // the sub-tokens `ui`, `refresh`, …). `/` and `.` are separators either way.
     // Neither form alone matches both: `"ai-memory"` matches the content token
     // but not the split path index; `"ai memory"` matches the path but not the
     // content token. OR-ing the two makes a search for `ai-memory` / `ui-refresh`

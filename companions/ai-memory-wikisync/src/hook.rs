@@ -12,12 +12,11 @@
 //! `AI_MEMORY_AUTH_TOKEN` from the environment like any other run.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::{paths, sync};
+use crate::{atomic, paths, sync};
 
 pub const BEGIN_MARKER: &str = "# >>> ai-memory-wikisync >>>";
 pub const END_MARKER: &str = "# <<< ai-memory-wikisync <<<";
@@ -319,37 +318,14 @@ fn merge_hook(existing: Option<&str>, block: &str, append: bool) -> Result<Strin
     Ok(format!("{text}{separator}{block}"))
 }
 
-/// Replace the hook atomically (tmp + fsync + rename) with mode 0755.
+/// Replace the hook atomically (unpredictable tmp + fsync + rename) with
+/// mode 0755. The staging name is unpredictable and exclusively created
+/// (GHSA-jr85-7366-xrm2), so a symlink planted in the hooks directory is
+/// neither followed nor raced.
 fn write_hook(hook: &Path, text: &str) -> Result<()> {
     let dir = hook.parent().context("hook path has no directory")?;
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let tmp = dir.join(".post-merge.wikisync-tmp");
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::new(e))
-                .context(format!("cannot clear stale {}", tmp.display()));
-        }
-    }
-    {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("cannot create {}", tmp.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("cannot make {} executable", tmp.display()))?;
-        }
-        file.write_all(text.as_bytes())
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("cannot sync {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, hook).with_context(|| format!("cannot move {} into place", tmp.display()))
+    atomic::write_atomic(hook, text.as_bytes(), atomic::KeepMode::Exact(0o755))
 }
 
 /// Entry point behind `install-hook`.
@@ -669,6 +645,40 @@ mod tests {
         let err = install(&args).unwrap_err().to_string();
         assert!(err.contains("symlink"), "{err}");
         assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "#!/bin/sh\n");
+    }
+
+    /// GHSA-jr85-7366-xrm2: `write_hook` staged at
+    /// `.post-merge.wikisync-tmp` — predictable, cleared with
+    /// remove-then-create, so a re-planted symlink won the race and was
+    /// created through. The staging name is unpredictable and exclusively
+    /// created now: the canary keeps its bytes, the hook is still installed,
+    /// and the plant is never even removed. With the old code this fails on
+    /// the plant assertion: the remove-then-create dance deleted it.
+    #[cfg(unix)]
+    #[test]
+    fn write_hook_ignores_a_symlink_planted_at_the_old_staging_name() {
+        let (tmp, root) = repo();
+        let victim = tmp.path().join("victim.sh");
+        fs::write(&victim, "#!/bin/sh\nuntouched\n").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".git/hooks/.post-merge.wikisync-tmp"))
+            .unwrap();
+
+        install(&install_args(&root.join("docs/wiki"))).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "#!/bin/sh\nuntouched\n",
+            "the planted symlink was followed"
+        );
+        let hook = fs::read_to_string(hook_of(&root)).unwrap();
+        assert!(hook.contains(BEGIN_MARKER), "{hook}");
+        assert!(
+            fs::symlink_metadata(root.join(".git/hooks/.post-merge.wikisync-tmp"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the predictable staging name was touched"
+        );
     }
 
     #[test]

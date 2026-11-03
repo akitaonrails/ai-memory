@@ -579,6 +579,71 @@ async fn export_apply_writes_files_and_state() {
     }
 }
 
+/// GHSA-jr85-7366-xrm2, end to end: a shared destination holds symlinks
+/// planted at the staging names this tool used to write through
+/// (`.wikisync-tmp-<page>` for page bodies, `state.json.tmp` for the state
+/// save). A full `export --apply` and a following `sync --apply` must write
+/// their real targets only: every canary keeps its bytes and every plant
+/// survives untouched, because no predictable name is ever opened.
+#[cfg(unix)]
+#[tokio::test]
+async fn export_and_sync_apply_ignore_symlinks_planted_at_the_old_staging_names() {
+    let (addr, _fixture) = serve(Fixture::new(fixture_pages())).await;
+    let (tmp, dest) = temp_dest();
+
+    let victim_page = tmp.path().join("victim-page");
+    fs::write(&victim_page, b"untouched page").unwrap();
+    fs::create_dir_all(dest.join("notes")).unwrap();
+    std::os::unix::fs::symlink(&victim_page, dest.join("notes/.wikisync-tmp-a.md")).unwrap();
+    let victim_state = tmp.path().join("victim-state");
+    fs::write(&victim_state, b"untouched state").unwrap();
+    fs::create_dir_all(dest.join(".ai-memory-wikisync")).unwrap();
+    std::os::unix::fs::symlink(
+        &victim_state,
+        dest.join(".ai-memory-wikisync/state.json.tmp"),
+    )
+    .unwrap();
+
+    run(&args(addr, &dest, &["notes"]), Mode::Apply)
+        .await
+        .expect("export applies over the plants");
+
+    assert_eq!(fs::read(&victim_page).unwrap(), b"untouched page");
+    assert_eq!(
+        fs::read(dest.join("notes/a.md")).unwrap(),
+        file("notes/a.md", "# A\nalpha\n")
+    );
+    let state = state::load(&dest).unwrap();
+    assert_eq!(state.pages.len(), 3, "the real state was written");
+    assert_eq!(fs::read(&victim_state).unwrap(), b"untouched state");
+    assert!(
+        fs::symlink_metadata(dest.join("notes/.wikisync-tmp-a.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        fs::symlink_metadata(dest.join(".ai-memory-wikisync/state.json.tmp"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // A sync --apply over the same destination: its export write and state
+    // save run the same staging path, so the plants stay inert here too.
+    sync(addr, &dest).await.expect("sync applies");
+    assert!(dest.join("decisions/0001-db.md").exists());
+    assert_eq!(fs::read(&victim_page).unwrap(), b"untouched page");
+    assert_eq!(fs::read(&victim_state).unwrap(), b"untouched state");
+    assert_eq!(state::load(&dest).unwrap().pages.len(), 4);
+    assert!(
+        fs::symlink_metadata(dest.join(".ai-memory-wikisync/state.json.tmp"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[tokio::test]
 async fn reexport_revalidates_with_etag_and_writes_nothing() {
     let (addr, fixture) = serve(Fixture::new(fixture_pages())).await;
