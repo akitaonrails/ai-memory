@@ -5425,9 +5425,13 @@ async fn process_authorized(
         // The opt-out covers both automatic batons: a session's end and a
         // turn checkpoint, which is OpenCode's only baton since a plugin
         // unload no longer ends its sessions, and Antigravity's since it has
-        // no end event. The checkpoint still refreshes the summary page.
-        let should_create_handoff =
-            !managed && !child_session && state.create_handoff_on_session_end;
+        // no end event. The checkpoint still refreshes the summary page. The
+        // per-execution `auto_handoff=0` flag (#1951) narrows it to this one
+        // session's events; it never creates a baton the server would not.
+        let should_create_handoff = !managed
+            && !child_session
+            && !env.auto_handoff_off
+            && state.create_handoff_on_session_end;
         let handoff = should_create_handoff.then(|| {
             build_auto_handoff(
                 page_ws,
@@ -5576,6 +5580,12 @@ async fn process_authorized(
                     session = %session_id,
                     page = %new_page.path,
                     "session ended; summary page written without a handoff (create_on_session_end disabled)",
+                );
+            } else if env.auto_handoff_off {
+                info!(
+                    session = %session_id,
+                    page = %new_page.path,
+                    "session ended; summary page written without a handoff (auto_handoff=0 for this execution)",
                 );
             } else {
                 // Only reachable through the admission refusal above, which
@@ -18374,6 +18384,106 @@ pub(crate) mod tests {
         assert!(
             !open_handoff_exists(&state).await,
             "create_on_session_end = false must not write a checkpoint baton"
+        );
+    }
+
+    async fn end_claude_session(state: &HookState, tmp: &TempDir, auto_handoff: Option<&str>) {
+        let session = SessionId::new();
+        for event in ["session-start", "user-prompt", "session-end"] {
+            let envelope = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(tmp.path().to_string_lossy().into_owned()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    auto_handoff: auto_handoff.map(str::to_owned),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": session.to_string(),
+                    "cwd": tmp.path(),
+                    "prompt": "Review the parser change",
+                }),
+            );
+            process(state, envelope, None, Vec::new()).await.unwrap();
+        }
+    }
+
+    /// #1951: a headless helper turn opts out of its own automatic baton with
+    /// `auto_handoff=0`, while the server keeps `create_on_session_end` on for
+    /// every other session, in the same project and at the same time.
+    #[tokio::test]
+    async fn auto_handoff_off_skips_only_that_sessions_baton() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        assert!(state.create_handoff_on_session_end);
+        for off in ["0", "false", "OFF", " no "] {
+            end_claude_session(&state, &tmp, Some(off)).await;
+            assert!(
+                !open_handoff_exists(&state).await,
+                "auto_handoff={off} must not create an automatic handoff"
+            );
+        }
+        assert!(
+            !session_pages(&state).await.is_empty(),
+            "the opted-out session still gets its summary page"
+        );
+        // Not a falsy value: the server default applies.
+        end_claude_session(&state, &tmp, Some("1")).await;
+        assert!(
+            open_handoff_exists(&state).await,
+            "auto_handoff=1 keeps the baton"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_handoff_off_leaves_a_concurrent_session_its_baton() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        end_claude_session(&state, &tmp, Some("0")).await;
+        end_claude_session(&state, &tmp, None).await;
+        assert!(
+            open_handoff_exists(&state).await,
+            "an attended session without the flag keeps its automatic baton"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_turn_checkpoint_honours_auto_handoff_off() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = SessionId::new();
+        let text = "Implemented the helper turn";
+        process(
+            &state,
+            opencode_turn_event(&session.to_string(), "user-prompt", text),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let mut stop = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "stop".into(),
+                agent: Some("opencode2".into()),
+                capture_assistant: Some("1".into()),
+                auto_handoff: Some("0".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": text,
+                "turn_checkpoint": true,
+                "_ai_memory_assistant": { "version": 1, "excerpt": text },
+            }),
+        );
+        crate::assistant_capture::apply_assistant_backstop(&mut stop, true);
+        process(&state, stop, None, Vec::new()).await.unwrap();
+        assert!(!session_pages(&state).await.is_empty());
+        assert!(
+            !open_handoff_exists(&state).await,
+            "auto_handoff=0 must not write a checkpoint baton"
         );
     }
 

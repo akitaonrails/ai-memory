@@ -407,7 +407,10 @@ The non-destructive offer-mode rationale is recorded in
 With server-wide `[handoff].create_on_session_end = false`, session end writes
 the summary page and enqueues consolidation but skips creating an automatic
 baton, and an OpenCode or Antigravity turn checkpoint refreshes the page
-without one (#1043). Manual handoffs take precedence;
+without one (#1043). A hook client whose environment sets
+`AI_MEMORY_AUTO_HANDOFF=off` forwards `auto_handoff=0`, which skips that one
+session's automatic baton the same way while leaving every other session on
+the server default (#1951). Manual handoffs take precedence;
 otherwise the newest cwd-eligible automatic handoff is delivered, and that
 same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic

@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a per-execution opt-out of the automatic handoff: a session whose
+  hooks run with `AI_MEMORY_AUTO_HANDOFF=off` still gets its summary page and
+  consolidation but leaves no baton at its end or turn checkpoint, while every
+  other session keeps `[handoff] create_on_session_end`. The native hook, the
+  shell and PowerShell bundles and the generated TypeScript plugins forward it
+  as `auto_handoff=0` (#1951).
 - Pages can name the repository files they describe: `memory_write_page`,
   `memory_write_pages_batch` and the admin write accept an optional
   `source_files: [{path, commit}]` (up to 16 repository-relative paths, 7-64

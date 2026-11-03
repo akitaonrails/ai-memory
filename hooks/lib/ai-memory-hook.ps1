@@ -1082,6 +1082,11 @@ function Invoke-AiMemoryHook {
     if ($env:AI_MEMORY_RUN_ID) {
         $QS += "&managed_run=$([Uri]::EscapeDataString($env:AI_MEMORY_RUN_ID))"
     }
+    # Per-execution opt-out of the automatic handoff (#1951), forwarded only
+    # for an explicit falsy value, as the native hook does.
+    if ($env:AI_MEMORY_AUTO_HANDOFF -and $env:AI_MEMORY_AUTO_HANDOFF.Trim().ToLowerInvariant() -in @("0", "false", "no", "off")) {
+        $QS += "&auto_handoff=0"
+    }
     $SessionQS = ""
     if ($Agent -eq "devin") {
         $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event

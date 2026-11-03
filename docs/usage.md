@@ -124,6 +124,14 @@ create_on_session_end = false
 
 When set to `false`, `SessionEnd` writes `sessions/<id>.md` and queues consolidation as usual, but skips creating an open handoff row (#1043). OpenCode's per-turn checkpoint, which stands in for its session end, likewise refreshes the summary page without creating or refreshing a baton. Explicit batons created with `memory_handoff_begin` and managed workstream runs remain unaffected. Like `claim_on_session_start`, this setting is server-wide.
 
+To skip the automatic handoff for one execution only, such as a headless helper turn (a read-only reviewer, a probe, one step of a scripted relay), set `AI_MEMORY_AUTO_HANDOFF=off` in the environment the harness and its hooks run in:
+
+```bash
+AI_MEMORY_AUTO_HANDOFF=off claude -p "Review the parser change"
+```
+
+The hook forwards it as `auto_handoff=0` on that session's events, so its end (or OpenCode/Antigravity turn checkpoint) writes the summary page and queues consolidation without leaving a baton. Other sessions, including ones running at the same time in the same project, keep the server's `create_on_session_end` behavior. `off`, `0`, `false` and `no` turn it off; any other value, or leaving it unset, changes nothing. It can only remove this session's automatic baton, never create one the server would not. The native `ai-memory hook`, the shell and PowerShell hook bundles and the generated TypeScript plugins all read it (#1951).
+
 ## Compaction recovery
 
 When Claude Code or Codex compact their working context, the

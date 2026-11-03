@@ -254,7 +254,7 @@ Defined by `EntropyFilterConfig` in `ai-memory-consolidate`. A skipped page is l
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
 | `claim_on_session_start` | `true` | `AI_MEMORY_HANDOFF__CLAIM_ON_SESSION_START` | Claim a pending handoff automatically at SessionStart. `false` renders a notice and waits for `memory_handoff_accept`. |
-| `create_on_session_end` | `true` | `AI_MEMORY_HANDOFF__CREATE_ON_SESSION_END` | Create an automatic open handoff when an unmanaged session ends. |
+| `create_on_session_end` | `true` | `AI_MEMORY_HANDOFF__CREATE_ON_SESSION_END` | Create an automatic open handoff when an unmanaged session ends. A hook client running with `AI_MEMORY_AUTO_HANDOFF=off` skips it for that execution only (see `docs/usage.md`). |
 
 ## `[profile]`
 

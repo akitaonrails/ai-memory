@@ -23,6 +23,7 @@ export HOME
 CALLER_SPOOL="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$ORIG_HOME/.local/share}/ai-memory}/hook-spool"
 unset AI_MEMORY_DATA_DIR XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME
 unset AI_MEMORY_RUN_ID AI_MEMORY_MANAGED_WORKSTREAM_ID AI_MEMORY_MANAGED_WORKSTREAM_NAME
+unset AI_MEMORY_AUTO_HANDOFF
 trap 'rm -rf "$TMP"; HOME=$ORIG_HOME' EXIT
 
 assert_eq() {
@@ -524,6 +525,15 @@ assert_eq "marker_qs forwards [profile] contribute and consume" \
 assert_eq "marker_qs sends explicit [profile] defaults when a marker omits the keys" \
     "&cwd=$(ai_memory_url_encode "$TMP/profile-only")&workspace=outer&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/profile-only")"
+# AI_MEMORY_AUTO_HANDOFF=off opts this execution out of the automatic handoff
+# (#1951); only an explicit falsy value is forwarded, next to the managed run.
+assert_eq "auto handoff unset sends nothing" "" "$(ai_memory_managed_qs)"
+assert_eq "auto handoff off is forwarded" "&auto_handoff=0" \
+    "$(AI_MEMORY_AUTO_HANDOFF=' Off ' ai_memory_managed_qs)"
+assert_eq "auto handoff on sends nothing" "" "$(AI_MEMORY_AUTO_HANDOFF=on ai_memory_managed_qs)"
+assert_eq "auto handoff rides with the managed run" "&managed_run=r1&auto_handoff=0" \
+    "$(AI_MEMORY_RUN_ID=r1 AI_MEMORY_AUTO_HANDOFF=0 ai_memory_managed_qs)"
+
 # `[handoff] deliver_on_session_start = false` is sent as &handoff=0 only when
 # explicitly falsy, and a [handoff]-only marker is a settings boundary.
 mkdir -p "$TMP/handoff-off/inner" "$TMP/handoff-on"
