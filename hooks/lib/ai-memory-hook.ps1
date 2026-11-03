@@ -796,15 +796,15 @@ function Invoke-AiMemoryDrainSpool {
         $code = 0
         $NoProxy = Get-AiMemoryNoProxy
         try {
-            Invoke-WebRequest @NoProxy `
+            $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
                 -Uri ([string]$entry.url) `
                 -Headers $headers `
                 -ContentType "application/json" `
-                -Body ([Text.Encoding]::UTF8.GetBytes([string]$entry.body)) | Out-Null
-            $code = 200
+                -Body ([Text.Encoding]::UTF8.GetBytes([string]$entry.body))
+            $code = Get-AiMemoryResponseStatus $Response
         } catch {
             $response = $_.Exception.Response
             if ($response) {
@@ -911,11 +911,29 @@ function Clear-AiMemorySessionId {
 # ALL_PROXY proxy even for a loopback URL, so a sandbox with an empty NO_PROXY
 # (ai-jail) routes the hook to a proxy that answers 4xx. -NoProxy (PowerShell
 # 6+) connects directly, as the native hook and the shell bundle do. Windows
-# PowerShell 5.1 reads no environment proxy and has no -NoProxy. Splat the
-# result into every Invoke-WebRequest.
+# PowerShell 5.1 reads no environment proxy and has no -NoProxy.
+#
+# MaximumRedirection 0 matches the native hook (`Policy::none`) and the
+# generated TypeScript integrations (`redirect: "error"`): a 3xx from an SSO
+# portal, proxy or captive portal must not be followed, so a login page's 200
+# cannot count as delivery, a 307/308 cannot replay the POST, and a 302 body
+# cannot be injected as a handoff. Splat the result into every Invoke-WebRequest.
 function Get-AiMemoryNoProxy {
-    if ($PSVersionTable.PSVersion.Major -ge 6) { return @{ NoProxy = $true } }
-    return @{}
+    $splat = @{ MaximumRedirection = 0 }
+    if ($PSVersionTable.PSVersion.Major -ge 6) { $splat['NoProxy'] = $true }
+    return $splat
+}
+
+# Status of a completed Invoke-WebRequest. Windows PowerShell 5.1 can return
+# a 3xx object instead of throwing when MaximumRedirection is 0; PowerShell 7
+# throws. Mocks that omit StatusCode keep the historical "did not throw means
+# 2xx" default so existing tests stay valid.
+function Get-AiMemoryResponseStatus {
+    param($Response, [int] $Default = 200)
+    if ($null -eq $Response) { return $Default }
+    $code = $Response.StatusCode
+    if ($null -eq $code) { return $Default }
+    try { return [int]$code } catch { return $Default }
 }
 
 function Read-AiMemoryStdin {
@@ -1092,15 +1110,20 @@ function Invoke-AiMemoryHook {
         $HookUrl = "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS&ingest_key=ps$([Guid]::NewGuid().ToString('N').Substring(0, 16))"
         $NoProxy = Get-AiMemoryNoProxy
         try {
-            Invoke-WebRequest @NoProxy `
+            $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 3 `
                 -Method Post `
                 -Uri $HookUrl `
                 -Headers $Headers `
                 -ContentType "application/json; charset=utf-8" `
-                -Body $BodyBytes | Out-Null
-            Invoke-AiMemoryKickDrain
+                -Body $BodyBytes
+            $Status = Get-AiMemoryResponseStatus $Response
+            if ($Status -ge 200 -and $Status -lt 300) {
+                Invoke-AiMemoryKickDrain
+            } elseif ($Status -lt 400 -or $Status -ge 500 -or $Status -eq 408 -or $Status -eq 425 -or $Status -eq 429) {
+                Write-AiMemorySpoolEvent -Url $HookUrl -Body $Payload
+            }
         } catch {
             $Status = 0
             if ($_.Exception.Response) {
@@ -1133,7 +1156,8 @@ function Invoke-AiMemoryHook {
                         -TimeoutSec 2 `
                         -Uri "$Server/brief?agent=$Agent$QS$BriefQS" `
                         -Headers $Headers
-                    if ($null -ne $Response -and $Response.Content) {
+                    $Status = Get-AiMemoryResponseStatus $Response
+                    if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {
                         $Wrapped = @{
                             hookSpecificOutput = @{
                                 hookEventName = "SubagentStart"
@@ -1247,7 +1271,8 @@ function Invoke-AiMemoryHook {
                 -TimeoutSec 2 `
                 -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
                 -Headers $Headers
-            if ($null -ne $Response -and $Response.Content) {
+            $Status = Get-AiMemoryResponseStatus $Response
+            if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {
                 if ($GrokPostTool) {
                     $Wrapped = @{
                         hookSpecificOutput = @{

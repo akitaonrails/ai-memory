@@ -18988,6 +18988,102 @@ mod tests {
         assert!(!stored.body.contains("lost"));
     }
 
+    /// Replacing a section while appending to its last nested section used to
+    /// delete the nested heading and report success. The batch now fails as
+    /// overlapping and the stored page keeps its body and version.
+    #[tokio::test]
+    async fn memory_patch_page_refuses_an_edit_inside_a_replaced_section() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let body = "# Plan\n## One\nold\n### Child\nkept\n## Two\nother\n";
+        let write = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "notes/plan.md".into(),
+                    body: body.into(),
+                    title: None,
+                    tier: None,
+                    tags: Vec::new(),
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let page_id = call_tool_json(write)["page_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let read = || {
+            server.memory_read_page(
+                Parameters(ReadPageArgs {
+                    path: Some("notes/plan.md".into()),
+                    query: None,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    include_related: false,
+                    related_depth: None,
+                    max_chars: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+        };
+        let page = call_tool_json(read().await.unwrap());
+        let section_sha256 = page["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["anchor"] == "One")
+            .unwrap()["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let error = server
+            .memory_patch_page(
+                Parameters(PatchPageArgs {
+                    path: "notes/plan.md".into(),
+                    expected_page_id: page_id.clone(),
+                    edits: vec![
+                        crate::page_patch::PagePatchEdit::ReplaceSection {
+                            anchor: "One".into(),
+                            section_sha256,
+                            content: "new".into(),
+                        },
+                        crate::page_patch::PagePatchEdit::Append {
+                            target: crate::page_patch::AppendTarget::Section,
+                            anchor: Some("Child".into()),
+                            content: "lost".into(),
+                        },
+                    ],
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.data.unwrap()["reason"], "overlapping_edits");
+        let stored = server
+            .wiki
+            .as_ref()
+            .unwrap()
+            .read_page(ws, proj, &PagePath::new("notes/plan.md").unwrap())
+            .unwrap();
+        assert_eq!(stored.body, body);
+        let after = call_tool_json(read().await.unwrap());
+        assert_eq!(after["page_id"], page_id);
+    }
+
     #[tokio::test]
     async fn memory_patch_page_requires_write_access_and_one_concurrent_writer_wins() {
         let (tmp, store, server, _ws, proj) = setup_server().await;

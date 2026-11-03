@@ -20,6 +20,112 @@ version in [`docs/changelog/`](docs/changelog/):
   envelope beside the CLI `tool_call` shape, and `[capture] ignore_paths`
   matches `read_files` `files[].path` and `run_commands` `commands` (#1950).
 
+- The generated OpenCode 2 plugin now retries a failed startup-context
+  (`/handoff`) fetch at most three times per root session. It used to retry on
+  every model request, and the `context` hook fires on each one, so a server
+  slower than the 1 s fetch timeout received a new request, and kept a busy
+  read worker, per model call. On a 3.3.0 server with a slow
+  interrupted-session lookup this grew `serve` by a few blocked threads a
+  minute until a restart (#1953).
+
+- Rule pages whose titles mix scripts no longer share one path. The rule
+  slugger kept only a title's ASCII letters and digits, so `ACME 客户周报的
+  格式与范围` and every other rule whose title shared the word `ACME` collapsed
+  onto `_rules/acme.md`, and each consolidation of the later one superseded
+  the earlier page. When the fold drops any letter or digit, the slug now
+  carries an 8-hex digest of the title (the same mechanism as the
+  `rule-<hex>` fallback): different titles keep different pages, a
+  restatement keeps updating its own, and a pure-ASCII title keeps its old
+  slug. Profile entry slugs take the same digest and now fold Latin
+  diacritics like rule titles do; a statement with no ASCII at all names
+  itself by digest instead of every such statement landing on `entry`. Two
+  rules in one batch that still slug alike, such as two long titles
+  truncating into one 60-char window, are renamed apart before the batch
+  writes rather than the second silently superseding the first. And when
+  a page's final path moves away from the path the model proposed, the
+  rule routing and the rename above being the usual reasons, wikilinks in
+  the same batch that target the proposed path are rewritten to the final
+  path, so sibling pages no longer link to a page that never exists;
+  same-project links are allowed to dangle, so no later pass repaired
+  them (#1943).
+
+- Full-text search now finds a page or observation that names a file with its
+  directory (`crates/store/src/ops.rs`) when the query is the file name
+  (`ops.rs`, `ops` or `src/ops.rs`). `/` is no longer an FTS token character,
+  so a path splits into words like the rest of the text; `_` and `-` still keep
+  identifiers whole. Both indexes rebuild once on upgrade (#1921).
+
+- `serve` no longer exits at startup, on any platform, when the wiki git
+  repository is owned by another account (libgit2 `code=Owner`, for example a
+  data directory created from an elevated shell or with `sudo`), including
+  while the OKF wiki migration is pending. Capture and search keep working, as
+  `docs/windows.md` describes, and startup logs the owner failure at ERROR with
+  the remedy; wiki commits keep failing until ownership is fixed (#1923).
+
+- Consolidation now waits for an LLM provider's `Retry-After` hint before
+  retrying after a rate limit or transient error, capped at 32 seconds, matching
+  the policy used by bootstrap chunks (#1889), remote embedders (#1397) and the
+  fallback chain (#1619). A rate-limited provider answering `429` with a hint
+  longer than the fixed 2-second delay is no longer retried prematurely before
+  its window has reset (#1928).
+
+- The PowerShell hook bundle no longer follows HTTP redirects, matching the
+  native hook client (#1818) and the generated TypeScript integrations
+  (#1903). Behind an SSO gateway, proxy or captive portal that redirects to
+  a login page, `Invoke-WebRequest`'s default of five hops treated the page's
+  `200` as a delivery: the spool drain deleted the event, a `307` or `308`
+  replayed the POST (and `Authorization`) to the redirect target, and a `302`
+  body could be injected as a handoff. The bundle now sets
+  `MaximumRedirection` to 0 and treats a non-2xx status as undelivered, so
+  the event stays spooled and no handoff is injected (#1930).
+
+- The thin CLI HTTP client no longer follows redirects, matching the native
+  hook client (#1818) and `ai-memory auth` (`Policy::none()`). Behind an SSO
+  gateway, proxy or captive portal, `reqwest::Client::new()` followed a 302
+  to a login page: `ai-memory backup` wrote that HTML as the gzip tarball,
+  JSON helpers parsed the page instead of reporting the 302, and a `307` or
+  `308` replayed the request body to the `Location` origin. A 3xx now fails
+  closed and the previous backup file is left in place; session finalization
+  and backfill's explicit-server bearer resolution share the same client
+  (#1932).
+
+- Recorded failed Cursor tool calls as failures. Cursor's
+  `postToolUseFailure` carries `error_message` and `failure_type`, not the
+  `error` string ai-memory read, so a call that failed or timed out was stored
+  as `outcome: unknown` with no text, and the session summary's failed count,
+  the `## Failed tool calls` section and the handoff's `Last failed tool call`
+  line all skipped it. Such a call now records `outcome: error` with Cursor's
+  error message; a denied call keeps its message and stays `unknown`. The
+  event was already wired, so no reinstall is needed (#1937).
+
+- Kept `memory_patch_page` edits where their anchors point. An `add_section`
+  listed before an append to the last section put the appended text under the
+  new heading, and replacing a section while appending to its last nested
+  section deleted that nested section and still reported success. Edits that
+  land at the same place now apply in one order whatever the request order
+  (text for an existing section, then `end_of_page`, then new sections), and an
+  edit to any section inside a replaced one fails the batch as
+  `overlapping_edits`. The durable-pages skill also told agents to use
+  `append_to_section`, which the tool rejects; it now names `append` and its
+  two targets (#1939).
+
+- Kept real-time hook capture working after Claude Code `/clear` in an
+  ID-selected managed run. The clear boundary links the new native session
+  while preserving checkout, operator, project and lease checks; replaying an
+  older session cannot move the run backward (#1936).
+
+### Security
+
+- `ai-memory-wikisync` now stages every file it replaces (exported pages,
+  the export state file and the git `post-merge` hook) under an
+  unpredictable name created exclusively, instead of a fixed staging name
+  opened with `File::create` or a remove-then-create pair. In a
+  destination shared with other accounts, a symlink planted at one of the
+  old predictable staging names could make an apply overwrite a file of
+  the planter's choosing, or win the narrow race those two writes left;
+  planted symlinks are now neither followed nor raced.
+  ([GHSA-jr85-7366-xrm2](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jr85-7366-xrm2))
+
 ## [3.3.1] - 2026-11-01
 
 ### Fixed
