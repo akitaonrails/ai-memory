@@ -470,8 +470,8 @@ async fn expired_pages_do_not_make_a_project_look_established() {
 
 /// Harvest, list, status and the digest used to stop at 200 pages in path
 /// order. A later category then vanished from those views, and the harvester
-/// treated its ledger rows as removed by the user. The whole-scope reads keep
-/// the page after that old cap; an explicit `Some(200)` still stops there.
+/// treated its ledger rows as removed by the user. Every read keeps the page
+/// after that old cap.
 #[tokio::test]
 async fn profile_reads_keep_pages_past_the_old_two_hundred_path_cap() {
     let tmp = tempfile::tempdir().unwrap();
@@ -517,22 +517,9 @@ async fn profile_reads_keep_pages_past_the_old_two_hundred_path_cap() {
         "harvester read dropped the page after the old path cap"
     );
 
-    let capped = store
-        .reader
-        .profile_entries(global.workspace_id, global.project_id, Some(200))
-        .await
-        .unwrap();
-    assert_eq!(capped.len(), 200);
-    assert!(
-        capped
-            .iter()
-            .all(|entry| entry.path != "profile/workflow/ship.md"),
-        "an explicit 200-row cap still stops in path order"
-    );
-
     let all = store
         .reader
-        .profile_entries(global.workspace_id, global.project_id, None)
+        .profile_entries(global.workspace_id, global.project_id)
         .await
         .unwrap();
     assert_eq!(all.len(), 201);

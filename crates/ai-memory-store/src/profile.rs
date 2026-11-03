@@ -116,25 +116,19 @@ pub(crate) fn contribute_opt_outs(conn: &Connection) -> StoreResult<Vec<ProfileO
 }
 
 /// The current, unexpired `profile/` pages of a scope, as digest entries.
-/// Pages with nothing to state are skipped. `limit` caps the SQL read when
-/// set; `None` returns every matching page. SQLite treats a negative LIMIT as
-/// unbounded, which is how the digest, list, status and apply paths load a
-/// scope that has grown past the old 200-row cap (#1946).
+/// Pages with nothing to state are skipped. The read has no row cap: list,
+/// status and apply show the whole scope, and the digest's byte budget, not
+/// path order, decides what a session start leaves out (#1946).
 pub(crate) fn profile_entries(
     conn: &Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
-    limit: Option<usize>,
 ) -> StoreResult<Vec<ProfileEntry>> {
-    let limit = match limit {
-        Some(n) => i64::try_from(n.max(1)).unwrap_or(i64::MAX),
-        None => -1,
-    };
     let sql = format!(
         "SELECT path, title, body, frontmatter_json FROM pages \
          WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 \
            AND path GLOB ?3{not_expired} \
-         ORDER BY path ASC LIMIT ?5",
+         ORDER BY path ASC",
         not_expired = not_expired("pages", "?4"),
     );
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -143,8 +137,7 @@ pub(crate) fn profile_entries(
             workspace_id.as_bytes(),
             project_id.as_bytes(),
             format!("{PROFILE_PATH_PREFIX}*"),
-            now_us(),
-            limit
+            now_us()
         ],
         |row| {
             Ok((
