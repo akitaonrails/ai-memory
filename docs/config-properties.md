@@ -58,7 +58,7 @@ An array of tables. Each entry is tried in order after the primary provider, onl
 | `provider` | empty (required) | - | Provider for this candidate, using the same names as `llm_provider`. |
 | `model` | empty (required) | - | Model id for this candidate. |
 | `base_url` | unset | - | Endpoint override for this candidate. Required for `openai-compat`. |
-| `api_key_env` | unset | - | Name of the environment variable holding this candidate's key. Required unless the provider has a native credential source. |
+| `api_key_env` | unset | - | Name of the environment variable holding this candidate's key. Required unless the provider has a native credential source. `copilot` and `anthropic-oauth` use the named key instead of their native token; `openai-oauth`, `codex` and `cursor` reject it. |
 
 ## `[llm.<task>]`
 
@@ -300,7 +300,7 @@ Defined by `ProfileSettings` in `ai-memory-core`.
 | `baseline_max_bytes` | `6000` (`DEFAULT_BASELINE_MAX_BYTES`) | `AI_MEMORY_PROFILE__BASELINE_MAX_BYTES` | Digest budget for a project with no pages yet, clamped to 2000 through 20000. |
 | `apply_max_lines` | `40` (`DEFAULT_APPLY_MAX_LINES`) | `AI_MEMORY_PROFILE__APPLY_MAX_LINES` | Most lines `ai-memory profile apply` writes into a rules file. |
 | `max_output_tokens` | `2000` (`DEFAULT_MAX_OUTPUT_TOKENS`) | `AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS` | Output-token allowance for one profile LLM call (classification and merge). Raise it when the provider spends part of the budget before the structured JSON, e.g. a thinking model, and the call fails with `finish_reason=length`. |
-| `llm` | `true` | `AI_MEMORY_PROFILE__LLM` | Use the configured LLM provider for the profile when there is one. |
+| `llm` | `true` | `AI_MEMORY_PROFILE__LLM` | Use the configured LLM provider for the profile when there is one. An [`[llm.profile]`](#llmtask) table gives the classify and merge calls their own provider and model. |
 
 ## `[sanitize]`
 

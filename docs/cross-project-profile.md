@@ -267,6 +267,23 @@ always your own sentence, never model text. If a call fails, the pass falls
 back to the zero-LLM path for that batch; without a provider the profile works
 the same way, with the word lists and the newest statement.
 
+Classify and merge use the server's default provider unless an `[llm.profile]`
+table names another. This lets the profile run a stronger model than routine
+consolidation:
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-haiku-4-5"     # consolidation and everything else
+
+[llm.profile]
+provider = "anthropic"             # required; credentials come from ANTHROPIC_API_KEY
+model = "claude-sonnet-4-5"        # classify and merge only
+```
+
+The profile chain does not include the global `[[llm_fallbacks]]`. Add
+`[[llm.profile.fallbacks]]` entries for that. See
+[`config-properties.md`](config-properties.md#llmtask) for every key.
+
 ### Correcting a wrong entry
 
 - **Remove it:** `ai-memory profile forget <path>`. The harvester remembers the

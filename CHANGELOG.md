@@ -117,6 +117,16 @@ version in [`docs/changelog/`](docs/changelog/):
 - Allowed MCP agents to address messages to a registered harness and record
   the sender harness (#1935).
 
+### Changed
+
+- `[[llm_fallbacks]]` entries now honor `api_key_env` for `copilot` and
+  `anthropic-oauth`, which used to ignore it and send the native token.
+  `openai-oauth`, `codex` and `cursor` have no key to override, so an entry
+  for one of them that sets `api_key_env` now fails `ai-memory serve` startup
+  instead of silently ignoring the variable; remove the key to keep the native
+  login. A `copilot` fallback's `base_url` now also sets its API endpoint when
+  `COPILOT_API_URL` is unset (#1969).
+
 ## [3.3.2] - 2026-11-03
 
 ### Fixed
