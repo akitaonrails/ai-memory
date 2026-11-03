@@ -340,6 +340,18 @@ const SERVER_WAIT: Duration = Duration::from_secs(3);
 /// The pause between connection attempts while waiting.
 const SERVER_WAIT_POLL: Duration = Duration::from_millis(200);
 
+/// `server_url` as an error message may print it: without the `user:pass@`
+/// userinfo a URL can carry, and never the raw text of one that does not
+/// parse (it could hold that userinfo in a form the parser rejects).
+fn display_server_url(server_url: &str) -> String {
+    let Ok(mut url) = reqwest_mcp::Url::parse(server_url) else {
+        return "the configured server URL".to_owned();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
+}
+
 /// Wait, at most `budget`, until something accepts TCP connections at
 /// `server_url`'s host and port, retrying only while the port refuses
 /// (the window a restarting service leaves). Any other failure, and a port
@@ -375,11 +387,12 @@ async fn wait_for_server(server_url: &str, budget: Duration, poll: Duration) -> 
             Err(_elapsed) => "the connection attempt timed out".to_owned(),
         };
         anyhow::bail!(
-            "could not reach the ai-memory server at {server_url}: {cause} (gave up after \
+            "could not reach the ai-memory server at {}: {cause} (gave up after \
              waiting {}s). Check the server is running (`ai-memory status`; on a service \
              install, `systemctl --user status ai-memory` or the launchd agent) and that this \
              entry points at it: the bridge connects to `--server-url`, else the configured \
              server (AI_MEMORY_SERVER_URL).",
+            display_server_url(server_url),
             budget.as_secs_f32()
         );
     }
@@ -413,7 +426,8 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
             let refused = format!("{error:#}").contains("Auth required");
             return Err(error).with_context(|| {
                 format!(
-                    "connecting the MCP bridge to {server_url}{}{}",
+                    "connecting the MCP bridge to {}{}{}",
+                    display_server_url(&server_url),
                     if refused {
                         ": the server answered 401 Unauthorized"
                     } else {
@@ -593,6 +607,32 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "unbounded wait: {elapsed:?}"
         );
+    }
+
+    /// The unreachable-server diagnosis never prints the `user:pass@`
+    /// userinfo a configured URL may carry, nor the raw text of a URL that
+    /// does not parse.
+    #[tokio::test]
+    async fn the_unreachable_diagnosis_strips_userinfo_from_the_url() {
+        let address = refusing_address().await;
+        let url = format!("http://alice:hunter2@{address}/mcp");
+        let error = wait_for_server(&url, Duration::from_millis(100), Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "could not reach the ai-memory server at http://{address}/mcp"
+            )),
+            "{message}"
+        );
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(!message.contains("alice"), "{message}");
+        assert_eq!(
+            display_server_url("http://user:secret@[::1]:9/mcp"),
+            "http://[::1]:9/mcp"
+        );
+        assert!(!display_server_url("not a url user:secret@").contains("secret"));
     }
 
     /// #1947: a server that comes up inside the bound (a service restart) is

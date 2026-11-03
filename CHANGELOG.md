@@ -43,7 +43,8 @@ version in [`docs/changelog/`](docs/changelog/):
   a client opened during a service restart lost its memory tools for the whole
   session. The bridge now retries a refused connection for up to 3 seconds,
   and when nothing answers it reports `could not reach the ai-memory server
-  at <url>` with a pointer to check the server, instead of rmcp's
+  at <url>` (with any `user:pass@` stripped from the URL) and a pointer to
+  check the server, instead of rmcp's
   `error sending request ... when send initialize request` under a bearer
   token hint that had nothing to do with it (#1947).
 
