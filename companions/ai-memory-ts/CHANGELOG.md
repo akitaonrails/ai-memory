@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `pages.write`, `pages.writeBatch` and `pages.update` accept `sourceFiles`
+  (sent as `source_files`), the repository files a page describes with the
+  commit it was checked against; `pages.update` carries it over. (#1957)
+
 ### Fixed
 
 - Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes

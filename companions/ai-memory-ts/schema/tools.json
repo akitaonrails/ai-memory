@@ -1048,6 +1048,24 @@
           "string"
         ]
       },
+      "source_files": {
+        "items": {
+          "properties": {
+            "commit": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "commit",
+            "path"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
       "tags": {
         "items": {
           "type": "string"
@@ -1145,6 +1163,24 @@
                 "type": "array"
               },
               "type": "object"
+            },
+            "source_files": {
+              "items": {
+                "properties": {
+                  "commit": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "commit",
+                  "path"
+                ],
+                "type": "object"
+              },
+              "type": "array"
             },
             "tags": {
               "items": {

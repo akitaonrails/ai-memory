@@ -67,6 +67,14 @@ export type ExistingProjectTarget =
 // Pages
 // ---------------------------------------------------------------------------
 
+/** A repository file a page describes, and the commit it was checked against. */
+export interface PageSourceFile {
+  /** Repository-relative path with `/` separators. */
+  path: string;
+  /** Commit id, 7-64 hex characters; the server stores it lowercased. */
+  commit: string;
+}
+
 /**
  * Page metadata a write sets. A write replaces the whole page: metadata the
  * call omits is cleared, not inherited. Use {@link PagesNamespace.update} to
@@ -91,6 +99,12 @@ export interface PageMetadata {
   relations?: Partial<Record<RelationName, string[]>>;
   /** TTL: an RFC 3339 instant or a bare `YYYY-MM-DD` date. Expired pages are hidden. */
   expiresAt?: string;
+  /**
+   * Up to 16 repository files the page describes. The server stores them and
+   * never reads the files; compare each with your checkout and record `stale`
+   * feedback when one changed.
+   */
+  sourceFiles?: PageSourceFile[];
 }
 
 /** Arguments of {@link PagesNamespace.write}. */

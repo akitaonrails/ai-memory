@@ -61,6 +61,27 @@ always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
 
+## Recipe: notice when a page's code has changed
+
+> "Remember this deploy gotcha; it is about `bin/deploy.sh`."
+
+Your agent can pass `source_files` to `memory_write_page`: the repository
+files the page describes, each with the commit it was checked against
+(`[{"path": "bin/deploy.sh", "commit": "3f2a9c1"}]`, up to 16). The server
+stores the list in the page's frontmatter and never opens the files, so it
+works the same against a remote or containerized server. To check a page, read
+it, then run this from the checkout for each entry:
+
+```bash
+git --literal-pathspecs diff --quiet 3f2a9c1 -- bin/deploy.sh
+```
+
+A non-zero exit, or a path that no longer exists, means the file changed:
+record `memory_feedback` with `signal: "stale"` and a reason such as
+`source-changed: bin/deploy.sh since 3f2a9c1`. The page drops in rank and shows
+up as a `feedback_flagged` finding in `memory_lint`. Rewriting the page with
+the new commit clears the flag.
+
 ## Recipe: stop re-explaining your habits in every new project
 
 > "In all my projects: use pnpm, keep integration tests in tests/suite."

@@ -140,6 +140,7 @@ describe("pages against a real server", () => {
       kind: "howto",
       abstract: "short",
       expiresAt: "2099-01-01",
+      sourceFiles: [{ path: "bin/deploy.sh", commit: "3F2A9C1" }],
     });
     const updated = await memory.pages.update("notes/meta.md", (current) => ({
       body: `${current.body}\nsecond`,
@@ -153,6 +154,9 @@ describe("pages against a real server", () => {
     assert.equal(page.frontmatter["kind"], "howto");
     assert.equal(page.frontmatter["abstract"], "short");
     assert.equal(page.frontmatter["expires_at"], "2099-01-01");
+    assert.deepEqual(page.frontmatter["source_files"], [
+      { path: "bin/deploy.sh", commit: "3f2a9c1" },
+    ]);
 
     await assert.rejects(
       memory.pages.update("notes/meta.md", async () => {

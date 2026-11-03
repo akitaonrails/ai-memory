@@ -58,7 +58,13 @@ describe("pages", () => {
     const result = await memory.pages.writeBatch({
       target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
       pages: [
-        { path: "notes/a.md", body: "# A", createOnly: true, tags: ["import"] },
+        {
+          path: "notes/a.md",
+          body: "# A",
+          createOnly: true,
+          tags: ["import"],
+          sourceFiles: [{ path: "src/a.rs", commit: "3f2a9c1" }],
+        },
         { path: "notes/b.md", body: "# B", expectedPageId: payloads.PAGE_ID },
       ],
     });
@@ -66,7 +72,13 @@ describe("pages", () => {
       workspace: "demo",
       project_id: payloads.resolvedWriteTarget.project_id,
       pages: [
-        { path: "notes/a.md", body: "# A", create_only: true, tags: ["import"] },
+        {
+          path: "notes/a.md",
+          body: "# A",
+          create_only: true,
+          tags: ["import"],
+          source_files: [{ path: "src/a.rs", commit: "3f2a9c1" }],
+        },
         { path: "notes/b.md", body: "# B", expected_page_id: payloads.PAGE_ID },
       ],
     });
@@ -91,6 +103,7 @@ describe("pages", () => {
       body: "# Retry policy",
       tags: ["a"],
       expiresAt: "2099-01-01",
+      sourceFiles: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expectedPageId: payloads.PAGE_ID,
     });
     assert.deepEqual(server.lastArgs(), {
@@ -100,6 +113,7 @@ describe("pages", () => {
       body: "# Retry policy",
       tags: ["a"],
       expires_at: "2099-01-01",
+      source_files: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expected_page_id: payloads.PAGE_ID,
     });
     assert.equal(result.pageId, payloads.NEXT_PAGE_ID);
@@ -276,6 +290,7 @@ describe("pages", () => {
       entities: ["foo bar"],
       relations: { fixes: ["notes/a.md"] },
       expires_at: "2099-01-01",
+      source_files: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expected_page_id: payloads.PAGE_ID,
     });
   });
@@ -762,6 +777,7 @@ describe("wire names", () => {
         abstract: "a",
         relations: { fixes: ["x"] },
         expiresAt: "2099-01-01",
+        sourceFiles: [{ path: "p", commit: "3f2a9c1" }],
         expectedPageId: "v",
       }),
       memory.pages.write({ path: "p", body: "b", createOnly: true }),
