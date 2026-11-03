@@ -1,7 +1,7 @@
 //! The cross-project profile's store side
 //! (`docs/design-cross-project-profile.md`): where each share mode lives, the
-//! reserved-name rules, the per-project `[profile]` flags, and the bounded
-//! digest reads. The isolation half is adversarial: a private profile must
+//! reserved-name rules, the per-project `[profile]` flags, and the digest
+//! reads. The isolation half is adversarial: a private profile must
 //! refuse every other operator, and a shared one must refuse writes from a
 //! database user without a grant.
 
@@ -465,5 +465,79 @@ async fn expired_pages_do_not_make_a_project_look_established() {
     assert!(
         inputs.project_has_pages,
         "one unexpired page means the project has memory"
+    );
+}
+
+/// Harvest, list, status and the digest used to stop at 200 pages in path
+/// order. A later category then vanished from those views, and the harvester
+/// treated its ledger rows as removed by the user. Every read keeps the page
+/// after that old cap.
+#[tokio::test]
+async fn profile_reads_keep_pages_past_the_old_two_hundred_path_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let global = ai_memory_store::create_global_scope(&store.writer)
+        .await
+        .unwrap();
+
+    for i in 0..200 {
+        let path = format!("profile/habits/h{i:03}.md");
+        store
+            .writer
+            .upsert_page(profile_page(
+                global.workspace_id,
+                global.project_id,
+                &path,
+                "Always keep pull requests small.",
+            ))
+            .await
+            .unwrap();
+    }
+    store
+        .writer
+        .upsert_page(profile_page(
+            global.workspace_id,
+            global.project_id,
+            "profile/workflow/ship.md",
+            "Ship a patch as soon as it is ready.",
+        ))
+        .await
+        .unwrap();
+
+    let (pages, _) = store
+        .reader
+        .profile_scope_pages(global.workspace_id, global.project_id)
+        .await
+        .unwrap();
+    assert_eq!(pages.len(), 201);
+    assert!(
+        pages
+            .iter()
+            .any(|page| page.path == "profile/workflow/ship.md"),
+        "harvester read dropped the page after the old path cap"
+    );
+
+    let all = store
+        .reader
+        .profile_entries(global.workspace_id, global.project_id)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 201);
+    assert!(
+        all.iter()
+            .any(|entry| entry.path == "profile/workflow/ship.md")
+    );
+
+    let inputs = store
+        .reader
+        .profile_digest_inputs(global.as_tuple(), global.as_tuple())
+        .await
+        .unwrap();
+    assert_eq!(inputs.entries.len(), 201);
+    assert!(
+        inputs
+            .entries
+            .iter()
+            .any(|entry| entry.path == "profile/workflow/ship.md")
     );
 }

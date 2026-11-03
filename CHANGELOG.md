@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Profile harvest, list, status and the session-start digest read every
+  current `profile/` page in the scope. The previous 200-row path-order cap
+  dropped later categories from those views and made the harvester treat the
+  unread pages as forgotten (#1946, #1955).
+
 - Cline 3.0.74 tool observations now classify ClineCore names (`read_files`,
   `run_commands`, `editor`, and the other built-ins) so they store as
   `tool file` / `tool non-file` with bounded output instead of `tool unknown`.
