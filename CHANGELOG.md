@@ -21,9 +21,12 @@ version in [`docs/changelog/`](docs/changelog/):
   quoted TOML or YAML value, `"Authorization": "Basic ..."` and any `.env`
   key past the first line were stored in clear while the same text as a
   plain body was redacted. The sanitizer now matches through JSON string
-  escapes as it already did through invisible characters, a redaction stops
-  at the end of its line instead of swallowing the rest of the result, and
-  what counts as a key or a value is unchanged (#1963).
+  escapes as it already did through invisible characters. A redaction stops
+  at the end of its line, and a quoted `KEY=value` or `"KEY":"value"` value
+  stops at its closing quote, so the rest of the result stays readable and
+  valid JSON. A quoted plain-text value with spaces, such as
+  `DB_PASSWORD="two words"`, is now redacted whole instead of up to its
+  first space. What counts as a key is unchanged (#1963).
 
 ## [3.3.2] - 2026-11-03
 

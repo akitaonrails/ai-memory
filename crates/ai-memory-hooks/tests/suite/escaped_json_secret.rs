@@ -67,6 +67,12 @@ async fn every_object_shaped_tool_result_is_redacted_in_the_stored_tool_body() {
             r#""interrupted":false"#,
         ),
         (
+            "compact json file in a claude code bash result",
+            "claude-code",
+            serde_json::json!({"stdout": format!("{{\"SESSION_SECRET\":\"{SECRET}\"}}"), "stderr": "", "interrupted": false}),
+            r#""interrupted":false"#,
+        ),
+        (
             "stdout only, grok aliases",
             "grok",
             serde_json::json!({"stdout": format!("{{\"api_key\": \"{SECRET}\"}}\n"), "truncated": false}),

@@ -124,7 +124,7 @@ fn emoji_tag_run_len(rest: &str) -> usize {
 }
 
 /// `text` seen through its transport encoding: every [`is_default_ignorable`]
-/// character dropped and every JSON string escape decoded, plus the span of
+/// character dropped and every JSON string escape decoded, plus where in
 /// `text` each byte of the view came from, so a match found in the view maps
 /// back to the bytes it covers. The escapes are the one layer ai-memory adds
 /// itself, when an object-shaped tool result is stored as compact JSON;
@@ -132,7 +132,9 @@ fn emoji_tag_run_len(rest: &str) -> usize {
 /// content and stay as written.
 struct Shadow {
     text: String,
-    origin: Vec<(usize, usize)>,
+    /// The start in `text` of the character or escape each view byte was
+    /// decoded from; its end is re-derived, which halves the view's size.
+    origin: Vec<usize>,
 }
 
 impl Shadow {
@@ -145,15 +147,12 @@ impl Shadow {
         let mut origin = Vec::with_capacity(text.len());
         let mut index = 0;
         while let Some(c) = text[index..].chars().next() {
-            let (c, end) = match json_escape_at(text.as_bytes(), index) {
-                Some((decoded, len)) => (decoded, index + len),
-                None => (c, index + c.len_utf8()),
-            };
+            let (c, len) = json_escape_at(text.as_bytes(), index).unwrap_or((c, c.len_utf8()));
             if !is_default_ignorable(c) {
                 shadow.push(c);
-                origin.extend(std::iter::repeat_n((index, end), c.len_utf8()));
+                origin.extend(std::iter::repeat_n(index, c.len_utf8()));
             }
-            index = end;
+            index += len;
         }
         Some(Self {
             text: shadow,
@@ -165,14 +164,23 @@ impl Shadow {
     /// byte of its first character through the last byte of its last,
     /// invisible characters between them and the escapes they were decoded
     /// from included.
-    fn original_span(&self, text_len: usize, start: usize, end: usize) -> (usize, usize) {
-        let from = self.origin.get(start).map_or(text_len, |span| span.0);
+    fn original_span(&self, text: &str, start: usize, end: usize) -> (usize, usize) {
+        let from = self.origin.get(start).copied().unwrap_or(text.len());
         let to = match end.checked_sub(1).and_then(|last| self.origin.get(last)) {
-            Some(last) if end > start => last.1,
+            Some(&last) if end > start => last + source_len_at(text, last),
             _ => from,
         };
         (from, to)
     }
+}
+
+/// The byte length of the escape or character at `text[index..]`, as
+/// [`Shadow::of`] consumed it.
+fn source_len_at(text: &str, index: usize) -> usize {
+    json_escape_at(text.as_bytes(), index).map_or_else(
+        || text[index..].chars().next().map_or(0, char::len_utf8),
+        |(_, len)| len,
+    )
 }
 
 /// The character the JSON string escape at `bytes[index..]` stands for and
@@ -357,15 +365,18 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     ),
     // Provider-specific env-var assignments (kept explicit for clarity
     // and so that bare `OPENAI_API_KEY=anything-at-all` still triggers
-    // even without `sk-` shape).
+    // even without `sk-` shape). In this rule and the two below, a quoted
+    // value ends at its closing quote, escapes inside it included: compact
+    // JSON has no whitespace for `\S+` to stop at, so it would redact the
+    // rest of the stored result and leave it unparseable.
     (
-        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)(?:\\*")?\s*[=:]\s*\S+"#,
+        r#"(?i)(ANTHROPIC_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY|VOYAGE_API_KEY|MISTRAL_API_KEY|GROQ_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_(SECRET_)?ACCESS_KEY[A-Z_]*|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|GOOGLE_API_KEY|GEMINI_API_KEY|OLLAMA_API_KEY)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+|\S+)"#,
         "env_secret",
     ),
     // Generic env-var catch-all: any *_KEY / *_TOKEN / *_SECRET /
     // *_PASSWORD / *_CREDENTIAL[S] / *_PRIVATE_KEY assignment.
     (
-        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)(?:\\*")?\s*[=:]\s*\S+"#,
+        r#"(?i)\b[A-Z][A-Z0-9_]*_(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PRIVATE_KEY)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+|\S+)"#,
         "env_secret",
     ),
     // The suffixes one step outside those: `*_KEY_ID` (the other half of an
@@ -375,7 +386,7 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // convention: as code identifiers (`api_key_id`, `password_salt`) they are
     // ordinary column and field names, and redaction is irreversible.
     (
-        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)(?:\\*")?\s*[=:]\s*\S+"#,
+        r#"\b[A-Z][A-Z0-9_]*_(KEY_ID|PASSPHRASE|SIGNING_KEY|PEPPER|SALT)(?:\\*")?\s*[=:]\s*(?:\\*"(?:[^"\\\r\n]|\\.)+|\S+)"#,
         "env_secret",
     ),
     // Filesystem paths that commonly contain credentials. The separator
@@ -529,6 +540,8 @@ impl Sanitizer {
                 changed = true;
             }
             if changed {
+                // Dropped first, so two views of a large result never coexist.
+                drop(shadow.take());
                 shadow = Shadow::of(&out);
             }
         }
@@ -556,7 +569,7 @@ impl Sanitizer {
                 continue;
             }
             let (start, end) = match shadow {
-                Some(shadow) => shadow.original_span(text.len(), m.start(), m.end()),
+                Some(shadow) => shadow.original_span(text, m.start(), m.end()),
                 None => (m.start(), m.end()),
             };
             if start < copied {
@@ -1766,6 +1779,54 @@ mod tests {
             s.scrub(r#"{"stdout":"{\"db_password\": \"correct-horse-battery\/\"}"}"#),
             r#"{"stdout":"{\"[REDACTED:auth_header]\"}"}"#
         );
+    }
+
+    /// Compact JSON has no whitespace for a `KEY=value` rule's value to stop
+    /// at, so a quoted value ends at its closing quote; otherwise the
+    /// redaction runs to the end of the stored result and leaves invalid JSON.
+    #[test]
+    fn a_quoted_secret_in_compact_json_stops_at_its_closing_quote() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        for (raw, secret) in [
+            (
+                r#"{"stdout":"{\"db_password\":\"correct-horse-battery\"}","stderr":"","interrupted":false}"#,
+                "correct-horse-battery",
+            ),
+            (
+                r#"{"stdout":"{\"DB_PASSWORD\":\"AKIAFAKEFAKEFAKEFAKE\"}","stderr":"","interrupted":false}"#,
+                "AKIAFAKEFAKEFAKEFAKE",
+            ),
+            (
+                r#"{"stdout":"{\"db_password\":\"sk-FAKEfake0123456789abcdef\"}","stderr":"","interrupted":false}"#,
+                "sk-FAKEfake0123456789abcdef",
+            ),
+            (
+                r#"{"stdout":"{\"SESSION_SECRET\":\"short\"}","stderr":"","interrupted":false}"#,
+                "short",
+            ),
+            (
+                r#"{"stdout":"{\"env\":\"{\\\"DB_PASSWORD\\\":\\\"correct-horse-battery\\\"}\"}","stderr":"","interrupted":false}"#,
+                "correct-horse-battery",
+            ),
+            (
+                r#"{"stdout":"{\"DB_PASSWORD\":\"a\\\"b\\\\c-correct-horse\"}","stderr":"","interrupted":false}"#,
+                "correct-horse",
+            ),
+        ] {
+            let out = s.scrub(raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret),
+                "secret must be redacted: {raw} -> {out}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {raw} -> {out}"));
+            assert_eq!(parsed["interrupted"], false, "{raw} -> {out}");
+        }
+        // The same rule over plain text: a quoted value with spaces is
+        // redacted whole instead of up to its first space.
+        let out = s.scrub("DB_PASSWORD=\"correct horse battery\"\nPORT=5432");
+        assert_eq!(out, "[REDACTED:env_secret]\"\nPORT=5432");
     }
 
     /// Decoding widens only what the rules see through, never what counts as
