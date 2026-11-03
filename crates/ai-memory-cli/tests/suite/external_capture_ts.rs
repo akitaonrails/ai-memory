@@ -1,5 +1,6 @@
 //! An external capture owner silences the generated TypeScript integration's
-//! transport without silencing its context delivery.
+//! transport without silencing its context delivery, and a kept file read
+//! carries the `_ai_memory_file` field (#1843).
 //!
 //! The native binary's own gate is covered by `external_capture`, which drives
 //! the real CLI. This file covers the other enforcement point: the
@@ -92,13 +93,17 @@ mod slow_generated_runtime {
     /// Drives the generated plugin through its public surface: a session
     /// start, a user prompt, the system-prompt transform that fetches a
     /// handoff, and dispose (which posts session-end and flushes the queue).
-    /// The loopback server counts what actually leaves the client.
+    /// The loopback server counts what actually leaves the client. A fourth
+    /// argument names a checkout to work in; the run then also reads one of
+    /// its files, and the server keeps each post-tool-use `_ai_memory_file`.
     const HARNESS: &str = r#"import { createServer } from "node:http";
 import AiMemoryHooks from "./ai-memory.ts";
 
 const port = Number(process.argv[2]);
-const directory = process.argv[3]!;
+const checkout = process.argv[4];
+const directory = checkout ?? process.argv[3]!;
 const events: string[] = [];
+const files: unknown[] = [];
 let handoffs = 0;
 const unmarked: string[] = [];
 const server = createServer((req, res) => {
@@ -106,9 +111,17 @@ const server = createServer((req, res) => {
   req.resume();
   if (req.headers["x-ai-memory-client"] !== "open-code") unmarked.push(url.pathname);
   if (url.pathname === "/hook") {
-    events.push(url.searchParams.get("event") ?? "?");
-    res.writeHead(204);
-    res.end();
+    const event = url.searchParams.get("event") ?? "?";
+    events.push(event);
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      if (event === "post-tool-use") {
+        try { files.push(JSON.parse(body)._ai_memory_file ?? null); } catch { files.push({ unparsable: body.length }); }
+      }
+      res.writeHead(204);
+      res.end();
+    });
     return;
   }
   if (url.pathname === "/handoff") {
@@ -132,11 +145,12 @@ await new Promise<void>((resolve, reject) => {
 const hooks: any = await (AiMemoryHooks as any)({ directory });
 await hooks.event({ event: { type: "session.created", properties: { info: { id: "s1", directory } } } });
 await hooks["chat.message"]({ sessionID: "s1" }, { parts: [{ type: "text", text: "PROMPT_SENTINEL" }] });
+if (checkout) await hooks["tool.execute.after"]({ sessionID: "s1", tool: "read", callID: "call-1", args: { filePath: "src/lib.rs" } }, { title: "src/lib.rs", output: "pub fn add() {}", metadata: {} });
 const transformed: { system: string[] } = { system: [] };
 await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, transformed);
 await hooks.dispose();
 server.close();
-console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.system }));
+console.log(JSON.stringify({ events, files, handoffs, unmarked, system: transformed.system }));
 "#;
 
     /// One plugin run. `hermetic` drops every ambient `AI_MEMORY_*` var, and
@@ -147,7 +161,12 @@ console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.sys
     /// `GIT_CONFIG_*` leaking in from the harness would point it somewhere
     /// outside the fixture. `PATH` and the rest of the environment stay so
     /// Node and git still resolve.
-    fn run_plugin(dir: &Path, port: u16, owner: Option<&str>) -> Option<Value> {
+    fn run_plugin(
+        dir: &Path,
+        port: u16,
+        owner: Option<&str>,
+        checkout: Option<&Path>,
+    ) -> Option<Value> {
         let mut command = hermetic("node");
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("GIT_") {
@@ -158,6 +177,7 @@ console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.sys
             .args(["--experimental-strip-types", "harness.ts"])
             .arg(port.to_string())
             .arg(dir)
+            .args(checkout)
             .current_dir(dir)
             .env("HOME", dir)
             .env("USERPROFILE", dir)
@@ -195,9 +215,14 @@ console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.sys
     /// and [`free_port`] releases the port before Node binds it, so under a
     /// parallel test load another socket can take it first. The harness then
     /// stops before the plugin runs and the fixture moves to a fresh port.
-    fn run_on_free_port(dir: &Path, port: &mut u16, owner: Option<&str>) -> Value {
+    fn run_on_free_port(
+        dir: &Path,
+        port: &mut u16,
+        owner: Option<&str>,
+        checkout: Option<&Path>,
+    ) -> Value {
         for _ in 0..5 {
-            if let Some(run) = run_plugin(dir, *port, owner) {
+            if let Some(run) = run_plugin(dir, *port, owner, checkout) {
                 return run;
             }
             *port = free_port();
@@ -231,7 +256,7 @@ console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.sys
         let mut port = free_port();
         write_fixture(&dir, port);
 
-        let owned = run_on_free_port(&dir, &mut port, Some("orchestrator-a"));
+        let owned = run_on_free_port(&dir, &mut port, Some("orchestrator-a"), None);
         assert!(
             delivered_events(&owned).is_empty(),
             "owned run must POST nothing: {owned}"
@@ -246,7 +271,7 @@ console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.sys
         // plugin and harness must capture normally. Without them the
         // assertions above could pass on a harness that never delivers.
         for (label, owner) in [("unset", None), ("whitespace", Some(" \t\n"))] {
-            let captured = run_on_free_port(&dir, &mut port, owner);
+            let captured = run_on_free_port(&dir, &mut port, owner, None);
             let events = delivered_events(&captured);
             for expected in ["session-start", "user-prompt", "session-end"] {
                 assert!(
@@ -282,8 +307,38 @@ console.log(JSON.stringify({ events, handoffs, unmarked, system: transformed.sys
         let busy = taken.local_addr().unwrap().port();
         let mut port = busy;
         write_fixture(&dir, port);
-        let run = run_on_free_port(&dir, &mut port, None);
+        let run = run_on_free_port(&dir, &mut port, None, None);
         assert_ne!(port, busy);
         assert!(delivered_events(&run).contains(&"session-start"), "{run}");
+    }
+
+    /// #1843: a kept file-tool post leaves the generated plugin carrying
+    /// `_ai_memory_file` with the checkout-relative path. The loopback stands
+    /// in for the server, so this is evidence about what the client sends;
+    /// the server's acceptance and storage of the field are the hook router's
+    /// tests.
+    #[test]
+    fn generated_plugin_sends_the_file_path_field_on_a_kept_read() {
+        if !node_strip_types_available() {
+            return;
+        }
+        let guard = tempfile::tempdir().expect("fixture root");
+        let dir = guard.path().to_path_buf();
+        let checkout = dir.join("repo");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(checkout.join("src")).unwrap();
+        std::fs::write(checkout.join("src/lib.rs"), "pub fn add() {}\n").unwrap();
+        let mut port = free_port();
+        write_fixture(&dir, port);
+        let run = run_on_free_port(&dir, &mut port, None, Some(&checkout));
+        assert!(
+            delivered_events(&run).contains(&"post-tool-use"),
+            "the read must be delivered: {run}"
+        );
+        assert_eq!(
+            run["files"],
+            serde_json::json!([{ "version": 1, "path": "src/lib.rs" }]),
+            "{run}"
+        );
     }
 }

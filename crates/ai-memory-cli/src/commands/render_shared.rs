@@ -416,6 +416,8 @@ const CAPTURE_NON_FILE_TOOLS: string[] = __AI_MEMORY_NON_FILE_TOOLS__;
 const CAPTURE_INLINE_CODE_TOOLS: string[] = __AI_MEMORY_INLINE_CODE_TOOLS__;
 const CAPTURE_OUTPUT_READER_TOOLS: string[] = __AI_MEMORY_OUTPUT_READER_TOOLS__;
 const CAPTURE_MAX_COMMAND_CHARS = __AI_MEMORY_MAX_COMMAND_CHARS__;
+// Longest checkout-relative path the file index keeps; generated from `ai_memory_core::FILE_PATH_MAX_CHARS`.
+const CAPTURE_FILE_PATH_MAX_CHARS = __AI_MEMORY_FILE_PATH_MAX_CHARS__;
 // Bounds on the other markers one call may make the policy read; mirror `capture_lookup_locations` and `foreign_capture_decision`.
 const CAPTURE_MAX_LOOKUP_LOCATIONS = 4096;
 const CAPTURE_MAX_FOREIGN_MARKERS = 16;
@@ -710,7 +712,19 @@ function captureDecide(tool: CaptureTool, config: CaptureConfig): CaptureDisposi
 const captureRank: Record<CaptureDisposition, number> = { keep: 0, "metadata-only": 1, drop: 2 };
 // Every other marker governing a path the call names (a file-tool target or the files an `apply_patch` names, a search/list directory, file or path-like glob argument, or a shell argument with a separator resolved from its workdir, plus that directory) inspects it too, so a checkout's `ignore_paths` hold for a call made from elsewhere. Lexical; each directory is looked up once and remembered for every lookup that passes it; a glob location is looked up from its literal root (before the walk, whose one listing may spend the time budget) and, when that root lies outside the event's own checkout, every directory it could pass through is checked for a marker of its own; a glob whose `..` follows a `**` is looked up in every reading. Locations outside the own checkout come first: there unreadable targets, glob syntax the walk cannot follow, and anything past the bounds are unprovable, while running out of budget inside the own checkout ends the lookup. Mirrors `capture_lookup_locations` and `foreign_capture_decision`.
 function captureForeignConfigs(tool: CaptureTool, config: CaptureConfig, cwd: string | undefined, own: string | undefined): CaptureConfig[] { const invalid: CaptureConfig[] = [{ state: "invalid", patterns: [], base: config.base, windowsHost: config.windowsHost }]; const locations = new Set<string>(); let overflow = false; const add = (path: string, base: string): string[] | undefined => { const absolute = /^(?:\/|\\\\|[A-Za-z]:[\\/])/.test(path); if (!absolute && !base) return undefined; const readings = captureAllReadings(captureResolve(path, base, config.windowsHost), config.windowsHost); if (readings === false) { overflow = true; return undefined; } if (!readings) return undefined; return readings.map((candidate) => { const location = candidate.windows ? candidate.path.replace(/\//g, "\\") : candidate.path; locations.add(location); return location; }); }; if (tool.family === "file") { const paths = tool.paths ?? tool.patch; if (!paths) return invalid; for (const path of paths) if (add(path, config.base) === undefined) return invalid; } else if (tool.family === "search-list") { if (!tool.search) return invalid; const roots: string[] = []; for (const root of tool.search.roots) { const found = add(root, config.base); if (found === undefined) return invalid; roots.push(...found); } if (!roots.length) roots.push(config.base); for (const pattern of tool.search.patterns.filter((p) => /[\/\\]/.test(p))) for (const root of roots) if (add(pattern, root) === undefined) return invalid; } else if (tool.family === "non-file" && tool.command !== undefined) { if (captureCommandOversized(tool.command)) return invalid; const base = captureBase(config, tool.workdir); if (base) add(base, base); const home = homedir(); const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); for (const [word, tilde] of [...split.words, ...split.expanded]) for (const [argument] of captureShellArguments(word)) { const expanded = captureExpandTilde(argument, tilde, home, base); if (/[\/\\]/.test(expanded)) add(expanded, base); } } if (overflow || locations.size > CAPTURE_MAX_LOOKUP_LOCATIONS) return invalid; const markers: string[] = []; const memo: CaptureMarkerMemo = { governing: new Map(), checkouts: new Map() }; let checkout: string | undefined; if (cwd) { const root = captureMemoCheckout(resolve(cwd), memo, { dirs: 0, entries: 0, deadline: Infinity, now: Date.now, probes: -Infinity }); checkout = root && captureOwnCheckout(root) ? root : undefined; captureMemoRemember(cwd, own, memo); if (statSync(resolve(cwd), { throwIfNoEntry: false })?.isDirectory()) captureMemoNote(cwd, memo); } const budget: CaptureGlobBudget = { dirs: 0, entries: 0, deadline: captureNow() + CAPTURE_MAX_GLOB_MS, now: captureNow, probes: 0 }; const remember = (marker: string | undefined): boolean => { if (!marker || marker === own || markers.includes(marker)) return true; if (markers.length === CAPTURE_MAX_FOREIGN_MARKERS) return false; markers.push(marker); return true; }; const insideOwn = (location: string) => checkout !== undefined && (location === checkout || location.startsWith(join(checkout, "x").slice(0, -1))); const ordered = [...locations].filter((location) => !insideOwn(location)); const insideFrom = ordered.length; ordered.push(...[...locations].filter(insideOwn).sort((a, b) => a.split(/[\\/]/).length - b.split(/[\\/]/).length)); for (let index = 0; index < ordered.length; index++) { const location = ordered[index]; const walk = captureGlobWalk(location); if (walk === undefined) return invalid; const lookup = walk ? walk.root : location; const dir = captureExistingDirWithin(lookup, memo, budget); if (dir === undefined) { if (index >= insideFrom) break; return invalid; } const marker = dir === null ? null : captureMemoMarker(dir, memo, budget); if (marker === undefined) { if (index >= insideFrom) break; return invalid; } if (!remember(marker ?? undefined)) return invalid; if (walk) { const found = captureMarkersBelow(walk.root, walk.steps, checkout, budget); if (!found) return invalid; for (const marker of found) if (!remember(marker)) return invalid; } } return markers.map((marker) => captureConfigAt(marker, cwd)); }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } if (config.state === "inactive") return { disposition, payload }; const extraction = config.state === "active" && tool.family === "search-list" ? "not-applicable" : tool.extraction === "not-applicable" ? "extracted" : tool.extraction; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol } }; return { disposition, protocol, payload }; }
+// Whether `key` is a file index key: non-empty, at most CAPTURE_FILE_PATH_MAX_CHARS, not rooted (`/`, `\` or a drive letter) and with no `..` segment; mirrors `valid_file_path_key`.
+function captureFileKey(key: string): boolean { return !!key && [...key].length <= CAPTURE_FILE_PATH_MAX_CHARS && !/^[\/\\]/.test(key) && !/^[A-Za-z]:/.test(key) && !key.split(/[\/\\]/).includes(".."); }
+// The nearest directory at or above `dir` holding `.git` (a worktree's `.git` file counts), the filesystem root included; mirrors `marker::checkout_root`.
+function captureCheckoutRoot(dir: string): string | undefined { for (let current = dir; ; current = dirname(current)) { if (captureExists(captureChild(current, ".git"))) return current; if (dirname(current) === current) return undefined; } }
+// A path's prefix (a Windows drive, `//server/share`, or a verbatim `\\?\` one), whether it is rooted, and its segments with `.` and `..` folded lexically, as Rust's `Path` reads it on that host: on Windows `\` and `/` both separate, except after a verbatim prefix, where only `\` does; elsewhere `\` is a filename character, which the policy's `captureNormalize` folds and the index must not.
+function captureFileParts(path: string, windowsHost: boolean): { prefix: string; rooted: boolean; segments: string[] } { const verbatim = windowsHost ? /^\\{2}\?\\(?:UNC\\[^\\]+\\[^\\]+|[A-Za-z]:(?=\\|$)|[^\\]+)/.exec(path) : null; const unc = windowsHost && !verbatim ? /^[\\/]{2}([^\\/]+)[\\/]+([^\\/]+)/.exec(path) : null; const drive = windowsHost && !verbatim && !unc ? /^[A-Za-z]:/.exec(path) : null; const prefix = verbatim ? (/^\\{2}\?\\[A-Za-z]:$/.test(verbatim[0]) ? verbatim[0].toUpperCase() : verbatim[0]) : unc ? `//${unc[1]}/${unc[2]}` : drive ? drive[0].toUpperCase() : ""; const rest = path.slice((verbatim ?? unc ?? drive)?.[0].length ?? 0); const rooted = !!verbatim || !!unc || (windowsHost ? /^[\\/]/ : /^\//).test(rest); return { prefix, rooted, segments: captureFoldSegments(rest.split(verbatim ? "\\" : windowsHost ? /[\\/]/ : "/"), rooted) }; }
+// Path segments with empty and `.` ones dropped and `..` folded, as `lexically_normalize` does: a `..` above the root is dropped, one leading a relative path is kept.
+function captureFoldSegments(parts: string[], rooted: boolean): string[] { const segments: string[] = []; for (const x of parts) { if (!x || x === ".") continue; if (x === ".." && segments.length && segments[segments.length - 1] !== "..") segments.pop(); else if (x !== ".." || !rooted) segments.push(x); } return segments; }
+// `target` read from the lexical cwd `base` the way `Path::join` reads it, component by component (a rooted target keeps only the base's drive or share, a drive-relative one replaces the base, and a relative one is appended, so its `/` separates even under a verbatim base), made relative to `checkout` and `/`-separated, or why it cannot be; mirrors the path steps of `file_path_field`. The Windows rules are std's: https://doc.rust-lang.org/std/path/struct.PathBuf.html#method.push and https://doc.rust-lang.org/std/path/enum.Prefix.html.
+function captureFileRelative(target: string, base: string, checkout: string, windowsHost: boolean): { path: string } | { skipped: string } { const own = captureFileParts(target, windowsHost); const from = captureFileParts(base, windowsHost); const joined = own.prefix ? own : { prefix: from.prefix, rooted: own.rooted || from.rooted, segments: own.rooted ? own.segments : captureFoldSegments([...from.segments, ...own.segments], from.rooted) }; const root = captureFileParts(checkout, windowsHost); if (joined.prefix !== root.prefix || joined.rooted !== root.rooted || root.segments.some((segment, index) => joined.segments[index] !== segment)) return { skipped: "outside_checkout" }; const key = joined.segments.slice(root.segments.length).join("/"); return captureFileKey(key) ? { path: key } : { skipped: "refused" }; }
+// The reserved `_ai_memory_file` field of a kept file-tool post (#1843): the one file the call names, relative to the checkout root of the lexical cwd, or why it has none; undefined when the call names no single file. An event without a cwd has no checkout to key the path to, so it is `no_checkout` rather than an absent field, which the server would count as an older client. The key is relative to the event's own checkout: these integrations do not reroute a tool event into the checkout an absolute target names, as the native `tool_location_routing_cwd` does, so such a target is `outside_checkout` here. Lexical like the policy, so a symlinked cwd is not resolved, and relative to the nearest `.git` rather than the marker, so two worktrees produce the same key. The path rules follow the OS the plugin runs on, as the native client's `Path` does, not the cwd's spelling (a POSIX `//home/u` is no share), and the base is the cwd as spelled, not the policy's Windows respelling (`\\?\C:\repo` stays verbatim); mirrors `file_path_field`.
+function captureFileField(tool: CaptureTool, cwd: string | undefined): { version: 1; path?: string; skipped?: string } | undefined { const targets = tool.paths ?? tool.patch; if (tool.family !== "file" || targets?.length !== 1 || tool.globs) return undefined; const base = cwd && resolve(cwd); const root = base ? captureCheckoutRoot(base) : undefined; return { version: 1, ...(root === undefined ? { skipped: "no_checkout" } : captureFileRelative(targets[0], base, root, typeof process !== "undefined" && process.platform === "win32")) }; }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined, event?: string): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } const file = event === "post-tool-use" && disposition === "keep" ? captureFileField(tool, cwd) : undefined; if (config.state === "inactive") return { disposition, payload: file ? { ...payload, _ai_memory_file: file } : payload }; const extraction = config.state === "active" && tool.family === "search-list" ? "not-applicable" : tool.extraction === "not-applicable" ? "extracted" : tool.extraction; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol, ...(file ? { _ai_memory_file: file } : {}) } }; return { disposition, protocol, payload }; }
 "##;
     let names = |names: &[&str]| {
         let quoted: Vec<String> = names.iter().map(|name| ts_string_literal(name)).collect();
@@ -741,6 +755,10 @@ function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined
         .replace(
             "__AI_MEMORY_MAX_COMMAND_CHARS__",
             &capture_policy::MAX_SHELL_COMMAND_CHARS.to_string(),
+        )
+        .replace(
+            "__AI_MEMORY_FILE_PATH_MAX_CHARS__",
+            &ai_memory_core::FILE_PATH_MAX_CHARS.to_string(),
         )
 }
 
@@ -3500,7 +3518,7 @@ mod tests {
         let fixture = include_str!("../../../ai-memory-hooks/tests/fixtures/capture-policy.json");
         let fixture = serde_json::to_string(fixture).unwrap();
         let source = format!(
-            r#"import {{ closeSync, mkdirSync, opendirSync as realOpendirSync, openSync as realOpenSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, writeFileSync }} from "node:fs";
+            r#"import {{ closeSync, mkdirSync, opendirSync as realOpendirSync, openSync as realOpenSync, readFileSync as readMarkerText, readSync, readdirSync, statSync, symlinkSync, writeFileSync }} from "node:fs";
 import {{ basename, dirname, join, resolve }} from "node:path";
 import {{ homedir }} from "node:os";
 
@@ -3802,6 +3820,96 @@ writeFileSync(join(routedRoot, ".ai-memory.toml"), 'server = "team-b"\n');
 writeFileSync(join(routedChild, ".ai-memory.toml"), 'workspace = "child"\n');
 markerFixtures.set(routedChild, join(routedChild, ".ai-memory.toml"));
 check(capturePolicy(bash("echo hi"), routedChild).disposition === "drop", "server-routed-inherited-drops");
+// #1843: a kept file-tool post carries `_ai_memory_file`, the checkout-relative path or why there is none, under an inactive or an active policy; mirrors `post_tool_use_carries_the_file_field_or_its_skip_reason`.
+const fileRepo = join(markerRoot, "file-repo");
+mkdirSync(join(fileRepo, ".git"), {{ recursive: true }});
+mkdirSync(join(fileRepo, "crates"), {{ recursive: true }});
+const fileWorktree = join(markerRoot, "file-worktree");
+mkdirSync(fileWorktree, {{ recursive: true }});
+writeFileSync(join(fileWorktree, ".git"), "gitdir: /elsewhere/.git/worktrees/w\n");
+const filePlain = join(markerRoot, "file-plain");
+mkdirSync(filePlain, {{ recursive: true }});
+const fileLink = join(markerRoot, "file-link");
+symlinkSync(fileRepo, fileLink);
+const fileOf = (payload: Record<string, unknown>, cwd: string | undefined, event: string | undefined) => capturePolicy(payload, cwd, event).payload._ai_memory_file;
+const filePath = (path: string) => JSON.stringify({{ version: 1, path }});
+const fileSkip = (skipped: string) => JSON.stringify({{ version: 1, skipped }});
+const patch = (...headers: string[]) => ({{ tool: "apply_patch", args: {{ patchText: ["*** Begin Patch", ...headers, "*** End Patch"].join("\n") }} }});
+const post = "post-tool-use";
+for (const [payload, cwd, event, expected, label] of [
+  [{{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileRepo, post, filePath("src/lib.rs"), "file-relative"],
+  [{{ tool: "read", args: {{ filePath: "../README.md" }} }}, join(fileRepo, "crates"), post, filePath("README.md"), "file-parent"],
+  [{{ tool: "edit", args: {{ filePath: join(fileRepo, "src", "a.rs") }} }}, fileRepo, post, filePath("src/a.rs"), "file-absolute"],
+  [{{ tool: "write", args: {{ filePath: "x.rs" }} }}, fileWorktree, post, filePath("x.rs"), "file-worktree"],
+  [{{ tool: "read", args: {{ filePath: "/etc/hosts" }} }}, fileRepo, post, fileSkip("outside_checkout"), "file-outside"],
+  [{{ tool: "read", args: {{ filePath: "a.rs" }} }}, filePlain, post, fileSkip("no_checkout"), "file-no-checkout"],
+  [{{ tool: "read", args: {{ filePath: "x".repeat(CAPTURE_FILE_PATH_MAX_CHARS + 1) }} }}, fileRepo, post, fileSkip("refused"), "file-over-long"],
+  [{{ tool: "read", args: {{ filePath: "x".repeat(CAPTURE_FILE_PATH_MAX_CHARS) }} }}, fileRepo, post, filePath("x".repeat(CAPTURE_FILE_PATH_MAX_CHARS)), "file-at-limit"],
+  // The bound counts characters, as `chars().count()` does, not UTF-16 units.
+  [{{ tool: "read", args: {{ filePath: "\u{{1F600}}".repeat(CAPTURE_FILE_PATH_MAX_CHARS) }} }}, fileRepo, post, filePath("\u{{1F600}}".repeat(CAPTURE_FILE_PATH_MAX_CHARS)), "file-at-limit-astral"],
+  [{{ tool: "read", args: {{ filePath: "." }} }}, fileRepo, post, fileSkip("refused"), "file-checkout-root"],
+  [{{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileRepo, "pre-tool-use", undefined, "file-pre-tool-use"],
+  [{{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileRepo, undefined, undefined, "file-no-event"],
+  // Even an absolute target gets no_checkout when the event has no cwd: there is no checkout to key it to.
+  [{{ tool: "read", args: {{ filePath: join(fileRepo, "src", "lib.rs") }} }}, undefined, post, fileSkip("no_checkout"), "file-no-cwd"],
+  [patch("*** Update File: one.rs"), fileRepo, post, filePath("one.rs"), "file-patch-one"],
+  [patch("*** Update File: a.rs", "*** Delete File: b.rs"), fileRepo, post, undefined, "file-patch-two"],
+  [patch("*** Update File: a.rs", "*** Move to: b.rs"), fileRepo, post, undefined, "file-patch-move"],
+  [{{ tool: "read_many_files", args: {{ include: ["src/lib.rs"] }} }}, fileRepo, post, undefined, "file-read-many-glob"],
+  [{{ tool: "read", args: {{ paths: ["a.rs", "b.rs"] }} }}, fileRepo, post, undefined, "file-two-paths"],
+  [bash("cat src/lib.rs"), fileRepo, post, undefined, "file-shell"],
+  [{{ tool: "read", args: {{ filePath: "sub/lib.rs" }} }}, fileLink, post, filePath("sub/lib.rs"), "file-symlinked-cwd"],
+  [{{ tool: "read", args: {{ filePath: join(fileRepo, "lib.rs") }} }}, fileLink, post, fileSkip("outside_checkout"), "file-symlink-target"],
+  // On a POSIX host `\` is a filename character, as for the native `Path`: never a separator, so `..\` is no parent.
+  [{{ tool: "read", args: {{ filePath: "a\\b.rs" }} }}, fileRepo, post, filePath("a\\b.rs"), "file-posix-backslash"],
+  [{{ tool: "read", args: {{ filePath: "..\\x.rs" }} }}, join(fileRepo, "crates"), post, fileSkip("refused"), "file-posix-backslash-parent"],
+  [{{ tool: "read", args: {{ filePath: "C:\\x" }} }}, fileRepo, post, fileSkip("refused"), "file-posix-drive"],
+  // A POSIX cwd spelled with a leading `//` is still POSIX for the index, as for the native client on that OS.
+  [{{ tool: "read", args: {{ filePath: "a\\b.rs" }} }}, `/${{fileRepo}}`, post, filePath("a\\b.rs"), "file-posix-double-slash-cwd"],
+] as [Record<string, unknown>, string | undefined, string | undefined, string | undefined, string][]) {{ const got = JSON.stringify(fileOf(payload, cwd, event)); check(got === expected, `${{label}}: ${{got}}`); }}
+// The path steps alone, so a Windows-flavoured cwd runs on any host: `Path::join` on Windows keeps only the base's drive or share for a rooted target and lets a drive-relative one replace the base.
+for (const [target, base, checkout, windowsHost, expected, label] of [
+  ["src\\a.rs", "C:/repo", "C:/repo", true, {{ path: "src/a.rs" }}, "win-relative"],
+  ["c:\\repo\\b.rs", "C:/repo", "C:/repo", true, {{ path: "b.rs" }}, "win-drive-case"],
+  ["/repo/x.rs", "C:/repo", "C:/repo", true, {{ path: "x.rs" }}, "win-rooted-inside"],
+  ["\\Windows\\win.ini", "C:/repo", "C:/repo", true, {{ skipped: "outside_checkout" }}, "win-rooted-outside"],
+  ["C:x.rs", "C:/repo", "C:/repo", true, {{ skipped: "outside_checkout" }}, "win-drive-relative"],
+  ["D:\\x.rs", "C:/repo", "C:/repo", true, {{ skipped: "outside_checkout" }}, "win-other-drive"],
+  ["..\\..\\x.rs", "C:/repo/sub", "C:/repo", true, {{ skipped: "outside_checkout" }}, "win-parent-outside"],
+  ["..\\x.rs", "C:/repo/sub", "C:/repo", true, {{ path: "x.rs" }}, "win-parent-inside"],
+  ["\\\\srv\\share\\repo\\y.rs", "//srv/share/repo", "//srv/share/repo", true, {{ path: "y.rs" }}, "win-unc"],
+  ["\\y.rs", "//srv/share/repo", "//srv/share/repo", true, {{ skipped: "outside_checkout" }}, "win-unc-rooted"],
+  ["\\repo\\y.rs", "//srv/share/repo", "//srv/share/repo", true, {{ path: "y.rs" }}, "win-unc-rooted-inside"],
+  // A verbatim cwd stays verbatim, as `Path` keeps it: its `\\?\C:` prefix is not the `C:` drive.
+  ["\\\\?\\C:\\repo\\x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ path: "x.rs" }}, "win-verbatim"],
+  ["C:\\repo\\x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ skipped: "outside_checkout" }}, "win-verbatim-against-drive"],
+  // After a verbatim prefix `/` is part of a name, and `\\?\UNC\` is its own prefix.
+  ["\\\\?\\C:\\repo/sub/x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ skipped: "outside_checkout" }}, "win-verbatim-slash"],
+  ["\\\\?\\C:repo\\x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ skipped: "outside_checkout" }}, "win-verbatim-inexact-drive"],
+  // A target joined onto a verbatim base is parsed on its own, as `PathBuf::push` does, so its `/` still separates.
+  ["src\\a.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ path: "src/a.rs" }}, "win-verbatim-base-relative"],
+  ["sub/x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ path: "sub/x.rs" }}, "win-verbatim-base-relative-slash"],
+  ["/repo/x.rs", "\\\\?\\C:\\repo", "\\\\?\\C:\\repo", true, {{ path: "x.rs" }}, "win-verbatim-base-rooted"],
+  ["..\\x.rs", "\\\\?\\C:\\repo\\sub", "\\\\?\\C:\\repo", true, {{ path: "x.rs" }}, "win-verbatim-base-parent"],
+  ["\\\\?\\UNC\\srv\\share\\repo\\y.rs", "\\\\?\\UNC\\srv\\share\\repo", "\\\\?\\UNC\\srv\\share\\repo", true, {{ path: "y.rs" }}, "win-verbatim-unc"],
+  ["\\\\?\\UNC\\srv\\other\\repo\\y.rs", "\\\\?\\UNC\\srv\\share\\repo", "\\\\?\\UNC\\srv\\share\\repo", true, {{ skipped: "outside_checkout" }}, "win-verbatim-unc-other-share"],
+  ["x.rs", "/", "/", false, {{ path: "x.rs" }}, "posix-root-checkout"],
+  ["\\\\server\\share\\x", "/r", "/r", false, {{ skipped: "refused" }}, "posix-unc-spelling"],
+] as [string, string, string, boolean, Record<string, string>, string][]) {{ const got = JSON.stringify(captureFileRelative(target, base, checkout, windowsHost)); check(got === JSON.stringify(expected), `${{label}}: ${{got}}`); }}
+const fileInactivePayload = bash("cat src/lib.rs");
+check(capturePolicy(fileInactivePayload, fileRepo, post).payload === fileInactivePayload, "file-none-preserves-object");
+const fileActive = marker(active, join(markerRoot, "file-active"));
+mkdirSync(join(fileActive, ".git"), {{ recursive: true }});
+const fileKept = capturePolicy({{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileActive, post);
+check(fileKept.disposition === "keep" && fileKept.payload._ai_memory_capture?.policy_state === "active" && JSON.stringify(fileKept.payload._ai_memory_file) === filePath("src/lib.rs"), "file-active-keep");
+const fileDropped = capturePolicy({{ tool: "read", args: {{ filePath: "secret/key.pem" }} }}, fileActive, post);
+check(fileDropped.disposition === "drop" && fileDropped.payload._ai_memory_file === undefined, "file-ignored-drop");
+const fileMetadata = capturePolicy(patch("*** Update File: one.rs"), fileActive, post);
+check(fileMetadata.disposition === "metadata-only" && fileMetadata.payload._ai_memory_file === undefined, "file-active-patch-metadata-only");
+const fileInvalid = marker("[capture", join(markerRoot, "file-invalid"));
+mkdirSync(join(fileInvalid, ".git"), {{ recursive: true }});
+const fileInvalidResult = capturePolicy({{ tool: "read", args: {{ filePath: "src/lib.rs" }} }}, fileInvalid, post);
+check(fileInvalidResult.disposition === "metadata-only" && fileInvalidResult.payload._ai_memory_file === undefined, "file-invalid-metadata-only");
 "#,
             fixture = fixture,
             policy = ts_capture_policy_v1("denylist"),

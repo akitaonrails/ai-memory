@@ -5484,7 +5484,7 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("event", event);
   url.searchParams.set("agent", AGENT);
   if (!applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined)) return;
-  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined, event);
   if (policy.disposition === "drop") return;
   try {{
     enqueueHook(event, url, policy.payload);
@@ -6358,7 +6358,7 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   url.searchParams.set("event", event);
   url.searchParams.set("agent", AGENT);
   if (!applyMarkerParams(url, typeof payload.cwd === "string" ? payload.cwd : undefined)) return;
-  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined);
+  const policy = capturePolicy(payload, typeof payload.cwd === "string" ? payload.cwd : undefined, event);
   if (policy.disposition === "drop") return;
   try {{
     enqueueHook(event, url, policy.payload);
@@ -13164,6 +13164,8 @@ model = "gpt-5"
         assert!(generated.contains("signal: timeoutSignal(HOOK_REQUEST_TIMEOUT_MS)"));
         assert!(generated.contains("await sleep(HOOK_INTER_REQUEST_DELAY_MS)"));
         assert!(generated.contains("const policy = capturePolicy(payload"));
+        // #1843: the event name gates the `_ai_memory_file` field.
+        assert!(generated.contains("payload.cwd : undefined, event);"));
         assert!(generated.contains("if (policy.disposition === \"drop\") return;"));
         assert!(generated.contains("enqueueHook(event, url, policy.payload);"));
         assert!(generated.contains("const CAPTURE_POLICY_V1 = 1;"));
