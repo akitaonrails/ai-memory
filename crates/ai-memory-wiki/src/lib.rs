@@ -30,7 +30,8 @@ pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
 pub use ledger::is_rotated_event_ledger;
 pub use markdown::{
     Markdown, decode_markdown_destination_path, delink_wikilinks, derive_title, emit,
-    extract_links, extract_relation_links, parse, rewrite_local_wikilinks,
+    extract_links, extract_relation_links, normalize_wikilink_path, parse, rewrite_local_wikilinks,
+    rewrite_wikilink_targets,
 };
 pub use migrations::run_pending as run_wiki_migrations;
 pub use okf_index::okf_directory_listing;

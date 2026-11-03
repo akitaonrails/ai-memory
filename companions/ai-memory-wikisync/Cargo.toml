@@ -16,10 +16,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Unpredictable, exclusively created staging files for every atomic replace
+# (GHSA-jr85-7366-xrm2); the tests also use it for temp destinations.
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 url = "2"
 
 [dev-dependencies]
 axum = "0.8"
-tempfile = "3"
 tokio = { version = "1", features = ["net"] }
