@@ -1908,18 +1908,20 @@ struct RestorePageArgs {
 
 /// The page metadata a checkpoint's frontmatter carries, in the shape
 /// `memory_write_page` takes, so a restore keeps `kind`, `entities`,
-/// `abstract`, `relations` and the profile fields instead of clearing them.
+/// `abstract`, `relations`, `sources` and the profile fields instead of
+/// clearing them.
 /// The write path validates them again with the same bounds as any write.
 fn checkpoint_write_metadata(
     frontmatter: &serde_json::Value,
 ) -> Result<ai_memory_core::page::PageWriteMetadata, McpError> {
-    const KEYS: [&str; 6] = [
+    const KEYS: [&str; 7] = [
         "kind",
         "entities",
         "abstract",
         "relations",
         "applies_to",
         "enforced_by",
+        "sources",
     ];
     let picked: serde_json::Map<String, serde_json::Value> = KEYS
         .iter()
@@ -22791,12 +22793,14 @@ mod tests {
     fn checkpoint_write_metadata_keeps_only_page_metadata_and_rejects_bad_shapes() {
         let meta = checkpoint_write_metadata(&serde_json::json!({
             "title": "ignored here", "kind": "rule", "entities": ["a"],
-            "abstract": null, "session_id": "x"
+            "abstract": null, "session_id": "x",
+            "sources": [{"path": "src/a.rs", "commit": "3f2a9c1"}]
         }))
         .unwrap();
         assert_eq!(meta.kind.as_deref(), Some("rule"));
         assert_eq!(meta.entities, ["a"]);
         assert!(meta.abstract_text.is_none());
+        assert_eq!(meta.sources.len(), 1);
         assert!(
             checkpoint_write_metadata(&serde_json::json!({ "entities": "not-a-list" })).is_err()
         );

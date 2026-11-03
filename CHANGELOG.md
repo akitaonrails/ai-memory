@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Pages can name the repository files they describe: `memory_write_page`,
+  `memory_write_pages_batch` and the admin write accept an optional
+  `sources: [{path, commit}]` (up to 16 repository-relative paths, 7-64 hex
+  commit ids), and a checkpoint restore keeps it. The server never reads those
+  files; a client compares each entry with its checkout and records `stale`
+  feedback when one changed (#1956).
 - Added a guarded `memory_write_pages_batch` MCP tool for companion imports:
   1-100 conditional page versions are admitted and persisted atomically in one
   existing project, with bounded bodies, duplicate-path rejection, ordered
