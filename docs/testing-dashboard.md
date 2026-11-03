@@ -25,8 +25,9 @@ python3 scripts/check-dashboard-core-mutations.py --case expose-restricted-mailb
 Use `AI_MEMORY_BIN` for another built executable and `AI_MEMORY_BROWSER` for an
 existing Chromium executable. On Linux, the runner also finds Chromium in the
 Playwright cache. An absent executable, a missing browser, a failed setup or a
-JavaScript exception fails the command. The Linux CI job installs the pinned
-browser and runs both mutation gates, without `continue-on-error` or retries.
+JavaScript exception fails the command. The Linux CI test job installs the
+pinned browser and runs the browser mutation gate; the Rust mutation gate is
+its own CI job. Neither uses `continue-on-error` or retries.
 The [browser installation reference](https://playwright.dev/docs/browsers)
 describes the test browser's system dependencies and headless shell.
 
@@ -40,8 +41,9 @@ screenshot.
 Run the Rust mutation command alone, with no other build running and no editor
 writing the selected source files. It temporarily changes clean tracked source
 files, stores the exact originals and restores them in `finally`. A concurrent
-edit is refused instead of overwritten. Each probe needs a passing baseline and
-a specific failed test assertion, so compiler errors and timeouts do not count.
+edit is refused instead of overwritten. Each distinct test command runs once as
+a passing baseline before any probe, and each probe needs a specific failed test
+assertion, so compiler errors and timeouts do not count.
 Logs and originals stay under `target/dashboard-core-mutations-*`.
 
 ## Behaviors protected

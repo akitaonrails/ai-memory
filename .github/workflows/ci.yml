@@ -42,7 +42,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
+      # Pull requests only restore. Each run that saved its own target/ put about
+      # 5 GB under the PR's ref, two runs filled the 10 GB quota, and main's
+      # entries, the only ones a PR can restore, were evicted (#1965).
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   management-ui:
@@ -54,6 +59,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --features ai-memory-cli/management-ui -- -D warnings
       - run: cargo test -p ai-memory-mcp --features management-ui management
       - run: cargo test -p ai-memory-store owned_session_purge
@@ -80,6 +87,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # On macOS, rustls-tls-native-roots otherwise enumerates Keychain every
       # time a test process builds a reqwest client. Scope the PEM-bundle
       # shortcut to macOS CI instead of setting a repo-wide Cargo env var that
@@ -163,9 +172,6 @@ jobs:
         env:
           AI_MEMORY_BIN: ${{ github.workspace }}/target/debug/ai-memory
         run: node tests/e2e/web_dashboard_mutations.mjs
-      - name: Dashboard Rust mutation checks
-        if: matrix.os == 'ubuntu-latest'
-        run: python3 scripts/check-dashboard-core-mutations.py
       - name: Generated capture-policy TypeScript runtime evidence
         if: matrix.os == 'ubuntu-latest'
         # `--workspace` reuses the test binaries built above instead of
@@ -188,6 +194,20 @@ jobs:
       - name: Vendored tailwind.css is current
         if: matrix.os == 'ubuntu-latest'
         run: git diff --exit-code -- crates/ai-memory-web/static/tailwind.css
+
+  # The script edits tracked source and rebuilds target/ once per mutant, so
+  # it runs alone: no later step consumes the binary it leaves behind, and a
+  # surviving mutant fails this check rather than the test suite (#1967).
+  mutation-checks:
+    name: dashboard mutation checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: python3 scripts/check-dashboard-core-mutations.py
 
   # Native Windows *test* coverage lives in `.github/workflows/windows.yml`: it
   # runs nightly, on demand, and on any pull request carrying the `windows`
@@ -222,6 +242,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: windows-cross
       # cargo-xwin drives clang-cl / lld-link against an auto-downloaded MSVC
       # CRT + Windows SDK, so bundled SQLite and vendored libgit2 (both C) build
@@ -250,6 +271,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: companions/${{ matrix.companion }}
       - run: cargo fmt --check --manifest-path companions/${{ matrix.companion }}/Cargo.toml
       - run: cargo clippy --locked --manifest-path companions/${{ matrix.companion }}/Cargo.toml --all-targets -- -D warnings
@@ -332,6 +354,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --bin ai-memory
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -350,6 +374,8 @@ jobs:
         with:
           toolchain: "1.95"
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install with a fresh dependency resolution
         run: cargo install --path crates/ai-memory-cli --debug --root target/source-install
       - name: Smoke test installed binary
@@ -489,6 +515,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install cargo-audit --locked
       # zip is versioned 8.6.0 for Candle compatibility but pinned to
       # upstream's official 8.x fix commit (507c5c76) for this GHSA.

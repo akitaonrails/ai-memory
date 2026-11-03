@@ -3201,11 +3201,7 @@ fn resolve_data_dir_with(data_dir: Option<&Path>, runtime_env: &RuntimeEnv) -> P
     let dir = data_dir
         .map(Path::to_path_buf)
         .or_else(|| runtime_env.data_dir().map(Path::to_path_buf))
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("ai-memory")
-        });
+        .unwrap_or_else(crate::config::default_data_dir);
     // Recover already-installed hooks that baked a safe verbatim data-dir form.
     match dir.to_str() {
         Some(s) if s.starts_with(r"\\?\") => {

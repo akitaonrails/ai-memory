@@ -285,6 +285,18 @@ pub(crate) fn split_origin_and_path(raw: &str) -> (String, String) {
     (trimmed.to_string(), String::new())
 }
 
+/// `url` as a log line or error message may print it: without the
+/// `user:pass@` userinfo a URL can carry, and never the raw text of one that
+/// does not parse (it could hold that userinfo in a form the parser rejects).
+pub(crate) fn display_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "an unparsable URL".to_owned();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.to_string()
+}
+
 /// Whether `url` names a server on this machine: an `http`/`https` URL whose
 /// host is `localhost`, an address in `127.0.0.0/8`, or `[::1]`, carrying no
 /// user information.
@@ -353,7 +365,7 @@ pub async fn get_json<T: DeserializeOwned>(
     let resp = require_success(&endpoint.i18n, reqwest::Method::GET, resp).await?;
     resp.json::<T>()
         .await
-        .with_context(|| format!("parsing JSON body from GET {url}"))
+        .with_context(|| format!("parsing JSON body from GET {}", display_url(&url)))
 }
 
 /// PATCH JSON body to `<endpoint>{path}`, deserialise JSON response.
@@ -375,7 +387,7 @@ pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
     let resp = require_success(&endpoint.i18n, reqwest::Method::PATCH, resp).await?;
     resp.json::<T>()
         .await
-        .with_context(|| format!("parsing JSON body from PATCH {url}"))
+        .with_context(|| format!("parsing JSON body from PATCH {}", display_url(&url)))
 }
 
 /// POST JSON body to `<endpoint>{path}`, deserialise JSON response.
@@ -441,7 +453,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
     let resp = require_success(&endpoint.i18n, reqwest::Method::POST, resp).await?;
     resp.json::<T>()
         .await
-        .with_context(|| format!("parsing JSON body from POST {url}"))
+        .with_context(|| format!("parsing JSON body from POST {}", display_url(&url)))
 }
 
 fn build_url_with_query(
@@ -474,11 +486,11 @@ pub(crate) fn augment_connect_error(
             } else {
                 "cli-http-default-server-hint"
             },
-            &endpoint.url,
+            display_url(&endpoint.url),
         );
-        anyhow::Error::new(err).context(i18n.two("cli-http-unreachable", url, hint))
+        anyhow::Error::new(err).context(i18n.two("cli-http-unreachable", display_url(url), hint))
     } else {
-        anyhow::Error::new(err).context(i18n.one("cli-http-request-failed", url))
+        anyhow::Error::new(err).context(i18n.one("cli-http-request-failed", display_url(url)))
     }
 }
 
@@ -602,7 +614,7 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     while let Some(chunk) = resp
         .chunk()
         .await
-        .with_context(|| format!("reading response chunk from POST {url}"))?
+        .with_context(|| format!("reading response chunk from POST {}", display_url(&url)))?
     {
         writer
             .write_all(&chunk)

@@ -105,6 +105,8 @@ jobs:
           toolchain: "1.95"
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
         run: cargo build --locked --release -p ai-memory-cli
@@ -160,6 +162,8 @@ jobs:
           toolchain: "1.95"
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
         run: cargo build --locked --release -p ai-memory-cli
@@ -232,6 +236,8 @@ jobs:
           toolchain: "1.95"
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
         run: cargo build --locked --release -p ai-memory-cli

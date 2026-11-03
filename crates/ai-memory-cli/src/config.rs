@@ -3397,7 +3397,7 @@ impl Config {
         }
         tracing::warn!(
             provider = provider.name(),
-            base_url = ambient,
+            base_url = %crate::http_client::display_url(ambient),
             "ignoring ambient LLM_BASE_URL: this provider talks to a fixed vendor \
              endpoint. Set llm_base_url (or AI_MEMORY_LLM_BASE_URL) to point it \
              somewhere else on purpose."
@@ -3721,13 +3721,16 @@ fn default_patchable_page_prefixes() -> Vec<String> {
         .collect()
 }
 
-fn default_data_dir() -> PathBuf {
+/// The data dir every entry point falls back to with no `--data-dir`, no
+/// `AI_MEMORY_DATA_DIR` and no config override. The hook resolves the same
+/// path, which lets `install-hooks` leave the flag out of a command (#1949).
+pub(crate) fn default_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ai-memory")
 }
 
-fn canonicalise_or_keep(p: &Path) -> PathBuf {
+pub(crate) fn canonicalise_or_keep(p: &Path) -> PathBuf {
     if let Ok(canon) = p.canonicalize() {
         return canon;
     }

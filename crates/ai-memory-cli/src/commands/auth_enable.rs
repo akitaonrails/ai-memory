@@ -26,6 +26,7 @@ use crate::cli::{AuthEnableArgs, InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::install_mcp::{self, mcp_server_url_from_base};
 use crate::commands::path_util::display_path;
 use crate::config::Config;
+use crate::http_client::display_url;
 use crate::local_auth::{self, HookCredential};
 use crate::server_profiles::{self, ProfileName};
 
@@ -356,7 +357,7 @@ fn print_outcome(i18n: &ai_memory_core::i18n::Localizer, outcome: &EnableOutcome
             Wiring::Rewired => println!(
                 "{}", i18n.format("cli-auth-enable-mcp-client-re-registered-in-so-it-reads-the-token-without-holding-it", &[("value0", client.to_string()), ("value1", display_path(&line.path).to_string())])),
             Wiring::OtherServer(url) => {
-                println!("{}", i18n.format("cli-auth-enable-mcp-client-targets-url-another-server-left-unchanged", &[("value0", client.to_string()), ("value1", url.to_string())]));
+                println!("{}", i18n.format("cli-auth-enable-mcp-client-targets-url-another-server-left-unchanged", &[("value0", client.to_string()), ("value1", display_url(url))]));
             }
             Wiring::Manual(reason) => {
                 println!("{}", i18n.format("cli-auth-enable-mcp-client-needs-a-manual-change-reason", &[("value0", client.to_string()), ("value1", reason.to_string())]));

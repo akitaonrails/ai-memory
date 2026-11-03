@@ -7292,8 +7292,8 @@ impl ReaderPool {
     /// [`prune_consolidated_observations`](crate::ops::prune_consolidated_observations),
     /// read-only, so a dry run can report a number without any chance of a
     /// write. Kept beside the delete rather than derived from it because the
-    /// dry run must never open a write transaction at all. The
-    /// active-work exclusion is the shared fragment
+    /// dry run must never open a write transaction at all. The session
+    /// eligibility is the shared fragment
     /// `OBSERVATION_PRUNE_SESSION_GUARD_SQL` (interpolated here and in the
     /// delete), so a dry run can never report rows the real pass would keep,
     /// or miss rows it would delete for the same snapshot.
@@ -7315,8 +7315,7 @@ impl ReaderPool {
                  ), eligible_sessions AS MATERIALIZED ( \
                      SELECT s.id FROM candidate_sessions candidate \
                      JOIN sessions s ON s.id = candidate.session_id \
-                     JOIN pages p ON p.id = s.summary_page_id \
-                     WHERE p.superseded_at IS NULL AND {guard} \
+                     WHERE {guard} \
                  ) \
                  SELECT COUNT(*) FROM observations o \
                  JOIN eligible_sessions eligible ON eligible.id = o.session_id \

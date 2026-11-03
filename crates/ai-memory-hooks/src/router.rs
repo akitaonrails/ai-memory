@@ -11428,7 +11428,7 @@ pub(crate) mod tests {
     /// creates a handoff (a wiki write + git checkpoint), which is slower than
     /// a plain observation store, so the deadline is generous and the poll
     /// waits for the specific kinds rather than a bare count.
-    async fn wait_for_kinds(
+    pub(crate) async fn wait_for_kinds(
         state: &HookState,
         sid: &str,
         expected: &[ObservationKind],

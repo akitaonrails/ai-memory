@@ -4925,12 +4925,19 @@ pub struct ObservationPruneOutcome {
     pub sessions_resynced: usize,
 }
 
-/// Active-work exclusion shared, byte for byte, by the observation prune and
-/// its dry-run count (`ReaderPool::prunable_observation_count`). The caller
-/// applies this once per distinct candidate session as alias `s`: a queued job
-/// still needs its raw capture, and an ended session whose observation count
-/// advanced has resumed but not yet reached the next consolidation enqueue.
-pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "NOT EXISTS ( \
+/// Eligibility shared, byte for byte, by the observation prune and its dry-run
+/// count (`ReaderPool::prunable_observation_count`), applied once per distinct
+/// candidate session as alias `s`. `summary_page_id` names the heuristic page;
+/// a consolidation rewrite supersedes that row, so only the live head at its
+/// path says whether the distillation survives (decay eviction clears
+/// `is_latest`). A queued job still needs its raw capture, and an ended session
+/// whose observation count advanced has resumed but not yet reached the next
+/// consolidation enqueue.
+pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "EXISTS ( \
+    SELECT 1 FROM pages pointer \
+    JOIN pages head USING (workspace_id, project_id, path) \
+    WHERE pointer.id = s.summary_page_id AND head.is_latest = 1 \
+) AND NOT EXISTS ( \
     SELECT 1 FROM session_consolidation_jobs j \
     WHERE j.session_id = s.id \
       AND j.state IN ('pending', 'running') \
@@ -4945,10 +4952,10 @@ pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "NOT EXISTS ( \
 /// Raw capture is the store's growth driver, but it is also the only input
 /// consolidation, auto-improvement and the `raw_hits` fallback have. Deleting
 /// it is safe exactly when its durable distillation still exists, so the
-/// predicate joins through `sessions.summary_page_id` — the marker
-/// [`end_session_row`] writes — and requires the page it points at to still be
-/// live. `superseded_at IS NOT NULL` means decay already evicted that page, so
-/// its session's raw capture is the last copy and must stay; a page hard-deleted
+/// predicate requires a live head at the path `sessions.summary_page_id` — the
+/// marker [`end_session_row`] writes — names ([`OBSERVATION_PRUNE_SESSION_GUARD_SQL`]
+/// says why the pointer's own row is not enough). An evicted head means its
+/// session's raw capture is the last copy and must stay; a page hard-deleted
 /// by the same sweep is excluded for free, because the `ON DELETE SET NULL`
 /// foreign key has already cleared the pointer. A session with no `sessions`
 /// row, or one that never ended, matches nothing and can never be pruned.
@@ -5002,8 +5009,7 @@ pub fn prune_consolidated_observations(
              ), eligible_sessions AS MATERIALIZED ( \
                  SELECT s.id FROM candidate_sessions candidate \
                  JOIN sessions s ON s.id = candidate.session_id \
-                 JOIN pages p ON p.id = s.summary_page_id \
-                 WHERE p.superseded_at IS NULL AND {guard} \
+                 WHERE {guard} \
              ) \
              DELETE FROM observations \
              WHERE id IN ( \
@@ -16548,7 +16554,7 @@ pub(crate) mod tests {
     }
 
     /// Point `sessions.summary_page_id` at the session's latest page in a
-    /// scope, the way session consolidation does.
+    /// scope, the way the session-end path does.
     fn point_summary_at_latest(
         conn: &mut Connection,
         sid: SessionId,
