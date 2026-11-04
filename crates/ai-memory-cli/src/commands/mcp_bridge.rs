@@ -21,6 +21,18 @@
 //!   that session's id, and forwarding it would steer this client's unscoped
 //!   calls through another session's active-project pointer.
 //!
+//!   A static client can still omit the scope, and then lands wherever the
+//!   server's fallback points (#1979). So when its launch directory resolves
+//!   to a project the way the thin CLI resolves one (the nearest
+//!   `.ai-memory.toml`, else the git remote), the session-less bridge fills
+//!   that `workspace` + `project` into each call to a tool taking both that
+//!   names no scope of its own: no `workspace`, `project`, `project_id`,
+//!   non-empty `scopes`, `global` other than false, or `scope` other than
+//!   `project`. Every other call is forwarded unchanged. A directory that is
+//!   neither marked nor inside a checkout (`/`, a bare home) resolves to
+//!   nothing, and so does a marker that routes to a `server` profile, since
+//!   its project lives on another server.
+//!
 //! A session-aware Claude Code bridge can add `--channel inbox` (#1942). It
 //! advertises Claude's experimental `claude/channel` capability and polls a
 //! count-only pending-inbox notice, pushing it only when the count changes.
@@ -41,15 +53,17 @@
 //! entry written before that, or by the print path, still carries it in
 //! `AI_MEMORY_AUTH_TOKEN`, which wins.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ClientJsonRpcMessage, ClientRequest,
-    CustomNotification, ListToolsResult, PaginatedRequestParams, ServerConfig,
-    ServerJsonRpcMessage, ServerNotification, ServerPeerInfo,
+    CustomNotification, JsonObject, ListToolsResult, PaginatedRequestParams, ServerConfig,
+    ServerJsonRpcMessage, ServerNotification, ServerPeerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, ServiceError};
 use rmcp::transport::async_rw::AsyncRwTransport;
@@ -79,6 +93,114 @@ const INBOX_CHANNEL_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 struct SessionAwareBridge {
     upstream: Peer<RoleClient>,
     server_config: ServerConfig,
+    /// The session-less bridge's default scope, `None` in the session-aware
+    /// mode and when the launch directory resolves to no project.
+    launch_scope: Option<Arc<LaunchScope>>,
+}
+
+/// The launch directory's project and the tools it is filled into (#1979).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchScope {
+    workspace: String,
+    project: String,
+    /// Upstream tools whose input schema takes both `workspace` and
+    /// `project`, read once at startup.
+    tools: HashSet<String>,
+}
+
+impl LaunchScope {
+    /// `request` with this scope filled in, when it calls a project-scoped
+    /// tool and names no scope of its own; otherwise unchanged.
+    fn apply(&self, mut request: CallToolRequestParams) -> CallToolRequestParams {
+        if !self.tools.contains(request.name.as_ref()) {
+            return request;
+        }
+        let mut arguments = request.arguments.take().unwrap_or_default();
+        if !names_a_scope(&arguments) {
+            arguments.insert("workspace".into(), self.workspace.clone().into());
+            arguments.insert("project".into(), self.project.clone().into());
+        }
+        request.arguments = Some(arguments);
+        request
+    }
+}
+
+/// Whether a call's arguments already choose where it goes. A `null` key
+/// counts as absent, the way the server's optional arguments read it. Any
+/// other value is the caller's, even a malformed one, which the server then
+/// refuses on its own terms rather than the bridge replacing it.
+fn names_a_scope(arguments: &JsonObject) -> bool {
+    let given = |key: &str| arguments.get(key).filter(|value| !value.is_null());
+    ["workspace", "project", "project_id"]
+        .into_iter()
+        .any(|key| given(key).is_some())
+        || given("scopes").is_some_and(|scopes| scopes.as_array().is_none_or(|s| !s.is_empty()))
+        || given("global").is_some_and(|global| global.as_bool() != Some(false))
+        || given("scope").is_some_and(|scope| scope.as_str() != Some("project"))
+}
+
+/// Tools whose input schema declares both `workspace` and `project`.
+fn project_scoped_tools(tools: &[Tool]) -> HashSet<String> {
+    tools
+        .iter()
+        .filter(|tool| {
+            tool.input_schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|properties| {
+                    properties.contains_key("workspace") && properties.contains_key("project")
+                })
+        })
+        .map(|tool| tool.name.to_string())
+        .collect()
+}
+
+/// `(workspace, project)` with the upstream tools it applies to. Without the
+/// schemas the bridge cannot tell a project-scoped tool from another, so a
+/// failed listing leaves every call unchanged.
+async fn launch_scope(
+    upstream: &Peer<RoleClient>,
+    (workspace, project): (String, String),
+) -> Option<Arc<LaunchScope>> {
+    match upstream.list_all_tools().await {
+        Ok(tools) => Some(Arc::new(LaunchScope {
+            workspace,
+            project,
+            tools: project_scoped_tools(&tools),
+        })),
+        Err(error) => {
+            tracing::warn!(error = %error, "listing upstream tools for the launch scope failed");
+            None
+        }
+    }
+}
+
+/// The directory the bridge was launched from: the host cwd the Docker
+/// wrapper passes, else the process cwd.
+fn launch_dir(config: &Config) -> Option<PathBuf> {
+    config
+        .runtime_env
+        .host_cwd()
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+}
+
+/// The `(workspace, project)` the thin CLI resolves for `dir`
+/// ([`super::resolve_scope_for_path`]), or `None` when `dir` is neither
+/// covered by a scope marker nor inside a checkout, when a marker routes it
+/// to a `server` profile, or when the marker cannot be read.
+fn launch_project(config: &Config, dir: &Path) -> Option<(String, String)> {
+    let dir = crate::marker::absolute_normalized(dir);
+    let lookup = dir.to_string_lossy();
+    let home = config.runtime_env.home_dir().map(Path::new);
+    if crate::marker::find_server_selection(&lookup, home).is_some() {
+        return None;
+    }
+    let marker = crate::marker::read_scope(&lookup, &config.runtime_env).ok()?;
+    if marker.is_none() && crate::marker::checkout_root(&dir).is_none() {
+        return None;
+    }
+    super::resolve_scope_for_path(config, &dir).ok()
 }
 
 impl ServerHandler for SessionAwareBridge {
@@ -107,6 +229,10 @@ impl ServerHandler for SessionAwareBridge {
         // the downstream client with its shape intact instead of the
         // round-driving `call_tool` helper resolving it against this
         // handler-less bridge.
+        let request = match &self.launch_scope {
+            Some(scope) => scope.apply(request),
+            None => request,
+        };
         self.upstream
             .call_tool_once(request)
             .await
@@ -575,6 +701,11 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         &config.server_url,
     ));
     let bearer = bridge_bearer(config, &server_url)?;
+    let launch_project = if args.no_session_id {
+        launch_dir(config).and_then(|dir| launch_project(config, &dir))
+    } else {
+        None
+    };
     let inbox_channel = args.channel.map(|_channel| {
         let session = session_id.unwrap_or_default().to_owned();
         let cwd = std::env::current_dir()
@@ -622,9 +753,14 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
     if args.channel.is_some() {
         server_config = with_inbox_channel_capability(server_config);
     }
+    let launch_scope = match launch_project {
+        Some(project) => launch_scope(upstream.peer(), project).await,
+        None => None,
+    };
     let bridge = SessionAwareBridge {
         upstream: upstream.peer().clone(),
         server_config,
+        launch_scope,
     };
     let (stdin, stdout) = stdio();
     let downstream = bridge
@@ -1128,6 +1264,7 @@ mod tests {
                 .peer_info()
                 .map(|info| bridge_config((*info).clone()))
                 .unwrap(),
+            launch_scope: None,
         };
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let downstream_server = tokio::spawn(async move { bridge.serve(server_io).await.unwrap() });
@@ -1157,6 +1294,394 @@ mod tests {
         downstream_client.cancel().await.unwrap();
         downstream_server.cancel().await.unwrap();
         upstream.cancel().await.unwrap();
+        http_server.abort();
+    }
+
+    fn launch_scope_for(tools: &[&str]) -> LaunchScope {
+        LaunchScope {
+            workspace: "launch-ws".into(),
+            project: "launch-project".into(),
+            tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+        }
+    }
+
+    fn call(name: &'static str, arguments: serde_json::Value) -> CallToolRequestParams {
+        let mut request = CallToolRequestParams::new(name);
+        request.arguments = arguments.as_object().cloned();
+        request
+    }
+
+    /// #1979: the launch scope reaches only a call that names no scope of its
+    /// own. An explicit pair, half a pair, a project id, a scope list, a
+    /// global search and a global or profile page keep the caller's choice,
+    /// and a tool that takes no project scope is never touched.
+    #[test]
+    fn the_launch_scope_fills_only_calls_that_name_no_scope() {
+        let scope = launch_scope_for(&["memory_query", "memory_write_page"]);
+        let filled = |arguments: serde_json::Value| {
+            serde_json::json!({
+                "workspace": "launch-ws",
+                "project": "launch-project",
+            })
+            .as_object()
+            .unwrap()
+            .iter()
+            .chain(arguments.as_object().unwrap())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<JsonObject>()
+        };
+        let q = serde_json::json!({"q": "notes"});
+        assert_eq!(
+            scope.apply(call("memory_query", q.clone())).arguments,
+            Some(filled(q))
+        );
+        assert_eq!(
+            scope
+                .apply(CallToolRequestParams::new("memory_query"))
+                .arguments,
+            Some(filled(serde_json::json!({}))),
+            "a call with no arguments at all is filled"
+        );
+        for (label, arguments) in [
+            (
+                "null keys",
+                serde_json::json!({"q": "x", "workspace": null, "project": null}),
+            ),
+            ("empty scopes", serde_json::json!({"q": "x", "scopes": []})),
+            (
+                "global false",
+                serde_json::json!({"q": "x", "global": false}),
+            ),
+            ("project page", serde_json::json!({"scope": "project"})),
+        ] {
+            let mut expected = arguments.as_object().unwrap().clone();
+            expected.insert("workspace".into(), "launch-ws".into());
+            expected.insert("project".into(), "launch-project".into());
+            assert_eq!(
+                scope.apply(call("memory_query", arguments)).arguments,
+                Some(expected),
+                "{label}"
+            );
+        }
+
+        for (label, arguments) in [
+            (
+                "another project",
+                serde_json::json!({"q": "x", "workspace": "acme", "project": "api"}),
+            ),
+            (
+                "workspace only",
+                serde_json::json!({"q": "x", "workspace": "acme"}),
+            ),
+            (
+                "project only",
+                serde_json::json!({"q": "x", "project": "api"}),
+            ),
+            (
+                "empty project",
+                serde_json::json!({"q": "x", "project": ""}),
+            ),
+            (
+                "project id",
+                serde_json::json!({"path": "a.md", "project_id": "0190"}),
+            ),
+            (
+                "scopes",
+                serde_json::json!({"q": "x", "scopes": [{"workspace": "a", "project": "b"}]}),
+            ),
+            ("global", serde_json::json!({"q": "x", "global": true})),
+            (
+                "malformed global",
+                serde_json::json!({"q": "x", "global": "yes"}),
+            ),
+            (
+                "global page",
+                serde_json::json!({"path": "a.md", "scope": "global"}),
+            ),
+            (
+                "profile page",
+                serde_json::json!({"path": "a.md", "scope": "profile"}),
+            ),
+        ] {
+            assert_eq!(
+                scope
+                    .apply(call("memory_write_page", arguments.clone()))
+                    .arguments,
+                arguments.as_object().cloned(),
+                "{label}"
+            );
+        }
+        let send = serde_json::json!({"to_workspace": "a", "to_project": "b", "body": "hi"});
+        assert_eq!(
+            scope
+                .apply(call("memory_message_send", send.clone()))
+                .arguments,
+            send.as_object().cloned(),
+            "a tool without project scope arguments is forwarded unchanged"
+        );
+        assert_eq!(
+            scope
+                .apply(CallToolRequestParams::new("memory_message_send"))
+                .arguments,
+            None
+        );
+    }
+
+    /// Eligibility comes from the upstream schema: both keys, not one.
+    #[test]
+    fn project_scoped_tools_take_both_workspace_and_project() {
+        let tool = |name: &'static str, properties: serde_json::Value| {
+            let schema = serde_json::json!({"type": "object", "properties": properties});
+            Tool::new(name, "", Arc::new(schema.as_object().unwrap().clone()))
+        };
+        let tools = [
+            tool(
+                "scoped",
+                serde_json::json!({"workspace": {}, "project": {}, "q": {}}),
+            ),
+            tool("workspace_only", serde_json::json!({"workspace": {}})),
+            tool(
+                "sender",
+                serde_json::json!({"from_workspace": {}, "from_project": {}}),
+            ),
+            Tool::new("schemaless", "", Arc::new(JsonObject::new())),
+        ];
+        assert_eq!(
+            project_scoped_tools(&tools),
+            HashSet::from(["scoped".to_owned()])
+        );
+    }
+
+    /// A throwaway checkout at `dir` with an `origin` remote, or `None` with
+    /// no `git` binary. The host is not a real forge, so a developer's global
+    /// `insteadOf` rules cannot rewrite it.
+    fn checkout_with_origin(dir: &Path, url: &str) -> Option<()> {
+        std::fs::create_dir_all(dir).unwrap();
+        for args in [&["init", "-q"][..], &["remote", "add", "origin", url][..]] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .ok()
+                .filter(std::process::ExitStatus::success)?;
+        }
+        Some(())
+    }
+
+    /// #1979: the launch directory resolves the way the thin CLI resolves
+    /// one, and to nothing where the CLI would guess: outside any checkout
+    /// and marker, under a marker routing to another server, and in a
+    /// directory that no longer exists.
+    #[test]
+    fn the_launch_project_resolves_like_the_thin_cli_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let resolve = |dir: &Path| {
+            let config = Config {
+                runtime_env: crate::config::RuntimeEnv::with_host_cwd_and_home_for_tests(
+                    dir.to_str().unwrap(),
+                    home.to_str().unwrap(),
+                ),
+                ..Config::default()
+            };
+            launch_project(&config, dir)
+        };
+        let pair = |workspace: &str, project: &str| Some((workspace.into(), project.into()));
+
+        let marked = home.join("work").join("notes");
+        std::fs::create_dir_all(marked.join("src")).unwrap();
+        std::fs::write(
+            marked.join(".ai-memory.toml"),
+            "workspace = \"team\"\nproject = \"notes\"\n",
+        )
+        .unwrap();
+        assert_eq!(resolve(&marked), pair("team", "notes"));
+        assert_eq!(
+            resolve(&marked.join("src")),
+            pair("team", "notes"),
+            "a subdirectory finds the marker above it"
+        );
+
+        if checkout_with_origin(
+            &home.join("work").join("api"),
+            "https://git.example.test/acme/api.git",
+        )
+        .is_some()
+        {
+            assert_eq!(
+                resolve(&home.join("work").join("api")),
+                pair(crate::config::DEFAULT_WORKSPACE, "acme-api"),
+                "an unmarked checkout takes the canonical remote name"
+            );
+        }
+
+        let plain_checkout = home.join("work").join("scratch");
+        std::fs::create_dir_all(plain_checkout.join(".git")).unwrap();
+        assert_eq!(
+            resolve(&plain_checkout),
+            pair(crate::config::DEFAULT_WORKSPACE, "scratch"),
+            "a checkout without a remote takes its folder name"
+        );
+
+        // Adversarial: these are where a guess would mislead a call.
+        let bare = home.join("downloads");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(resolve(&bare), None, "neither marked nor a checkout");
+        assert_eq!(resolve(&home), None, "the home directory itself");
+        let routed = home.join("work").join("routed");
+        std::fs::create_dir_all(routed.join(".git")).unwrap();
+        std::fs::write(
+            routed.join(".ai-memory.toml"),
+            "workspace = \"team-b\"\nproject = \"routed\"\nserver = \"team-b\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(&routed),
+            None,
+            "its project lives on another server"
+        );
+        assert_eq!(
+            resolve(&tmp.path().join("missing")),
+            None,
+            "a vanished directory"
+        );
+    }
+
+    /// One recorded call: the tool name and the arguments it arrived with.
+    type SeenCall = (String, Option<JsonObject>);
+
+    /// Records the arguments of every call, behind a scoped and an unscoped
+    /// tool.
+    #[derive(Clone)]
+    struct ScopeRecorder {
+        seen: Arc<Mutex<Vec<SeenCall>>>,
+    }
+
+    impl ServerHandler for ScopeRecorder {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, McpError> {
+            let schema = |properties: serde_json::Value| {
+                let schema = serde_json::json!({"type": "object", "properties": properties});
+                Arc::new(schema.as_object().unwrap().clone())
+            };
+            Ok(ListToolsResult {
+                tools: vec![
+                    Tool::new(
+                        "memory_query",
+                        "",
+                        schema(serde_json::json!({"q": {}, "workspace": {}, "project": {}})),
+                    ),
+                    Tool::new(
+                        "memory_message_send",
+                        "",
+                        schema(serde_json::json!({"to_workspace": {}, "to_project": {}})),
+                    ),
+                ],
+                ..Default::default()
+            })
+        }
+
+        async fn call_tool(
+            &self,
+            request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, McpError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((request.name.to_string(), request.arguments));
+            Ok(CallToolResult::success(vec![Content::text("ok")]).into())
+        }
+    }
+
+    /// #1979, end to end through rmcp: the session-less bridge reads the
+    /// upstream schemas once, fills the launch scope into an unscoped query,
+    /// and forwards an explicitly scoped query and an unscoped-tool call as
+    /// sent. A bridge without a launch scope (the session-aware mode, or a
+    /// directory that resolves to nothing) forwards the unscoped query as
+    /// sent too.
+    #[tokio::test]
+    async fn the_session_less_bridge_scopes_unscoped_calls_to_its_launch_project() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = ScopeRecorder { seen: seen.clone() };
+        let service: StreamableHttpService<ScopeRecorder, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok(recorder.clone()),
+                LocalSessionManager::default().into(),
+                StreamableHttpServerConfig::default().with_json_response(true),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().nest_service("/mcp", service))
+                .await
+                .unwrap();
+        });
+
+        let calls = [
+            ("memory_query", serde_json::json!({"q": "notes"})),
+            (
+                "memory_query",
+                serde_json::json!({"q": "api", "workspace": "acme", "project": "api"}),
+            ),
+            (
+                "memory_message_send",
+                serde_json::json!({"to_workspace": "a", "to_project": "b"}),
+            ),
+        ];
+        for scoped in [true, false] {
+            let upstream =
+                ().serve(upstream_transport(&format!("http://{address}/mcp"), None, None).unwrap())
+                    .await
+                    .unwrap();
+            let launch_scope = if scoped {
+                launch_scope(upstream.peer(), ("team".into(), "notes".into())).await
+            } else {
+                None
+            };
+            let bridge = SessionAwareBridge {
+                upstream: upstream.peer().clone(),
+                server_config: upstream
+                    .peer_info()
+                    .map(|info| bridge_config((*info).clone()))
+                    .unwrap(),
+                launch_scope,
+            };
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let downstream_server =
+                tokio::spawn(async move { bridge.serve(server_io).await.unwrap() });
+            let downstream_client = ().serve(client_io).await.unwrap();
+            let downstream_server = downstream_server.await.unwrap();
+            seen.lock().unwrap().clear();
+            for (name, arguments) in &calls {
+                downstream_client
+                    .call_tool(call(name, arguments.clone()))
+                    .await
+                    .unwrap();
+            }
+            let mut expected: Vec<SeenCall> = calls
+                .iter()
+                .map(|(name, arguments)| ((*name).to_owned(), arguments.as_object().cloned()))
+                .collect();
+            if scoped {
+                let first = expected[0].1.as_mut().unwrap();
+                first.insert("workspace".into(), "team".into());
+                first.insert("project".into(), "notes".into());
+            }
+            assert_eq!(*seen.lock().unwrap(), expected, "scoped: {scoped}");
+            downstream_client.cancel().await.unwrap();
+            downstream_server.cancel().await.unwrap();
+            upstream.cancel().await.unwrap();
+        }
         http_server.abort();
     }
 

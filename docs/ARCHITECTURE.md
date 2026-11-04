@@ -915,7 +915,9 @@ HTTP clients. It has two modes, chosen by the entry that launches it:
   install): it forwards no session identity and ignores an inherited
   `CLAUDE_CODE_SESSION_ID`, which a client started from a Claude Code
   terminal would otherwise lend to that session's active-project pointer.
-  The client is a static MCP client and passes `workspace` + `project`.
+  The client is a static MCP client and passes `workspace` + `project`; a
+  call that names no scope gets the launch directory's project, resolved once
+  at startup with the thin CLI's rules (`docs/auto-scope.md`).
 
 The bridge connects upstream before it serves stdio, so a refused credential
 (401) or an unreachable server ends it at once with the reason.

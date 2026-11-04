@@ -199,6 +199,32 @@ session id, not even an inherited `CLAUDE_CODE_SESSION_ID`, so those clients
 stay static MCP clients and pass `workspace` + `project`; they never touch a
 per-session pointer.
 
+### The session-less bridge's launch scope
+
+A static client sometimes omits the scope anyway, and an unscoped call then
+lands wherever the server's fallback points, which can be another repository
+the hooks made active (#1979). The session-less bridge therefore resolves a
+default scope once, from the directory it was launched in (`AI_MEMORY_HOST_CWD`
+under the Docker wrapper), with the thin CLI's rules: the nearest
+`.ai-memory.toml` names the workspace and project, else a valid `upstream` or
+`origin` remote supplies the canonical path name in the `default` workspace,
+else the launch directory's folder name does. It fills that `workspace` + `project` into
+a call only when the tool's schema takes both and the call names no scope of
+its own: no `workspace`, `project` or `project_id`, no non-empty `scopes`, no
+`global` other than `false`, and no `scope` other than `project`. Everything
+else is forwarded unchanged, so an explicit scope always wins and a partial one
+still fails closed on the server.
+
+The bridge resolves no default, and forwards every call unchanged, when its
+directory is neither covered by a scope marker nor inside a checkout (`/`, a
+bare home directory), when a marker routes it to a `server` profile (its
+project lives on another server), or when the upstream tool list cannot be
+read. The filled scope is an explicit scope like any other: the server
+authorizes it for the caller, it never reads or moves an active-project
+pointer, and it names the same project the hooks capture that checkout into.
+The session-aware bridge fills in nothing, since the server routes its calls
+by the forwarded session id.
+
 Use `per_session` only when your client or bridge can send the same
 opaque session id from the hook payload on each MCP request as
 `X-Memory-Actor-Session-Id`, native MCP metadata as above, or `Mcp-Session-Id`. Otherwise

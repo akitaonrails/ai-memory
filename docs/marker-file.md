@@ -30,7 +30,10 @@ project-scoped tool call because they cannot attach the real lifecycle-hook
 session id. Without a marker override, static clients derive the project from normalized
 `upstream`, then `origin`, joining the full hostless path with the standard safe
 name mapping; only no-valid-remote checkouts use their folder basename.
-Session-aware bridges keep automatic current-project routing.
+Session-aware bridges keep automatic current-project routing. The session-less
+`ai-memory mcp-bridge --no-session-id` applies this derivation itself, from its
+launch directory, to a call that names no scope
+([`auto-scope.md`](auto-scope.md#the-session-less-bridges-launch-scope)).
 
 ## Where to put it
 
