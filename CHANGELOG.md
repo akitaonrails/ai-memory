@@ -11,6 +11,60 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.3.3] - 2026-11-03
+
+### Fixed
+
+- The observation prune (`[decay] observation_retention_days`) checked "summary
+  page still alive" on the heuristic page `sessions.summary_page_id` names. The
+  LLM worker rewrites that page as a new version, so once decay evicted the
+  rewrite the prune deleted the session's last copy, and the dry run counted
+  it. The check now asks for a live head at the page's path (#1961).
+
+- The `ai-memory starting` line that every command logs at startup no longer
+  prints the `user:pass@` part of a configured server URL. Neither do the
+  thin-client errors for an unreachable server or a failed request, `setup`'s
+  MCP check, the warning about an ignored ambient `LLM_BASE_URL`, or the
+  `auth enable` line for an MCP entry that targets another server. All of
+  them now use the helper the `mcp-bridge` connection errors adopted in 3.3.2
+  (#1960).
+
+- `install-hooks --agent cursor` no longer writes the default data dir into
+  `~/.cursor/hooks.json` when that path needs quoting. On macOS the default is
+  `~/Library/Application Support/ai-memory`, and a headless `cursor-agent -p`
+  run whose commands carried that quoted path captured nothing. The hook finds
+  the default itself, so those commands need no quoting. A space-free default,
+  such as the usual Linux path, and any custom data dir are still passed.
+  `ai-memory upgrade`, or re-running `install-hooks --agent cursor --apply`,
+  replaces the old entries (#1949).
+
+### Security
+
+- A password or API key printed by a tool is now redacted when the result
+  arrives as an object, the shape Claude Code's Bash `PostToolUse` always
+  takes (`{"stdout", "stderr", "interrupted"}`). Such a result is stored as
+  compact JSON, so the sanitizer saw `\"` and `\n` where its rules expected
+  a quote and a line break: a `"db_password": "..."` in a printed config, a
+  quoted TOML or YAML value, `"Authorization": "Basic ..."` and any `.env`
+  key past the first line were stored in clear while the same text as a
+  plain body was redacted. The sanitizer now matches through JSON string
+  escapes as it already did through invisible characters. In text that is
+  not JSON, a redaction still covers at least what the text as written
+  matches, so a literal `\n` or `\"` in a plain `.env` value cannot cut it
+  short. In a line that parses as JSON, such as a stored tool result, a
+  quoted `KEY=value` or `"KEY":"value"` value stops at its closing quote,
+  and a value stops at an escaped line break, so the lines around it stay
+  readable and the result stays valid JSON. An escaped tab stays part of the
+  value, and so does a line break before the string's last line when that
+  line is not a new `KEY=value`, `key: value` or `#` line. A secret that
+  continues over more lines, or past an escaped quote, is redacted only up
+  to that point. No redaction starts or ends inside an escape. An unquoted
+  value at the very end of a string with no line break after it still
+  redacts the rest of the result, as before. A quoted plain-text value with
+  spaces, such as `DB_PASSWORD="two words"`, is now redacted whole instead
+  of up to its first space. What counts as a key is unchanged (#1963,
+  #1974).
+
 ## [3.3.2] - 2026-11-03
 
 ### Fixed
@@ -3834,7 +3888,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.3...HEAD
+[3.3.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.3
 [3.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.2
 [3.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.1
 [3.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.0
