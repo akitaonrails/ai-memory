@@ -77,6 +77,7 @@ async fn writer_hook_admission_survives_external_write_lock_held_during_read_the
         title: "checkpoint lock wait".into(),
         body: "the writer must wait out an external checkpoint".into(),
         importance: 5,
+        file_path: None,
     };
 
     let started = Instant::now();

@@ -58,7 +58,13 @@ describe("pages", () => {
     const result = await memory.pages.writeBatch({
       target: { workspace: "demo", projectId: payloads.resolvedWriteTarget.project_id },
       pages: [
-        { path: "notes/a.md", body: "# A", createOnly: true, tags: ["import"] },
+        {
+          path: "notes/a.md",
+          body: "# A",
+          createOnly: true,
+          tags: ["import"],
+          sourceFiles: [{ path: "src/a.rs", commit: "3f2a9c1" }],
+        },
         { path: "notes/b.md", body: "# B", expectedPageId: payloads.PAGE_ID },
       ],
     });
@@ -66,7 +72,13 @@ describe("pages", () => {
       workspace: "demo",
       project_id: payloads.resolvedWriteTarget.project_id,
       pages: [
-        { path: "notes/a.md", body: "# A", create_only: true, tags: ["import"] },
+        {
+          path: "notes/a.md",
+          body: "# A",
+          create_only: true,
+          tags: ["import"],
+          source_files: [{ path: "src/a.rs", commit: "3f2a9c1" }],
+        },
         { path: "notes/b.md", body: "# B", expected_page_id: payloads.PAGE_ID },
       ],
     });
@@ -91,6 +103,7 @@ describe("pages", () => {
       body: "# Retry policy",
       tags: ["a"],
       expiresAt: "2099-01-01",
+      sourceFiles: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expectedPageId: payloads.PAGE_ID,
     });
     assert.deepEqual(server.lastArgs(), {
@@ -100,6 +113,7 @@ describe("pages", () => {
       body: "# Retry policy",
       tags: ["a"],
       expires_at: "2099-01-01",
+      source_files: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expected_page_id: payloads.PAGE_ID,
     });
     assert.equal(result.pageId, payloads.NEXT_PAGE_ID);
@@ -276,6 +290,7 @@ describe("pages", () => {
       entities: ["foo bar"],
       relations: { fixes: ["notes/a.md"] },
       expires_at: "2099-01-01",
+      source_files: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
       expected_page_id: payloads.PAGE_ID,
     });
   });
@@ -463,6 +478,8 @@ describe("messages", () => {
     server.tools.set("memory_message_send", () => ({ message_id: payloads.MESSAGE_ID }));
     const sent = await memory.messages.send({
       to: OTHER,
+      toAgent: "codex",
+      fromAgent: "claude-code",
       body: "please do X",
       subject: "hi",
       nature: "measured",
@@ -471,8 +488,10 @@ describe("messages", () => {
     assert.deepEqual(server.lastArgs(), {
       to_workspace: "demo",
       to_project: "other",
+      to_agent: "codex",
       from_workspace: "demo",
       from_project: "app",
+      from_agent: "claude-code",
       body: "please do X",
       subject: "hi",
       nature: "measured",
@@ -530,11 +549,16 @@ describe("reads", () => {
     const recent = await memory.recent({ limit: 3 });
     assert.deepEqual(server.lastArgs(), { workspace: "demo", project: "app", limit: 3 });
     assert.equal(recent.hits[0]?.path, "notes/retries.md");
-    const briefing = await memory.briefing({ recentPagesLimit: 2, settledFirst: true });
+    const briefing = await memory.briefing({
+      recentPagesLimit: 2,
+      recentSessionsLimit: 3,
+      settledFirst: true,
+    });
     assert.deepEqual(server.lastArgs(), {
       workspace: "demo",
       project: "app",
       recent_pages_limit: 2,
+      recent_sessions_limit: 3,
       settled_first: true,
     });
     assert.equal(briefing.activity7d.pagesUpdated, 1);
@@ -753,6 +777,7 @@ describe("wire names", () => {
         abstract: "a",
         relations: { fixes: ["x"] },
         expiresAt: "2099-01-01",
+        sourceFiles: [{ path: "p", commit: "3f2a9c1" }],
         expectedPageId: "v",
       }),
       memory.pages.write({ path: "p", body: "b", createOnly: true }),
@@ -789,7 +814,7 @@ describe("wire names", () => {
       memory.query({ query: "q", global: true }),
       memory.status(),
       memory.recent({ limit: 1 }),
-      memory.briefing({ recentPagesLimit: 1, settledFirst: true }),
+      memory.briefing({ recentPagesLimit: 1, recentSessionsLimit: 1, settledFirst: true }),
       memory.explore({ focus: "f", recentPagesLimit: 1, reasoning: "low" }),
       memory.observations({
         sessionId: "s",
@@ -813,7 +838,9 @@ describe("wire names", () => {
       memory.handoffs.cancel({ handoffId: "h", anyOwner: true }),
       memory.messages.send({
         to: OTHER,
+        toAgent: "codex",
         from: SCOPE,
+        fromAgent: "claude-code",
         body: "b",
         subject: "s",
         nature: "measured",

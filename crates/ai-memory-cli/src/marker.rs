@@ -1237,7 +1237,9 @@ impl MarkerMemo {
 /// `project_strategy`), or any of the other settings
 /// `hook_capture::marker_query_suffix_impl` forwards (`[recall]
 /// default_global`, `[briefing]` and `[profile]` keys, top-level
-/// `drop_subagent_captures`).
+/// `drop_subagent_captures`), or `[messaging] inbox_notice_on_prompt`,
+/// which the hook reads locally instead of forwarding but must still read
+/// from the nearest settings-declaring marker (#1942).
 /// A marker with any of these is a resolution boundary; only a marker whose
 /// only content is `[capture]` (e.g. `ignore_paths`) is transparent (#668).
 ///
@@ -1254,7 +1256,7 @@ fn declares_more_than_capture(text: &str) -> bool {
         "identity",
         "identity_style",
     ];
-    const FLAG_KEYS: [&str; 7] = [
+    const FLAG_KEYS: [&str; 8] = [
         "default_global",
         "inject_on_session_start",
         "inject_on_subagent_start",
@@ -1262,6 +1264,7 @@ fn declares_more_than_capture(text: &str) -> bool {
         "contribute",
         "consume",
         "deliver_on_session_start",
+        "inbox_notice_on_prompt",
     ];
     QUOTED_KEYS
         .iter()

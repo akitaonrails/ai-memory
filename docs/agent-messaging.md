@@ -1,8 +1,9 @@
 # Cross-project agent messaging (inbox/queue)
 
-Direct, claim-once messaging between two projects, so an agent in one repo can
-ask an agent in another repo to do something **without pulling that repo's
-context into its own session**. Added in 2.3 (migration V64).
+Direct, claim-once messaging between projects, so an agent in one repo can ask
+an agent in another repo to do something **without pulling that repo's context
+into its own session**. The MCP send tool also accepts the same project as its
+recipient. Added in 2.3 (migration V64).
 
 The motivating case: you have Kimi open in `Projects/A` and Claude open in
 `Projects/B`. A needs a change from B. You don't want Kimi to read and reason
@@ -10,9 +11,10 @@ about B (wasted tokens, polluted memory). Instead Kimi writes a self-contained
 request and drops it into B's inbox through ai-memory; later, in B, you tell
 Claude to check its inbox, it pops the message, and works from it.
 
-This is the one place ai-memory deliberately crosses its per-project isolation
-boundary. The crossing is explicit and bidirectionally scoped: a project only
-ever sees mail addressed **to** it (its inbox) or sent **from** it (its outbox).
+Cross-project messages deliberately cross ai-memory's per-project isolation
+boundary. The destination is explicit and bidirectionally scoped: a project
+only ever sees mail addressed **to** it (its inbox) or sent **from** it (its
+outbox).
 
 ## The model
 
@@ -50,7 +52,7 @@ Four MCP tools (documented in the installed `ai-memory-messaging` skill):
 
 | Tool | Role |
 |---|---|
-| `memory_message_send` | Send a message to `to_workspace` + `to_project`'s inbox. |
+| `memory_message_send` | Send to `to_workspace` + `to_project`'s inbox; optional `to_agent` restricts claiming to a registered harness. The same project is a valid recipient. |
 | `memory_message_list` | List pending mail. `box="inbox"` (default) or `box="outbox"`. Read-only. |
 | `memory_message_pop` | Claim the next inbox message (oldest, or a specific `message_id`). |
 | `memory_message_cancel` | Retract a sent message (`message_id`), or clear the whole outbox. |
@@ -67,6 +69,13 @@ complete prompt, because the recipient cannot see project A. When the body
 states a direct measurement, also send `nature: "measured"` and evidence such
 as the command, query, `file:line`, or source message id. Relayed claims should
 remain `reported` unless the sender measures them again.
+
+Set `to_agent` to a registered harness such as `codex` when only that harness
+may claim the message; the recipient project must have a session recorded for
+it. Omit `to_agent` for shared project mail. The MCP tool accepts the sender's
+own project as the recipient too. Static MCP clients can set `from_agent` when
+the caller's session does not record its harness; a recorded session takes
+precedence.
 
 **In Claude (project B), receiving:**
 
@@ -418,3 +427,59 @@ into a resuming agent. The names are there so a static client can pass them to
 the pop; if they cannot be looked up, the notice falls back to "this project's
 inbox". The count is also available on demand via `memory_briefing`
 (`pending_message_count`), whose `scope` names the project it counted.
+
+### Mid-session notices for Claude Code
+
+A repository can opt into the same count-only notice while a Claude Code
+session runs:
+
+```toml
+[messaging]
+inbox_notice_on_prompt = true
+```
+
+The `UserPromptSubmit` hook then fetches `GET /handoff?inbox_only=1`. The
+server authorizes it like a session start and returns only the count-only
+notice: it claims no handoff, builds no recovery snapshot, brief or profile
+digest, records nothing, and leaves the caller's active project alone. The
+hook prints the notice only when the count or the inbox names change, so a
+busy session is not reminded on every prompt. The message body still never
+leaves `memory_message_pop`. The notice counts only mail this harness could
+pop: shared project mail plus mail addressed to Claude Code.
+
+A hook only runs when you submit a prompt. To reach an idle session, the
+session-aware `mcp-bridge` can also act as a
+[Claude Code channel](https://code.claude.com/docs/en/channels-reference).
+Add `--channel inbox` to the bridge's entry:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "command": "/path/to/ai-memory",
+      "args": ["mcp-bridge", "--channel", "inbox"]
+    }
+  }
+}
+```
+
+and start Claude with the entry's name:
+
+```bash
+claude --dangerously-load-development-channels server:ai-memory
+```
+
+The bridge advertises `claude/channel`, polls the same `inbox_only` notice
+(every 5 seconds after a change, backing off to once a minute while nothing
+changes), and sends `notifications/claude/channel` only when the text
+changes. The event body is that notice and nothing else. Claude channels are a
+research preview: the ai-memory bridge is not on Claude's channel allowlist,
+so it loads only through the development flag above, only in an interactive
+session, and only where an organization has not turned channels off
+(`channelsEnabled`). That is why the bridge flag is explicit and off by
+default; without it the bridge behaves exactly as before.
+
+Both notice clients need a server with this release. An older server ignores
+`inbox_only` and still returns only the notice (the clients also send
+`handoff=0&recovery=0&profile_digest=0`), but it republishes the active
+project on each fetch.

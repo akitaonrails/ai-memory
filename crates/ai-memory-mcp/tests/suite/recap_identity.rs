@@ -86,6 +86,7 @@ async fn harness() -> Harness {
         )),
         home_dir: None,
         trusted_proxy_identity: false,
+        index_file_paths: false,
     });
     let auth = AuthState::new(Some(ROOT_TOKEN.to_string())).with_multiuser(
         TokenPepper::new("test-pepper-recap-identity-1234567890ab"),

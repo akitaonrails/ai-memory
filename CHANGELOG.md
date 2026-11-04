@@ -15,6 +15,46 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Showed the harness's session name beside its short ID in the agent dashboard.
   Codex reports names and renames at the end of a turn (#1948).
+- Added per-task LLM provider and fallback profiles for consolidation, bootstrap,
+  auto-improve, experience, dream, lint, profile, rerank, and query answers
+  (including explore). Tasks without an override share the default provider;
+  an override uses only its own fallback chain and can run without a global
+  provider. CLI and web health identify each configured task (#1969).
+
+- Added an opt-in file path index, `[ingest] index_file_paths` (off by
+  default). The native hook client sends the checkout-relative path of the
+  one file a kept file-tool PostToolUse named, in a versioned
+  `_ai_memory_file` field the server always strips, and the server stores it
+  on the observation after its own capture inspection and the sanitizer
+  check. An `ignore_paths` exclusion never sends a path. A set of
+  `file_path_*` counters in `/admin/status` and `/admin/metrics`
+  (`ai_memory_hook_file_paths_total`) records why each other file-tool event
+  got none, with no path or scope label; `/admin/status` also reports when
+  the counters started (`started_ms`). A new internal store read maps a path
+  to the sessions the caller may read. The generated TypeScript integrations
+  follow separately (#1843).
+- Added a per-execution opt-out of the automatic handoff: a session whose
+  hooks run with `AI_MEMORY_AUTO_HANDOFF=off` still gets its summary page and
+  consolidation but leaves no baton at its end or turn checkpoint, while every
+  other session keeps `[handoff] create_on_session_end`. The native hook, the
+  shell and PowerShell bundles and the generated TypeScript plugins forward it
+  as `auto_handoff=0` (#1951).
+- Pages can name the repository files they describe: `memory_write_page`,
+  `memory_write_pages_batch` and the admin write accept an optional
+  `source_files: [{path, commit}]` (up to 16 repository-relative paths, 7-64
+  hex commit ids), and a checkpoint restore keeps it. The key is separate from
+  OKF `sources`, which keeps the page's session provenance. The server never
+  reads those files; a client compares each entry with its checkout and records
+  `stale` feedback when one changed. The TypeScript SDK sends it as
+  `sourceFiles` and `pages.update` carries it over (#1957).
+- Added a dropped-fact report to the opt-in dream pass. For each applied merge
+  it lists the keep-tokens (file paths, identifiers, error codes, URLs) that a
+  source page had and the merged survivor lacks, as `dropped_keep_tokens` on
+  `DreamReport.merges`. A token counts as kept only when the survivor holds it
+  as a whole token. The server logs one warning with the survivor path and the
+  number of dropped tokens; the tokens themselves are logged only at debug.
+  Merges still land, and every source stays recoverable with `restore-page`
+  (#1958).
 - Added a guarded `memory_write_pages_batch` MCP tool for companion imports:
   1-100 conditional page versions are admitted and persisted atomically in one
   existing project, with bounded bodies, duplicate-path rejection, ordered
@@ -37,6 +77,15 @@ version in [`docs/changelog/`](docs/changelog/):
   while many repositories bootstrapped. Runs for the same project still wait
   for each other, and the wiki's own commit lock still serialises the git
   commit (#1890).
+- Added MCP 2026-07-28 lifecycle support by moving the server and stdio
+  bridge to rmcp 3.8. The HTTP transport answers `server/discover` and serves
+  requests carrying complete per-request version metadata statelessly, while
+  the legacy `initialize` handshake keeps working for 2024-11-05, 2025-03-26
+  and 2025-06-18 clients; `--http-stateful` now governs only that legacy
+  session mode, and rejects a session-less request with 400 instead of 422. `mcp-bridge` answers a dual-era
+  client's discovery probe itself, absorbs the cancellation such a client can
+  send after timing the probe out, and forwards multi-round tool results
+  without resolving them locally (#1924).
 - Supported optional `AI_MEMORY_LLM_COMPAT_STREAM` (`llm_compat_stream` in `config.toml`)
   to explicitly set the `stream` field for `openai-compat` Chat Completions requests,
   preventing gateways from defaulting to SSE. Both Docker wrappers forward the
@@ -59,11 +108,256 @@ version in [`docs/changelog/`](docs/changelog/):
 - Made workspace, project, and agent dashboard metric cards link to the
   project list, session/event tables, Knowledge view, or harness-filtered
   Token usage view that explains each count (#1868).
+- Added two off-by-default retrieval signals. `[retrieval] feedback_demotion`
+  lowers the authority of a current page version carrying open `stale` or
+  `wrong` feedback until a rewrite supersedes it. `[retrieval]
+  query_signal_weight` records a sanitized, project-scoped association when
+  the same session reads a query hit or marks it helpful, then boosts that
+  page for later similar queries; the boost is capped by lexical similarity
+  and the number of distinct sessions, and a rewrite clears it. Only callers
+  with write access record associations, `not_helpful` withdraws one, and
+  purging a session deletes the ones it wrote. Both
+  contributions appear in `memory_query(explain=true)`, and both weights
+  default to `0.0`, leaving ranking and capture unchanged (#1941).
+- Added `[messaging] inbox_notice_on_prompt` to `.ai-memory.toml`. A Claude
+  Code session in an opted-in project receives the count-only pending-mail
+  notice on prompts, deduplicated until the count or inbox names change. A
+  session-aware `mcp-bridge --channel inbox` can push the same notice into an
+  idle session through Claude's experimental `claude/channel` (loaded with
+  `claude --dangerously-load-development-channels server:<name>`); the flag
+  stays off by default while channels remain a research preview. Both poll a
+  new read-only `GET /handoff?inbox_only=1` form that claims nothing and
+  leaves the active project alone. Message text never enters a notice (#1942).
 - Added `[recovery] deliver_on_session_start = false` to `.ai-memory.toml`.
   The per-project opt-out suppresses the unfinished-session recovery snapshot
   and its backfill marker without closing the source session. Handoffs,
   managed context, briefs, the profile digest and the inbox notice remain
   independent and unchanged (#1865).
+- Allowed `memory_briefing` callers to include up to 50 recent sessions so
+  agents can see active harnesses in a busy project (#1934).
+
+- Allowed MCP agents to address messages to a registered harness and record
+  the sender harness (#1935).
+
+### Changed
+
+- `[[llm_fallbacks]]` entries now honor `api_key_env` for `copilot` and
+  `anthropic-oauth`, which used to ignore it and send the native token.
+  `openai-oauth`, `codex` and `cursor` have no key to override, so an entry
+  for one of them that sets `api_key_env` now fails `ai-memory serve` startup
+  instead of silently ignoring the variable; remove the key to keep the native
+  login. A `copilot` fallback's `base_url` now also sets its API endpoint when
+  `COPILOT_API_URL` is unset (#1969).
+
+## [3.3.3] - 2026-11-03
+
+### Fixed
+
+- The observation prune (`[decay] observation_retention_days`) checked "summary
+  page still alive" on the heuristic page `sessions.summary_page_id` names. The
+  LLM worker rewrites that page as a new version, so once decay evicted the
+  rewrite the prune deleted the session's last copy, and the dry run counted
+  it. The check now asks for a live head at the page's path (#1961).
+
+- The `ai-memory starting` line that every command logs at startup no longer
+  prints the `user:pass@` part of a configured server URL. Neither do the
+  thin-client errors for an unreachable server or a failed request, `setup`'s
+  MCP check, the warning about an ignored ambient `LLM_BASE_URL`, or the
+  `auth enable` line for an MCP entry that targets another server. All of
+  them now use the helper the `mcp-bridge` connection errors adopted in 3.3.2
+  (#1960).
+
+- `install-hooks --agent cursor` no longer writes the default data dir into
+  `~/.cursor/hooks.json` when that path needs quoting. On macOS the default is
+  `~/Library/Application Support/ai-memory`, and a headless `cursor-agent -p`
+  run whose commands carried that quoted path captured nothing. The hook finds
+  the default itself, so those commands need no quoting. A space-free default,
+  such as the usual Linux path, and any custom data dir are still passed.
+  `ai-memory upgrade`, or re-running `install-hooks --agent cursor --apply`,
+  replaces the old entries (#1949).
+
+### Security
+
+- A password or API key printed by a tool is now redacted when the result
+  arrives as an object, the shape Claude Code's Bash `PostToolUse` always
+  takes (`{"stdout", "stderr", "interrupted"}`). Such a result is stored as
+  compact JSON, so the sanitizer saw `\"` and `\n` where its rules expected
+  a quote and a line break: a `"db_password": "..."` in a printed config, a
+  quoted TOML or YAML value, `"Authorization": "Basic ..."` and any `.env`
+  key past the first line were stored in clear while the same text as a
+  plain body was redacted. The sanitizer now matches through JSON string
+  escapes as it already did through invisible characters. In text that is
+  not JSON, a redaction still covers at least what the text as written
+  matches, so a literal `\n` or `\"` in a plain `.env` value cannot cut it
+  short. In a line that parses as JSON, such as a stored tool result, a
+  quoted `KEY=value` or `"KEY":"value"` value stops at its closing quote,
+  and a value stops at an escaped line break, so the lines around it stay
+  readable and the result stays valid JSON. An escaped tab stays part of the
+  value, and so does a line break before the string's last line when that
+  line is not a new `KEY=value`, `key: value` or `#` line. A secret that
+  continues over more lines, or past an escaped quote, is redacted only up
+  to that point. No redaction starts or ends inside an escape. An unquoted
+  value at the very end of a string with no line break after it still
+  redacts the rest of the result, as before. A quoted plain-text value with
+  spaces, such as `DB_PASSWORD="two words"`, is now redacted whole instead
+  of up to its first space. What counts as a key is unchanged (#1963,
+  #1974).
+
+## [3.3.2] - 2026-11-03
+
+### Fixed
+
+- Profile harvest, list and status read every current `profile/` page in the
+  scope. The previous 200-row path-order cap dropped later categories from
+  those views and made the harvester treat the unread pages as forgotten. The
+  session-start digest, which runs on the first prompt of every session, reads
+  up to 2,000 pages: far more than its byte budget can show, and still a
+  bounded read (#1946, #1955).
+
+- Cline 3.0.74 tool observations now classify ClineCore names (`read_files`,
+  `run_commands`, `editor`, and the other built-ins) so they store as
+  `tool file` / `tool non-file` with bounded output instead of `tool unknown`.
+  Capture also reads the documented `preToolUse.toolName` / `parameters`
+  envelope beside the CLI `tool_call` shape, and `[capture] ignore_paths`
+  matches `read_files` `files[].path` and `run_commands` `commands`. A
+  headless `cline -y` task still records no prompt: Cline seeds its first
+  prompt without firing `UserPromptSubmit`, and `TaskStart` carries no task
+  text (#1950, #1954).
+
+- The generated OpenCode 2 plugin now retries a failed startup-context
+  (`/handoff`) fetch at most three times per root session. It used to retry on
+  every model request, and the `context` hook fires on each one, so a server
+  slower than the 1 s fetch timeout received a new request, and kept a busy
+  read worker, per model call. On a 3.3.0 server with a slow
+  interrupted-session lookup this grew `serve` by a few blocked threads a
+  minute until a restart (#1953).
+
+- `mcp-bridge` no longer exits at once when it starts while the server is
+  not listening yet. A stdio client does not relaunch a bridge that exited, so
+  a client opened during a service restart lost its memory tools for the whole
+  session. The bridge now retries a refused connection for up to 3 seconds,
+  and when nothing answers it reports `could not reach the ai-memory server
+  at <url>` (with any `user:pass@` stripped from the URL) and a pointer to
+  check the server, instead of rmcp's
+  `error sending request ... when send initialize request` under a bearer
+  token hint that had nothing to do with it (#1947).
+
+- Rule pages whose titles mix scripts no longer share one path. The rule
+  slugger kept only a title's ASCII letters and digits, so `ACME 客户周报的
+  格式与范围` and every other rule whose title shared the word `ACME` collapsed
+  onto `_rules/acme.md`, and each consolidation of the later one superseded
+  the earlier page. When the fold drops any letter or digit, the slug now
+  carries an 8-hex digest of the title (the same mechanism as the
+  `rule-<hex>` fallback): different titles keep different pages, a
+  restatement keeps updating its own, and a pure-ASCII title keeps its old
+  slug. A rule written before this change keeps its unsuffixed page: when
+  the old path holds the same title, the restatement updates it there
+  instead of forking a second live copy at the new path. Profile entry slugs take the same digest and now fold Latin
+  diacritics like rule titles do; a statement with no ASCII at all names
+  itself by digest instead of every such statement landing on `entry`. Two
+  rules in one batch that still slug alike, such as two long titles
+  truncating into one 60-char window, are renamed apart before the batch
+  writes rather than the second silently superseding the first. And when
+  a page's final path moves away from the path the model proposed, the
+  rule routing and the rename above being the usual reasons, wikilinks in
+  the same batch that target the proposed path are rewritten to the final
+  path, so sibling pages no longer link to a page that never exists;
+  same-project links are allowed to dangle, so no later pass repaired
+  them (#1943).
+
+- Full-text search now finds a page or observation that names a file with its
+  directory (`crates/store/src/ops.rs`) when the query is the file name
+  (`ops.rs`, `ops` or `src/ops.rs`). `/` is no longer an FTS token character,
+  so a path splits into words like the rest of the text; `_` and `-` still keep
+  identifiers whole. Both indexes rebuild once on upgrade (#1921).
+
+- `serve` no longer exits at startup, on any platform, when the wiki git
+  repository is owned by another account (libgit2 `code=Owner`, for example a
+  data directory created from an elevated shell or with `sudo`), including
+  while the OKF wiki migration is pending. Capture and search keep working, as
+  `docs/windows.md` describes, and startup logs the owner failure at ERROR with
+  the remedy; wiki commits keep failing until ownership is fixed (#1923).
+
+- Consolidation now waits for an LLM provider's `Retry-After` hint before
+  retrying after a rate limit or transient error, capped at 32 seconds, matching
+  the policy used by bootstrap chunks (#1889), remote embedders (#1397) and the
+  fallback chain (#1619). A rate-limited provider answering `429` with a hint
+  longer than the fixed 2-second delay is no longer retried prematurely before
+  its window has reset (#1928).
+
+- The PowerShell hook bundle no longer follows HTTP redirects, matching the
+  native hook client (#1818) and the generated TypeScript integrations
+  (#1903). Behind an SSO gateway, proxy or captive portal that redirects to
+  a login page, `Invoke-WebRequest`'s default of five hops treated the page's
+  `200` as a delivery: the spool drain deleted the event, a `307` or `308`
+  replayed the POST (and `Authorization`) to the redirect target, and a `302`
+  body could be injected as a handoff. The bundle now sets
+  `MaximumRedirection` to 0 and treats a non-2xx status as undelivered, so
+  the event stays spooled and no handoff is injected (#1930).
+
+- The thin CLI HTTP client no longer follows redirects, matching the native
+  hook client (#1818) and `ai-memory auth` (`Policy::none()`). Behind an SSO
+  gateway, proxy or captive portal, `reqwest::Client::new()` followed a 302
+  to a login page: `ai-memory backup` wrote that HTML as the gzip tarball,
+  JSON helpers parsed the page instead of reporting the 302, and a `307` or
+  `308` replayed the request body to the `Location` origin. A 3xx now fails
+  closed and the previous backup file is left in place; session finalization
+  and backfill's explicit-server bearer resolution share the same client
+  (#1932).
+
+- `ai-memory setup`'s health probe, `ai-memory-wikisync` and
+  `ai-memory-importer` no longer follow HTTP redirects either, completing the
+  thin-client change above. A proxy or login portal answering `307` toward
+  another origin's healthy `/healthz` made setup trust a server it never
+  reached, and the companions' bearer reads and write POSTs were replayed to
+  the `Location` origin. Each now reports the 3xx as a redirect it does not
+  follow (#1932).
+
+- Recorded failed Cursor tool calls as failures. Cursor's
+  `postToolUseFailure` carries `error_message` and `failure_type`, not the
+  `error` string ai-memory read, so a call that failed or timed out was stored
+  as `outcome: unknown` with no text, and the session summary's failed count,
+  the `## Failed tool calls` section and the handoff's `Last failed tool call`
+  line all skipped it. Such a call now records `outcome: error` with Cursor's
+  error message; a denied call keeps its message and stays `unknown`. The
+  event was already wired, so no reinstall is needed (#1937).
+
+- Kept `memory_patch_page` edits where their anchors point. An `add_section`
+  listed before an append to the last section put the appended text under the
+  new heading, and replacing a section while appending to its last nested
+  section deleted that nested section and still reported success. Edits that
+  land at the same place now apply in one order whatever the request order
+  (text for an existing section, then `end_of_page`, then new sections), and an
+  edit to any section inside a replaced one fails the batch as
+  `overlapping_edits`. The durable-pages skill also told agents to use
+  `append_to_section`, which the tool rejects; it now names `append` and its
+  two targets (#1939).
+
+- Kept real-time hook capture working after Claude Code `/clear` in an
+  ID-selected managed run. The clear boundary links the new native session
+  while preserving checkout, operator, project and lease checks; replaying an
+  older session cannot move the run backward (#1936).
+
+- An in-session `/resume` back to the conversation from before a `/clear` no
+  longer stops capture in an ID-selected managed run. The clear relink above
+  left the old native id refused for good, so Claude's `SessionStart` with
+  `source: "resume"` was rejected and the resumed conversation went
+  uncaptured. A resume now relinks the run to a native session its own
+  workstream already held, under the same checkout, operator, project, lease
+  and Write checks, and only when no other live run holds that session; a
+  replayed `clear` still cannot move the run backward (#1936, #1944).
+
+### Security
+
+- `ai-memory-wikisync` now stages every file it replaces (exported pages,
+  the export state file and the git `post-merge` hook) under an
+  unpredictable name created exclusively, instead of a fixed staging name
+  opened with `File::create` or a remove-then-create pair. In a
+  destination shared with other accounts, a symlink planted at one of the
+  old predictable staging names could make an apply overwrite a file of
+  the planter's choosing, or win the narrow race those two writes left;
+  planted symlinks are now neither followed nor raced.
+  ([GHSA-jr85-7366-xrm2](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-jr85-7366-xrm2))
 
 ## [3.3.1] - 2026-11-01
 
@@ -3732,7 +4026,9 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.3...HEAD
+[3.3.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.3
+[3.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.2
 [3.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.1
 [3.3.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.0
 [3.2.10]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.2.10

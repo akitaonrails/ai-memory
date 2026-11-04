@@ -77,6 +77,7 @@ async fn prompt(fx: &Fixture, project: &str, body: &str) -> ProjectId {
                 title: "obs".into(),
                 body: body.into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

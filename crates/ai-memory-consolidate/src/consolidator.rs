@@ -5,7 +5,7 @@
 //! [`Wiki::write_page`] so the supersession chain + git auto-commit
 //! kicks in automatically.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,6 @@ use ai_memory_llm::{
 };
 use ai_memory_store::{ReaderPool, StoreError, WriterHandle};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -113,6 +112,19 @@ const CONSOLIDATION_LLM_MAX_ATTEMPTS: u32 = 3;
 /// tenacity-style escalating backoff — see the cognee #2840 lesson in
 /// `ai-memory-llm`; the same policy `bootstrap.rs` applies to its chunks.
 const CONSOLIDATION_LLM_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Ceiling on a provider-requested wait, the same one the remote embedders
+/// apply to `Retry-After` (#1397) and `bootstrap.rs` applies to its chunks
+/// (#1889), so one bad hint cannot park consolidation.
+const CONSOLIDATION_LLM_MAX_RETRY_AFTER: Duration = Duration::from_secs(32);
+
+/// Wait before retrying consolidation after `err`. A provider that names its
+/// own delay is waited for, up to [`CONSOLIDATION_LLM_MAX_RETRY_AFTER`]:
+/// retrying sooner than a rate-limited provider asked only spends the attempt
+/// on another `429`. Without a hint the fixed `fallback` applies, as before.
+fn consolidation_retry_wait(err: &LlmError, fallback: Duration) -> Duration {
+    err.retry_after()
+        .map_or(fallback, |hint| hint.min(CONSOLIDATION_LLM_MAX_RETRY_AFTER))
+}
 
 /// Run one consolidation structured call with a short, bounded retry.
 ///
@@ -137,17 +149,19 @@ where
         match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
             Ok(value) => return Ok(value),
             Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
+                let wait = consolidation_retry_wait(&e, retry_delay);
                 // Redacted fields only: this log line is on the consolidation
                 // path, and the `Display` of a provider failure carries the
                 // response body while an HTTP error's can carry the URL.
                 warn!(
                     attempt,
                     max = CONSOLIDATION_LLM_MAX_ATTEMPTS,
+                    wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                     error_class = %e.class(),
                     error_status = ?e.http_status(),
                     "consolidation hit a transient LLM error; retrying shortly",
                 );
-                tokio::time::sleep(retry_delay).await;
+                tokio::time::sleep(wait).await;
                 attempt += 1;
             }
             Err(e) => return Err(e),
@@ -564,6 +578,58 @@ impl Consolidator {
     /// request carries no pin of its own, so writing it would replace the
     /// body and drop the pin. `_slots/` are pinned automatically and keep
     /// the state/invariant regime above, so they are not skipped here.
+    /// #1943 gave mixed-script rule titles a `-<8 hex>` slug suffix, so a
+    /// rule written before it lives at the unsuffixed `_rules/<slug>.md`.
+    /// When that page exists and holds this rule's own title, keep writing
+    /// there instead of forking a second live copy at the new path. A page
+    /// there with a different title (the collision #1943 fixed) is left
+    /// alone and the rule keeps its digested path.
+    fn keep_legacy_rule_path(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        req: &mut WritePageRequest,
+        outcome: &mut ConsolidationOutcome,
+    ) {
+        if !is_rule_request(req) {
+            return;
+        }
+        let Some(title) = req.frontmatter.get("title").and_then(|t| t.as_str()) else {
+            return;
+        };
+        let Some(legacy) = legacy_rule_slug(title)
+            .and_then(|slug| PagePath::new(format!("_rules/{slug}.md")).ok())
+        else {
+            return;
+        };
+        let same_rule = match self.wiki.read_page(workspace_id, project_id, &legacy) {
+            Ok(md) => md
+                .frontmatter
+                .get("title")
+                .and_then(|t| t.as_str())
+                .is_some_and(|existing| {
+                    title_collision_key(existing) == title_collision_key(title)
+                }),
+            Err(ai_memory_wiki::WikiError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                false
+            }
+            Err(err) => {
+                warn!(
+                    path = %legacy.as_str(),
+                    error = %err,
+                    "could not read the pre-#1943 rule path; writing the rule at its new path",
+                );
+                false
+            }
+        };
+        if same_rule {
+            req.path = legacy.clone();
+            outcome.path = legacy;
+        }
+    }
+
     fn should_skip_pinned_page_update(
         &self,
         workspace_id: WorkspaceId,
@@ -820,6 +886,7 @@ impl Consolidator {
         // update here is a real write.
         let mut requests = Vec::with_capacity(batch.updates.len());
         let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
+        let mut proposed_paths = Vec::with_capacity(batch.updates.len());
         for upd in &batch.updates {
             // A path `slugify_page_path` cannot repair (a leading slash, an
             // empty or dot segment) fails `PagePath::new` inside
@@ -901,6 +968,7 @@ impl Consolidator {
                     }
                 }
             }
+            self.keep_legacy_rule_path(ws, proj, &mut req, &mut outcome);
             if self.should_skip_high_resistance_slot_update(ws, proj, &req)? {
                 warn!(
                     path = %req.path.as_str(),
@@ -932,6 +1000,47 @@ impl Consolidator {
             }
             requests.push(req);
             outcomes_preview.push(outcome);
+            // The path the model proposed for this page, kept beside the
+            // built request so the redirect pass below can repoint sibling
+            // links when the final path moved (#1943).
+            proposed_paths.push(upd.path.clone());
+        }
+
+        // #1943: two different rules in one batch can slug to the same
+        // `_rules/<slug>.md` (two long titles truncating into one 60-char
+        // window, or any other pair the slugger maps together). Both
+        // writes would land on one path and the second would supersede
+        // the first, silently dropping a rule. Rename the contested pages
+        // before anything is written; identical titles keep the shared
+        // path, so a restated rule still updates its own page.
+        resolve_rule_path_collisions(&mut requests, &mut outcomes_preview);
+
+        // #1943, second half: a page whose final path moved away from the
+        // model's proposal (Rule routing to `_rules/<slug>`, the collision
+        // rename above, path sanitization) leaves every same-batch
+        // wikilink to the proposed path pointing at a page that never
+        // exists, and same-project links are by design allowed to dangle,
+        // so no later pass repairs them. Repoint them at the final path
+        // now, while the whole batch is still in memory. Keys normalise
+        // through the same wikilink fold the rewriter matches with.
+        let redirects: BTreeMap<String, String> = requests
+            .iter()
+            .zip(proposed_paths.iter())
+            .filter_map(|(req, proposed)| {
+                let key = ai_memory_wiki::normalize_wikilink_path(proposed)?;
+                (key.as_str() != req.path.as_str())
+                    .then(|| (key.as_str().to_owned(), req.path.as_str().to_owned()))
+            })
+            .collect();
+        if !redirects.is_empty() {
+            for (req, outcome) in requests.iter_mut().zip(outcomes_preview.iter_mut()) {
+                let rewritten =
+                    ai_memory_wiki::rewrite_wikilink_targets(&req.body, &req.path, &redirects);
+                if rewritten != req.body {
+                    req.body = rewritten.clone();
+                    outcome.new_body_markdown = rewritten;
+                }
+            }
         }
 
         // #1218: same cross-scope link guard as the single-page path, run
@@ -1115,6 +1224,96 @@ fn build_update(
         tags: upd.tags.clone(),
     };
     Ok((req, outcome))
+}
+
+/// Same-batch guard for rule paths (#1943). `slugify_for_rule` already
+/// digests mixed-script titles apart, but two different titles can still
+/// meet on one slug: two long titles truncating into the same 60-char
+/// window, or a crafted ASCII title echoing another page's digest. Left
+/// alone, `Wiki::apply_batch` writes both and the second supersedes the
+/// first, silently dropping a rule.
+///
+/// Every page on a path claimed by more than one distinct title is
+/// renamed to `<slug>-<8 hex>` of its own title key, so the names stay
+/// pairwise distinct and stable whatever order the model emitted them
+/// in. Identical titles (same collision key) take the same new name and
+/// keep superseding each other, so a restated rule updates its own page
+/// instead of forking it. Non-rule pages are not touched: their path is
+/// the model's own, and two updates aimed at one model path are the
+/// supersession chain's business.
+fn resolve_rule_path_collisions(
+    requests: &mut [WritePageRequest],
+    outcomes: &mut [ConsolidationOutcome],
+) {
+    // path -> the distinct title keys claiming it, rules only. The kind
+    // and title are read from the built frontmatter because that is where
+    // `build_update` normalizes both (empty-title fallback included).
+    let mut claimants: std::collections::BTreeMap<&PagePath, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for req in requests.iter() {
+        if is_rule_request(req)
+            && let Some(title) = req.frontmatter.get("title").and_then(|t| t.as_str())
+        {
+            claimants
+                .entry(&req.path)
+                .or_default()
+                .insert(title_collision_key(title));
+        }
+    }
+    let contested: HashSet<String> = claimants
+        .into_iter()
+        .filter(|(_, keys)| keys.len() > 1)
+        .map(|(path, _)| path.as_str().to_owned())
+        .collect();
+    if contested.is_empty() {
+        return;
+    }
+    let mut taken: HashSet<String> = requests
+        .iter()
+        .map(|r| r.path.as_str().to_owned())
+        .collect();
+    for (req, outcome) in requests.iter_mut().zip(outcomes.iter_mut()) {
+        if !contested.contains(req.path.as_str()) {
+            continue;
+        }
+        let Some(title) = req.frontmatter.get("title").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Some(hex) = crate::slug_digest::title_digest_key(title)
+            .as_deref()
+            .map(crate::slug_digest::digest_hex8)
+        else {
+            continue;
+        };
+        let stem = req
+            .path
+            .as_str()
+            .strip_suffix(".md")
+            .unwrap_or(req.path.as_str());
+        // Another page in the batch could already own the digested name
+        // (a model path built to match, or a rule whose own slug ends in
+        // the same hex). Number the newcomer until the name is free, the
+        // same deterministic fallback `profile::unique_path` uses.
+        let mut candidate = format!("{stem}-{hex}.md");
+        let mut n = 2;
+        while taken.contains(&candidate) {
+            candidate = format!("{stem}-{hex}-{n}.md");
+            n += 1;
+        }
+        let Ok(path) = PagePath::new(candidate.clone()) else {
+            continue;
+        };
+        taken.insert(candidate);
+        req.path = path.clone();
+        outcome.path = path;
+    }
+}
+
+/// Whether a built request is a rule page, per the frontmatter `build_update`
+/// stamps for every Rule update.
+fn is_rule_request(req: &WritePageRequest) -> bool {
+    req.frontmatter.get("kind").and_then(|k| k.as_str())
+        == Some(crate::types::PageKind::Rule.as_str())
 }
 
 const fn tier_as_str(t: Tier) -> &'static str {
@@ -2020,76 +2219,105 @@ fn indent_for_prompt(s: &str) -> String {
 /// each accented letter is a non-ASCII scalar that the run-collapse turns
 /// into a `-`, splitting the word. The truncation cuts at the last hyphen
 /// within the 60-char budget so a long title ends on a whole word rather
-/// than mid-word. Non-decomposable Latin-1 letters (ß, ø, æ) still fall to
-/// `-`, which is acceptable; all pt-BR letters decompose to ASCII.
+/// than mid-word. Non-decomposable Latin-1 letters (ß, ø, æ) still fall
+/// to `-` and count as dropped letters below; all pt-BR letters decompose
+/// to ASCII.
+///
+/// A title that mixes scripts keeps its ASCII words but loses the rest to
+/// the fold, so `ACME 客户周报` and `ACME 其他报告` would both slug to
+/// `acme` and each overwrite the other's page (#1943). When the fold
+/// drops any letter or digit, a `-<8 hex>` digest of the title key (the
+/// same mechanism as the `rule-<hex>` fallback) is appended: different
+/// titles cannot share a path, a restated title keeps updating its own
+/// page, and a pure-ASCII title keeps its exact old slug.
 fn slugify_for_rule(title: &str) -> String {
+    fold_rule_slug(title, true)
+}
+
+/// The slug a rule title took before #1943 added the fold-loss digest, when
+/// it differs from today's. An upgrade must not fork an existing rule onto
+/// a second path, so a write whose legacy page holds the same title keeps
+/// updating that page (see `Consolidator::keep_legacy_rule_path`).
+fn legacy_rule_slug(title: &str) -> Option<String> {
+    let legacy = fold_rule_slug(title, false);
+    (legacy != slugify_for_rule(title)).then_some(legacy)
+}
+
+fn fold_rule_slug(title: &str, digest_fold_loss: bool) -> String {
     // NFD decomposition splits `é` into `e` + U+0301 (combining acute),
     // `ç` into `c` + U+0327, etc. Reuses ai-memory-core's icu_normalizer.
     let decomposed = icu_normalizer::DecomposingNormalizer::new_nfd().normalize(title);
     let mut out = String::with_capacity(decomposed.len());
     let mut prev_dash = true; // leading dashes get folded
+    let mut dropped_alnum = false;
     for c in decomposed.chars() {
         // Drop the combining marks NFD left behind (the Combining
         // Diacritical Marks block), rather than folding them to a `-`,
         // so the base letter stands alone: `e` + U+0301 -> `e`.
-        if ('\u{0300}'..='\u{036F}').contains(&c) {
+        if crate::slug_digest::is_combining_mark(c) {
             continue;
         }
         let lower = c.to_ascii_lowercase();
         if lower.is_ascii_alphanumeric() {
             out.push(lower);
             prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
+        } else {
+            dropped_alnum |= crate::slug_digest::is_fold_lost_alnum(c);
+            if !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
         }
     }
     while out.ends_with('-') {
         out.pop();
     }
+    // The digest names the whole title, ASCII words included, so two
+    // titles that share ASCII words but differ elsewhere part ways, and
+    // composed/decomposed spellings of one title (same NFD form) agree.
+    // `dropped_alnum` guarantees the key exists whenever it is needed.
+    let digest = crate::slug_digest::title_digest_key(title)
+        .as_deref()
+        .map(crate::slug_digest::digest_hex8);
     if out.is_empty() {
         // A title with no ASCII letter or digit (Cyrillic, CJK, ...) would
         // share one name with every other such title, and each rule would
         // overwrite the last. Name it after the title instead. A title with
-        // no letter or digit at all has nothing to name it by. The hash takes
-        // the same fold as the ASCII slug (lower-cased words, separators
-        // collapsed) so a restated rule updates its own page; combining
-        // marks stay with their letter so `й` and `и` remain distinct.
-        let in_word = |c: char| c.is_alphanumeric() || ('\u{0300}'..='\u{036F}').contains(&c);
-        let key = decomposed
-            .split(|c: char| !in_word(c))
-            .filter(|word| !word.is_empty())
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>()
-            .join("-");
-        if key.chars().any(char::is_alphanumeric) {
-            let digest = Sha256::digest(key.as_bytes());
-            let hex: String = digest
-                .iter()
-                .take(4)
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            return format!("rule-{hex}");
-        }
-        return "rule".into();
+        // no letter or digit at all has nothing to name it by.
+        return match digest {
+            Some(hex) => format!("rule-{hex}"),
+            None => "rule".into(),
+        };
     }
-    if out.len() > 60 {
-        // `out` is ASCII here, so byte index 60 is a char boundary. Cut at
+    // The suffix rides inside the 60-char cap, so the ASCII part folds to
+    // a 51-char budget when one is coming.
+    let suffix = if dropped_alnum && digest_fold_loss {
+        digest.map(|hex| format!("-{hex}"))
+    } else {
+        None
+    };
+    let cap = 60 - suffix.as_deref().map_or(0, str::len);
+    if out.len() > cap {
+        // `out` is ASCII here, so a byte index is a char boundary. Cut at
         // the last hyphen inside the window to end on a whole word; only
-        // hard-cut at 60 when the window holds no hyphen (one long token).
-        // The window includes index 60: a hyphen there means the first 60
-        // chars are whole words, and they all fit. A hyphen in the first
-        // half does not count, because cutting there would throw most of
-        // the title away (a short first word before one long token).
-        match out[..=60].rfind('-').filter(|&idx| idx >= 30) {
+        // hard-cut when the window holds no hyphen (one long token). The
+        // window includes the cap index: a hyphen there means the first
+        // `cap` chars are whole words, and they all fit. A hyphen in the
+        // first half does not count, because cutting there would throw
+        // most of the title away (a short first word before one long
+        // token).
+        match out[..=cap].rfind('-').filter(|&idx| idx >= cap / 2) {
             Some(idx) => out.truncate(idx),
-            None => out.truncate(60),
+            None => out.truncate(cap),
         }
         while out.ends_with('-') {
             out.pop();
         }
     }
-    out
+    match suffix {
+        Some(suffix) => format!("{out}{suffix}"),
+        None => out,
+    }
 }
 
 fn short_id(s: &str) -> String {
@@ -3872,6 +4100,105 @@ mod tests {
         assert!(slug.starts_with("a-bbb"), "slug collapsed to {slug:?}");
     }
 
+    /// #1943: a mixed-script title keeps its ASCII words but loses the
+    /// rest to the fold, so two rules that share one ASCII word and
+    /// nothing else must not share `_rules/<slug>.md`. Each carries a
+    /// digest of its own title, stable across restatements.
+    #[test]
+    fn slugify_distinguishes_mixed_script_titles() {
+        let report = slugify_for_rule("ACME 客户周报的格式与范围");
+        let other = slugify_for_rule("ACME 其他报告");
+        for slug in [&report, &other] {
+            assert!(slug.starts_with("acme-"), "ASCII words survive: {slug}");
+            assert_ne!(
+                slug, "acme",
+                "a dropped letter must cost the shared slug: {slug}"
+            );
+            let path = PagePath::new(format!("_rules/{slug}.md")).unwrap();
+            path.ensure_portable().unwrap();
+        }
+        assert_ne!(report, other);
+        assert_eq!(report, slugify_for_rule("ACME 客户周报的格式与范围"));
+        // Case and punctuation do not name a new rule, with or without a
+        // digest.
+        assert_eq!(report, slugify_for_rule("acme 客户周报的格式与范围！"));
+
+        let check = slugify_for_rule("部署前先运行 start 检查");
+        assert!(check.starts_with("start-"), "ASCII words survive: {check}");
+        assert_ne!(check, slugify_for_rule("start 中文检查"));
+    }
+
+    /// #1943: pure-ASCII titles keep their exact pre-fix slugs; the
+    /// digest only appears when the fold actually dropped a letter or
+    /// digit. Folded Latin diacritics are carried, not dropped, so they
+    /// stay suffix-free too.
+    #[test]
+    fn slugify_leaves_ascii_titles_byte_identical() {
+        assert_eq!(
+            slugify_for_rule("Never ship code without a unit test"),
+            "never-ship-code-without-a-unit-test"
+        );
+        assert_eq!(slugify_for_rule("---hyphenated---"), "hyphenated");
+        assert_eq!(
+            slugify_for_rule("Deploy before start checks"),
+            "deploy-before-start-checks"
+        );
+        assert_eq!(slugify_for_rule("Modelo estável"), "modelo-estavel");
+        assert_eq!(
+            slugify_for_rule("Política de retenção"),
+            "politica-de-retencao"
+        );
+    }
+
+    /// #1943: composed and decomposed spellings of one title are one
+    /// title: same ASCII slug, same digest, so they update one page.
+    #[test]
+    fn slugify_treats_composition_variants_as_one_title() {
+        assert_eq!(
+            slugify_for_rule("Café 中文规则"),
+            slugify_for_rule("Cafe\u{0301} 中文规则")
+        );
+        assert_eq!(
+            slugify_for_rule("Équipe 客户周报"),
+            slugify_for_rule("E\u{0301}quipe 客户周报")
+        );
+    }
+
+    /// #1943: a mixed-script title still fits the 60-char cap, digest
+    /// included, and a long ASCII prefix does not hide the difference
+    /// between two titles that only differ in their dropped words.
+    #[test]
+    fn slugify_caps_mixed_script_titles_with_their_digest() {
+        let prefix = format!("{} ", "word".repeat(40));
+        let a = slugify_for_rule(&format!("{prefix}中文规则"));
+        let b = slugify_for_rule(&format!("{prefix}其他规则"));
+        for slug in [&a, &b] {
+            assert!(slug.len() <= 60, "cap holds with the digest: {slug}");
+            let (stem, hex) = slug.split_at(slug.len() - 8);
+            assert!(stem.ends_with('-'), "digest is hyphen-joined: {slug}");
+            assert!(
+                hex.chars().all(|c| c.is_ascii_hexdigit()),
+                "digest is hex: {slug}"
+            );
+        }
+        assert_ne!(a, b);
+        assert_eq!(a, slugify_for_rule(&format!("{prefix}中文规则")));
+    }
+
+    /// #1943 (batch guard input): two pure-ASCII titles longer than the
+    /// cap can truncate into the same 60-char window, which is the model-side
+    /// collision `resolve_rule_path_collisions` exists to catch, because
+    /// no digest ever fires for them.
+    #[test]
+    fn slugify_truncation_can_still_collide_two_long_titles() {
+        let prefix = "always gate deploys on the checklist that ships with the repository ";
+        let a = slugify_for_rule(&format!("{prefix}alpha branch"));
+        let b = slugify_for_rule(&format!("{prefix}beta branch"));
+        assert_eq!(a, b, "long titles sharing a window slug alike");
+        assert!(a.len() <= 60);
+        assert!(!a.contains(|c: char| !c.is_ascii()), "{a}");
+    }
+
     fn update_with_summary(summary: Option<&str>) -> crate::types::ConsolidatedPageUpdate {
         crate::types::ConsolidatedPageUpdate {
             path: "concepts/queue.md".into(),
@@ -4644,6 +4971,7 @@ mod tests {
         calls: AtomicUsize,
         failures: usize,
         failure: ScriptedFailure,
+        retry_after: Option<Duration>,
         response: serde_json::Value,
     }
 
@@ -4672,7 +5000,7 @@ mod tests {
                     ScriptedFailure::Transient => LlmError::Provider {
                         status: 503,
                         body: "This model is currently experiencing high demand.".into(),
-                        retry_after: None,
+                        retry_after: self.retry_after,
                     },
                     ScriptedFailure::Deterministic => LlmError::Auth("expired".into()),
                 });
@@ -4754,6 +5082,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             failures: 2, // fails twice, answers on the 3rd (= the budget)
             failure: ScriptedFailure::Transient,
+            retry_after: None,
             response: scripted_page(),
         };
 
@@ -4782,6 +5111,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             failures: usize::MAX, // never clears
             failure: ScriptedFailure::Transient,
+            retry_after: None,
             response: scripted_page(),
         };
 
@@ -4802,6 +5132,61 @@ mod tests {
         );
     }
 
+    /// A provider hint replaces the fixed delay, clamped to the same ceiling
+    /// the remote embedders and bootstrap use; without one the fixed delay is
+    /// unchanged.
+    #[test]
+    fn consolidation_retry_wait_honours_a_capped_provider_hint() {
+        let hinted = |hint| LlmError::Provider {
+            status: 429,
+            body: "slow down".into(),
+            retry_after: Some(hint),
+        };
+        let fixed = Duration::from_secs(2);
+        assert_eq!(
+            consolidation_retry_wait(&LlmError::Auth("x".into()), fixed),
+            fixed
+        );
+        assert_eq!(
+            consolidation_retry_wait(&hinted(Duration::from_secs(10)), fixed),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            consolidation_retry_wait(&hinted(Duration::from_secs(3600)), fixed),
+            CONSOLIDATION_LLM_MAX_RETRY_AFTER,
+            "a huge hint must not park consolidation"
+        );
+    }
+
+    /// A rate-limited provider that says when to come back is not retried
+    /// before then, even when the fixed delay is zero: retrying earlier only
+    /// spends the attempt on another 429.
+    #[tokio::test]
+    async fn consolidation_retry_waits_for_the_providers_retry_after() {
+        let llm = FlakyLlm {
+            calls: AtomicUsize::new(0),
+            failures: 1,
+            failure: ScriptedFailure::Transient,
+            retry_after: Some(Duration::from_millis(150)),
+            response: scripted_page(),
+        };
+        let started = std::time::Instant::now();
+        complete_structured_with_retry::<ConsolidatedPage>(
+            &llm,
+            ChatRequest::user_prompt("consolidate"),
+            ai_memory_llm::LlmOperationId::default(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("the retry after the hinted wait succeeds");
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "retried after {:?}, before the provider's Retry-After",
+            started.elapsed()
+        );
+    }
+
     /// A deterministic failure is not retried, and a consolidation whose
     /// completion never arrives writes no page.
     #[tokio::test]
@@ -4812,6 +5197,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             failures: usize::MAX,
             failure: ScriptedFailure::Deterministic,
+            retry_after: None,
             response: scripted_page(),
         });
 

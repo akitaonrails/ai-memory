@@ -124,6 +124,14 @@ create_on_session_end = false
 
 When set to `false`, `SessionEnd` writes `sessions/<id>.md` and queues consolidation as usual, but skips creating an open handoff row (#1043). OpenCode's per-turn checkpoint, which stands in for its session end, likewise refreshes the summary page without creating or refreshing a baton. Explicit batons created with `memory_handoff_begin` and managed workstream runs remain unaffected. Like `claim_on_session_start`, this setting is server-wide.
 
+To skip the automatic handoff for one execution only, such as a headless helper turn (a read-only reviewer, a probe, one step of a scripted relay), set `AI_MEMORY_AUTO_HANDOFF=off` in the environment the harness and its hooks run in:
+
+```bash
+AI_MEMORY_AUTO_HANDOFF=off claude -p "Review the parser change"
+```
+
+The hook forwards it as `auto_handoff=0` on that session's events, so its end (or OpenCode/Antigravity turn checkpoint) writes the summary page and queues consolidation without leaving a baton. Other sessions, including ones running at the same time in the same project, keep the server's `create_on_session_end` behavior. `off`, `0`, `false` and `no` turn it off; any other value, or leaving it unset, changes nothing. It can only remove this session's automatic baton, never create one the server would not. The native `ai-memory hook`, the shell and PowerShell hook bundles and the generated TypeScript plugins all read it (#1951).
+
 ## Compaction recovery
 
 When Claude Code or Codex compact their working context, the
@@ -459,11 +467,16 @@ immediately before patching, then call `memory_patch_page` with that required
 
 Use `target: "end_of_page"` with no anchor to append at EOF. `add_section`
 requires an ATX level 2-6 heading such as `## Decisions` and rejects a heading
-that already exists after whitespace/case normalization. Duplicate headings,
-stale page or section tokens, overlapping targets, failed admission, or a
-concurrent writer reject the whole batch. Existing frontmatter is preserved;
-the final body still passes through the normal sanitizer, admission,
-attribution, versioning, index and git-checkpoint path.
+that already exists after whitespace/case normalization. Edits that land at the
+same place keep where they resolved in the page you read, whatever their order
+in `edits`: an append to the last section stays in that section, an
+`end_of_page` append follows it, and new sections come last. Replacing a
+section also replaces the sections nested in it, so another edit to one of
+those is an overlapping target. Duplicate headings, stale page or section
+tokens, overlapping targets, failed admission, or a concurrent writer reject
+the whole batch. Existing frontmatter is preserved; the final body still passes
+through the normal sanitizer, admission, attribution, versioning, index and
+git-checkpoint path.
 
 ## Install the routing snippet and Agent Skills
 

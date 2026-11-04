@@ -95,7 +95,7 @@ impl Harness {
         // Seed N distinct projects, each with a unique marker page so MCP
         // reads can verify they resolved into the right active_project.
         //
-        // The FTS5 tokenizer is `unicode61 ... tokenchars '/_-'`, so
+        // The FTS5 tokenizer is `unicode61 ... tokenchars '_-'`, so
         // `_` is part of a token (NOT a separator). A body like
         // "PROJ_1_BODY" tokenizes as a single token and a `PROJ` query
         // misses it. Use space-separated words instead: a shared word
@@ -140,7 +140,7 @@ impl Harness {
             move || Ok(server.clone()),
             LocalSessionManager::default().into(),
             StreamableHttpServerConfig::default()
-                .with_stateful_mode(false)
+                .with_legacy_session_mode(false)
                 .with_json_response(true),
         );
 
@@ -180,6 +180,7 @@ impl Harness {
             )),
             home_dir: None,
             trusted_proxy_identity: false,
+            index_file_paths: false,
         });
 
         let router = Router::new()

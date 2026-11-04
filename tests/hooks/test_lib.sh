@@ -23,6 +23,7 @@ export HOME
 CALLER_SPOOL="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$ORIG_HOME/.local/share}/ai-memory}/hook-spool"
 unset AI_MEMORY_DATA_DIR XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME
 unset AI_MEMORY_RUN_ID AI_MEMORY_MANAGED_WORKSTREAM_ID AI_MEMORY_MANAGED_WORKSTREAM_NAME
+unset AI_MEMORY_AUTO_HANDOFF
 trap 'rm -rf "$TMP"; HOME=$ORIG_HOME' EXIT
 
 assert_eq() {
@@ -524,6 +525,15 @@ assert_eq "marker_qs forwards [profile] contribute and consume" \
 assert_eq "marker_qs sends explicit [profile] defaults when a marker omits the keys" \
     "&cwd=$(ai_memory_url_encode "$TMP/profile-only")&workspace=outer&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/profile-only")"
+# AI_MEMORY_AUTO_HANDOFF=off opts this execution out of the automatic handoff
+# (#1951); only an explicit falsy value is forwarded, next to the managed run.
+assert_eq "auto handoff unset sends nothing" "" "$(ai_memory_managed_qs)"
+assert_eq "auto handoff off is forwarded" "&auto_handoff=0" \
+    "$(AI_MEMORY_AUTO_HANDOFF=' Off ' ai_memory_managed_qs)"
+assert_eq "auto handoff on sends nothing" "" "$(AI_MEMORY_AUTO_HANDOFF=on ai_memory_managed_qs)"
+assert_eq "auto handoff rides with the managed run" "&managed_run=r1&auto_handoff=0" \
+    "$(AI_MEMORY_RUN_ID=r1 AI_MEMORY_AUTO_HANDOFF=0 ai_memory_managed_qs)"
+
 # `[handoff] deliver_on_session_start = false` is sent as &handoff=0 only when
 # explicitly falsy, and a [handoff]-only marker is a settings boundary.
 mkdir -p "$TMP/handoff-off/inner" "$TMP/handoff-on"
@@ -1472,7 +1482,7 @@ if [ -n "$PSH" ]; then
         rm -f "$TMP/ps-scope.log"
         printf '%s' "$1" | (cd "$SCOPE_ELSEWHERE" && HOME="$TMP" AI_MEMORY_DATA_DIR="$TMP/ps-scope-data-$2" \
             AI_MEMORY_TEST_LOG="$(host_path "$TMP/ps-scope.log")" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
-            ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [int] \$TimeoutSec, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'HANDOFF' } }; Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff") >/dev/null 2>&1 || true
+            ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [switch] \$NoProxy, [int] \$TimeoutSec, [int] \$MaximumRedirection, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'HANDOFF'; StatusCode = 200 } }; Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff") >/dev/null 2>&1 || true
         grep '/handoff?' "$TMP/ps-scope.log" 2>/dev/null || true
     }
     assert_eq "powershell: no project directory claims no handoff" "" \
@@ -1502,7 +1512,7 @@ if [ -n "$PSH" ]; then
             "$(host_path "$1" | sed 's/\\/\\\\/g')" \
             | (HOME="$TMP" AI_MEMORY_DATA_DIR="$TMP/ps-subagent-data" \
                 AI_MEMORY_TEST_LOG="$(host_path "$TMP/ps-subagent.log")" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
-                ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [int] \$TimeoutSec, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'SUBAGENT-BRIEF' } }; Invoke-AiMemoryHook -Event 'subagent-start' -Agent 'claude-code' -SubagentStartBrief") 2>/dev/null
+                ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [switch] \$NoProxy, [int] \$TimeoutSec, [int] \$MaximumRedirection, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'SUBAGENT-BRIEF'; StatusCode = 200 } }; Invoke-AiMemoryHook -Event 'subagent-start' -Agent 'claude-code' -SubagentStartBrief") 2>/dev/null
     }
     PS_SUB_OUT=$(ps_subagent_start "$SUB_REPO")
     case "$PS_SUB_OUT" in
@@ -1647,6 +1657,10 @@ assert_eq "powershell: every request call site found" "yes" \
 # PowerShell 7 reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY for Invoke-WebRequest;
 # `Get-AiMemoryNoProxy` supplies -NoProxy there, like the curl branches above.
 assert_eq "powershell: every request skips environment proxies" "$PS_REQUESTS" "$PS_REQUESTS_NO_PROXY"
+# MaximumRedirection 0 matches the native hook: Invoke-WebRequest follows
+# five hops by default, so a 302 login page counted as delivery.
+assert_eq "powershell: the request splat refuses redirects" "ok" \
+    "$(grep -Fq 'MaximumRedirection = 0' "$PS_HELPER" && grep -Fq 'function Get-AiMemoryResponseStatus' "$PS_HELPER" && printf ok || printf missing)"
 
 # A spooled fixture event names this run's temp tree or targets the fake
 # `memory.test` host. Live sessions share the spool and may mention that host

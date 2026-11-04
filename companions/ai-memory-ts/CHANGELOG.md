@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `pages.write`, `pages.writeBatch` and `pages.update` accept `sourceFiles`
+  (sent as `source_files`), the repository files a page describes with the
+  commit it was checked against; `pages.update` carries it over. (#1957)
+
 ### Fixed
 
 - Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
@@ -24,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `briefing` takes `recentSessionsLimit` (default 5, max 50), matching the
+  server's new `memory_briefing` argument for seeing every active harness in a
+  busy project. (#1934)
+
+- `messages.send` takes `toAgent`, the registered harness that may claim the
+  message in the recipient project, and `fromAgent`, the sending harness for a
+  client whose session does not record it, matching the server's new
+  `to_agent` and `from_agent`. (#1935)
 - `pages.resolveWriteTarget` preflights an exact existing writable project by
   name or stable id, and `pages.writeBatch` commits up to 100 conditional page
   versions atomically. These wrappers cover the bulk-import tools added for

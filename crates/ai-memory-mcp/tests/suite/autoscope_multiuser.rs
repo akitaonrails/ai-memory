@@ -151,7 +151,7 @@ impl MultiUserHarness {
             move || Ok(server.clone()),
             LocalSessionManager::default().into(),
             StreamableHttpServerConfig::default()
-                .with_stateful_mode(false)
+                .with_legacy_session_mode(false)
                 .with_json_response(true),
         );
 
@@ -192,6 +192,7 @@ impl MultiUserHarness {
             )),
             home_dir: None,
             trusted_proxy_identity: false,
+            index_file_paths: false,
         });
 
         // Production-equivalent Bearer middleware. Pepper + reader are

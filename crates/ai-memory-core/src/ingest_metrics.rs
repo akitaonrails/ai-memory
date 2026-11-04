@@ -25,8 +25,8 @@ use crate::LatencyHistogram;
 /// the hot path must not pay for a fence. A counter observed a few events
 /// stale is fine; a lock on `/hook` is not.
 ///
-/// Content-free by construction, like the spool health snapshot: counts and one
-/// timestamp, no paths, prompts, or tool payloads.
+/// Content-free by construction, like the spool health snapshot: counts and two
+/// timestamps, no paths, prompts, or tool payloads.
 #[derive(Debug, Default)]
 pub struct IngestMetrics {
     /// Events accepted for processing (202 with work queued).
@@ -69,6 +69,52 @@ pub struct IngestMetrics {
     /// Time `POST /hook` took to answer (admission, not the spawned
     /// processing). Counts only; never in [`IngestMetricsSnapshot`].
     hook_latency: LatencyHistogram,
+    /// Stored file-tool PostToolUse deliveries per [`FilePathOutcome`],
+    /// counted only while `[ingest] index_file_paths` is on.
+    file_paths: [AtomicU64; FilePathOutcome::Indexed as usize + 1],
+    /// When these counters started, so a measurement window can tell that two
+    /// snapshots came from the same process.
+    started_ms: StartedMs,
+}
+
+/// Unix milliseconds at construction.
+#[derive(Debug)]
+struct StartedMs(u64);
+
+impl Default for StartedMs {
+    fn default() -> Self {
+        Self(u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap_or(0))
+    }
+}
+
+/// Why a stored file-tool PostToolUse did or did not get a `file_path`, one
+/// counter each (#1843). The first matching reason wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePathOutcome {
+    /// The capture claim did not parse, or the server's inspection disagreed.
+    InvalidClaim,
+    /// A valid claim reduced the call to metadata.
+    MetadataOnly,
+    /// The call names no file the server can read.
+    NoFile,
+    /// The call names more than one file, or a glob.
+    MultiFile,
+    /// No `_ai_memory_file` field: an older or unsupported client.
+    FieldAbsent,
+    /// A field version this server does not read.
+    UnknownVersion,
+    /// The client found the file outside the checkout.
+    SkippedOutsideCheckout,
+    /// The client found no checkout root.
+    SkippedNoCheckout,
+    /// The client refused the normalized path.
+    SkippedRefused,
+    /// The client sent a skip reason this server does not know.
+    SkippedOther,
+    /// The field was malformed or the path failed a server check.
+    ServerRejected,
+    /// The path was stored. Keep last: it sizes the counter array.
+    Indexed,
 }
 
 impl IngestMetrics {
@@ -124,6 +170,10 @@ impl IngestMetrics {
     pub fn record_persisted(&self, unix_ms: u64) {
         self.last_persisted_ms.store(unix_ms, Ordering::Relaxed);
     }
+    /// Record one stored file-tool delivery under `outcome`.
+    pub fn record_file_path(&self, outcome: FilePathOutcome) {
+        self.file_paths[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
 
     /// The `POST /hook` response-time histogram.
     #[must_use]
@@ -152,7 +202,25 @@ impl IngestMetrics {
                 0 => None,
                 ms => Some(ms),
             },
+            file_path_invalid_claim: self.file_path(FilePathOutcome::InvalidClaim),
+            file_path_metadata_only: self.file_path(FilePathOutcome::MetadataOnly),
+            file_path_no_file: self.file_path(FilePathOutcome::NoFile),
+            file_path_multi_file: self.file_path(FilePathOutcome::MultiFile),
+            file_path_field_absent: self.file_path(FilePathOutcome::FieldAbsent),
+            file_path_unknown_version: self.file_path(FilePathOutcome::UnknownVersion),
+            file_path_skipped_outside_checkout: self
+                .file_path(FilePathOutcome::SkippedOutsideCheckout),
+            file_path_skipped_no_checkout: self.file_path(FilePathOutcome::SkippedNoCheckout),
+            file_path_skipped_refused: self.file_path(FilePathOutcome::SkippedRefused),
+            file_path_skipped_other: self.file_path(FilePathOutcome::SkippedOther),
+            file_path_server_rejected: self.file_path(FilePathOutcome::ServerRejected),
+            file_path_indexed: self.file_path(FilePathOutcome::Indexed),
+            started_ms: self.started_ms.0,
         }
+    }
+
+    fn file_path(&self, outcome: FilePathOutcome) -> u64 {
+        self.file_paths[outcome as usize].load(Ordering::Relaxed)
     }
 }
 
@@ -186,6 +254,58 @@ pub struct IngestMetricsSnapshot {
     pub failed: u64,
     /// Unix ms of the last newly persisted observation or effect, if any.
     pub last_persisted_ms: Option<u64>,
+    /// Stored file-tool deliveries per [`FilePathOutcome`], under its label.
+    pub file_path_invalid_claim: u64,
+    /// See [`FilePathOutcome::MetadataOnly`].
+    pub file_path_metadata_only: u64,
+    /// See [`FilePathOutcome::NoFile`].
+    pub file_path_no_file: u64,
+    /// See [`FilePathOutcome::MultiFile`].
+    pub file_path_multi_file: u64,
+    /// See [`FilePathOutcome::FieldAbsent`].
+    pub file_path_field_absent: u64,
+    /// See [`FilePathOutcome::UnknownVersion`].
+    pub file_path_unknown_version: u64,
+    /// See [`FilePathOutcome::SkippedOutsideCheckout`].
+    pub file_path_skipped_outside_checkout: u64,
+    /// See [`FilePathOutcome::SkippedNoCheckout`].
+    pub file_path_skipped_no_checkout: u64,
+    /// See [`FilePathOutcome::SkippedRefused`].
+    pub file_path_skipped_refused: u64,
+    /// See [`FilePathOutcome::SkippedOther`].
+    pub file_path_skipped_other: u64,
+    /// See [`FilePathOutcome::ServerRejected`].
+    pub file_path_server_rejected: u64,
+    /// See [`FilePathOutcome::Indexed`].
+    pub file_path_indexed: u64,
+    /// Unix ms when this process's counters started; two snapshots with the
+    /// same value come from one process.
+    pub started_ms: u64,
+}
+
+impl IngestMetricsSnapshot {
+    /// The file path counters as `(label, count)` pairs, in
+    /// [`FilePathOutcome`] order.
+    #[must_use]
+    pub const fn file_paths(&self) -> [(&'static str, u64); 12] {
+        [
+            ("invalid_claim", self.file_path_invalid_claim),
+            ("metadata_only", self.file_path_metadata_only),
+            ("no_file", self.file_path_no_file),
+            ("multi_file", self.file_path_multi_file),
+            ("field_absent", self.file_path_field_absent),
+            ("unknown_version", self.file_path_unknown_version),
+            (
+                "skipped_outside_checkout",
+                self.file_path_skipped_outside_checkout,
+            ),
+            ("skipped_no_checkout", self.file_path_skipped_no_checkout),
+            ("skipped_refused", self.file_path_skipped_refused),
+            ("skipped_other", self.file_path_skipped_other),
+            ("server_rejected", self.file_path_server_rejected),
+            ("indexed", self.file_path_indexed),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -245,7 +365,7 @@ mod tests {
         assert_eq!(s.last_persisted_ms, None);
     }
 
-    /// The shape is the privacy contract: counts and one timestamp, nothing
+    /// The shape is the privacy contract: counts and timestamps, nothing
     /// that could carry a prompt, path, or tool payload. If a field carrying
     /// captured text is ever added, this fails loudly (#428).
     #[test]
@@ -264,12 +384,25 @@ mod tests {
                 "dropped_invalid",
                 "dropped_unauthorized",
                 "failed",
+                "file_path_field_absent",
+                "file_path_indexed",
+                "file_path_invalid_claim",
+                "file_path_metadata_only",
+                "file_path_multi_file",
+                "file_path_no_file",
+                "file_path_server_rejected",
+                "file_path_skipped_no_checkout",
+                "file_path_skipped_other",
+                "file_path_skipped_outside_checkout",
+                "file_path_skipped_refused",
+                "file_path_unknown_version",
                 "ignored_end",
                 "last_persisted_ms",
                 "replayed",
                 "resumed",
                 "shed_rate_limited",
                 "shed_saturated",
+                "started_ms",
                 "stored"
             ]
         );
@@ -279,6 +412,38 @@ mod tests {
                 "every field must be a count or a timestamp, got {v}"
             );
         }
+    }
+
+    /// Each file path outcome lands under its own label and nowhere else.
+    #[test]
+    fn each_file_path_outcome_has_its_own_counter() {
+        let m = IngestMetrics::default();
+        let outcomes = [
+            (FilePathOutcome::InvalidClaim, "invalid_claim"),
+            (FilePathOutcome::MetadataOnly, "metadata_only"),
+            (FilePathOutcome::NoFile, "no_file"),
+            (FilePathOutcome::MultiFile, "multi_file"),
+            (FilePathOutcome::FieldAbsent, "field_absent"),
+            (FilePathOutcome::UnknownVersion, "unknown_version"),
+            (
+                FilePathOutcome::SkippedOutsideCheckout,
+                "skipped_outside_checkout",
+            ),
+            (FilePathOutcome::SkippedNoCheckout, "skipped_no_checkout"),
+            (FilePathOutcome::SkippedRefused, "skipped_refused"),
+            (FilePathOutcome::SkippedOther, "skipped_other"),
+            (FilePathOutcome::ServerRejected, "server_rejected"),
+            (FilePathOutcome::Indexed, "indexed"),
+        ];
+        // A distinct count per outcome, so any swapped label shows.
+        for (times, (outcome, _)) in (1..).zip(outcomes) {
+            for _ in 0..times {
+                m.record_file_path(outcome);
+            }
+        }
+        let expected: Vec<(&str, u64)> = (1..).zip(outcomes).map(|(n, (_, l))| (l, n)).collect();
+        assert_eq!(m.snapshot().file_paths().to_vec(), expected);
+        assert!(m.snapshot().started_ms > 0);
     }
 
     /// Counters are shared across tasks through an `Arc`; concurrent

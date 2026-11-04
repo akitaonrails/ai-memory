@@ -98,7 +98,10 @@ async fn make_admin_state(tmp: &TempDir, llm: Option<Arc<dyn LlmProvider>>) -> A
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: llm,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,

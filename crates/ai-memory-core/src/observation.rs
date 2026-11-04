@@ -26,6 +26,23 @@ pub const FAILED_TOOL_OUTCOME_LINE: &str = "\noutcome: error";
 /// header the router writes fits, so an output excerpt is never scanned.
 pub const TOOL_BODY_HEADER_MAX_CHARS: usize = 512;
 
+/// Longest checkout-relative path the file index stores, the bound the
+/// handoff file list uses for stored paths.
+pub const FILE_PATH_MAX_CHARS: usize = 512;
+
+/// Whether `path` is a checkout-relative file index key: non-empty, at most
+/// [`FILE_PATH_MAX_CHARS`], not rooted (`/`, `\` or a drive letter) and with no
+/// `..` segment. The client folds `..` before sending, so one reaching the
+/// server was forged.
+#[must_use]
+pub fn valid_file_path_key(path: &str) -> bool {
+    !path.is_empty()
+        && path.chars().count() <= FILE_PATH_MAX_CHARS
+        && !path.starts_with(['/', '\\'])
+        && !matches!(path.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+        && !path.split(['/', '\\']).any(|segment| segment == "..")
+}
+
 /// Classification of a single observation, mirroring the headline
 /// Claude Code / Codex lifecycle hook events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,6 +151,11 @@ pub struct NewObservation {
     /// store fills it in at write time.
     #[serde(default)]
     pub occurred_at: Option<i64>,
+    /// Checkout-relative path of the one file a kept file-tool call named,
+    /// when `[ingest] index_file_paths` is on. [`crate::Sanitized::new`]
+    /// clears a value that fails [`crate::Sanitizer::admits_file_path`].
+    #[serde(default)]
+    pub file_path: Option<String>,
 }
 
 /// Materialised view of an observation row.

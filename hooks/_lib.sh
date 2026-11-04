@@ -381,9 +381,16 @@ ai_memory_antigravity_is_initial_invocation() {
     [ "$value" = "0" ]
 }
 
+# Invocation-scoped context: the managed run, and the per-execution
+# `AI_MEMORY_AUTO_HANDOFF=off` opt-out of the automatic handoff (#1951), which
+# is forwarded only for an explicit falsy value, as the native hook does.
 ai_memory_managed_qs() {
-    [ -n "${AI_MEMORY_RUN_ID:-}" ] || return 0
-    printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"
+    if [ -n "${AI_MEMORY_RUN_ID:-}" ]; then
+        printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"
+    fi
+    case "$(printf '%s' "${AI_MEMORY_AUTO_HANDOFF:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+        0|false|no|off) printf '&auto_handoff=0' ;;
+    esac
 }
 
 # Resolve cwd for agents whose native hook payload omits it. Payload wins,

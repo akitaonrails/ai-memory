@@ -67,6 +67,14 @@ export type ExistingProjectTarget =
 // Pages
 // ---------------------------------------------------------------------------
 
+/** A repository file a page describes, and the commit it was checked against. */
+export interface PageSourceFile {
+  /** Repository-relative path with `/` separators. */
+  path: string;
+  /** Commit id, 7-64 hex characters; the server stores it lowercased. */
+  commit: string;
+}
+
 /**
  * Page metadata a write sets. A write replaces the whole page: metadata the
  * call omits is cleared, not inherited. Use {@link PagesNamespace.update} to
@@ -91,6 +99,12 @@ export interface PageMetadata {
   relations?: Partial<Record<RelationName, string[]>>;
   /** TTL: an RFC 3339 instant or a bare `YYYY-MM-DD` date. Expired pages are hidden. */
   expiresAt?: string;
+  /**
+   * Up to 16 repository files the page describes. The server stores them and
+   * never reads the files; compare each with your checkout and record `stale`
+   * feedback when one changed.
+   */
+  sourceFiles?: PageSourceFile[];
 }
 
 /** Arguments of {@link PagesNamespace.write}. */
@@ -651,6 +665,8 @@ export interface SessionActivity {
 export interface BriefingArgs extends ScopedArgs {
   /** How many recent pages to include (default 10, max 100). */
   recentPagesLimit?: number;
+  /** How many recent sessions to include (default 5, max 50). */
+  recentSessionsLimit?: number;
   /** Lead with the project's settled rule and decision pages. */
   settledFirst?: boolean;
 }
@@ -924,6 +940,17 @@ export interface SendMessageArgs {
   to: Scope;
   /** Sending project. Defaults to the client's `scope`. */
   from?: Scope;
+  /**
+   * Restrict claiming to this registered harness in the recipient project
+   * (for example `codex` or `claude-code`); the server refuses a harness with
+   * no session there. Omit for shared project mail.
+   */
+  toAgent?: string;
+  /**
+   * The sending harness (for example `claude-code`), for a client whose
+   * session metadata does not record it. Carried as the message's `fromAgent`.
+   */
+  fromAgent?: string;
   /** Self-contained request for the recipient's agent. */
   body: string;
   /** Optional one-line subject. */

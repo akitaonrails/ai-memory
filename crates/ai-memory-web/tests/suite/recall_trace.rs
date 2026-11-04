@@ -467,6 +467,7 @@ async fn project_search_shows_observation_excerpts_only_to_the_sessions_owner() 
                 title: "prompt".into(),
                 body: "quokka plutonium shipment notes".into(),
                 importance: 5,
+                file_path: None,
             },
             &ai_memory_core::Sanitizer::builtin(),
         ))
@@ -946,6 +947,7 @@ async fn kind_and_tier_filters_hold_in_every_stream() {
                 title: "prompt".into(),
                 body: "where does the quokka sleep".into(),
                 importance: 5,
+                file_path: None,
             },
             &ai_memory_core::Sanitizer::builtin(),
         ))

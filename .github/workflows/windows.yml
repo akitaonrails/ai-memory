@@ -138,6 +138,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: companions/ai-memory-wikisync
       - run: cargo fmt --check --manifest-path companions/ai-memory-wikisync/Cargo.toml
       - run: cargo clippy --locked --manifest-path companions/ai-memory-wikisync/Cargo.toml --all-targets -- -D warnings
@@ -158,6 +159,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --all-targets
       - name: install.ps1 against local releases
         run: pwsh -NoProfile -File tests/install_ps1.ps1 -Binary target/debug/ai-memory.exe
@@ -173,7 +176,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --manifest-path companions/ai-memory-relay/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: false
       - name: External lifecycle delivery against the real server

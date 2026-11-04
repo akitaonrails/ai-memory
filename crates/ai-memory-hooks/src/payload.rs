@@ -1,14 +1,16 @@
 //! Wire envelope received on `POST /hook`.
 
 use ai_memory_core::{
-    AgentKind, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer, TOOL_BODY_SEPARATOR,
-    TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
+    AgentKind, FilePathOutcome, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer,
+    TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::capture_policy::{
-    ToolFamily, ToolObservationMetadata, tool_observation_metadata, tool_observation_outcome,
+    FileTarget, ToolFamily, ToolObservationMetadata, file_target, tool_observation_metadata,
+    tool_observation_outcome,
 };
+use crate::file_field::{FileClaim, FileSkip};
 
 /// Durable excerpt ceiling for user prompts. Prompts retain more working
 /// context than tool/notification summaries while remaining bounded.
@@ -23,6 +25,10 @@ pub const NOTIFICATION_EXCERPT_MAX_BYTES: usize = 2_000;
 /// Durable excerpt ceiling for tool I/O summaries and short excerpts
 /// (tool results, extension bodies, Stop assistant excerpts).
 pub const TOOL_EXCERPT_MAX_BYTES: usize = 2_000;
+
+/// The extension label backfilled non-user events (assistant/tool) are recorded
+/// under, mirroring the companion importer's replay-through-`/hook` mechanism.
+pub const BACKFILL_EXTENSION: &str = "ai-memory-backfill";
 
 /// Durable body ceiling the ingest funnel applies to an event's excerpt
 /// **after** the sanitizer has scrubbed the full text.
@@ -98,6 +104,12 @@ pub struct HookQuery {
     /// Invocation-scoped `ai-memory run` lease. Absent for every direct
     /// harness launch, preserving legacy capture and handoff behavior.
     pub managed_run: Option<String>,
+    /// Invocation-scoped opt-out of the automatic handoff, forwarded by the
+    /// host hook from `AI_MEMORY_AUTO_HANDOFF` (#1951). An explicit falsy
+    /// value keeps this session's end or turn checkpoint from leaving a
+    /// baton; absent or anything else keeps `[handoff]
+    /// create_on_session_end` in charge.
+    pub auto_handoff: Option<String>,
     /// Client-side opt-in for assistant/Stop capture, baked onto the native
     /// `stop` hook command by `install-hooks --capture-assistant`. A truthy
     /// value tells the server the client deliberately attached a sanitized
@@ -185,6 +197,9 @@ pub struct HookEnvelope {
     pub all_owners_requested: bool,
     /// Invocation-scoped managed-run id forwarded by the host hook.
     pub managed_run: Option<String>,
+    /// Whether this execution opted out of the automatic handoff (the
+    /// `auto_handoff=0` query flag, from `AI_MEMORY_AUTO_HANDOFF`, #1951).
+    pub auto_handoff_off: bool,
     /// Optional third-party extension namespace.
     pub extension: Option<String>,
     /// Optional source event name from the extension vocabulary.
@@ -214,6 +229,14 @@ pub struct HookEnvelope {
     /// The metadata-only rebuilds clear it.
     #[serde(skip)]
     pub(crate) recorded_tool: Option<crate::capture_policy::RecordedToolName>,
+    /// Why this file-tool PostToolUse did or did not get a `file_path`
+    /// (`[ingest] index_file_paths`, #1843); counted once the delivery is
+    /// stored.
+    #[serde(skip)]
+    pub(crate) file_path_outcome: Option<ai_memory_core::FilePathOutcome>,
+    /// The path to store, set only with [`FilePathOutcome::Indexed`].
+    #[serde(skip)]
+    pub(crate) file_path: Option<String>,
     /// The agent's raw JSON, kept for forensics.
     pub raw: serde_json::Value,
 }
@@ -239,6 +262,7 @@ impl std::fmt::Debug for HookEnvelope {
                 &self.recall_default_global_requested,
             )
             .field("managed_run", &self.managed_run)
+            .field("auto_handoff_off", &self.auto_handoff_off)
             .field(
                 "capture_assistant_requested",
                 &self.capture_assistant_requested,
@@ -676,6 +700,7 @@ impl HookEnvelope {
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
         let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
+        let auto_handoff_off = query_flag_falsy(query.auto_handoff.as_deref());
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
         let source_event = extension.as_ref().and_then(|_| {
@@ -770,6 +795,7 @@ impl HookEnvelope {
             recall_default_global_requested,
             all_owners_requested,
             managed_run,
+            auto_handoff_off,
             capture_assistant_requested,
             ingest_key,
             extension,
@@ -778,8 +804,55 @@ impl HookEnvelope {
             body_excerpt,
             occurred_at,
             recorded_tool,
+            file_path_outcome: None,
+            file_path: None,
             raw,
         }
+    }
+
+    /// Decide whether this event stores a `file_path` and why, when
+    /// `[ingest] index_file_paths` is on (#1843). Only a live PostToolUse of a
+    /// file tool is classified; capture inspection has already set an
+    /// invalid-claim or metadata-only outcome. The path check is the one
+    /// `Sanitized::new` repeats on insert, so the two cannot disagree.
+    pub(crate) fn classify_file_path(
+        &mut self,
+        enabled: bool,
+        claim: FileClaim,
+        sanitizer: &Sanitizer,
+    ) {
+        if !enabled
+            || self.event != HookEvent::PostToolUse
+            || self.extension.as_deref() == Some(BACKFILL_EXTENSION)
+        {
+            self.file_path_outcome = None;
+            return;
+        }
+        if self.file_path_outcome.is_some() {
+            return;
+        }
+        let Some(target) = file_target(self.agent, &self.raw) else {
+            return;
+        };
+        self.file_path_outcome = Some(match (target, claim) {
+            (FileTarget::NoFile, _) => FilePathOutcome::NoFile,
+            (FileTarget::Many, _) => FilePathOutcome::MultiFile,
+            (FileTarget::One(_), FileClaim::Absent) => FilePathOutcome::FieldAbsent,
+            (FileTarget::One(_), FileClaim::UnknownVersion) => FilePathOutcome::UnknownVersion,
+            (FileTarget::One(_), FileClaim::Skipped(skip)) => match skip {
+                Some(FileSkip::OutsideCheckout) => FilePathOutcome::SkippedOutsideCheckout,
+                Some(FileSkip::NoCheckout) => FilePathOutcome::SkippedNoCheckout,
+                Some(FileSkip::Refused) => FilePathOutcome::SkippedRefused,
+                None => FilePathOutcome::SkippedOther,
+            },
+            (FileTarget::One(_), FileClaim::Path(path)) if sanitizer.admits_file_path(&path) => {
+                self.file_path = Some(path);
+                FilePathOutcome::Indexed
+            }
+            (FileTarget::One(_), FileClaim::Path(_) | FileClaim::Malformed) => {
+                FilePathOutcome::ServerRejected
+            }
+        });
     }
 
     /// Name a closed-tool call (`[ingest] record_tool_names`): the title
@@ -1078,6 +1151,7 @@ fn safe_tool_body(
                 raw.pointer("/tool_result/output")
                     .and_then(value_to_text)
                     .or_else(|| raw.pointer("/tool_result/error").and_then(value_to_text))
+                    .or_else(|| raw.pointer("/postToolUse/result").and_then(value_to_text))
             } else if agent == AgentKind::GeminiCli {
                 // Gemini CLI's `AfterTool` `tool_response` holds the model's
                 // copy of the result in `llmContent` (a string or a Part
@@ -1094,6 +1168,7 @@ fn safe_tool_body(
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
+                    .or_else(|| cursor_failure_message(agent, raw))
                     .or_else(|| antigravity_edit_content(agent, raw))
             }
             .unwrap_or_else(|| "(no output captured)".into());
@@ -1103,6 +1178,15 @@ fn safe_tool_body(
         }
         _ => None,
     }
+}
+
+/// Cursor's `postToolUseFailure` has no `tool_output`; what went wrong is in
+/// its top-level `error_message` (<https://cursor.com/docs/agent/hooks>).
+fn cursor_failure_message(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
+    if agent != AgentKind::Cursor {
+        return None;
+    }
+    raw.get("error_message").and_then(value_to_text)
 }
 
 fn antigravity_edit_content(agent: AgentKind, raw: &serde_json::Value) -> Option<String> {
@@ -3568,6 +3652,66 @@ mod tests {
         assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
     }
 
+    /// Cursor fires `postToolUseFailure` instead of `postToolUse` when a tool
+    /// fails, times out or is denied: no `tool_output`, an `error_message`
+    /// and a `failure_type` (<https://cursor.com/docs/agent/hooks>). The hook
+    /// posts it as a post-tool-use, and the body keeps the outcome and the
+    /// error text, never the tool's input.
+    #[test]
+    fn cursor_post_tool_use_failure_records_the_error_outcome_and_text() {
+        let failure = |failure_type: &str, error_message: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("cursor".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "conversation_id": "conv-1",
+                    "generation_id": "gen-1",
+                    "session_id": "conv-1",
+                    "hook_event_name": "postToolUseFailure",
+                    "cursor_version": "3.24.9",
+                    "workspace_roots": ["/project"],
+                    "tool_name": "Shell",
+                    "tool_input": {"command": "npm test SENTINEL_COMMAND"},
+                    "tool_use_id": "abc123",
+                    "cwd": "/project",
+                    "error_message": error_message,
+                    "failure_type": failure_type,
+                    "duration": 5000,
+                    "is_interrupt": false,
+                }),
+            )
+        };
+
+        let timeout = failure("timeout", "Command timed out after 30s");
+        assert_eq!(timeout.agent, AgentKind::Cursor);
+        assert_eq!(timeout.event, HookEvent::PostToolUse);
+        assert_eq!(timeout.title_hint.as_deref(), Some("tool non-file"));
+        assert_eq!(
+            timeout.body_excerpt.as_deref(),
+            Some(
+                "tool_family: non-file\ntool_call_id: abc123\noutcome: error\n---\n\
+                 Command timed out after 30s"
+            )
+        );
+
+        let error = failure("error", "Exit code 1: Cannot find module 'express'");
+        let body = error.body_excerpt.expect("cursor failure body");
+        assert!(body.contains("\noutcome: error\n---\n"), "{body:?}");
+        assert!(body.contains("Cannot find module 'express'"), "{body:?}");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
+
+        // A denied call keeps its message but is not a failed call.
+        let denied = failure("permission_denied", "Denied by the user");
+        let body = denied.body_excerpt.expect("cursor denied body");
+        assert!(
+            body.ends_with("\noutcome: unknown\n---\nDenied by the user"),
+            "{body:?}"
+        );
+    }
+
     /// Kiro CLI's tool hooks carry `tool_name` and `tool_input`, and its
     /// `PostToolUse` adds `tool_response`: a plain string on the v3 engine
     /// (live capture, Kiro CLI 2.16.2) and an object with a `success` flag on
@@ -3733,6 +3877,119 @@ mod tests {
         );
         assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
         assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+    }
+
+    /// Cline CLI 3.0.74 PreToolUse/PostToolUse carry ClineCore names at
+    /// `tool_call.name` (and the documented `preToolUse.toolName` envelope).
+    /// Those names were unknown, so every observation stored as `tool unknown`
+    /// with no output (#1950).
+    #[test]
+    fn cline_tool_events_keep_their_family_title_and_output() {
+        let live_post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hookName": "PostToolUse",
+                "taskId": "cline-task-1",
+                "preToolUse": {
+                    "toolName": "run_commands",
+                    "parameters": {"commands": ["ls"]}
+                },
+                "tool_call": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "input": {"commands": ["ls"]}
+                },
+                "tool_result": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "output": "MARKER_CLINE_OUTPUT"
+                }
+            }),
+        );
+        assert_eq!(live_post.agent, AgentKind::Cline);
+        assert_eq!(live_post.title_hint.as_deref(), Some("tool non-file"));
+        let body = live_post.body_excerpt.expect("cline live post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("tool_call_id: toolu_01cline"), "{body:?}");
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(body.contains("MARKER_CLINE_OUTPUT"), "{body:?}");
+
+        let live_pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hookName": "PreToolUse",
+                "taskId": "cline-task-1",
+                "preToolUse": {
+                    "toolName": "run_commands",
+                    "parameters": {"commands": ["ls"]}
+                },
+                "tool_call": {
+                    "id": "toolu_01cline",
+                    "name": "run_commands",
+                    "input": {"commands": ["ls"]}
+                }
+            }),
+        );
+        assert_eq!(live_pre.title_hint.as_deref(), Some("tool non-file"));
+        let pre_body = live_pre.body_excerpt.expect("cline live pre-tool body");
+        assert!(pre_body.contains("tool_family: non-file"), "{pre_body:?}");
+        assert!(!pre_body.contains("ls"), "{pre_body:?}");
+
+        let documented_post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "postToolUse": {
+                    "toolName": "read_files",
+                    "parameters": {"files": [{"path": "src/lib.rs"}]},
+                    "result": "MARKER_CLINE_DOCUMENTED",
+                    "success": true
+                }
+            }),
+        );
+        assert_eq!(documented_post.title_hint.as_deref(), Some("tool file"));
+        let documented_body = documented_post
+            .body_excerpt
+            .expect("cline documented post-tool body");
+        assert!(
+            documented_body.contains("outcome: success"),
+            "{documented_body:?}"
+        );
+        assert!(
+            documented_body.contains("MARKER_CLINE_DOCUMENTED"),
+            "{documented_body:?}"
+        );
+
+        let documented_pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("cline".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "preToolUse": {
+                    "toolName": "read_files",
+                    "parameters": {"files": [{"path": "src/lib.rs"}]}
+                }
+            }),
+        );
+        assert_eq!(documented_pre.title_hint.as_deref(), Some("tool file"));
+        assert!(
+            documented_pre
+                .body_excerpt
+                .is_some_and(|body| !body.is_empty())
+        );
     }
 
     /// Claude Code's Windows `PowerShell` tool shares Bash's payload shape but

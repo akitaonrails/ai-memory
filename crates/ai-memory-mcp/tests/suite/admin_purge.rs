@@ -45,7 +45,10 @@ async fn make_state_with_chain(
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -238,6 +241,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                         title: format!("{label} obs {i}"),
                         body: "body".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -466,6 +470,7 @@ async fn purge_session_dry_run_reports_the_same_counts_the_confirmed_purge_will(
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -782,6 +787,7 @@ async fn purge_session_confirm_true_and_dry_run_true_still_only_previews() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -893,6 +899,7 @@ async fn purge_session_dry_run_and_confirmed_purge_both_report_collateral_damage
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1233,7 +1240,10 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1339,7 +1349,10 @@ async fn purge_project_idempotent_second_call_is_404() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: state_a.wiki.clone(),
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1614,6 +1627,7 @@ async fn purge_project_dry_run_counts_observations_stamped_from_another_projects
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1757,6 +1771,7 @@ async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

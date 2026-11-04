@@ -22,8 +22,9 @@ use ai_memory_core::{
     UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::{
-    ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
-    PagePrecondition, PrepareWorkstreamRun, Store, StoreError, WorkstreamSelection,
+    ClaudeSessionBoundary, ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession,
+    ManagedRunSessionLink, PagePrecondition, PrepareWorkstreamRun, Store, StoreError,
+    WorkstreamSelection,
 };
 
 fn operator(name: &str) -> String {
@@ -109,6 +110,7 @@ async fn session_end_readers_refuse_foreign_session_ids() {
                 title: "private prompt".into(),
                 body: "foreign scopes must not read this".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -197,6 +199,7 @@ async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
                         title: "routine".into(),
                         body: format!("{tag} row {i}"),
                         importance: 1,
+                        file_path: None,
                     },
                     &sanitizer,
                 ))
@@ -1798,6 +1801,7 @@ async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
                     importance: 5,
 
                     occurred_at: None,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -1962,6 +1966,379 @@ async fn a_session_linked_by_one_managed_run_is_not_another_runs() {
     assert_eq!(
         status(beta.run_id).await,
         (Some("native-beta".into()), true)
+    );
+}
+
+/// The clear transition rechecks authority in its writer transaction, even
+/// when the caller has already passed a read-side scope check.
+#[tokio::test]
+async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let alice = operator("alice");
+    let run = store
+        .writer
+        .prepare_workstream_run_owned(
+            PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: ws,
+                project_id: proj,
+                repo_fingerprint: "clear-repo".into(),
+                worktree_fingerprint: "clear-tree".into(),
+                cwd: "/repo".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "clear-test".into(),
+            },
+            Some(alice.clone()),
+        )
+        .await
+        .unwrap();
+    let input = |native: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run.run_id,
+        workspace_id: ws,
+        project_id: proj,
+        cwd: "/repo".into(),
+        agent: AgentKind::ClaudeCode,
+        native_session_id: native.into(),
+        owner_user: Some(alice.clone()),
+    };
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input("original"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    store
+        .writer
+        .accept_managed_run_context(run.run_id)
+        .await
+        .unwrap();
+    for case in [
+        "workspace",
+        "project",
+        "owner",
+        "shared",
+        "cwd",
+        "agent",
+        "dirty-id",
+    ] {
+        let mut rejected = input(case);
+        match case {
+            "workspace" => rejected.workspace_id = other_ws,
+            "project" => rejected.project_id = other_proj,
+            "owner" => rejected.owner_user = Some(operator("bob")),
+            "shared" => rejected.owner_user = None,
+            "cwd" => rejected.cwd = "/other-checkout".into(),
+            "agent" => rejected.agent = AgentKind::Codex,
+            "dirty-id" => rejected.native_session_id = "sk-abcdefghijklmnopqrstuvwx".into(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store
+                .writer
+                .relink_managed_claude_session(rejected, ClaudeSessionBoundary::Clear)
+                .await
+                .unwrap(),
+            ManagedRunSessionLink::Refused,
+            "{case}"
+        );
+        assert_eq!(
+            store
+                .reader
+                .managed_run_status(run.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("original"),
+            "{case}"
+        );
+    }
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+        [run.run_id.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_session(input("expired"), ClaudeSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+    store
+        .writer
+        .heartbeat_managed_run(run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_session(input("cleared"), ClaudeSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    let history: Vec<(String, bool)> = conn.prepare("SELECT native_session_id, is_current FROM workstream_native_sessions WHERE workstream_id = ?1 ORDER BY native_session_id").unwrap()
+        .query_map([run.workstream_id.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(
+        history,
+        vec![("cleared".into(), true), ("original".into(), false)]
+    );
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_session(input("original"), ClaudeSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+    store.writer.cancel_managed_run(run.run_id).await.unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_claude_session(input("terminal"), ClaudeSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+}
+
+/// An in-session `/resume` after `/clear` returns the run to a conversation
+/// its workstream already held (#1944 follow-up): SessionStart `resume` may
+/// relink to such an id, and capture continues. It never reaches further: a
+/// never-held id, another operator, another checkout, a lapsed lease, an id
+/// only another workstream held, and an id a parallel live run currently
+/// holds are all refused, and a `clear` still never rewinds to a known id.
+#[tokio::test]
+async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let prepare = |tree: &str, lease: &str, owner: String| {
+        let store = &store;
+        let tree = tree.to_owned();
+        let lease = lease.to_owned();
+        async move {
+            store
+                .writer
+                .prepare_workstream_run_owned(
+                    PrepareWorkstreamRun {
+                        scope_by_id: true,
+                        workspace_id: ws,
+                        project_id: proj,
+                        repo_fingerprint: "resume-repo".into(),
+                        worktree_fingerprint: tree,
+                        cwd: "/repo".into(),
+                        agent: AgentKind::ClaudeCode,
+                        automatic_harness: false,
+                        available_agents: Vec::new(),
+                        selection: WorkstreamSelection::Current,
+                        lease_owner: lease,
+                    },
+                    Some(owner),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let run = prepare("resume-tree", "resume-a", alice.clone()).await;
+    let input = |run_id, native: &str, owner: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run_id,
+        workspace_id: ws,
+        project_id: proj,
+        cwd: "/repo".into(),
+        agent: AgentKind::ClaudeCode,
+        native_session_id: native.into(),
+        owner_user: Some(owner.to_owned()),
+    };
+    let link = |i: LinkOrAdoptManagedRunSession, boundary| {
+        let store = &store;
+        async move {
+            store
+                .writer
+                .relink_managed_claude_session(i, boundary)
+                .await
+                .unwrap()
+        }
+    };
+    let current = |run_id| {
+        let store = &store;
+        async move {
+            store
+                .reader
+                .managed_run_status(run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+        }
+    };
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(run.run_id, "original", &alice))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    store
+        .writer
+        .accept_managed_run_context(run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Clear
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+
+    // Adversarial: none of these may move the run off `cleared`.
+    for (case, i) in [
+        ("never-held", input(run.run_id, "never-held", &alice)),
+        (
+            "other-operator",
+            input(run.run_id, "original", &operator("bob")),
+        ),
+        ("other-checkout", {
+            let mut i = input(run.run_id, "original", &alice);
+            i.cwd = "/other-checkout".into();
+            i
+        }),
+    ] {
+        assert_eq!(
+            link(i, ClaudeSessionBoundary::Resume).await,
+            ManagedRunSessionLink::Refused,
+            "{case}"
+        );
+        assert_eq!(
+            current(run.run_id).await.as_deref(),
+            Some("cleared"),
+            "{case}"
+        );
+    }
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Clear
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "a clear (or its delayed replay) never rewinds to a known id"
+    );
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+        [run.run_id.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "lapsed lease"
+    );
+    store
+        .writer
+        .heartbeat_managed_run(run.run_id)
+        .await
+        .unwrap();
+
+    // Control: the run's own operator resumes the pre-clear conversation.
+    assert_eq!(
+        link(
+            input(run.run_id, "original", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("original"));
+
+    // A run in another workstream cannot resume into this one's history.
+    let other = prepare("other-tree", "resume-b", alice.clone()).await;
+    assert_ne!(other.workstream_id, run.workstream_id);
+    store
+        .writer
+        .link_or_adopt_managed_run_session(input(other.run_id, "other-native", &alice))
+        .await
+        .unwrap();
+    store
+        .writer
+        .accept_managed_run_context(other.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(other.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "an id only another workstream held"
+    );
+    assert_eq!(current(other.run_id).await.as_deref(), Some("other-native"));
+
+    // A parallel live run that holds one of this workstream's earlier ids
+    // keeps it: a resume never takes a session another live run captures.
+    let parallel = prepare("parallel-tree", "resume-c", alice.clone()).await;
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(parallel.run_id, "cleared", &alice))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(parallel.run_id)
+    );
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Refused,
+        "an id a parallel live run holds"
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("original"));
+    store
+        .writer
+        .cancel_managed_run(parallel.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        link(
+            input(run.run_id, "cleared", &alice),
+            ClaudeSessionBoundary::Resume
+        )
+        .await,
+        ManagedRunSessionLink::Exact(run.run_id),
+        "once the parallel run ends, the held id resumes again"
     );
 }
 
@@ -3632,7 +4009,7 @@ async fn two_harnesses_of_one_operator_share_one_private_profile() {
     .expect("the other harness finds the same profile");
     let entries = store
         .reader
-        .profile_entries(seen_by_codex.workspace_id, seen_by_codex.project_id, 10)
+        .profile_entries(seen_by_codex.workspace_id, seen_by_codex.project_id)
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);
@@ -4210,6 +4587,7 @@ async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control()
         body: "must survive a self-service purge".into(),
         importance: 5,
         occurred_at: None,
+        file_path: None,
     };
     store
         .writer
@@ -4958,6 +5336,7 @@ async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_cont
                     title: format!("{owner} unfinished task"),
                     body: format!("private evidence {index}"),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5063,6 +5442,7 @@ async fn interrupted_recovery_ignores_foreign_scope_work_and_batons_with_control
                 title: "unfinished task".into(),
                 body: "private evidence".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         )
@@ -5143,4 +5523,189 @@ async fn interrupted_recovery_ignores_foreign_scope_work_and_batons_with_control
         Some(ended),
         "control: work resumed in this scope reopens it"
     );
+}
+
+/// Store one PostToolUse naming `file_path`, at `occurred_at` microseconds.
+async fn file_observation(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    session: SessionId,
+    file_path: Option<&str>,
+    occurred_at: i64,
+) -> ai_memory_core::ObservationId {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: Some(occurred_at),
+                session_id: session,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool file".into(),
+                body: "tool_family: file\noutcome: ok".into(),
+                importance: 5,
+                file_path: file_path.map(str::to_owned),
+            },
+            &Sanitizer::default(),
+        ))
+        .await
+        .unwrap()
+}
+
+/// #1843: a file path query never crosses a project or a workspace. The same
+/// path in a sibling project and in another workspace stays there. Control:
+/// the home project returns its own session. Fails with the scope predicate
+/// removed from `observations_for_file`.
+#[tokio::test]
+async fn observations_for_file_never_crosses_a_project_or_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, home) = scope(&store).await;
+    let sibling = store
+        .writer
+        .get_or_create_project(ws, "sibling".to_string(), None)
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("other".to_string())
+        .await
+        .unwrap();
+    let foreign = store
+        .writer
+        .get_or_create_project(other_ws, "shared-app".to_string(), None)
+        .await
+        .unwrap();
+    let mine = open_session(&store, ws, home, AgentKind::Codex).await;
+    file_observation(&store, ws, home, mine, Some("src/lib.rs"), 1_000).await;
+    for (w, p) in [(ws, sibling), (other_ws, foreign)] {
+        let theirs = open_session(&store, w, p, AgentKind::Codex).await;
+        file_observation(&store, w, p, theirs, Some("src/lib.rs"), 2_000).await;
+    }
+
+    let hits = store
+        .reader
+        .observations_for_file(ws, home, OwnerFilter::Any, "src/lib.rs".into(), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, mine);
+}
+
+/// #1843: "this session touched this file" comes from the observation, so it
+/// follows the observation's owner, and the owner rule runs before the limit.
+/// With `limit = 1`, operator B's newer owned session neither appears for A
+/// nor takes A's slot; a shared session is visible to both. Controls: B sees
+/// its own session, and `OwnerFilter::Any` sees all three. Fails with the
+/// owner clause removed, or applied after the limit.
+#[tokio::test]
+async fn observations_for_file_follows_the_session_owner_before_the_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = owned_session(&store, ws, proj, Some(operator("alice"))).await;
+    let bob = owned_session(&store, ws, proj, Some(operator("bob"))).await;
+    let shared = owned_session(&store, ws, proj, None).await;
+    file_observation(&store, ws, proj, alice, Some("src/lib.rs"), 1_000).await;
+    file_observation(&store, ws, proj, shared, Some("src/lib.rs"), 2_000).await;
+    file_observation(&store, ws, proj, bob, Some("src/lib.rs"), 3_000).await;
+    let sessions = |owner: OwnerFilter, limit: usize| {
+        let reader = store.reader.clone();
+        async move {
+            reader
+                .observations_for_file(ws, proj, owner, "src/lib.rs".into(), limit)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.session_id)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let as_alice = OwnerFilter::User(operator("alice"));
+    assert_eq!(sessions(as_alice.clone(), 1).await, vec![shared]);
+    assert_eq!(sessions(as_alice, 10).await, vec![shared, alice]);
+    assert_eq!(sessions(OwnerFilter::Unattributed, 10).await, vec![shared]);
+    assert_eq!(
+        sessions(OwnerFilter::User(operator("bob")), 1).await,
+        vec![bob]
+    );
+    assert_eq!(
+        sessions(OwnerFilter::Any, 10).await,
+        vec![bob, shared, alice]
+    );
+}
+
+/// #1843: every entry points at a target an agent can read. A session with
+/// a `sessions/<id>.md` page carries it; an open session, or one whose page
+/// expired, carries none and is read by `session_id` at `last_offset`,
+/// which lands on the newest observation naming the file.
+#[tokio::test]
+async fn observations_for_file_maps_sessions_to_readable_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let paged = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let open = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let expired = open_session(&store, ws, proj, AgentKind::Codex).await;
+    file_observation(&store, ws, proj, paged, Some("src/lib.rs"), 1_000).await;
+    file_observation(&store, ws, proj, open, None, 2_000).await;
+    file_observation(&store, ws, proj, open, Some("src/lib.rs"), 3_000).await;
+    file_observation(&store, ws, proj, open, None, 4_000).await;
+    let newest = file_observation(&store, ws, proj, open, Some("src/lib.rs"), 5_000).await;
+    file_observation(&store, ws, proj, open, Some("other.rs"), 6_000).await;
+    file_observation(&store, ws, proj, expired, Some("src/lib.rs"), 7_000).await;
+    let session_page = |session: SessionId| format!("sessions/{session}.md");
+    store
+        .writer
+        .upsert_page(page(ws, proj, &session_page(paged), "Session", "summary"))
+        .await
+        .unwrap();
+    let mut gone = page(ws, proj, &session_page(expired), "Session", "summary");
+    gone.expires_at = Some(jiff::Timestamp::from_second(1).unwrap());
+    store.writer.upsert_page(gone).await.unwrap();
+
+    let hits = store
+        .reader
+        .observations_for_file(ws, proj, OwnerFilter::Any, "src/lib.rs".into(), 10)
+        .await
+        .unwrap();
+    let by_session =
+        |session: SessionId| hits.iter().find(|hit| hit.session_id == session).unwrap();
+    assert_eq!(hits.len(), 3);
+    assert_eq!(
+        by_session(paged).page.as_ref().map(PagePath::as_str),
+        Some(session_page(paged).as_str())
+    );
+    assert_eq!(
+        by_session(expired).page,
+        None,
+        "an expired page counts as none"
+    );
+    let open_hit = by_session(open);
+    assert_eq!((open_hit.page.as_ref(), open_hit.hits), (None, 2));
+    assert_eq!(open_hit.last_seen.as_microsecond(), 5_000);
+
+    let read = store
+        .reader
+        .session_observations_scoped(
+            ws,
+            proj,
+            open,
+            ai_memory_store::ObservationPage {
+                limit: 1,
+                offset: usize::try_from(open_hit.last_offset).unwrap(),
+                order: ai_memory_store::ObservationOrder::Asc,
+                kinds: None,
+                query: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.records[0].id, newest);
 }

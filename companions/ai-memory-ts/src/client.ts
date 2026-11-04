@@ -176,6 +176,22 @@ function metadataFromFrontmatter(frontmatter: Raw): PageMetadata {
     }
     if (Object.keys(kept).length > 0) meta.relations = kept;
   }
+  const sourceFiles = frontmatter["source_files"];
+  if (
+    Array.isArray(sourceFiles) &&
+    sourceFiles.every(
+      (item) =>
+        item !== null &&
+        typeof item === "object" &&
+        typeof (item as Raw)["path"] === "string" &&
+        typeof (item as Raw)["commit"] === "string",
+    )
+  ) {
+    meta.sourceFiles = (sourceFiles as Raw[]).map((item) => ({
+      path: item["path"] as string,
+      commit: item["commit"] as string,
+    }));
+  }
   return meta;
 }
 
@@ -257,6 +273,7 @@ export class PagesNamespace {
         abstract: item.abstract,
         relations: item.relations,
         expires_at: item.expiresAt,
+        source_files: item.sourceFiles,
         expected_page_id: item.expectedPageId,
         create_only: item.createOnly === true ? true : undefined,
       });
@@ -320,6 +337,7 @@ export class PagesNamespace {
         abstract: a.abstract,
         relations: a.relations,
         expires_at: a.expiresAt,
+        source_files: a.sourceFiles,
         expected_page_id: a.expectedPageId,
         create_only: a.createOnly === true ? true : undefined,
       }),
@@ -492,7 +510,7 @@ export class PagesNamespace {
   /**
    * Read a page, apply `change`, and write it back only if nobody changed it
    * in between (`expectedPageId`). The page's current metadata (title, tier,
-   * tags, pinned, kind, entities, abstract, relations, TTL) is carried over
+   * tags, pinned, kind, entities, abstract, relations, TTL, source files) is carried over
    * unless `change` sets it; `null` clears a field.
    *
    * One attempt, no retry: on a concurrent change it throws
@@ -699,8 +717,10 @@ export class MessagesNamespace {
       wire({
         to_workspace: to.workspace,
         to_project: to.project,
+        to_agent: a.toAgent,
         from_workspace: from.workspace,
         from_project: from.project,
+        from_agent: a.fromAgent,
         body: a.body,
         subject: a.subject,
         nature: a.nature,
@@ -1004,6 +1024,7 @@ export class AiMemoryClient {
       wire({
         ...scopeWire(scope),
         recent_pages_limit: a.recentPagesLimit,
+        recent_sessions_limit: a.recentSessionsLimit,
         settled_first: a.settledFirst === true ? true : undefined,
       }),
       false,

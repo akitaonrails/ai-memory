@@ -3,6 +3,15 @@
 # matches rendered text against it at the display boundary.
 
 diag-preview = { $value0 }  { $value1 }  { $value2 }  PREVIEW
+diag-unknown-llm-task = unknown LLM task llm.{ $name }
+diag-llm-task-provider-empty = { $path }.provider must not be empty
+diag-llm-task-provider-unsupported = { $path }.provider={ $raw } is not a supported provider
+diag-validating-profile = validating LLM task profile { $path }
+diag-validating-fallback-profile = validating LLM fallback profile { $item }
+diag-building-profile = building LLM fallback provider { $item }
+diag-profile-api-key-unsupported = provider not configured: api_key_env is not supported by provider { $provider }
+diag-building-llm-provider-chains = building LLM provider chains from config
+diag-reranker-llm-provider-required = AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider
 diag-aborted-no-input = aborted (no input)
 diag-aborted = aborted
 diag-reading = reading { $value0 }
@@ -279,10 +288,16 @@ diag-project-selection-cancelled-no-managed-run-was = project selection cancelle
 diag-the-session-id-contains-characters-that-are = the session id contains characters that are invalid in an HTTP header
 diag-building-the-mcp-bridge-http-client = building the MCP bridge HTTP client
 diag-failed-to-install-a-rustls-crypto-provider = failed to install a rustls crypto provider; the MCP bridge cannot open an https:// connection without one
+diag-could-not-reach-the-ai-memory-server-at = could not reach the ai-memory server at { $server_url }: { $reason } (gave up after waiting { $value0 }s). Check the server is running (`ai-memory status`; on a service install, `systemctl --user status ai-memory` or the launchd agent) and that this entry points at it: the bridge connects to `--server-url`, else the configured server (AI_MEMORY_SERVER_URL).
+diag-the-connection-attempt-timed-out = the connection attempt timed out
 diag-upstream-mcp-server-completed-initialization-without-server = upstream MCP server completed initialization without server info
 diag-starting-session-aware-stdio-mcp-bridge = starting session-aware stdio MCP bridge
 diag-waiting-for-the-stdio-mcp-client-transport = waiting for the stdio MCP client transport
 diag-closing-upstream-http-mcp-transport = closing upstream HTTP MCP transport
+diag-channel-inbox-needs-a-session-aware-claude = --channel inbox needs a session-aware Claude Code bridge: keep --agent claude-code and omit --no-session-id
+diag-fetching = fetching { $value0 }
+diag-fetching-returned-http = fetching { $value0 } returned HTTP { $value1 }
+diag-pushing-the-inbox-channel-notification = pushing the inbox channel notification
 diag-was-passed-empty-provide-a-non-empty = { $flag } was passed empty; provide a non-empty value, or omit an optional scope flag to use the project this directory resolves to
 diag-openclaw-plugin-installed-from = OpenClaw plugin installed from { $value0 }.
 diag-if-your-openclaw-gateway-did-not-auto = If your OpenClaw gateway did not auto-restart, run `openclaw gateway restart`.

@@ -4074,11 +4074,11 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
         }
         _ => (None, None),
     };
-    conn.execute(
+    let result = conn.execute(
         "INSERT INTO observations \
          (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
-          importance, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+          importance, created_at, file_path) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             id.as_bytes(),
             obs.session_id.as_bytes(),
@@ -4091,8 +4091,42 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
             obs.body,
             importance,
             now,
+            obs.file_path,
         ],
-    )?;
+    );
+    // Historical migration tests stop before V99 and exercise this helper
+    // against that frozen schema, as with `finish_cjk_index_write`. A real
+    // Store migrates first, so a missing column stays a fatal error in every
+    // production build.
+    #[cfg(test)]
+    let result = match result {
+        Err(error)
+            if obs.file_path.is_none()
+                && error.to_string().contains("no column named file_path") =>
+        {
+            conn.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                  title, body, importance, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    id.as_bytes(),
+                    obs.session_id.as_bytes(),
+                    obs.workspace_id.as_bytes(),
+                    obs.project_id.as_bytes(),
+                    kind,
+                    extension,
+                    source_event,
+                    obs.title,
+                    obs.body,
+                    importance,
+                    now,
+                ],
+            )
+        }
+        other => other,
+    };
+    result?;
     index_observation_cjk(conn, conn.last_insert_rowid(), &obs.title, &obs.body)?;
     Ok(id)
 }
@@ -4491,6 +4525,124 @@ pub fn record_page_feedback(
     Ok(Some((page_id, next_salience)))
 }
 
+/// Record one implicit (normalized query → page) association (#1941, slice 2)
+/// and return the association's signal count after the upsert.
+///
+/// The upsert keys on `(workspace, project, query hash, page version)` and
+/// increments `signal_count` only when the writing session differs from
+/// `last_session`, so one session repeating the same read contributes at most
+/// one association. Like the access-bump reinforcement this is an implicit
+/// signal, so it writes no audit row. A `page_id` that is no longer the
+/// current version in this scope — rewritten, purged or deleted between the
+/// read and this detached write — is a no-op returning `0`, never an error:
+/// the association attaches to the version exactly as explicit feedback does.
+pub fn record_query_page_signal(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_id: PageId,
+    query_text: &str,
+    session: Option<&str>,
+) -> StoreResult<u32> {
+    let normalized = crate::query_signals::normalize_query(query_text);
+    if normalized.is_empty() {
+        return Ok(0);
+    }
+    let hash = crate::query_signals::query_hash(&normalized);
+    // Session keys are client-supplied strings. Store the same `SessionId`
+    // the hook ingress derives for that native id: it is bounded (a UUID),
+    // and it is what lets `purge_session` find this row and delete the query
+    // text the purged session wrote.
+    let session: Option<String> =
+        session.map(|s| ai_memory_core::SessionId::from_native(s).to_string());
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    // The EXISTS guard is the FK lesson from `bump_access_for_pages_for_actor`:
+    // this write is detached from the read that triggered it, so the page may
+    // be gone. It must also still be the CURRENT version — an association
+    // pointing at a superseded version never boosts anything, and recording
+    // one would only orphan text.
+    let is_current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pages \
+          WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3 AND is_latest = 1)",
+        params![
+            page_id.as_bytes(),
+            workspace_id.as_bytes(),
+            project_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    if !is_current {
+        tx.rollback()?;
+        return Ok(0);
+    }
+    tx.execute(
+        "INSERT INTO query_page_signals \
+           (workspace_id, project_id, query_hash, page_id, query_text, signal_count, last_session, last_seen) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7) \
+         ON CONFLICT(workspace_id, project_id, query_hash, page_id) DO UPDATE SET \
+           signal_count = CASE WHEN query_page_signals.last_session IS ?6 \
+                               THEN query_page_signals.signal_count \
+                               ELSE query_page_signals.signal_count + 1 END, \
+           query_text = excluded.query_text, \
+           last_session = excluded.last_session, \
+           last_seen = excluded.last_seen",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes(),
+            normalized,
+            session,
+            now,
+        ],
+    )?;
+    let count: i64 = tx.query_row(
+        "SELECT signal_count FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND query_hash = ?3 AND page_id = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Drop one implicit (normalized query → page) association (#1941): the
+/// negative signal a `not_helpful` feedback right after the query sends.
+/// Returns whether a row was removed. Removing the row (rather than storing a
+/// negative count) keeps the boost one-sided: an association can lose its
+/// boost, but a page can never be pushed below where plain ranking put it by
+/// this signal.
+pub fn forget_query_page_signal(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    page_id: PageId,
+    query_text: &str,
+) -> StoreResult<bool> {
+    let normalized = crate::query_signals::normalize_query(query_text);
+    if normalized.is_empty() {
+        return Ok(false);
+    }
+    let hash = crate::query_signals::query_hash(&normalized);
+    let removed = conn.execute(
+        "DELETE FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND query_hash = ?3 AND page_id = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            &hash[..],
+            page_id.as_bytes()
+        ],
+    )?;
+    Ok(removed > 0)
+}
+
 /// Mark the expected latest page as evicted by the forget sweep.
 ///
 /// The full identity and latest-id check share one transaction so a stale
@@ -4826,12 +4978,19 @@ pub struct ObservationPruneOutcome {
     pub sessions_resynced: usize,
 }
 
-/// Active-work exclusion shared, byte for byte, by the observation prune and
-/// its dry-run count (`ReaderPool::prunable_observation_count`). The caller
-/// applies this once per distinct candidate session as alias `s`: a queued job
-/// still needs its raw capture, and an ended session whose observation count
-/// advanced has resumed but not yet reached the next consolidation enqueue.
-pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "NOT EXISTS ( \
+/// Eligibility shared, byte for byte, by the observation prune and its dry-run
+/// count (`ReaderPool::prunable_observation_count`), applied once per distinct
+/// candidate session as alias `s`. `summary_page_id` names the heuristic page;
+/// a consolidation rewrite supersedes that row, so only the live head at its
+/// path says whether the distillation survives (decay eviction clears
+/// `is_latest`). A queued job still needs its raw capture, and an ended session
+/// whose observation count advanced has resumed but not yet reached the next
+/// consolidation enqueue.
+pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "EXISTS ( \
+    SELECT 1 FROM pages pointer \
+    JOIN pages head USING (workspace_id, project_id, path) \
+    WHERE pointer.id = s.summary_page_id AND head.is_latest = 1 \
+) AND NOT EXISTS ( \
     SELECT 1 FROM session_consolidation_jobs j \
     WHERE j.session_id = s.id \
       AND j.state IN ('pending', 'running') \
@@ -4846,10 +5005,10 @@ pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "NOT EXISTS ( \
 /// Raw capture is the store's growth driver, but it is also the only input
 /// consolidation, auto-improvement and the `raw_hits` fallback have. Deleting
 /// it is safe exactly when its durable distillation still exists, so the
-/// predicate joins through `sessions.summary_page_id` — the marker
-/// [`end_session_row`] writes — and requires the page it points at to still be
-/// live. `superseded_at IS NOT NULL` means decay already evicted that page, so
-/// its session's raw capture is the last copy and must stay; a page hard-deleted
+/// predicate requires a live head at the path `sessions.summary_page_id` — the
+/// marker [`end_session_row`] writes — names ([`OBSERVATION_PRUNE_SESSION_GUARD_SQL`]
+/// says why the pointer's own row is not enough). An evicted head means its
+/// session's raw capture is the last copy and must stay; a page hard-deleted
 /// by the same sweep is excluded for free, because the `ON DELETE SET NULL`
 /// foreign key has already cleared the pointer. A session with no `sessions`
 /// row, or one that never ended, matches nothing and can never be pruned.
@@ -4903,8 +5062,7 @@ pub fn prune_consolidated_observations(
              ), eligible_sessions AS MATERIALIZED ( \
                  SELECT s.id FROM candidate_sessions candidate \
                  JOIN sessions s ON s.id = candidate.session_id \
-                 JOIN pages p ON p.id = s.summary_page_id \
-                 WHERE p.superseded_at IS NULL AND {guard} \
+                 WHERE {guard} \
              ) \
              DELETE FROM observations \
              WHERE id IN ( \
@@ -7285,6 +7443,16 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![format!("session:{session_id}")],
     )?;
 
+    // Query-signal associations (#1941) this session wrote last carry its
+    // query text. The row goes with the session, even when earlier sessions
+    // also confirmed it: the text is the user's, and the boost is a
+    // convenience that the next confirming session rebuilds.
+    tx.execute(
+        "DELETE FROM query_page_signals \
+          WHERE workspace_id = ?1 AND project_id = ?2 AND last_session = ?3",
+        rusqlite::params![&wid[..], &pid[..], session_id.to_string()],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -8148,6 +8316,7 @@ pub fn move_project_workspace(
         "profile_candidates",
         "profile_entry_ledger",
         "profile_harvest_marks",
+        "query_page_signals",
     ] {
         tx.execute(
             &format!(
@@ -8411,6 +8580,7 @@ pub fn merge_project(
         "session_consolidation_jobs",
         "page_feedback",
         "purged_sessions",
+        "query_page_signals",
     ] {
         tx.execute(
             &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
@@ -9653,6 +9823,7 @@ pub(crate) mod tests {
             title: "hook".into(),
             body: "observation".into(),
             importance: 5,
+            file_path: None,
         }
     }
 
@@ -9944,6 +10115,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray).unwrap();
 
@@ -10051,6 +10223,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -10387,6 +10560,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &collateral_obs).unwrap();
 
@@ -11909,6 +12083,7 @@ pub(crate) mod tests {
             importance: 5,
 
             occurred_at: None,
+            file_path: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -14057,6 +14232,7 @@ pub(crate) mod tests {
                 title: "Read".into(),
                 body: "README.md".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14118,6 +14294,7 @@ pub(crate) mod tests {
                 title: "stop".into(),
                 body: String::new(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14165,6 +14342,7 @@ pub(crate) mod tests {
                 title: "hello".into(),
                 body: "do the thing".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14226,6 +14404,7 @@ pub(crate) mod tests {
                     title: "t".into(),
                     body: "b".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -14683,6 +14862,7 @@ pub(crate) mod tests {
                 title: "hook".into(),
                 body: "observation".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -14728,6 +14908,7 @@ pub(crate) mod tests {
                 title: "hook".into(),
                 body: "observation".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -15510,6 +15691,7 @@ pub(crate) mod tests {
                 title: "t".into(),
                 body: "b".into(),
                 importance: 5,
+                file_path: None,
             },
         )
         .unwrap();
@@ -16044,6 +16226,7 @@ pub(crate) mod tests {
                     title: format!("movable-obs-{n}"),
                     body: "zebra token body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -16438,7 +16621,7 @@ pub(crate) mod tests {
     }
 
     /// Point `sessions.summary_page_id` at the session's latest page in a
-    /// scope, the way session consolidation does.
+    /// scope, the way the session-end path does.
     fn point_summary_at_latest(
         conn: &mut Connection,
         sid: SessionId,
@@ -16596,6 +16779,7 @@ pub(crate) mod tests {
                     title: format!("stray-obs-{i}"),
                     body: "zebra token body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -17211,6 +17395,7 @@ pub(crate) mod tests {
                     title: format!("call {i}"),
                     body: "body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -17573,6 +17758,7 @@ pub(crate) mod tests {
                     title: format!("call {i}"),
                     body: "body".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -17665,6 +17851,7 @@ pub(crate) mod tests {
                     title: "before v20".into(),
                     body: "existing observation survives table rebuild".into(),
                     importance: 5,
+                    file_path: None,
                 },
             )
             .unwrap();
@@ -18195,6 +18382,7 @@ pub(crate) mod tests {
             title: "t".into(),
             body: "b".into(),
             importance: 5,
+            file_path: None,
         };
         assert!(
             insert_observation(&mut conn, &mismatched_obs).is_err(),

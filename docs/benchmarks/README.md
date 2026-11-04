@@ -13,6 +13,10 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-11-03** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.3.3 release)** | **0.951** | [longmemeval-s-3.3.3-release.md](longmemeval-s-3.3.3-release.md) |
+| **2026-11-03** | LongMemEval-S (v1) | **local embeddings + observation stream (3.3.3 release)** | **0.943** | [longmemeval-s-3.3.3-release.md](longmemeval-s-3.3.3-release.md) |
+| **2026-11-03** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.3.2 release)** | **0.951** | [longmemeval-s-3.3.2-release.md](longmemeval-s-3.3.2-release.md) |
+| **2026-11-03** | LongMemEval-S (v1) | **local embeddings + observation stream (3.3.2 release)** | **0.938** | [longmemeval-s-3.3.2-release.md](longmemeval-s-3.3.2-release.md) |
 | **2026-10-29** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.3.0 release)** | **0.951** | [longmemeval-s-3.3.0-release.md](longmemeval-s-3.3.0-release.md) |
 | **2026-10-29** | LongMemEval-S (v1) | **local embeddings + observation stream (3.3.0 release)** | **0.945** | [longmemeval-s-3.3.0-release.md](longmemeval-s-3.3.0-release.md) |
 | **2026-10-26** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.2.6 release)** | **0.951** | [longmemeval-s-3.2.6-release.md](longmemeval-s-3.2.6-release.md) |
@@ -38,6 +42,20 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 3.3.3 patch-release run matched 3.3.2's FTS numbers in every slice, and
+local `hit@5` moved from 0.938 to 0.943 within its run-to-run variance.
+Ingest throughput depends on the storage under the server's data dir (the
+harness honours `TMPDIR`); measured back to back on the same storage, 3.3.2
+and 3.3.3 ingest at the same rate. See the
+[3.3.3 release report](longmemeval-s-3.3.3-release.md).
+
+The 3.3.2 patch-release run kept FTS `hit@5` and `hit@10` and returned
+about 3% less context after the path-splitting change (#1922). Local
+`hit@5` moved from 0.945 to 0.938; re-running the questions that moved
+showed most of them flip on identical code, so the movement is run-to-run
+variance tracked in #1854. See the
+[3.3.2 release report](longmemeval-s-3.3.2-release.md).
 
 The 3.3.0 minor-release run found FTS identical to 3.2.6 at every accuracy
 and recall cutoff and kept local `hit@5` exact. Local `hit@10` and

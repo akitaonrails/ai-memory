@@ -68,6 +68,7 @@ fn observation(
             title: format!("tool call {n}"),
             body: "ran a command and captured a bounded excerpt of its output".into(),
             importance: 5,
+            file_path: None,
         },
         &Sanitizer::builtin(),
     )

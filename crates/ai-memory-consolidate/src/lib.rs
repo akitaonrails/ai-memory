@@ -28,6 +28,7 @@ mod path_sanitize;
 pub mod profile;
 pub mod projection;
 mod prompt_template;
+mod slug_digest;
 pub mod sweep;
 pub mod types;
 

@@ -58,7 +58,35 @@ An array of tables. Each entry is tried in order after the primary provider, onl
 | `provider` | empty (required) | - | Provider for this candidate, using the same names as `llm_provider`. |
 | `model` | empty (required) | - | Model id for this candidate. |
 | `base_url` | unset | - | Endpoint override for this candidate. Required for `openai-compat`. |
-| `api_key_env` | unset | - | Name of the environment variable holding this candidate's key. Required unless the provider has a native credential source. |
+| `api_key_env` | unset | - | Name of the environment variable holding this candidate's key. Required unless the provider has a native credential source. `copilot` and `anthropic-oauth` use the named key instead of their native token; `openai-oauth`, `codex` and `cursor` reject it. |
+
+## `[llm.<task>]`
+
+Each optional task profile selects a separate provider chain. The task keys are
+`consolidation`, `bootstrap`, `auto_improve`, `experience`, `dream`, `lint`,
+`profile`, `rerank` and `query_answer`. The last covers both
+`memory_query(answer=true)` and `memory_explore`. Scheduled lint remains
+rule-only.
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `provider` | required, nonblank | `AI_MEMORY_LLM__<TASK>__PROVIDER` | Provider name, using the same names as `llm_provider`. |
+| `model` | selected provider's default | `AI_MEMORY_LLM__<TASK>__MODEL` | Model override for this task; required for `openai-compat`. |
+| `base_url` | selected provider's default | `AI_MEMORY_LLM__<TASK>__BASE_URL` | Endpoint override; required for `openai-compat`. The global endpoint is not inherited. |
+| `api_key_env` | provider's normal credential source | `AI_MEMORY_LLM__<TASK>__API_KEY_ENV` | Name of the environment variable holding the credential, never the credential itself. |
+| `fallbacks` | `[]` | - | Ordered fallback profiles, with the same fields and requirements as `[[llm_fallbacks]]`. |
+
+Replace `<TASK>` with an uppercase task key, for example
+`AI_MEMORY_LLM__BOOTSTRAP__PROVIDER`. Fallback lists are config-only.
+`openai-compat` requires both `model` and `base_url`. OpenAI OAuth, Codex and
+Cursor use their native login files or CLI and reject `api_key_env`.
+An unset task shares the same default provider instance and chain; if no default
+exists, it has no provider. A task profile works independently when the global
+provider is unset. Its chain contains only its primary and its own fallbacks;
+global fallbacks are not appended. A missing explicitly named credential fails
+`ai-memory serve` startup instead of inheriting the default credential. Timeout,
+compatibility settings, headers and reasoning effort remain global. See
+[`llm-provider-fallback.md`](llm-provider-fallback.md) for an example.
 
 ## `[[admission_webhooks]]`
 
@@ -158,6 +186,8 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | `abstract_vectors` | `false` | `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS` | Add the L0 abstract embedding stream to the rank fusion. |
 | `belief_authority_weight` | `0.0` | `AI_MEMORY_RETRIEVAL__BELIEF_AUTHORITY_WEIGHT` | Weight of a page's evidence-derived confidence in its authority. 0 is inert and negatives clamp to 0. |
 | `observation_stream` | `true` | `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM` | Add the observation evidence stream, where matching observation bodies vote for their session's page. |
+| `feedback_demotion` | `0.0` | `AI_MEMORY_RETRIEVAL__FEEDBACK_DEMOTION` | Authority subtracted from a page whose current version carries open `stale`/`wrong` feedback, until a rewrite clears it. 0 is inert and negatives clamp to 0. |
+| `query_signal_weight` | `0.0` | `AI_MEMORY_RETRIEVAL__QUERY_SIGNAL_WEIGHT` | Similarity-capped authority boost from (query → page) associations captured when a session-aware caller with write access read a query hit or marked it helpful; `not_helpful` withdraws one and a session purge deletes its rows. 0 disables both capture and boost. |
 
 ## `[search.fts]`
 
@@ -254,7 +284,7 @@ Defined by `EntropyFilterConfig` in `ai-memory-consolidate`. A skipped page is l
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
 | `claim_on_session_start` | `true` | `AI_MEMORY_HANDOFF__CLAIM_ON_SESSION_START` | Claim a pending handoff automatically at SessionStart. `false` renders a notice and waits for `memory_handoff_accept`. |
-| `create_on_session_end` | `true` | `AI_MEMORY_HANDOFF__CREATE_ON_SESSION_END` | Create an automatic open handoff when an unmanaged session ends. |
+| `create_on_session_end` | `true` | `AI_MEMORY_HANDOFF__CREATE_ON_SESSION_END` | Create an automatic open handoff when an unmanaged session ends. A hook client running with `AI_MEMORY_AUTO_HANDOFF=off` skips it for that execution only (see `docs/usage.md`). |
 
 ## `[profile]`
 
@@ -270,7 +300,7 @@ Defined by `ProfileSettings` in `ai-memory-core`.
 | `baseline_max_bytes` | `6000` (`DEFAULT_BASELINE_MAX_BYTES`) | `AI_MEMORY_PROFILE__BASELINE_MAX_BYTES` | Digest budget for a project with no pages yet, clamped to 2000 through 20000. |
 | `apply_max_lines` | `40` (`DEFAULT_APPLY_MAX_LINES`) | `AI_MEMORY_PROFILE__APPLY_MAX_LINES` | Most lines `ai-memory profile apply` writes into a rules file. |
 | `max_output_tokens` | `2000` (`DEFAULT_MAX_OUTPUT_TOKENS`) | `AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS` | Output-token allowance for one profile LLM call (classification and merge). Raise it when the provider spends part of the budget before the structured JSON, e.g. a thinking model, and the call fails with `finish_reason=length`. |
-| `llm` | `true` | `AI_MEMORY_PROFILE__LLM` | Use the configured LLM provider for the profile when there is one. |
+| `llm` | `true` | `AI_MEMORY_PROFILE__LLM` | Use the configured LLM provider for the profile when there is one. An [`[llm.profile]`](#llmtask) table gives the classify and merge calls their own provider and model. |
 
 ## `[sanitize]`
 
@@ -289,6 +319,7 @@ Defined by `SanitizeConfig` in `ai-memory-core`. Built-in redaction patterns alw
 | `drop_tool_names` | `[]` | `AI_MEMORY_INGEST__DROP_TOOL_NAMES` | Drop a tool event whose tool name equals one of these exactly. |
 | `drop_events` | `[]` | `AI_MEMORY_INGEST__DROP_EVENTS` | Drop whole hook event kinds. `session-start` and `session-end` are rejected at load. |
 | `record_tool_names` | `false` | `AI_MEMORY_INGEST__RECORD_TOOL_NAMES` | Name each tool call in its observation (`tool non-file: Bash`, plus a Claude Code skill or subagent type) instead of only its family. Never a tool's arguments. |
+| `index_file_paths` | `false` | `AI_MEMORY_INGEST__INDEX_FILE_PATHS` | Store the checkout-relative path of the one file a kept file-tool call named (native hook client only), and count in `file_path_*` why the others got none ([design](design-file-path-index.md)). |
 
 ## `[hook_spool]`
 

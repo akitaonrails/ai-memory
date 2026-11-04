@@ -42,7 +42,10 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -343,6 +346,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 title: "alpha prompt".into(),
                 body: "".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -377,6 +381,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 title: "beta prompt".into(),
                 body: "".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

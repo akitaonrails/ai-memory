@@ -65,6 +65,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
       "abstract",
       "relations",
       "expires_at",
+      "source_files",
       "expected_page_id",
       "create_only",
     ],
@@ -143,8 +144,10 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     sends: [
       "to_workspace",
       "to_project",
+      "to_agent",
       "from_workspace",
       "from_project",
+      "from_agent",
       "body",
       "subject",
       "nature",
@@ -173,7 +176,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["briefing"],
     phase: 2,
-    sends: [...SCOPE, "recent_pages_limit", "settled_first"],
+    sends: [...SCOPE, "recent_pages_limit", "recent_sessions_limit", "settled_first"],
   },
   memory_explore: {
     status: "wrapped",

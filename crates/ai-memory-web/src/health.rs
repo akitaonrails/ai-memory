@@ -281,6 +281,19 @@ pub fn localized_checks(
             s.providers.llm.retry_hint.as_deref(),
         );
     }
+    for chain in &s.providers.llm_task_chains {
+        if chain.status == ProviderHealthStatus::Error {
+            push(
+                "llm_task_provider",
+                CheckStatus::Error,
+                i18n.format(
+                    "web-health-detail-llm-task-failed",
+                    &[("value0", chain.task.config_key().to_owned())],
+                ),
+                None,
+            );
+        }
+    }
     if s.providers.embedding.status == ProviderHealthStatus::Error {
         push(
             "embedding_provider",

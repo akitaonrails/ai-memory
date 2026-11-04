@@ -764,6 +764,7 @@ async fn management_pagination_reports_its_limit_and_keeps_pages_disjoint() {
                     body: format!("event body {index}"),
                     importance: 5,
                     occurred_at: None,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))

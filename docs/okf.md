@@ -78,7 +78,10 @@ Markdown URL, while `[[wikilinks]]` continue to name literal page paths.
 
 Extension fields kept verbatim (unknown keys are conformant): `tier`,
 `kind`, `slot_kind`, `entities`, `pinned`, `consolidated`,
-`session_id`, `agent`, `summary`, `expires_at`.
+`session_id`, `agent`, `summary`, `expires_at`, `source_files`.
+`source_files` (`[{path, commit}]`, the repository files a page describes) is
+deliberately a separate key: OKF `sources` holds the page's session
+provenance, and the two never share entries.
 
 ## Bundle boundary
 

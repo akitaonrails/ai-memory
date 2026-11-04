@@ -2126,6 +2126,7 @@ mod load_with_count_scopes {
                 body: body.into(),
                 importance: 5,
                 occurred_at: None,
+                file_path: None,
             };
             store
                 .writer

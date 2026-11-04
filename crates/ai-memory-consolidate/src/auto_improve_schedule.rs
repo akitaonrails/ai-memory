@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use ai_memory_core::{ActorContext, PagePath, ProjectId, SessionId, WorkspaceId};
-use ai_memory_llm::LlmProvider;
+use ai_memory_llm::{LlmProvider, LlmProviders, LlmWorkload};
 use ai_memory_store::{
     ApproveAutoImproveProposalResult, AutoImproveProposalOperation, NewAutoImproveProposal,
     ReaderPool, SkippedProposal, StageAutoImproveRun, WriterHandle,
@@ -154,7 +154,7 @@ pub async fn run_auto_improve_scheduler_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
     wiki: &Wiki,
-    llm: &Arc<dyn LlmProvider>,
+    llms: &LlmProviders,
     settings: &ScheduledAutoImproveSettings,
 ) -> Result<ScheduledAutoImproveTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
@@ -178,40 +178,20 @@ pub async fn run_auto_improve_scheduler_tick(
             continue;
         }
 
-        let candidates = match reader
-            .auto_improve_candidate_sessions(
-                scope.workspace_id,
-                scope.project_id,
-                settings.min_session_age_secs,
-                settings.max_sessions_per_tick,
-            )
-            .await
-        {
-            Ok(candidates) => candidates,
-            Err(e) => {
-                outcome.errors += 1;
-                tracing::warn!(
-                    workspace = %scope.workspace_name,
-                    project = %scope.project_name,
-                    error = %e,
-                    "scheduled auto-improve candidate query failed"
-                );
-                continue;
-            }
-        };
-        let ctx = ScheduledAutoImproveContext {
-            reader,
-            writer,
-            wiki,
-            llm,
-            workspace_id: scope.workspace_id,
-            project_id: scope.project_id,
-            settings,
-        };
-
         // Cross-session ("experience") pass — cadence-gated per scope,
         // independent of whether this tick has per-session candidates.
-        if let Some(experience) = &settings.experience {
+        if let (Some(experience), Some(llm)) =
+            (&settings.experience, llms.get(LlmWorkload::Experience))
+        {
+            let ctx = ScheduledAutoImproveContext {
+                reader,
+                writer,
+                wiki,
+                llm,
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+                settings,
+            };
             match reader
                 .experience_pass_due(scope.workspace_id, scope.project_id)
                 .await
@@ -283,6 +263,44 @@ pub async fn run_auto_improve_scheduler_tick(
                 }
             }
         }
+        if settings.max_sessions_per_tick == 0 {
+            continue;
+        }
+
+        let Some(llm) = llms.get(LlmWorkload::AutoImprove) else {
+            continue;
+        };
+
+        let candidates = match reader
+            .auto_improve_candidate_sessions(
+                scope.workspace_id,
+                scope.project_id,
+                settings.min_session_age_secs,
+                settings.max_sessions_per_tick,
+            )
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(e) => {
+                outcome.errors += 1;
+                tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    error = %e,
+                    "scheduled auto-improve candidate query failed"
+                );
+                continue;
+            }
+        };
+        let ctx = ScheduledAutoImproveContext {
+            reader,
+            writer,
+            wiki,
+            llm,
+            workspace_id: scope.workspace_id,
+            project_id: scope.project_id,
+            settings,
+        };
 
         if candidates.is_empty() {
             continue;
@@ -855,6 +873,10 @@ mod tests {
         let llm: Arc<dyn LlmProvider> = Arc::new(SchedulerSentinelLlm {
             calls: Arc::clone(&calls),
         });
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            overrides: [(LlmWorkload::AutoImprove, llm)].into(),
+        };
         let settings = ScheduledAutoImproveSettings {
             review: AutoImproveReviewConfig {
                 min_observations: 3,
@@ -880,7 +902,7 @@ mod tests {
         // Attempt 1: retryable provider 400 → the claim records the attempt
         // (not parked). The persisted column carries only class/status.
         let first =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(first.errors, 1, "the retryable failure must be reported");
@@ -899,7 +921,7 @@ mod tests {
         // Attempt 2: the claim re-arms and each attempt writes only the safe
         // summary.
         let second =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(second.errors, 1);
@@ -911,7 +933,7 @@ mod tests {
         // Attempt 3 exhausts the budget: the claim parks and stops being a
         // candidate — the policy is unchanged by the redaction.
         let third =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(third.errors, 1);
@@ -919,7 +941,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
         let fourth =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(fourth.errors, 0, "a parked claim must not be retried");
@@ -1034,21 +1056,30 @@ mod tests {
             review: AutoImproveReviewConfig::default(),
             require_approval: true,
             min_session_age_secs: 0,
-            max_sessions_per_tick: 10,
+            max_sessions_per_tick: 0,
             experience: Some(crate::ExperienceConfig {
                 sessions: 10,
                 min_new_sessions: 3,
                 ..crate::ExperienceConfig::default()
             }),
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceSentinelLlm);
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            overrides: [(
+                LlmWorkload::Experience,
+                Arc::new(ExperienceSentinelLlm) as Arc<dyn LlmProvider>,
+            )]
+            .into(),
+        };
 
         let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
 
         assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
+        assert_eq!(outcome.scopes_with_candidates, 0, "{outcome:?}");
+        assert_eq!(outcome.reviewed, 0, "{outcome:?}");
         assert_eq!(
             outcome.errors, 1,
             "the experience failure must be reported once: {outcome:?}"
@@ -1187,9 +1218,12 @@ mod tests {
             max_sessions_per_tick: 10,
             experience: None,
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            ..Default::default()
+        };
         let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
 
@@ -1337,8 +1371,7 @@ mod tests {
             review: AutoImproveReviewConfig::default(),
             require_approval: true,
             min_session_age_secs: 0,
-            // Per-session path effectively off: the fake sessions have no
-            // observations, so preflight rejects them anyway.
+            // Only the experience provider is configured.
             max_sessions_per_tick: 10,
             experience: Some(crate::ExperienceConfig {
                 sessions: 10,
@@ -1346,12 +1379,32 @@ mod tests {
                 ..crate::ExperienceConfig::default()
             }),
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(ExperienceLlm);
+        let disabled = run_auto_improve_scheduler_tick(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &LlmProviders::default(),
+            &settings,
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled.experience_runs, 0);
+        assert_eq!(disabled.reviewed, 0);
+
+        let llms = LlmProviders {
+            overrides: [(
+                LlmWorkload::Experience,
+                Arc::new(ExperienceLlm) as Arc<dyn LlmProvider>,
+            )]
+            .into(),
+            ..Default::default()
+        };
         let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(outcome.experience_runs, 1, "{outcome:?}");
+        assert_eq!(outcome.reviewed, 0, "{outcome:?}");
         assert_eq!(outcome.errors, 0, "{outcome:?}");
 
         // The proposal is staged pending (require_approval), through the
@@ -1374,7 +1427,7 @@ mod tests {
 
         // Cadence anchored: an immediate second tick runs nothing.
         let outcome2 =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(outcome2.experience_runs, 0, "{outcome2:?}");
@@ -1454,9 +1507,12 @@ mod tests {
                 ..crate::ExperienceConfig::default()
             }),
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let llms = LlmProviders {
+            default: Some(Arc::new(PanicLlm)),
+            ..Default::default()
+        };
         let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(outcome.experience_runs, 0, "{outcome:?}");
@@ -1556,6 +1612,7 @@ mod tests {
                         title: format!("event {i}"),
                         body: "run the full gate before release".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -1645,6 +1702,10 @@ mod tests {
             experience: None,
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);
+        let llms = LlmProviders {
+            default: Some(Arc::clone(&llm)),
+            ..Default::default()
+        };
         let ctx = ScheduledAutoImproveContext {
             reader: &store.reader,
             writer: &store.writer,
@@ -1666,7 +1727,7 @@ mod tests {
 
         let tick_session = seed_reviewable_session(&store, ws, proj).await;
         let tick =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await
                 .unwrap();
         assert_eq!(tick.errors, 0);

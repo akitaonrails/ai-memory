@@ -119,6 +119,7 @@ async fn residue_changes_only_the_provider_request_not_the_stored_page() {
                     title,
                     body,
                     importance,
+                    file_path: None,
                 },
                 &sanitizer,
             ))

@@ -83,6 +83,7 @@ pub(crate) async fn observe(
                 title: "prompt".into(),
                 body: body.into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

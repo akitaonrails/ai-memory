@@ -40,6 +40,8 @@ export const read = {
     abstract: "short",
     relations: { fixes: ["notes/a.md"], bogus: ["x"] },
     expires_at: "2099-01-01",
+    source_files: [{ path: "bin/deploy.sh", commit: "3f2a9c1" }],
+    sources: [{ resource: "ai-memory://session/x", author: "process:claude-code" }],
     type: "Note",
     generated: { by: "process:ai-memory/3.0.0", at: "2026-10-13T15:10:47Z" },
   },

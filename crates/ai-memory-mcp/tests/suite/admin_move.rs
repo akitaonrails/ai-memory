@@ -48,7 +48,10 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -82,7 +85,10 @@ async fn make_state_with_chain(tmp: &TempDir, chain: AdmissionChain) -> (AdminSt
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -673,7 +679,10 @@ async fn move_project_carries_source_embedding() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: Some(embedder),
@@ -837,6 +846,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
                 title: "prompt".into(),
                 body: "do the thing".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -969,7 +979,10 @@ async fn true_move_notifies_admission_with_destination_names() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1028,7 +1041,10 @@ async fn make_state_with_embedder(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: Some(embedder),
@@ -1259,7 +1275,10 @@ fn build_state(store: &Store, tmp: &TempDir) -> AdminState {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki: Wiki::new(tmp.path(), store.writer.clone()).unwrap(),
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1760,7 +1779,10 @@ async fn true_move_aborts_when_admission_rejects() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1860,7 +1882,10 @@ async fn copy_purge_purge_admission_runs_before_db_destruction() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -1977,7 +2002,10 @@ async fn move_copy_skips_contributors_webhook_but_runs_others() {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -2288,6 +2316,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2650,6 +2679,7 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2777,6 +2807,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2865,6 +2896,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2905,6 +2937,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
                 importance: 5,
 
                 occurred_at: None,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))

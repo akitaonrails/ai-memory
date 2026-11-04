@@ -73,7 +73,7 @@ use ai_memory_core::{
     DEFAULT_WORKSPACE_NAME, PageId, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{
-    ChatRequest, Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot,
+    ChatRequest, Embedder, LlmProviders, LlmWorkload, ProviderHealth, ProviderHealthSnapshot,
     error_status_and_message,
 };
 use ai_memory_store::{
@@ -228,8 +228,8 @@ pub struct AdminState {
     pub reader: ReaderPool,
     /// Wiki handle — pages are written here.
     pub wiki: Wiki,
-    /// Optional LLM provider. When `None`, bootstrap returns 503.
-    pub llm: Option<Arc<dyn LlmProvider>>,
+    /// LLM providers selected by workload, with a default provider.
+    pub llm_providers: LlmProviders,
     /// If true, auto-improve leaves staged proposals pending for manual
     /// approval; otherwise it approves them immediately through the normal wiki
     /// write path.
@@ -1470,11 +1470,11 @@ async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl Into
 /// same status class and bounded message the health snapshot records — never
 /// the request, the reply text or the provider's full body.
 async fn handle_llm_test(State(state): State<Arc<AdminState>>) -> Response {
-    let Some(llm) = state.llm.clone() else {
+    let Some(llm) = state.llm_providers.default.as_ref().cloned() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error": "this server has no LLM provider configured; set one in its config and restart it",
+                "error": "this server has no default LLM provider configured; set one in its config and restart it",
             })),
         )
             .into_response();
@@ -2620,14 +2620,14 @@ async fn handle_bootstrap(
     }
 
     // Live runs from here on need LLM + workspace/project resolution.
-    if state.llm.is_none() {
+    let Some(llm) = state.llm_providers.get(LlmWorkload::Bootstrap).cloned() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
                 "error": "LLM provider not configured on server"
             })),
         ));
-    }
+    };
     let target = create_ws_proj(&state, &req.workspace, &req.project).await?;
     let (ws, proj) = target.scope.as_tuple();
 
@@ -2640,13 +2640,6 @@ async fn handle_bootstrap(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
-
-    let llm = Arc::clone(
-        state
-            .llm
-            .as_ref()
-            .expect("llm is Some: checked above (non-dry-run without LLM returns 503)"),
-    );
 
     let cfg = BootstrapConfig {
         // repo_path is unused by process_sources — the path field is
@@ -2808,7 +2801,7 @@ async fn handle_auto_improve(
         ));
     }
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
-    let Some(llm) = state.llm.as_ref().cloned() else {
+    let Some(llm) = state.llm_providers.get(LlmWorkload::AutoImprove).cloned() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
@@ -4367,7 +4360,7 @@ async fn handle_lint(
     run_lint(
         &state.reader,
         &state.wiki,
-        state.llm.as_ref(),
+        state.llm_providers.get(LlmWorkload::Lint),
         ws,
         proj,
         ai_memory_consolidate::LintOptions {
@@ -9994,7 +9987,7 @@ mod tests {
         ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
     };
     use ai_memory_core::{Sanitized, Sanitizer};
-    use ai_memory_llm::{ChatRequest, ChatResponse, LlmOperationId, LlmResult, LlmWorkload};
+    use ai_memory_llm::{ChatRequest, ChatResponse, LlmOperationId, LlmProvider, LlmResult};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
     use axum::http::Request;
@@ -10304,7 +10297,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10373,7 +10366,10 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: Some(llm),
+            llm_providers: LlmProviders {
+                default: Some(llm),
+                ..Default::default()
+            },
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10448,7 +10444,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10576,7 +10572,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -10815,7 +10811,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -11013,7 +11009,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -11238,7 +11234,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -12136,7 +12132,10 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm,
+            llm_providers: LlmProviders {
+                default: llm,
+                ..Default::default()
+            },
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -12484,18 +12483,19 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
             .await
             .unwrap();
 
-        let router = admin_router(admin_state_for_store_with_llm(
-            &tmp,
-            &store,
-            wiki,
-            Some(Arc::new(FakeAutoImproveLlm)),
-        ));
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state
+            .llm_providers
+            .overrides
+            .insert(LlmWorkload::AutoImprove, Arc::new(FakeAutoImproveLlm));
+        let router = admin_router(state);
         let resp = router
             .oneshot(
                 Request::builder()
@@ -12642,6 +12642,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12784,6 +12785,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12904,6 +12906,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13007,6 +13010,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13163,6 +13167,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "durable lesson".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -14036,7 +14041,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14149,7 +14154,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14255,7 +14260,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14367,7 +14372,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14918,7 +14923,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -14987,7 +14992,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -15681,7 +15686,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -15816,7 +15821,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: missing_db_reader,
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,
@@ -16789,7 +16794,7 @@ mod tests {
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
-            llm: None,
+            llm_providers: LlmProviders::default(),
             auto_improve_require_approval: false,
             auto_improve_review_config: Default::default(),
             embedder: None,

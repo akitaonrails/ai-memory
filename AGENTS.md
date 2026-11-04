@@ -198,7 +198,8 @@ or prompt routing for learning review.
   workspace resolver 3. The authoritative workspace version is
   `workspace.package.version` in `Cargo.toml`.
 - **Async runtime:** `tokio` (full features).
-- **MCP/HTTP:** `rmcp` 2.2 (server SDK) + `axum` 0.8 for MCP HTTP, hooks,
+- **MCP/HTTP:** `rmcp` 3.8 (server SDK; MCP 2026-07-28 plus the legacy
+  initialize handshake) + `axum` 0.8 for MCP HTTP, hooks,
   admin, `/api/v1`, and the built-in `/web` UI; `tower` / `tower-http`.
 - **Store:** `rusqlite` (bundled SQLite, backup API), `refinery`
   migrations, FTS5, `parking_lot`.
@@ -712,7 +713,10 @@ Additional boundary rules:
   on a contributor PR to the tap to remember it.
 - **A release that touches retrieval re-runs the retrieval benchmark once,
   on the final release candidate, and compares it with the previous
-  release.** The full run takes hours, so it is never run speculatively:
+  release.** A full run takes about half an hour on an idle host (FTS about
+  a minute, local embeddings 22-30 minutes, nearly all of it CPU-bound
+  embedding ingest) and hours when it shares the CPU with builds, so it runs
+  alone and is never run speculatively:
   - *Only when needed.* First diff the range against the last tag for
     retrieval code (store reader and ranking, the hook capture to
     observation path, consolidation output that pages are built from,

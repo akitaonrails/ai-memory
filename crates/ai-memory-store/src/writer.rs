@@ -441,6 +441,25 @@ pub(crate) enum WriteCmd {
         params: crate::decay::DecayParams,
         reply: oneshot::Sender<StoreResult<Option<(PageId, f64)>>>,
     },
+    /// Record one implicit (query → page) association (#1941). The op
+    /// normalizes and hashes the query itself so every writer of a row
+    /// derives the same key.
+    RecordQuerySignal {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        query_text: String,
+        session: Option<String>,
+        reply: oneshot::Sender<StoreResult<u32>>,
+    },
+    /// Drop one implicit (query → page) association (#1941).
+    ForgetQuerySignal {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        query_text: String,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     SoftDeleteForDecayIfLatest {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -853,6 +872,7 @@ pub(crate) enum WriteCmd {
     },
     LinkOrAdoptManagedRunSession {
         input: LinkOrAdoptManagedRunSession,
+        boundary: crate::workstream::ClaudeSessionBoundary,
         reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
     LinkManagedRunSessionInScope {
@@ -2375,6 +2395,58 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record one implicit (query → page) association and return the
+    /// association's signal count after the upsert (`0` when the page is no
+    /// longer the current version in that scope). See
+    /// [`ops::record_query_page_signal`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_query_page_signal(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        query_text: String,
+        session: Option<String>,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordQuerySignal {
+            workspace_id,
+            project_id,
+            page_id,
+            query_text,
+            session,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Drop one implicit (query → page) association, returning whether a row
+    /// was removed. See [`ops::forget_query_page_signal`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn forget_query_page_signal(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_id: PageId,
+        query_text: String,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ForgetQuerySignal {
+            workspace_id,
+            project_id,
+            page_id,
+            query_text,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Tombstone the expected latest page identified by the forget sweep.
     ///
     /// # Errors
@@ -3749,8 +3821,32 @@ impl WriterHandle {
         input: LinkOrAdoptManagedRunSession,
     ) -> StoreResult<ManagedRunSessionLink> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::LinkOrAdoptManagedRunSession { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::LinkOrAdoptManagedRunSession {
+            input,
+            boundary: crate::workstream::ClaudeSessionBoundary::Other,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Relink an ID-selected Claude run after an authorized SessionStart
+    /// `clear` (to a never-seen native id) or `resume` (to one this
+    /// workstream held and no other live run holds). Rechecks the checkout,
+    /// operator, live lease and native-session boundary in the same
+    /// transaction that publishes the new current session.
+    pub async fn relink_managed_claude_session(
+        &self,
+        input: LinkOrAdoptManagedRunSession,
+        boundary: crate::workstream::ClaudeSessionBoundary,
+    ) -> StoreResult<ManagedRunSessionLink> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::LinkOrAdoptManagedRunSession {
+            input,
+            boundary,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -4585,6 +4681,40 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "record_page_feedback");
             }
+            WriteCmd::RecordQuerySignal {
+                workspace_id,
+                project_id,
+                page_id,
+                query_text,
+                session,
+                reply,
+            } => {
+                let result = ops::record_query_page_signal(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    page_id,
+                    &query_text,
+                    session.as_deref(),
+                );
+                send_or_warn(reply, result, "record_query_page_signal");
+            }
+            WriteCmd::ForgetQuerySignal {
+                workspace_id,
+                project_id,
+                page_id,
+                query_text,
+                reply,
+            } => {
+                let result = ops::forget_query_page_signal(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    page_id,
+                    &query_text,
+                );
+                send_or_warn(reply, result, "forget_query_page_signal");
+            }
             WriteCmd::BumpAccess {
                 page_ids,
                 actor,
@@ -5274,8 +5404,13 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "link_managed_run_session");
             }
-            WriteCmd::LinkOrAdoptManagedRunSession { input, reply } => {
-                let result = crate::workstream::link_or_adopt_native_session(&mut conn, &input);
+            WriteCmd::LinkOrAdoptManagedRunSession {
+                input,
+                boundary,
+                reply,
+            } => {
+                let result =
+                    crate::workstream::link_or_adopt_native_session(&mut conn, &input, boundary);
                 send_or_warn(reply, result, "link_or_adopt_managed_run_session");
             }
             WriteCmd::LinkManagedRunSessionInScope { input, reply } => {

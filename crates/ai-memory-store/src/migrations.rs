@@ -764,6 +764,7 @@ mod tests {
                 title: "prompt".into(),
                 body: "continue".into(),
                 importance: 8,
+                file_path: None,
             },
         )
         .unwrap();
@@ -2486,5 +2487,167 @@ mod tests {
             duplicate.is_err(),
             "a claimed identity must stay unique per workspace"
         );
+    }
+
+    #[test]
+    fn v97_rebuilds_both_fts_indexes_so_a_directory_path_matches_its_basename() {
+        use crate::fts_query::{FtsStopwords, prepare_fts5_query};
+
+        const TABLES: [&str; 2] = ["pages_fts", "observations_fts"];
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 96).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let observation = |body: &str| NewObservation {
+            occurred_at: None,
+            session_id,
+            workspace_id,
+            project_id,
+            kind: ObservationKind::PostToolUse,
+            extension: None,
+            source_event: None,
+            title: "tool file".into(),
+            body: body.into(),
+            importance: 5,
+            file_path: None,
+        };
+        let body = "edited crates/ai-memory-store/src/reader.rs in ai-memory";
+        let page = [4_u8; 16];
+        conn.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, pinned, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'notes/edit.md', 'title', 'semantic', ?4, zeroblob(32), '{}', \
+                     1, 0, 1, 1)",
+            params![
+                page.as_slice(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                body,
+            ],
+        )
+        .unwrap();
+        crate::ops::insert_observation(&mut conn, &observation(body)).unwrap();
+
+        let stopwords = FtsStopwords::default();
+        let matches = |conn: &Connection, table: &str, raw: &str| -> i64 {
+            let query = prepare_fts5_query(raw, &stopwords);
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1"),
+                [query],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        for table in TABLES {
+            assert_eq!(matches(&conn, table, "reader.rs"), 0, "{table} at V96");
+        }
+
+        run(&mut conn).unwrap();
+
+        for table in TABLES {
+            for raw in ["reader.rs", "reader", "src/reader.rs", "ai-memory"] {
+                assert_eq!(matches(&conn, table, raw), 1, "{table} query {raw:?}");
+            }
+        }
+
+        // The recreated triggers keep the index in step with later writes.
+        conn.execute(
+            "UPDATE pages SET body = 'nothing here' WHERE id = ?1",
+            params![page.as_slice()],
+        )
+        .unwrap();
+        assert_eq!(matches(&conn, "pages_fts", "reader.rs"), 0);
+        crate::ops::insert_observation(&mut conn, &observation("see src/ops.rs")).unwrap();
+        assert_eq!(matches(&conn, "observations_fts", "ops.rs"), 1);
+    }
+
+    /// V99 adds `file_path` to a store that already holds observations: an
+    /// existing row keeps its columns and reads NULL, a new row stores its
+    /// path, and a path lookup uses the partial index.
+    #[test]
+    fn v99_adds_a_nullable_file_path_to_existing_observations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 98).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, importance, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'post-tool-use', 'tool file', 'before V99', 5, 1)",
+            params![
+                [7_u8; 16].as_slice(),
+                session_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+            ],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let existing: (String, Option<String>) = conn
+            .query_row("SELECT body, file_path FROM observations", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(existing, ("before V99".to_owned(), None));
+        crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool file".into(),
+                body: "after V99".into(),
+                importance: 5,
+                file_path: Some("src/lib.rs".into()),
+            },
+        )
+        .unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM observations \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND file_path = 'src/lib.rs'",
+                params![workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_observations_file_path"), "{plan}");
     }
 }

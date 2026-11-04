@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use ai_memory_core::{NewWorkstreamEvent, WorkstreamEventKind};
 use ai_memory_hooks::capture_policy::metadata_only_body;
+use ai_memory_hooks::payload::BACKFILL_EXTENSION;
 use ai_memory_workstream::{
     LaunchRoots, ManagedHarness, OVERSIZED_RECORD_LOSS, build_launch_plan_with_env,
     export_transcript, export_transcript_delta, export_transcript_range, find_native_session,
@@ -51,7 +52,7 @@ use super::doctor::{SCANNED_HARNESSES, relocated_session_dir};
 use super::run;
 use super::transcript_capture::{EventCapture, TranscriptCapture};
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, get_json, post_json};
+use crate::http_client::{ServerEndpoint, get_json, http_client, post_json};
 
 /// Circuit breaker on total imported events across the whole bootstrap. Once
 /// reached, no further sessions are started; the remaining sessions are
@@ -65,10 +66,6 @@ const PER_HARNESS_SCAN_LIMIT: usize = 200;
 /// server's `MAX_HOOK_BATCH_ITEMS` so a batch is never rejected for size.
 const HOOK_BATCH_ITEMS: usize = 256;
 const HOOK_BATCH_BYTES: usize = 8 * 1024 * 1024;
-
-/// The extension label backfilled non-user events (assistant/tool) are recorded
-/// under, mirroring the companion importer's replay-through-`/hook` mechanism.
-const BACKFILL_EXTENSION: &str = "ai-memory-backfill";
 
 /// A local native session eligible for import.
 #[derive(Debug, Clone)]
@@ -349,7 +346,7 @@ async fn backfill_endpoint(
     if let Some(url) = args.server_url.as_deref() {
         let static_token = crate::config::read_hook_auth_token(&config.data_dir);
         let token = super::hook_spool::resolve_bearer(
-            &reqwest::Client::new(),
+            &http_client(),
             &config.data_dir,
             static_token.as_deref(),
         )
@@ -1981,6 +1978,7 @@ mod tests {
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
             record_tool_names: false,
             skip_wiki_checkpoints: false,
+            index_file_paths: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-with-a-very-long-identifier-that-would-break-the-old-key";
@@ -2184,6 +2182,7 @@ mod tests {
             ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
             record_tool_names: false,
             skip_wiki_checkpoints: false,
+            index_file_paths: false,
         };
         let endpoint = ServerEndpoint::for_hook_target("http://localhost".into(), None);
         let sid = "native-session-resumed-across-two-offline-intervals";

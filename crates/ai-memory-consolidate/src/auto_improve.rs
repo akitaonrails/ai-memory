@@ -3394,6 +3394,7 @@ mod tests {
                         title: format!("event {i}"),
                         body: "run the full gate before release".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -3473,6 +3474,7 @@ mod tests {
                         title: format!("event {i}"),
                         body: "run the full gate before release".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -3601,6 +3603,7 @@ mod tests {
                         title: format!("event {i}"),
                         body: "run the full gate before release".into(),
                         importance: 5,
+                        file_path: None,
                     },
                     &Sanitizer::builtin(),
                 ))

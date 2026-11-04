@@ -155,10 +155,10 @@ if selected:
     CASES = [case for case in CASES if case["name"] == selected]
 
 
-def run(case, label):
-    log = OUT / (case["name"] + "-" + label + ".log")
+def run(command, log_name, timeout=300):
+    log = OUT / (log_name + ".log")
     with log.open("w") as output:
-        result = subprocess.run(case["command"], cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, timeout=300)
+        result = subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, timeout=timeout)
     return result.returncode, log.read_text(errors="replace")
 
 
@@ -174,6 +174,18 @@ def replace_bytes(path, contents):
 
 with LOCK.open("x"):
     try:
+        # Build each package's test binary first with no time limit: on a
+        # cold cache (any branch but main restores a stale or empty one) the
+        # first compile alone can take longer than a test run's budget.
+        for target in dict.fromkeys(tuple(case["command"][:-1]) for case in CASES):
+            name = "-".join(target[3:]).replace("--", "")
+            code, _ = run([*target, "--no-run"], name + "-build", timeout=None)
+            assert code == 0, name + ": test build failed"
+        # The source is the same for every baseline, so each distinct test
+        # command runs once, before any file is touched.
+        for command in {tuple(case["command"]): case["command"] for case in CASES}.values():
+            code, _ = run(command, command[-1] + "-baseline")
+            assert code == 0, command[-1] + ": baseline failed"
         for case in CASES:
             path = ROOT / case["file"]
             subprocess.run(["git", "diff", "--exit-code", "HEAD", "--", case["file"]], cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
@@ -187,11 +199,9 @@ with LOCK.open("x"):
                 assert section.count(before) == count, case["name"] + ": source anchor drifted"
                 section = section.replace(before, after)
             changed = (text[:start] + section + text[end:]).encode()
-            code, _ = run(case, "baseline")
-            assert code == 0, case["name"] + ": baseline failed"
             try:
                 replace_bytes(path, changed)
-                code, output = run(case, "mutant")
+                code, output = run(case["command"], case["name"] + "-mutant")
                 assert code != 0 and "test result: FAILED." in output, case["name"] + ": mutation survived or failed outside a test: " + output[-1500:]
                 assert case["command"][-1] + " ... FAILED" in output, case["name"] + ": unrelated test failed"
                 REPORT["mutants"].append({"name": case["name"], "killed": True, "test": case["command"][-1]})

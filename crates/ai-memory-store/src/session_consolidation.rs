@@ -499,6 +499,7 @@ mod tests {
                     title: "prompt".into(),
                     body: "continue".into(),
                     importance: 8,
+                    file_path: None,
                 },
                 &Sanitizer::default(),
             ))

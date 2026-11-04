@@ -2,8 +2,8 @@
 //! abstract-embedding stream must be inert by default and change ordering
 //! only when explicitly enabled.
 
-use ai_memory_core::{NewPage, PagePath, Tier};
-use ai_memory_store::{EmbeddingWrite, RetrievalTuning, Store, f32_vec_to_bytes};
+use ai_memory_core::{FeedbackKind, NewPage, PagePath, Tier};
+use ai_memory_store::{DecayParams, EmbeddingWrite, RetrievalTuning, Store, f32_vec_to_bytes};
 
 fn page(
     ws: ai_memory_core::WorkspaceId,
@@ -37,7 +37,32 @@ fn tuning(session_recall: bool, bonus: f64, abstract_vectors: bool) -> Retrieval
         abstract_vectors,
         belief_authority_weight: 0.0,
         observation_stream: false,
+        feedback_demotion: 0.0,
+        query_signal_weight: 0.0,
     }
+}
+
+async fn plain_search(
+    store: &Store,
+    ws: ai_memory_core::WorkspaceId,
+    proj: ai_memory_core::ProjectId,
+) -> Vec<ai_memory_store::PageHit> {
+    store
+        .reader
+        .hybrid_search(
+            ws,
+            proj,
+            "zebraquux".to_string(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            10,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
 }
 
 async fn two_page_store() -> (
@@ -265,4 +290,382 @@ async fn abstract_vector_stream_is_opt_in() {
         .await
         .unwrap();
     assert_eq!(hits[0].path.as_str(), "notes/b.md");
+}
+
+#[tokio::test]
+async fn feedback_demotion_is_opt_in_and_clears_on_rewrite() {
+    let (_tmp, mut store, ws, proj) = two_page_store().await;
+    let make_page =
+        |path: &str, body: &str| page(ws, proj, path, "same title", body, Tier::Semantic);
+    let old_a = store
+        .writer
+        .upsert_page(make_page("notes/a.md", "zebraquux"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(make_page("notes/b.md", "zebraquux"))
+        .await
+        .unwrap();
+
+    let baseline = plain_search(&store, ws, proj).await;
+    assert_eq!(baseline[0].path.as_str(), "notes/a.md");
+
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            proj,
+            PagePath::new("notes/a.md").unwrap(),
+            FeedbackKind::Stale,
+            None,
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+    store.reader.set_retrieval_tuning(RetrievalTuning {
+        feedback_demotion: 1.0,
+        ..tuning(false, 0.0, false)
+    });
+    let hits = store
+        .reader
+        .hybrid_search_explained(
+            ws,
+            proj,
+            "zebraquux".to_string(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            10,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits[0].0.path.as_str(), "notes/b.md");
+    let flagged = hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == "notes/a.md")
+        .unwrap();
+    assert_eq!(flagged.1.feedback_demotion, Some(1.0));
+
+    let mut refreshed = make_page("notes/a.md", "zebraquux");
+    refreshed.frontmatter_json = serde_json::json!({"revision": 2});
+    store.writer.upsert_page(refreshed).await.unwrap();
+    let rewritten = store
+        .reader
+        .hybrid_search_explained(
+            ws,
+            proj,
+            "zebraquux".to_string(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            10,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reader
+            .feedback_flagged_page_ids(ws, proj, vec![old_a])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rewrite supersedes the flagged version and clears the penalty"
+    );
+    assert!(
+        rewritten
+            .iter()
+            .all(|(_, details)| details.feedback_demotion.is_none()),
+        "explain must report no penalty after the rewrite: {rewritten:?}"
+    );
+}
+
+#[tokio::test]
+async fn query_signals_boost_only_their_similar_query_and_current_version() {
+    let (_tmp, mut store, ws, proj) = two_page_store().await;
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other".to_string(), None)
+        .await
+        .unwrap();
+    let make_page =
+        |project, path: &str| page(ws, project, path, "same title", "zebraquux", Tier::Semantic);
+    store
+        .writer
+        .upsert_page(make_page(proj, "notes/a.md"))
+        .await
+        .unwrap();
+    let b = store
+        .writer
+        .upsert_page(make_page(proj, "notes/b.md"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(make_page(other, "notes/other.md"))
+        .await
+        .unwrap();
+
+    // One session repeats the same pairing; a second session moves the count.
+    assert_eq!(
+        store
+            .writer
+            .record_query_page_signal(
+                ws,
+                proj,
+                b,
+                "zebraquux caddy".to_string(),
+                Some("s1".to_string()),
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .writer
+            .record_query_page_signal(
+                ws,
+                proj,
+                b,
+                "zebraquux caddy".to_string(),
+                Some("s1".to_string()),
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .writer
+            .record_query_page_signal(
+                ws,
+                proj,
+                b,
+                "zebraquux caddy".to_string(),
+                Some("s2".to_string()),
+            )
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        store
+            .writer
+            .record_query_page_signal(
+                ws,
+                other,
+                b,
+                "zebraquux caddy".to_string(),
+                Some("s3".to_string()),
+            )
+            .await
+            .unwrap(),
+        0,
+        "a page id from another project must not create a signal there"
+    );
+
+    store.reader.set_retrieval_tuning(RetrievalTuning {
+        query_signal_weight: 1.0,
+        ..tuning(false, 0.0, false)
+    });
+    let hits = store
+        .reader
+        .hybrid_search_explained(
+            ws,
+            proj,
+            "zebraquux caddy".to_string(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            10,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits[0].0.path.as_str(), "notes/b.md");
+    assert_eq!(hits[0].1.query_signal_boost, Some(0.5));
+    let unconfirmed = hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == "notes/a.md")
+        .unwrap();
+    assert_eq!(unconfirmed.1.query_signal_boost, None);
+
+    let mut rewritten_page = make_page(proj, "notes/b.md");
+    rewritten_page.frontmatter_json = serde_json::json!({"revision": 2});
+    let new_b = store.writer.upsert_page(rewritten_page).await.unwrap();
+    assert_ne!(new_b, b);
+    let rewritten = store
+        .reader
+        .hybrid_search_explained(
+            ws,
+            proj,
+            "zebraquux caddy".to_string(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            10,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rewritten[0].0.path.as_str(), "notes/a.md");
+    assert!(
+        rewritten
+            .iter()
+            .all(|(_, details)| details.query_signal_boost.is_none()),
+        "an association attached to a superseded version must not boost its successor"
+    );
+}
+
+/// A purged session takes its query text with it (#1941): an association the
+/// session wrote last is deleted in the purge transaction, while one another
+/// session wrote last stays. The client's native session id is stored as the
+/// same `SessionId` the hook ingress derives, which is what lets the purge
+/// find it.
+#[tokio::test]
+async fn purging_a_session_deletes_the_query_signals_it_wrote_last() {
+    use ai_memory_core::{AgentKind, NewSession, SessionId};
+    use ai_memory_store::{Compaction, PurgeMode};
+    let (_tmp, store, ws, proj) = two_page_store().await;
+    let page_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            proj,
+            "notes/purge.md",
+            "purge",
+            "zebraquux",
+            Tier::Semantic,
+        ))
+        .await
+        .unwrap();
+    let other_page = store
+        .writer
+        .upsert_page(page(
+            ws,
+            proj,
+            "notes/keep.md",
+            "keep",
+            "zebraquux",
+            Tier::Semantic,
+        ))
+        .await
+        .unwrap();
+    let native = "claude-native-session";
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: SessionId::from_native(native),
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    for (page, session) in [(page_id, native), (other_page, "another-session")] {
+        store
+            .writer
+            .record_query_page_signal(
+                ws,
+                proj,
+                page,
+                "zebraquux private question".to_string(),
+                Some(session.to_string()),
+            )
+            .await
+            .unwrap();
+    }
+
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj,
+            SessionId::from_native(native),
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+
+    let rows = store
+        .reader
+        .query_signals_for_pages(ws, proj, vec![page_id, other_page])
+        .await
+        .unwrap();
+    assert!(
+        rows.get(&page_id).is_none_or(Vec::is_empty),
+        "the purged session's query text must be gone: {rows:?}"
+    );
+    assert_eq!(
+        rows.get(&other_page).map(Vec::len),
+        Some(1),
+        "another session's association stays"
+    );
+}
+
+/// `forget_query_page_signal` (the `not_helpful` negative signal) removes
+/// exactly the matching (query, page) association.
+#[tokio::test]
+async fn forgetting_a_query_signal_removes_only_that_pair() {
+    let (_tmp, store, ws, proj) = two_page_store().await;
+    let page_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            proj,
+            "notes/f.md",
+            "f",
+            "zebraquux",
+            Tier::Semantic,
+        ))
+        .await
+        .unwrap();
+    for query in ["zebraquux caddy", "zebraquux postgres"] {
+        store
+            .writer
+            .record_query_page_signal(ws, proj, page_id, query.to_string(), Some("s".into()))
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .writer
+            .forget_query_page_signal(ws, proj, page_id, "  ZEBRAQUUX   caddy ".to_string())
+            .await
+            .unwrap(),
+        "the normalized query must match the stored row"
+    );
+    let rows = store
+        .reader
+        .query_signals_for_pages(ws, proj, vec![page_id])
+        .await
+        .unwrap()
+        .remove(&page_id)
+        .unwrap_or_default();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].query_text, "zebraquux postgres");
+    assert!(
+        !store
+            .writer
+            .forget_query_page_signal(ws, proj, page_id, "zebraquux caddy".to_string())
+            .await
+            .unwrap()
+    );
 }

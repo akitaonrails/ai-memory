@@ -35,7 +35,13 @@ Optional top-level metadata: `kind` (64 characters), `entities` (10 names,
 and `relations` (an object mapping `causes`, `fixes`, or `contradicts` to page
 target arrays, 32 targets total, 1,024 characters each). Relation targets use
 `path`, `project:path`, or `workspace/project:path`; extensionless page paths
-resolve with `.md`, and scope components must already be trimmed. Limits apply
+resolve with `.md`, and scope components must already be trimmed. A page that
+describes repository files can name them in `source_files`: up to 16
+`{path, commit}` entries, each a repository-relative `/`-separated path and the
+7-64 hex commit (`git rev-parse HEAD`) the page was checked against. The server
+never reads those files; when one changed since its commit, a client records
+`memory_feedback` with `signal: "stale"`, and rewriting the page with the new
+commit clears the flag. Limits apply
 to raw values before trimming, normalization or deduplication. Arbitrary
 frontmatter and author fields are not editable.
 Every `memory_write_page` call replaces the whole page and its metadata;
@@ -47,8 +53,11 @@ two preconditions.
 
 For a targeted edit, prefer `memory_patch_page`: read the page, pass its
 required `page_id` as `expected_page_id`, and submit one bounded batch.
-`append_to_section` and `add_section` use heading anchors from the read
-response; `replace_section` must also carry that section's returned `sha256`.
+`append` with `target: "section"` takes a heading `anchor` from the read
+response, and with `target: "end_of_page"` takes none; `add_section` takes a
+new level 2-6 heading such as `## Decisions`; `replace_section` takes an
+`anchor` and must also carry that section's returned `sha256` as
+`section_sha256`.
 All edits resolve against the same captured body and either commit together or
 write nothing. Missing, duplicate, stale, or conflicting anchors fail closed.
 Use `memory_write_page` when replacing the whole document.

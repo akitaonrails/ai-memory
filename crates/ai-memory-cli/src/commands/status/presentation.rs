@@ -423,7 +423,11 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
     terminal.line(format_args!(
         "{}",
         i18n.format(
-            "cli-presentation-llm",
+            if report.providers.llm_task_chains.is_empty() {
+                "cli-presentation-llm"
+            } else {
+                "cli-presentation-llm-default"
+            },
             &[(
                 "value0",
                 provider_health_line(i18n, &report.providers.llm).to_string()
@@ -461,5 +465,64 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
         for candidate in &report.providers.llm_candidates {
             terminal.line(format_args!("      {}", fallback_candidate_line(candidate)));
         }
+    }
+    for line in task_chain_lines(i18n, &report.providers.llm_task_chains) {
+        terminal.line(format_args!("{line}"));
+    }
+}
+
+fn task_chain_lines(
+    i18n: &ai_memory_core::i18n::Localizer,
+    chains: &[ai_memory_llm::LlmTaskChainHealthSnapshot],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for chain in chains {
+        lines.push(i18n.format(
+            "cli-presentation-llm-task",
+            &[
+                ("value0", chain.task.config_key().to_owned()),
+                ("value1", format!("{}/{}", chain.provider, chain.model)),
+                ("value2", i18n.status(chain.status.as_str())),
+            ],
+        ));
+        for candidate in &chain.candidates {
+            lines.push(format!("      {}", fallback_candidate_line(candidate)));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_only_chain_displays_provider_status_and_circuit() {
+        let chains = vec![ai_memory_llm::LlmTaskChainHealthSnapshot {
+            task: ai_memory_llm::LlmWorkload::Rerank,
+            provider: "openai".into(),
+            model: "task-model".into(),
+            status: ProviderHealthStatus::Error,
+            candidates: vec![ai_memory_llm::CandidateHealth {
+                provider: "openai".into(),
+                model: "task-model".into(),
+                last_selected: false,
+                last_success_at: None,
+                last_error_at: None,
+                last_error_status: None,
+                last_error_class: None,
+                circuit_open_until: Some("2026-05-28T12:00:30Z".parse().unwrap()),
+            }],
+        }];
+        let lines = task_chain_lines(&ai_memory_core::i18n::Localizer::default(), &chains);
+        assert!(lines[0].contains("rerank"));
+        assert!(lines[0].contains("openai/task-model"));
+        assert!(lines[0].contains("error"));
+        assert!(lines[1].contains("circuit open until"));
+        let pt =
+            ai_memory_core::i18n::Localizer::new(ai_memory_core::i18n::Language::PortugueseBrazil);
+        let lines = task_chain_lines(&pt, &chains);
+        assert!(lines[0].contains("rerank"));
+        assert!(lines[0].contains(&pt.status("error")));
     }
 }

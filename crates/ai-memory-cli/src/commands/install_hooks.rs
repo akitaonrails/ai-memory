@@ -38,7 +38,7 @@ use crate::commands::render_shared::{
     build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
-    kimi_code_hook_commands, local_hook_policy_v1_supported, ts_auth_headers_fn,
+    kimi_code_hook_commands, local_hook_policy_v1_supported, shell_quote, ts_auth_headers_fn,
     ts_capture_policy_v1, ts_string_literal, ts_timeout_signal, yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
@@ -3125,7 +3125,7 @@ fn apply_to_cursor_settings(
         &command_dir,
         server_url,
         auth_token,
-        data_dir,
+        cursor_command_data_dir(data_dir, &crate::config::default_data_dir()),
         strategy,
         &path,
     )?;
@@ -3193,11 +3193,53 @@ fn unrecognized_ai_memory_hook_entries(root: &serde_json::Value) -> Vec<(String,
     found
 }
 
+/// The `--data-dir` to bake into Cursor's hook commands. `None` (leave it to
+/// the hook's own default) only when the data dir is the platform default AND
+/// its path would need quoting; every other case passes the flag as before.
+///
+/// The macOS default is `~/Library/Application Support/ai-memory`. The quoted
+/// form of that path is the one difference the reporter found between a
+/// headless `cursor-agent -p` run that captured nothing and one that worked
+/// (#1949). Cursor documents no quoting rules for a hook `command`: it "can be
+/// a shell string, an absolute path, or a relative path"
+/// (<https://cursor.com/docs/agent/hooks>). The 2026.10.22 CLI bundle passes
+/// the string to the user's shell (`builtin eval` under zsh or bash, `sh -c`
+/// otherwise; a PowerShell `&` pipeline on Windows), all of which honour
+/// quotes, so this removes the dependency rather than working around a
+/// confirmed split.
+///
+/// The omission is narrow on purpose. Without the flag the hook resolves
+/// `dirs::data_local_dir()` at run time, which on Linux follows
+/// `XDG_DATA_HOME`; a GUI-launched Cursor can see a different value than the
+/// install shell and would then use another spool and token dir. The Linux
+/// default needs no quoting, so it keeps the pinned flag.
+///
+/// `data_dir` arrives through `Config::load`'s `canonicalise_or_keep`, so the
+/// default goes through the same function before comparing.
+fn cursor_command_data_dir<'a>(data_dir: &'a Path, default: &Path) -> Option<&'a Path> {
+    let is_default =
+        data_dir == default || data_dir == crate::config::canonicalise_or_keep(default);
+    let omit = is_default && path_needs_shell_quoting(data_dir);
+    (!omit).then_some(data_dir)
+}
+
+/// Whether a path holds a character that `shell_quote` would quote, judged on
+/// the plain form the command renders (a Windows `\\?\` prefix is stripped
+/// first). `\` is left out: it is the Windows separator, and a Windows path
+/// only needs quoting for the same reasons (whitespace, metacharacters) as a
+/// POSIX one.
+fn path_needs_shell_quoting(path: &Path) -> bool {
+    let lossy = path.to_string_lossy();
+    strip_windows_verbatim_prefix(&lossy)
+        .split('\\')
+        .any(|segment| shell_quote(segment) != segment)
+}
+
 fn merge_cursor_hooks(
     staged: &Path,
     server_url: &str,
     auth_token: Option<&str>,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     project_strategy: Option<&str>,
     config_path: &Path,
 ) -> Result<ApplyOutcome> {
@@ -3207,7 +3249,7 @@ fn merge_cursor_hooks(
         server_url,
         auth_token,
         "cursor",
-        Some(data_dir),
+        data_dir,
         project_strategy,
         false,
     );
@@ -4327,6 +4369,13 @@ const OPENCODE2_BINDING: &str = r#"
     type SessionInfo = Awaited<ReturnType<typeof ctx.session.get>>;
     const sessions = new Map<SessionID, Promise<SessionInfo>>();
     const assistantText = new Map<SessionID, string>();
+    // Failed startup-context fetches per root session. A failure is retried on
+    // the next model request, but only a few times: the `context` hook fires on
+    // every model call, and a server slower than the fetch timeout keeps
+    // working on each abandoned request, so an unbounded retry turns one slow
+    // lookup into a request (and a server worker) per model call.
+    const handoffFailures = new Map<SessionID, number>();
+    const HANDOFF_MAX_ATTEMPTS = 3;
     // Stops listening on unload. Deliveries keep `hookAbort` until the queued
     // events have had their drain budget.
     const unload = new AbortController();
@@ -4354,6 +4403,7 @@ const OPENCODE2_BINDING: &str = r#"
       sessions.delete(id);
       assistantText.delete(id);
       handoffFetches.delete(id);
+      handoffFailures.delete(id);
     }
 
     async function ensureSession(id: SessionID): Promise<SessionInfo | undefined> {
@@ -4494,7 +4544,13 @@ const OPENCODE2_BINDING: &str = r#"
         handoffFetches.set(id, pending);
       }
       const handoff = await pending;
-      if (handoff === undefined) handoffFetches.delete(id);
+      if (handoff === undefined) {
+        const failures = (handoffFailures.get(id) ?? 0) + 1;
+        handoffFailures.set(id, failures);
+        // Keep the settled failure cached once the budget is spent, so later
+        // model requests stop re-asking the server.
+        if (failures < HANDOFF_MAX_ATTEMPTS) handoffFetches.delete(id);
+      }
       if (handoff) {
         event.system.push({ type: "text", text: handoff });
       }
@@ -4652,6 +4708,9 @@ pub(crate) fn ts_apply_marker_params(
     let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): boolean {
   const managedRun = process.env.AI_MEMORY_RUN_ID;
   if (managedRun) url.searchParams.set("managed_run", managedRun);
+  if (/^(0|false|no|off)$/.test((process.env.AI_MEMORY_AUTO_HANDOFF ?? "").trim().toLowerCase())) {
+    url.searchParams.set("auto_handoff", "0");
+  }
   if (!cwd) return true;
   url.searchParams.set("cwd", cwd);
   let workspace: string | undefined;
@@ -15735,7 +15794,7 @@ process.exit(0);
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
-            config_tmp.path(),
+            Some(config_tmp.path()),
             None,
             &config_path,
         )
@@ -15758,6 +15817,174 @@ process.exit(0);
             parsed["version"], 1,
             "version: 1 must be set at the top level"
         );
+    }
+
+    /// #1949: only a default data dir whose path needs quoting is left to the
+    /// hook's own resolution; everything else keeps the pinned flag.
+    #[test]
+    fn cursor_command_data_dir_omits_only_a_default_that_needs_quoting() {
+        let tmp = TempDir::new().unwrap();
+        let spaced = tmp.path().join("Application Support").join("ai-memory");
+        fs::create_dir_all(&spaced).unwrap();
+        assert_eq!(cursor_command_data_dir(&spaced, &spaced), None);
+        let canonical = fs::canonicalize(&spaced).unwrap();
+        assert_eq!(
+            cursor_command_data_dir(&canonical, &spaced),
+            None,
+            "Config::load hands over the canonical spelling"
+        );
+
+        // A space-free default (the Linux XDG path) stays pinned, so a Cursor
+        // launched with another XDG_DATA_HOME still reaches the same dir.
+        let plain = tmp.path().join("share").join("ai-memory");
+        fs::create_dir_all(&plain).unwrap();
+        let plain = fs::canonicalize(&plain).unwrap();
+        assert!(!path_needs_shell_quoting(&plain), "{}", plain.display());
+        assert_eq!(
+            cursor_command_data_dir(&plain, &plain),
+            Some(plain.as_path())
+        );
+
+        let custom = tmp.path().join("custom dir").join("ai-memory");
+        assert_eq!(
+            cursor_command_data_dir(&custom, &spaced),
+            Some(custom.as_path()),
+            "a non-default data dir must still be baked in"
+        );
+    }
+
+    /// The default goes through the same `canonicalise_or_keep` as
+    /// `Config::load`, so a symlinked parent and a default that does not
+    /// exist yet (before `init`) still compare equal.
+    #[cfg(unix)]
+    #[test]
+    fn cursor_command_data_dir_matches_a_missing_default_under_a_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real home");
+        fs::create_dir_all(real.join("Application Support")).unwrap();
+        let link = tmp.path().join("link home");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let default = link.join("Application Support").join("ai-memory");
+        assert!(!default.exists());
+        let loaded = crate::config::canonicalise_or_keep(&default);
+        assert_ne!(loaded, default, "the parent symlink is resolved");
+        assert_eq!(cursor_command_data_dir(&loaded, &default), None);
+    }
+
+    #[test]
+    fn path_needs_shell_quoting_ignores_windows_separators_and_verbatim_prefix() {
+        assert!(!path_needs_shell_quoting(Path::new(
+            r"\\?\C:\Users\me\AppData\Local\ai-memory"
+        )));
+        assert!(path_needs_shell_quoting(Path::new(
+            r"C:\Users\Name With Space\AppData\Local\ai-memory"
+        )));
+        assert!(!path_needs_shell_quoting(Path::new(
+            "/home/me/.local/share/ai-memory"
+        )));
+        assert!(path_needs_shell_quoting(Path::new(
+            "/Users/me/Library/Application Support/ai-memory"
+        )));
+    }
+
+    fn cursor_ai_memory_commands(config_path: &Path) -> Vec<(String, String)> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+        let mut out = Vec::new();
+        for (event, entries) in parsed["hooks"].as_object().unwrap() {
+            for entry in entries.as_array().into_iter().flatten() {
+                if is_ai_memory_hook_entry(entry) {
+                    out.push((
+                        event.clone(),
+                        entry["command"].as_str().unwrap().to_string(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// #1949 upgrade path: an install that baked the quoted default data dir
+    /// is rewritten in place, once per event, keeping third-party hooks.
+    #[test]
+    fn cursor_reapply_replaces_quoted_default_data_dir_entries() {
+        let hooks_tmp = TempDir::new().unwrap();
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let old = "/Users/me/.local/lib/ai-memory/ai-memory --data-dir \
+                   '/Users/me/Library/Application Support/ai-memory' hook --event {event} \
+                   --agent cursor --server-url http://127.0.0.1:49374";
+        let old_entry = |event: &str| serde_json::json!({"type": "command", "command": old.replace("{event}", event), "matcher": ""});
+        let existing = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "sessionStart": [
+                    {"type": "command", "command": "/opt/other-tool --flag"},
+                    old_entry("session-start"),
+                ],
+                "stop": [old_entry("stop")],
+            }
+        });
+        fs::write(&config_path, existing.to_string()).unwrap();
+
+        merge_cursor_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            None,
+            None,
+            &config_path,
+        )
+        .unwrap();
+
+        let ours = cursor_ai_memory_commands(&config_path);
+        assert_eq!(ours.len(), CURSOR_PROFILE.events.len(), "{ours:?}");
+        for (event, command) in &ours {
+            assert!(
+                !command.contains("--data-dir") && !command.contains("Application Support"),
+                "{event}: stale data dir survived: {command}"
+            );
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["hooks"]["sessionStart"][0]["command"], "/opt/other-tool --flag",
+            "third-party hook is kept"
+        );
+        assert_eq!(
+            merge_cursor_hooks(
+                hooks_tmp.path(),
+                "http://127.0.0.1:49374",
+                None,
+                None,
+                None,
+                &config_path,
+            )
+            .unwrap(),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// A custom data dir with a space is still passed, quoted for the platform.
+    #[test]
+    fn cursor_custom_data_dir_with_space_is_still_passed() {
+        let hooks_tmp = TempDir::new().unwrap();
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let data_dir = config_tmp.path().join("my data");
+        merge_cursor_hooks(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            Some(&data_dir),
+            None,
+            &config_path,
+        )
+        .unwrap();
+        for (event, command) in cursor_ai_memory_commands(&config_path) {
+            assert!(command.contains("--data-dir"), "{event}: {command}");
+            assert!(command.contains("my data"), "{event}: {command}");
+        }
     }
 
     #[test]
@@ -15858,7 +16085,7 @@ process.exit(0);
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
-            config_tmp.path(),
+            Some(config_tmp.path()),
             None,
             &config_path,
         )
@@ -15873,7 +16100,7 @@ process.exit(0);
             hooks_tmp.path(),
             "http://127.0.0.1:49374",
             None,
-            config_tmp.path(),
+            Some(config_tmp.path()),
             None,
             &config_path,
         )
@@ -18075,6 +18302,53 @@ mod identity_parity_tests {
                 result.starts_with(&expected),
                 "{}: {result:?}",
                 case["name"]
+            );
+        }
+    }
+
+    /// #1951: the generated TypeScript adapters forward
+    /// `AI_MEMORY_AUTO_HANDOFF=off` as `auto_handoff=0`, like the native hook
+    /// and the shell bundles, and send nothing for any other value.
+    #[test]
+    fn ts_apply_marker_params_forwards_only_an_auto_handoff_opt_out() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let module = tmp.path().join("auto-handoff.ts");
+        std::fs::write(
+            &module,
+            format!(
+                "{}\nconst url = new URL(\"http://127.0.0.1/hook\");\napplyMarkerParams(url, undefined);\nprocess.stdout.write(url.search);\n",
+                super::ts_apply_marker_params(None, false)
+            ),
+        )
+        .unwrap();
+        for (value, expected) in [
+            (Some(" Off "), "?auto_handoff=0"),
+            (Some("0"), "?auto_handoff=0"),
+            (Some("on"), ""),
+            (None, ""),
+        ] {
+            let mut command = Command::new("node");
+            command
+                .args(["--experimental-strip-types", "--no-warnings"])
+                .arg(&module)
+                .env_remove("AI_MEMORY_RUN_ID")
+                .env_remove("AI_MEMORY_AUTO_HANDOFF");
+            if let Some(value) = value {
+                command.env("AI_MEMORY_AUTO_HANDOFF", value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                expected,
+                "{value:?}"
             );
         }
     }

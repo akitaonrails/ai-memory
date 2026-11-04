@@ -358,6 +358,32 @@ pub fn marker_requests_subagent_briefing(cwd: &str) -> bool {
     marker_requests_briefing_with_home(cwd, home_dir().as_deref(), BriefingKey::SubagentStart)
 }
 
+/// Whether the marker that routes `cwd` opts this repository into the
+/// mid-session inbox notice (#1942): `[messaging] inbox_notice_on_prompt`.
+/// Same selection rule as [`marker_requests_briefing`] — the nearest
+/// settings-declaring marker, so a nested capture-only marker cannot shadow
+/// an outer opt-in and a marker declaring only this key still counts as a
+/// settings boundary. Truthy-only: absent or falsy leaves the notice off.
+pub fn marker_requests_inbox_notice(cwd: &str) -> bool {
+    marker_requests_inbox_notice_with_home(cwd, home_dir().as_deref())
+}
+
+/// [`marker_requests_inbox_notice`] resolved against `home` instead of the
+/// operator's home directory, so tests are hermetic.
+fn marker_requests_inbox_notice_with_home(cwd: &str, home: Option<&Path>) -> bool {
+    crate::marker::routing_selection_with_home(cwd, cwd, home, false)
+        .ok()
+        .flatten()
+        .and_then(|selection| {
+            crate::marker::parse_toml_section_flag(
+                &selection.path,
+                "messaging",
+                "inbox_notice_on_prompt",
+            )
+        })
+        .is_some_and(|value| is_truthy(&value))
+}
+
 /// [`marker_requests_briefing`] for the opt-in `key`, resolved against `home`
 /// instead of the operator's home directory.
 fn marker_requests_briefing_with_home(cwd: &str, home: Option<&Path>, key: BriefingKey) -> bool {
@@ -1166,6 +1192,12 @@ mod tests {
     fn marker_requests_briefing(cwd: &str) -> bool {
         let home = tempfile::TempDir::new().unwrap();
         marker_requests_briefing_with_home(cwd, Some(home.path()), BriefingKey::SessionStart)
+    }
+
+    /// Shadows [`super::marker_requests_inbox_notice`] with the same empty home.
+    fn marker_requests_inbox_notice(cwd: &str) -> bool {
+        let home = tempfile::TempDir::new().unwrap();
+        marker_requests_inbox_notice_with_home(cwd, Some(home.path()))
     }
 
     async fn serve_once(status: &'static str, body: &'static str) -> String {
@@ -2309,6 +2341,58 @@ drop_subagent_captures = "true"
         )
         .unwrap();
         assert!(marker_requests_briefing(cwd));
+    }
+
+    #[test]
+    fn marker_requests_inbox_notice_only_for_truthy_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let cwd = tmp.path().to_str().unwrap();
+
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninject_on_session_start = true\n").unwrap();
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninbox_notice_on_prompt = false\n").unwrap();
+        assert!(!marker_requests_inbox_notice(cwd));
+        std::fs::write(&marker, "[messaging]\ninbox_notice_on_prompt = true\n").unwrap();
+        assert!(marker_requests_inbox_notice(cwd));
+    }
+
+    #[test]
+    fn inbox_notice_gate_reads_the_nearest_settings_marker() {
+        let home = tempfile::TempDir::new().unwrap();
+        let nested = home.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            home.path().join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = true\n",
+        )
+        .unwrap();
+        let cwd = nested.to_str().unwrap();
+        assert!(marker_requests_inbox_notice_with_home(
+            cwd,
+            Some(home.path())
+        ));
+
+        std::fs::write(
+            nested.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"/secret\"]\n",
+        )
+        .unwrap();
+        assert!(
+            marker_requests_inbox_notice_with_home(cwd, Some(home.path())),
+            "a capture-only nested marker is transparent, so the outer opt-in stays active"
+        );
+
+        std::fs::write(
+            nested.join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = false\n",
+        )
+        .unwrap();
+        assert!(!marker_requests_inbox_notice_with_home(
+            cwd,
+            Some(home.path())
+        ));
     }
 
     /// The Kimi once-per-session gate reads the marker the query it gates

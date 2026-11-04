@@ -26,6 +26,7 @@ mod assistant_capture;
 mod brief_tiers;
 pub mod capture_policy;
 pub mod drop_list;
+mod file_field;
 mod grants;
 pub mod hermes;
 pub mod idle_end;
@@ -55,11 +56,13 @@ pub use assistant_capture::{
 };
 pub use capture_policy::{
     CaptureConfig, CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy,
-    CaptureProtocol, CaptureSource, ExtractionState, GlobStep, GlobWalk, PolicyState, ToolFamily,
-    absolute_tool_location_paths, capture_lookup_locations, describe_invalid_capture_config,
-    glob_segment_matches, glob_walk, repository_admits_capture, tool_call_payload, valid_call_id,
+    CaptureProtocol, CaptureSource, ExtractionState, FileTarget, GlobStep, GlobWalk, PolicyState,
+    ToolFamily, absolute_tool_location_paths, capture_lookup_locations,
+    describe_invalid_capture_config, file_target, glob_segment_matches, glob_walk,
+    repository_admits_capture, tool_call_payload, valid_call_id,
 };
 pub use drop_list::IngestDropList;
+pub use file_field::{FILE_FIELD_KEY, FileSkip, file_field};
 pub use hermes::{hermes_is_delegated_child, hermes_is_first_turn, shape_hermes_lifecycle_body};
 pub use idle_end::{
     IDLE_END_BATCH, IDLE_END_INTERVAL_SECS, IdleEndTickInput, IdleEndTickOutcome, run_idle_end_tick,

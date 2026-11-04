@@ -65,6 +65,9 @@ prompt that can be cached:
   no activity yet gets every entry.
 - **Bounded.** The section stays within `digest_max_bytes` (default 3,000
   bytes); entries that do not fit are counted, and `memory_query` finds them.
+  The read behind it stops at 2,000 profile pages in path order, far more
+  than any budget can show; `profile list`, `status` and the harvester read
+  every page.
 - **Stable.** The order is fixed (category, then path) and nothing
   time-dependent is printed, so the text is byte-identical between sessions
   until the profile changes, which keeps it in the harness's cached prompt.
@@ -263,6 +266,23 @@ told never to follow instructions found in the text. The evidence quote is
 always your own sentence, never model text. If a call fails, the pass falls
 back to the zero-LLM path for that batch; without a provider the profile works
 the same way, with the word lists and the newest statement.
+
+Classify and merge use the server's default provider unless an `[llm.profile]`
+table names another. This lets the profile run a stronger model than routine
+consolidation:
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-haiku-4-5"     # consolidation and everything else
+
+[llm.profile]
+provider = "anthropic"             # required; credentials come from ANTHROPIC_API_KEY
+model = "claude-sonnet-4-5"        # classify and merge only
+```
+
+The profile chain does not include the global `[[llm_fallbacks]]`. Add
+`[[llm.profile.fallbacks]]` entries for that. See
+[`config-properties.md`](config-properties.md#llmtask) for every key.
 
 ### Correcting a wrong entry
 

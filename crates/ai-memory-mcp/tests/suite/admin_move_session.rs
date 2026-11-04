@@ -37,7 +37,10 @@ async fn make_state(tmp: &TempDir) -> (AdminState, Store) {
         writer: store.writer.clone(),
         reader: store.reader.clone(),
         wiki,
-        llm: None,
+        llm_providers: ai_memory_llm::LlmProviders {
+            default: None,
+            overrides: Default::default(),
+        },
         auto_improve_require_approval: false,
         auto_improve_review_config: Default::default(),
         embedder: None,
@@ -166,6 +169,7 @@ async fn seed_session(
                     title: format!("prompt {n}"),
                     body: "do the thing".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -581,6 +585,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
                 title: "late prompt".into(),
                 body: "one more".into(),
                 importance: 5,
+                file_path: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -994,6 +999,7 @@ async fn scatter_observations(
                     title: format!("stray {i}"),
                     body: "landed in the wrong bucket".into(),
                     importance: 5,
+                    file_path: None,
                 },
                 &Sanitizer::builtin(),
             ))

@@ -196,11 +196,7 @@ async fn handle_status(
             Ok(Some((scope, names))) => {
                 let entries = match state
                     .reader
-                    .profile_entries(
-                        scope.workspace_id,
-                        scope.project_id,
-                        ai_memory_store::PROFILE_ENTRIES_LIMIT,
-                    )
+                    .profile_entries(scope.workspace_id, scope.project_id)
                     .await
                 {
                     Ok(entries) => entries,
@@ -266,11 +262,7 @@ async fn handle_list(
     };
     let entries = match state
         .reader
-        .profile_entries(
-            scope.workspace_id,
-            scope.project_id,
-            ai_memory_store::PROFILE_ENTRIES_LIMIT,
-        )
+        .profile_entries(scope.workspace_id, scope.project_id)
         .await
     {
         Ok(entries) => entries,
@@ -380,11 +372,7 @@ async fn handle_apply(
         }
         None => match state
             .reader
-            .profile_entries(
-                profile_scope.workspace_id,
-                profile_scope.project_id,
-                ai_memory_store::PROFILE_ENTRIES_LIMIT,
-            )
+            .profile_entries(profile_scope.workspace_id, profile_scope.project_id)
             .await
         {
             Ok(entries) => (entries, BTreeSet::new()),

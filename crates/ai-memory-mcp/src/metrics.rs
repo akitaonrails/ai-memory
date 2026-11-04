@@ -89,6 +89,13 @@ pub fn render_prometheus(ingest: &IngestMetrics, mcp: &McpMetrics) -> String {
             ("failed", snap.failed),
         ],
     );
+    counter_family(
+        &mut out,
+        "ai_memory_hook_file_paths_total",
+        "Stored file-tool deliveries by file path outcome since the server started.",
+        "outcome",
+        &snap.file_paths(),
+    );
     if let Some(ms) = snap.last_persisted_ms {
         let _ = writeln!(
             out,
@@ -169,6 +176,7 @@ mod tests {
             "ai_memory_hook_admissions_total{result=\"accepted\"} 1",
             "ai_memory_hook_admissions_total{result=\"shed_saturated\"} 0",
             "ai_memory_hook_deliveries_total{outcome=\"stored\"} 1",
+            "ai_memory_hook_file_paths_total{outcome=\"indexed\"} 0",
             "ai_memory_hook_last_persisted_timestamp_seconds 1700000000",
             "ai_memory_mcp_tool_calls_total{kind=\"read\"} 1",
             "ai_memory_mcp_tool_calls_total{kind=\"write\"} 0",

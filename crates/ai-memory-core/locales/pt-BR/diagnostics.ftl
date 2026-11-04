@@ -283,10 +283,16 @@ diag-project-selection-cancelled-no-managed-run-was = seleção de projeto cance
 diag-the-session-id-contains-characters-that-are = o id de sessão contém caracteres inválidos em um cabeçalho HTTP
 diag-building-the-mcp-bridge-http-client = criando o cliente HTTP da ponte MCP
 diag-failed-to-install-a-rustls-crypto-provider = falha ao instalar um provedor de criptografia rustls; sem ele a ponte MCP não consegue abrir uma conexão https://
+diag-could-not-reach-the-ai-memory-server-at = não foi possível alcançar o servidor ai-memory em { $server_url }: { $reason } (desistiu após aguardar { $value0 }s). Verifique se o servidor está em execução (`ai-memory status`; em uma instalação como serviço, `systemctl --user status ai-memory` ou o agente do launchd) e se esta entrada aponta para ele: a ponte conecta em `--server-url`, senão no servidor configurado (AI_MEMORY_SERVER_URL).
+diag-the-connection-attempt-timed-out = a tentativa de conexão esgotou o tempo
 diag-upstream-mcp-server-completed-initialization-without-server = o servidor MCP upstream concluiu a inicialização sem informações do servidor
 diag-starting-session-aware-stdio-mcp-bridge = iniciando a ponte MCP stdio com reconhecimento de sessão
 diag-waiting-for-the-stdio-mcp-client-transport = aguardando o transporte do cliente MCP stdio
 diag-closing-upstream-http-mcp-transport = encerrando o transporte MCP HTTP upstream
+diag-channel-inbox-needs-a-session-aware-claude = --channel inbox exige uma ponte Claude Code com sessão: mantenha --agent claude-code e omita --no-session-id
+diag-fetching = buscando { $value0 }
+diag-fetching-returned-http = busca de { $value0 } retornou HTTP { $value1 }
+diag-pushing-the-inbox-channel-notification = enviando a notificação do canal da caixa de entrada
 diag-was-passed-empty-provide-a-non-empty = { $flag } foi informado vazio; informe um valor não vazio ou omita a flag de escopo opcional para usar o projeto que este diretório resolve
 diag-openclaw-plugin-installed-from = Plugin do OpenClaw instalado a partir de { $value0 }.
 diag-if-your-openclaw-gateway-did-not-auto = Se o gateway do OpenClaw não reiniciou sozinho, execute `openclaw gateway restart`.
@@ -960,3 +966,12 @@ diag-refusing-to-other-processes-running = recusando { $verb ->
        *[other] { $verb }
     }: { $value0 } outro(s) processo(s) do ai-memory em execução (pids: { $value1 }). Encerre-os e execute novamente.
 diag-web-all-projects-total = Todos os projetos ({ $total })
+diag-unknown-llm-task = tarefa LLM desconhecida llm.{ $name }
+diag-llm-task-provider-empty = { $path }.provider não pode estar vazio
+diag-llm-task-provider-unsupported = { $path }.provider={ $raw } não é um provedor compatível
+diag-validating-profile = validando perfil de tarefa LLM { $path }
+diag-validating-fallback-profile = validando perfil alternativo LLM { $item }
+diag-building-profile = criando provedor alternativo LLM { $item }
+diag-profile-api-key-unsupported = provedor não configurado: api_key_env não é compatível com o provedor { $provider }
+diag-building-llm-provider-chains = criando cadeias de provedores LLM a partir da configuração
+diag-reranker-llm-provider-required = AI_MEMORY_RERANKER=llm requer AI_MEMORY_LLM_PROVIDER ou um provedor llm.rerank

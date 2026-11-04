@@ -1109,7 +1109,8 @@ version.
 
 It differs from `restore-page` in how the text gets back in. The checkpoint's
 body and frontmatter (`title`, `tier`, `tags`, `pinned`, `expires_at`, `kind`,
-`entities`, `abstract`, `relations`, `applies_to`, `enforced_by`) go through the
+`entities`, `abstract`, `relations`, `applies_to`, `enforced_by`,
+`source_files`) go through the
 same path as `memory_write_page`: the sanitizer, the admission chain, write
 attribution and supersession all apply, and the version it replaces stays
 reachable. Metadata that `memory_write_page` would refuse is refused here too,
