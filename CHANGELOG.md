@@ -122,6 +122,13 @@ version in [`docs/changelog/`](docs/changelog/):
   a WAL-consistent read-only snapshot, with explicit project mapping,
   client-side sanitization, sensitive-record exclusion, exact-body resume, and
   dry-run by default (#1840).
+- Added a document-embedding cache to the `ai-memory-eval retrieval`
+  benchmark. Local-embeddings runs store each haystack page's vector under
+  `evals/.cache/embeddings/`, keyed by provider, model, dimension and a hash of
+  the page text with the replay's wall-clock timestamps masked, and later runs
+  reuse it. Query embeddings and ranking stay live. `--no-embedding-cache`
+  runs cold. The server side is an eval-only variable the harness sets; normal
+  configuration has no such setting. (#1973)
 
 - Added `ai-memory-eval retrieval-compare`, which pairs two saved retrieval
   reports by question and lists the questions whose first hit moved, the

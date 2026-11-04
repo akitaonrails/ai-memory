@@ -47,6 +47,7 @@ dependencies = [
  "ai-memory-workstream",
  "anyhow",
  "askama",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "clap",

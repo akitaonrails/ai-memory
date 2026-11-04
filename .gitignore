@@ -51,3 +51,4 @@ evals/runs/
 *.bak-*
 evals/datasets/
 evals/models/
+evals/.cache/

@@ -49,6 +49,7 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use super::eval_embedding_cache::{EvalEmbeddingCache, eval_embedding_cache_dir};
 use crate::cli::{ServeArgs, TransportKind};
 use crate::config::{AuthSettings, AutoImproveSettings, Config, MaintenanceSettings};
 use ai_memory_mcp::auth::{AuthState, require_bearer};
@@ -3159,6 +3160,17 @@ async fn configure_embedder(
         Arc::new(EmbeddingCapacity::new(embedder, local_capacity(cores))?)
     } else {
         embedder
+    };
+    // Outermost, so a cached document vector skips the capacity queue too.
+    let embedder: Arc<dyn Embedder> = match eval_embedding_cache_dir() {
+        Some(root) => {
+            info!(
+                root = %root.display(),
+                "benchmark document-embedding cache enabled (eval harness only)"
+            );
+            Arc::new(EvalEmbeddingCache::new(embedder, &root))
+        }
+        None => embedder,
     };
     Ok((wiki.with_embedder(embedder.clone()), Some(embedder)))
 }

@@ -124,6 +124,12 @@ pub struct RetrievalArgs {
     #[arg(long)]
     keep_data_dir: bool,
 
+    /// Embed every haystack document live instead of reusing vectors cached
+    /// under `evals/.cache/embeddings/` by earlier local-embeddings runs.
+    /// Query embeddings are never cached either way.
+    #[arg(long)]
+    no_embedding_cache: bool,
+
     // ---- baseline config knobs ----
     /// Baseline embedding mode: `none` (zero-LLM, vectors off, the
     /// default) or `local` (in-process all-MiniLM-L6-v2, vectors on; the
@@ -238,6 +244,10 @@ enum Engine {
     Grep,
 }
 
+/// Where local-embeddings runs keep haystack document vectors between runs,
+/// keyed by provider, model, dimension and text hash (gitignored).
+const EMBEDDING_CACHE_DIR: &str = "evals/.cache/embeddings";
+
 /// One resolved server + query configuration.
 struct Knobs {
     /// Short label for reports (`baseline` / `candidate`).
@@ -246,6 +256,8 @@ struct Knobs {
     /// `zero-llm` or `local-embeddings`, for report provenance.
     mode: &'static str,
     models_root: Option<PathBuf>,
+    /// Document-embedding cache root handed to the server (local mode only).
+    embedding_cache: Option<PathBuf>,
     reranker: bool,
     env: Vec<(String, String)>,
     query_args: serde_json::Map<String, serde_json::Value>,
@@ -302,6 +314,7 @@ impl Knobs {
             embeddings: embeddings_kind,
             mode,
             models_root,
+            embedding_cache: None,
             reranker,
             env,
             query_args,
@@ -311,10 +324,19 @@ impl Knobs {
         })
     }
 
+    /// Point a local-embeddings server at the document-vector cache; a
+    /// zero-LLM server has no embedder, so it never gets one.
+    fn use_embedding_cache(&mut self, root: &std::path::Path) {
+        if self.embeddings == EvalEmbeddings::Local {
+            self.embedding_cache = Some(root.to_path_buf());
+        }
+    }
+
     fn launch_config(&self) -> LaunchConfig<'_> {
         LaunchConfig {
             embeddings: self.embeddings,
             models_root: self.models_root.as_deref(),
+            embedding_cache: self.embedding_cache.as_deref(),
             reranker: self.reranker,
             env: &self.env,
         }
@@ -437,7 +459,7 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
         );
     }
 
-    let baseline = Knobs::parse(
+    let mut baseline = Knobs::parse(
         "baseline",
         &args.embeddings,
         args.reranker,
@@ -446,7 +468,7 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
         args.ingest,
         args.date_prefix,
     )?;
-    let candidate = if args.ab_mode() {
+    let mut candidate = if args.ab_mode() {
         let embeddings = args
             .candidate_embeddings
             .clone()
@@ -463,6 +485,14 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
     } else {
         None
     };
+
+    if !args.no_embedding_cache {
+        let root = std::path::absolute(EMBEDDING_CACHE_DIR)
+            .context("resolving the embedding cache directory")?;
+        for knobs in std::iter::once(&mut baseline).chain(candidate.as_mut()) {
+            knobs.use_embedding_cache(&root);
+        }
+    }
 
     // Fetch the local embedding model once if any config needs it.
     let needs_local = baseline.embeddings == EvalEmbeddings::Local
@@ -735,6 +765,7 @@ async fn run_config(run: &RunContext<'_>, knobs: &Knobs) -> Result<report::Repor
         dataset_sha256: run.variant.sha256,
         mode: knobs.mode,
         config: knobs.summary.clone(),
+        embedding_cache: knobs.embedding_cache.is_some(),
         questions_scored: scores.len(),
         abstention_excluded: run.abstention_n,
         ks: args.ks.clone(),
@@ -800,6 +831,7 @@ fn run_grep(
         dataset_sha256: variant.sha256,
         mode: "grep",
         config: "engine=grep (whole raw session, term overlap, no server)".into(),
+        embedding_cache: false,
         questions_scored: scores.len(),
         abstention_excluded: abstention_n,
         ks: args.ks.clone(),
@@ -886,5 +918,32 @@ mod tests {
         .unwrap();
         assert!(k.summary.contains("ingest=whole-session"));
         assert!(k.summary.contains("date_prefix=session-start"));
+    }
+
+    #[test]
+    fn embedding_cache_reaches_only_local_embedding_servers() {
+        let root = std::path::Path::new("/cache");
+        let parse = |embeddings| {
+            Knobs::parse(
+                "baseline",
+                embeddings,
+                false,
+                &[],
+                &[],
+                IngestMode::Hooks,
+                DatePrefix::Turn,
+            )
+            .unwrap()
+        };
+        let mut local = parse("local");
+        assert_eq!(local.launch_config().embedding_cache, None);
+        local.use_embedding_cache(root);
+        assert_eq!(local.launch_config().embedding_cache, Some(root));
+        // The published config line stays comparable with earlier runs.
+        assert_eq!(local.summary, "embeddings=local reranker=off");
+
+        let mut fts = parse("none");
+        fts.use_embedding_cache(root);
+        assert_eq!(fts.launch_config().embedding_cache, None);
     }
 }

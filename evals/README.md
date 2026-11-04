@@ -360,6 +360,12 @@ Output: a per-slice table on stdout plus
 provenance (commit, dataset sha, hardware, per-question scores).
 When publishing a baseline, copy the markdown into `docs/benchmarks/`.
 
+`--embeddings local` runs keep haystack document vectors in
+`evals/.cache/embeddings/` (gitignored) and reuse them on the next run, so a
+repeat run skips most of its embedding work; query embeddings stay live.
+`--no-embedding-cache` runs cold. See
+[Reuse haystack embeddings across runs](../docs/benchmarks/README.md#reuse-haystack-embeddings-across-runs-local-mode).
+
 ### Bundled coding-session retrieval corpus
 
 `--dataset-variant coding-v1` selects four synthetic questions in

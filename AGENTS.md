@@ -746,6 +746,13 @@ Additional boundary rules:
     throughput, and say for each material change whether it is a deliberate
     trade the CHANGELOG states or a possible regression. Run-to-run noise is
     about ±0.005 overall and ±0.02–0.03 on small slices.
+  - *Published local numbers come from a cold run.* Run the release
+    candidate's local leg with `--no-embedding-cache`. A cached run reuses
+    one earlier cold run's document vectors, its ingest throughput and query
+    latency measure the cache, and its key names the model, not the
+    embedding code. Cached
+    runs are for iteration: re-running the questions that moved, or comparing
+    two builds without the cold-run variance (`docs/benchmarks/README.md`).
   - *A drop does not block the release.* Publish the honest numbers in
     `docs/benchmarks/`, keep `docs/comparison.md` and
     `docs/competitive-parity.md` in step, and open an issue for the next
