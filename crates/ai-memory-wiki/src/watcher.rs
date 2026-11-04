@@ -48,6 +48,20 @@ use crate::wiki::Wiki;
 /// Reconciliation tick interval.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How recent a file's mtime or change time may be, relative to the start of
+/// the reconcile pass that walked it, before the pass refuses to trust its
+/// fingerprint (git's "racily clean" rule). A same-length edit landing after
+/// the reindex read but inside the same timestamp tick leaves a fingerprint
+/// identical to the recorded one; if its notify event was also dropped, the
+/// skip would hide that edit until the file changed again. Any such edit
+/// happens after the pass started, so its timestamp, truncated to the
+/// filesystem's granularity, is at most one tick before the pass start. Five
+/// seconds covers the coarsest common tick (FAT's 2 s; HFS+ and many SMB/NFS
+/// servers use 1 s) with room for a few seconds of skew between this clock
+/// and a network filesystem server's. The cost is one extra read, on the next
+/// pass, of a file written in the last few seconds.
+const RACY_FINGERPRINT_WINDOW: Duration = Duration::from_secs(5);
+
 /// Debounce window for filesystem events.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
@@ -422,6 +436,31 @@ impl FileFingerprint {
             changed: (metadata.ctime(), metadata.ctime_nsec()),
         })
     }
+
+    /// True when the file's mtime (or, on unix, change time) is too close to
+    /// `pass_started`, or after it, for an equal fingerprint to prove the
+    /// file unchanged. See [`RACY_FINGERPRINT_WINDOW`].
+    fn is_racy(&self, pass_started: std::time::SystemTime) -> bool {
+        let Some(threshold) = pass_started.checked_sub(RACY_FINGERPRINT_WINDOW) else {
+            return true;
+        };
+        if self.modified >= threshold {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            let threshold_nanos = match threshold.duration_since(std::time::UNIX_EPOCH) {
+                Ok(since_epoch) => since_epoch.as_nanos() as i128,
+                Err(before_epoch) => -(before_epoch.duration().as_nanos() as i128),
+            };
+            let changed_nanos =
+                i128::from(self.changed.0) * 1_000_000_000 + i128::from(self.changed.1);
+            if changed_nanos >= threshold_nanos {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Per-`(workspace, project, path)` fingerprint of each file as of the
@@ -669,6 +708,23 @@ async fn reconcile(
     missing_streaks: &mut MissingStreaks,
     indexed_fingerprints: &mut IndexedFingerprints,
 ) -> WikiResult<ReconcileStats> {
+    reconcile_at(
+        wiki,
+        missing_streaks,
+        indexed_fingerprints,
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+/// [`reconcile`] with the pass start time injected, so tests can age a
+/// file's timestamps past [`RACY_FINGERPRINT_WINDOW`] without sleeping.
+async fn reconcile_at(
+    wiki: &Wiki,
+    missing_streaks: &mut MissingStreaks,
+    indexed_fingerprints: &mut IndexedFingerprints,
+    pass_started: std::time::SystemTime,
+) -> WikiResult<ReconcileStats> {
     let root = wiki.root().to_path_buf();
     // Walk all per-project subdirectories: <ws_uuid>/<proj_uuid>/
     let project_dirs = tokio::task::spawn_blocking(move || walk_project_dirs(&root))
@@ -739,6 +795,10 @@ async fn reconcile(
             // still found on disk, which the reconcile-delete check needs.
             walked.insert(path.clone());
             let key = (ws, proj, path);
+            // A racily clean fingerprint is neither compared nor recorded,
+            // so the file is reread every pass until its timestamps age out
+            // of the window.
+            let fingerprint = fingerprint.filter(|f| !f.is_racy(pass_started));
             if let Some(fingerprint) = fingerprint
                 && indexed_fingerprints.get(&key) == Some(&fingerprint)
             {
@@ -1600,12 +1660,14 @@ mod tests {
 
         let mut streaks = MissingStreaks::new();
         let mut fingerprints = IndexedFingerprints::new();
-        let first = reconcile(&wiki, &mut streaks, &mut fingerprints)
+        // Passes run well after the writes, so no timestamp is racily clean.
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        let first = reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
             .await
             .unwrap();
         assert_eq!((first.indexed, first.skipped_unchanged), (1, 0));
 
-        let idle = reconcile(&wiki, &mut streaks, &mut fingerprints)
+        let idle = reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
             .await
             .unwrap();
         assert_eq!(
@@ -1615,7 +1677,7 @@ mod tests {
         );
 
         std::fs::write(dir.join("stable.md"), "secondversiontoken, longer\n").unwrap();
-        let changed = reconcile(&wiki, &mut streaks, &mut fingerprints)
+        let changed = reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
             .await
             .unwrap();
         assert_eq!((changed.indexed, changed.skipped_unchanged), (1, 0));
@@ -1631,13 +1693,82 @@ mod tests {
         );
 
         std::fs::remove_file(dir.join("stable.md")).unwrap();
-        reconcile(&wiki, &mut streaks, &mut fingerprints)
+        reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
             .await
             .unwrap();
         assert!(
             fingerprints.is_empty(),
             "a file that is gone leaves the fingerprint map",
         );
+    }
+
+    /// Git's racily-clean rule for the #1975 skip: a fingerprint whose mtime
+    /// is not yet older than [`RACY_FINGERPRINT_WINDOW`] at the start of the
+    /// pass cannot prove the file unchanged, because a same-length edit
+    /// landing after the reindex read but in the same timestamp tick would
+    /// look identical. Such a file is reread on every pass until it ages out.
+    #[tokio::test]
+    async fn reconcile_rereads_a_racily_clean_file_until_its_mtime_ages_out() {
+        let (tmp, _store, wiki, ws, proj) = setup().await;
+        let dir = proj_dir(&tmp, ws, proj);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("fresh.md");
+        std::fs::write(&file, "racytoken\n").unwrap();
+        // The pass starts at the file's own mtime: the worst case, and
+        // independent of how long the test machine takes to get here.
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        for pass in 0..2 {
+            let stats = reconcile_at(&wiki, &mut streaks, &mut fingerprints, written)
+                .await
+                .unwrap();
+            assert_eq!(
+                (stats.indexed, stats.skipped_unchanged),
+                (1, 0),
+                "pass {pass}: a racily clean file must be reread",
+            );
+        }
+        assert!(
+            fingerprints.is_empty(),
+            "a racily clean fingerprint is never recorded",
+        );
+
+        let aged = written + RACY_FINGERPRINT_WINDOW + Duration::from_secs(1);
+        let first_trusted = reconcile_at(&wiki, &mut streaks, &mut fingerprints, aged)
+            .await
+            .unwrap();
+        assert_eq!(
+            (first_trusted.indexed, first_trusted.skipped_unchanged),
+            (1, 0)
+        );
+        let idle = reconcile_at(&wiki, &mut streaks, &mut fingerprints, aged)
+            .await
+            .unwrap();
+        assert_eq!(
+            (idle.indexed, idle.skipped_unchanged),
+            (0, 1),
+            "once its timestamps are older than the window the file is skipped",
+        );
+    }
+
+    #[test]
+    fn racy_fingerprint_window_brackets_the_pass_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("f.md");
+        std::fs::write(&file, "x").unwrap();
+        let fingerprint = FileFingerprint::of(&std::fs::metadata(&file).unwrap()).unwrap();
+        let mtime = fingerprint.modified;
+        assert!(fingerprint.is_racy(mtime), "mtime equal to the pass start");
+        assert!(
+            fingerprint.is_racy(mtime - Duration::from_secs(1)),
+            "mtime after the pass start (clock skew or a backwards step)",
+        );
+        assert!(fingerprint.is_racy(mtime + RACY_FINGERPRINT_WINDOW - Duration::from_millis(1)));
+        // Unix also checks the change time; give it the same slack, since the
+        // write above sets both to about the same instant.
+        assert!(!fingerprint.is_racy(mtime + RACY_FINGERPRINT_WINDOW + Duration::from_secs(1)));
     }
 
     /// The unchanged-file skip must still count a skipped page as found on
@@ -1653,11 +1784,12 @@ mod tests {
 
         let mut streaks = MissingStreaks::new();
         let mut fingerprints = IndexedFingerprints::new();
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
         for pass in 0..4 {
             // A page that changes every pass keeps the walk non-empty, so
             // the empty-walk breaker cannot hide a wrongly "missing" page.
             std::fs::write(&churn, "x".repeat(pass + 1)).unwrap();
-            let stats = reconcile(&wiki, &mut streaks, &mut fingerprints)
+            let stats = reconcile_at(&wiki, &mut streaks, &mut fingerprints, later)
                 .await
                 .unwrap();
             assert_eq!(stats.tombstoned_missing, 0, "pass {pass}");
