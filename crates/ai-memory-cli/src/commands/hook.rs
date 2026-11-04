@@ -1308,7 +1308,7 @@ const _: () = assert!(ANCHOR_BUDGET <= CODEX_RECAP_BUDGET);
 /// unknown or refused session gets a "no session is recorded" notice; neither
 /// starts with this, so neither is injected automatically. A session with no
 /// prompts yet still gets its short anchor, which names where the record is.
-pub(crate) const ANCHOR_HEADER: &str = "> 🧭 ai-memory: post-compaction anchor for this session";
+pub(crate) const ANCHOR_HEADER: &str = ai_memory_core::compaction_recap::ANCHOR_HEADER_PREFIX;
 
 /// Whether a `SessionStart` is the one an agent fires right after a context
 /// compaction, which adds its `additionalContext` to the compacted context:
@@ -11245,7 +11245,7 @@ mod tests {
         for body in [
             "> 🧭 ai-memory: compaction recap for this session\n<!-- ai-memory:untrusted-history:start -->\nold recap",
             "> 🧭 ai-memory: no compaction is recorded for this session yet.",
-            "> 🧭 ai-memory: post-compaction anchor: no session is recorded for this id.",
+            ai_memory_core::compaction_recap::NO_ANCHOR_SESSION_NOTICE,
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let (base, mut requests) = serve_requests("200 OK", body).await;
