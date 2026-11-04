@@ -65,17 +65,19 @@ impl ProviderHealth {
             })
             .collect();
         let llm = self.llm.snapshot();
-        let llm_workloads = if llm.status == ProviderHealthStatus::Disabled && overrides.is_empty()
-        {
-            Vec::new()
-        } else {
-            self.llm_workloads.snapshot()
-        };
+        let (llm_workloads, llm_workloads_started_ms) =
+            if llm.status == ProviderHealthStatus::Disabled && overrides.is_empty() {
+                (Vec::new(), None)
+            } else {
+                let (rows, started_ms) = self.llm_workloads.snapshot();
+                (rows, Some(started_ms))
+            };
         ProviderHealthSnapshot {
             llm,
             llm_candidates,
             llm_task_chains,
             llm_workloads,
+            llm_workloads_started_ms,
             embedding: self.embedding.snapshot(),
         }
     }
@@ -208,6 +210,12 @@ pub struct ProviderHealthSnapshot {
     /// usage and last outcome. Empty when no LLM provider is configured.
     #[serde(default)]
     pub llm_workloads: Vec<LlmWorkloadHealthSnapshot>,
+    /// Unix milliseconds when the `llm_workloads` counters started. They
+    /// reset on restart, so two snapshots measure one window only when this
+    /// value matches. `None` when `llm_workloads` is empty, and from a server
+    /// built before the field existed.
+    #[serde(default)]
+    pub llm_workloads_started_ms: Option<u64>,
     /// Health of independently configured task chains, in stable task order.
     #[serde(default)]
     pub llm_task_chains: Vec<LlmTaskChainHealthSnapshot>,
@@ -484,25 +492,30 @@ impl ProviderRoleState {
 
 const LLM_WORKLOAD_BUCKETS: usize = ai_memory_core::LATENCY_BUCKET_BOUNDS_US.len() + 1;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct LlmWorkloadHealth {
-    state: Arc<Mutex<[LlmWorkloadState; LlmWorkload::ALL.len()]>>,
+    state: Arc<Mutex<LlmWorkloadCounters>>,
 }
 
-impl Default for LlmWorkloadHealth {
+/// Every workload's counters and when they started, under one lock so a
+/// snapshot never pairs counters with the start time of another reset.
+struct LlmWorkloadCounters {
+    started_ms: u64,
+    rows: [LlmWorkloadState; LlmWorkload::ALL.len()],
+}
+
+impl Default for LlmWorkloadCounters {
     fn default() -> Self {
         Self {
-            state: Arc::new(Mutex::new(std::array::from_fn(|_| {
-                LlmWorkloadState::default()
-            }))),
+            started_ms: u64::try_from(Timestamp::now().as_millisecond()).unwrap_or(0),
+            rows: std::array::from_fn(|_| LlmWorkloadState::default()),
         }
     }
 }
 
 impl LlmWorkloadHealth {
     fn reset(&self) {
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) =
-            std::array::from_fn(|_| LlmWorkloadState::default());
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = LlmWorkloadCounters::default();
     }
 
     fn record<T>(
@@ -516,8 +529,8 @@ impl LlmWorkloadHealth {
     ) {
         let now = Timestamp::now();
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        let mut states = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let state = &mut states[workload.index()];
+        let mut counters = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut counters.rows[workload.index()];
         state.calls = state.calls.saturating_add(1);
         state.latency_total_us = state.latency_total_us.saturating_add(elapsed_us);
         state.latency_max_us = state.latency_max_us.max(elapsed_us);
@@ -558,13 +571,15 @@ impl LlmWorkloadHealth {
         }
     }
 
-    fn snapshot(&self) -> Vec<LlmWorkloadHealthSnapshot> {
-        let states = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        LlmWorkload::ALL
+    /// The rows in [`LlmWorkload::ALL`] order and when their counters started.
+    fn snapshot(&self) -> (Vec<LlmWorkloadHealthSnapshot>, u64) {
+        let counters = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = LlmWorkload::ALL
             .iter()
             .copied()
-            .map(|workload| states[workload.index()].snapshot(workload))
-            .collect()
+            .map(|workload| counters.rows[workload.index()].snapshot(workload))
+            .collect();
+        (rows, counters.started_ms)
     }
 }
 
@@ -1283,6 +1298,58 @@ mod tests {
         assert_eq!(after_error.retry_hint.as_deref(), Some(retry_hint.as_str()));
     }
 
+    /// #1981: the counters say when they started, the value holds while they
+    /// count, and a reset restarts both, so two snapshots with the same
+    /// `llm_workloads_started_ms` measure one window.
+    #[tokio::test]
+    async fn workload_counters_report_when_they_started() {
+        let health = ProviderHealth::default();
+        let disabled = health.snapshot();
+        assert!(disabled.llm_workloads.is_empty());
+        assert_eq!(disabled.llm_workloads_started_ms, None);
+
+        let before = u64::try_from(Timestamp::now().as_millisecond()).unwrap();
+        let llm = health.wrap_llm_provider(Arc::new(FakeLlm { fail: false }), "openai", "m", None);
+        let started = health.snapshot().llm_workloads_started_ms.unwrap();
+        assert!(started >= before, "{started} < {before}");
+        llm.complete(ChatRequest::user_prompt("ping"))
+            .await
+            .unwrap();
+        let counted = health.snapshot();
+        assert_eq!(counted.llm_workloads_started_ms, Some(started));
+        assert_eq!(
+            counted
+                .llm_workloads
+                .iter()
+                .map(|row| row.calls)
+                .sum::<u64>(),
+            1
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        let _llm = health.wrap_llm_provider(Arc::new(FakeLlm { fail: false }), "openai", "m", None);
+        let reset = health.snapshot();
+        assert!(reset.llm_workloads_started_ms.unwrap() > started);
+        assert!(reset.llm_workloads.iter().all(|row| row.calls == 0));
+
+        let json = serde_json::to_value(&reset).unwrap();
+        assert_eq!(
+            json["llm_workloads_started_ms"],
+            reset.llm_workloads_started_ms.unwrap()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_from_an_older_server_has_no_workload_start() {
+        let mut json = serde_json::to_value(ProviderHealthSnapshot::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("llm_workloads_started_ms")
+            .unwrap();
+        let parsed: ProviderHealthSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.llm_workloads_started_ms, None);
+    }
+
     #[test]
     fn workload_snapshot_is_bounded_redacted_and_percentiled() {
         let workloads = LlmWorkloadHealth::default();
@@ -1327,6 +1394,7 @@ mod tests {
 
         let row = workloads
             .snapshot()
+            .0
             .into_iter()
             .find(|row| row.workload == LlmWorkload::Rerank)
             .unwrap();

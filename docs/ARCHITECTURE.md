@@ -958,9 +958,10 @@ the deployment distinguishes operators. Counters reset on restart.
 ### LLM workload telemetry
 
 The root-protected `GET /admin/status` snapshot includes a bounded
-`providers.llm_workloads` array when an LLM is configured. Call sites attach
-one member of the closed `LlmWorkload` enum to the existing UUIDv7 logical
-operation id; its displayed/wire value remains only the UUID, so the label
+`providers.llm_workloads` array when an LLM is configured, with
+`providers.llm_workloads_started_ms` saying when its counters started. Call
+sites attach one member of the closed `LlmWorkload` enum to the existing UUIDv7
+logical operation id; its displayed/wire value remains only the UUID, so the label
 cannot affect a provider request or fallback correlation. The provider-health
 wrapper records one provider-interface invocation around the whole fallback
 chain (outer caller retries are separate invocations): outcome,
@@ -971,10 +972,10 @@ caller, or unbounded label. State is in memory, resets on restart, and does not
 choose a provider or model. The server constructs the wrapper once at startup;
 there is no runtime provider hot-reload.
 
-This instrumentation is the evidence gate for any future per-operation
-provider profiles. The current configuration remains one global provider plus
-its ordered fallback chain; no routing surface exists until measured latency,
-usage, and quality justify the added auth and configuration boundary.
+The labels route nothing. An `[llm.<task>]` profile in the config gives that
+task its own provider and fallback chain (#1969), every other task uses the
+global provider and its ordered fallback chain, and `llm_task_chains` reports
+the health of each configured task chain.
 
 ### Web search and the recall trace
 
