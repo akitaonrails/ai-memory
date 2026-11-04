@@ -80,7 +80,7 @@ async function until(predicate, message) {
 const root = process.cwd();
 const info = (id, parentID) => ({ id, title: id, location: { directory: root }, parentID });
 const records = new Map([["root-a", info("root-a")], ["root-b", { ...info("root-b"), location: { directory: root + "/beta" } }],
-  ["child", info("child", "root-a")], ["root-slow", info("root-slow")]]);
+  ["child", info("child", "root-a")], ["root-slow", info("root-slow")], ["root-c", info("root-c")]]);
 const a = host(root, records);
 const b = host(root + "/beta", records);
 const disposeA = await plugin.setup(a.ctx);
@@ -165,6 +165,19 @@ try {
   const oldServer = { sessionID: "root-slow", system: [] };
   await a.hooks.get("session.context")(oldServer);
   assert.ok(!oldServer.system.some((part) => part.text.includes("compaction recap")), "an older server's recap is never injected");
+  // Deleting a session forgets its armed anchor along with the rest of its state.
+  const anchorC = "> 🧭 ai-memory: post-compaction anchor for this session (root-c)";
+  a.emit({ type: "session.compaction.ended", data: { sessionID: "root-c", reason: "auto", text: "summary" } });
+  await until(() => anchors().length === 3, "compaction end arms root-c's anchor");
+  const armed = { sessionID: "root-c", system: [] };
+  await a.hooks.get("session.context")(armed);
+  assert.ok(armed.system.some((part) => part.text === anchorC), "root-c's anchor is armed");
+  a.emit({ type: "session.deleted", data: { sessionID: "root-c" } });
+  await until(() => requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-c"), "deleted root-c must end");
+  const afterDelete = { sessionID: "root-c", system: [] };
+  await a.hooks.get("session.context")(afterDelete);
+  assert.ok(!afterDelete.system.some((part) => part.text === anchorC), "a deleted session's anchor is forgotten");
+  assert.equal(anchors().length, 3, "a deleted session never refetches its anchor");
 
   await b.hooks.get("session.prompt")({ sessionID: "root-b", messageID: "b1", prompt: { text: "beta" } });
   await b.hooks.get("session.context")({ sessionID: "root-b", system: [] });

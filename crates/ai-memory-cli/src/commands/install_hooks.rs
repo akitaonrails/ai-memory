@@ -4404,6 +4404,8 @@ const OPENCODE2_BINDING: &str = r#"
       assistantText.delete(id);
       handoffFetches.delete(id);
       handoffFailures.delete(id);
+      recapFetches.delete(id);
+      anchorFetches.delete(id);
     }
 
     async function ensureSession(id: SessionID): Promise<SessionInfo | undefined> {
