@@ -620,6 +620,140 @@ async fn purging_a_session_deletes_the_query_signals_it_wrote_last() {
     );
 }
 
+/// Adversarial (#1941): a signal row is filed under the QUERIED project, so a
+/// session in project A that searched project B left its query text in B.
+/// Purging the session, its project, or its workspace must reach those B rows
+/// too, while a different session's row in B survives every purge.
+#[tokio::test]
+async fn purges_delete_query_signals_a_session_left_in_another_project() {
+    use ai_memory_core::{AgentKind, NewSession, SessionId};
+    use ai_memory_store::{Compaction, PurgeMode};
+    let (_tmp, store, ws, proj_a) = two_page_store().await;
+    let proj_b = store
+        .writer
+        .get_or_create_project(ws, "other".to_string(), None)
+        .await
+        .unwrap();
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere".to_string())
+        .await
+        .unwrap();
+    let proj_c = store
+        .writer
+        .get_or_create_project(other_ws, "far".to_string(), None)
+        .await
+        .unwrap();
+    let begin = |native: &'static str, ws, project| {
+        let writer = store.writer.clone();
+        async move {
+            writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: SessionId::from_native(native),
+                    workspace_id: ws,
+                    project_id: project,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+    };
+    begin("a-purged-session", ws, proj_a).await;
+    begin("a-sibling-session", ws, proj_a).await;
+    begin("b-own-session", ws, proj_b).await;
+    begin("c-far-session", other_ws, proj_c).await;
+    let mut pages = Vec::new();
+    for (path, session) in [
+        ("notes/by-purged.md", "a-purged-session"),
+        ("notes/by-sibling.md", "a-sibling-session"),
+        ("notes/by-far.md", "c-far-session"),
+        ("notes/by-b.md", "b-own-session"),
+    ] {
+        let page_id = store
+            .writer
+            .upsert_page(page(ws, proj_b, path, path, "zebraquux", Tier::Semantic))
+            .await
+            .unwrap();
+        store
+            .writer
+            .record_query_page_signal(
+                ws,
+                proj_b,
+                page_id,
+                "zebraquux private question".to_string(),
+                Some(session.to_string()),
+            )
+            .await
+            .unwrap();
+        pages.push(page_id);
+    }
+    let [by_purged, by_sibling, by_far, by_b] = pages[..] else {
+        unreachable!()
+    };
+    let surviving = || async {
+        let rows = store
+            .reader
+            .query_signals_for_pages(ws, proj_b, vec![by_purged, by_sibling, by_far, by_b])
+            .await
+            .unwrap();
+        [by_purged, by_sibling, by_far, by_b]
+            .map(|page| rows.get(&page).is_some_and(|rows| !rows.is_empty()))
+    };
+    assert_eq!(surviving().await, [true, true, true, true]);
+
+    store
+        .writer
+        .purge_session(
+            ws,
+            proj_a,
+            SessionId::from_native("a-purged-session"),
+            None,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        surviving().await,
+        [false, true, true, true],
+        "purge-session must delete its query text from the project it queried"
+    );
+
+    store
+        .writer
+        .purge_project(
+            ws,
+            proj_a,
+            "default/app",
+            None,
+            false,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        surviving().await,
+        [false, false, true, true],
+        "purge-project must delete its sessions' query text from sibling projects"
+    );
+
+    store
+        .writer
+        .delete_workspace(other_ws, true, Compaction::Skip, PurgeMode::Commit)
+        .await
+        .unwrap();
+    assert_eq!(
+        surviving().await,
+        [false, false, false, true],
+        "deleting a workspace must delete its sessions' query text elsewhere; \
+         a session of the queried project keeps its own row"
+    );
+}
+
 /// `forget_query_page_signal` (the `not_helpful` negative signal) removes
 /// exactly the matching (query, page) association.
 #[tokio::test]
