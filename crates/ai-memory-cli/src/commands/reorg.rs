@@ -87,7 +87,12 @@ pub async fn run(config: &Config, args: ReorgArgs) -> Result<()> {
         );
         println!("{}", "-".repeat(80));
         for e in &report.plan {
-            println!("{:<38} {:<20} {}", e.session_id, e.new_project, e.cwd);
+            println!(
+                "{:<38} {:<20} {}",
+                super::run::display_session_id(&e.session_id),
+                e.new_project,
+                e.cwd
+            );
         }
         println!("{}", i18n.text("cli-reorg-dry-run-omit-dry-run-to-apply"));
     } else {
