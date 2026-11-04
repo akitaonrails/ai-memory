@@ -182,6 +182,7 @@ cli-help-root-delete-page-path-help = { "Exact wiki path to delete (e.g. `notes/
 cli-help-root-delete-page-workspace-help = { "Workspace name. Defaults to the nearest `.ai-memory.toml` marker's `workspace`, else `default`. Resolution is announced on stderr so a cross-workspace project-name collision can never silently route the delete to the wrong slot" }
 cli-help-root-delete-page-project-help = { "Project name. When omitted, auto-derived from the current project (same heuristic write-page/read-page use)" }
 cli-help-root-serve-about = { "Run the MCP server (with watcher) over stdio or HTTP" }
+cli-help-root-serve-enable-management-ui-help = { "Enable the server-rendered management console at /manage (requires management-ui build feature)" }
 cli-help-root-serve-enable-session-management-help = { "Serve the `/management/v1` session inspection and owned-purge routes to signed-in browser users. Off by default; requires `--transport http`" }
 cli-help-root-serve-enable-self-service-keys-help = { "Let signed-in browser users issue and revoke their own `aim_` API keys under `/management/v1/credentials`. Off by default; requires `--transport http`" }
 cli-help-root-serve-transport-help = { "Transport to expose the MCP server on" }
