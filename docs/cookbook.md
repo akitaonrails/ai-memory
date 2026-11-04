@@ -346,6 +346,34 @@ compacted or merged stays in git and the supersession chain, recoverable with
   moment you return. It is off by default, never deletes a source, and is gated on
   an internal recall eval before it could ever become default behavior.
 
+## Recipe: long sessions on a small context window
+
+A local model with a context window around 200k tokens, or any long-horizon
+session, compacts again and again. Each compaction keeps a lossy summary, and
+the first thing it loses is the start of the session: the task you gave, its
+constraints, the early decisions. ai-memory has the prompts you actually
+typed, so the agent can re-ground on them.
+
+- On Claude Code, Codex, Factory Droid and OpenCode V1/V2, after each
+  compaction the hooks inject a small post-compaction anchor (about 2,000
+  characters by default) with the session's first and latest prompts, and the
+  installed instructions tell the agent to trust it over the summary.
+- On Gemini CLI, Cursor, Copilot CLI, Kimi Code, Grok, Kiro, Cline, Muse and
+  the rest, nothing is injected: the routing block and the handoff skill tell
+  the agent to read its own session's prompts with
+  `memory_read_session_observations` after a compaction. Install the managed
+  routing (`ai-memory install-instructions`, or ask "install ai-memory
+  routing") so every session gets that rule.
+- Anywhere the hooks answer a prompt, you can start one with
+  `reload context` to get the stretch the last compaction dropped, for example
+  `reload context, then finish the migration`.
+
+Codex's `compact_prompt` setting replaces Codex's whole compaction prompt and
+applies only to local providers, so it cannot add one line the way the OpenCode
+hook does. Change it only if you mean to rewrite how Codex summarizes. See
+[`usage.md`](usage.md#reload-context-after-a-compaction) for the per-harness
+details.
+
 ## Recipe: two agents / two repos working together
 
 - **Continuity across agents in the same project** (quit Claude Code, open Codex

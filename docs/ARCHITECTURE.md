@@ -427,8 +427,25 @@ starts.
 `PostToolUse`, OpenCode through its system/context hooks). It is read-only and
 anchored on the session row rather than a cwd: project read authorization and
 the handoff owner filter gate it, and it renders the captured prompts and last
-reply between the session's latest two `pre-compact` observations plus the
-project's open handoffs, listed without a claim.
+reply between the session's latest two compaction boundaries (a `pre-compact`
+or `post-compaction` observation) plus the project's open handoffs, listed
+without a claim.
+The same route with `mode=anchor` builds the post-compaction anchor (#1983):
+the session's first operator prompts, which hold the original task, then its
+latest ones, inside the untrusted-history markers, within a 2,000-character
+default budget (clamped to 800 to 4,000), with a footer naming
+`memory_read_session_observations` and `memory_query` for the full record. The
+hook client fetches it when `SessionStart` arrives with source `compact`
+(Claude Code, Codex, Factory Droid) and emits it through that agent's
+`SessionStart` envelope instead of the startup packet, so a compaction claims
+no handoff. The generated OpenCode V1/V2 plugins arm it on the compaction
+event and inject it through their system/context hooks until the next
+compaction. Every other harness relies on the instruction surfaces
+(`SNIPPET_BODY`, `COMPACT_SNIPPET_BODY`, the `MEMORY_INSTRUCTIONS` core and
+the handoff skill), which tell the agent to re-ground after a compaction with
+`memory_read_session_observations` (`session_id: "current"`,
+`kinds: ["user-prompt","stop"]`) and to trust the recorded prompts over the
+summary.
 ai-memory opens native stores read-only. Raw sanitized JSONL segments are
 immutable, while SQLite supplies monotonic sequences, FTS, native
 source/delivery cursors, and idempotent retry state. A full-ledger

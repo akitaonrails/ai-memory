@@ -13,6 +13,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a post-compaction rule to every instruction surface ai-memory
+  installs: the `AGENTS.md`/`CLAUDE.md` routing block (full and compact), the
+  MCP handshake instructions, the handoff and retrieval skills, and the Grok
+  rule. After a context compaction the agent re-grounds on ai-memory before it
+  continues, reading the injected post-compaction anchor or else its session's
+  prompts through `memory_read_session_observations` (`session_id: "current"`,
+  `kinds: ["user-prompt","stop"]`), and trusts those prompts over the summary.
+  Harnesses without a post-compaction hook (Gemini CLI, Cursor, Copilot CLI,
+  Kimi Code, Grok, Kiro, Cline, Muse) rely on this rule alone. `docs/usage.md`,
+  `docs/support-matrix.md`, `docs/ARCHITECTURE.md` and a cookbook recipe for
+  long sessions on a small context window describe the automatic and manual
+  paths (#1983).
+
 - Added per-task LLM provider and fallback profiles for consolidation, bootstrap,
   auto-improve, experience, dream, lint, profile, rerank, and query answers
   (including explore). Tasks without an override share the default provider;
