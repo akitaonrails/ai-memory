@@ -2329,6 +2329,11 @@ fn strip_deleted_suffix(exe: PathBuf) -> PathBuf {
 /// store path names one immutable package version, which `nix-collect-garbage`
 /// deletes after the next profile switch, while the profile's `bin/` on PATH
 /// keeps pointing at the current build.
+///
+/// A binary in a Scoop version directory (`apps\<app>\<version>\`) is
+/// embedded through the app's `current` junction when it exists: `scoop
+/// update` installs the next version beside it and `scoop cleanup` deletes
+/// the old one, while `current` follows the active version.
 fn embedded_exe_from(raw: Option<PathBuf>) -> PathBuf {
     embedded_exe_with(raw, Path::is_file)
 }
@@ -2341,6 +2346,12 @@ fn embedded_exe_with(raw: Option<PathBuf>, is_file: impl Fn(&Path) -> bool) -> P
     };
     if is_nix_store_path(&exe) {
         return PathBuf::from(FALLBACK_HOOK_EXE);
+    }
+    if let Some(current) = crate::install_layout::scoop_current_links(&exe)
+        .into_iter()
+        .find(|link| is_file(link))
+    {
+        return current;
     }
     if is_file(&exe) {
         return exe;
@@ -3409,6 +3420,22 @@ mod tests {
             assert_eq!(exe, PathBuf::from(normal));
             assert_eq!(rendered_exec_command(&exe), normal);
         }
+    }
+
+    #[test]
+    fn hook_rendered_from_a_scoop_version_dir_uses_the_current_link() {
+        let versioned = PathBuf::from("/Users/me/scoop/apps/ai-memory/3.4.0/ai-memory.exe");
+        let current = PathBuf::from("/Users/me/scoop/apps/ai-memory/current/ai-memory.exe");
+        assert_eq!(
+            embedded_exe_with(Some(versioned.clone()), |_| true),
+            current
+        );
+        assert_eq!(embedded_exe_with(Some(current.clone()), |_| true), current);
+        // Control: without a `current` link the version path is all there is.
+        assert_eq!(
+            embedded_exe_with(Some(versioned.clone()), |path| path == versioned),
+            versioned
+        );
     }
 
     #[test]

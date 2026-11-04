@@ -49,6 +49,7 @@ use crate::cli::{
 };
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, ServerProbe, probe_server};
+use crate::install_layout::scoop_current_links;
 
 /// How long `setup` waits for a service it just started to answer.
 const SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -452,13 +453,15 @@ fn qoder_detected(home: &Path) -> Option<PathBuf> {
 }
 
 /// The binary path the service unit runs. A package manager's versioned
-/// location (a Homebrew `Cellar/<formula>/<version>` or a `/nix/store` path)
-/// disappears on the next upgrade or `brew cleanup` / garbage collection, so a
-/// unit naming it stops starting. When the running binary lives in one, the
-/// unit names a stable link that resolves to the same file instead: the path
-/// as invoked, an `ai-memory` on `PATH` (`/usr/local/bin`, `~/.nix-profile/bin`,
-/// `/etc/profiles/per-user/<user>/bin`), or Homebrew's `opt/<formula>` and
-/// `bin` links. Without one, the resolved path is kept as before.
+/// location (a Homebrew `Cellar/<formula>/<version>`, a `/nix/store` path, or
+/// a Scoop `apps\<app>\<version>` directory) disappears on the next upgrade
+/// or `brew cleanup` / garbage collection / `scoop cleanup`, so a unit naming
+/// it stops starting. When the running binary lives in one, the unit names a
+/// stable link that resolves to the same file instead: the path as invoked, an
+/// `ai-memory` on `PATH` (`/usr/local/bin`, `~/.nix-profile/bin`,
+/// `/etc/profiles/per-user/<user>/bin`), Homebrew's `opt/<formula>` and `bin`
+/// links, or Scoop's `apps\<app>\current` junction. Without one, the
+/// resolved path is kept as before.
 fn service_exe(invoked: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> PathBuf {
     let Ok(resolved) = std::fs::canonicalize(invoked) else {
         return invoked.to_path_buf();
@@ -476,6 +479,7 @@ fn service_exe(invoked: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> PathBu
         .unwrap_or_default();
     std::iter::once(invoked.to_path_buf())
         .chain(homebrew_links(&resolved))
+        .chain(scoop_current_links(&resolved))
         .chain(on_path)
         .find(|candidate| {
             candidate.is_absolute()
@@ -488,7 +492,9 @@ fn service_exe(invoked: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> PathBu
 /// Whether `path` sits in a store a package manager replaces per version.
 fn is_versioned_package_path(path: &Path) -> bool {
     let parts: Vec<_> = path.components().map(|part| part.as_os_str()).collect();
-    parts.windows(2).any(|pair| pair == ["nix", "store"]) || cellar_index(&parts).is_some()
+    parts.windows(2).any(|pair| pair == ["nix", "store"])
+        || cellar_index(&parts).is_some()
+        || !scoop_current_links(path).is_empty()
 }
 
 /// The index of a `Cellar` component followed by `<formula>/<version>/...`.
@@ -1460,6 +1466,85 @@ mod tests {
         let invoked = root.join("invoked");
         symlink(&real, &invoked).unwrap();
         assert_eq!(service_exe(&invoked, &env), invoked);
+    }
+
+    /// A Scoop binary resolves through the `current` junction to
+    /// `apps/<app>/<version>/`, which `scoop update` replaces; the unit names
+    /// the `current` link instead, and a `current` that points at another
+    /// version is refused. A symlink stands in for the junction here; the
+    /// Windows test below uses a real one.
+    #[cfg(unix)]
+    #[test]
+    fn a_scoop_binary_is_recorded_through_its_current_link() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let app = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("scoop/apps/ai-memory");
+        let version_dir = app.join("3.4.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let real = version_dir.join("ai-memory.exe");
+        std::fs::write(&real, "bin").unwrap();
+        let no_env = |_: &str| None;
+        assert!(is_versioned_package_path(&real));
+
+        // No `current` link: the resolved path is all there is.
+        assert_eq!(service_exe(&real, &no_env), real);
+
+        // Control: a `current` link to another version never wins.
+        let old_dir = app.join("3.3.3");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("ai-memory.exe"), "old").unwrap();
+        symlink("3.3.3", app.join("current")).unwrap();
+        assert_eq!(service_exe(&real, &no_env), real);
+
+        std::fs::remove_file(app.join("current")).unwrap();
+        symlink("3.4.0", app.join("current")).unwrap();
+        let current = app.join("current/ai-memory.exe");
+        assert!(!is_versioned_package_path(&current));
+        assert_eq!(service_exe(&real, &no_env), current);
+        // The shim runs the binary through `current`, which already is stable.
+        assert_eq!(service_exe(&current, &no_env), current);
+    }
+
+    /// The same mapping through a real Scoop-style directory junction, which
+    /// `std::fs::canonicalize` resolves to the version directory.
+    #[cfg(windows)]
+    #[test]
+    fn a_scoop_binary_is_recorded_through_its_current_junction() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("scoop").join("apps").join("ai-memory");
+        let version_dir = app.join("3.4.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("ai-memory.exe"), "bin").unwrap();
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(app.join("current"))
+            .arg(&version_dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+        let current = app.join("current").join("ai-memory.exe");
+        let resolved = std::fs::canonicalize(&current).unwrap();
+        assert!(is_versioned_package_path(&resolved));
+
+        let recorded = service_exe(&current, &|_: &str| None);
+        assert!(
+            !is_versioned_package_path(&recorded),
+            "{}",
+            recorded.display()
+        );
+        assert_eq!(std::fs::canonicalize(&recorded).unwrap(), resolved);
+        let recorded = service_exe(&resolved, &|_: &str| None);
+        assert!(
+            !is_versioned_package_path(&recorded),
+            "{}",
+            recorded.display()
+        );
+        assert_eq!(std::fs::canonicalize(&recorded).unwrap(), resolved);
     }
 
     /// A binary outside any versioned store keeps the resolved path, as
