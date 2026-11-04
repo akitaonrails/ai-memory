@@ -3944,7 +3944,7 @@ are checked against the release workflow's exact layout but are not extracted
 during self-upgrade. Archives are capped at 4,096 entries and 512 MiB expanded,
 in addition to the 128 MiB response-body cap. Windows uses rename-aside
 (`.exe` → `.old`, then promote `.new`) because
-a running image cannot be overwritten in place. It refuses Homebrew/AUR/`/usr`
+a running image cannot be overwritten in place. It refuses Homebrew/AUR/Scoop/`/usr`
 installs (use the package manager), unwritable prefixes (for example Program
 Files; download the zip manually), and in-container binaries (upgrade the
 host wrapper/image instead). Windows aarch64 has no release asset yet. For

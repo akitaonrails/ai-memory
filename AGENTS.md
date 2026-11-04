@@ -246,7 +246,7 @@ crates/
 ├── ai-memory-test-support/ shared test helpers (dev-dependency only, no test binary).
 └── ai-memory-cli/         `ai-memory` binary entry point + thin HTTP subcommands.
 evals/                     live A/B harness; workspace member, not shipped.
-companions/ai-memory-importer/  standalone OMC, external-conversation and agentmemory importer; NOT a root
+companions/ai-memory-importer/  standalone OMC, external-conversation, agentmemory and claude-mem importer; NOT a root
                            workspace member — build/test it with
                            `--manifest-path companions/ai-memory-importer/Cargo.toml`.
 companions/ai-memory-client/    capture-privacy helpers shared by relay + importer; own workspace.
@@ -268,7 +268,7 @@ bin/                       host wrapper scripts (`ai-memory`, `deploy`, `release
 install.sh                 two-command native install, step one (release asset).
 INSTALL_FOR_AGENTS.md      how an AI agent installs ai-memory for its user.
 docker/                    Dockerfile, compose files, TLS proxy templates.
-packaging/                 AUR/RPM/systemd/launchd/sysusers/tmpfiles/env native packaging assets.
+packaging/                 AUR/RPM/Scoop/systemd/launchd/sysusers/tmpfiles/env native packaging assets.
 nix/, flake.nix            Nix package + NixOS module.
 scripts/                   packaging checks, hook installer, acceptance scripts.
 tests/                     e2e smoke (`e2e/handoff_smoke.sh`), hook shell tests, fixtures.
@@ -721,6 +721,12 @@ Additional boundary rules:
   wrong hash makes `brew install` fail for everyone. This is a mandatory,
   recurring post-release step (it has been forgotten repeatedly); do not rely
   on a contributor PR to the tap to remember it.
+- **Check the Scoop bucket after every release.** `release.yml`'s `scoop`
+  job pushes `bucket/ai-memory.json` to `akitaonrails/scoop-bucket`, but it
+  only warns and skips when `SCOOP_BUCKET_TOKEN` is missing or cannot push.
+  After the release, confirm the job ran green and that the bucket's manifest
+  names the new version and the hash from
+  `ai-memory-windows-x86_64.zip.sha256`.
 - **A release that touches retrieval re-runs the retrieval benchmark once,
   on the final release candidate, and compares it with the previous
   release.** A full run takes about half an hour on an idle host (FTS about
@@ -786,7 +792,7 @@ Additional boundary rules:
 - **MCP tool surface changes** require updating `MEMORY_INSTRUCTIONS`,
   `ai_memory_core::SNIPPET_BODY`, README/docs tool references, and the
   regression tests asserting every tool appears in both prompt surfaces.
-  The tool count is currently 25 (see `docs/ARCHITECTURE.md`). They also
+  The tool count is currently 27 (see `docs/ARCHITECTURE.md`). They also
   update the TypeScript SDK in `companions/ai-memory-ts` in the same change:
   the schema snapshot (`npm run schema:update`), the wrapper or its
   classification in `src/coverage.ts`, types, tests and docs. The SDK's

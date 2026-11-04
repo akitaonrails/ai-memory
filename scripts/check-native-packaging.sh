@@ -106,7 +106,7 @@ check_scoop_manifest() {
     and .homepage == "https://aimemory.sh"
     and .license == "MIT"
     and .bin == "ai-memory.exe"
-    and .checkver == "github"
+    and .checkver.github == "https://github.com/akitaonrails/ai-memory"
     and (.architecture."64bit".url | endswith("/v" + $m.version + "/" + $zip))
     and (.architecture."64bit".hash | test("^[0-9a-f]{64}$"))
     and .autoupdate.architecture."64bit".url

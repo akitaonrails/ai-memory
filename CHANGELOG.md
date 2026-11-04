@@ -13,7 +13,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
-- Published ai-memory to the maintainer's Scoop bucket: on Windows,
+- Added Scoop publishing to the maintainer's bucket: on Windows,
   `scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket`
   then `scoop install ai-memory`. Each tagged release pins the manifest to the
   Windows zip and the SHA-256 the release publishes, and pushes it to the
@@ -21,6 +21,7 @@ version in [`docs/changelog/`](docs/changelog/):
   in the logon entry, hook commands and MCP entries, never the version
   directory that `scoop cleanup` deletes. `ai-memory upgrade` refuses a Scoop
   install and points to `scoop update ai-memory`.
+
 - Added a post-compaction anchor, `GET /recap?mode=anchor`: a small,
   read-only block (default 2,000 chars) with a session's first and latest
   operator prompts, read across every compaction, behind the recap's own
@@ -82,9 +83,6 @@ version in [`docs/changelog/`](docs/changelog/):
   (`ai_memory_hook_file_paths_total`) records why each other file-tool event
   got none, with no path or scope label; `/admin/status` also reports when
   the counters started (`started_ms`). A new internal store read maps a path
-  to the sessions the caller may read. The generated TypeScript integrations
-  follow separately (#1843).
-
   to the sessions the caller may read (#1843).
 
 - Added a per-execution opt-out of the automatic handoff: a session whose
@@ -94,7 +92,7 @@ version in [`docs/changelog/`](docs/changelog/):
   shell and PowerShell bundles and the generated TypeScript plugins forward it
   as `auto_handoff=0` (#1951).
 
-- Pages can name the repository files they describe: `memory_write_page`,
+- Added repository file references to pages: `memory_write_page`,
   `memory_write_pages_batch` and the admin write accept an optional
   `source_files: [{path, commit}]` (up to 16 repository-relative paths, 7-64
   hex commit ids), and a checkpoint restore keeps it. The key is separate from
@@ -122,13 +120,14 @@ version in [`docs/changelog/`](docs/changelog/):
   a WAL-consistent read-only snapshot, with explicit project mapping,
   client-side sanitization, sensitive-record exclusion, exact-body resume, and
   dry-run by default (#1840).
+
 - Added a document-embedding cache to the `ai-memory-eval retrieval`
   benchmark. Local-embeddings runs store each haystack page's vector under
   `evals/.cache/embeddings/`, keyed by provider, model, dimension and a hash of
   the page text with the replay's wall-clock timestamps masked, and later runs
   reuse it. Query embeddings and ranking stay live. `--no-embedding-cache`
   runs cold. The server side is an eval-only variable the harness sets; normal
-  configuration has no such setting. (#1973)
+  configuration has no such setting (#1973).
 
 - Added `ai-memory-eval retrieval-compare`, which pairs two saved retrieval
   reports by question and lists the questions whose first hit moved, the
@@ -221,7 +220,8 @@ version in [`docs/changelog/`](docs/changelog/):
   Claude Code keeps. Claude Code defers ai-memory's tools behind tool search,
   and the cut used to land inside the first tool's routing, so the other 26
   tools had no routing before Claude loaded them. A test keeps the index
-  complete and under the limit. (#1980)
+  complete and under the limit (#1980).
+
 - `[[llm_fallbacks]]` entries now honor `api_key_env` for `copilot` and
   `anthropic-oauth`, which used to ignore it and send the native token.
   `openai-oauth`, `codex` and `cursor` have no key to override, so an entry

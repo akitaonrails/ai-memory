@@ -207,7 +207,7 @@ agentmemory has this informally (`/handoff` skill); we make it explicit from day
 
 basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a
 result. The original v1 surface was deliberately narrow; the current additive
-surface is listed in [`ARCHITECTURE.md`](ARCHITECTURE.md#mcp-tool-surface-25-tools):
+surface is listed in [`ARCHITECTURE.md`](ARCHITECTURE.md#mcp-tool-surface-27-tools):
 
 | Tool | Purpose | Annotation |
 |---|---|---|

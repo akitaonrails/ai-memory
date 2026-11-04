@@ -751,6 +751,9 @@ jobs:
     needs: [check-secrets, github-release, validate-version]
     if: needs.check-secrets.outputs.scoop_enabled == 'true'
     runs-on: ubuntu-latest
+    # The release is already published; a bucket push failure (expired or
+    # under-scoped token) must not turn the release run red.
+    continue-on-error: true
     permissions:
       contents: read
     steps:
