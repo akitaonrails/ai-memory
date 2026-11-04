@@ -811,6 +811,12 @@ from an untrusted server as untrusted, and every runtime auth, ownership, scope,
 and admission check remains authoritative. The handshake puts its complete
 scope and trust contract before the detailed routing reference so clients that
 truncate server instructions at 2,048 characters still receive the essentials.
+A one-line index of every tool follows that core and ends within 4,096
+characters. That is the instructions limit of
+[Claude Code](https://code.claude.com/docs/en/mcp#tool-search-for-mcp-server-authors)
+since v2.1.296, and its tool search defers every tool definition until Claude
+asks for one, so the index is the only per-tool routing those sessions see up
+front. Tests hold the core to 2,048 and the index to 4,096 UTF-16 units (#1980).
 The rest of #920 remains deliberately unshipped: description shortening needs
 tool-selection evaluation before removing self-contained guidance from MCP-only
 clients; `response_format` variants would enlarge each read schema while
