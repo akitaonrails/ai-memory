@@ -32,6 +32,13 @@ version in [`docs/changelog/`](docs/changelog/):
   separator still makes the call metadata-only, and quoted braces that list
   alternatives are looked up once per alternative (#1977).
 
+- A failed Cursor Agent CLI call returned an error that quoted the CLI's
+  stderr, or its answer when that was not JSON, without the secret scrub
+  HTTP provider error bodies already get. Those errors are logged, so a token
+  the child echoed could reach the server log. Both excerpts now go through
+  the built-in sanitizer before they are cut, which also strips terminal
+  control sequences (#1978).
+
 ## [3.3.3] - 2026-11-03
 
 ### Fixed
