@@ -2885,6 +2885,37 @@ impl AiMemoryServer {
         fields
     }
 
+    /// The harness recorded for the caller's session, only when that session
+    /// belongs to `(ws, proj)` and passes the caller's owner filter.
+    ///
+    /// The session id arrives in a request header the caller controls, so an
+    /// unscoped lookup would accept another project's or another operator's
+    /// session as message provenance (or as the claiming session) and echo
+    /// its harness back. A session outside the caller's scope is treated as
+    /// no session at all.
+    async fn caller_session_agent_in_scope(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: Option<SessionId>,
+        actor: &ai_memory_core::ActorContext,
+    ) -> Result<Option<AgentKind>, McpError> {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let summary = self
+            .reader
+            .session_summary_scoped(
+                ws,
+                proj,
+                session_id,
+                ai_memory_core::OwnerFilter::for_actor_context(actor),
+            )
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(summary.map(|summary| AgentKind::from_wire(&summary.agent_kind)))
+    }
+
     /// Refuse a message-queue change whose project was inferred rather than
     /// named or bound to the caller's hook session.
     ///
@@ -7319,14 +7350,9 @@ impl AiMemoryServer {
         }
         let sender = crate::actor::actor_from_parts(&parts);
         let candidate_session = aps_actor.session_id.as_deref().map(SessionId::from_native);
-        let recorded_agent = match candidate_session {
-            Some(sid) => self
-                .reader
-                .session_agent_kind(sid)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
-            None => None,
-        };
+        let recorded_agent = self
+            .caller_session_agent_in_scope(from_ws, from_proj, candidate_session, &sender)
+            .await?;
         let declared_agent = args
             .from_agent
             .as_deref()
@@ -7345,7 +7371,7 @@ impl AiMemoryServer {
             .or(declared_agent)
             .or_else(|| sender.agent.as_deref().map(AgentKind::from_wire))
             .unwrap_or(AgentKind::Other);
-        // Only a session that already exists can be stored as provenance.
+        // Only an existing session in the sender's own scope is provenance.
         let from_session_id = candidate_session.filter(|_| recorded_session);
         let from_owner_user = sender.identity_key().map(|key| key.storage_key());
         let effective_from_agent = from_agent.as_str().to_owned();
@@ -7521,14 +7547,9 @@ impl AiMemoryServer {
             })
             .transpose()?;
         let candidate_session = aps_actor.session_id.as_deref().map(SessionId::from_native);
-        let recorded_agent = match candidate_session {
-            Some(sid) => self
-                .reader
-                .session_agent_kind(sid)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
-            None => None,
-        };
+        let recorded_agent = self
+            .caller_session_agent_in_scope(ws, proj, candidate_session, &caller)
+            .await?;
         // Routing metadata can arrive before the lifecycle hook inserts a session.
         // Only persisted sessions may be used as the claim's foreign key.
         let claiming_session = candidate_session.filter(|_| recorded_agent.is_some());
@@ -12070,6 +12091,175 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored.as_deref(), Some(session_id.as_bytes().as_slice()));
+    }
+
+    /// Adversarial (security-boundaries row 32c): the session header is
+    /// caller-controlled, so a session from another project or another
+    /// operator must not become the message's `from_session_id` or lend it
+    /// its harness. The caller's own session is the control.
+    #[tokio::test]
+    async fn message_send_ignores_a_session_outside_the_senders_scope() {
+        let (_tmp, store, server, ws, scratch) = setup_server().await;
+        store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "project-c", None)
+            .await
+            .unwrap();
+        let begin = |id: SessionId, project: ProjectId, actor_user: Option<&str>| {
+            let writer = store.writer.clone();
+            let actor_user = actor_user.map(str::to_owned);
+            async move {
+                writer
+                    .begin_session(NewSession {
+                        id,
+                        workspace_id: ws,
+                        project_id: project,
+                        agent_kind: AgentKind::Codex,
+                        cwd: None,
+                        actor_user,
+                        occurred_at: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+        let foreign_project = SessionId::new();
+        begin(foreign_project, other_project, Some("user:alice")).await;
+        let foreign_operator = SessionId::new();
+        begin(foreign_operator, scratch, Some("user:bob")).await;
+        let own = SessionId::new();
+        begin(own, scratch, Some("user:alice")).await;
+
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        for (label, session, expect_recorded) in [
+            ("another project's session", foreign_project, false),
+            ("another operator's session", foreign_operator, false),
+            ("the caller's own session", own, true),
+        ] {
+            let body = format!("provenance probe: {label}");
+            let mut parts = test_parts_default();
+            parts.headers.insert(
+                "x-memory-actor-session-id",
+                session.to_string().parse().unwrap(),
+            );
+            parts.extensions.insert(ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            });
+            server
+                .memory_message_send(
+                    Parameters(MessageSendArgs {
+                        to_workspace: "default".into(),
+                        to_project: "project-b".into(),
+                        to_agent: None,
+                        body: body.clone(),
+                        subject: None,
+                        nature: ai_memory_core::MessageNature::Unknown,
+                        evidence: None,
+                        from_agent: Some("grok".into()),
+                        from_project: Some("scratch".into()),
+                        from_workspace: Some("default".into()),
+                    }),
+                    OptionalParts(parts),
+                )
+                .await
+                .unwrap();
+            let (agent, stored): (String, Option<Vec<u8>>) = conn
+                .query_row(
+                    "SELECT from_agent, from_session_id FROM agent_messages WHERE body = ?1",
+                    [&body],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            if expect_recorded {
+                assert_eq!(agent, "codex", "{label}");
+                assert_eq!(
+                    stored.as_deref(),
+                    Some(session.as_bytes().as_slice()),
+                    "{label}"
+                );
+            } else {
+                assert_eq!(agent, "grok", "{label} must not lend its harness");
+                assert_eq!(stored, None, "{label} must not become provenance");
+            }
+        }
+    }
+
+    /// Adversarial (row 32c, claim side): a session header naming another
+    /// project's session must not make the caller that session's harness for
+    /// `to_agent` mail, nor be stored as the claiming session. A session of
+    /// the recipient project is the control.
+    #[tokio::test]
+    async fn message_pop_ignores_a_session_outside_the_claim_scope() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        let recipient = store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        let elsewhere = store
+            .writer
+            .get_or_create_project(ws, "project-c", None)
+            .await
+            .unwrap();
+        let foreign = SessionId::new();
+        let own = SessionId::new();
+        for (id, project) in [(foreign, elsewhere), (own, recipient)] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: project,
+                    agent_kind: AgentKind::Codex,
+                    cwd: None,
+                    actor_user: None,
+                    occurred_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        store
+            .writer
+            .insert_message(ai_memory_core::NewAgentMessage {
+                from_workspace_id: ws,
+                from_project_id: recipient,
+                from_agent: AgentKind::Other,
+                from_session_id: None,
+                from_owner_user: None,
+                to_workspace_id: ws,
+                to_project_id: recipient,
+                to_agent: Some(AgentKind::Codex),
+                subject: None,
+                body: "codex only".into(),
+                nature: ai_memory_core::MessageNature::Unknown,
+                evidence: None,
+            })
+            .await
+            .unwrap();
+        let pop = |session: SessionId| {
+            server.memory_message_pop(
+                Parameters(MessagePopArgs {
+                    agent: None,
+                    message_id: None,
+                    project: Some("project-b".into()),
+                    workspace: Some("default".into()),
+                }),
+                test_parts_with_session(&session.to_string()),
+            )
+        };
+        let foreign_pop = call_tool_json(pop(foreign).await.unwrap());
+        assert!(
+            foreign_pop["message"].is_null(),
+            "another project's session must not claim as its harness: {foreign_pop}"
+        );
+        let own_pop = call_tool_json(pop(own).await.unwrap());
+        assert_eq!(own_pop["message"]["body"], "codex only");
     }
 
     #[tokio::test]
