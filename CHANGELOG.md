@@ -209,6 +209,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- The MCP server instructions now carry a one-line index of every tool right
+  after the scope and trust core, ending within the 4,096 characters current
+  Claude Code keeps. Claude Code defers ai-memory's tools behind tool search,
+  and the cut used to land inside the first tool's routing, so the other 26
+  tools had no routing before Claude loaded them. A test keeps the index
+  complete and under the limit. (#1980)
 - `[[llm_fallbacks]]` entries now honor `api_key_env` for `copilot` and
   `anthropic-oauth`, which used to ignore it and send the native token.
   `openai-oauth`, `codex` and `cursor` have no key to override, so an entry

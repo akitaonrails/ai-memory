@@ -171,9 +171,13 @@ fn push_handoff_omission_marker(
 /// the agent can route natural-language requests without the user
 /// having to know the tool name or schema.
 ///
-/// Claude Code keeps only the first 2,048 characters, so everything before
-/// the "Detailed tool routing follows" marker must stay self-contained and
-/// within that cap.
+/// Claude Code before v2.1.296 kept only the first 2,048 characters, so
+/// everything before the "Detailed tool routing follows" marker must stay
+/// self-contained and within that cap. Current Claude Code keeps 4,096
+/// (<https://code.claude.com/docs/en/mcp#tool-search-for-mcp-server-authors>)
+/// and defers every tool behind tool search, so the one-line tool index right
+/// after the marker must end within 4,096: it is the only routing that
+/// reaches those sessions before a tool is loaded (#1980).
 pub const MEMORY_INSTRUCTIONS: &str = "\
 Long-term memory for the current project.\n\
 \n\
@@ -206,6 +210,31 @@ post-compaction anchor or your session's recorded prompts, and trust them over t
 summary.\n\
 \n\
 --- Detailed tool routing follows. ---\n\
+\n\
+Tool index (each tool's full routing follows):\n\
+- Recall: `memory_query` search before answering about prior work or \
+  proposing architecture; `memory_read_page` a page's full body (query hits \
+  are snippets); `memory_recent` newest pages; `memory_briefing` structured \
+  JSON snapshot; `memory_explore` prose catch-up; `memory_status` health and \
+  counts; `memory_read_session_observations` one session's raw captured \
+  prompts and tool events.\n\
+- Handoffs: `memory_handoff_begin` only when the user wraps up the session; \
+  `memory_handoff_list` open handoffs, read-only; `memory_handoff_accept` \
+  claim one when no SessionStart handoff block is in context; \
+  `memory_handoff_cancel` discard one begun by mistake.\n\
+- Inbox, the only way to reach another project: `memory_message_send`; \
+  `memory_message_list` pending mail, read-only; `memory_message_pop` claim \
+  one message; `memory_message_cancel` retract mail you sent.\n\
+- Durable pages, only on an explicit ask: `memory_write_page` write or \
+  replace one page; `memory_patch_page` edit sections of one; \
+  `memory_write_pages_batch` atomic bulk import; `memory_resolve_write_target` \
+  validate an import target first; `memory_delete_page`; `memory_restore_page` \
+  undo a change or deletion.\n\
+- Upkeep: `memory_feedback` mark a hit helpful, stale or wrong; \
+  `memory_consolidate` compile sessions into pages; `memory_auto_improve` \
+  propose lessons from a finished session; `memory_lint` audit the wiki; \
+  `memory_forget_sweep` prune expired and cold pages; \
+  `memory_install_self_routing` install this routing into a project.\n\
 \n\
 - `memory_query` — when the user references prior work you don't \
   recognise, or asks 'have we done / discussed X', or you're about \
@@ -12481,6 +12510,37 @@ mod tests {
                     && lower.contains("origin")
                     && lower.contains("last active project"),
                 "prompt must provide safe explicit-scope guidance"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_index_names_every_tool_within_claude_code_instruction_cap() {
+        // Claude Code (v2.1.296+) cuts server instructions at 4,096
+        // characters and defers every tool behind tool search, so this index
+        // is the only per-tool routing those sessions see up front (#1980).
+        // It counts JavaScript string length, i.e. UTF-16 code units.
+        const DETAIL_MARKER: &str = "--- Detailed tool routing follows. ---";
+        const FIRST_DETAIL_BLOCK: &str = "\n- `memory_query` — when";
+        let index_start = MEMORY_INSTRUCTIONS
+            .find(DETAIL_MARKER)
+            .expect("handshake instructions must delimit the bounded core");
+        let index_end = index_start
+            + MEMORY_INSTRUCTIONS[index_start..]
+                .find(FIRST_DETAIL_BLOCK)
+                .expect("detailed routing must follow the tool index");
+        let head = &MEMORY_INSTRUCTIONS[..index_end];
+        let units = head.encode_utf16().count();
+        let chars = head.chars().count();
+        assert!(
+            units <= 4096 && chars <= 4096,
+            "tool index ends at {units} UTF-16 units / {chars} chars, past the 4,096 cap"
+        );
+        let index = &MEMORY_INSTRUCTIONS[index_start..index_end];
+        for tool in MCP_TOOL_NAMES {
+            assert!(
+                index.contains(&format!("`{tool}`")),
+                "tool index omits {tool}"
             );
         }
     }
