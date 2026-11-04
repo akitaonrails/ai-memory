@@ -507,10 +507,10 @@ estimate is nonzero.
 The telemetry stores no prompt, completion, scope, project, or caller-supplied
 label. A fallback chain is measured as one provider-interface invocation, not
 as one call per internal candidate attempt; an outer caller retry is another
-invocation. Workload labels do not select a
-provider or model: all operations still use the configured global provider and
-fallback chain. Per-workload routing remains measure-first and has no public
-configuration surface.
+invocation. The workload label itself never selects a provider or model. A
+task uses its own provider and fallback chain only when the config declares an
+`[llm.<task>]` profile for it (see `config.default.toml`); every other task
+uses the global provider and its fallback chain.
 
 Embeddings are optional and separate from the LLM provider. Set
 `AI_MEMORY_EMBEDDING_PROVIDER=openai`, `voyage`, `google`/`gemini`,

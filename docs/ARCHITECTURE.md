@@ -972,10 +972,10 @@ caller, or unbounded label. State is in memory, resets on restart, and does not
 choose a provider or model. The server constructs the wrapper once at startup;
 there is no runtime provider hot-reload.
 
-This instrumentation is the evidence gate for any future per-operation
-provider profiles. The current configuration remains one global provider plus
-its ordered fallback chain; no routing surface exists until measured latency,
-usage, and quality justify the added auth and configuration boundary.
+The labels route nothing. An `[llm.<task>]` profile in the config gives that
+task its own provider and fallback chain (#1969), every other task uses the
+global provider and its ordered fallback chain, and `llm_task_chains` reports
+the health of each configured task chain.
 
 ### Web search and the recall trace
 
