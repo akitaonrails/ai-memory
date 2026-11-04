@@ -174,13 +174,20 @@ fn secret_patterns() -> &'static [RedactionRule] {
                 .unwrap(),
                 replacement: "[REDACTED CREDENTIAL]",
             },
+            // ai-memory's own `aim_` keys and `ams_` session secrets. Outside
+            // the `\b…\b` rule above: base64url can end in `-`, where a
+            // closing `\b` would leave the last character behind.
+            RedactionRule {
+                regex: Regex::new(r"\b(?:aim|ams)_[A-Za-z0-9_-]{40,}").unwrap(),
+                replacement: "[REDACTED CREDENTIAL]",
+            },
             RedactionRule {
                 regex: Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}").unwrap(),
                 replacement: "$1[REDACTED]",
             },
             RedactionRule {
                 regex: Regex::new(
-                    r#"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)\b(\s*[:=]\s*)(\"[^\"\r\n]{6,}\"|'[^'\r\n]{6,}'|(?:\[REDACTED(?: CREDENTIAL| PRIVATE KEY)?\]|[^\s,;])+)"#,
+                    r#"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)\b((?:\\*")?\s*[:=]\s*)(\\*"[^"\\\r\n]{6,}\\*"|'[^'\r\n]{6,}'|(?:\[REDACTED(?: CREDENTIAL| PRIVATE KEY)?\]|[^\s,;])+)"#,
                 )
                 .unwrap(),
                 replacement: "$1$2[REDACTED]",

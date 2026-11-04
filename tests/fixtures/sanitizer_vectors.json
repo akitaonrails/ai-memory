@@ -3,7 +3,13 @@
   "credentials": [
     "sk-leak-0123456789abcdef0123",
     "ghp_FAKE0123456789ABCDEFGHIJ0123",
-    "AKIAFAKEFAKEFAKEFAKE"
+    "AKIAFAKEFAKEFAKEFAKE",
+    "aim_FAKEfake0123-_xyFAKEfake0123-_xyFAKEfake0123-_xy"
+  ],
+  "credential_fields": [
+    {"input": "{\"auth_mode\":\"static\",\"token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"attempts\":0}", "secret": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "kept": ["attempts"]},
+    {"input": "{\"stdout\":\"{\\\"auth_mode\\\":\\\"static\\\",\\\"token\\\":\\\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\\",\\\"attempts\\\":0}\\n\"}", "secret": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "kept": ["attempts"]},
+    {"input": "token = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"", "secret": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
   ],
   "invisibles": [
     "\u200b",
