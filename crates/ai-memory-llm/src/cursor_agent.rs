@@ -29,6 +29,7 @@ use crate::auth::CursorAuth;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, Role};
+use ai_memory_core::Sanitizer;
 
 /// Model used when `AI_MEMORY_LLM_MODEL` is unset.
 ///
@@ -221,10 +222,14 @@ impl CursorAgentProvider {
         let (status, stdout, stderr) = collected;
         if !status.success() {
             let code = status.code().unwrap_or(1);
-            let body = String::from_utf8_lossy(&stderr);
+            // Cursor agent's stderr may echo session content or environment
+            // fragments — run the same built-in secret scrubber the HTTP
+            // providers use before anything reaches a log or the caller.
+            let raw = String::from_utf8_lossy(&stderr);
+            let scrubbed = Sanitizer::builtin().scrub(&raw);
             return Err(LlmError::Provider {
                 status: u16::try_from(code).unwrap_or(1),
-                body: truncate_chars(&body, 500),
+                body: crate::text::truncate_with_ellipsis(&scrubbed, 500),
                 retry_after: None,
             });
         }
