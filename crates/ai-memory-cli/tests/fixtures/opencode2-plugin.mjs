@@ -17,7 +17,11 @@ globalThis.fetch = async (input, options = {}) => {
     throw new DOMException("The operation timed out.", "TimeoutError");
   }
   if (url.pathname === "/recap" && url.searchParams.get("mode") === "anchor") {
-    return new Response(`ANCHOR ${url.searchParams.get("session_id")}`);
+    // `root-slow` stands for a server that predates `mode=anchor`: its
+    // answer is the full recap, which must never be injected automatically.
+    const id = url.searchParams.get("session_id");
+    return new Response(id === "root-slow" ? "> 🧭 ai-memory: compaction recap for this session"
+      : `> 🧭 ai-memory: post-compaction anchor for this session (${id})`);
   }
   return new Response(url.pathname === "/handoff" ? "Remember the verified handoff." : "{}");
 };
@@ -145,7 +149,7 @@ try {
   for (let i = 0; i < 2; i++) {
     const call = { sessionID: "root-a", system: [] };
     await a.hooks.get("session.context")(call);
-    assert.ok(call.system.some((part) => part.text === "ANCHOR root-a"), "anchor rides every model call until the next compaction");
+    assert.ok(call.system.some((part) => part.text === "> 🧭 ai-memory: post-compaction anchor for this session (root-a)"), "anchor rides every model call until the next compaction");
   }
   assert.equal(anchors().length, 1, "the anchor is fetched once per compaction");
   const stopsBefore = stopCount();
@@ -154,8 +158,13 @@ try {
   await until(() => stopCount() > stopsBefore, "events after the next compaction start processed");
   const afterNext = { sessionID: "root-a", system: [] };
   await a.hooks.get("session.context")(afterNext);
-  assert.ok(!afterNext.system.some((part) => part.text === "ANCHOR root-a"), "the next compaction forgets the anchor");
+  assert.ok(!afterNext.system.some((part) => part.text === "> 🧭 ai-memory: post-compaction anchor for this session (root-a)"), "the next compaction forgets the anchor");
   assert.equal(anchors().length, 1, "a subagent compaction never fetches an anchor");
+  a.emit({ type: "session.compaction.ended", data: { sessionID: "root-slow", reason: "auto", text: "summary" } });
+  await until(() => anchors().length === 2, "an older server is still asked");
+  const oldServer = { sessionID: "root-slow", system: [] };
+  await a.hooks.get("session.context")(oldServer);
+  assert.ok(!oldServer.system.some((part) => part.text.includes("compaction recap")), "an older server's recap is never injected");
 
   await b.hooks.get("session.prompt")({ sessionID: "root-b", messageID: "b1", prompt: { text: "beta" } });
   await b.hooks.get("session.context")({ sessionID: "root-b", system: [] });

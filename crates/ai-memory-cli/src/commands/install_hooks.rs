@@ -5453,6 +5453,9 @@ const recapFetches = new Map<string, Promise<string | undefined>>();
 // the post-compaction anchor (its first and latest operator prompts) is armed
 // when a compaction ends and delivered beside the recap until the next one.
 const ANCHOR_BUDGET = 2000;
+// Only a real anchor is injected: an older server ignores `mode` and answers
+// with the full recap, and an unknown session gets a notice.
+const ANCHOR_HEADER = {anchor_header};
 const anchorFetches = new Map<string, Promise<string | undefined>>();
 const preCompactLast = new Map<string, number>();
 
@@ -5589,6 +5592,7 @@ async function fetchRecap(cwd: string, id: string, anchor = false): Promise<stri
     }});
     if (!response.ok) return undefined;
     const recap = (await response.text()).trim();
+    if (anchor && !recap.startsWith(ANCHOR_HEADER)) return undefined;
     return recap || undefined;
   }} catch (_e) {{
     return undefined;
@@ -5738,6 +5742,7 @@ export default AiMemoryHooks;
         server_literal = ts_string_literal(server_url),
         token_line = token_line,
         reload_trigger = ai_memory_core::compaction_recap::RELOAD_TRIGGER_JS_REGEX,
+        anchor_header = ts_string_literal(super::hook::ANCHOR_HEADER),
     );
     // Anchors are compile-time constants over this same file's template;
     // a mismatch is a template edit that forgot the spool patch.
@@ -15600,7 +15605,11 @@ const server = createServer((req, res) => {
       const mode = url.searchParams.get("mode");
       recaps.push({ mode, budget: url.searchParams.get("budget"), session_id: url.searchParams.get("session_id") });
       res.writeHead(200, { "content-type": "text/plain" });
-      res.end(mode === "anchor" ? `ANCHOR ${url.searchParams.get("session_id")}` : "RECAP");
+      const id = url.searchParams.get("session_id");
+      // `old` stands for a server that predates `mode=anchor`.
+      res.end(mode === "anchor" && id !== "old"
+        ? `> 🧭 ai-memory: post-compaction anchor for this session (${id})`
+        : "RECAP");
       return;
     }
     res.writeHead(204);
@@ -15630,6 +15639,10 @@ async function compacting(id: string): Promise<Record<string, unknown>> {
 const compacted = (id: string) => plugin.event({ event: { type: "session.compacted", properties: { sessionID: id } } });
 await created("root");
 await created("task", "root");
+await created("old");
+await compacting("old");
+await compacted("old");
+const oldAfter = await modelCall("old");
 const before = await modelCall("root");
 const rootCompacting = await compacting("root");
 const taskCompacting = await compacting("task");
@@ -15642,7 +15655,7 @@ const reload = await modelCall("root");
 await compacting("root");
 const afterNext = await modelCall("root");
 await plugin.dispose();
-console.log(JSON.stringify({ before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }));
+console.log(JSON.stringify({ oldAfter, before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }));
 process.exit(0);
 "#;
 
@@ -15661,7 +15674,11 @@ process.exit(0);
                 OPENCODE_COMPACTION_HARNESS,
                 &project,
             );
-            let anchor = serde_json::json!("ANCHOR root");
+            let anchor =
+                serde_json::json!("> 🧭 ai-memory: post-compaction anchor for this session (root)");
+            // A server that ignores `mode=anchor` answers with its recap,
+            // which is never injected automatically.
+            assert!(run["oldAfter"].as_array().unwrap().is_empty(), "{run}");
             let has = |key: &serde_json::Value, text: &serde_json::Value| {
                 key.as_array().unwrap().contains(text)
             };
@@ -15692,6 +15709,7 @@ process.exit(0);
             assert_eq!(
                 run["recaps"],
                 serde_json::json!([
+                    {"mode": "anchor", "budget": "2000", "session_id": "old"},
                     {"mode": "anchor", "budget": "2000", "session_id": "root"},
                     {"mode": null, "budget": null, "session_id": "root"},
                 ]),

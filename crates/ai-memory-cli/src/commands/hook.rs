@@ -1303,6 +1303,12 @@ fn recap_url(base: &str, agent: &str, session_id: &str, budget: Option<usize>) -
 /// budget serves every agent because it already fits Codex's limit.
 const ANCHOR_BUDGET: usize = 2_000;
 const _: () = assert!(ANCHOR_BUDGET <= CODEX_RECAP_BUDGET);
+/// The first line of a real anchor. A server that predates `mode=anchor`
+/// ignores it and answers with the full recap (up to 8,000 chars), and an
+/// unknown or refused session gets a "no session is recorded" notice; neither
+/// starts with this, so neither is injected automatically. A session with no
+/// prompts yet still gets its short anchor, which names where the record is.
+pub(crate) const ANCHOR_HEADER: &str = "> 🧭 ai-memory: post-compaction anchor for this session";
 
 /// Whether a `SessionStart` is the one an agent fires right after a context
 /// compaction, which adds its `additionalContext` to the compacted context:
@@ -2168,7 +2174,9 @@ where
                 let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
                 let url = anchor_url(base, &args.agent, session_id);
                 if let Some(anchor) =
-                    get_handoff(&client, &url, bearer.as_deref(), handoff_timeout()).await
+                    get_handoff(&client, &url, bearer.as_deref(), handoff_timeout())
+                        .await
+                        .filter(|body| body.starts_with(ANCHOR_HEADER))
                 {
                     let envelope = session_start_handoff_envelope(agent_kind, anchor);
                     writeln!(stdout, "{envelope}")?;
@@ -11186,7 +11194,7 @@ mod tests {
         ];
         for (agent, args) in agents {
             let tmp = tempfile::tempdir().unwrap();
-            let (base, mut requests) = serve_requests("200 OK", "ANCHOR-BODY").await;
+            let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
             let stdout = run_hook(
                 &tmp.path().join("data"),
                 args("session-start", &base),
@@ -11199,7 +11207,7 @@ mod tests {
                 serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext": "ANCHOR-BODY",
+                        "additionalContext": ANCHOR_SAMPLE,
                     }
                 }),
                 "{agent}"
@@ -11224,6 +11232,36 @@ mod tests {
             let drain = seen.iter().position(|r| r.starts_with("POST /hook"));
             let anchor = seen.iter().position(|r| r.starts_with("GET /recap"));
             assert!(drain.is_some() && drain < anchor, "{agent}: {seen:?}");
+        }
+    }
+
+    const ANCHOR_SAMPLE: &str = "> 🧭 ai-memory: post-compaction anchor for this session (compacted-session)\n> The summary may have lost detail.";
+
+    /// An older server ignores `mode=anchor` and answers with the full recap
+    /// or its "no compaction" notice; an unknown or refused session gets the
+    /// anchor's own notice. None of them is injected.
+    #[tokio::test]
+    async fn compact_session_start_injects_only_a_real_anchor() {
+        for body in [
+            "> 🧭 ai-memory: compaction recap for this session\n<!-- ai-memory:untrusted-history:start -->\nold recap",
+            "> 🧭 ai-memory: no compaction is recorded for this session yet.",
+            "> 🧭 ai-memory: post-compaction anchor: no session is recorded for this id.",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", body).await;
+            let stdout = run_hook(
+                &tmp.path().join("data"),
+                claude_args("session-start", &base),
+                session_start_payload(tmp.path(), "compacted-session", "compact"),
+            )
+            .await;
+            assert_eq!(stdout, b"{}\n", "{body}");
+            let seen = all_requests(&mut requests).await;
+            assert_eq!(recap_requests(&seen).len(), 1, "{seen:?}");
+            assert!(
+                !seen.iter().any(|r| r.starts_with("GET /handoff")),
+                "{seen:?}"
+            );
         }
     }
 
