@@ -1974,23 +1974,30 @@ pub fn capture_lookup_locations(
     raw: &Value,
     cwd: &str,
     home: Option<&str>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<LookupLocation>> {
     let extracted = extract(agent, raw);
-    let mut seen = std::collections::HashSet::new();
-    let mut locations = Vec::new();
-    let mut push = |candidate: Option<Normalized>| -> Option<()> {
+    let mut seen = std::collections::HashMap::new();
+    let mut locations: Vec<LookupLocation> = Vec::new();
+    let mut push = |candidate: Option<Normalized>, literal: LiteralGroups| -> Option<()> {
         let Some(candidate) = candidate else {
             return Some(());
         };
-        let location = native_path(candidate);
-        if seen.insert(location.clone()) {
-            if locations.len() == MAX_LOOKUP_LOCATIONS {
-                return None;
-            }
-            locations.push(location);
+        let path = native_path(candidate);
+        if let Some(&index) = seen.get(&path) {
+            // Spelled twice, the location reads as syntax wherever either
+            // spelling does.
+            let location: &mut LookupLocation = &mut locations[index];
+            location.literal = location.literal.and(literal);
+            return Some(());
         }
+        if locations.len() == MAX_LOOKUP_LOCATIONS {
+            return None;
+        }
+        seen.insert(path.clone(), locations.len());
+        locations.push(LookupLocation { path, literal });
         Some(())
     };
+    let syntax = LiteralGroups::default();
     // Every reading of a glob whose `..` follows a `**` ([`normalize_readings`]).
     let readings = |path: &str, base: &str| normalize_readings(path, base).ok();
     match (extracted.family, extracted.command.as_ref()) {
@@ -2001,7 +2008,7 @@ pub fn capture_lookup_locations(
                 .or(extracted.patch_paths.as_ref())?;
             for path in paths {
                 for candidate in readings(path, cwd)?? {
-                    push(Some(candidate))?;
+                    push(Some(candidate), syntax)?;
                 }
             }
         }
@@ -2011,7 +2018,7 @@ pub fn capture_lookup_locations(
             for root in &scope.roots {
                 for root in readings(root, cwd)?? {
                     roots.push(native_path(root.clone()));
-                    push(Some(root))?;
+                    push(Some(root), syntax)?;
                 }
             }
             if roots.is_empty() {
@@ -2022,7 +2029,7 @@ pub fn capture_lookup_locations(
             for pattern in scope.patterns.iter().filter(|p| p.contains(['/', '\\'])) {
                 for root in &roots {
                     for candidate in readings(pattern, root)?? {
-                        push(Some(candidate))?;
+                        push(Some(candidate), syntax)?;
                     }
                 }
             }
@@ -2032,15 +2039,25 @@ pub fn capture_lookup_locations(
                 return None;
             }
             let base = command_base(extracted.workdir.as_deref(), cwd);
-            push(normalize_candidate(&base, &base))?;
+            push(normalize_candidate(&base, &base), syntax)?;
             let home = home.and_then(|dir| normalize_root(dir).ok());
             let split = command.split(extracted.powershell || flavor_of(cwd) == Flavor::Windows);
-            for (word, tilde) in split.words.iter().chain(&split.expanded) {
+            let words = split.words.iter().map(|(word, tilde)| {
+                let literal = split.literal.get(word).copied().unwrap_or_default();
+                (word, *tilde, literal)
+            });
+            let expanded = split
+                .expanded
+                .iter()
+                .map(|(word, tilde)| (word, *tilde, syntax));
+            for (word, tilde, literal) in words.chain(expanded) {
                 for (argument, _) in shell_arguments(word) {
-                    let expanded = expand_tilde(argument, *tilde, home.as_deref(), &base);
-                    if expanded.contains(['/', '\\']) {
-                        for candidate in readings(&expanded, &base)?.into_iter().flatten() {
-                            push(Some(candidate))?;
+                    let expanded = expand_tilde(argument, tilde, home.as_deref(), &base);
+                    for (text, literal) in quoted_brace_readings(expanded, literal) {
+                        if text.contains(['/', '\\']) {
+                            for candidate in readings(&text, &base)?.into_iter().flatten() {
+                                push(Some(candidate), literal)?;
+                            }
                         }
                     }
                 }
@@ -2049,6 +2066,67 @@ pub fn capture_lookup_locations(
         _ => {}
     }
     Some(locations)
+}
+
+/// A location [`capture_lookup_locations`] names, and which of its glob
+/// syntax is text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupLocation {
+    /// The absolute location, in its own separator style.
+    pub path: String,
+    literal: LiteralGroups,
+}
+
+impl LookupLocation {
+    /// How to follow the location ([`glob_walk`]), reading a group or brace
+    /// its shell word quoted as text.
+    #[must_use]
+    pub fn walk(&self) -> GlobWalk {
+        glob_walk_with(&self.path, self.literal)
+    }
+}
+
+/// Which groups (`(`…`)`) and braces (`{`…`}`) of a location are text rather
+/// than glob syntax: those a shell word quoted. A shell expands neither
+/// inside quotes, so an unbalanced one there cannot span a separator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiteralGroups {
+    parens: bool,
+    braces: bool,
+}
+
+impl LiteralGroups {
+    /// Text only where both readings say so.
+    fn and(self, other: Self) -> Self {
+        Self {
+            parens: self.parens && other.parens,
+            braces: self.braces && other.braces,
+        }
+    }
+}
+
+/// `text`, and when its braces are quoted text that still lists
+/// alternatives (`'{a/x,b}'`), each alternative too: a program that globs
+/// its argument itself (`rg -g`, `fd`) expands them, so the lookup follows
+/// each one. Past [`MAX_BRACE_ALTERNATIVES`] the braces read as syntax again.
+fn quoted_brace_readings(text: String, literal: LiteralGroups) -> Vec<(String, LiteralGroups)> {
+    if !literal.braces || !text.contains('{') {
+        return vec![(text, literal)];
+    }
+    match brace_alternatives(&text) {
+        Some(alternatives) if alternatives.len() > 1 => std::iter::once(text)
+            .chain(alternatives)
+            .map(|reading| (reading, literal))
+            .collect(),
+        Some(_) => vec![(text, literal)],
+        None => vec![(
+            text,
+            LiteralGroups {
+                braces: false,
+                ..literal
+            },
+        )],
+    }
 }
 
 /// Where a search/list tool reads: see [`Extracted::search_scope`].
@@ -2228,9 +2306,18 @@ pub fn glob_segment_matches(segment: &str, name: &str) -> bool {
 /// only ever adds directories.
 #[must_use]
 pub fn glob_walk(location: &str) -> GlobWalk {
+    glob_walk_with(location, LiteralGroups::default())
+}
+
+/// [`glob_walk`], reading the groups and braces `literal` names as text.
+fn glob_walk_with(location: &str, literal: LiteralGroups) -> GlobWalk {
     // A parameter expansion's braces are not a brace expansion; the shell
     // split also reads the word with each default in its place.
-    let syntax = |segment: &str| segment.contains(['*', '?', '[', '{', '(']);
+    let syntax = |segment: &str| {
+        segment.contains(['*', '?', '['])
+            || (!literal.braces && segment.contains('{'))
+            || (!literal.parens && segment.contains('('))
+    };
     if location.contains("${") || !syntax(location) {
         return GlobWalk::Literal;
     }
@@ -2276,7 +2363,8 @@ pub fn glob_walk(location: &str) -> GlobWalk {
                 .any(|piece| piece == ".." || piece.starts_with('~'))
         };
         let leaves = leaves_at(segment)
-            || (segment.contains('{')
+            || (!literal.braces
+                && segment.contains('{')
                 && match brace_alternatives(segment) {
                     Some(alternatives) => alternatives.iter().any(|alternative| {
                         alternative.contains(['/', '\\'])
@@ -2285,7 +2373,10 @@ pub fn glob_walk(location: &str) -> GlobWalk {
                     }),
                     None => brace_overflow_could_leave(segment),
                 });
-        if leaves || !balanced('{', '}') || !balanced('(', ')') {
+        if leaves
+            || (!literal.braces && !balanced('{', '}'))
+            || (!literal.parens && !balanced('(', ')'))
+        {
             return GlobWalk::Unprovable;
         }
         if segment.contains("**") {
@@ -2689,6 +2780,9 @@ enum ShellCommand<'a> {
 #[derive(Default)]
 struct ShellWords {
     words: Vec<(String, bool)>,
+    /// Which of the groups and braces in each of `words` are text: every
+    /// reading of that word agreed ([`LiteralGroups::and`]).
+    literal: std::collections::HashMap<String, LiteralGroups>,
     opaque: bool,
     /// The words of each script that holds such syntax, read as the shell
     /// expands them where that can change which directory a path names: a
@@ -2770,7 +2864,7 @@ impl ShellCommand<'_> {
             Self::Line(command) => {
                 split.opaque = has_unevaluated_expansion(command);
                 if split.opaque {
-                    split.expanded.extend(shell_tokens(command, true));
+                    split.expanded.extend(expanded_words(command));
                 }
                 for (text, literal) in readings(command) {
                     push_nested_words(
@@ -2787,7 +2881,7 @@ impl ShellCommand<'_> {
                 split.opaque = items.iter().any(|item| has_unevaluated_expansion(item))
                     || runs_inline_code(items);
                 for item in items.iter().filter(|item| has_unevaluated_expansion(item)) {
-                    split.expanded.extend(shell_tokens(item, true));
+                    split.expanded.extend(expanded_words(item));
                 }
                 for (index, item) in items.iter().enumerate() {
                     // An element reaches the program as is, so only a script
@@ -2820,32 +2914,51 @@ impl ShellCommand<'_> {
 fn push_argv_item(item: &str, script: bool, literal: bool, split: &mut ShellWords) {
     let tokens = split_words(item, literal);
     if tokens.len() == 1 && tokens[0].0 == item {
-        push_word(item, false, split);
+        let marks = Marks {
+            tilde: false,
+            bare_brace: script && tokens[0].1.bare_brace,
+        };
+        push_word(item, marks, split);
         return;
     }
     // Kept whole, a long script would exhaust the match budget.
     if item.chars().count() <= MAX_ARGV_PATH_CHARS {
-        split.words.push((item.to_owned(), false));
+        // An element reaches the program as is; a script's groups and braces
+        // are the shell's, read through its words below.
+        let literal = LiteralGroups {
+            parens: !script,
+            braces: !script,
+        };
+        add_word(item.to_owned(), false, literal, split);
     }
     push_nested_words(
-        &literal_tildes(tokens, script),
+        &literal_marks(tokens, script),
         MAX_SHELL_NESTING - 1,
         literal,
         split,
     );
 }
 
-/// `tokens` re-split from one word, whose unquoted tildes count only when a
-/// shell runs that word as a script; in a quoted message or pattern
-/// (`-m "fix ~approx"`, `grep '~[a-z]+'`) a tilde is literal.
-fn literal_tildes(tokens: Vec<(String, bool)>, script: bool) -> Vec<(String, bool)> {
+/// `tokens` re-split from one word, whose unquoted tildes and braces count
+/// only when a shell runs that word as a script; in a quoted message or
+/// pattern (`-m "fix ~approx"`, `grep '~[a-z]+'`, `awk '{print $1/2}'`) they
+/// are text.
+fn literal_marks(tokens: Vec<(String, Marks)>, script: bool) -> Vec<(String, Marks)> {
     if script {
         return tokens;
     }
     tokens
         .into_iter()
-        .map(|(token, _)| (token, false))
+        .map(|(token, _)| (token, Marks::default()))
         .collect()
+}
+
+/// The words of a script with syntax the matcher does not evaluate, read as
+/// the shell expands them ([`ShellWords::expanded`]).
+fn expanded_words(script: &str) -> impl Iterator<Item = (String, bool)> {
+    shell_tokens(script, true)
+        .into_iter()
+        .map(|(word, marks)| (word, marks.tilde))
 }
 
 /// `command` without PowerShell's backquote and cmd's caret escapes, each of
@@ -2904,7 +3017,7 @@ const MAX_SHELL_NESTING: usize = 4;
 /// `literal` re-splits each word with its backslashes kept
 /// ([`split_words`]).
 fn push_nested_words(
-    words: &[(String, bool)],
+    words: &[(String, Marks)],
     depth: usize,
     literal: bool,
     split: &mut ShellWords,
@@ -2913,8 +3026,8 @@ fn push_nested_words(
     if runs_inline_code(&texts) {
         split.opaque = true;
     }
-    for (index, (word, tilde)) in words.iter().enumerate() {
-        push_word(word, *tilde, split);
+    for (index, (word, marks)) in words.iter().enumerate() {
+        push_word(word, *marks, split);
         let tokens = split_words(word, literal);
         if tokens.len() == 1 && tokens[0].0 == *word {
             continue;
@@ -2929,9 +3042,9 @@ fn push_nested_words(
         let script = word.contains("$(") || word.contains('`') || is_shell_script(&texts, index);
         if script && has_unevaluated_expansion(word) {
             split.opaque = true;
-            split.expanded.extend(shell_tokens(word, true));
+            split.expanded.extend(expanded_words(word));
         }
-        push_nested_words(&literal_tildes(tokens, script), depth, literal, split);
+        push_nested_words(&literal_marks(tokens, script), depth, literal, split);
     }
 }
 
@@ -2940,15 +3053,24 @@ fn push_nested_words(
 /// Windows path keeps its separators. A word with a parameter default
 /// (`${X:-docs/x.md}`) also adds the reading with the operand in its place,
 /// of the word as written and of its POSIX reading (`${X:-d\ocs/x.md}`).
-/// `tilde` says whether a `~` in the word was outside quotes.
-fn push_word(word: &str, tilde: bool, split: &mut ShellWords) {
-    push_word_reading(word, tilde, split);
+/// `marks` says how the word was quoted.
+fn push_word(word: &str, marks: Marks, split: &mut ShellWords) {
+    push_word_reading(word, marks, split);
     if word.contains('\\') {
         let plain = without_backslash_escapes(word);
         if plain != word {
-            push_word_reading(&plain, tilde, split);
+            push_word_reading(&plain, marks, split);
         }
     }
+}
+
+fn add_word(word: String, tilde: bool, literal: LiteralGroups, split: &mut ShellWords) {
+    split
+        .literal
+        .entry(word.clone())
+        .and_modify(|seen| *seen = seen.and(literal))
+        .or_insert(literal);
+    split.words.push((word, tilde));
 }
 
 /// `word` as a POSIX shell reads its unquoted backslashes: each escapes the
@@ -2966,10 +3088,16 @@ fn without_backslash_escapes(word: &str) -> String {
     plain
 }
 
-fn push_word_reading(word: &str, tilde: bool, split: &mut ShellWords) {
-    split.words.push((word.to_owned(), tilde));
+fn push_word_reading(word: &str, marks: Marks, split: &mut ShellWords) {
+    // An unquoted `(` ends a word, so one inside a word is quoted or
+    // escaped: text, never a group.
+    let literal = LiteralGroups {
+        parens: true,
+        braces: !marks.bare_brace,
+    };
+    add_word(word.to_owned(), marks.tilde, literal, split);
     if let Some((operands, exhausted)) = parameter_operands(word) {
-        split.words.push((operands, tilde));
+        add_word(operands, marks.tilde, literal, split);
         // A default nested deeper than the matcher reads is unprovable.
         split.opaque |= exhausted;
     }
@@ -3327,29 +3455,39 @@ fn shell_words(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// [`shell_words`], each word with whether it holds a `~` outside quotes and
-/// not after a backslash, the only tilde a shell expands.
-fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
+/// How a shell word was quoted, for the readings that depend on it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Marks {
+    /// A `~` outside quotes and not after a backslash, the only tilde a
+    /// shell expands.
+    tilde: bool,
+    /// A `{` or `}` outside quotes, which a brace expansion may read. A
+    /// quoted one is text to the shell.
+    bare_brace: bool,
+}
+
+/// [`shell_words`], each word with how it was quoted ([`Marks`]).
+fn marked_shell_words(command: &str) -> Vec<(String, Marks)> {
     shell_tokens(command, false)
 }
 
 /// [`marked_shell_words`]; with `expand`, a zsh glob group stays inside its
 /// word (`docs/(a|b)/x`, `(a|b)/x`) instead of splitting it as a subshell, and
 /// the numeric and control escapes of an ANSI-C string are decoded.
-fn shell_tokens(command: &str, expand: bool) -> Vec<(String, bool)> {
+fn shell_tokens(command: &str, expand: bool) -> Vec<(String, Marks)> {
     tokenize(command, expand, false)
 }
 
 /// [`marked_shell_words`] with every backslash an ordinary character, as
 /// PowerShell and cmd read it: `\\srv\share\x`, bare or double-quoted, keeps
 /// both leading backslashes.
-fn literal_shell_words(command: &str) -> Vec<(String, bool)> {
+fn literal_shell_words(command: &str) -> Vec<(String, Marks)> {
     tokenize(command, false, true)
 }
 
 /// The words of `command` read with POSIX quoting ([`shell_tokens`]), or,
 /// with `literal`, with backslashes kept as written ([`literal_shell_words`]).
-fn split_words(command: &str, literal: bool) -> Vec<(String, bool)> {
+fn split_words(command: &str, literal: bool) -> Vec<(String, Marks)> {
     if literal {
         literal_shell_words(command)
     } else {
@@ -3358,11 +3496,11 @@ fn split_words(command: &str, literal: bool) -> Vec<(String, bool)> {
 }
 
 /// [`shell_tokens`]; `literal` reads every backslash as an ordinary character.
-fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, bool)> {
+fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, Marks)> {
     let is_operator = |c: char| matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`');
     let mut words = Vec::new();
     let mut word = String::new();
-    let mut tilde = false;
+    let mut marks = Marks::default();
     let mut in_word = false;
     let mut quote = None;
     let mut chars = command.chars().peekable();
@@ -3430,19 +3568,20 @@ fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, bool)> {
             }
             (None, c) if c.is_whitespace() || is_operator(c) => {
                 if in_word {
-                    words.push((std::mem::take(&mut word), tilde));
-                    (in_word, tilde) = (false, false);
+                    words.push((std::mem::take(&mut word), std::mem::take(&mut marks)));
+                    in_word = false;
                 }
             }
             (None, c) => {
-                tilde |= c == '~' && !word.ends_with('\\');
+                marks.tilde |= c == '~' && !word.ends_with('\\');
+                marks.bare_brace |= matches!(c, '{' | '}');
                 word.push(c);
                 in_word = true;
             }
         }
     }
     if in_word {
-        words.push((word, tilde));
+        words.push((word, marks));
     }
     words
 }
@@ -4537,6 +4676,16 @@ fn char_equal(left: char, right: char, insensitive: bool) -> bool {
 mod tests {
     use super::*;
 
+    /// The paths [`capture_lookup_locations`] names, without how each reads.
+    fn location_paths(found: Option<Vec<LookupLocation>>) -> Option<Vec<String>> {
+        found.map(|locations| {
+            locations
+                .into_iter()
+                .map(|location| location.path)
+                .collect()
+        })
+    }
+
     /// The routed `cwd` is built from these paths, so a Windows target keeps
     /// backslashes (as the harness reports every other cwd) while `..` is
     /// still collapsed; a POSIX target is unchanged. Windows CI caught the
@@ -5405,7 +5554,12 @@ mod tests {
             CaptureDisposition::Keep
         );
         assert_eq!(
-            capture_lookup_locations(AgentKind::Droid, &patch("../other/x.rs"), "/repo", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Droid,
+                &patch("../other/x.rs"),
+                "/repo",
+                None
+            )),
             Some(vec!["/other/x.rs".to_owned()])
         );
         assert_eq!(
@@ -5437,7 +5591,12 @@ mod tests {
         // Droid's directory and glob arguments locate the call in another
         // checkout.
         let elsewhere = |name: &str, input: Value| {
-            capture_lookup_locations(AgentKind::Droid, &call(name, input), "/repo", None)
+            location_paths(capture_lookup_locations(
+                AgentKind::Droid,
+                &call(name, input),
+                "/repo",
+                None,
+            ))
         };
         assert_eq!(
             elsewhere("LS", json!({"directory_path": "/other/docs"})),
@@ -5956,7 +6115,12 @@ mod tests {
         assert_eq!(excluded.tool_family(), ToolFamily::File);
         assert_eq!(excluded.disposition(), CaptureDisposition::MetadataOnly);
         assert_eq!(
-            capture_lookup_locations(AgentKind::Muse, &patch("../other/x.rs"), "/repo", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Muse,
+                &patch("../other/x.rs"),
+                "/repo",
+                None
+            )),
             Some(vec!["/other/x.rs".to_owned()])
         );
 
@@ -5966,7 +6130,7 @@ mod tests {
         assert_eq!(decision.tool_family(), ToolFamily::SearchList);
         assert_eq!(decision.disposition(), CaptureDisposition::Drop);
         assert_eq!(
-            capture_lookup_locations(
+            location_paths(capture_lookup_locations(
                 AgentKind::Muse,
                 &call(
                     "search",
@@ -5974,7 +6138,7 @@ mod tests {
                 ),
                 "/repo",
                 None
-            ),
+            )),
             Some(vec!["/other".to_owned(), "/other/a/*.env".to_owned()])
         );
 
@@ -6858,11 +7022,22 @@ mod tests {
             CaptureDisposition::Keep
         );
         assert!(
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(&over), "/repo", None).is_none()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(&over),
+                "/repo",
+                None
+            ))
+            .is_none()
         );
         assert!(
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(&at_limit), "/repo", None)
-                .is_some()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(&at_limit),
+                "/repo",
+                None
+            ))
+            .is_some()
         );
     }
 
@@ -7441,8 +7616,14 @@ mod tests {
     #[test]
     fn windows_lookup_locations_keep_glob_segments_whole() {
         let cwd = r"C:\work\b";
-        let locations =
-            |raw: &Value| capture_lookup_locations(AgentKind::ClaudeCode, raw, cwd, None);
+        let locations = |raw: &Value| {
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                cwd,
+                None,
+            ))
+        };
         assert_eq!(
             locations(&bash("cat {.,}./a/secrets.env")),
             Some(vec![
@@ -7465,7 +7646,12 @@ mod tests {
     #[test]
     fn capture_lookup_locations_name_every_path_a_call_spells() {
         let locations = |raw: &Value| {
-            capture_lookup_locations(AgentKind::ClaudeCode, raw, "/work/b", Some("/home/me"))
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                "/work/b",
+                Some("/home/me"),
+            ))
         };
         assert_eq!(
             locations(
@@ -7494,12 +7680,12 @@ mod tests {
             Some(vec!["/work/a".to_owned()])
         );
         assert_eq!(
-            capture_lookup_locations(
+            location_paths(capture_lookup_locations(
                 AgentKind::ClaudeCode,
                 &json!({"tool_name": "Read", "tool_input": {"file_path": "C:\\a\\x.md"}}),
                 "C:\\b",
                 None,
-            ),
+            )),
             Some(vec!["C:\\a\\x.md".to_owned()])
         );
         // A search/list tool names its root and the path-like globs below it;
@@ -7781,7 +7967,13 @@ mod tests {
             CaptureDisposition::Keep
         );
         let locations = |raw: &Value| {
-            capture_lookup_locations(AgentKind::ClaudeCode, raw, "/work/b", None).unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for raw in [
             bash("cat ./**/../a/secrets.env"),
@@ -7869,8 +8061,13 @@ mod tests {
             Err(())
         );
         let locations = |command: &str| {
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
-                .unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(command),
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for command in [
             "cat .*/a/secrets.env",
@@ -7908,8 +8105,13 @@ mod tests {
     #[test]
     fn glob_groups_and_ansi_c_escapes_reach_the_marker_lookup() {
         let locations = |command: &str| {
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
-                .unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(command),
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for (command, location) in [
             ("cat ../(a)/secrets.env", "/work/(a)/secrets.env"),
@@ -8001,7 +8203,12 @@ mod tests {
             "tool_input": {"command": "*** Begin Patch\n*** Add File: x.rs\n+x\n  \t*** Update File: ../a/secrets.env\n+KEY\n*** End Patch"},
         });
         assert_eq!(
-            capture_lookup_locations(AgentKind::Codex, &patch, "/work/b", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Codex,
+                &patch,
+                "/work/b",
+                None
+            )),
             Some(vec![
                 "/work/b/x.rs".to_owned(),
                 "/work/a/secrets.env".to_owned()
@@ -8012,7 +8219,12 @@ mod tests {
             "tool_input": {"pattern": "KEY", "path": "/work", "file_glob": "a/*.env"},
         });
         assert_eq!(
-            capture_lookup_locations(AgentKind::Hermes, &search, "/work/b", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Hermes,
+                &search,
+                "/work/b",
+                None
+            )),
             Some(vec!["/work".to_owned(), "/work/a/*.env".to_owned()])
         );
     }

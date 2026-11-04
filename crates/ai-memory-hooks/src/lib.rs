@@ -54,9 +54,10 @@ pub use assistant_capture::{
 };
 pub use capture_policy::{
     CaptureConfig, CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy,
-    CaptureProtocol, CaptureSource, ExtractionState, GlobStep, GlobWalk, PolicyState, ToolFamily,
-    absolute_tool_location_paths, capture_lookup_locations, describe_invalid_capture_config,
-    glob_segment_matches, glob_walk, repository_admits_capture, tool_call_payload, valid_call_id,
+    CaptureProtocol, CaptureSource, ExtractionState, GlobStep, GlobWalk, LookupLocation,
+    PolicyState, ToolFamily, absolute_tool_location_paths, capture_lookup_locations,
+    describe_invalid_capture_config, glob_segment_matches, glob_walk, repository_admits_capture,
+    tool_call_payload, valid_call_id,
 };
 pub use drop_list::IngestDropList;
 pub use hermes::{hermes_is_delegated_child, hermes_is_first_turn, shape_hermes_lifecycle_body};

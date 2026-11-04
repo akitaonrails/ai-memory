@@ -784,7 +784,12 @@ most 256 directories and runs at most 50 ms per call; past any bound the call
 is metadata-only, and so is glob syntax that can leave its leading directories:
 a brace or group spanning a separator, a `..` or `~` alternative, a brace
 expansion that builds one, or a brace-built directory name that older bash
-expands to `..` (`.{*,x}/`). A brace expansion too large to list (more than 64
+expands to `..` (`.{*,x}/`). In a shell argument, a `(` or `{` the shell does
+not expand is text, not glob syntax: one inside quotes or escaped
+(`awk '{print $1/2}'`, `jq '(.a // "x")'`, `echo 'a/{b'`), or in an element of
+an argument vector that no shell runs. Quoted braces that still list
+alternatives (`rg -g '{a/x,b}'`) are looked up once per alternative as well,
+since a program that globs its own argument expands them. A brace expansion too large to list (more than 64
 words) counts as leaving only when its pieces could build such a word; integer
 and letter sequences cannot, so `touch test/file{1..200}.txt` and `cat
 data/{a..h}{1..9}.csv` are walked like any other glob. A `..` after a `**`,
