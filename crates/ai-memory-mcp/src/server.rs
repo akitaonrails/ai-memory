@@ -415,7 +415,8 @@ should be proposed from a completed session, or at explicit wrap-up \
   `memory_handoff_list` `newer_unended_session` names a session that never \
   ended (a harness cut off by a quota limit or a crash): read it with \
   `order: \"desc\"` before relying on an older handoff or page. Pass \
-  `session_id` (the UUID or the harness's native id), or omit it for the \
+  `session_id` (the UUID or the harness's native id; `\"current\"` for your \
+  own session when your client forwards its hook session id), or omit it for the \
   newest other session with work in the current project (your cwd first, \
   ended or not); page with \
   `limit`/`offset`, narrow with `kinds` or `query`. Read-only, no LLM call.\n\
@@ -1853,13 +1854,23 @@ const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
 /// Sessions with recent work the default read scans for one in the caller's
 /// cwd. The list is ordered by activity, so it stays small.
 const SESSION_OBSERVATIONS_DEFAULT_SCAN: usize = 16;
+/// The `session_id` that names the caller's own session.
+const CURRENT_SESSION: &str = "current";
+/// The refusal when `session_id: "current"` comes from a client that does not
+/// say which session it runs in.
+const CURRENT_SESSION_UNKNOWN: &str = "session_id \"current\" needs the session this client \
+     runs in, and the request does not carry it: pass the session id from the post-compaction \
+     anchor or the session-start notice instead";
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ReadSessionObservationsArgs {
     /// Session id to read: the UUID from a `memory_query` raw hit,
     /// `memory_briefing`'s `recent_sessions`, a session-start notice or an
     /// admin session listing, or the harness's own native id (an OpenCode
-    /// `ses_…` id, for example), which maps to the same session. Omit to
+    /// `ses_…` id, for example), which maps to the same session. Pass
+    /// `"current"` for your own session when your client forwards its
+    /// lifecycle-hook session id (a session-aware bridge, OpenCode 2);
+    /// otherwise it is refused. Omit to
     /// read the session with the newest captured work visible to you in the
     /// resolved project, ended or cut off, other than your own: one in your
     /// own cwd first, then any. With no work in the last 30 days, the latest
@@ -2391,26 +2402,33 @@ impl AiMemoryServer {
         let user = ctx
             .and_then(ai_memory_core::ActorContext::identity_key)
             .map(|key| key.storage_key());
-        let header_session = |name: &str| {
-            parts
-                .headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        let session_id = ctx
+        let session_id =
+            Self::caller_hook_session_id(parts).or_else(|| request_header(parts, "mcp-session-id"));
+        ai_memory_core::ActorKey { user, session_id }
+    }
+
+    /// The lifecycle-hook session the caller runs in, when its client says
+    /// so: the auth middleware's `ActorContext`, the session-aware bridge's
+    /// `X-Memory-Actor-Session-Id` header, or OpenCode 2's native
+    /// `_meta["ai.opencode/sessionID"]`. Never the transport's
+    /// `Mcp-Session-Id`, which names an MCP connection and not a session the
+    /// hooks recorded.
+    ///
+    /// The id is client-supplied, so it is a name, not a credential: any read
+    /// keyed on it still goes through the scope and owner checks an explicit
+    /// `session_id` does.
+    fn caller_hook_session_id(parts: &axum::http::request::Parts) -> Option<String> {
+        parts
+            .extensions
+            .get::<ai_memory_core::ActorContext>()
             .and_then(|c| c.session_id.clone())
-            .or_else(|| header_session("x-memory-actor-session-id"))
+            .or_else(|| request_header(parts, "x-memory-actor-session-id"))
             .or_else(|| {
                 parts
                     .extensions
                     .get::<NativeSessionId>()
                     .map(|id| id.0.clone())
             })
-            .or_else(|| header_session("mcp-session-id"));
-        ai_memory_core::ActorKey { user, session_id }
     }
 
     /// The `limit` sessions with the newest captured work in one scope, for
@@ -6122,7 +6140,10 @@ impl AiMemoryServer {
         (a session-start notice, `memory_briefing` `recent_sessions` or \
         `memory_handoff_list` `newer_unended_session` names it; read it with \
         `order: \"desc\"`). Pass `session_id` (the UUID, or the harness's \
-        native id); omit it to read the session with the newest captured \
+        native id), or `\"current\"` for your own session after a context \
+        compaction (resolved only when your client forwards its hook session \
+        id; otherwise refused, so pass the id from the post-compaction anchor \
+        or session-start notice); omit it to read the session with the newest captured \
         work visible to you in the resolved project, other than your own \
         (one in your own cwd first; ended or not), or the latest completed \
         one when nothing worked in the last 30 days. Pages with \
@@ -6202,12 +6223,23 @@ impl AiMemoryServer {
             })
             .transpose()?;
 
-        // Session visibility uses the same predicate for an explicit id and
-        // for the default: the session must have its row or at least one
-        // observation in the resolved scope, and pass the owner filter. An
-        // id from another scope or operator reads as not found, so a known
-        // uuid cannot probe across projects.
-        let session = match args.session_id.as_deref().map(str::trim) {
+        // `"current"` names the caller's own session only when its client
+        // says which one that is. The transport's `Mcp-Session-Id` and the
+        // default "newest other session" are never substituted for it.
+        let requested = match args.session_id.as_deref().map(str::trim) {
+            Some(raw) if raw.eq_ignore_ascii_case(CURRENT_SESSION) => Some(
+                Self::caller_hook_session_id(&parts)
+                    .ok_or_else(|| McpError::invalid_params(CURRENT_SESSION_UNKNOWN, None))?,
+            ),
+            other => other.map(str::to_owned),
+        };
+
+        // Session visibility uses the same predicate for an explicit id, a
+        // resolved `"current"` and the default: the session must have its row
+        // or at least one observation in the resolved scope, and pass the
+        // owner filter. An id from another scope or operator reads as not
+        // found, so a known uuid cannot probe across projects.
+        let session = match requested.as_deref() {
             Some(raw) if !raw.is_empty() => {
                 // The hooks store a native id that is not a UUID under its
                 // v5 mapping, so the same mapping finds it here. The scoped
@@ -9415,6 +9447,17 @@ fn default_parts() -> axum::http::request::Parts {
     *request.method_mut() = axum::http::Method::POST;
     *request.uri_mut() = axum::http::Uri::from_static("/mcp");
     request.into_parts().0
+}
+
+/// A non-empty request header, trimmed.
+fn request_header(parts: &axum::http::request::Parts, name: &str) -> Option<String> {
+    parts
+        .headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Routing-only native identity; never populate authenticated actor extensions
@@ -18283,6 +18326,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bob["session"]["session_id"], bobs.to_string(), "{bob}");
+    }
+
+    async fn current_session_read(
+        server: &AiMemoryServer,
+        parts: axum::http::request::Parts,
+    ) -> Result<serde_json::Value, McpError> {
+        let mut args = session_observations_args(None);
+        args.session_id = Some("current".into());
+        server
+            .memory_read_session_observations(Parameters(args), OptionalParts(parts))
+            .await
+            .map(call_tool_json)
+    }
+
+    /// `session_id: "current"` resolves only from the caller's hook session
+    /// id. A client that sends none is refused, even when it carries a
+    /// transport `Mcp-Session-Id` naming a stored session and a session
+    /// literally stored as `current` exists: neither is the caller's session,
+    /// and the default "newest other session" is not substituted either.
+    #[tokio::test]
+    async fn read_current_session_refuses_a_caller_without_a_hook_session() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let start = now_us() - 3_600_000_000;
+        let transport = "transport-session-1";
+        for native in [transport, "current"] {
+            seed_owned_session(
+                &store,
+                ws,
+                proj,
+                SessionId::from_native(native),
+                "/w/a",
+                None,
+                start,
+                false,
+            )
+            .await;
+        }
+        let mut parts = test_parts_default();
+        parts
+            .headers
+            .insert("mcp-session-id", transport.parse().unwrap());
+        let err = current_session_read(&server, parts)
+            .await
+            .expect_err("a caller without a hook session id has no current session");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(err.message, CURRENT_SESSION_UNKNOWN);
+        assert!(
+            err.message.contains("post-compaction anchor"),
+            "{}",
+            err.message
+        );
+
+        // Control: the same caller's explicit id reads the session.
+        let mut args = session_observations_args(Some(SessionId::from_native(transport)));
+        args.session_id = Some(transport.into());
+        let page = server
+            .memory_read_session_observations(Parameters(args), OptionalParts(test_parts_default()))
+            .await
+            .map(call_tool_json)
+            .unwrap();
+        assert_eq!(
+            page["session"]["session_id"],
+            SessionId::from_native(transport).to_string()
+        );
+    }
+
+    /// `"current"` is a name the client supplies, not a credential: pointing
+    /// the bridge header at another operator's session reads it as not found,
+    /// exactly as the explicit id would. Control: the owner's own header and
+    /// OpenCode 2's `_meta` session id both resolve to their own session.
+    #[tokio::test]
+    async fn read_current_session_never_reaches_a_foreign_session() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let start = now_us() - 3_600_000_000;
+        let alices = "alice-native-1";
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(alices),
+            "/w/a",
+            Some("alice"),
+            start,
+            false,
+        )
+        .await;
+
+        let err = current_session_read(&server, parts_with_caller(Some("bob"), alices))
+            .await
+            .expect_err("bob's header naming alice's session must not read it");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("not found"), "{}", err.message);
+
+        // Control: alice's own bridge header resolves to her session.
+        let page = current_session_read(&server, parts_with_caller(Some("alice"), alices))
+            .await
+            .unwrap();
+        assert_eq!(
+            page["session"]["session_id"],
+            SessionId::from_native(alices).to_string(),
+            "{page}"
+        );
+        assert!(page["total"].as_u64().unwrap() > 0, "{page}");
+
+        // Control: OpenCode 2's `_meta` session id resolves the same way.
+        let opencode = "ses_opencode_2";
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(opencode),
+            "/w/a",
+            None,
+            start,
+            false,
+        )
+        .await;
+        let mut parts = test_parts_default();
+        parts
+            .extensions
+            .insert(NativeSessionId(opencode.to_owned()));
+        let page = current_session_read(&server, parts).await.unwrap();
+        assert_eq!(
+            page["session"]["session_id"],
+            SessionId::from_native(opencode).to_string(),
+            "{page}"
+        );
     }
 
     #[tokio::test]

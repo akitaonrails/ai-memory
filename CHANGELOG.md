@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added a post-compaction anchor, `GET /recap?mode=anchor`: a small,
+  read-only block (default 2,000 chars) with a session's first and latest
+  operator prompts, read across every compaction, behind the recap's own
+  read-access and owner gates. `memory_read_session_observations` accepts
+  `session_id: "current"` when the client forwards its hook session id, and
+  refuses it otherwise. The "reload context" recap now also treats Devin's
+  `post-compaction` as a compaction boundary (#1983).
 - Added per-task LLM provider and fallback profiles for consolidation, bootstrap,
   auto-improve, experience, dream, lint, profile, rerank, and query answers
   (including explore). Tasks without an override share the default provider;
