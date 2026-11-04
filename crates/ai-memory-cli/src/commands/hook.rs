@@ -21,9 +21,9 @@ use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
     CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, FILE_FIELD_KEY,
-    FileSkip, FileTarget, GlobStep, GlobWalk, HookEvent, PolicyState, absolute_tool_location_paths,
-    capture_lookup_locations, file_field, file_target, glob_segment_matches, glob_walk,
-    repository_admits_capture,
+    FileSkip, FileTarget, GlobStep, GlobWalk, HookEvent, LookupLocation, PolicyState,
+    absolute_tool_location_paths, capture_lookup_locations, file_field, file_target,
+    glob_segment_matches, repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
@@ -2817,13 +2817,13 @@ fn foreign_decision_within(
     // long list inside the checkout must not spend it first. Inside it the
     // own policy governs, as for a glob rooted there; a marker nested in it
     // is found while the budget lasts, the shallowest locations first.
-    let (outside, mut inside): (Vec<String>, Vec<String>) =
+    let (outside, mut inside): (Vec<LookupLocation>, Vec<LookupLocation>) =
         locations.into_iter().partition(|location| {
             checkout
                 .as_deref()
-                .is_none_or(|checkout| !Path::new(location).starts_with(checkout))
+                .is_none_or(|checkout| !Path::new(&location.path).starts_with(checkout))
         });
-    inside.sort_by_key(|location| Path::new(location).components().count());
+    inside.sort_by_key(|location| Path::new(&location.path).components().count());
     let inside_from = outside.len();
     for (index, location) in outside.into_iter().chain(inside).enumerate() {
         // Past a bound, a location inside the own checkout ends the lookup;
@@ -2835,8 +2835,8 @@ fn foreign_decision_within(
                 Some(unprovable())
             }
         };
-        let (lookup, steps) = match glob_walk(&location) {
-            GlobWalk::Literal => (location, None),
+        let (lookup, steps) = match location.walk() {
+            GlobWalk::Literal => (location.path, None),
             GlobWalk::Unprovable => return unprovable(),
             GlobWalk::Walk { root, steps } => (root, Some(steps)),
         };
@@ -5782,6 +5782,62 @@ mod tests {
             budget,
         )
         .map(|decision| decision.protocol().disposition())
+    }
+
+    /// Regression (#1977): a shell does not expand a `(` or `{` inside
+    /// quotes, so a quoted one next to a `/` (an awk block, a jq group) is
+    /// text and the call keeps its output with no marker anywhere.
+    /// Adversarial: an unquoted brace expansion or zsh group that spans a
+    /// separator still proves nothing, and quoted braces that list
+    /// alternatives, which a program that globs its own argument expands,
+    /// are followed into the sibling checkout they name.
+    #[test]
+    fn a_quoted_group_or_brace_next_to_a_separator_is_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let plain = work.join("plain");
+        let a = work.join("a");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(a.join(".git")).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        for command in [
+            "echo '(a/b)'",
+            "echo 'a/(b'",
+            "echo 'a/{b'",
+            "echo \"(a/b)\"",
+            "echo a/\\(b",
+            "awk '{print $1/2}' f.txt",
+            "jq '(.a // \"x\")' f.json",
+            "jq '{a: .x, b: (.y/2)}' f.json",
+            "bash -c \"awk '{print \\$1/2}' f.txt\"",
+        ] {
+            assert_eq!(
+                foreign_disposition(&plain, command, None, None, fast),
+                None,
+                "{command}"
+            );
+        }
+        for command in ["cat {x/y,z}", "cat x/{y", "bash -c 'cat {x/y,z}'"] {
+            assert_eq!(
+                foreign_disposition(&plain, command, None, None, fast),
+                Some(CaptureDisposition::MetadataOnly),
+                "{command}"
+            );
+        }
+        assert!(
+            foreign_disposition(&plain, "rg -g '{../a/secrets.env,x}' key", None, None, fast)
+                .is_some(),
+            "the sibling checkout's marker governs a quoted alternative naming it"
+        );
+        assert_eq!(
+            foreign_disposition(&plain, "rg -g '{../plain/x,y}' key", None, None, fast),
+            None
+        );
     }
 
     /// Regression (the docs promised it; v2.6.3 kept the call): a `**` that

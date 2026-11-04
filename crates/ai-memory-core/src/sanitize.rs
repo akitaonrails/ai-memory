@@ -54,7 +54,9 @@
 //! Standalone high-entropy strings (e.g. a 32-char random hex) cannot
 //! be safely redacted without knowing their structure — too many false
 //! positives. Operators who care about that level of paranoia should
-//! add a custom pattern via `extra_patterns`.
+//! add a custom pattern via `extra_patterns`. ai-memory's own root bearer
+//! is such a string: it is caught under a `token` key (a hook spool entry)
+//! or behind `Bearer`, not printed alone (`cat` of its token file).
 //!
 //! Look-alike characters (full-width `ｓｋ－…`, other confusables) are not
 //! folded: matching does not apply NFKC normalization.
@@ -447,6 +449,10 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "github_token"),
+    // ai-memory's own DB-user API keys (`aim_`) and web-session secrets
+    // (`ams_`): the prefix plus 43 base64url characters. The 40-character
+    // floor keeps snake_case identifiers that start with `aim_` intact.
+    (r"\b(?:aim|ams)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
     // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
     //
     // Anchored to the exact published format — a 4-character prefix plus
@@ -544,6 +550,19 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // nested that deep is not covered (#1963).
     (
         r#"(?i)\b[A-Za-z0-9_-]*(?:authentication|authorization|credentials?|password|passwd|apikey|accountkey|authtoken|[a-z0-9]*(?:api|auth|access|secret|security|private|session|refresh|client|consumer|subscription|app|bearer)-(?:key|token))(?:\\*")?\s*[=:]\s*(?:\\*")?(?:(?:basic|bearer|digest|token|apikey)\s+)?"?[A-Za-z0-9._~+/=-]{8,}"#,
+        "auth_header",
+    ),
+    // A bare `token` key: the rule above needs an auth word before `token`,
+    // but a hook spool entry stores ai-memory's root bearer (64 hex
+    // characters from `generate-auth-token`) as `"token":"…"` (#1982), and
+    // Vault and many CLI config files use the same key. The key also names
+    // tokenizer output and short literals, so the value floor is 32: longer
+    // than a word, shorter than a generated credential. A `-` before the key
+    // makes it a header name such as `Continuation-Token`, which stays the
+    // rule above's call; the character before the key is context, not part
+    // of the redaction.
+    (
+        r#"(?i)(?:^|[^A-Za-z0-9_-])(?P<secret>token(?:\\*"|')?\s*[=:]\s*(?:\\*"|')?[A-Za-z0-9._~+/=-]{32,})"#,
         "auth_header",
     ),
     // Provider-specific env-var assignments (kept explicit for clarity
@@ -1781,6 +1800,17 @@ mod tests {
                 assert!(out.starts_with("key ") && out.ends_with(" end"), "{out:?}");
             }
         }
+        for field in vectors["credential_fields"].as_array().unwrap() {
+            let input = field["input"].as_str().unwrap();
+            let out = s().scrub(input);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(field["secret"].as_str().unwrap()),
+                "{input:?} -> {out:?}"
+            );
+            for kept in field["kept"].as_array().into_iter().flatten() {
+                assert!(out.contains(kept.as_str().unwrap()), "{input:?} -> {out:?}");
+            }
+        }
         let body_line = vectors["key_body_line"].as_str().unwrap();
         for block in vectors["key_blocks"].as_array().unwrap() {
             let input = block["input"].as_str().unwrap();
@@ -2352,6 +2382,77 @@ mod tests {
         ] {
             let out = s().scrub(raw);
             assert_eq!(out, raw, "must be left alone: {raw}");
+        }
+    }
+
+    /// ai-memory's own credentials: the root bearer `generate-auth-token`
+    /// mints (64 hex characters) under the bare `token` key a hook spool
+    /// entry stores it in, and the `aim_`/`ams_` keys and session secrets.
+    /// An agent printing a spool entry while debugging delivery is how the
+    /// first reaches a tool result (#1982). The rest of the result is kept
+    /// and still parses.
+    #[test]
+    fn ai_memorys_own_credentials_are_redacted() {
+        // Fixtures are FAKE shapes, not real values.
+        let s = s();
+        let hex = "0123456789abcdef".repeat(4);
+        let key = format!("aim_{}", "FAKEfake0123-_xy".repeat(3));
+        let session = format!("ams_{}", "FAKEfake0123-_xy".repeat(3));
+        let spool = format!(
+            r#"{{"stdout":"{{\"url\":\"http://127.0.0.1:0/hook?event=post-tool-use\",\"body\":\"...\",\"created_ms\":0,\"auth_mode\":\"static\",\"token\":\"{hex}\",\"attempts\":0}}\n","stderr":"","interrupted":false}}"#
+        );
+        let out = s.scrub(&spool);
+        assert!(!out.contains(&hex), "{spool} -> {out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("redaction broke the JSON ({e}): {out}"));
+        let inner = parsed["stdout"].as_str().unwrap();
+        assert!(
+            inner.contains(r#""auth_mode":"static""#) && inner.contains(r#""attempts":0}"#),
+            "the fields around the token must survive: {out}"
+        );
+        assert_eq!(parsed["interrupted"], false, "{out}");
+
+        for (raw, secret) in [
+            (format!(r#"{{"token":"{hex}"}}"#), hex.as_str()),
+            (
+                format!(r#"{{"stdout":"{{\\\"token\\\":\\\"{hex}\\\"}}"}}"#),
+                hex.as_str(),
+            ),
+            (format!("token = \"{hex}\"\n"), hex.as_str()),
+            (format!("token: '{hex}'\n"), hex.as_str()),
+            (format!("TOKEN={hex}"), hex.as_str()),
+            (format!(r#"{{"token":"{key}","id":"k1"}}"#), key.as_str()),
+            (format!("$ cat hook-key\n{key}\n"), key.as_str()),
+            (
+                format!("Cookie: ai_memory_session={session}"),
+                session.as_str(),
+            ),
+        ] {
+            let out = s.scrub(&raw);
+            assert!(
+                out.contains("[REDACTED:") && !out.contains(secret),
+                "credential must be redacted: {raw} -> {out}"
+            );
+        }
+    }
+
+    /// The bare `token` key also names tokenizer output, counts and short
+    /// literals, and `aim_` starts ordinary identifiers; none of those carry
+    /// a credential, so the value floor and the key-prefix shape leave them
+    /// byte-identical.
+    #[test]
+    fn a_bare_token_key_without_a_credential_is_left_alone() {
+        let s = s();
+        for raw in [
+            r#"{"token":"Hello","logprob":-0.12}"#,
+            r#"{"tokens":1234,"token_count":1234567890}"#,
+            r#"{"stdout":"{\"token\":\"short-lived\"}\n"}"#,
+            "token: the next word the model emits",
+            "Continuation-Token: 0123456789abcdef0123456789abcdef0123456789",
+            "let aim_target_position = aim_offset + 1;",
+            "ams_ and aim_ are the key prefixes",
+        ] {
+            assert_eq!(s.scrub(raw), raw, "must be left alone: {raw}");
         }
     }
 }

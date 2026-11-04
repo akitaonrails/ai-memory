@@ -55,8 +55,8 @@ pub use assistant_capture::{
 };
 pub use capture_policy::{
     CaptureConfig, CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy,
-    CaptureProtocol, CaptureSource, ExtractionState, FileTarget, GlobStep, GlobWalk, PolicyState,
-    ToolFamily, absolute_tool_location_paths, capture_lookup_locations,
+    CaptureProtocol, CaptureSource, ExtractionState, FileTarget, GlobStep, GlobWalk, LookupLocation,
+    PolicyState, ToolFamily, absolute_tool_location_paths, capture_lookup_locations,
     describe_invalid_capture_config, file_target, glob_segment_matches, glob_walk,
     repository_admits_capture, tool_call_payload, valid_call_id,
 };

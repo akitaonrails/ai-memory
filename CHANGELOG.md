@@ -63,12 +63,14 @@ version in [`docs/changelog/`](docs/changelog/):
   the counters started (`started_ms`). A new internal store read maps a path
   to the sessions the caller may read. The generated TypeScript integrations
   follow separately (#1843).
+
 - Added a per-execution opt-out of the automatic handoff: a session whose
   hooks run with `AI_MEMORY_AUTO_HANDOFF=off` still gets its summary page and
   consolidation but leaves no baton at its end or turn checkpoint, while every
   other session keeps `[handoff] create_on_session_end`. The native hook, the
   shell and PowerShell bundles and the generated TypeScript plugins forward it
   as `auto_handoff=0` (#1951).
+
 - Pages can name the repository files they describe: `memory_write_page`,
   `memory_write_pages_batch` and the admin write accept an optional
   `source_files: [{path, commit}]` (up to 16 repository-relative paths, 7-64
@@ -77,6 +79,7 @@ version in [`docs/changelog/`](docs/changelog/):
   reads those files; a client compares each entry with its checkout and records
   `stale` feedback when one changed. The TypeScript SDK sends it as
   `sourceFiles` and `pages.update` carries it over (#1957).
+
 - Added a dropped-fact report to the opt-in dream pass. For each applied merge
   it lists the keep-tokens (file paths, identifiers, error codes, URLs) that a
   source page had and the merged survivor lacks, as `dropped_keep_tokens` on
@@ -85,6 +88,7 @@ version in [`docs/changelog/`](docs/changelog/):
   number of dropped tokens; the tokens themselves are logged only at debug.
   Merges still land, and every source stays recoverable with `restore-page`
   (#1958).
+
 - Added a guarded `memory_write_pages_batch` MCP tool for companion imports:
   1-100 conditional page versions are admitted and persisted atomically in one
   existing project, with bounded bodies, duplicate-path rejection, ordered
@@ -95,11 +99,13 @@ version in [`docs/changelog/`](docs/changelog/):
   a WAL-consistent read-only snapshot, with explicit project mapping,
   client-side sanitization, sensitive-record exclusion, exact-body resume, and
   dry-run by default (#1840).
+
 - Added `ai-memory-eval retrieval-compare`, which pairs two saved retrieval
   reports by question and lists the questions whose first hit moved, the
   cutoffs each crossed, and how many moved per question type. `--fts` marks
   moved questions whose row equals the same build's FTS run, which is how a
   local query that ran without its vector shows up (#1854).
+
 - Added `bootstrap_max_concurrent` (`AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT`,
   default 1, unchanged) so bootstrap runs for different projects can call the
   LLM at the same time. One server-wide mutex held every run for its whole
@@ -107,6 +113,7 @@ version in [`docs/changelog/`](docs/changelog/):
   while many repositories bootstrapped. Runs for the same project still wait
   for each other, and the wiki's own commit lock still serialises the git
   commit (#1890).
+
 - Added MCP 2026-07-28 lifecycle support by moving the server and stdio
   bridge to rmcp 3.8. The HTTP transport answers `server/discover` and serves
   requests carrying complete per-request version metadata statelessly, while
@@ -116,11 +123,13 @@ version in [`docs/changelog/`](docs/changelog/):
   client's discovery probe itself, absorbs the cancellation such a client can
   send after timing the probe out, and forwards multi-round tool results
   without resolving them locally (#1924).
+
 - Supported optional `AI_MEMORY_LLM_COMPAT_STREAM` (`llm_compat_stream` in `config.toml`)
   to explicitly set the `stream` field for `openai-compat` Chat Completions requests,
   preventing gateways from defaulting to SSE. Both Docker wrappers forward the
   setting to helper commands such as `llm-test`. Set `false` for non-streaming
   JSON; `true` is rejected because the Chat Completions transport cannot decode SSE (#1906).
+
 - Added Brazilian Portuguese to the web interface and to human CLI output,
   through embedded Fluent catalogs for `en` and `pt-BR`. The CLI language comes
   from `--language`, `AI_MEMORY_LANGUAGE` or the top-level `language` config key
@@ -129,15 +138,18 @@ version in [`docs/changelog/`](docs/changelog/):
   Help, prompts, status lines and command errors are translated at the display
   boundary; JSON, MCP payloads, logs, stored content and generated configuration
   keep their existing representation. See `docs/localization.md` (#1912).
+
 - Made the profile's LLM output budget configurable through
   `[profile] max_output_tokens` (`AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS`,
   default 2000, unchanged). The ceiling was hardcoded, and local thinking
   models can spend part of it on their reasoning block before the
   structured JSON, ending the call at `finish_reason=length` and dropping
   the pass to the zero-LLM fallbacks (#1877).
+
 - Made workspace, project, and agent dashboard metric cards link to the
   project list, session/event tables, Knowledge view, or harness-filtered
   Token usage view that explains each count (#1868).
+
 - Added two off-by-default retrieval signals. `[retrieval] feedback_demotion`
   lowers the authority of a current page version carrying open `stale` or
   `wrong` feedback until a rewrite supersedes it. `[retrieval]
@@ -149,6 +161,7 @@ version in [`docs/changelog/`](docs/changelog/):
   purging a session deletes the ones it wrote. Both
   contributions appear in `memory_query(explain=true)`, and both weights
   default to `0.0`, leaving ranking and capture unchanged (#1941).
+
 - Added `[messaging] inbox_notice_on_prompt` to `.ai-memory.toml`. A Claude
   Code session in an opted-in project receives the count-only pending-mail
   notice on prompts, deduplicated until the count or inbox names change. A
@@ -158,11 +171,13 @@ version in [`docs/changelog/`](docs/changelog/):
   stays off by default while channels remain a research preview. Both poll a
   new read-only `GET /handoff?inbox_only=1` form that claims nothing and
   leaves the active project alone. Message text never enters a notice (#1942).
+
 - Added `[recovery] deliver_on_session_start = false` to `.ai-memory.toml`.
   The per-project opt-out suppresses the unfinished-session recovery snapshot
   and its backfill marker without closing the source session. Handoffs,
   managed context, briefs, the profile digest and the inbox notice remain
   independent and unchanged (#1865).
+
 - Allowed `memory_briefing` callers to include up to 50 recent sessions so
   agents can see active harnesses in a busy project (#1934).
 
@@ -178,6 +193,42 @@ version in [`docs/changelog/`](docs/changelog/):
   instead of silently ignoring the variable; remove the key to keep the native
   login. A `copilot` fallback's `base_url` now also sets its API endpoint when
   `COPILOT_API_URL` is unset (#1969).
+
+### Fixed
+
+- The sanitizer now redacts ai-memory's own credentials. A hook spool entry
+  stores the static root bearer under a bare `token` key, which no rule
+  matched, so an agent printing a spool entry while debugging delivery
+  stored the server's root token in the observation. A `token` key with a
+  value of 32 or more characters is now redacted in JSON (escaped or not),
+  TOML, YAML and `TOKEN=` form, and so are `aim_` API keys and `ams_` session
+  secrets anywhere in the text. The external-capture client scrub follows
+  the same rules, and also reads a quoted or escaped JSON key now (#1982).
+
+- A shell call with a quoted `(` or `{` next to a `/`, such as
+  `awk '{print $1/2}'`, `jq '(.a // "x")'` or `echo 'a/{b'`, was spooled
+  metadata-only with no output, even with no `.ai-memory.toml` anywhere. The
+  marker lookup read the quoted character as a glob group or brace spanning
+  the separator and gave up on the call. A shell does not expand either one
+  inside quotes, so the native hook and the generated integrations now read
+  it as text. An unquoted brace expansion or zsh glob group that spans a
+  separator still makes the call metadata-only, and quoted braces that list
+  alternatives are looked up once per alternative (#1977).
+
+- A failed Cursor Agent CLI call returned an error that quoted the CLI's
+  stderr, or its answer when that was not JSON, without the secret scrub
+  HTTP provider error bodies already get. Those errors are logged, so a token
+  the child echoed could reach the server log. Both excerpts now go through
+  the built-in sanitizer before they are cut, which also strips terminal
+  control sequences (#1978).
+
+- An idle `serve` no longer spends 25-40% of a core on a large wiki. The
+  watcher's 30-second reconcile pass reindexed every page file on every tick,
+  which cost two or three store round trips per page even when nothing had
+  changed: 10 to 20 seconds of work per tick on a 43,000-page wiki. The pass
+  now skips a file whose size, mtime, inode and change time match the pass
+  that last indexed it, so an idle tick only walks the tree. The first pass
+  after startup still reads every page (#1975).
 
 ## [3.3.3] - 2026-11-03
 
