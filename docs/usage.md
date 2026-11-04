@@ -200,15 +200,18 @@ on without it.
 | Claude Code | Automatic: `SessionStart` with source `compact`, through `hookSpecificOutput.additionalContext` |
 | Codex | Automatic: `SessionStart` with source `compact`, as developer context before the next model request |
 | Factory Droid | Automatic: `SessionStart` with source `compact`, appended to the new session context |
-| OpenCode V1 | Automatic: the `experimental.session.compacting` hook adds one line asking the summary to keep the session id and point at ai-memory, and `session.compacted` arms the anchor for the system transform until the next compaction |
-| OpenCode V2 | Automatic: `session.compaction.ended` arms the anchor for the `context` hook until the next compaction |
+| OpenCode V1 | Automatic: the `experimental.session.compacting` hook adds one line to `output.context` asking the summary to keep the session id and point at ai-memory, and `session.compacted` arms the anchor for the system transform until the next compaction |
+| OpenCode V2 | Automatic: the `compaction` hook adds the same line as a `system` part, and `session.compaction.ended` arms the anchor for the `context` hook until the next compaction |
 | Gemini CLI, Cursor, GitHub Copilot CLI, Kimi Code, Grok Build, Kiro CLI, Cline, Muse Code and the rest | Instructions only: these harnesses have no hook that can add context after a compaction (Muse reports a `compact` source, but its output contract is unpublished), so the agent follows the installed instructions and reads its own session's prompts |
 
 When no anchor arrives, the agent calls `memory_read_session_observations`
 with `session_id: "current"` and `kinds: ["user-prompt","stop"]`. The server
 resolves `"current"` only for a session-aware client (the session-aware bridge
-header or OpenCode 2's native session id); a static client is refused and
-passes the session id from the anchor or the session-start notice instead.
+header or OpenCode 2's native session id). A static client is refused and
+passes the session id shown in the post-compaction anchor. With no anchor, it
+omits `session_id` and confirms that the returned session's prompts match its
+own conversation before trusting them. The session-start notice names a
+different session, so its id is never the fallback here.
 
 #### Manual: `reload context`
 
