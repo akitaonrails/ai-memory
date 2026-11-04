@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- An idle `serve` no longer spends 25-40% of a core on a large wiki. The
+  watcher's 30-second reconcile pass reindexed every page file on every tick,
+  which cost two or three store round trips per page even when nothing had
+  changed: 10 to 20 seconds of work per tick on a 43,000-page wiki. The pass
+  now skips a file whose size, mtime, inode and change time match the pass
+  that last indexed it, so an idle tick only walks the tree. The first pass
+  after startup still reads every page (#1975).
+
 ## [3.3.3] - 2026-11-03
 
 ### Fixed
