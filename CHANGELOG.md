@@ -263,8 +263,10 @@ version in [`docs/changelog/`](docs/changelog/):
   which cost two or three store round trips per page even when nothing had
   changed: 10 to 20 seconds of work per tick on a 43,000-page wiki. The pass
   now skips a file whose size, mtime, inode and change time match the pass
-  that last indexed it, so an idle tick only walks the tree. The first pass
-  after startup still reads every page (#1975).
+  that last indexed it, so an idle tick only walks the tree. A file whose
+  timestamps are less than five seconds older than the pass is still reread,
+  so a same-size edit landing within the filesystem's timestamp granularity
+  is not missed. The first pass after startup still reads every page (#1975).
 
 ## [3.3.3] - 2026-11-03
 
