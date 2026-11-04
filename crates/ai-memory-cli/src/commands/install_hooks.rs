@@ -4404,6 +4404,8 @@ const OPENCODE2_BINDING: &str = r#"
       assistantText.delete(id);
       handoffFetches.delete(id);
       handoffFailures.delete(id);
+      recapFetches.delete(id);
+      anchorFetches.delete(id);
     }
 
     async function ensureSession(id: SessionID): Promise<SessionInfo | undefined> {
@@ -4507,9 +4509,17 @@ const OPENCODE2_BINDING: &str = r#"
               sessionCwds.delete(id);
             } else if (event.type === "session.compaction.started") {
               recapFetches.delete(event.data.sessionID);
+              anchorFetches.delete(event.data.sessionID);
               const session = await ensureSession(event.data.sessionID);
               if (!session) continue;
               postPreCompact(event.data.sessionID, session.location.directory);
+            } else if (event.type === "session.compaction.ended") {
+              // The summary has replaced the history; the next model call's
+              // context hook carries the anchor until the next compaction.
+              const id = event.data.sessionID;
+              const session = await ensureSession(id);
+              if (!session || session.parentID) continue;
+              anchorFetches.set(id, fetchRecap(session.location.directory, id, true));
             }
           } catch (error) {
             if (!unload.signal.aborted) console.warn("ai-memory event capture failed", error);
@@ -4558,6 +4568,18 @@ const OPENCODE2_BINDING: &str = r#"
       if (recap) {
         event.system.push({ type: "text", text: recap });
       }
+      const anchor = await anchorFetches.get(id);
+      if (anchor) {
+        event.system.push({ type: "text", text: anchor });
+      }
+    });
+    // The compaction request's own system parts: one line so the summary
+    // keeps the session id. It adds no heading, so the template's `##`
+    // sections stay as the compaction agent writes them.
+    const compactionRegistration = await ctx.session.hook("compaction", async (event) => {
+      const session = await ensureSession(event.sessionID);
+      if (!session || session.parentID || !recordsSession(session.location.directory)) return;
+      event.system.push({ type: "text", text: compactionNote(event.sessionID) });
     });
     const beforeRegistration = await ctx.tool.hook("execute.before", async (event) => {
       const session = await ensureSession(event.sessionID);
@@ -4588,6 +4610,7 @@ const OPENCODE2_BINDING: &str = r#"
       for (const registration of [
         promptRegistration,
         contextRegistration,
+        compactionRegistration,
         beforeRegistration,
         afterRegistration,
       ]) {
@@ -5428,6 +5451,14 @@ const handoffFetches = new Map<string, Promise<string | undefined>>();
 // compaction like the handoff it sits beside.
 const RELOAD_TRIGGER = {reload_trigger};
 const recapFetches = new Map<string, Promise<string | undefined>>();
+// After a compaction the summary may have lost the session's original task:
+// the post-compaction anchor (its first and latest operator prompts) is armed
+// when a compaction ends and delivered beside the recap until the next one.
+const ANCHOR_BUDGET = 2000;
+// Only a real anchor is injected: an older server ignores `mode` and answers
+// with the full recap, and an unknown session gets a notice.
+const ANCHOR_HEADER = {anchor_header};
+const anchorFetches = new Map<string, Promise<string | undefined>>();
 const preCompactLast = new Map<string, number>();
 
 function cwdFor(id: string | undefined, directory: string): string {{
@@ -5466,6 +5497,7 @@ function endSession(id: string | undefined, directory: string, cwd?: string, ext
   sessionParents.delete(id);
   handoffFetches.delete(id);
   recapFetches.delete(id);
+  anchorFetches.delete(id);
   preCompactLast.delete(id);
 }}
 
@@ -5526,7 +5558,21 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   }}
 }}
 
-async function fetchRecap(cwd: string, id: string): Promise<string | undefined> {{
+// Whether this plugin records the session at `cwd`, by the same rule as the
+// recap fetch below: nothing for a repository an allowlist build does not
+// capture.
+function recordsSession(cwd: string): boolean {{
+  if (captureServerRouted(cwd)) return false;
+  return CAPTURE_MODE !== "allowlist" || !!findMarker(cwd);
+}}
+
+// One line for the compaction summary, so the session id and where its
+// record lives survive the compaction itself.
+function compactionNote(id: string): string {{
+  return `Keep this session's id (${{id}}) and note that its original task, prompts and decisions are recorded in ai-memory (memory_read_session_observations).`;
+}}
+
+async function fetchRecap(cwd: string, id: string, anchor = false): Promise<string | undefined> {{
   if (captureServerRouted(cwd)) return undefined;
   // Same rule as the handoff fetch: no request for a repository an allowlist
   // build does not capture.
@@ -5534,6 +5580,10 @@ async function fetchRecap(cwd: string, id: string): Promise<string | undefined> 
   const url = new URL(`${{SERVER}}/recap`);
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("session_id", id);
+  if (anchor) {{
+    url.searchParams.set("mode", "anchor");
+    url.searchParams.set("budget", String(ANCHOR_BUDGET));
+  }}
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     const response = await fetch(url, {{
@@ -5544,6 +5594,7 @@ async function fetchRecap(cwd: string, id: string): Promise<string | undefined> 
     }});
     if (!response.ok) return undefined;
     const recap = (await response.text()).trim();
+    if (anchor && !recap.startsWith(ANCHOR_HEADER)) return undefined;
     return recap || undefined;
   }} catch (_e) {{
     return undefined;
@@ -5606,6 +5657,11 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         const id = properties.sessionID;
         postPreCompact(id, directory);
         if (id) recapFetches.delete(id);
+        // OpenCode publishes this once the summary replaced the history
+        // (`session/compaction.ts`); the next model call carries the anchor.
+        if (id && !sessionParents.has(id)) {{
+          anchorFetches.set(id, fetchRecap(cwdFor(id, directory), id, true));
+        }}
       }}
     }},
     "chat.message": async (input, output) => {{
@@ -5648,10 +5704,18 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
         metadata: (output as any).metadata,
       }});
     }},
-    "experimental.session.compacting": async (input) => {{
+    // Strings pushed to `output.context` are appended to the default
+    // compaction prompt (OpenCode `session/compaction.ts`); `output.prompt`
+    // would replace that prompt, so it is never set.
+    "experimental.session.compacting": async (input, output) => {{
       const id = sessionID(input);
       postPreCompact(id, directory);
       if (id) recapFetches.delete(id);
+      if (id) anchorFetches.delete(id);
+      const context = (output as any)?.context;
+      if (id && !sessionParents.has(id) && Array.isArray(context) && recordsSession(cwdFor(id, directory))) {{
+        context.push(compactionNote(id));
+      }}
     }},
     "experimental.chat.system.transform": async (input, output) => {{
       const id = sessionID(input);
@@ -5669,6 +5733,8 @@ export const AiMemoryHooks: Plugin = async ({{ directory }}) => {{
       if (handoff) (output as any).system.push(handoff);
       const recap = await recapFetches.get(id);
       if (recap) (output as any).system.push(recap);
+      const anchor = await anchorFetches.get(id);
+      if (anchor) (output as any).system.push(anchor);
     }},
   }};
 }};
@@ -5678,6 +5744,7 @@ export default AiMemoryHooks;
         server_literal = ts_string_literal(server_url),
         token_line = token_line,
         reload_trigger = ai_memory_core::compaction_recap::RELOAD_TRIGGER_JS_REGEX,
+        anchor_header = ts_string_literal(super::hook::ANCHOR_HEADER),
     );
     // Anchors are compile-time constants over this same file's template;
     // a mismatch is a template edit that forgot the spool patch.
@@ -13518,7 +13585,9 @@ model = "gpt-5"
         assert!(
             plugin.contains("const recapFetches = new Map<string, Promise<string | undefined>>();")
         );
-        assert!(plugin.contains("async function fetchRecap(cwd: string, id: string)"));
+        assert!(
+            plugin.contains("async function fetchRecap(cwd: string, id: string, anchor = false)")
+        );
         assert!(plugin.contains("`${SERVER}/recap`"));
         assert!(plugin.contains(
             "if (id && RELOAD_TRIGGER.test(prompt)) recapFetches.set(id, fetchRecap(cwd, id));"
@@ -13538,10 +13607,57 @@ model = "gpt-5"
             plugin.contains(RELOAD_TRIGGER_LINE),
             "trigger regex missing"
         );
-        assert!(plugin.contains("async function fetchRecap(cwd: string, id: string)"));
+        assert!(
+            plugin.contains("async function fetchRecap(cwd: string, id: string, anchor = false)")
+        );
         assert!(plugin.contains("RELOAD_TRIGGER.test(event.prompt.text)"));
         assert!(plugin.contains("event.system.push({ type: \"text\", text: recap });"));
         assert!(plugin.contains("recapFetches.delete(event.data.sessionID);"));
+    }
+
+    /// #1983: OpenCode V1 (`session/compaction.ts`) appends strings pushed to
+    /// `experimental.session.compacting`'s `output.context` to its default
+    /// compaction prompt, publishes `session.compacted` after it, and lets
+    /// `experimental.chat.system.transform` add to the next model call.
+    #[test]
+    fn opencode_plugin_arms_the_anchor_after_a_compaction() {
+        let plugin = build_opencode_plugin("http://127.0.0.1:49374", None, None, "denylist");
+        assert!(plugin.contains("const ANCHOR_BUDGET = 2000;"));
+        assert!(plugin.contains("url.searchParams.set(\"mode\", \"anchor\");"));
+        assert!(plugin.contains("\"experimental.session.compacting\": async (input, output) => {"));
+        assert!(plugin.contains("context.push(compactionNote(id));"));
+        // Setting `prompt` would replace OpenCode's compaction template.
+        assert!(!plugin.contains(".prompt = "), "never set output.prompt");
+        assert!(
+            plugin.contains("anchorFetches.set(id, fetchRecap(cwdFor(id, directory), id, true));")
+        );
+        assert!(plugin.contains("if (anchor) (output as any).system.push(anchor);"));
+        // The next compaction and the session end forget the anchor.
+        assert_eq!(plugin.matches("anchorFetches.delete(id);").count(), 2);
+    }
+
+    /// #1983: OpenCode 2 publishes `session.compaction.ended` and runs the
+    /// `compaction` session hook with the summary request's `system` parts
+    /// (both present in the OpenCode 2.2.5 binary).
+    #[test]
+    fn opencode2_plugin_arms_the_anchor_after_a_compaction() {
+        let plugin =
+            build_opencode2_plugin("http://127.0.0.1:49374", None, None, "denylist", false)
+                .unwrap();
+        assert!(plugin.contains("event.type === \"session.compaction.ended\""));
+        assert!(
+            plugin.contains(
+                "anchorFetches.set(id, fetchRecap(session.location.directory, id, true));"
+            )
+        );
+        assert!(plugin.contains("anchorFetches.delete(event.data.sessionID);"));
+        assert!(plugin.contains("event.system.push({ type: \"text\", text: anchor });"));
+        assert!(plugin.contains("ctx.session.hook(\"compaction\""));
+        assert!(plugin.contains(
+            "event.system.push({ type: \"text\", text: compactionNote(event.sessionID) });"
+        ));
+        assert!(plugin.contains("compactionRegistration,"));
+        assert!(!plugin.contains("experimental."));
     }
 
     #[test]
@@ -13770,8 +13886,9 @@ model = "gpt-5"
             .find("fetchHandoff(")
             .expect("the transform still claims for a top-level session");
         assert!(guard < claim, "a subagent must return before the claim");
-        // Capture is untouched: no other hook consults the parent map.
-        assert_eq!(plugin.matches("sessionParents.has(").count(), 1);
+        // Capture is untouched: besides this claim, only the post-compaction
+        // note and anchor (#1983), both delivery, consult the parent map.
+        assert_eq!(plugin.matches("sessionParents.has(").count(), 3);
     }
 
     #[test]
@@ -15471,6 +15588,137 @@ process.exit(0);
                     "{id}: {run}"
                 );
             }
+        }
+
+        /// Drives the rendered OpenCode V1 plugin through a compaction the way
+        /// OpenCode 1.x runs one (`session/compaction.ts`): the
+        /// `experimental.session.compacting` hook, then `session.compacted`,
+        /// then model calls through `experimental.chat.system.transform`, for
+        /// a top-level session and a `task` subagent, with a "reload context"
+        /// prompt and a second compaction after it.
+        const OPENCODE_COMPACTION_HARNESS: &str = r#"import { createServer } from "node:http";
+import { readFileSync, writeFileSync } from "node:fs";
+
+const project = process.argv[2]!;
+const recaps: Record<string, string | null>[] = [];
+const server = createServer((req, res) => {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  req.resume();
+  req.on("end", () => {
+    if (url.pathname === "/recap") {
+      const mode = url.searchParams.get("mode");
+      recaps.push({ mode, budget: url.searchParams.get("budget"), session_id: url.searchParams.get("session_id") });
+      res.writeHead(200, { "content-type": "text/plain" });
+      const id = url.searchParams.get("session_id");
+      // `old` stands for a server that predates `mode=anchor`.
+      res.end(mode === "anchor" && id !== "old"
+        ? `> 🧭 ai-memory: post-compaction anchor for this session (${id})`
+        : "RECAP");
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+});
+await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+const port = (server.address() as any).port;
+writeFileSync(
+  "./ext.ts",
+  readFileSync("./ext.template.ts", "utf8").replace("http://127.0.0.1:65535", `http://127.0.0.1:${port}`),
+);
+const { default: AiMemoryHooks } = await import("./ext.ts");
+const plugin = await AiMemoryHooks({ directory: project });
+const created = (id: string, parentID?: string) => plugin.event({ event: { type: "session.created",
+  properties: { sessionID: id, info: { id, directory: project, ...(parentID ? { parentID } : {}) } } } });
+async function modelCall(id: string): Promise<string[]> {
+  const output = { system: [] as string[] };
+  await plugin["experimental.chat.system.transform"]({ sessionID: id }, output);
+  return output.system;
+}
+async function compacting(id: string): Promise<Record<string, unknown>> {
+  const output: Record<string, unknown> = { context: [] as string[] };
+  await plugin["experimental.session.compacting"]({ sessionID: id }, output);
+  return output;
+}
+const compacted = (id: string) => plugin.event({ event: { type: "session.compacted", properties: { sessionID: id } } });
+await created("root");
+await created("task", "root");
+await created("old");
+await compacting("old");
+await compacted("old");
+const oldAfter = await modelCall("old");
+const before = await modelCall("root");
+const rootCompacting = await compacting("root");
+const taskCompacting = await compacting("task");
+await compacted("root");
+await compacted("task");
+const after = [await modelCall("root"), await modelCall("root")];
+const taskAfter = await modelCall("task");
+await plugin["chat.message"]({ sessionID: "root" }, { parts: [{ type: "text", text: "reload context" }] });
+const reload = await modelCall("root");
+await compacting("root");
+const afterNext = await modelCall("root");
+await plugin.dispose();
+console.log(JSON.stringify({ oldAfter, before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }));
+process.exit(0);
+"#;
+
+        #[test]
+        fn opencode_plugin_injects_the_anchor_after_a_compaction() {
+            if !node_strips_types() {
+                eprintln!("skipping: node lacks --experimental-strip-types");
+                return;
+            }
+            let tmp = TempDir::new().unwrap();
+            let project = tmp.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let run = run_harness(
+                &tmp,
+                opencode_plugin_under_test(),
+                OPENCODE_COMPACTION_HARNESS,
+                &project,
+            );
+            let anchor =
+                serde_json::json!("> 🧭 ai-memory: post-compaction anchor for this session (root)");
+            // A server that ignores `mode=anchor` answers with its recap,
+            // which is never injected automatically.
+            assert!(run["oldAfter"].as_array().unwrap().is_empty(), "{run}");
+            let has = |key: &serde_json::Value, text: &serde_json::Value| {
+                key.as_array().unwrap().contains(text)
+            };
+            assert!(!has(&run["before"], &anchor), "{run}");
+            // One line for the summary, and the compaction prompt itself is
+            // left to OpenCode.
+            let context = run["rootCompacting"]["context"].as_array().unwrap();
+            assert_eq!(context.len(), 1, "{run}");
+            assert!(context[0].as_str().unwrap().contains("(root)"), "{run}");
+            assert!(run["rootCompacting"].get("prompt").is_none(), "{run}");
+            assert_eq!(
+                run["taskCompacting"]["context"],
+                serde_json::json!([]),
+                "{run}"
+            );
+            for call in run["after"].as_array().unwrap() {
+                assert!(
+                    has(call, &anchor),
+                    "every call until the next compaction: {run}"
+                );
+            }
+            assert!(run["taskAfter"].as_array().unwrap().is_empty(), "{run}");
+            // "reload context" keeps working beside the anchor.
+            assert!(has(&run["reload"], &serde_json::json!("RECAP")), "{run}");
+            assert!(has(&run["reload"], &anchor), "{run}");
+            // The next compaction forgets both.
+            assert!(run["afterNext"].as_array().unwrap().is_empty(), "{run}");
+            assert_eq!(
+                run["recaps"],
+                serde_json::json!([
+                    {"mode": "anchor", "budget": "2000", "session_id": "old"},
+                    {"mode": "anchor", "budget": "2000", "session_id": "root"},
+                    {"mode": null, "budget": null, "session_id": "root"},
+                ]),
+                "{run}"
+            );
         }
 
         /// Every request reaches a gateway in front of the server that

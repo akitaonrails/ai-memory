@@ -5,6 +5,17 @@
 
 const PHRASE: &str = "reload context";
 
+/// The first line of every post-compaction anchor `GET /recap?mode=anchor`
+/// renders for a readable session, up to the session id. The hook client and
+/// the OpenCode plugins inject a reply only when it starts with this, so an
+/// older server's full recap or a refusal notice never lands automatically.
+pub const ANCHOR_HEADER_PREFIX: &str = "> 🧭 ai-memory: post-compaction anchor for this session";
+
+/// The anchor's reply for a session the store does not know or the caller may
+/// not read. It deliberately does not start with [`ANCHOR_HEADER_PREFIX`].
+pub const NO_ANCHOR_SESSION_NOTICE: &str = "> 🧭 ai-memory: post-compaction anchor: no session is \
+     recorded under this id for you, so there is nothing to re-ground on.\n";
+
 /// [`is_reload_request`] as a JavaScript regex literal, for the generated
 /// OpenCode plugins.
 pub const RELOAD_TRIGGER_JS_REGEX: &str = r"/^\s*reload context(?![\p{L}\p{N}_])/iu";
@@ -30,6 +41,11 @@ pub fn is_reload_request(prompt: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_unknown_session_notice_is_not_an_anchor() {
+        assert!(!NO_ANCHOR_SESSION_NOTICE.starts_with(ANCHOR_HEADER_PREFIX));
+    }
 
     #[test]
     fn reload_trigger_table() {
