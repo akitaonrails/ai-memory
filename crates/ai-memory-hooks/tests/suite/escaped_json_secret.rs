@@ -103,6 +103,40 @@ async fn every_object_shaped_tool_result_is_redacted_in_the_stored_tool_body() {
     }
 }
 
+/// A hook spool entry holds the static root bearer under a bare `token`
+/// key; an agent printing one while debugging delivery must not store it
+/// (#1982). Fails with the bare-`token` rule removed from the sanitizer.
+#[tokio::test]
+async fn a_printed_spool_entry_does_not_store_the_root_bearer() {
+    let tmp = TempDir::new().unwrap();
+    let state = make_state(&tmp).await;
+    // A FAKE value in the `generate-auth-token` shape.
+    let token = "0123456789abcdef".repeat(4);
+    let entry = serde_json::json!({
+        "url": "http://127.0.0.1:0/hook?event=post-tool-use",
+        "body": "{}",
+        "created_ms": 0,
+        "auth_mode": "static",
+        "token": token,
+        "attempts": 0,
+    });
+    let tool_response = serde_json::json!({
+        "stdout": format!("{entry}\n"),
+        "stderr": "",
+        "interrupted": false,
+    });
+    let body = stored_tool_body(&state, "claude-code", tool_response).await;
+    assert!(
+        !body.contains(&token) && body.contains("[REDACTED:"),
+        "root bearer stored verbatim: {body:?}"
+    );
+    assert!(
+        body.contains(r#"\"url\":\"http://127.0.0.1:0/hook"#)
+            && body.contains(r#""interrupted":false"#),
+        "redaction swallowed the rest of the entry: {body:?}"
+    );
+}
+
 /// A result with no secret is stored as it arrived.
 #[tokio::test]
 async fn an_object_shaped_tool_result_without_a_secret_is_stored_whole() {

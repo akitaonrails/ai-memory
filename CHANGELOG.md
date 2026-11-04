@@ -11,6 +11,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The sanitizer now redacts ai-memory's own credentials. A hook spool entry
+  stores the static root bearer under a bare `token` key, which no rule
+  matched, so an agent printing a spool entry while debugging delivery
+  stored the server's root token in the observation. A `token` key with a
+  value of 32 or more characters is now redacted in JSON (escaped or not),
+  TOML, YAML and `TOKEN=` form, and so are `aim_` API keys and `ams_` session
+  secrets anywhere in the text. The external-capture client scrub follows
+  the same rules, and also reads a quoted or escaped JSON key now (#1982).
+
 ## [3.3.3] - 2026-11-03
 
 ### Fixed

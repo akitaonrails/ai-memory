@@ -383,6 +383,17 @@ fn shared_sanitizer_vectors_hold() {
             assert!(out.starts_with("key ") && out.ends_with(" end"), "{out:?}");
         }
     }
+    for field in vectors["credential_fields"].as_array().unwrap() {
+        let input = field["input"].as_str().unwrap();
+        let out = sanitize_external_text(input);
+        assert!(
+            out.contains("[REDACTED") && !out.contains(field["secret"].as_str().unwrap()),
+            "{input:?} -> {out:?}"
+        );
+        for kept in field["kept"].as_array().into_iter().flatten() {
+            assert!(out.contains(kept.as_str().unwrap()), "{input:?} -> {out:?}");
+        }
+    }
     let body_line = vectors["key_body_line"].as_str().unwrap();
     for block in vectors["key_blocks"].as_array().unwrap() {
         let input = block["input"].as_str().unwrap();
