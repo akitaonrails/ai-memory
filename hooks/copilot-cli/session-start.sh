@@ -32,7 +32,7 @@ printf '%s' "$PAYLOAD" \
 # Copilot CLI accepts SessionStart context only in its top-level
 # additionalContext envelope. The hook protocol maps the PascalCase event
 # name to snake_case fields before this script receives it; no handoff -> {}.
-HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=copilot-cli${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
+HANDOFF=$(ai_memory_get_start_handoff "$PAYLOAD" "$SERVER/handoff?agent=copilot-cli${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
 if [ -n "$HANDOFF" ]; then
     printf '{"additionalContext":%s}\n' \
         "$(printf '%s' "$HANDOFF" | ai_memory_json_string)"

@@ -71,7 +71,7 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::transport::{StreamableHttpClientTransport, Transport, stdio};
 use rmcp::{ErrorData as McpError, Peer, ServerHandler, ServiceExt};
 
-use super::hook_capture::{build_client, marker_query_suffix_without_briefing, url_encode};
+use super::hook_capture::{build_client, inbox_notice_query_suffix, url_encode};
 use crate::cli::{BridgeAgent, BridgeChannel, McpBridgeArgs};
 use crate::commands::install_mcp::mcp_server_url_from_base;
 use crate::config::Config;
@@ -449,19 +449,19 @@ fn validate_channel_args(args: &McpBridgeArgs) -> Result<()> {
     Ok(())
 }
 
-/// The `/handoff` URL the inbox channel polls. `inbox_only=1` makes the
-/// server return only the count-only inbox notice and skip every claim, write
-/// and active-project publish, so a background poll never moves the caller's
-/// "current project" pointer; the suppression flags keep a server that
-/// predates `inbox_only` to the same body.
+/// The `/handoff` URL the inbox channel polls. Its query comes from
+/// [`inbox_notice_query_suffix`], whose `inbox_only=1` makes the server
+/// return only the count-only inbox notice and skip every claim, write and
+/// active-project publish, so a background poll never moves the caller's
+/// "current project" pointer.
 fn inbox_channel_url(mcp_url: &str, cwd: &str, session_id: &str) -> String {
     let (path, _) = mcp_url.split_once('?').unwrap_or((mcp_url, ""));
     let path = path.trim_end_matches('/');
     let base = path.strip_suffix("/mcp").unwrap_or(path);
     format!(
-        "{base}/handoff?agent=claude-code&session_id={}{}&inbox_only=1&handoff=0&recovery=0&profile_digest=0",
+        "{base}/handoff?agent=claude-code&session_id={}{}",
         url_encode(session_id),
-        marker_query_suffix_without_briefing(cwd, None),
+        inbox_notice_query_suffix(cwd, None),
     )
 }
 
@@ -866,6 +866,34 @@ mod tests {
                 && !url.contains("flavor=moonshot"),
             "{url}"
         );
+    }
+
+    /// The bridge poll carries each suppression flag once even when the
+    /// marker turns handoff and recovery delivery off, so the server's
+    /// `HandoffQuery` extractor accepts it instead of failing every poll.
+    #[test]
+    fn inbox_channel_url_parses_with_delivery_opt_outs() {
+        use ai_memory_hooks::router::HandoffQuery;
+        use axum::extract::Query;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[handoff]\ndeliver_on_session_start = false\n\
+             [recovery]\ndeliver_on_session_start = false\n",
+        )
+        .unwrap();
+        let url = super::inbox_channel_url(
+            "http://127.0.0.1:1/mcp",
+            repo.path().to_str().unwrap(),
+            "ses",
+        );
+        let uri: axum::http::Uri = url.parse().unwrap();
+        let Query(query) = Query::<HandoffQuery>::try_from_uri(&uri)
+            .unwrap_or_else(|e| panic!("the server would reject {url}: {e}"));
+        assert_eq!(query.inbox_only.as_deref(), Some("1"), "{url}");
+        assert_eq!(query.handoff.as_deref(), Some("0"), "{url}");
+        assert_eq!(query.recovery.as_deref(), Some("0"), "{url}");
     }
 
     #[test]

@@ -38,7 +38,7 @@ fi
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=session-start&agent=kiro-cli${QS}" >/dev/null 2>&1 || true
 
-HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=kiro-cli${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
+HANDOFF=$(ai_memory_get_start_handoff "$PAYLOAD" "$SERVER/handoff?agent=kiro-cli${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
 # Mark an opted-in session as briefed only AFTER the GET completed — success
 # or error. Fail-open on purpose: with the server down the flagged request
 # delivers nothing anyway, and the one lost brief returns next session.

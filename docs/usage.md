@@ -195,14 +195,21 @@ and does not re-send the session-start packet, digest or brief. When the
 server is slow or unreachable the hook prints nothing and the harness carries
 on without it.
 
+The anchor comes from the native `ai-memory hook` only. Any `SessionStart`
+with source `compact`, from any harness, claims nothing: the native hook and
+the shell and PowerShell fallback hooks in `hooks/` all skip the handoff
+fetch and print their usual empty reply. The fallback hooks never inject an
+anchor, so a Claude Code, Codex or Droid install running them relies on the
+installed instructions, like the harnesses in the last row below.
+
 | Harness | Post-compaction path |
 |---|---|
-| Claude Code | Automatic: `SessionStart` with source `compact`, through `hookSpecificOutput.additionalContext` |
-| Codex | Automatic: `SessionStart` with source `compact`, as developer context before the next model request |
-| Factory Droid | Automatic: `SessionStart` with source `compact`, appended to the new session context |
+| Claude Code | Automatic (native hook): `SessionStart` with source `compact`, through `hookSpecificOutput.additionalContext` |
+| Codex | Automatic (native hook): `SessionStart` with source `compact`, as developer context before the next model request |
+| Factory Droid | Automatic (native hook): `SessionStart` with source `compact`, appended to the new session context |
 | OpenCode V1 | Automatic: the `experimental.session.compacting` hook adds one line to `output.context` asking the summary to keep the session id and point at ai-memory, and `session.compacted` arms the anchor for the system transform until the next compaction |
 | OpenCode V2 | Automatic: the `compaction` hook adds the same line as a `system` part, and `session.compaction.ended` arms the anchor for the `context` hook until the next compaction |
-| Gemini CLI, Cursor, GitHub Copilot CLI, Kimi Code, Grok Build, Kiro CLI, Cline, Muse Code and the rest | Instructions only: these harnesses have no hook that can add context after a compaction (Muse reports a `compact` source, but its output contract is unpublished), so the agent follows the installed instructions and reads its own session's prompts |
+| Gemini CLI, Cursor, GitHub Copilot CLI, Kimi Code, Grok Build, Kiro CLI, Cline, Muse Code and the rest | Instructions only: these harnesses have no hook that can add context after a compaction (Muse reports a `compact` source, but its output contract is unpublished, so its compaction start only skips the handoff claim), so the agent follows the installed instructions and reads its own session's prompts |
 
 When no anchor arrives, the agent calls `memory_read_session_observations`
 with `session_id: "current"` and `kinds: ["user-prompt","stop"]`. The server

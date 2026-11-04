@@ -337,6 +337,45 @@ pub fn marker_query_suffix_without_briefing(cwd: &str, default_strategy: Option<
     marker_query_suffix_impl(cwd, default_strategy, None)
 }
 
+/// The fixed `/handoff` flags of a count-only inbox notice fetch (#1942).
+/// `inbox_only=1` makes the server return only the notice and skip every
+/// claim, write and active-project publish; the suppression flags keep a
+/// server that predates `inbox_only` to the same body.
+const INBOX_NOTICE_FLAGS: &str = "&inbox_only=1&handoff=0&recovery=0&profile_digest=0";
+
+/// The query suffix of a count-only inbox notice fetch: the routing pairs of
+/// [`marker_query_suffix_without_briefing`] followed by
+/// [`INBOX_NOTICE_FLAGS`]. The marker's own `&handoff=0` / `&recovery=0`
+/// delivery opt-outs are left out because the fixed flags already carry
+/// them: `GET /handoff` deserializes its query into a struct, and a repeated
+/// key is a 400, which would hide the notice for exactly the repositories
+/// that turned delivery off. Both the Claude Code prompt notice and the
+/// `mcp-bridge --channel inbox` poll build their query here.
+pub fn inbox_notice_query_suffix(cwd: &str, default_strategy: Option<&str>) -> String {
+    match routing_selection(cwd) {
+        Ok(selection) => inbox_notice_query_suffix_from_selection(cwd, default_strategy, selection),
+        // Like `marker_query_suffix_impl`: an unreadable routing marker sends
+        // no routing pairs at all.
+        Err(_) => INBOX_NOTICE_FLAGS.to_owned(),
+    }
+}
+
+fn inbox_notice_query_suffix_from_selection(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    selection: Option<RoutingSelection>,
+) -> String {
+    let mut qs = build_marker_query_suffix(
+        cwd,
+        default_strategy,
+        None,
+        selection,
+        DeliveryOptOuts::Omit,
+    );
+    qs.push_str(INBOX_NOTICE_FLAGS);
+    qs
+}
+
 /// Whether the marker that routes `cwd` explicitly enables the compiled
 /// project brief. It is the selection [`marker_query_suffix`] reads its
 /// `&briefing` params from, so the Kimi gate agrees with the query it gates:
@@ -705,6 +744,31 @@ fn marker_query_suffix_impl_from_selection(
     briefing_key: Option<BriefingKey>,
     selection: Option<RoutingSelection>,
 ) -> String {
+    build_marker_query_suffix(
+        cwd,
+        default_strategy,
+        briefing_key,
+        selection,
+        DeliveryOptOuts::Forward,
+    )
+}
+
+/// Whether a marker suffix carries the `[handoff]` / `[recovery]`
+/// `deliver_on_session_start` opt-outs as `&handoff=0` / `&recovery=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOptOuts {
+    Forward,
+    /// The caller appends both flags itself ([`INBOX_NOTICE_FLAGS`]).
+    Omit,
+}
+
+fn build_marker_query_suffix(
+    cwd: &str,
+    default_strategy: Option<&str>,
+    briefing_key: Option<BriefingKey>,
+    selection: Option<RoutingSelection>,
+    delivery_opt_outs: DeliveryOptOuts,
+) -> String {
     let mut qs = format!("&cwd={}", url_encode(cwd));
     let marker = selection.as_ref().map(|selection| selection.path.clone());
     let scope = hook_scope_from_selection(cwd, default_strategy, selection);
@@ -795,11 +859,13 @@ fn marker_query_suffix_impl_from_selection(
     if let Some(val) = profile_consume {
         qs.push_str(&format!("&profile_consume={val}"));
     }
-    if handoff_off {
-        qs.push_str("&handoff=0");
-    }
-    if recovery_off {
-        qs.push_str("&recovery=0");
+    if delivery_opt_outs == DeliveryOptOuts::Forward {
+        if handoff_off {
+            qs.push_str("&handoff=0");
+        }
+        if recovery_off {
+            qs.push_str("&recovery=0");
+        }
     }
     // Per-repo brief opt-in: forwarded on every request for simplicity (the
     // capture path ignores it); only the `/handoff` GET at session start, or
@@ -2179,6 +2245,75 @@ drop_subagent_captures = "true"
 
         let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
         assert!(!outer.contains("recovery"), "{outer}");
+    }
+
+    /// The inbox notice query (#1942) appends its own `handoff=0` and
+    /// `recovery=0`, so it must not also forward the marker's delivery
+    /// opt-outs: `GET /handoff` deserializes its query into `HandoffQuery`,
+    /// which rejects a repeated key, and the notice would never appear for a
+    /// repository that turned handoff or recovery delivery off. Every shape is
+    /// parsed with the server's own extractor; the control proves that
+    /// extractor rejects the old composition.
+    #[test]
+    fn inbox_notice_query_parses_as_a_handoff_query_under_every_delivery_opt_out() {
+        use ai_memory_hooks::router::HandoffQuery;
+        use axum::extract::Query;
+
+        let parse = |qs: &str| {
+            let uri: axum::http::Uri = format!("/handoff?agent=claude-code&session_id=s{qs}")
+                .parse()
+                .unwrap();
+            Query::<HandoffQuery>::try_from_uri(&uri).map(|Query(query)| query)
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+        let selection = || {
+            super::super::super::marker::routing_selection_with_home(
+                cwd,
+                cwd,
+                Some(home.path()),
+                false,
+            )
+            .unwrap()
+        };
+        let handoff_off = "[handoff]\ndeliver_on_session_start = false\n";
+        let recovery_off = "[recovery]\ndeliver_on_session_start = false\n";
+        let cases = [
+            ("no marker", None),
+            ("no opt-out", Some("workspace = \"w\"\n".to_owned())),
+            ("handoff off", Some(handoff_off.to_owned())),
+            ("recovery off", Some(recovery_off.to_owned())),
+            ("both off", Some(format!("{handoff_off}{recovery_off}"))),
+            (
+                "legacy handoff off",
+                Some("deliver_on_session_start = false\n".to_owned()),
+            ),
+        ];
+        for (name, body) in cases {
+            match &body {
+                Some(body) => std::fs::write(&marker, body).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&marker);
+                }
+            }
+            let qs = inbox_notice_query_suffix_from_selection(cwd, None, selection());
+            let query = parse(&qs).unwrap_or_else(|e| panic!("{name}: {qs} rejected: {e}"));
+            assert_eq!(query.inbox_only.as_deref(), Some("1"), "{name}");
+            assert_eq!(query.handoff.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.recovery.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.profile_digest.as_deref(), Some("0"), "{name}");
+            assert_eq!(query.cwd.as_deref(), Some(cwd), "{name}");
+            assert!(query.briefing.is_none(), "{name}: {qs}");
+
+            // Control: the routing suffix that forwards the opt-outs, followed
+            // by the fixed flags, is what both callers used to send.
+            let forwarded = marker_query_suffix_impl_from_selection(cwd, None, None, selection());
+            let old = format!("{forwarded}{INBOX_NOTICE_FLAGS}");
+            let opted_out = forwarded.contains("&handoff=0") || forwarded.contains("&recovery=0");
+            assert_eq!(parse(&old).is_err(), opted_out, "{name}: {old}");
+        }
     }
 
     /// A marker WITHOUT `drop_subagent_captures` does not forward the flag, so
