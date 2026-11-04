@@ -268,6 +268,16 @@ sign in, with no console window, and restarts if it fails. Details and the
 other Windows setups (WSL2, Docker Desktop, a real Windows service) are in
 [`docs/windows.md`](docs/windows.md).
 
+With [Scoop](https://scoop.sh) (ai-memory 3.4.0 or later):
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Update it with `scoop update ai-memory`.
+
 ### Arch Linux (AUR)
 
 For native Arch installs, use the AUR packages. They install

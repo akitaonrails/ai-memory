@@ -90,6 +90,34 @@ check_sdk_not_distributed() {
   rm -f "${probe}"
 }
 
+# packaging/scoop/ai-memory.json is a template: the release workflow pins its
+# version, url and hash to the tag before pushing it to the Scoop bucket. Check
+# the parts the workflow keeps as they are, and that they name the zip the
+# release actually builds.
+check_scoop_manifest() {
+  local manifest=packaging/scoop/ai-memory.json
+  local zip=ai-memory-windows-x86_64.zip
+  log "Checking Scoop manifest template"
+  require_tool jq
+  jq -e . "${manifest}" >/dev/null || fail "${manifest} is not valid JSON"
+  jq -e --arg zip "${zip}" '
+    . as $m
+    | (.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+    and .homepage == "https://aimemory.sh"
+    and .license == "MIT"
+    and .bin == "ai-memory.exe"
+    and .checkver == "github"
+    and (.architecture."64bit".url | endswith("/v" + $m.version + "/" + $zip))
+    and (.architecture."64bit".hash | test("^[0-9a-f]{64}$"))
+    and .autoupdate.architecture."64bit".url
+      == "https://github.com/akitaonrails/ai-memory/releases/download/v$version/" + $zip
+    and .autoupdate.hash.url == "$url.sha256"
+  ' "${manifest}" >/dev/null \
+    || fail "${manifest} does not match the release's Windows zip or Scoop's manifest fields"
+  grep -Fq "RELEASE_ARTIFACT: ${zip%.zip}" .github/workflows/release.yml \
+    || fail "release.yml no longer builds ${zip}, which ${manifest} installs"
+}
+
 main() {
   local repo
   repo="$(repo_root)"
@@ -123,6 +151,8 @@ main() {
   else
     log "Skipping RPM spec check (rpmspec unavailable)"
   fi
+
+  check_scoop_manifest
 
   # Honor TMPDIR: mktemp ignores it once the template carries an explicit
   # directory, and a host whose /tmp is small or quota-limited would reject

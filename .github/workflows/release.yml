@@ -11,6 +11,8 @@ name: release
 #   DOCKERHUB_USERNAME  — Docker Hub account name
 #   DOCKERHUB_TOKEN     — Docker Hub access token (read/write)
 #   AUR_SSH_PRIVATE_KEY — private key for an AUR account with maintainer access
+#   SCOOP_BUCKET_TOKEN  — token that can push to akitaonrails/scoop-bucket
+#                         (fine-grained: Contents read/write on that repo)
 #
 # The CI workflow already validates the binary and package assets
 # (fmt / clippy / test / native-packaging). This workflow assumes CI
@@ -321,12 +323,14 @@ jobs:
     outputs:
       docker_enabled: ${{ steps.check.outputs.docker_enabled }}
       aur_enabled: ${{ steps.check.outputs.aur_enabled }}
+      scoop_enabled: ${{ steps.check.outputs.scoop_enabled }}
     steps:
       - id: check
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
         run: |
           if [ -n "$DOCKERHUB_TOKEN" ] && [ -n "$DOCKERHUB_USERNAME" ]; then
             echo "docker_enabled=true" >> "$GITHUB_OUTPUT"
@@ -340,6 +344,13 @@ jobs:
           else
             echo "aur_enabled=false" >> "$GITHUB_OUTPUT"
             echo "::warning::AUR_SSH_PRIVATE_KEY not set — skipping AUR publish."
+          fi
+
+          if [ -n "$SCOOP_BUCKET_TOKEN" ]; then
+            echo "scoop_enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "scoop_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SCOOP_BUCKET_TOKEN not set — skipping Scoop bucket publish."
           fi
 
   docker-amd64:
@@ -606,6 +617,11 @@ jobs:
           echo "\$env:AI_MEMORY_VERSION='${{ needs.validate-version.outputs.version }}'; irm https://github.com/akitaonrails/ai-memory/releases/download/${GITHUB_REF_NAME}/install.ps1 | iex" >> body.md
           echo "ai-memory setup" >> body.md
           echo "" >> body.md
+          echo "# Windows (Scoop)" >> body.md
+          echo "scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket" >> body.md
+          echo "scoop install ai-memory" >> body.md
+          echo "ai-memory setup" >> body.md
+          echo "" >> body.md
           echo "# From source" >> body.md
           echo "cargo install --locked --git https://github.com/akitaonrails/ai-memory --tag ${GITHUB_REF_NAME}" >> body.md
           echo '```' >> body.md
@@ -725,6 +741,70 @@ jobs:
           publish_pkg ai-memory "$source_pkgbuild"
           publish_pkg ai-memory-bin "$bin_pkgbuild"
           EOF
+
+  # Pins packaging/scoop/ai-memory.json to this tag and pushes it to the
+  # akitaonrails/scoop-bucket `bucket/` directory. The hash comes from the
+  # published release's `.sha256` sidecar, never from workflow artifacts, so
+  # the bucket verifies exactly what the release serves.
+  scoop:
+    name: scoop bucket publish
+    needs: [check-secrets, github-release, validate-version]
+    if: needs.check-secrets.outputs.scoop_enabled == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pin version, URL and hash for the tag
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          zip="ai-memory-windows-x86_64.zip"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          sidecar="$(curl -fsSL --retry 3 "$base/$zip.sha256")"
+          hash="$(printf '%s\n' "$sidecar" | awk -v zip="$zip" '$2 == zip { print $1 }')"
+          if ! printf '%s' "$hash" | grep -Eqx '[0-9a-f]{64}'; then
+            echo "::error::$zip.sha256 on the v${VERSION} release has no sha256 for $zip"
+            exit 1
+          fi
+          jq --arg version "$VERSION" --arg url "$base/$zip" --arg hash "$hash" '
+            del(."##")
+            | .version = $version
+            | .architecture."64bit".url = $url
+            | .architecture."64bit".hash = $hash
+          ' packaging/scoop/ai-memory.json > scoop-manifest.json
+          jq -e '.version and .architecture."64bit".hash' scoop-manifest.json >/dev/null
+
+      - name: Push manifest to scoop-bucket
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The token reaches git through GIT_ASKPASS, never argv or the
+          # remote URL, so it stays out of process listings and git config.
+          askpass="$(mktemp)"
+          trap 'rm -f "$askpass"' EXIT
+          printf '#!/bin/sh\nprintf %%s "$SCOOP_BUCKET_TOKEN"\n' > "$askpass"
+          chmod 700 "$askpass"
+          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+          git clone --depth 1 https://x-access-token@github.com/akitaonrails/scoop-bucket.git bucket
+          mkdir -p bucket/bucket
+          cp scoop-manifest.json bucket/bucket/ai-memory.json
+          cd bucket
+          git config user.name "ai-memory release bot"
+          git config user.email "actions@github.com"
+          git add bucket/ai-memory.json
+          if git diff --cached --quiet; then
+            echo "scoop-bucket already has ai-memory ${VERSION}; nothing to push"
+            exit 0
+          fi
+          git commit -m "ai-memory ${VERSION}"
+          git push origin HEAD
 
   rpm:
     name: Fedora RPM (${{ matrix.arch }})

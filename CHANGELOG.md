@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Published ai-memory to the maintainer's Scoop bucket: on Windows,
+  `scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket`
+  then `scoop install ai-memory`. Each tagged release pins the manifest to the
+  Windows zip and the SHA-256 the release publishes, and pushes it to the
+  bucket. `ai-memory setup` records Scoop's `apps\ai-memory\current` junction
+  in the logon entry, hook commands and MCP entries, never the version
+  directory that `scoop cleanup` deletes. `ai-memory upgrade` refuses a Scoop
+  install and points to `scoop update ai-memory`.
 - Added a post-compaction anchor, `GET /recap?mode=anchor`: a small,
   read-only block (default 2,000 chars) with a session's first and latest
   operator prompts, read across every compaction, behind the recap's own
