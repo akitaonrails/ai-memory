@@ -7427,11 +7427,14 @@ pub(crate) fn purge_session_with_owner(
     // Query-signal associations (#1941) this session wrote last carry its
     // query text. The row goes with the session, even when earlier sessions
     // also confirmed it: the text is the user's, and the boost is a
-    // convenience that the next confirming session rebuilds.
+    // convenience that the next confirming session rebuilds. Not scoped to
+    // this project: a row is filed under the QUERIED project, so a session
+    // that searched a sibling scope left its text there. No index covers
+    // `last_session`; this rare path scans the opt-in table rather than make
+    // every signal upsert maintain one.
     tx.execute(
-        "DELETE FROM query_page_signals \
-          WHERE workspace_id = ?1 AND project_id = ?2 AND last_session = ?3",
-        rusqlite::params![&wid[..], &pid[..], session_id.to_string()],
+        "DELETE FROM query_page_signals WHERE last_session = ?1",
+        rusqlite::params![session_id.to_string()],
     )?;
 
     // Tombstone before the row goes, in the same transaction: a purge that
@@ -7826,6 +7829,11 @@ pub fn purge_project(
         });
     }
 
+    // Query signals this project's sessions filed under OTHER projects carry
+    // their query text; the cascade below only reaches this project's rows.
+    // Must run before the cascade removes the sessions it matches against.
+    delete_query_signals_of_sessions(&tx, "project_id = ?1", &pid[..])?;
+
     // Cascade handles pages / sessions / observations / handoffs /
     // page_embeddings. The workspace row is intentionally left intact —
     // other projects may still live there.
@@ -7880,6 +7888,30 @@ pub fn purge_project(
         workstream_ids,
         compacted,
     })
+}
+
+/// Delete the query-signal rows (#1941) whose `last_session` is one of the
+/// sessions `sessions_where` selects, in any project.
+///
+/// A signal row is filed under the project that was queried, not the one the
+/// session belongs to, so a purge's own cascade misses the rows its sessions
+/// left in sibling scopes — and each still holds the session's query text.
+/// `last_session` is the session id's hyphenated text form (see
+/// [`record_query_page_signal`]), rebuilt here from the blob key so the delete
+/// is one statement rather than a per-session loop.
+fn delete_query_signals_of_sessions(
+    tx: &rusqlite::Transaction<'_>,
+    sessions_where: &str,
+    id: &[u8],
+) -> StoreResult<u64> {
+    let sql = format!(
+        "DELETE FROM query_page_signals WHERE last_session IN ( \
+           SELECT lower(substr(hex(id), 1, 8) || '-' || substr(hex(id), 9, 4) || '-' \
+                     || substr(hex(id), 13, 4) || '-' || substr(hex(id), 17, 4) || '-' \
+                     || substr(hex(id), 21, 12)) \
+             FROM sessions WHERE {sessions_where})"
+    );
+    Ok(tx.execute(&sql, rusqlite::params![id])? as u64)
 }
 
 /// Summary returned by [`delete_workspace`].
@@ -8053,6 +8085,9 @@ pub fn delete_workspace(
         });
     }
 
+    // Same cross-scope query-signal cleanup as `purge_project`, before the
+    // cascade removes the sessions it matches against.
+    delete_query_signals_of_sessions(&tx, "workspace_id = ?1", &wid[..])?;
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
         rusqlite::params![&wid[..]],
