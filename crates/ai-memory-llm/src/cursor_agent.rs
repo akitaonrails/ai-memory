@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use ai_memory_core::Sanitizer;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::Command;
@@ -29,7 +30,6 @@ use crate::auth::CursorAuth;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, Role};
-use ai_memory_core::Sanitizer;
 
 /// Model used when `AI_MEMORY_LLM_MODEL` is unset.
 ///
@@ -222,14 +222,9 @@ impl CursorAgentProvider {
         let (status, stdout, stderr) = collected;
         if !status.success() {
             let code = status.code().unwrap_or(1);
-            // Cursor agent's stderr may echo session content or environment
-            // fragments — run the same built-in secret scrubber the HTTP
-            // providers use before anything reaches a log or the caller.
-            let raw = String::from_utf8_lossy(&stderr);
-            let scrubbed = Sanitizer::builtin().scrub(&raw);
             return Err(LlmError::Provider {
                 status: u16::try_from(code).unwrap_or(1),
-                body: crate::text::truncate_with_ellipsis(&scrubbed, 500),
+                body: child_output_excerpt(&String::from_utf8_lossy(&stderr), 500),
                 retry_after: None,
             });
         }
@@ -356,7 +351,7 @@ fn parse_json_answer(text: &str) -> LlmResult<serde_json::Value> {
     }
     Err(LlmError::UnexpectedShape(format!(
         "cursor agent did not return JSON: {}",
-        truncate_chars(stripped, 200)
+        child_output_excerpt(stripped, 200)
     )))
 }
 
@@ -369,16 +364,13 @@ fn strip_fence(text: &str) -> &str {
     rest.trim_end().trim_end_matches('`').trim_end()
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        if out.chars().count() >= max {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-    }
-    out
+/// Child output can echo the prompt (captured session text) or values from
+/// the child's environment, and the error it ends up in is logged. Scrub
+/// secrets and terminal control sequences the way HTTP provider error bodies
+/// are, and before the cut, so a secret straddling it cannot survive as a
+/// prefix too short to match.
+fn child_output_excerpt(text: &str, max_bytes: usize) -> String {
+    crate::text::truncate_with_ellipsis(&Sanitizer::builtin().scrub(text), max_bytes)
 }
 
 async fn read_capped(mut reader: impl AsyncRead + Unpin, cap: usize) -> LlmResult<Vec<u8>> {
