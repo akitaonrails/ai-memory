@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use super::show::terminal_text;
 use crate::cli::{ProjectAccessArgs, ProjectArgs, ProjectCommand};
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -65,8 +66,8 @@ async fn access(ep: &ServerEndpoint, args: ProjectAccessArgs) -> Result<()> {
                 "cli-project-repo-is-now-was",
                 &[
                     ("value0", repo.to_string()),
-                    ("value1", resp.mode.to_string()),
-                    ("value2", resp.previous.to_string())
+                    ("value1", terminal_text(&resp.mode)),
+                    ("value2", terminal_text(&resp.previous))
                 ]
             )
         );
@@ -77,7 +78,7 @@ async fn access(ep: &ServerEndpoint, args: ProjectAccessArgs) -> Result<()> {
                 "cli-project-repo-was-already-nothing-changed",
                 &[
                     ("value0", repo.to_string()),
-                    ("value1", resp.mode.to_string())
+                    ("value1", terminal_text(&resp.mode))
                 ]
             )
         );
@@ -86,7 +87,7 @@ async fn access(ep: &ServerEndpoint, args: ProjectAccessArgs) -> Result<()> {
         println!();
         println!("{}", i18n.format("cli-project-these-users-have-written-to-repo-and-hold-no-grant-so-they-are-now-refused", &[("value0", repo.to_string())]));
         for name in &resp.without_access {
-            println!("  {name}");
+            println!("  {}", terminal_text(name));
         }
         println!(
             "{}", i18n.format("cli-project-grant-the-ones-who-should-keep-access-ai-memory-user-grant-user-name-workspa", &[("value0", args.workspace.to_string()), ("value1", args.project.to_string())]));

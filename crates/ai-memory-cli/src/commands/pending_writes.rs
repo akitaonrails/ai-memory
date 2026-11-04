@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::{
     PendingWriteIdArgs, PendingWriteRejectArgs, PendingWritesArgs, PendingWritesCommand,
     PendingWritesListArgs,
@@ -65,7 +66,13 @@ async fn list(config: &Config, ep: &ServerEndpoint, args: PendingWritesListArgs)
         println!("{}", i18n.text("cli-pending-writes-no-pending-writes"));
     } else {
         for p in proposals {
-            println!("{}  {}  {}  {}", p.id, p.status, p.operation, p.target_path);
+            println!(
+                "{}  {}  {}  {}",
+                terminal_text(&p.id),
+                terminal_text(&p.status),
+                terminal_text(&p.operation),
+                terminal_text(&p.target_path)
+            );
         }
     }
     Ok(())
@@ -89,15 +96,17 @@ async fn show(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) ->
     } else {
         println!(
             "{} [{}] {}",
-            detail.summary.target_path, detail.summary.status, detail.summary.title
+            terminal_text(&detail.summary.target_path),
+            terminal_text(&detail.summary.status),
+            terminal_text(&detail.summary.title)
         );
         println!(
             "{}",
             i18n.format(
                 "cli-pending-writes-body",
                 &[
-                    ("value0", detail.rationale.to_string()),
-                    ("value1", detail.body_markdown.to_string())
+                    ("value0", terminal_body(&detail.rationale)),
+                    ("value1", terminal_body(&detail.body_markdown))
                 ]
             )
         );
@@ -120,7 +129,7 @@ async fn diff(config: &Config, ep: &ServerEndpoint, args: PendingWriteIdArgs) ->
     if args.json {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
-        print!("{}", resp.diff);
+        print!("{}", terminal_body(&resp.diff));
     }
     Ok(())
 }

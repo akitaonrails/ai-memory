@@ -703,10 +703,17 @@ pub(super) fn harness_name(harness: RunHarnessChoice) -> String {
         .map_or_else(|| "unknown".to_owned(), |value| value.get_name().to_owned())
 }
 
-pub(super) fn terminal_text(text: &str) -> String {
+pub(crate) fn terminal_text(text: &str) -> String {
+    terminal_body(text).replace(['\n', '\t'], "?")
+}
+
+/// Keep document line breaks and indentation while sanitizing terminal controls.
+pub(crate) fn terminal_body(text: &str) -> String {
     text.chars()
         .map(|character| {
-            if character.is_control() {
+            if (character.is_control() && !matches!(character, '\n' | '\t'))
+                || matches!(character, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
                 '?'
             } else {
                 character
@@ -1241,6 +1248,16 @@ mod tests {
     #[test]
     fn terminal_text_removes_control_sequences() {
         assert_eq!(terminal_text("safe\n\u{1b}[31mname\r"), "safe??[31mname?");
+    }
+
+    #[test]
+    fn terminal_text_neutralizes_unicode_direction_and_line_controls() {
+        assert_eq!(
+            terminal_text(
+                "café\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\u{2028}\u{2029}end"
+            ),
+            "café???????????end"
+        );
     }
 
     #[test]

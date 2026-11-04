@@ -39,6 +39,7 @@ use ai_memory_workstream::{
     ManagedHarness, build_launch_plan, list_native_sessions, native_memory_dir,
 };
 
+use super::show::terminal_text;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
 
@@ -1096,8 +1097,8 @@ fn render_project_coordinate(
                     "cli-doctor-project-coordinate-requested-current",
                     &[
                         ("value0", format!("{}", server.status)),
-                        ("value1", server.requested_name.to_string()),
-                        ("value2", current.to_string())
+                        ("value1", terminal_text(&server.requested_name)),
+                        ("value2", terminal_text(current))
                     ]
                 )
             );

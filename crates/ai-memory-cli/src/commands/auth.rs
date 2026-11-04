@@ -15,6 +15,7 @@ use secrecy::ExposeSecret as _;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::{AuthArgs, AuthCommand, AuthProviderChoice};
 use crate::commands::path_util::display_path;
 use crate::config::Config;
@@ -84,15 +85,19 @@ async fn login_oidc_device(
 ) -> Result<()> {
     let i18n = &config.i18n;
     let client = auth_http_client()?;
-    let discovery = discover(&client, issuer).await?;
-    let device = request_device_code(&client, &discovery, client_id, OIDC_DEFAULT_SCOPE).await?;
+    let discovery = discover(&client, issuer)
+        .await
+        .map_err(|error| anyhow!("{}", terminal_body(&error.to_string())))?;
+    let device = request_device_code(&client, &discovery, client_id, OIDC_DEFAULT_SCOPE)
+        .await
+        .map_err(|error| anyhow!("{}", terminal_body(&error.to_string())))?;
 
     match device.verification_uri_complete.as_deref() {
         Some(complete) => println!(
             "{}",
             i18n.format(
                 "cli-auth-open-this-url-complete",
-                &[("value0", complete.to_string())]
+                &[("value0", terminal_text(complete))]
             )
         ),
         None => {
@@ -100,14 +105,14 @@ async fn login_oidc_device(
                 "{}",
                 i18n.format(
                     "cli-auth-open-this-url-complete",
-                    &[("value0", device.verification_uri.to_string())]
+                    &[("value0", terminal_text(&device.verification_uri))]
                 )
             );
             println!(
                 "{}",
                 i18n.format(
                     "cli-auth-enter-code",
-                    &[("value0", device.user_code.to_string())]
+                    &[("value0", terminal_text(&device.user_code))]
                 )
             );
         }
@@ -165,13 +170,19 @@ async fn poll_oidc_device(
     let timeout = timeout.min(device_timeout);
     with_authorization_timeout(timeout, "oidc-device", async {
         loop {
-            match poll_token_once(client, discovery, client_id, &device.device_code).await? {
+            match poll_token_once(client, discovery, client_id, &device.device_code)
+                .await
+                .map_err(|error| anyhow!("{}", terminal_body(&error.to_string())))?
+            {
                 PollOutcome::Token(token) => return Ok(*token),
                 PollOutcome::Pending => {}
                 PollOutcome::SlowDown => interval = interval.saturating_add(Duration::from_secs(5)),
                 PollOutcome::Denied => bail!("oidc-device authorization denied"),
                 PollOutcome::Expired => bail!("oidc-device code expired before authorization"),
-                PollOutcome::Other(error) => bail!("oidc-device authorization failed: {error}"),
+                PollOutcome::Other(error) => bail!(
+                    "oidc-device authorization failed: {}",
+                    terminal_text(&error)
+                ),
             }
             sleep(interval).await;
         }
@@ -227,7 +238,7 @@ async fn login_openai_oauth(config: &Config, timeout_secs: u64) -> Result<()> {
         "{}",
         i18n.format(
             "cli-auth-enter-code",
-            &[("value0", device.user_code.to_string())]
+            &[("value0", terminal_text(&device.user_code))]
         )
     );
     println!("{}", i18n.text("cli-auth-waiting-for-authorization"));
@@ -257,7 +268,7 @@ async fn login_openai_oauth(config: &Config, timeout_secs: u64) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-auth-account-account-id",
-                &[("value0", account_id.to_string())]
+                &[("value0", terminal_text(account_id))]
             )
         );
     }
@@ -500,14 +511,14 @@ async fn run_copilot_device_flow(
         "{}",
         i18n.format(
             "cli-auth-open-this-url-complete",
-            &[("value0", device.verification_uri.to_string())]
+            &[("value0", terminal_text(&device.verification_uri))]
         )
     );
     println!(
         "{}",
         i18n.format(
             "cli-auth-enter-code",
-            &[("value0", device.user_code.to_string())]
+            &[("value0", terminal_text(&device.user_code))]
         )
     );
     println!("{}", i18n.text("cli-auth-waiting-for-authorization"));
@@ -543,7 +554,7 @@ async fn start_device_authorization(client: &reqwest::Client) -> Result<DeviceAu
         .context("starting openai-oauth device authorization")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = provider_error_body(resp).await;
+        let body = terminal_body(&provider_error_body(resp).await);
         bail!("openai-oauth device authorization failed ({status}): {body}");
     }
     resp.json::<DeviceAuthorization>()
@@ -585,7 +596,7 @@ async fn poll_device_authorization(
                 && resp.status() != reqwest::StatusCode::NOT_FOUND
             {
                 let status = resp.status();
-                let body = provider_error_body(resp).await;
+                let body = terminal_body(&provider_error_body(resp).await);
                 bail!("openai-oauth authorization polling failed ({status}): {body}");
             }
             sleep(interval).await;
@@ -612,7 +623,7 @@ async fn exchange_authorization_code(
         .context("exchanging openai-oauth authorization code")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = provider_error_body(resp).await;
+        let body = terminal_body(&provider_error_body(resp).await);
         bail!("openai-oauth token exchange failed ({status}): {body}");
     }
     resp.json::<OpenAiOAuthTokenResponse>()
@@ -633,7 +644,7 @@ async fn start_github_device_authorization(
         .context("starting copilot GitHub device authorization")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = provider_error_body(resp).await;
+        let body = terminal_body(&provider_error_body(resp).await);
         bail!("copilot GitHub device authorization failed ({status}): {body}");
     }
     resp.json::<GitHubDeviceAuthorization>()
@@ -665,7 +676,7 @@ async fn poll_github_device_authorization(
                 .context("polling copilot GitHub device authorization")?;
             let status = resp.status();
             if !status.is_success() {
-                let body = provider_error_body(resp).await;
+                let body = terminal_body(&provider_error_body(resp).await);
                 bail!("copilot GitHub authorization polling failed ({status}): {body}");
             }
             let body = resp
@@ -683,7 +694,9 @@ async fn poll_github_device_authorization(
                 Some(error) => {
                     let description = body.error_description.unwrap_or_default();
                     return Err(anyhow!(
-                        "copilot GitHub authorization failed: {error} {description}"
+                        "copilot GitHub authorization failed: {} {}",
+                        terminal_text(error),
+                        terminal_text(&description)
                     ));
                 }
                 None => bail!("copilot GitHub token response did not include access_token"),

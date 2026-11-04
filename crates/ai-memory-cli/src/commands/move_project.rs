@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 use serde::Serialize;
 
+use super::show::terminal_text;
 use crate::cli::MoveProjectArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -147,7 +148,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-move-project-ai-memory-warning-warning",
-                &[("value0", warning.to_string())]
+                &[("value0", terminal_text(warning))]
             )
         );
     }
@@ -169,7 +170,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
     if moved_via == "true-move" {
         // Lossless: re-stamped in place, nothing copied or purged.
         println!(
-            "{}", i18n.format("cli-move-project-moved-pages-pages-re-stamped-true-move-sessions-observations-and-history-pre", &[("value0", from_workspace.to_string()), ("value1", target_label.to_string()), ("value2", args.to_workspace.to_string()), ("value3", target_label.to_string()), ("value4", format!("{}", pages))]));
+            "{}", i18n.format("cli-move-project-moved-pages-pages-re-stamped-true-move-sessions-observations-and-history-pre", &[("value0", from_workspace.to_string()), ("value1", terminal_text(&target_label)), ("value2", args.to_workspace.to_string()), ("value3", terminal_text(&target_label)), ("value4", format!("{}", pages))]));
     } else {
         // copy-purge (merge into an existing same-named project).
         let tail = if skipped_count > 0 {
@@ -185,9 +186,9 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
                 "cli-move-project-moved-pages-pages-copied-merged-into-existing-project-tail",
                 &[
                     ("value0", from_workspace.to_string()),
-                    ("value1", target_label.to_string()),
+                    ("value1", terminal_text(&target_label)),
                     ("value2", args.to_workspace.to_string()),
-                    ("value3", target_label.to_string()),
+                    ("value3", terminal_text(&target_label)),
                     ("value4", format!("{}", pages)),
                     ("value5", tail.to_string())
                 ]
@@ -203,8 +204,8 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             for c in conflicts {
                 println!(
                     "  {} → {}",
-                    c["path"].as_str().unwrap_or("?"),
-                    c["moved_to"].as_str().unwrap_or("?"),
+                    terminal_text(c["path"].as_str().unwrap_or("?")),
+                    terminal_text(c["moved_to"].as_str().unwrap_or("?")),
                 );
             }
         }

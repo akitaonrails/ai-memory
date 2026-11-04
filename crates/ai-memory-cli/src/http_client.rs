@@ -55,7 +55,7 @@ impl fmt::Display for ServerResponseError {
                 ("method", self.method.to_string()),
                 ("path", self.path.clone()),
                 ("status", self.status.to_string()),
-                ("detail", self.body.clone()),
+                ("detail", crate::commands::show::terminal_body(&self.body)),
             ],
         ))
     }

@@ -155,7 +155,7 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
         i18n.format(
             "cli-message-sent-message-from-from-workspace-from-project-to",
             &[
-                ("value0", resp.message_id.to_string()),
+                ("value0", super::show::terminal_text(&resp.message_id)),
                 ("value1", from_workspace.to_string()),
                 ("value2", from_project.to_string()),
                 ("value3", args.to_workspace.to_string()),
@@ -223,15 +223,23 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
             .parse::<jiff::Timestamp>()
             .map(|ts| now_ms.saturating_sub(ts.as_millisecond()) / 1_000)
             .unwrap_or(0);
-        let subject = m.subject.as_deref().unwrap_or("(no subject)");
+        let subject = super::show::terminal_text(m.subject.as_deref().unwrap_or("(no subject)"));
         let (from, to) = if args.outbox {
             (
                 format!("{workspace}/{project}"),
-                format!("{}/{}", m.to_workspace_id, m.to_project_id),
+                format!(
+                    "{}/{}",
+                    super::show::terminal_text(&m.to_workspace_id),
+                    super::show::terminal_text(&m.to_project_id)
+                ),
             )
         } else {
             (
-                format!("{}/{}", m.from_workspace_id, m.from_project_id),
+                format!(
+                    "{}/{}",
+                    super::show::terminal_text(&m.from_workspace_id),
+                    super::show::terminal_text(&m.from_project_id)
+                ),
                 format!("{workspace}/{project}"),
             )
         };
@@ -242,7 +250,10 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
         );
         println!(
             "{}",
-            i18n.format("cli-message-id", &[("value0", m.id.to_string())])
+            i18n.format(
+                "cli-message-id",
+                &[("value0", super::show::terminal_text(&m.id))]
+            )
         );
         println!("    {from} -> {to}");
     }
@@ -401,7 +412,7 @@ fn render_popped(
             )]
         )
     );
-    let _ = writeln!(out, "\n{security_notice}");
+    let _ = writeln!(out, "\n{}", super::show::terminal_body(security_notice));
     let _ = writeln!(out, "{BODY_FENCE_OPEN}");
     if let Some(evidence) = message.evidence.as_deref() {
         let _ = writeln!(
@@ -423,16 +434,7 @@ fn render_popped(
 /// — a reader can see what was written — but no longer starts the line, so it
 /// cannot be mistaken for the renderer's own fence.
 fn escape_body_fence(body: &str) -> String {
-    let body: String = body
-        .chars()
-        .map(|character| {
-            if character == '\n' || character == '\t' || !character.is_control() {
-                character
-            } else {
-                '?'
-            }
-        })
-        .collect();
+    let body = super::show::terminal_body(body);
     body.replace(BODY_FENCE_OPEN, &format!("(escaped) {BODY_FENCE_OPEN}"))
         .replace(BODY_FENCE_CLOSE, &format!("(escaped) {BODY_FENCE_CLOSE}"))
 }

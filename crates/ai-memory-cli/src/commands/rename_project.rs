@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 
+use super::show::terminal_text;
 use crate::cli::RenameProjectArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -58,7 +59,7 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-move-project-ai-memory-warning-warning",
-                &[("value0", warning.to_string())]
+                &[("value0", terminal_text(warning))]
             )
         );
     }
@@ -74,7 +75,7 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
             "cli-rename-project-renamed-pages-now-under-the-new-name",
             &[
                 ("value0", workspace.to_string()),
-                ("value1", old_name.to_string()),
+                ("value1", terminal_text(&old_name)),
                 ("value2", workspace.to_string()),
                 ("value3", args.to.to_string()),
                 ("value4", format!("{}", pages))

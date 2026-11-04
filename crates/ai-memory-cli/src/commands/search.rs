@@ -10,6 +10,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::SearchArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -77,9 +78,9 @@ fn render_text(i18n: &ai_memory_core::i18n::Localizer, query: &str, hits: &[Hit]
                 i18n.format(
                     "cli-search-scoped-hit",
                     &[
-                        ("value0", workspace.to_string()),
-                        ("value1", project.to_string()),
-                        ("value2", hit.path.to_string()),
+                        ("value0", terminal_text(workspace)),
+                        ("value1", terminal_text(project)),
+                        ("value2", terminal_text(&hit.path)),
                         ("value3", format!("{:.4}", hit.rank))
                     ]
                 )
@@ -90,14 +91,14 @@ fn render_text(i18n: &ai_memory_core::i18n::Localizer, query: &str, hits: &[Hit]
                 i18n.format(
                     "cli-search-hit",
                     &[
-                        ("value0", hit.path.to_string()),
+                        ("value0", terminal_text(&hit.path)),
                         ("value1", format!("{:.4}", hit.rank))
                     ]
                 )
             ),
         };
-        let _ = writeln!(out, "    {}", hit.title);
-        let _ = writeln!(out, "    {}", hit.snippet);
+        let _ = writeln!(out, "    {}", terminal_text(&hit.title));
+        let _ = writeln!(out, "    {}", terminal_body(&hit.snippet));
     }
     out
 }
