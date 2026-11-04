@@ -1101,6 +1101,24 @@ ai_memory_get_handoff() {
     fi
 }
 
+# True when SessionStart payload "$1" is the one an agent fires right after a
+# context compaction (`"source": "compact"`). That start is mid-session, so it
+# must not claim a handoff baton, recovery snapshot or brief.
+ai_memory_is_compaction_start() {
+    _amsrc=$(printf '%s' "$1" | ai_memory_after_key source \
+        | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n 1) || return 1
+    [ "$_amsrc" = "compact" ]
+}
+
+# The session-start handoff GET: `ai_memory_get_handoff "$2"`, except for a
+# compaction start (payload "$1"), which fetches nothing and so prints the
+# same empty reply as "no pending handoff" (parity with the native hook; the
+# post-compaction anchor is native-only).
+ai_memory_get_start_handoff() {
+    ai_memory_is_compaction_start "$1" && return 0
+    ai_memory_get_handoff "$2"
+}
+
 # GET the read-only subagent brief at URL "$1", with ai_memory_get_handoff's
 # guards: a URL without `cwd`, or for a server-routed repository, is never
 # sent. It keeps a name of its own because `/brief` claims nothing, while

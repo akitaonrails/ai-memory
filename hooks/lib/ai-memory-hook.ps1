@@ -1221,6 +1221,16 @@ function Invoke-AiMemoryHook {
             }
         } catch {
         }
+        # A compaction's SessionStart (`source: "compact"`) is mid-session:
+        # claim no handoff, recovery snapshot or brief, and print the same
+        # empty reply as "no pending handoff" (parity with the native hook and
+        # `ai_memory_get_start_handoff`; the anchor is native-only).
+        if ($Event -eq "session-start" -and $ParsedPayload -and [string]$ParsedPayload.source -eq "compact") {
+            if ($AntigravityStartOutput -or $CopilotCliSessionStartOutput -or $SessionStartEnvelope) {
+                [Console]::Out.Write("{}")
+            }
+            return
+        }
         $Shown = $null
         if ($GrokPostTool) {
             if (Test-AiMemorySubagentPayload $ParsedPayload) {

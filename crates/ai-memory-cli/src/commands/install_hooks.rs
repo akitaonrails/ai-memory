@@ -18050,7 +18050,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             "Devin session-start.sh must use additionalContext field"
         );
         assert!(
-            script_content.contains("ai_memory_get_handoff"),
+            script_content.contains("ai_memory_get_start_handoff"),
             "Devin session-start.sh must fetch handoff"
         );
         assert!(

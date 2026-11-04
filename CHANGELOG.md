@@ -48,9 +48,11 @@ version in [`docs/changelog/`](docs/changelog/):
   native hook skips the startup packet (no handoff claim, recovery snapshot
   or brief) and injects the session's post-compaction anchor from
   `GET /recap?mode=anchor` instead; it prints the usual empty reply when the
-  anchor is unavailable. The generated OpenCode V1 and V2 plugins fetch the
-  anchor when a compaction ends and add it to every later model call until
-  the next one, and each adds one line to the compaction request naming the
+  anchor is unavailable. Any other harness that sends a `compact` source,
+  through the native hook or the shell and PowerShell fallback hooks, also
+  skips the startup packet and gets the empty reply, without an anchor. The
+  generated OpenCode V1 and V2 plugins fetch the anchor when a compaction ends
+  and add it to every later model call until the next one, and each adds one line to the compaction request naming the
   session id and saying where its record lives. `startup`, `resume`, `clear`
   and "reload context" behave as before (#1983).
 
