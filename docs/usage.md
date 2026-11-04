@@ -161,9 +161,60 @@ infer an agent.
 
 ### Reload context after a compaction
 
-A compaction keeps a model-written summary of the conversation, and the
-summary can drop or soften what you asked. Start a prompt with
-`reload context` to put the stretch it dropped back in front of the agent:
+A compaction replaces the conversation with a model-written summary, and the
+summary can drop or soften what you asked. The start of the session goes
+first: the original task, its constraints, the early decisions. On a long
+session, or a local model with a context window around 200k tokens, this
+happens again and again. Every instruction surface ai-memory installs (the
+`AGENTS.md`/`CLAUDE.md` block, the MCP handshake and the handoff skill) tells
+the agent to re-ground on ai-memory after a compaction before it continues,
+and to trust your recorded prompts over the summary. Some harnesses also get
+the evidence injected automatically.
+
+#### Automatic: the post-compaction anchor
+
+Where the harness has a hook that runs after a compaction, ai-memory injects a
+**post-compaction anchor** for the session, built by
+`GET /recap?session_id=<id>&mode=anchor`:
+
+- a header naming the session id, and a line telling the agent that the
+  summary may have lost detail and that your prompts below are the source of
+  truth for the task and its constraints;
+- the session's first prompts, verbatim and oldest first, which hold the
+  original task, then its latest prompts, newest last. Harness markup is left
+  out as in the recap. The first prompts get up to about 45% of the budget;
+  anything cut or dropped carries a visible note;
+- a footer pointing at the full record (`memory_read_session_observations`
+  with the session id and `kinds: ["user-prompt","stop"]`) and at
+  `memory_query` for decisions.
+
+The default budget is 2,000 characters (clamped to 800 to 4,000), small enough
+for a tight context. The anchor covers the whole session, so it still works
+after the fifth compaction. It is read-only: a compaction claims no handoff
+and does not re-send the session-start packet, digest or brief. When the
+server is slow or unreachable the hook prints nothing and the harness carries
+on without it.
+
+| Harness | Post-compaction path |
+|---|---|
+| Claude Code | Automatic: `SessionStart` with source `compact`, through `hookSpecificOutput.additionalContext` |
+| Codex | Automatic: `SessionStart` with source `compact`, as developer context before the next model request |
+| Factory Droid | Automatic: `SessionStart` with source `compact`, appended to the new session context |
+| OpenCode V1 | Automatic: the `experimental.session.compacting` hook adds one line asking the summary to keep the session id and point at ai-memory, and `session.compacted` arms the anchor for the system transform until the next compaction |
+| OpenCode V2 | Automatic: `session.compaction.ended` arms the anchor for the `context` hook until the next compaction |
+| Gemini CLI, Cursor, GitHub Copilot CLI, Kimi Code, Grok Build, Kiro CLI, Cline, Muse Code and the rest | Instructions only: these harnesses have no hook that can add context after a compaction (Muse reports a `compact` source, but its output contract is unpublished), so the agent follows the installed instructions and reads its own session's prompts |
+
+When no anchor arrives, the agent calls `memory_read_session_observations`
+with `session_id: "current"` and `kinds: ["user-prompt","stop"]`. The server
+resolves `"current"` only for a session-aware client (the session-aware bridge
+header or OpenCode 2's native session id); a static client is refused and
+passes the session id from the anchor or the session-start notice instead.
+
+#### Manual: `reload context`
+
+Start a prompt with `reload context` to put the stretch the last compaction
+dropped back in front of the agent, on any harness whose hooks can answer a
+prompt:
 
 ```
 reload context after last compaction, then finish the screenshots for guide 12
@@ -202,9 +253,10 @@ agent, which then runs it without a recap. Prompts that do not start with
 | OpenCode V1 / V2 | With that prompt and later model calls, until the next compaction |
 | Grok Build | After the first tool result of that turn: Grok discards `UserPromptSubmit` output. The recap shares that field with a handoff delivered at the same time and is sized to fit; when the handoff leaves too little room, it comes with the next tool result. A request with no tool call expires after 30 minutes or at session end |
 
-A session that has not been compacted yet answers with a one-line notice. The
-full record stays available through `memory_read_session_observations` with
-the session id and `kinds: ["user-prompt", "stop"]`.
+A session that has not been compacted yet answers the manual recap with a
+one-line notice. The full record stays available through
+`memory_read_session_observations` with the session id and
+`kinds: ["user-prompt", "stop"]`.
 
 ## Proactive memory queries
 
