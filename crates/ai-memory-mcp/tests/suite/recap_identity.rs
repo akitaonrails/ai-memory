@@ -299,3 +299,58 @@ async fn a_db_user_without_a_grant_reads_their_own_restricted_session_as_unknown
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("WINDOW-PROMPT-BOB"), "{body}");
 }
+
+async fn anchor(h: &Harness, token: &str, session: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .uri(format!(
+            "/recap?session_id={session}&agent=claude-code&mode=anchor"
+        ))
+        .header("host", "localhost")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("anchor req");
+    let resp = h.router.clone().oneshot(req).await.expect("anchor");
+    let status = resp.status();
+    (status, body_text(resp).await)
+}
+
+/// The post-compaction anchor reads the whole session, not one window, so it
+/// gets the same identity gates as the recap: another DB user and an
+/// unattributed root token both read an owned session as unknown.
+#[tokio::test]
+async fn the_anchor_refuses_another_users_session_through_the_middleware() {
+    let h = harness().await;
+    let alice = db_user(&h, "alice").await;
+    let bob = db_user(&h, "bob").await;
+    let session = "66666666-6666-4666-8666-666666666666";
+    compacted_session(&h, &alice.token, session, "ALICE").await;
+
+    for token in [bob.token.as_str(), ROOT_TOKEN] {
+        let (status, body) = anchor(&h, token, session).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(NO_SESSION), "{body}");
+        assert!(
+            !body.contains("WINDOW-PROMPT"),
+            "prompt text leaked: {body}"
+        );
+        assert!(
+            !body.contains("an older prompt"),
+            "prompt text leaked: {body}"
+        );
+        assert!(!body.contains(PROJECT), "project name leaked: {body}");
+    }
+    let (_, unknown) = anchor(&h, &bob.token, "77777777-7777-4777-8777-777777777777").await;
+    let (_, refused) = anchor(&h, &bob.token, session).await;
+    assert_eq!(unknown, refused, "a refusal must read like an unknown id");
+
+    // Control: the owner's anchor holds the first prompt and the latest one.
+    let (status, body) = anchor(&h, &alice.token, session).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("post-compaction anchor for this session"),
+        "{body}"
+    );
+    let first = body.find("an older prompt").expect("first prompt");
+    let latest = body.find("WINDOW-PROMPT-ALICE").expect("latest prompt");
+    assert!(first < latest, "{body}");
+}
