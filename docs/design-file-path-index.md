@@ -154,6 +154,12 @@ of the event:
    than 512 characters (the bound `HANDOFF_FILE_MAX_CHARS` uses for stored
    paths). The client sends `skipped: refused`.
 
+An OMP `read` or `write` path can name its file through a suffix
+(`src/app.ts:5-9`, `vault.zip:notes/a.md`). Before step 1 the TS integrations
+pick the file OMP reads: the full name when a file has it, otherwise the
+longest part before a `:` or `?` that names one (`captureOmpTarget`), so that
+ranged read is keyed `src/app.ts`.
+
 Relative to the checkout root rather than the marker directory, so two worktrees
 or two clones of the same repository produce the same key.
 
