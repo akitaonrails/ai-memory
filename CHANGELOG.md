@@ -51,6 +51,11 @@ version in [`docs/changelog/`](docs/changelog/):
   an override uses only its own fallback chain and can run without a global
   provider. CLI and web health identify each configured task (#1969).
 
+- Added `providers.llm_workloads_started_ms` to `/admin/status`: the Unix time
+  in milliseconds when the per-workload LLM counters started. The counters
+  still reset on restart, and two snapshots with the same value measure one
+  window (#1981).
+
 - Added an opt-in file path index, `[ingest] index_file_paths` (off by
   default). The native hook client sends the checkout-relative path of the
   one file a kept file-tool PostToolUse named, in a versioned

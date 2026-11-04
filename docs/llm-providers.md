@@ -490,6 +490,11 @@ Each row reports process-lifetime calls, successes and errors, total/max
 latency, fixed-bucket p50/p95 upper bounds, last outcome, and token counts. The
 counters are process-local and reset on restart; the server constructs the
 configured provider wrapper once at startup and has no runtime provider reload.
+`providers.llm_workloads_started_ms` gives the Unix time in milliseconds when
+the counters started (null when no LLM provider is configured). A window is the
+difference between two snapshots with the same `llm_workloads_started_ms`. A
+restart, including one for a configuration change, starts a new value, so it
+closes a segment, and a window spanning restarts adds its segments.
 
 `estimated_input_tokens` and `estimated_output_tokens` use a deliberately
 coarse four-characters-per-token estimate so structured and plain calls remain

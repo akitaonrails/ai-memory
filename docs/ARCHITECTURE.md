@@ -958,9 +958,10 @@ the deployment distinguishes operators. Counters reset on restart.
 ### LLM workload telemetry
 
 The root-protected `GET /admin/status` snapshot includes a bounded
-`providers.llm_workloads` array when an LLM is configured. Call sites attach
-one member of the closed `LlmWorkload` enum to the existing UUIDv7 logical
-operation id; its displayed/wire value remains only the UUID, so the label
+`providers.llm_workloads` array when an LLM is configured, with
+`providers.llm_workloads_started_ms` saying when its counters started. Call
+sites attach one member of the closed `LlmWorkload` enum to the existing UUIDv7
+logical operation id; its displayed/wire value remains only the UUID, so the label
 cannot affect a provider request or fallback correlation. The provider-health
 wrapper records one provider-interface invocation around the whole fallback
 chain (outer caller retries are separate invocations): outcome,
