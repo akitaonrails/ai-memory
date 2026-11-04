@@ -41,3 +41,9 @@ b19ee0c040fb766a5c7405c9e22159fdbc1e2ef4:companions/ai-memory-importer/src/agent
 43a60cde7036c1ad4618001058d64fcc9b72d8ae:crates/ai-memory-cli/tests/llm_env.rs:generic-api-key:172
 # Synthetic GitHub-token shape in a claude-mem metadata sanitizer test (split since); contains no credential material.
 9fb7c1d7f390abcc8d639f514f181dd147be07b5:companions/ai-memory-importer/src/claude_mem.rs:github-pat:1291
+# Synthetic `generate-auth-token`-shaped values (0123456789abcdef repeated) in the #1982 sanitizer regression vectors; contain no credential material.
+05477cd44a86c923eeeb1b70352bf612fd8c60ac:crates/ai-memory-hooks/tests/suite/escaped_json_secret.rs:generic-api-key:114
+05477cd44a86c923eeeb1b70352bf612fd8c60ac:tests/fixtures/sanitizer_vectors.json:generic-api-key:10
+05477cd44a86c923eeeb1b70352bf612fd8c60ac:tests/fixtures/sanitizer_vectors.json:generic-api-key:11
+05477cd44a86c923eeeb1b70352bf612fd8c60ac:tests/fixtures/sanitizer_vectors.json:generic-api-key:12
+05477cd44a86c923eeeb1b70352bf612fd8c60ac:crates/ai-memory-core/src/sanitize.rs:generic-api-key:2393
