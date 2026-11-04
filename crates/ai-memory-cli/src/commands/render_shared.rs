@@ -3927,6 +3927,17 @@ for (const [payload, cwd, event, expected, label] of [
   // A POSIX cwd spelled with a leading `//` is still POSIX for the index, as for the native client on that OS.
   [{{ tool: "read", args: {{ filePath: "a\\b.rs" }} }}, `/${{fileRepo}}`, post, filePath("a\\b.rs"), "file-posix-double-slash-cwd"],
 ] as [Record<string, unknown>, string | undefined, string | undefined, string | undefined, string][]) {{ const got = JSON.stringify(fileOf(payload, cwd, event)); check(got === expected, `${{label}}: ${{got}}`); }}
+// OMP keys the file its path names (`captureOmpTarget`): the full name when a file has it, else the part before the selector or archive member that does; Pi reads the name it is given.
+mkdirSync(join(fileRepo, "omp"), {{ recursive: true }});
+for (const name of ["app.ts", "vault.zip", "odd:1-5"]) writeFileSync(join(fileRepo, "omp", name), "x");
+for (const [agent, path, expected, label] of [
+  ["omp", "omp/app.ts:5-9", "omp/app.ts", "omp-file-selector"],
+  ["omp", "omp/odd:1-5", "omp/odd:1-5", "omp-file-literal-first"],
+  ["omp", "omp/vault.zip:notes/a.md", "omp/vault.zip", "omp-file-archive-member"],
+  ["omp", "omp/gone.ts:1-5", "omp/gone.ts:1-5", "omp-file-missing"],
+  ["pi", "omp/app.ts:5-9", "omp/app.ts:5-9", "pi-file-literal"],
+] as [string, string, string, string][]) {{ AGENT = agent; const got = JSON.stringify(fileOf({{ tool: "read", args: {{ path }} }}, fileRepo, post)); check(got === filePath(expected), `${{label}}: ${{got}}`); }}
+AGENT = "";
 // The path steps alone, so a Windows-flavoured cwd runs on any host: `Path::join` on Windows keeps only the base's drive or share for a rooted target and lets a drive-relative one replace the base.
 for (const [target, base, checkout, windowsHost, expected, label] of [
   ["src\\a.rs", "C:/repo", "C:/repo", true, {{ path: "src/a.rs" }}, "win-relative"],
