@@ -22,6 +22,16 @@ version in [`docs/changelog/`](docs/changelog/):
   secrets anywhere in the text. The external-capture client scrub follows
   the same rules, and also reads a quoted or escaped JSON key now (#1982).
 
+- A shell call with a quoted `(` or `{` next to a `/`, such as
+  `awk '{print $1/2}'`, `jq '(.a // "x")'` or `echo 'a/{b'`, was spooled
+  metadata-only with no output, even with no `.ai-memory.toml` anywhere. The
+  marker lookup read the quoted character as a glob group or brace spanning
+  the separator and gave up on the call. A shell does not expand either one
+  inside quotes, so the native hook and the generated integrations now read
+  it as text. An unquoted brace expansion or zsh glob group that spans a
+  separator still makes the call metadata-only, and quoted braces that list
+  alternatives are looked up once per alternative (#1977).
+
 ## [3.3.3] - 2026-11-03
 
 ### Fixed
