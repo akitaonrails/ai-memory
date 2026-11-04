@@ -3575,6 +3575,8 @@ const fixtureText = {fixture};
 const markerRoot = process.argv[2]!;
 const markerFixtures = new Map<string, string>();
 function findMarker(cwd: string | undefined): string | undefined {{ return cwd ? markerFixtures.get(cwd) : undefined; }}
+// The integration's own `AGENT` constant, which the policy reads; a check sets it to the harness it runs as.
+let AGENT = "";
 {policy}
 
 const fixture = JSON.parse(fixtureText);
@@ -3637,6 +3639,14 @@ const directoryRoot = marker(`[capture]\nignore_paths = ${{JSON.stringify(fixtur
 for (const vector of fixture.read_many_files_directories.vectors) {{
   expectDecision({{ tool: "read_many_files", args: {{ include: vector.include }} }}, directoryRoot, vector.disposition, "file", "extracted", vector.include.length, `read-many-directory: ${{JSON.stringify(vector)}}`);
 }}
+// OMP names a file through a suffix of a `read` or `write` path, so both matchers read every part before a `:` or `?` (shared vectors).
+for (const vector of fixture.omp_path_grammar.readings) check(JSON.stringify(captureOmpReadings([vector.path])) === JSON.stringify(vector.readings), `omp-readings: ${{JSON.stringify(vector)}}`);
+const ompRoot = marker(`[capture]\nignore_paths = ${{JSON.stringify(fixture.omp_path_grammar.ignore_paths)}}\n`);
+for (const vector of fixture.omp_path_grammar.vectors) {{
+  AGENT = vector.agent;
+  expectDecision({{ tool: vector.tool, args: {{ path: vector.path.replaceAll("{{root}}", ompRoot) }} }}, ompRoot, vector.disposition, "file", vector.extraction_state ?? "extracted", vector.path_count ?? 1, `omp-path: ${{JSON.stringify(vector)}}`);
+}}
+AGENT = "";
 // Output readers: stripped under a policy, untouched without one.
 const reader = {{ tool: "process", args: {{ action: "log" }}, output: privateBody }};
 check(capturePolicy(reader, "/no-marker").disposition === "keep", "reader-inactive-keep");
