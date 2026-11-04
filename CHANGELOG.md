@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added automatic re-grounding after a context compaction. When Claude Code,
+  Codex or Factory Droid fires `SessionStart` with `source: "compact"`, the
+  native hook skips the startup packet (no handoff claim, recovery snapshot
+  or brief) and injects the session's post-compaction anchor from
+  `GET /recap?mode=anchor` instead; it prints the usual empty reply when the
+  anchor is unavailable. The generated OpenCode V1 and V2 plugins fetch the
+  anchor when a compaction ends and add it to every later model call until
+  the next one, and each adds one line to the compaction request naming the
+  session id and saying where its record lives. `startup`, `resume`, `clear`
+  and "reload context" behave as before (#1983).
 - Added per-task LLM provider and fallback profiles for consolidation, bootstrap,
   auto-improve, experience, dream, lint, profile, rerank, and query answers
   (including explore). Tasks without an override share the default provider;
