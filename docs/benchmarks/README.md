@@ -13,6 +13,8 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-11-04** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.4.0 release)** | **0.951** | [longmemeval-s-3.4.0-release.md](longmemeval-s-3.4.0-release.md) |
+| **2026-11-04** | LongMemEval-S (v1) | **local embeddings + observation stream (3.4.0 release)** | **0.940** | [longmemeval-s-3.4.0-release.md](longmemeval-s-3.4.0-release.md) |
 | **2026-11-03** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.3.3 release)** | **0.951** | [longmemeval-s-3.3.3-release.md](longmemeval-s-3.3.3-release.md) |
 | **2026-11-03** | LongMemEval-S (v1) | **local embeddings + observation stream (3.3.3 release)** | **0.943** | [longmemeval-s-3.3.3-release.md](longmemeval-s-3.3.3-release.md) |
 | **2026-11-03** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.3.2 release)** | **0.951** | [longmemeval-s-3.3.2-release.md](longmemeval-s-3.3.2-release.md) |
@@ -42,6 +44,13 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 | 2026-09-01 | LongMemEval-S (v1) | local embeddings (2.0 default, prior) | 0.823 | [longmemeval-s-2026-09-01-local.md](longmemeval-s-2026-09-01-local.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm, stopword-filtered FTS (prior) | 0.668 | [longmemeval-s-2026-09-01-fts.md](longmemeval-s-2026-09-01-fts.md) |
 | 2026-09-01 | LongMemEval-S (v1) | zero-llm (pre-2.0 FTS) | 0.617 | [longmemeval-s-2026-09-01.md](longmemeval-s-2026-09-01.md) |
+
+The 3.4.0 minor-release run matched 3.3.3's FTS numbers overall and in every
+slice, and local `hit@5` moved from 0.943 to 0.940 within its run-to-run
+variance; the local run now embeds cold (`--no-embedding-cache`). The full
+FTS ingest ran slower on a busy host, and alternating the 3.3.3 and 3.4.0
+servers on the same sample showed the same throughput. See the
+[3.4.0 release report](longmemeval-s-3.4.0-release.md).
 
 The 3.3.3 patch-release run matched 3.3.2's FTS numbers in every slice, and
 local `hit@5` moved from 0.938 to 0.943 within its run-to-run variance.
