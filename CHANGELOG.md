@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-11-04
+
 ### Added
 
 - Added Scoop publishing to the maintainer's bucket: on Windows,
@@ -4147,7 +4149,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.3.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.0...HEAD
+[3.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.0
 [3.3.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.3
 [3.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.2
 [3.3.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.1
