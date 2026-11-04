@@ -13,8 +13,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
-### - Added a post-compaction anchor, `GET /recap?mode=anchor`: a small,
-
+- Added a post-compaction anchor, `GET /recap?mode=anchor`: a small,
   read-only block (default 2,000 chars) with a session's first and latest
   operator prompts, read across every compaction, behind the recap's own
   read-access and owner gates. `memory_read_session_observations` accepts
@@ -22,8 +21,7 @@ version in [`docs/changelog/`](docs/changelog/):
   refuses it otherwise. The "reload context" recap now also treats Devin's
   `post-compaction` as a compaction boundary (#1983).
 
-### - Added a post-compaction rule to every instruction surface ai-memory
-
+- Added a post-compaction rule to every instruction surface ai-memory
   installs: the `AGENTS.md`/`CLAUDE.md` routing block (full and compact), the
   MCP handshake instructions, the handoff and retrieval skills, and the Grok
   rule. After a context compaction the agent re-grounds on ai-memory before it
@@ -35,6 +33,17 @@ version in [`docs/changelog/`](docs/changelog/):
   `docs/support-matrix.md`, `docs/ARCHITECTURE.md` and a cookbook recipe for
   long sessions on a small context window describe the automatic and manual
   paths (#1983).
+
+- Added automatic re-grounding after a context compaction. When Claude Code,
+  Codex or Factory Droid fires `SessionStart` with `source: "compact"`, the
+  native hook skips the startup packet (no handoff claim, recovery snapshot
+  or brief) and injects the session's post-compaction anchor from
+  `GET /recap?mode=anchor` instead; it prints the usual empty reply when the
+  anchor is unavailable. The generated OpenCode V1 and V2 plugins fetch the
+  anchor when a compaction ends and add it to every later model call until
+  the next one, and each adds one line to the compaction request naming the
+  session id and saying where its record lives. `startup`, `resume`, `clear`
+  and "reload context" behave as before (#1983).
 
 - Added per-task LLM provider and fallback profiles for consolidation, bootstrap,
   auto-improve, experience, dream, lint, profile, rerank, and query answers

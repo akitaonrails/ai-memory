@@ -16,6 +16,13 @@ globalThis.fetch = async (input, options = {}) => {
   if (url.pathname === "/handoff" && url.searchParams.get("session_id") === "root-slow") {
     throw new DOMException("The operation timed out.", "TimeoutError");
   }
+  if (url.pathname === "/recap" && url.searchParams.get("mode") === "anchor") {
+    // `root-slow` stands for a server that predates `mode=anchor`: its
+    // answer is the full recap, which must never be injected automatically.
+    const id = url.searchParams.get("session_id");
+    return new Response(id === "root-slow" ? "> 🧭 ai-memory: compaction recap for this session"
+      : `> 🧭 ai-memory: post-compaction anchor for this session (${id})`);
+  }
   return new Response(url.pathname === "/handoff" ? "Remember the verified handoff." : "{}");
 };
 const { default: plugin } = await import(pathToFileURL(process.argv[2]).href);
@@ -119,6 +126,46 @@ try {
   assert.ok(requests.some((r) => r.payload?.output === "content-only tool evidence"));
   assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end"));
 
+  // #1983: the compaction request gets one line naming the session, its end
+  // arms the anchor for every later model call, and the next compaction's
+  // start forgets it. A subagent's compaction gets neither.
+  const anchors = () => requests.filter((r) => r.url.pathname === "/recap" && r.url.searchParams.get("mode") === "anchor");
+  const stopCount = () => requests.filter((r) => r.url.searchParams.get("event") === "stop").length;
+  a.emit({ type: "session.compaction.started", data: { sessionID: "root-a", reason: "auto" } });
+  await until(() => requests.some((r) => r.url.searchParams.get("event") === "pre-compact"), "compaction start captured");
+  const summaryRequest = { sessionID: "root-a", system: [] };
+  await a.hooks.get("session.compaction")(summaryRequest);
+  assert.equal(summaryRequest.system.length, 1);
+  assert.equal(summaryRequest.system[0].type, "text");
+  assert.ok(summaryRequest.system[0].text.includes("(root-a)"), summaryRequest.system[0].text);
+  const childSummary = { sessionID: "child", system: [] };
+  await a.hooks.get("session.compaction")(childSummary);
+  assert.equal(childSummary.system.length, 0, "a subagent compaction gets no note");
+  a.emit({ type: "session.compaction.ended", data: { sessionID: "root-a", reason: "auto", text: "summary" } });
+  a.emit({ type: "session.compaction.ended", data: { sessionID: "child", reason: "auto", text: "summary" } });
+  await until(() => anchors().length === 1, "compaction end arms the anchor");
+  assert.equal(anchors()[0].url.searchParams.get("session_id"), "root-a");
+  assert.equal(anchors()[0].url.searchParams.get("budget"), "2000");
+  for (let i = 0; i < 2; i++) {
+    const call = { sessionID: "root-a", system: [] };
+    await a.hooks.get("session.context")(call);
+    assert.ok(call.system.some((part) => part.text === "> 🧭 ai-memory: post-compaction anchor for this session (root-a)"), "anchor rides every model call until the next compaction");
+  }
+  assert.equal(anchors().length, 1, "the anchor is fetched once per compaction");
+  const stopsBefore = stopCount();
+  a.emit({ type: "session.compaction.started", data: { sessionID: "root-a", reason: "auto" } });
+  a.emit({ type: "session.execution.succeeded", data: { sessionID: "root-a" } });
+  await until(() => stopCount() > stopsBefore, "events after the next compaction start processed");
+  const afterNext = { sessionID: "root-a", system: [] };
+  await a.hooks.get("session.context")(afterNext);
+  assert.ok(!afterNext.system.some((part) => part.text === "> 🧭 ai-memory: post-compaction anchor for this session (root-a)"), "the next compaction forgets the anchor");
+  assert.equal(anchors().length, 1, "a subagent compaction never fetches an anchor");
+  a.emit({ type: "session.compaction.ended", data: { sessionID: "root-slow", reason: "auto", text: "summary" } });
+  await until(() => anchors().length === 2, "an older server is still asked");
+  const oldServer = { sessionID: "root-slow", system: [] };
+  await a.hooks.get("session.context")(oldServer);
+  assert.ok(!oldServer.system.some((part) => part.text.includes("compaction recap")), "an older server's recap is never injected");
+
   await b.hooks.get("session.prompt")({ sessionID: "root-b", messageID: "b1", prompt: { text: "beta" } });
   await b.hooks.get("session.context")({ sessionID: "root-b", system: [] });
   // Deletion, not unload, is the end signal: a deleted child keeps ancestry
@@ -131,7 +178,7 @@ try {
   await disposeA();
   assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-a"), "eviction unload must not end a live session");
   assert.ok(!requests.some((r) => r.url.searchParams.get("event") === "session-end" && r.payload.sessionID === "root-b"), "location cleanup must not close another instance");
-  console.log("PASS: resumed sessions, retained handoff, child isolation, bounded handoff retries, terminal events, deletion ends, unload does not");
+  console.log("PASS: resumed sessions, retained handoff, child isolation, bounded handoff retries, terminal events, post-compaction anchor, deletion ends, unload does not");
 } finally {
   await disposeB();
 }
