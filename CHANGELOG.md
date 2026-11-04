@@ -51,6 +51,13 @@ version in [`docs/changelog/`](docs/changelog/):
   an override uses only its own fallback chain and can run without a global
   provider. CLI and web health identify each configured task (#1969).
 
+- Added a default scope to `ai-memory mcp-bridge --no-session-id`: a tool call
+  that names no workspace, project or global scope goes to the project of the
+  directory the client launched the bridge from, resolved as the CLI resolves
+  one (the nearest `.ai-memory.toml`, else the git remote). An explicit scope
+  is still forwarded unchanged, and a directory outside any marked tree or
+  checkout, or one routed to another server, gets no default (#1979).
+
 - Added an opt-in file path index, `[ingest] index_file_paths` (off by
   default). The native hook client sends the checkout-relative path of the
   one file a kept file-tool PostToolUse named, in a versioned

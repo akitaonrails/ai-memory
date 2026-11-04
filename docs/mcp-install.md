@@ -23,7 +23,10 @@ Warp, Kilo Code, Goose and OpenHuman have no
 > other client gets a local stdio entry, in its own format, that runs
 > `ai-memory mcp-bridge --no-session-id --server-url <url>`: the bridge reads
 > the token file at launch and forwards no session id, so the client passes
-> `workspace` and `project` like any static client. Stdio entries name the
+> `workspace` and `project` like any static client. When a call names no
+> scope, the bridge fills in the project of the directory the client launched
+> it from, resolved the way the CLI resolves one (see
+> [`auto-scope.md`](auto-scope.md#the-session-less-bridges-launch-scope)). Stdio entries name the
 > `ai-memory` binary by its absolute path, so the client does not need it on
 > its `PATH`; the Docker wrapper keeps the bare `ai-memory`. When the install
 > was given a data dir (`--data-dir`, `AI_MEMORY_DATA_DIR` or `data_dir` in
