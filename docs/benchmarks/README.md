@@ -267,6 +267,60 @@ ai-memory-eval retrieval \
   --server-env AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS=1
 ```
 
+### Reuse haystack embeddings across runs (local mode)
+
+Local-embeddings ingest is nearly all CPU time spent embedding haystack
+pages, and the haystack is the same on every run. The harness therefore
+keeps each document vector it computes in `evals/.cache/embeddings/`
+(gitignored) and hands the stored vector back on the next run. The key is
+the embedder's provider, model identity and dimension plus the sha256 of
+the text embedded, so a different model or dimension never reads another's
+vectors. The hash skips RFC 3339 UTC timestamps (`2026-11-04T17:26:19Z`).
+The server stamps each replayed hook event with its own clock and the session
+page lists those times, so without the mask no page text repeats between runs:
+an unmasked key stored a new vector for every page on the second run. A cached run
+therefore ranks pages with the vector the first run computed, for a text that
+differed only in those wall-clock times. Any other change to a page's text,
+the dataset's own dates included, is a miss and embeds live. Only document
+embeddings are cached: query embeddings, ranking and fusion run live, so a
+cached run still measures the code under test.
+
+The harness turns the cache on for every local-embeddings server it starts,
+through the eval-only server variable `AI_MEMORY_EVAL_EMBEDDING_CACHE_DIR`.
+Like the checkpoint variable above, no product path sets it, the server reads
+it once at startup, and it is absent from `config.toml`. Zero-LLM runs have no
+embedder and never use it. A report whose document vectors came from the cache
+says so on a `document embeddings: eval cache` line and in `embedding_cache`
+in `report.json`.
+
+Pass `--no-embedding-cache` for a fully cold run, and delete
+`evals/.cache/embeddings/` (or run cold) after a change to the embedding code
+itself: the key names the model, not the code that turns text into a vector.
+
+Measured on `--stratify 40 --embeddings local` (230 questions, checkpoints
+skipped), on the 32-thread benchmark box while other builds kept its load
+average between 10 and 90, so read the wall clock as indicative:
+
+| run | wall clock | ingest p50 per question | query p50 / p95 | vectors embedded |
+|---|---:|---:|---:|---:|
+| cold, filling the cache | 1,015 s | 22.5 s | 123 / 264 ms | 11,012 |
+| cached | 132 s | 3.2 s | 70 / 116 ms | 0 |
+| cached again | 135 s | 3.2 s | 66 / 124 ms | 0 |
+| cold, `--no-embedding-cache` | 963 s | 21.2 s | 113 / 294 ms | 11,012 |
+
+Both cached runs matched the run that filled the cache on every question's
+`hit@k`, `recall@k`, `recall-all@k` and retrieved sessions. Only context
+tokens moved, by at most 3 tokens on 3 questions, because snippets carry the
+replay's wall-clock times. Three cold runs of the same tree differed pairwise
+on 10 to 12 questions' `hit@k` and 19 to 23 questions' `recall@k`, while
+overall `hit@5` stayed within 0.935-0.943. That spread is the local-mode
+variance tracked in #1854. A cached run reproduces the one cold run that
+filled the cache, so two builds compared on the same cache differ only where
+the builds do. Query latency also drops in a cached run, because queries no
+longer compete with embedding work, so a cached run's latency and ingest
+numbers are not comparable with a cold run's. Published release numbers come
+from a cold run (AGENTS.md, project maintenance rules).
+
 ### Run the two modes back to back, not at the same time
 
 Two harness processes are fully independent (separate server, temp data
