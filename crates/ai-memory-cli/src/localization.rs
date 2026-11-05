@@ -94,6 +94,18 @@ pub fn failure_report(error: &anyhow::Error) -> String {
     crate::commands::show::terminal_body(&report)
 }
 
+/// The text of a diagnostic printed while the command keeps running.
+///
+/// A recoverable failure continues the run, so its message never reaches
+/// [`failure_report`]: the one place every *fatal* failure is neutralized.
+/// These messages quote the same foreign text, though — a decode error names
+/// the value it was sent, and an HTTP detail is whatever the server returned —
+/// so the rendered line is neutralized here. Translating first keeps the
+/// language catalog keyed on the untouched English text (#2000).
+pub(crate) fn diagnostic(i18n: &Localizer, text: impl std::fmt::Display) -> String {
+    crate::commands::show::terminal_text(&i18n.diagnostic(&text.to_string()))
+}
+
 pub(crate) fn command(mut command: clap::Command, path: &str, i18n: &Localizer) -> clap::Command {
     if i18n.language() == Language::English {
         return command;
@@ -319,6 +331,38 @@ mod tests {
             assert!(report.contains("x?]52;c;cHduZWQ=?"), "{report:?}");
             assert!(report.contains("caf\u{e9} ?reply"), "{report:?}");
             assert!(report.contains('\n'), "{report:?}");
+        }
+    }
+
+    /// #2000: a recoverable failure keeps the command running, so it never
+    /// passes `failure_report`. Its diagnostic still quotes a server value —
+    /// a decode error names the token it was sent — and must print inert.
+    #[test]
+    fn mid_run_diagnostic_neutralizes_terminal_controls_in_every_language() {
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Status {
+            Ready,
+        }
+        let error =
+            serde_json::from_str::<Status>("\"\\u001b]52;c;cHduZWQ=\\u0007\\u202e\\u200f\"")
+                .expect_err("the payload is not a known status");
+        assert!(
+            format!("{error:#}").contains('\u{1b}'),
+            "control: serde quotes the decoded value"
+        );
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let line = diagnostic(
+                &Localizer::new(language),
+                format!("decoding reply ({error:#})"),
+            );
+            assert!(
+                !line.contains(['\u{1b}', '\u{7}', '\u{202e}', '\u{200f}']),
+                "terminal control survived: {line:?}"
+            );
+            assert!(line.contains("?]52;c;cHduZWQ=???"), "{line:?}");
+            assert!(!line.contains('\n'), "{line:?}");
         }
     }
 

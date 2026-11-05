@@ -713,8 +713,22 @@ pub(crate) fn terminal_text(text: &str) -> String {
 pub(crate) fn terminal_body(text: &str) -> String {
     text.chars()
         .map(|character| {
+            // Control, direction-override and invisible-format characters all
+            // let a value the CLI only quotes reach the terminal as a
+            // sequence the operator did not read: C0/C1 controls and DEL
+            // (`is_control`), bidi embeddings/overrides/isolates plus the
+            // Arabic letter mark, and the zero-width/word-joiner/BOM family
+            // (#2000).
             if (character.is_control() && !matches!(character, '\n' | '\t'))
-                || matches!(character, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{2028}'..='\u{202e}'
+                        | '\u{2060}'..='\u{2064}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{feff}'
+                )
             {
                 '?'
             } else {
@@ -1259,6 +1273,14 @@ mod tests {
                 "café\u{202a}\u{202b}\u{202c}\u{202d}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\u{2028}\u{2029}end"
             ),
             "café???????????end"
+        );
+    }
+
+    #[test]
+    fn terminal_text_neutralizes_mid_direction_marks_and_zero_width_characters() {
+        assert_eq!(
+            terminal_text("caf\u{200e}\u{200f}\u{61c}\u{200b}\u{200c}\u{200d}\u{2060}\u{feff}é"),
+            "caf????????é"
         );
     }
 

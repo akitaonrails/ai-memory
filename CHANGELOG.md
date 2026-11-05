@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- A recoverable error printed while `ai-memory run` or `ai-memory uninstall`
+  keeps going is now neutralized like the final failure report, so a value
+  read back from the server cannot reach the terminal as an escape sequence.
+  The sanitizer also covers the direction marks (U+061C, U+200E/U+200F) and
+  the zero-width characters (U+200B–U+200D, U+2060, U+FEFF) it used to keep
+  (#2000).
+
 ## [3.4.2] - 2026-11-05
 
 ### Added

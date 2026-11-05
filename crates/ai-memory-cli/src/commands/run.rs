@@ -43,6 +43,7 @@ use crate::http_client::{
     ServerEndpoint, ServerProbe, ServerResponseError, augment_connect_error, get_json, post_empty,
     post_json, post_json_no_content, probe_server,
 };
+use crate::localization::diagnostic;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -989,8 +990,16 @@ async fn run_once_with_wiring(
             },
         )
     {
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not remember the project ID ({error:#}); use --project-id {} next time",
-            scope.project_id)));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not remember the project ID ({error:#}); use --project-id {} next time",
+                    scope.project_id
+                )
+            )
+        );
     }
     let resolved_name = prepared
         .resolved_project
@@ -1003,7 +1012,15 @@ async fn run_once_with_wiring(
         resolved_name,
         &repository.cwd,
     ) {
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run")));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
+                )
+            )
+        );
     }
     let privacy = acquired_try!(Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from));
     if let Some(id) = prepared.native_session_id.as_deref() {
@@ -1110,7 +1127,7 @@ async fn run_once_with_wiring(
             &orphaned_session,
         )
         .unwrap_or_else(|error| {
-            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted")));
+            eprintln!("{}", diagnostic(&config.i18n, format!("ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted")));
             None
         });
         let current = effective_store(harness, &home, &repository.cwd, plan.session_dir.as_deref());
@@ -1201,7 +1218,8 @@ async fn run_once_with_wiring(
         {
             Ok(candidates) if !candidates.is_empty() => {
                 let selection = acquired_try!(
-                    choose_native_session_interactive(&config.i18n,
+                    choose_native_session_interactive(
+                        &config.i18n,
                         harness,
                         prepared.workstream_name.clone(),
                         candidates,
@@ -1226,13 +1244,29 @@ async fn run_once_with_wiring(
                         ));
                     }
                     Ok(None) => {}
-                    Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not read the native session choice ({error}); starting a new {} session",
-                        harness.as_str()))),
+                    Err(error) => eprintln!(
+                        "{}",
+                        diagnostic(
+                            &config.i18n,
+                            format!(
+                                "ai-memory: could not read the native session choice ({error}); starting a new {} session",
+                                harness.as_str()
+                            )
+                        )
+                    ),
                 }
             }
             Ok(_) => {}
-            Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not inspect prior {} sessions ({error}); starting a new session",
-                harness.as_str()))),
+            Err(error) => eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not inspect prior {} sessions ({error}); starting a new session",
+                        harness.as_str()
+                    )
+                )
+            ),
         }
     }
     if yolo_requested {
@@ -1404,8 +1438,16 @@ async fn run_once_with_wiring(
         {
             Ok(history) => history,
             Err(error) => {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not prepare the previous {} session history ({error:#}); continuing with the portable workstream packet",
-                    previous.agent.as_str())));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not prepare the previous {} session history ({error:#}); continuing with the portable workstream packet",
+                            previous.agent.as_str()
+                        )
+                    )
+                );
                 None
             }
         },
@@ -1570,12 +1612,20 @@ async fn run_once_with_wiring(
                     .as_ref()
                     .and_then(|status| status.native_session_id.as_deref())
             {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
-                    harness.as_str(),
-                    harness.agent_kind().as_str(),
-                    SessionId::from_native(linked),
-                    super::render_shared::shell_quote(&workspace),
-                    super::render_shared::shell_quote(&project))));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
+                            harness.as_str(),
+                            harness.agent_kind().as_str(),
+                            SessionId::from_native(linked),
+                            super::render_shared::shell_quote(&workspace),
+                            super::render_shared::shell_quote(&project)
+                        )
+                    )
+                );
             }
             None
         }
@@ -1613,7 +1663,15 @@ async fn run_once_with_wiring(
         ) {
             Ok(ids) => ids,
             Err(error) => {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported")));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported"
+                        )
+                    )
+                );
                 Vec::new()
             }
         }
@@ -1812,15 +1870,28 @@ async fn run_once_with_wiring(
         let session = display_session_id(&session.to_string());
         match finalized {
             Ok(ids) if !ids.is_empty() => {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: finalized the {agent} session {session}")));
+                eprintln!(
+                    "{}",
+                    config.i18n.diagnostic(&format!(
+                        "ai-memory: finalized the {agent} session {session}"
+                    ))
+                );
             }
             // No session under that id for this agent and owner in this
             // scope: its hooks are not installed or never fired, or they
             // filed it under another workspace/project.
             Ok(_) => {}
-            Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
-                super::render_shared::shell_quote(&workspace),
-                super::render_shared::shell_quote(&project)))),
+            Err(error) => eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+                        super::render_shared::shell_quote(&workspace),
+                        super::render_shared::shell_quote(&project)
+                    )
+                )
+            ),
         }
     }
     Ok(RunOutcome {
@@ -2113,8 +2184,16 @@ async fn journal_degraded_run(
     let source_cursor = match prelaunch_cursor {
         Some(Ok(cursor)) => Some(cursor),
         Some(Err(error)) => {
-            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
-                display_session_id(&native_session_id))));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                        display_session_id(&native_session_id)
+                    )
+                )
+            );
             return;
         }
         None => None,
@@ -2136,8 +2215,16 @@ async fn journal_degraded_run(
         {
             Ok(export) => export,
             Err(error) => {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
-                    display_session_id(&native_session_id))));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                            display_session_id(&native_session_id)
+                        )
+                    )
+                );
                 return;
             }
         };
@@ -3724,8 +3811,16 @@ fn follow_claude_continued_session(
         }
         Ok(None) => own,
         Err(error) => {
-            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
-                display_session_id(&own))));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
+                        display_session_id(&own)
+                    )
+                )
+            );
             own
         }
     }
@@ -3802,7 +3897,15 @@ async fn resolve_native_session_after_run(
         // The session the run was prepared with is no evidence either: this
         // launch may not have touched it while another one did.
         Err(error) if error.is::<AmbiguousNativeSession>() => {
-            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it")));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it"
+                    )
+                )
+            );
             return Ok(None);
         }
         Err(error) => return Err(error),
@@ -4301,9 +4404,17 @@ fn build_preflighted_launch_plan(
             Some(linked_session_id.to_string()),
         )),
         Err(error) => {
-            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
-                harness.as_str(),
-                display_session_id(linked_session_id))));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
+                        harness.as_str(),
+                        display_session_id(linked_session_id)
+                    )
+                )
+            );
             Ok((plan, None))
         }
     }
@@ -4362,7 +4473,15 @@ fn remember_session_store(
         native_session_id,
         store,
     ) {
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not record the client-local session store ({error:#}); continuing the managed run")));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not record the client-local session store ({error:#}); continuing the managed run"
+                )
+            )
+        );
     }
 }
 
