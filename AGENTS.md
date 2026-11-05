@@ -608,6 +608,20 @@ Additional boundary rules:
   precedence, and cross-workspace isolation; PRs touching permissions still need
   root, DB-user, and anonymous cases — now recorded against the inventory.
 - New disk+SQL mutations need recovery/rollback tests.
+- **Design the upgrade path for existing users in the same change.** A change
+  that alters how an existing install names, keys, resolves or stores
+  something (project naming, session identity, a config or credential
+  location, the on-disk layout, a default) must answer three questions before
+  merge. What does a user's existing data look like under the new rule? What
+  happens the first time an old install or an in-flight session meets it? How
+  is a half-migrated state, with data split between the old and new key,
+  detected? Repair automatically when the repair is lossless. Otherwise, in an
+  interactive terminal, explain the mismatch and offer the lossless fix,
+  defaulting to it. Non-interactive and hook paths print the exact command.
+  A user's first sign of a migration must never be a raw error. Test the
+  upgrade with data written under the old rule, not only fresh installs. The
+  switch from folder-name to git-remote project names split five projects on
+  one server, and the only symptom was `409 managed run is not active` (#1993).
 - **A changed default reaches every consumer.** When a change alters a default
   or where a setting or credential lives (auth on for new installs, a token
   read from a file, a new required header or path), list every component that
