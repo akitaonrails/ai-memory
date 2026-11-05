@@ -4812,7 +4812,13 @@ async fn handle_restore_page(
             .wiki
             .restore_page_from_checkpoint(ws, proj, path.clone(), rev)
             .await
-            .map_err(|e| internal_err(e.to_string()))?
+            .map_err(|error| match error {
+                WikiError::Store(StoreError::SessionPurged(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
+                _ => internal_err(error.to_string()),
+            })?
     } else {
         let version = version_id
             .ok_or_else(|| internal_err("validated page-version restore lost its version id"))?;
@@ -4821,6 +4827,10 @@ async fn handle_restore_page(
             .restore_page_from_version(ws, proj, path.clone(), version)
             .await
             .map_err(|error| match error {
+                WikiError::Store(StoreError::SessionPurged(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
                 WikiError::Store(StoreError::NotFound(_)) => (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"error": error.to_string()})),

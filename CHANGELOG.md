@@ -60,6 +60,13 @@ version in [`docs/changelog/`](docs/changelog/):
   a value that is not a JSON array of strings is kept as written. A rerun
   writes the new layout over a page the 3.4.0 importer wrote, keeping the old
   version in the page's history; a page edited since is still refused (#1996).
+- Prevented `POST /admin/restore-page` and MCP `memory_restore_page` from
+  recreating purged session summaries. Admin restores return 409; MCP
+  restores refuse the checkpoint before writing. Refusals leave the index
+  and disk unchanged. A live current manual page at the same path remains
+  restorable. A version without `session_id` cannot be distinguished from a
+  legacy summary: it restores while a live manual page holds the path, and
+  is refused when no live replacement exists (#1989).
 
 ## [3.4.1] - 2026-11-05
 

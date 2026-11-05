@@ -204,30 +204,46 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
-/// Reindex a disk page without reviving a purged session's summary.
+/// Reindex or restore a page without reviving a purged session's summary.
 /// The tombstone and any surviving manual version are checked in the upsert
 /// transaction, so a directory walk's earlier snapshot cannot authorize a
-/// write after a session purge. Explicit page writes/restores use `upsert_page`.
+/// write after a session purge. Explicit new page writes use `upsert_page`.
 pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let session = page
-        .path
+    check_page_restore_allowed(
+        &tx,
+        page.workspace_id,
+        page.project_id,
+        &page.path,
+        &page.frontmatter_json,
+    )?;
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Check the original page metadata against session-purge tombstones.
+pub(crate) fn check_page_restore_allowed(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> StoreResult<()> {
+    let session = path
         .as_str()
         .strip_prefix("sessions/")
         .and_then(|rest| rest.strip_suffix(".md"))
         .and_then(|id| id.parse::<SessionId>().ok());
     if let Some(session) = session {
         let session_text = session.to_string();
-        let owns_file = page
-            .frontmatter_json
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            == Some(session_text.as_str());
+        let owns_file =
+            frontmatter.get("session_id").and_then(|v| v.as_str()) == Some(session_text.as_str());
         // #866 keeps manual versions at this path. They may keep changing,
         // but absence of `session_id` alone is not permission to recreate a
         // deleted page: legacy summaries can lack that field too (#701).
-        let blocked: bool = tx.query_row(
+        let blocked: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM purged_sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3) \
                AND (?6 OR NOT EXISTS(SELECT 1 FROM pages \
@@ -235,10 +251,10 @@ pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResu
                    AND is_latest = 1 \
                    AND json_extract(frontmatter_json, '$.session_id') IS NOT ?5))",
             params![
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
                 session.as_bytes(),
-                page.path.as_str(),
+                path.as_str(),
                 session_text,
                 owns_file
             ],
@@ -248,9 +264,7 @@ pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResu
             return Err(StoreError::SessionPurged(session_text));
         }
     }
-    let id = upsert_page_in_tx(&tx, page, now)?;
-    tx.commit()?;
-    Ok(id)
+    Ok(())
 }
 
 /// What a conditional page write requires of the current latest version.
