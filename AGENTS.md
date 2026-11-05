@@ -747,7 +747,10 @@ Additional boundary rules:
   release (`gh release list -R akitaonrails/ai-jail`, and `ai-jail --help` from
   it) with what ai-memory models: `JAIL_TOGGLES`, `RESERVED_JAIL_FLAGS` and
   `build_ai_jail_invocation` in `crates/ai-memory-workstream/src/jail.rs`, the
-  checklist notes, and `docs/design-yolo-safety-ai-jail.md`. Look for new flags
+  wrapper contract in `jail_contract.rs` (`ai-jail capabilities --json`, the
+  `--harness` names, request kinds, `status --json` blocker codes and exit
+  codes; the real-binary tests in `jail_requests.rs` run against the installed
+  one), the checklist notes, and `docs/design-yolo-safety-ai-jail.md`. Look for new flags
   worth offering, changed defaults or semantics (2.15's `--github` also shares
   the keyring token), and flags ai-memory passes that changed or were removed.
   Adjust the integration in the same release, or say in the release notes which

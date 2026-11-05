@@ -554,6 +554,18 @@ ai-memory run --yolo claude
   automatically there, enable them in your global `~/.ai-jail` or pass
   `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
   run never writes its own flags into your repository's `.ai-jail`.
+- **With ai-jail 3.0.1 or newer.** ai-jail reviews the access itself, so
+  ai-memory's screen keeps only the extra folders (`f`). ai-memory names the
+  harness for ai-jail and lists what it needs (the harness's login state and
+  the `AI_MEMORY_*` and API-key variables that are set) in a request file it
+  keeps in its data directory. ai-jail shows each request with its reason the
+  first time, and asks again only when the list changes. Values never go in
+  that file. A memory server on this machine is reached through one forwarded
+  port, so the network stays filtered unless you open it in ai-jail's review;
+  a server on another machine keeps full network, which ai-jail labels OPEN.
+  Without a terminal, a launch that needs a review stops and prints the
+  `ai-jail configure …` command to run first. Copilot and Command Code, which
+  ai-jail has no preset for, keep the checklist above.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
   directly, so `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with

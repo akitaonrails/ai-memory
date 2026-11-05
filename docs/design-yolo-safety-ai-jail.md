@@ -440,6 +440,84 @@ directly.
   routing values (§2). It never turns a config-file bearer into an environment
   variable, and the toggle flags carry no values or secrets.
 
+### 6. ai-jail 3.0.1+: the wrapper contract
+
+ai-jail 3.0.0 moved its policy out of the checkout (`~/.config/ai-jail`), runs
+its own first-run review for known harnesses, and treats unrestricted network
+as OPEN. ai-memory's flag-based launch still works there, but the user saw two
+checklists, ai-memory opened the full network, and ai-jail had to guess the
+harness from ai-memory's argv (a wrapper flag it did not know, such as
+`--jail-map`, made it give up). ai-jail 3.0.1 added a wrapper contract
+([WRAPPER_INTEGRATION.md](https://github.com/akitaonrails/ai-jail/blob/v3.0.1/docs/WRAPPER_INTEGRATION.md)),
+and ai-memory uses it when it can (#2020).
+
+**When.** The installed ai-jail's `--help` lists `--harness` and
+`--request-file`, `ai-jail capabilities --json` reports schema 1 with
+`harness_flag`, `request_file`, `status_json` and `configure_requests`, and the
+harness has an ai-jail preset (`ai_jail_harness_name`: Copilot and Command
+Code do not). `capabilities` is never asked of an older ai-jail, which would
+sandbox a command by that name. An explicit `--jail` with an automatic harness
+keeps the flag launch, because the server picks the harness after the re-exec
+decision. Otherwise the launch is the §2/§5 one.
+
+**Launch.** `ai-jail --harness H --request-file F <reach> --no-save-config
+<toggles> <folders> -- ai-memory run …`:
+
+- *Requests, not grants.* Harness state (`agent_state`) and each forwarded
+  variable name that is set (`env`) go in the manifest with a reason ai-jail's
+  review shows. Values never enter it; ai-jail copies them from its own
+  environment once approved. A denied request stops the launch (ai-jail exit
+  3), so the list stays short and its order fixed, and an unchanged launch
+  writes the same file.
+- *The manifest file.* `<data_dir>/jail-requests/<sha256(checkout)>.json`,
+  written atomically (one link), owner-only, in an owner-only directory.
+  ai-jail itself refuses a manifest inside the checkout, a symlink, or a
+  group/world-writable file, so a repository cannot pose as the wrapper.
+- *Reaching the server.* A server on `localhost` or `127.0.0.0/8` gets
+  `--forward-port PORT`: that one host port on the jail's loopback, and the
+  network stays filtered. Any other server keeps `--network`, labelled OPEN
+  in ai-jail's review: ai-jail's filter reaches LAN and remote services only
+  through its HTTP proxy, and ai-memory's hook clients bypass proxies on
+  purpose (§2). `[::1]` is not bridged by `--forward-port`, so it also keeps
+  `--network`.
+- *Still flags.* `--jail=…` toggles and extra folders were chosen in
+  ai-memory (the list, the picker, `--jail-map`), which is the consent a
+  request would ask for again. `--no-save-config` stays: without it ai-jail
+  saves the launch's restrictive flags (an unchecked `--no-ssh`) as permanent
+  project constraints, which a later approval in its review cannot lift. The
+  review's own approvals are saved either way.
+
+**Preflight** (`settle_jail_review`). `status --json` for the exact launch
+argv, then:
+
+| status | terminal | action |
+|---|---|---|
+| `backend_unavailable` | either | stop, quoting ai-jail |
+| `missing_approved_env` / `directory_drift` / `changed_ssh_key` | either | stop, quoting ai-jail, with the review command |
+| first run (review not done) | yes | launch; ai-jail's first-run review covers the requests |
+| reviewed, requests pending | yes | run `ai-jail configure --harness H --request-file F`, read status again, stop if anything is still pending |
+| review needed | no | stop with the review command |
+| nothing pending, or status unreadable | either | launch (ai-jail explains any refusal itself) |
+
+A cancelled review (exit 130) stops with "the agent was not started". The
+launch itself is an `exec`, so its exit codes reach the caller unchanged.
+
+**Checklist.** ai-jail's review owns credentials, SSH and network, so
+ai-memory's screen shows only the extra folders (`f`, `reset`, Enter). The
+remembered toggle answers are kept for a later launch that falls back to
+flags, and the next-run line is a bare `--jail` plus the folders.
+
+**Tests.** `jail_contract.rs` covers capability parsing (every missing piece
+falls back), harness names against ai-jail's accepted list, server reach, the
+manifest, argv assembly and the preflight table. `run.rs` covers the review
+flow with scripted statuses: approve, deny, cancel, no terminal, drift,
+backend, first run, unreadable status. `jail_requests.rs` runs the real
+installed ai-jail (when 3.0.1+ is on `PATH`) against ai-memory's manifest and
+flags, and checks that it refuses a manifest in the checkout, a
+world-writable one and a symlink. `jail_toggles_e2e.rs` drives the built
+binary against a fake ai-jail 3.0.1 for the launch argv, the no-terminal stop,
+the drift stop and the preset fallback.
+
 ## OS support matrix
 
 | Concern | Linux | macOS | Windows |
