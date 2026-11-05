@@ -1152,6 +1152,93 @@ mod tests {
     }
 
     #[test]
+    fn list_columns_read_as_bullets_and_other_text_stays_as_written() {
+        for (value, field, expected) in [
+            (
+                r#"["The cache lives in SQLite","WAL mode is on"]"#,
+                Field::List,
+                Some("- The cache lives in SQLite\n- WAL mode is on"),
+            ),
+            (
+                r#"["src/cache.rs","src/db.rs"]"#,
+                Field::Files,
+                Some("- `src/cache.rs`\n- `src/db.rs`"),
+            ),
+            (
+                r#" [" src/a.rs ", ""] "#,
+                Field::Files,
+                Some("- `src/a.rs`"),
+            ),
+            ("[]", Field::Files, None),
+            ("null", Field::List, None),
+            (r#"["", "  "]"#, Field::List, None),
+            ("   ", Field::Files, None),
+            (
+                "src/a.rs, src/b.rs",
+                Field::Files,
+                Some("src/a.rs, src/b.rs"),
+            ),
+            ("[1, 2]", Field::List, Some("[1, 2]")),
+            (
+                r#"["kept as written"]"#,
+                Field::Text,
+                Some(r#"["kept as written"]"#),
+            ),
+        ] {
+            assert_eq!(section_text(value, field).as_deref(), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn structured_observation_lists_become_bullets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-mem.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_versions(id INTEGER PRIMARY KEY, version INTEGER UNIQUE NOT NULL, applied_at TEXT NOT NULL);\
+                 INSERT INTO schema_versions(version,applied_at) VALUES(53,'now');\
+                 CREATE TABLE sdk_sessions(memory_session_id TEXT UNIQUE, project TEXT NOT NULL, cwd TEXT);\
+                 INSERT INTO sdk_sessions VALUES('m1','api','/repo/api');\
+                 CREATE TABLE session_summaries(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, request TEXT, learned TEXT, created_at TEXT NOT NULL);\
+                 CREATE TABLE observations(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, text TEXT, type TEXT NOT NULL, title TEXT, subtitle TEXT, facts TEXT, narrative TEXT, files_read TEXT, files_modified TEXT, created_at TEXT NOT NULL);\
+                 INSERT INTO observations VALUES(1,'m1','api',NULL,'decision','Use SQLite',NULL,'[\"The cache lives in SQLite\",\"WAL mode is on\"]','We chose SQLite.','[\"src/cache.rs\",\"src/db.rs\"]','[]','2026-01-01');\
+                 INSERT INTO observations VALUES(2,'m1','api',NULL,'bugfix','Fix the lock',NULL,'null','Retry the write.','src/lock.rs, src/retry.rs','[\"\"]','2026-01-01');",
+            )
+            .unwrap();
+        drop(connection);
+        let snapshot = snapshot_database(&path).unwrap();
+        let plan = plan_snapshot(&snapshot, &mapping(), DEFAULT_DEST_PREFIX).unwrap();
+        let body = |suffix: &str| {
+            plan.pages
+                .iter()
+                .find(|page| page.path.ends_with(suffix))
+                .unwrap()
+                .versions[0]
+                .body
+                .clone()
+        };
+        let decision = body("decision/1.md");
+        assert!(
+            decision.contains("## Facts\n\n- The cache lives in SQLite\n- WAL mode is on\n"),
+            "{decision}"
+        );
+        assert!(
+            decision.contains("## Files read\n\n- `src/cache.rs`\n- `src/db.rs`"),
+            "{decision}"
+        );
+        assert!(!decision.contains("## Files modified"), "{decision}");
+        assert!(!decision.contains("[\""), "{decision}");
+        let bugfix = body("bugfix/2.md");
+        assert!(!bugfix.contains("## Facts"), "{bugfix}");
+        assert!(
+            bugfix.contains("## Files read\n\nsrc/lock.rs, src/retry.rs"),
+            "{bugfix}"
+        );
+        assert!(!bugfix.contains("## Files modified"), "{bugfix}");
+    }
+
+    #[test]
     fn rejects_unknown_schema_and_source_symlinks() {
         let (_dir, path) = fixture(false);
         let connection = Connection::open(&path).unwrap();
