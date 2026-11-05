@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Decay cleanup no longer fails the pass on a purged session's leftover page
+  file: the reindex is skipped (the summary stays deleted) and the tombstoned
+  chain is still removed (#1999).
+
 ## [3.4.2] - 2026-11-05
 
 ### Added
