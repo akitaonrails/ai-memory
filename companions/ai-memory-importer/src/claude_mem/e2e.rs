@@ -37,7 +37,7 @@ async fn e2e_claude_mem_batch_is_searchable_private_and_idempotent() {
              CREATE TABLE sdk_sessions(memory_session_id TEXT UNIQUE, project TEXT NOT NULL, cwd TEXT);\
              INSERT INTO sdk_sessions VALUES('memory-1','api','/checkout/api');\
              CREATE TABLE observations(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, text TEXT, type TEXT NOT NULL, title TEXT, subtitle TEXT, facts TEXT, narrative TEXT, files_read TEXT, files_modified TEXT, created_at TEXT NOT NULL);\
-             INSERT INTO observations VALUES(1,'memory-1','api',NULL,'decision','Use the bounded writer',NULL,'[]','Batch writes preserve atomicity','[]','[]','2026-10-31');\
+             INSERT INTO observations VALUES(1,'memory-1','api',NULL,'decision','Use the bounded writer',NULL,'[\"Writes commit in one batch\"]','Batch writes preserve atomicity','[\"src/writer.rs\"]','[]','2026-10-31');\
              INSERT INTO observations VALUES(2,'memory-1','api','E2E-SENSITIVE-SENTINEL-1840','sensitive','Do not import',NULL,NULL,NULL,NULL,NULL,'2026-10-31');\
              CREATE TABLE session_summaries(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, request TEXT, learned TEXT, created_at TEXT NOT NULL);\
              INSERT INTO session_summaries VALUES(7,'memory-1','api','Import safely','Only supported durable records cross the boundary','2026-10-31');",
@@ -78,6 +78,30 @@ async fn e2e_claude_mem_batch_is_searchable_private_and_idempotent() {
         hits.to_string()
             .contains("imported/claude-mem/decision/1.md"),
         "{hits}"
+    );
+    // claude-mem's JSON lists arrive as bullets, and an empty one as nothing.
+    let page = tool(
+        &server,
+        "memory_read_page",
+        json!({
+            "workspace": "e2e",
+            "project": "claude-mem",
+            "path": "imported/claude-mem/decision/1.md"
+        }),
+    )
+    .await;
+    let body = page["body"].as_str().unwrap_or_default();
+    assert!(
+        body.contains("## Facts\n\n- Writes commit in one batch"),
+        "{page}"
+    );
+    assert!(
+        body.contains("## Files read\n\n- `src/writer.rs`"),
+        "{page}"
+    );
+    assert!(
+        !body.contains("## Files modified") && !body.contains("[\""),
+        "{page}"
     );
     let sensitive = tool(
         &server,
