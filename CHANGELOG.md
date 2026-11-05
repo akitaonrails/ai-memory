@@ -21,7 +21,7 @@ version in [`docs/changelog/`](docs/changelog/):
   for a technical reason goes to `gotchas/`. It recognizes a correction by
   meaning rather than by keywords, so the language does not matter, counts
   only `user-prompt` observations, and skips a refusal with no reason or a
-  one-off rename. Proposals still follow the approval policy. (#NNN)
+  one-off rename. Proposals still follow the approval policy. (#1992)
 
 ## [3.4.0] - 2026-11-04
 
