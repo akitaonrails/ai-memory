@@ -639,6 +639,7 @@ readable wiki pages; the next session starts with a handoff.
   [Investigate token usage](docs/usage.md#investigate-token-usage-in-the-dashboard)
   for capture coverage, cache accounting and the investigation flags. You can
   drill down from a project to an agent, its sessions and individual responses.
+  The updated Pi extension reports session totals only, not response-ledger rows.
   The web [agent inbox](docs/agent-messaging.md#in-the-web-ui) lets an operator
   queue requests for registered agents and read the received and sent history.
   Token filters run on the full authorized ledger, with native turn and tool

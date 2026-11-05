@@ -11,6 +11,28 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- Added Pi session token totals from saved usage at agent stops and shutdown.
+  Reloads, resumes and repeated reports preserve cumulative input, output and
+  cache counts; missing usage stays unknown. Totals follow Pi's session history,
+  including copied fork history. Per-response Pi ledger records remain
+  unsupported; update the server and reinstall the Pi extension to enable
+  session reporting (#1984, #1985).
+
+### Changed
+
+- The auto-improvement reviewer now has explicit instructions for user
+  corrections. When the user rejects, corrects, interrupts or undoes the
+  agent's work and gives a reason, it proposes a `_rules/` page, or a patch to
+  the one already on that topic, saying what to avoid, why and what to do
+  instead, and quotes the user verbatim as evidence. An approach that failed
+  for a technical reason goes to `gotchas/`. It recognizes a correction by
+  meaning rather than by keywords, so the language does not matter, counts
+  only `user-prompt` observations, and skips a refusal with no reason or a
+  one-off rename. Proposals still follow the approval policy. (#1992)
+
+
 ## [3.4.2] - 2026-11-05
 
 ### Added
