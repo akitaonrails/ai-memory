@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.2] - 2026-11-05
+
 ### Added
 
 - `ai-memory run`'s ai-jail checklist now remembers each checkout's answers,
@@ -4244,7 +4246,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.2...HEAD
+[3.4.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.2
 [3.4.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.1
 [3.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.0
 [3.3.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.3
