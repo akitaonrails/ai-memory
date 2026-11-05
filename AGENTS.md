@@ -741,6 +741,17 @@ Additional boundary rules:
   After the release, confirm the job ran green and that the bucket's manifest
   names the new version and the hash from
   `ai-memory-windows-x86_64.zip.sha256`.
+- **Check the latest ai-jail release before every release.** `ai-memory run`
+  re-execs harnesses under ai-jail and passes its flags, so a new ai-jail can
+  add, rename or change what a flag does. Before tagging, compare the newest
+  release (`gh release list -R akitaonrails/ai-jail`, and `ai-jail --help` from
+  it) with what ai-memory models: `JAIL_TOGGLES`, `RESERVED_JAIL_FLAGS` and
+  `build_ai_jail_invocation` in `crates/ai-memory-workstream/src/jail.rs`, the
+  checklist notes, and `docs/design-yolo-safety-ai-jail.md`. Look for new flags
+  worth offering, changed defaults or semantics (2.15's `--github` also shares
+  the keyring token), and flags ai-memory passes that changed or were removed.
+  Adjust the integration in the same release, or say in the release notes which
+  ai-jail version was checked and that nothing needed changing.
 - **A release that touches retrieval re-runs the retrieval benchmark once,
   on the final release candidate, and compares it with the previous
   release.** A full run takes about half an hour on an idle host (FTS about
