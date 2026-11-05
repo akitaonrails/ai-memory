@@ -695,7 +695,7 @@ fn read_observations(
         let files_read: Option<String> = bounded(row.get(10)?, "observation files_read")?;
         let files_modified: Option<String> = bounded(row.get(11)?, "observation files_modified")?;
         let source_id = id.to_string();
-        let body = observation_body(
+        let (body, earlier_body) = observation_bodies(
             &created_at,
             text.as_deref(),
             subtitle.as_deref(),
@@ -714,6 +714,7 @@ fn read_observations(
             format!("{prefix}/{}/{id}.md", observation_type.path_segment()),
             title,
             body,
+            earlier_body,
             observation_type.kind(),
             &["claude-mem-import", "observation"],
         );
@@ -785,17 +786,25 @@ fn read_summaries(
             ("Files edited", Field::Files),
             ("Notes", Field::Text),
         ];
+        // The 3.4.0 importer read every summary column as text.
         let mut sections = Vec::new();
+        let mut earlier_sections = Vec::new();
         for (offset, (label, field)) in labels.into_iter().enumerate() {
             let value: Option<String> = bounded(row.get(4 + offset)?, "summary field")?;
-            if let Some(value) = value.and_then(|value| section_text(&value, field)) {
-                sections.push(format!("## {label}\n\n{value}"));
+            let Some(value) = value else { continue };
+            if let Some(text) = section_text(&value, field) {
+                sections.push(format!("## {label}\n\n{text}"));
+            }
+            if let Some(text) = section_text(&value, Field::Text) {
+                earlier_sections.push(format!("## {label}\n\n{text}"));
             }
         }
-        let body = format!(
-            "Imported at source timestamp: `{created_at}`\n\n{}",
-            sections.join("\n\n")
-        );
+        let summary_body = |sections: Vec<String>| {
+            format!(
+                "Imported at source timestamp: `{created_at}`\n\n{}",
+                sections.join("\n\n")
+            )
+        };
         let source_id = id.to_string();
         let planned = page(
             "claude_mem_summary",
@@ -803,7 +812,8 @@ fn read_summaries(
             destination,
             format!("{prefix}/session-summary/{id}.md"),
             format!("Session summary {id}"),
-            body,
+            summary_body(sections),
+            summary_body(earlier_sections),
             "session-summary",
             &["claude-mem-import", "session-summary"],
         );
@@ -866,8 +876,10 @@ fn optional_bounded_metadata(
         .transpose()
 }
 
+/// An observation's page body, and the body the 3.4.0 importer planned for
+/// the same row, which read every column as text.
 #[allow(clippy::too_many_arguments)]
-fn observation_body(
+fn observation_bodies(
     created_at: &str,
     text: Option<&str>,
     subtitle: Option<&str>,
@@ -875,8 +887,9 @@ fn observation_body(
     narrative: Option<&str>,
     files_read: Option<&str>,
     files_modified: Option<&str>,
-) -> String {
+) -> (String, String) {
     let mut body = format!("Imported at source timestamp: `{created_at}`");
+    let mut earlier = body.clone();
     for (heading, field, value) in [
         ("Observation", Field::Text, text),
         ("Subtitle", Field::Text, subtitle),
@@ -885,11 +898,15 @@ fn observation_body(
         ("Files read", Field::Files, files_read),
         ("Files modified", Field::Files, files_modified),
     ] {
-        if let Some(value) = value.and_then(|value| section_text(value, field)) {
-            body.push_str(&format!("\n\n## {heading}\n\n{value}"));
+        let Some(value) = value else { continue };
+        if let Some(text) = section_text(value, field) {
+            body.push_str(&format!("\n\n## {heading}\n\n{text}"));
+        }
+        if let Some(text) = section_text(value, Field::Text) {
+            earlier.push_str(&format!("\n\n## {heading}\n\n{text}"));
         }
     }
-    body
+    (body, earlier)
 }
 
 /// How [`section_text`] reads a claude-mem column.
@@ -942,6 +959,7 @@ fn page(
     path: String,
     title: String,
     body: String,
+    earlier_body: String,
     kind: &str,
     tags: &[&str],
 ) -> PlannedPage {
@@ -951,9 +969,17 @@ fn page(
             .as_bytes(),
     )
     .to_string();
-    let sanitized = ai_memory_client::sanitize_external_text(&body);
     let footer =
         format!("*Imported from claude-mem ({record} `{source_id}`). Import key: `{key}`.*");
+    let finish =
+        |body: &str| bounded_page_body(&ai_memory_client::sanitize_external_text(body), &footer);
+    let body = finish(&body);
+    // What an earlier importer release wrote for this row, so a rerun
+    // replaces its own older layout instead of refusing it.
+    let previous_bodies = Some(finish(&earlier_body))
+        .filter(|earlier| *earlier != body)
+        .into_iter()
+        .collect();
     PlannedPage {
         record,
         destination,
@@ -963,12 +989,12 @@ fn page(
             source_id: source_id.to_owned(),
             version: None,
             title: one_line(&ai_memory_client::sanitize_external_text(&title), 80),
-            body: bounded_page_body(&sanitized, &footer),
+            body,
             kind: kind.to_owned(),
             tier: "episodic",
             tags: tags_from(tags.iter().copied()),
             expires_at: None,
-            previous_bodies: Vec::new(),
+            previous_bodies,
         }],
     }
 }
@@ -1484,6 +1510,7 @@ mod tests {
             },
             "imported/claude-mem/decision/1.md".into(),
             "Decision".into(),
+            "body".into(),
             "body".into(),
             "decision",
             &["claude-mem-import"],
