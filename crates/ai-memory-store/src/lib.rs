@@ -282,6 +282,21 @@ impl Store {
                 "project coordinate keys backfilled"
             );
         }
+        for twin in project_coordinates::shadowing_empty_twins(&conn, 20)? {
+            tracing::warn!(
+                workspace = %twin.workspace,
+                project = %twin.name,
+                owner = %twin.owner,
+                "empty project '{}' holds the canonical name of '{}'; it is skipped when \
+                 resolving that name, and can be renamed out of the way with \
+                 `ai-memory rename-project --workspace {} --project-id {} --to {}-empty`",
+                twin.name,
+                twin.owner,
+                twin.workspace,
+                twin.id,
+                twin.name
+            );
+        }
         let cjk_backfill = ops::backfill_cjk_indexes(&mut conn)?;
         if cjk_backfill.pages > 0 || cjk_backfill.observations > 0 {
             tracing::info!(
