@@ -877,19 +877,61 @@ fn observation_body(
     files_modified: Option<&str>,
 ) -> String {
     let mut body = format!("Imported at source timestamp: `{created_at}`");
-    for (heading, value) in [
-        ("Observation", text),
-        ("Subtitle", subtitle),
-        ("Facts", facts),
-        ("Narrative", narrative),
-        ("Files read", files_read),
-        ("Files modified", files_modified),
+    for (heading, field, value) in [
+        ("Observation", Field::Text, text),
+        ("Subtitle", Field::Text, subtitle),
+        ("Facts", Field::List, facts),
+        ("Narrative", Field::Text, narrative),
+        ("Files read", Field::Files, files_read),
+        ("Files modified", Field::Files, files_modified),
     ] {
-        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-            body.push_str(&format!("\n\n## {heading}\n\n{}", value.trim()));
+        if let Some(value) = value.and_then(|value| section_text(value, field)) {
+            body.push_str(&format!("\n\n## {heading}\n\n{value}"));
         }
     }
     body
+}
+
+/// How [`section_text`] reads a claude-mem column.
+#[derive(Clone, Copy)]
+enum Field {
+    /// Prose, kept as written.
+    Text,
+    /// A list of strings.
+    List,
+    /// A list of file paths.
+    Files,
+}
+
+/// A claude-mem column as section text, or `None` when it holds nothing.
+/// claude-mem stores an observation's `facts`, `files_read` and
+/// `files_modified`, and a summary's `files_read` and `files_edited`, as
+/// `JSON.stringify` arrays of strings (`SessionStore.ts` `storeObservations`
+/// and `storeSummary`), so such an array becomes one bullet per entry, a file
+/// path in a code span as the agentmemory export writes it, and an empty
+/// array or `null` adds no section. Any other text is kept as written.
+fn section_text(value: &str, field: Field) -> Option<String> {
+    let value = value.trim();
+    if !matches!(field, Field::Text) {
+        match serde_json::from_str::<serde_json::Value>(value) {
+            Ok(serde_json::Value::Null) => return None,
+            Ok(serde_json::Value::Array(items)) if items.iter().all(|item| item.is_string()) => {
+                let lines: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(|item| match field {
+                        Field::Files => format!("- `{item}`"),
+                        _ => format!("- {item}"),
+                    })
+                    .collect();
+                return (!lines.is_empty()).then(|| lines.join("\n"));
+            }
+            _ => {}
+        }
+    }
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 #[allow(clippy::too_many_arguments)]
