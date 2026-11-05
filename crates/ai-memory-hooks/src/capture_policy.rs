@@ -915,6 +915,7 @@ impl CapturePolicy {
                     Some(paths)
                         if paths
                             .iter()
+                            .chain(&extracted.readings)
                             .any(|path| normalize_candidate(path, cwd).is_none()) =>
                     {
                         (
@@ -923,17 +924,26 @@ impl CapturePolicy {
                         )
                     }
                     Some(paths) => {
+                        // An OMP path's other readings are candidates too.
+                        let with_readings;
+                        let candidates: &[String] = if extracted.readings.is_empty() {
+                            paths
+                        } else {
+                            with_readings =
+                                [paths.as_slice(), extracted.readings.as_slice()].concat();
+                            &with_readings
+                        };
                         let matched = if extracted.globs {
                             self.match_globs(paths, cwd)
                         } else {
-                            self.match_paths(paths, cwd)
+                            self.match_paths(candidates, cwd)
                         };
                         // A harness's saved copy of an earlier tool's output
                         // is read back like `BashOutput`; past the budget
                         // that check proves nothing either.
                         let spooled = || -> Result<bool, ()> {
                             let mut work = 0_usize;
-                            for path in paths {
+                            for path in candidates {
                                 let readings = if extracted.globs {
                                     normalize_readings(path, cwd).ok().flatten()
                                 } else {
@@ -1284,6 +1294,10 @@ fn hook_tool_call(agent: AgentKind, name: &str, args: Value) -> (&str, Value) {
 struct Extracted<'a> {
     family: ToolFamily,
     paths: Option<Vec<String>>,
+    /// The other files an OMP path can name ([`omp_path_readings`]). The
+    /// call's own decision reads them beside `paths`; the call still names
+    /// only its `paths`.
+    readings: Vec<String>,
     /// A shell tool's command, not yet split into words.
     command: Option<ShellCommand<'a>>,
     /// A command-running tool, even when its command is unreadable.
@@ -1399,6 +1413,20 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             })
         })
         .flatten();
+    // An OMP `read` or `write` path that has more readings than the bound
+    // proves nothing, like an unreadable candidate.
+    let (paths, readings) = match paths {
+        Some(paths)
+            if agent == AgentKind::Omp
+                && OMP_PATH_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()) =>
+        {
+            match omp_path_readings(&paths) {
+                Some(readings) => (Some(paths), readings),
+                None => (None, Vec::new()),
+            }
+        }
+        paths => (paths, Vec::new()),
+    };
     let command = (family == ToolFamily::NonFile)
         .then(|| {
             args.and_then(|value| {
@@ -1469,6 +1497,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
     Extracted {
         family,
         paths,
+        readings,
         command,
         shell,
         workdir,
@@ -1799,6 +1828,16 @@ pub const OUTPUT_READER_TOOL_NAMES: &[&str] = &[
     "read_powershell",
     "write_powershell",
 ];
+
+/// OMP tools whose `path` can name a file through a suffix, per the tool
+/// prompts OMP gives the model: a `read` line selector (`notes.txt:450-455`,
+/// `:-5`, `:raw`, `:conflicts`), executable view (`bin:main`), video time or
+/// JSON/SQLite query (`data.json?q=.x`), and a `read` or `write` archive
+/// member (`archive.zip:dir/file`) or SQLite table or row (`app.db:users:42`)
+/// (OMP v18.16.0,
+/// <https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/prompts/tools/read.md>
+/// and `write.md` beside it). [`omp_path_readings`] reads them.
+pub const OMP_PATH_TOOL_NAMES: &[&str] = &["read", "write"];
 
 fn family(name: &str) -> ToolFamily {
     let name = name.to_ascii_lowercase();
@@ -2703,6 +2742,48 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
         }
     }
     (!paths.is_empty()).then_some(paths)
+}
+
+/// The other files an [`OMP_PATH_TOOL_NAMES`] path can name: every part of it
+/// before a `:` or `?`. OMP reads a literal file of the full name when one
+/// exists and otherwise the part before the selector, archive member, table
+/// or query, so each part is a candidate and the stricter decision wins:
+/// `secrets.env:1-20` reads `secrets.env`. A Windows root prefix's `?` and
+/// `:` end no part ([`windows_prefix_len`]). `None` past
+/// [`MAX_CAPTURE_CANDIDATES`] parts, which proves nothing.
+fn omp_path_readings(paths: &[String]) -> Option<Vec<String>> {
+    let mut readings = Vec::new();
+    for path in paths {
+        let root = windows_prefix_len(path).max(1);
+        for (index, c) in path.char_indices() {
+            if index < root || !matches!(c, ':' | '?') {
+                continue;
+            }
+            if readings.len() == MAX_CAPTURE_CANDIDATES {
+                return None;
+            }
+            readings.push(path[..index].to_owned());
+        }
+    }
+    Some(readings)
+}
+
+/// How many leading bytes of `path` are a Windows root prefix: a device
+/// prefix (`\\?\`, `\\.\`), a drive (`C:`), or both (`\\?\C:`). A path whose
+/// second character is a colon is drive-relative to the matcher on every host
+/// ([`is_drive_relative`]), which fails closed, so a POSIX `x:1-5` loses no
+/// reading either.
+fn windows_prefix_len(path: &str) -> usize {
+    let bytes = path.as_bytes();
+    let device = bytes.len() >= 4
+        && matches!(bytes[0], b'\\' | b'/')
+        && matches!(bytes[1], b'\\' | b'/')
+        && matches!(bytes[2], b'?' | b'.')
+        && matches!(bytes[3], b'\\' | b'/');
+    let start = if device { 4 } else { 0 };
+    let drive = bytes.get(start).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(start + 1) == Some(&b':');
+    if drive { start + 2 } else { start }
 }
 
 /// Meta Muse Code's memory tools (Muse Code 1.4.7).
@@ -7518,6 +7599,59 @@ mod tests {
         assert!(!glob_matches_below("/repo/*.md", "/repo/README.md", false));
         assert!(!glob_matches_below("/repo/docs/adr/**", "/repo/src", false));
         assert!(glob_matches_below("C:/Docs/**", "c:/docs", true));
+    }
+
+    /// OMP's `read` and `write` name a file through a suffix of `path`, so a
+    /// ranged read of an ignored file (`secrets.env:1-20`), an archive member,
+    /// a SQLite row or a query would otherwise miss every exact-file pattern.
+    /// The shared vectors attempt each documented form; `src/app.ts:5-9` and
+    /// Pi, which reads the name it is given, are the controls.
+    #[test]
+    fn omp_path_suffixes_cannot_reach_ignored_paths() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/capture-policy.json")).unwrap();
+        let section = &fixture["omp_path_grammar"];
+        for vector in section["readings"].as_array().unwrap() {
+            let path = vector["path"].as_str().unwrap().to_owned();
+            let expected: Vec<String> = serde_json::from_value(vector["readings"].clone()).unwrap();
+            assert_eq!(omp_path_readings(&[path]), Some(expected), "{vector}");
+        }
+        let ignore_paths = section["ignore_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pattern| pattern.as_str().unwrap().to_owned())
+            .collect();
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig { ignore_paths }),
+            "/repo",
+            None,
+        );
+        for vector in section["vectors"].as_array().unwrap() {
+            let agent = AgentKind::from_wire(vector["agent"].as_str().unwrap());
+            let path = vector["path"].as_str().unwrap().replace("{root}", "/repo");
+            let raw = json!({"tool": vector["tool"], "args": {"path": path}});
+            let protocol = policy.inspect(agent, &raw, "/repo").protocol().clone();
+            assert_eq!(
+                serde_json::to_value(protocol.disposition()).unwrap(),
+                vector["disposition"],
+                "{raw}"
+            );
+            assert_eq!(protocol.tool_family(), ToolFamily::File, "{raw}");
+            assert_eq!(
+                serde_json::to_value(protocol.extraction_state()).unwrap(),
+                vector
+                    .get("extraction_state")
+                    .cloned()
+                    .unwrap_or(json!("extracted")),
+                "{raw}"
+            );
+            assert_eq!(
+                u64::from(protocol.path_count()),
+                vector["path_count"].as_u64().unwrap_or(1),
+                "{raw}"
+            );
+        }
     }
 
     /// Tools that read back an earlier command's output are stripped to
