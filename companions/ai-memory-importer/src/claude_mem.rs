@@ -1239,6 +1239,44 @@ mod tests {
     }
 
     #[test]
+    fn summary_file_lists_become_bullets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-mem.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_versions(id INTEGER PRIMARY KEY, version INTEGER UNIQUE NOT NULL, applied_at TEXT NOT NULL);\
+                 INSERT INTO schema_versions(version,applied_at) VALUES(53,'now');\
+                 CREATE TABLE sdk_sessions(memory_session_id TEXT UNIQUE, project TEXT NOT NULL, cwd TEXT);\
+                 INSERT INTO sdk_sessions VALUES('m1','api','/repo/api');\
+                 CREATE TABLE observations(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, text TEXT, type TEXT NOT NULL, title TEXT, subtitle TEXT, facts TEXT, narrative TEXT, files_read TEXT, files_modified TEXT, created_at TEXT NOT NULL);\
+                 CREATE TABLE session_summaries(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, request TEXT, investigated TEXT, learned TEXT, completed TEXT, next_steps TEXT, files_read TEXT, files_edited TEXT, notes TEXT, created_at TEXT NOT NULL);\
+                 INSERT INTO session_summaries VALUES(7,'m1','api','Speed up the cache',NULL,'SQLite is enough',NULL,'Benchmark the hot path','[\"src/cache.rs\",\"src/db.rs\"]','[]',NULL,'2026-01-01');",
+            )
+            .unwrap();
+        drop(connection);
+        let snapshot = snapshot_database(&path).unwrap();
+        let plan = plan_snapshot(&snapshot, &mapping(), DEFAULT_DEST_PREFIX).unwrap();
+        let summary = &plan
+            .pages
+            .iter()
+            .find(|page| page.path.ends_with("session-summary/7.md"))
+            .unwrap()
+            .versions[0]
+            .body;
+        assert!(
+            summary.contains("## Files read\n\n- `src/cache.rs`\n- `src/db.rs`"),
+            "{summary}"
+        );
+        assert!(!summary.contains("## Files edited"), "{summary}");
+        assert!(!summary.contains("[\""), "{summary}");
+        assert!(
+            summary.contains("## Next steps\n\nBenchmark the hot path"),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn rejects_unknown_schema_and_source_symlinks() {
         let (_dir, path) = fixture(false);
         let connection = Connection::open(&path).unwrap();
