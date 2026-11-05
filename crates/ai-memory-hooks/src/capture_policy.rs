@@ -1413,19 +1413,24 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             })
         })
         .flatten();
-    // An OMP `read` or `write` path that has more readings than the bound
-    // proves nothing, like an unreadable candidate.
-    let (paths, readings) = match paths {
-        Some(paths)
-            if agent == AgentKind::Omp
-                && OMP_PATH_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()) =>
-        {
-            match omp_path_readings(&paths) {
-                Some(readings) => (Some(paths), readings),
-                None => (None, Vec::new()),
-            }
-        }
-        paths => (paths, Vec::new()),
+    // An OMP or Pi path that has more readings than the bound proves
+    // nothing, like an unreadable candidate.
+    let readings = match (&paths, agent) {
+        (Some(paths), AgentKind::Omp) => omp_path_readings(
+            paths,
+            OMP_PATH_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
+        ),
+        (Some(paths), AgentKind::Pi) => Some(
+            paths
+                .iter()
+                .filter_map(|path| pi_expand_path(path))
+                .collect(),
+        ),
+        _ => Some(Vec::new()),
+    };
+    let (paths, readings) = match readings {
+        Some(readings) => (paths, readings),
+        None => (None, Vec::new()),
     };
     let command = (family == ToolFamily::NonFile)
         .then(|| {
@@ -2749,23 +2754,96 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
 /// exists and otherwise the part before the selector, archive member, table
 /// or query, so each part is a candidate and the stricter decision wins:
 /// `secrets.env:1-20` reads `secrets.env`. A Windows root prefix's `?` and
-/// `:` end no part ([`windows_prefix_len`]). `None` past
-/// [`MAX_CAPTURE_CANDIDATES`] parts, which proves nothing.
-fn omp_path_readings(paths: &[String]) -> Option<Vec<String>> {
+/// `:` end no part ([`windows_prefix_len`]). Each part, and the path itself,
+/// is also read as OMP's `expandPath` opens it ([`omp_expand_path`]), so
+/// `:/repo/secrets.env:1-20` reads `/repo/secrets.env`; any other OMP file
+/// tool (`edit`) resolves its path the same way but takes no suffix, so
+/// without `suffixes` only the path itself is expanded. `None` past
+/// [`MAX_CAPTURE_CANDIDATES`] readings, which proves nothing.
+fn omp_path_readings(paths: &[String], suffixes: bool) -> Option<Vec<String>> {
     let mut readings = Vec::new();
+    let mut add = |reading: String| {
+        if readings.len() == MAX_CAPTURE_CANDIDATES {
+            return None;
+        }
+        readings.push(reading);
+        Some(())
+    };
     for path in paths {
         let root = windows_prefix_len(path).max(1);
         for (index, c) in path.char_indices() {
-            if index < root || !matches!(c, ':' | '?') {
+            if !suffixes || index < root || !matches!(c, ':' | '?') {
                 continue;
             }
-            if readings.len() == MAX_CAPTURE_CANDIDATES {
-                return None;
+            let part = &path[..index];
+            add(part.to_owned())?;
+            if let Some(expanded) = omp_expand_path(part) {
+                add(expanded)?;
             }
-            readings.push(path[..index].to_owned());
+        }
+        // Last, so the file index tries the whole expanded name first.
+        if let Some(expanded) = omp_expand_path(path) {
+            add(expanded)?;
         }
     }
     Some(readings)
+}
+
+/// The path OMP opens for `path` when `expandPath` rewrites it (OMP v18.16.0,
+/// <https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/tools/path-utils.ts>):
+/// a stray leading `:` before a path shape (`:/x`, `:./x`, `:../x`, `:~`,
+/// `:C:`) is dropped, then a leading `@` before an absolute path or `~`
+/// (`@/x`, `@C:\x`, `@~/x`), then a `file://` URL is read as its path. `~`
+/// itself is not expanded, a residual docs/marker-file.md lists. `None` when
+/// nothing changes.
+fn omp_expand_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let colon_shape = |rest: &str| {
+        let rest = rest.as_bytes();
+        matches!(rest.first(), Some(b'/' | b'\\' | b'~'))
+            || matches!(
+                rest,
+                [b'.', b'/' | b'\\', ..] | [b'.', b'.', b'/' | b'\\', ..]
+            )
+            || matches!(rest, [drive, b':', ..] if drive.is_ascii_alphabetic())
+    };
+    let mut expanded = if bytes.first() == Some(&b':') && colon_shape(&path[1..]) {
+        &path[1..]
+    } else {
+        path
+    };
+    if let Some(rest) = expanded.strip_prefix('@')
+        && (matches!(rest.as_bytes().first(), Some(b'/' | b'\\'))
+            || rest == "~"
+            || rest.starts_with("~/")
+            || is_absolute(rest))
+    {
+        expanded = rest;
+    }
+    let expanded = file_url_reading(expanded);
+    (expanded != path).then_some(expanded)
+}
+
+/// The path Pi opens for a `read`, `write` or `edit` path when its
+/// `normalizePath` rewrites it (pi-mono v1.5.0,
+/// <https://github.com/badlogic/pi-mono/blob/v1.5.0/packages/coding-agent/src/utils/paths.ts>):
+/// any leading `@` is dropped, then a `file://` URL is read as its path. `~`
+/// is not expanded, as for OMP. `None` when nothing changes.
+fn pi_expand_path(path: &str) -> Option<String> {
+    let expanded = file_url_reading(path.strip_prefix('@').unwrap_or(path));
+    (expanded != path).then_some(expanded)
+}
+
+/// A `file://` URL's path ([`file_url_path`]), else `path` itself.
+fn file_url_reading(path: &str) -> String {
+    if path
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+    {
+        file_url_path(path).unwrap_or_else(|| path.to_owned())
+    } else {
+        path.to_owned()
+    }
 }
 
 /// How many leading bytes of `path` are a Windows root prefix: a device
@@ -7604,8 +7682,10 @@ mod tests {
     /// OMP's `read` and `write` name a file through a suffix of `path`, so a
     /// ranged read of an ignored file (`secrets.env:1-20`), an archive member,
     /// a SQLite row or a query would otherwise miss every exact-file pattern.
-    /// The shared vectors attempt each documented form; `src/app.ts:5-9` and
-    /// Pi, which reads the name it is given, are the controls.
+    /// OMP's `expandPath` and Pi's `normalizePath` also drop a leading `:` or
+    /// `@` and read a `file://` URL, in `edit` too. The shared vectors attempt
+    /// each documented form; `src/app.ts:5-9`, a literal `@secrets.env` for
+    /// OMP and a ranged path for Pi, which takes no suffix, are the controls.
     #[test]
     fn omp_path_suffixes_cannot_reach_ignored_paths() {
         let fixture: Value =
@@ -7614,7 +7694,16 @@ mod tests {
         for vector in section["readings"].as_array().unwrap() {
             let path = vector["path"].as_str().unwrap().to_owned();
             let expected: Vec<String> = serde_json::from_value(vector["readings"].clone()).unwrap();
-            assert_eq!(omp_path_readings(&[path]), Some(expected), "{vector}");
+            assert_eq!(omp_path_readings(&[path], true), Some(expected), "{vector}");
+        }
+        for vector in section["pi_readings"].as_array().unwrap() {
+            let path = vector["path"].as_str().unwrap();
+            let expected: Vec<String> = serde_json::from_value(vector["readings"].clone()).unwrap();
+            assert_eq!(
+                pi_expand_path(path).into_iter().collect::<Vec<_>>(),
+                expected,
+                "{vector}"
+            );
         }
         let ignore_paths = section["ignore_paths"]
             .as_array()
@@ -7651,6 +7740,51 @@ mod tests {
                 vector["path_count"].as_u64().unwrap_or(1),
                 "{raw}"
             );
+        }
+    }
+
+    /// OMP drops a stray leading `:` before a path shape (`expandPath`), so
+    /// `:/repo/secrets.env:1-20` reads `/repo/secrets.env`. The generated
+    /// TypeScript policy is metadata-only on any leading `:`, so this native
+    /// row lives here rather than in the shared vectors; `:src/app.ts` (no
+    /// path shape, opened as spelled) and Pi, which keeps a leading `:`, are
+    /// the controls.
+    #[test]
+    fn omp_stray_leading_colon_cannot_reach_ignored_paths() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secrets.env".into(), "*.pem".into()],
+            }),
+            "/repo",
+            None,
+        );
+        for (agent, path, expected) in [
+            (
+                AgentKind::Omp,
+                ":/repo/secrets.env:1-20",
+                CaptureDisposition::Drop,
+            ),
+            (
+                AgentKind::Omp,
+                ":/repo/secrets.env",
+                CaptureDisposition::Drop,
+            ),
+            (AgentKind::Omp, ":./key.pem:1-40", CaptureDisposition::Drop),
+            (
+                AgentKind::Omp,
+                ":../repo/secrets.env",
+                CaptureDisposition::Drop,
+            ),
+            (AgentKind::Omp, ":src/app.ts:5-9", CaptureDisposition::Keep),
+            (
+                AgentKind::Pi,
+                ":/repo/secrets.env",
+                CaptureDisposition::Keep,
+            ),
+        ] {
+            let raw = json!({"tool": "read", "args": {"path": path}});
+            let protocol = policy.inspect(agent, &raw, "/repo").protocol().clone();
+            assert_eq!(protocol.disposition(), expected, "{agent:?} {path}");
         }
     }
 

@@ -22,8 +22,12 @@ version in [`docs/changelog/`](docs/changelog/):
   posted the content. The capture policy and the extension now also match
   every part of an OMP `read` or `write` path before a `:` or `?`, and the
   opt-in file index keys such a call by the file OMP reads (`src/app.ts` for
-  `src/app.ts:5-9`). Run `ai-memory upgrade`, or re-run `install-hooks
-  --agent omp --apply`, to regenerate the extension (#1990).
+  `src/app.ts:5-9`). OMP and Pi file-tool paths that the harness rewrites
+  before opening are matched as rewritten too: a stray leading `:` (OMP), a
+  leading `@` and a `file://` URL, so `@secrets.env` in Pi or
+  `@/repo/secrets.env` in OMP no longer slips past the exclusion. Run
+  `ai-memory upgrade`, or re-run `install-hooks --agent omp --apply` (or
+  `--agent pi`), to regenerate the extension (#1990).
 
 ## [3.4.1] - 2026-11-05
 
