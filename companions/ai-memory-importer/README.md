@@ -144,7 +144,10 @@ pages land at `imported/claude-mem/<type>/<id>.md`; summaries use
 `refactor`, and `discovery`. Unknown types are skipped and counted without
 reading their bodies. `security_note` retains that source path and maps to the
 `gotcha` kind; the five change/discovery types map to `fact` while retaining
-their source type in the path.
+their source type in the path. claude-mem stores an observation's facts and
+file lists, and a summary's file lists, as JSON arrays; each becomes a bullet
+list, file paths in code spans, and an empty list adds no section. A value
+that is not such an array is kept as written.
 
 The importer opens the source read-only and uses SQLite's backup API to take a
 WAL-consistent private snapshot before inspection. It refuses a symlink or a
@@ -296,7 +299,10 @@ their ai-memory 3.0 compatibility. The claude-mem manifest contains source
 ids, destinations, counts, and hashes, but never imported bodies or skipped
 sensitive/security bodies. Each imported page carries a deterministic
 source-row key, while resume authority still requires an exact full-body
-match; retaining the footer on an edited page does not permit overwrite.
+match; retaining the footer on an edited page does not permit overwrite. The
+one other body a rerun accepts is the exact body the 3.4.0 importer planned for
+the same row, with the lists copied as text: the rerun writes the current
+layout over it, and the old version stays in the page's history.
 
 The document route adds these boundaries:
 

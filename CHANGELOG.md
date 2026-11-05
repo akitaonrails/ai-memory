@@ -17,6 +17,15 @@ version in [`docs/changelog/`](docs/changelog/):
   cells keep their text instead of reading the next entry or failing with an
   out-of-range index (#1995).
 
+- The claude-mem importer now writes an observation's facts and file lists,
+  and a summary's file lists, as bullet lists. claude-mem stores them as JSON
+  arrays, which imported pages showed as written
+  (`["src/cache.rs","src/db.rs"]`), and each empty list added a section
+  holding `[]`. File paths are code spans, an empty list adds no section, and
+  a value that is not a JSON array of strings is kept as written. A rerun
+  writes the new layout over a page the 3.4.0 importer wrote, keeping the old
+  version in the page's history; a page edited since is still refused (#1996).
+
 ## [3.4.1] - 2026-11-05
 
 ### Fixed
