@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed shell hooks injecting redirect and error response bodies as handoff
+  or brief context. Only 2xx responses now supply context, with the response
+  body preserved across all three authentication modes.
+
 ## [3.4.1] - 2026-11-05
 
 ### Fixed
