@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   cache counts; missing usage stays unknown. Totals follow Pi's session history,
   including copied fork history. Per-response Pi ledger records remain
   unsupported; update the server and reinstall the Pi extension to enable
-  session reporting (#1984).
+  session reporting (#1984, #1985).
 
 ### Changed
 
