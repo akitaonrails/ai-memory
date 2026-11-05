@@ -322,6 +322,7 @@ pub(crate) fn plan(dir: &Path, destination: &Destination, prefix: &str) -> Resul
                 tier,
                 tags: tags_from(tags.iter().map(String::as_str)),
                 expires_at: None,
+                previous_bodies: Vec::new(),
             }],
         });
     }
