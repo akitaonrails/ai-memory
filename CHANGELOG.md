@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved empty XLSX shared-string entries during document import so later
+  cells keep their text instead of reading the next entry or failing with an
+  out-of-range index.
+
 ## [3.4.1] - 2026-11-05
 
 ### Fixed
