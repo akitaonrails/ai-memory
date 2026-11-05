@@ -169,6 +169,12 @@ fn assert_human(output: &Output, success: bool, replacements: usize) {
 #[case::purge_project(
     &["purge-project", "--workspace", "ws", "--project", "proj", "--confirm"],
     "/admin/purge-project", json!({"label": TEXT}), 1)]
+#[case::purge_project_orphaned_workstreams(
+    &["purge-project", "--workspace", "ws", "--project", "proj", "--confirm"],
+    "/admin/purge-project", json!({"label": "ws/proj", "workstream_ids": [TEXT]}), 1)]
+#[case::purge_session_files(
+    &["purge-session", "--workspace", "ws", "--project", "proj", "--session-id", ID, "--confirm"],
+    "/admin/purge-session", json!({"files_deleted": [TEXT], "files_failed": [TEXT]}), 2)]
 #[case::rename_workstream_changed(
     &["rename-workstream", "--workspace", "ws", "--project", "proj", "--from", "old", "--to", "new"],
     "/workstream/rename", json!({"workstream_id": ID, "from": TEXT, "to": format!("new-{TEXT}")}), 2)]
@@ -305,6 +311,37 @@ async fn purge_project_preview_label() {
         false,
         1,
     );
+}
+
+/// A decode failure quotes the server's value back (serde names the unknown
+/// variant verbatim), so the exit report must neutralize it too.
+#[tokio::test]
+async fn decode_error_quoting_server_text() {
+    let fixture = Fixture::json(
+        "/workstream/recent",
+        json!([{"workstream_id": ID, "name": "name", "created_at": "2026-01-01T00:00:00Z",
+            "last_active_at": "2026-01-01T00:00:00Z", "current": true,
+            "linked_harnesses": [TEXT]}]),
+    )
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", root.path().join("gitconfig"))
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = cli(
+        root.path(),
+        &fixture.url,
+        &["workstreams", "--workspace", "ws", "--project", "proj"],
+    )
+    .await;
+    assert_human(&output, false, 1);
 }
 
 #[tokio::test]

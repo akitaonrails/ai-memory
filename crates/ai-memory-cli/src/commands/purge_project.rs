@@ -268,7 +268,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
         println!(
             "{}", i18n.text("cli-purge-project-the-following-workstream-segment-directories-are-now-orphaned-under-data-dir"));
         for id in ids.iter().filter_map(serde_json::Value::as_str) {
-            println!("  - {id}");
+            println!("  - {}", super::show::terminal_text(id));
         }
     }
     if let Some(failed) = report["files_failed"].as_array()

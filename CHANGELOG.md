@@ -14,8 +14,9 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 
 - Sanitized server-provided text in human CLI output, including HTTP error
-  messages. Terminal controls and Unicode direction and line controls now
-  display as `?`, while JSON output, document line breaks and tabs are preserved.
+  messages and the error report a failed command prints on exit. Terminal
+  controls and Unicode direction and line controls now display as `?`, while
+  JSON output, document line breaks and tabs are preserved (#1987).
 
 ## [3.4.1] - 2026-11-05
 

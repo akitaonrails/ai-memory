@@ -167,7 +167,7 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
     {
         println!("{}", i18n.text("cli-purge-session-wiki-pages-removed"));
         for path in paths.iter().filter_map(serde_json::Value::as_str) {
-            println!("  - {path}");
+            println!("  - {}", super::show::terminal_text(path));
         }
     }
     if let Some(failed) = report["files_failed"].as_array()
@@ -176,7 +176,7 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
         println!(
             "{}", i18n.format("cli-purge-session-warning-wiki-page-file-s-could-not-be-removed-from-disk-db-rows-are-gone", &[("value0", format!("{}", failed.len()))]));
         for path in failed.iter().filter_map(serde_json::Value::as_str) {
-            println!("  - {path}");
+            println!("  - {}", super::show::terminal_text(path));
         }
     }
     if report["compacted"].as_bool().unwrap_or(false) {
