@@ -38,6 +38,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The dashboard's icons now render on every platform. The three shipped
+  web fonts are Latin subsets, so the geometric and symbol characters the
+  templates use as icons were absent from them and fell through to the
+  platform UI font, which carries only a few: on macOS 4 of the 17 the
+  dashboard uses, leaving the other 13 as tofu boxes. The base font stacks
+  now name the symbol face each platform ships, after `system-ui`, so Latin
+  text is unchanged.
 - The project-split repair now joins the two projects instead of only
   renaming them. 3.4.1's two renames left the repository identity on the
   archived project, so identity-based capture and the checkout's saved
