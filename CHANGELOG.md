@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.1] - 2026-11-05
+
 ### Fixed
 
 - `ai-memory run` no longer fails with `409 managed run is not active` when it
@@ -4163,7 +4165,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.1...HEAD
+[3.4.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.1
 [3.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.0
 [3.3.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.3
 [3.3.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.2
