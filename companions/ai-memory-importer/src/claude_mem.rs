@@ -776,20 +776,20 @@ fn read_summaries(
         };
         let created_at = bounded_metadata(row.get(3)?, "summary created_at", MAX_TIMESTAMP_BYTES)?;
         let labels = [
-            "Request",
-            "Investigated",
-            "Learned",
-            "Completed",
-            "Next steps",
-            "Files read",
-            "Files edited",
-            "Notes",
+            ("Request", Field::Text),
+            ("Investigated", Field::Text),
+            ("Learned", Field::Text),
+            ("Completed", Field::Text),
+            ("Next steps", Field::Text),
+            ("Files read", Field::Files),
+            ("Files edited", Field::Files),
+            ("Notes", Field::Text),
         ];
         let mut sections = Vec::new();
-        for (offset, label) in labels.iter().enumerate() {
+        for (offset, (label, field)) in labels.into_iter().enumerate() {
             let value: Option<String> = bounded(row.get(4 + offset)?, "summary field")?;
-            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-                sections.push(format!("## {label}\n\n{}", value.trim()));
+            if let Some(value) = value.and_then(|value| section_text(&value, field)) {
+                sections.push(format!("## {label}\n\n{value}"));
             }
         }
         let body = format!(
