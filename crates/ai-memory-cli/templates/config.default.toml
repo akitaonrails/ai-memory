@@ -148,6 +148,15 @@ log_level = "info"
 # tiers). Env equivalent: `AI_MEMORY_LLM_TIMEOUT_SECS`.
 # llm_timeout_secs = 300
 
+# openai-compat only: add request metadata headers to every chat attempt, so a
+# gateway can attribute and limit traffic. `x-ai-memory-workload` names the
+# workload (consolidation, profile, dream, lint, ...); `x-ai-memory-workspace`
+# and `x-ai-memory-project` name the scope, and `x-ai-memory-user` the
+# username, only when the operation has exactly one. Values are names, never
+# page content. Other providers never send them. Off by default. Env
+# equivalent: `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`.
+# llm_request_metadata_headers = false
+
 # How many live `bootstrap` runs may call the LLM at once, across projects. A
 # second run for the same project always waits for the first. The default runs
 # one at a time; raise it when the provider batches concurrent requests (a local
@@ -165,7 +174,9 @@ log_level = "info"
 # `Name=Value` entries. Empty by default. Use it for a gateway that wants a
 # caller-identifying header; OpenCode asks for `x-opencode-session` and a
 # specific `User-Agent`. Headers ai-memory sets itself (`authorization`,
-# `content-type`, `x-api-key`, ...) are refused at startup. Values are never
+# `content-type`, `x-api-key`, ...) are refused at startup, and so are
+# `x-request-id` and the `x-ai-memory-*` metadata names for openai-compat,
+# which sends them itself. Values are never
 # logged. Env equivalent: `AI_MEMORY_LLM_HEADERS`, set as an array such as
 # `["name=value","name2=value2"]`. A plain comma separated string is rejected.
 # llm_headers = []
