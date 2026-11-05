@@ -47,7 +47,7 @@ use ai_memory_core::{
     ActorContext, PageEvidence, PageEvidenceKind, PageId, ProjectId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload, Role,
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmSubject, LlmWorkload, Role,
     complete_structured_with_operation_id,
 };
 use ai_memory_store::{DecayParams, PagePrecondition, ReaderPool};
@@ -532,6 +532,9 @@ pub async fn run_dream_pass(
         return Ok(report);
     }
 
+    // One project per pass and no operator behind it: the scope is the
+    // whole subject.
+    let subject = crate::llm_subject::scope(reader, workspace_id, Some(project_id)).await;
     for plan in planned {
         // B3 cancel-on-activity: stop before starting the next cluster the
         // moment the operator returns. Checked at the boundary so an in-flight
@@ -540,7 +543,8 @@ pub async fn run_dream_pass(
             report.cancelled = true;
             break;
         }
-        match merge_one_cluster(wiki, reader, llm, workspace_id, project_id, &plan).await {
+        match merge_one_cluster(wiki, reader, llm, workspace_id, project_id, &plan, &subject).await
+        {
             MergeOutcome::Applied {
                 new_survivor_id,
                 superseded,
@@ -603,6 +607,7 @@ async fn merge_one_cluster(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     plan: &PlannedCluster,
+    subject: &LlmSubject,
 ) -> MergeOutcome {
     let survivor = &plan.survivor;
     let actor = ActorContext::anonymous();
@@ -653,7 +658,7 @@ async fn merge_one_cluster(
     let merged: DreamMergedPage = match complete_structured_with_operation_id(
         llm,
         request,
-        LlmOperationId::for_workload(LlmWorkload::Dream),
+        LlmOperationId::for_workload(LlmWorkload::Dream).with_subject(subject.clone()),
     )
     .await
     {

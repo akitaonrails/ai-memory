@@ -733,8 +733,13 @@ pub async fn run_auto_improve_review(
             // One review call is one LLM operation: a fresh identity, never
             // the agent's session id — two reviews of the same session must
             // not look like one operation on the provider side.
-            let operation_id =
-                LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::AutoImprove);
+            let operation_id = LlmOperationId::for_workload(
+                ai_memory_llm::LlmWorkload::AutoImprove,
+            )
+            .with_subject(ai_memory_llm::LlmSubject {
+                user: crate::llm_subject::session_owner(reader, session_id).await,
+                ..crate::llm_subject::scope(reader, workspace_id, Some(project_id)).await
+            });
             let raw: AutoImproveLlmResponse =
                 complete_structured_with_operation_id(llm, request, operation_id).await?;
             let (mut proposals, mut rejected_candidates, mut warnings) =

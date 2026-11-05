@@ -24,6 +24,7 @@ pub mod experience;
 pub mod keep_tokens;
 mod link_guard;
 pub mod lint;
+mod llm_subject;
 mod path_sanitize;
 pub mod profile;
 pub mod projection;
