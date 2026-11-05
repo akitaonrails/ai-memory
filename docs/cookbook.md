@@ -502,7 +502,10 @@ ai-memory run --yolo claude
   type to filter, Space to select (read-only), Ctrl+W to make the selected one
   read-write, Tab or → to open a folder, ← to go up, Enter when done. From the
   command line, `ai-memory run --jail --jail-map ../ai-jail claude` mounts a
-  folder read-only and `--jail-rw-map DIR` read-write; both repeat. Your home,
+  folder read-only and `--jail-rw-map DIR` read-write; both repeat. Put these
+  options before the harness: for example,
+  `ai-memory run --jail --jail-map ../reference --jail-rw-map ../scratch claude`
+  mounts both folders. Your home,
   `/`, credential folders (`~/.ssh`, `~/.aws`, `~/.config/gh`, …) and
   ai-memory's own data directory are refused, and the error says why. Edits
   the agent makes in a read-write sibling are captured under the current

@@ -89,6 +89,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `@/repo/secrets.env` in OMP no longer slips past the exclusion. Run
   `ai-memory upgrade`, or re-run `install-hooks --agent omp --apply` (or
   `--agent pi`), to regenerate the extension (#1990).
+- Fixed parsing of `run --jail-map DIR` and `--jail-rw-map DIR` when followed
+  by another wrapper option. Folder values no longer end wrapper-option
+  parsing before the harness; native arguments after it stay intact (#1998).
 
 ## [3.4.1] - 2026-11-05
 

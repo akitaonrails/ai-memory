@@ -100,6 +100,8 @@ fn delimit_run_native_args(args: &mut Vec<OsString>) {
                 | "--profile"
                 | "--env"
                 | "--env-file"
+                | "--jail-map"
+                | "--jail-rw-map"
                 | "--data-dir"
                 | "--config"
         ) && !raw.contains('=');
@@ -4926,6 +4928,55 @@ mod tests {
             error.to_string().contains("expected one of"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn run_jail_folder_values_do_not_end_wrapper_argument_parsing() {
+        for folder_args in [
+            vec![
+                "--jail-map",
+                "../read only",
+                "--jail-rw-map",
+                "../writable",
+                "--jail-map",
+                "../reference",
+            ],
+            vec![
+                "--jail-map=../read only",
+                "--jail-rw-map=../writable",
+                "--jail-map=../reference",
+            ],
+        ] {
+            for explicit_harness in [false, true] {
+                let mut argv = vec!["ai-memory", "run", "--jail=none"];
+                argv.extend_from_slice(&folder_args);
+                argv.extend(["--profile", "wrapper-profile"]);
+                if explicit_harness {
+                    argv.extend(["omp", "--profile", "native-profile"]);
+                }
+                let cli = crate::cli::try_parse_from(&argv)
+                    .unwrap_or_else(|error| panic!("{argv:?}: {error}"));
+                let Command::Run(args) = cli.command else {
+                    panic!("expected run command");
+                };
+                assert_eq!(
+                    args.jail_map,
+                    ["../read only", "../reference"].map(PathBuf::from)
+                );
+                assert_eq!(args.jail_rw_map, [PathBuf::from("../writable")]);
+                assert_eq!(args.profile.as_deref(), Some("wrapper-profile"));
+                if explicit_harness {
+                    assert_eq!(args.harness, Some(RunHarnessChoice::Omp));
+                    assert_eq!(
+                        args.native_args,
+                        ["--profile", "native-profile"].map(OsString::from)
+                    );
+                } else {
+                    assert!(args.harness.is_none());
+                    assert!(args.native_args.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
