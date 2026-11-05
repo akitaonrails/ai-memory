@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Added an opt-in, development-only Raw-RAG retrieval baseline to
   `ai-memory-eval`: overlapping source windows, local dense retrieval and
   cross-encoder reranking, with pinned models and per-window provenance.
-  The shipped server, capture pipeline and retrieval defaults are unchanged.
+  The shipped server, capture pipeline and retrieval defaults are unchanged (#2017).
 - Added Pi session token totals from saved usage at agent stops and shutdown.
   Reloads, resumes and repeated reports preserve cumulative input, output and
   cache counts; missing usage stays unknown. Totals follow Pi's session history,
