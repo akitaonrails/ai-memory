@@ -100,6 +100,8 @@ An array of tables, defined by `WebhookConfig` in `ai-memory-wiki`. The default 
 | `failure_policy` | `ignore` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `ignore` logs a warning and continues. `reject` aborts the write. |
 | `events` | required | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | Operations the webhook subscribes to. An empty list means it never fires. |
 | `blocking` | `true` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `true` runs inside the write path and can change the page. `false` fires after the page lands and ignores the response. |
+| `projects` | `[]` (every project) | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `workspace/project` entries the webhook is told about. A workspace-wide event matches by workspace. A malformed entry stops the server. |
+| `headers` | `[]` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | Extra request headers, each `{ name, value_file }`. The file is read once at server start (relative paths resolve against the data dir) and its value is never logged. Reserved names (`Content-Type`, `Content-Length`, `Host`, `X-Memory-Op`) and a missing or empty file stop the server. |
 
 `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` takes a JSON array of these entries and replaces the list from the file. Valid `events` are `write_page`, `consolidate`, `delete`, `delete_event_ledger`, `purge_project`, `purge_session`, `purge_workspace`, `move_project`, `move_session`, `handoff_begin`, `handoff_accept`, `handoff_cancel`, `message_send`, `message_pop` and `message_cancel`.
 

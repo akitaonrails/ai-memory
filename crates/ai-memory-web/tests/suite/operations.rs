@@ -957,6 +957,8 @@ async fn operations_browser_messages_use_the_configured_sanitizer_and_admission(
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::MessageSend],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let wiki = wiki

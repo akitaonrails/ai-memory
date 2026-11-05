@@ -7407,7 +7407,7 @@ impl AiMemoryServer {
         // Admission is asked at the crossing point (the recipient scope): a
         // per-operator webhook can refuse prompt-derived text entering another
         // project.
-        let admission = self
+        let mut admission = self
             .authorize_operation(
                 to_ws,
                 to_proj,
@@ -7415,11 +7415,16 @@ impl AiMemoryServer {
                 &parts,
             )
             .await?;
+        let queued_to_agent = message.to_agent;
         let id = self
             .writer
             .insert_message(message)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let (Some(wiki), Some(ctx)) = (self.wiki.as_ref(), admission.as_mut()) {
+            wiki.describe_queued_message(ctx, id, queued_to_agent, from_ws, from_proj)
+                .await;
+        }
         self.notify_operation_observers(admission.as_ref());
         ok_json(&serde_json::json!({
             "message_id": id.to_string(),

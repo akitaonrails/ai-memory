@@ -398,6 +398,8 @@ async fn purge_session_reports_file_cleanup_failure_after_db_commit() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeSession],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -547,6 +549,8 @@ async fn purge_session_dry_run_does_not_dispatch_admission_webhook() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeSession],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -1228,6 +1232,8 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::PurgeProject],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -1501,6 +1507,8 @@ async fn purge_project_dry_run_does_not_dispatch_admission_webhook() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeProject],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;

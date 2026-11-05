@@ -1240,6 +1240,29 @@ impl AuthSettings {
     }
 }
 
+/// Parse `AI_MEMORY_ADMISSION_WEBHOOKS_JSON`: the same webhook list a
+/// `[[admission_webhooks]]` table holds, as one JSON array.
+fn parse_admission_webhooks_json(raw: &str) -> Result<Vec<ai_memory_wiki::WebhookConfig>> {
+    serde_json::from_str(raw).with_context(|| {
+        "parsing AI_MEMORY_ADMISSION_WEBHOOKS_JSON (must be a JSON array of \
+         {name,url,timeout_ms?,failure_policy?,events,blocking?,projects?,headers?})"
+    })
+}
+
+/// Resolve each webhook header's relative `value_file` against the data dir.
+///
+/// Only the path is resolved here. The file holds a secret only the server
+/// sends, and every hook and thin client loads this same config, so it is
+/// read once by `AdmissionChain::new` when `serve` builds the chain; a missing
+/// file then stops the server, not the hooks.
+fn resolve_admission_header_files(webhooks: &mut [ai_memory_wiki::WebhookConfig], data_dir: &Path) {
+    for header in webhooks.iter_mut().flat_map(|hook| hook.headers.iter_mut()) {
+        if header.value_file.is_relative() {
+            header.value_file = data_dir.join(&header.value_file);
+        }
+    }
+}
+
 /// What [`apply_bearer_token_file`] needs to know about the load.
 struct TokenFileContext<'a> {
     data_dir: &'a Path,
@@ -2515,12 +2538,7 @@ impl Config {
         if let Ok(raw) = std::env::var("AI_MEMORY_ADMISSION_WEBHOOKS_JSON")
             && !raw.trim().is_empty()
         {
-            let parsed: Vec<ai_memory_wiki::WebhookConfig> = serde_json::from_str(&raw)
-                .with_context(|| {
-                    "parsing AI_MEMORY_ADMISSION_WEBHOOKS_JSON (must be a JSON array of \
-                     {name,url,timeout_ms?,failure_policy?,events})"
-                })?;
-            config.admission_webhooks = parsed;
+            config.admission_webhooks = parse_admission_webhooks_json(&raw)?;
         }
         // FTS stopword list (issue #953): CSV env override, applied as data
         // (see `apply_fts_stopwords_env`'s doc comment for why this can't go
@@ -2574,6 +2592,8 @@ impl Config {
         // server WAS on the default port -- which is how the reporter wrote
         // test pages into their real store.
         derive_server_url_from_bind(&mut config, explicit_server_url);
+        // After the data dir is final, as for the bearer token file below.
+        resolve_admission_header_files(&mut config.admission_webhooks, &config.data_dir);
         apply_bearer_token_file(
             &mut config.auth,
             &TokenFileContext {
@@ -7263,6 +7283,43 @@ input_token_safety_margin = {margin}
         let config_path = tmp.path().join("config.toml");
         std::fs::write(&config_path, toml).unwrap();
         Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+    }
+
+    #[test]
+    fn admission_webhook_bot_wake_config_is_the_same_from_toml_and_json() {
+        let toml = r#"
+[[admission_webhooks]]
+name = "grok-bot-wake"
+url = "https://example.test/hook"
+events = ["message_send"]
+blocking = false
+projects = ["fuad/grok-bot"]
+headers = [{ name = "Authorization", value_file = "secrets/wake" }]
+"#;
+        // The secret file does not exist: loading the config must not open it,
+        // or every hook and thin client would fail on a server-only secret.
+        let config = load_with_toml(toml).unwrap();
+        let mut from_json = parse_admission_webhooks_json(
+            r#"[{"name":"grok-bot-wake","url":"https://example.test/hook",
+                "events":["message_send"],"blocking":false,
+                "projects":["fuad/grok-bot"],
+                "headers":[{"name":"Authorization","value_file":"secrets/wake"}]}]"#,
+        )
+        .unwrap();
+        resolve_admission_header_files(&mut from_json, &config.data_dir);
+
+        assert_eq!(
+            serde_json::to_value(&config.admission_webhooks).unwrap(),
+            serde_json::to_value(&from_json).unwrap(),
+            "TOML and the JSON env override describe the same webhook"
+        );
+        let hook = &config.admission_webhooks[0];
+        assert_eq!(hook.projects, ["fuad/grok-bot"]);
+        assert_eq!(
+            hook.headers[0].value_file,
+            config.data_dir.join("secrets/wake"),
+            "a relative value_file resolves against the data dir"
+        );
     }
 
     fn load_with_oauth_fixture(tmp: &TempDir, toml: &str) -> Config {

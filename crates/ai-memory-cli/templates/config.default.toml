@@ -849,8 +849,15 @@ mid_session = "follow-cwd"
 # webhook inside the write path, where it can change the page and a rejection
 # aborts the write. With blocking = false the webhook is called after the page
 # lands, its response is ignored, and a slow or down mirror adds no latency to
-# writes. `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` takes a JSON array of the same
-# fields and replaces the list from this file.
+# writes. projects (default: every project) limits the webhook to the listed
+# "workspace/project" entries; a workspace-wide event matches by workspace.
+# headers adds request headers whose values are read from files, once, when the
+# server starts: a relative value_file resolves against the data dir, a missing
+# or empty file stops the server, and the value never reaches a log. Together
+# they let a bot's endpoint be woken on message_send with no relay in between;
+# the message_send context names the message id, the addressed harness and the
+# sending project, never the message text. `AI_MEMORY_ADMISSION_WEBHOOKS_JSON`
+# takes a JSON array of the same fields and replaces the list from this file.
 #   [[admission_webhooks]]
 #   name           = "contributors"
 #   url            = "http://contributors-webhook.memory.svc.cluster.local/enrich"
@@ -858,6 +865,14 @@ mid_session = "follow-cwd"
 #   failure_policy = "ignore"
 #   blocking       = true
 #   events         = ["write_page", "consolidate"]
+#
+#   [[admission_webhooks]]
+#   name     = "bot-wake"
+#   url      = "https://bot.example.test/wake"
+#   blocking = false
+#   events   = ["message_send"]
+#   projects = ["default/ops-bot"]
+#   headers  = [{ name = "Authorization", value_file = "secrets/bot-wake" }]
 
 # NOTE: `[auth]` must remain the LAST section in this template.
 # `ai-memory init` appends further `[auth]` keys (token_pepper, root_username,

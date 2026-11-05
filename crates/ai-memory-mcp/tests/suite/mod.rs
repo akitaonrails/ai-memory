@@ -26,6 +26,7 @@ mod admin_write_page;
 mod agent_messages_briefing;
 mod agent_messages_scope;
 mod agent_messages_tools;
+mod agent_messages_webhook;
 mod autoscope_multiuser;
 mod dual_key_scope;
 mod handoff_admission;
