@@ -152,7 +152,9 @@ pub(crate) fn confirm_repair(
     write!(output, "{}", i18n.text("cli-run-project-split-prompt"))?;
     output.flush()?;
     let mut line = String::new();
-    input.read_line(&mut line)?;
+    if input.read_line(&mut line)? == 0 {
+        return Ok(false);
+    }
     Ok(matches!(
         line.trim().to_ascii_lowercase().as_str(),
         "" | "y" | "yes" | "s" | "sim"
@@ -342,6 +344,17 @@ mod tests {
             let printed = String::from_utf8(output).unwrap();
             assert!(printed.contains("acme-api-split-"), "{printed}");
         }
+    }
+
+    #[test]
+    fn eof_does_not_confirm_the_repair() {
+        let i18n = ai_memory_core::i18n::Localizer::default();
+        let mut output = Vec::new();
+        assert!(
+            !confirm_repair(&i18n, &split(), &mut io::empty(), &mut output).unwrap(),
+            "closing the prompt without an answer must not rename either project"
+        );
+        assert!(!output.is_empty(), "the repair was offered before EOF");
     }
 
     #[test]
