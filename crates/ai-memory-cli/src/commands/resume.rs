@@ -114,6 +114,8 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             true_yolo: args.true_yolo,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: args.fresh,
             force_unlock: false,
             no_autowire: false,

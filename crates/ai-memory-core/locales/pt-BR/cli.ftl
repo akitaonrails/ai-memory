@@ -805,6 +805,6 @@ cli-setup-ready-prefix = { "O ai-memory está configurado. " }
 cli-config-load-failed = Não foi possível carregar a configuração do ai-memory
 cli-error-report = Erro: { $message }
 cli-error-caused-by = Causado por:
-cli-run-project-split-explain = A sessão que você está retomando foi gravada no projeto { $workspace }/{ $old }, com o nome desta pasta, antes de o repositório ter um remote git. Este checkout agora resolve para { $workspace }/{ $new }, que ainda não gravou nada. Renomear { $old } para { $new } une os dois e mantém todas as sessões, observações e páginas; o { $new } vazio fica guardado como { $archive }, sem ser apagado.
+cli-run-project-split-explain = 🔀 Esta sessão está em { $workspace }/{ $old } (nome da pasta, de antes de o repositório ter remote); este checkout agora é { $workspace }/{ $new }, ainda vazio. Renomear { $old } → { $new } mantém todas as sessões e páginas, e o projeto vazio fica guardado como { $archive }.
 cli-run-project-split-prompt = Renomear e continuar? [S/n]{ " " }
 cli-run-project-split-repaired = Renomeado { $workspace }/{ $old } → { $workspace }/{ $new }; iniciando a sessão de novo.

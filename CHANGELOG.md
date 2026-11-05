@@ -11,6 +11,31 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- `ai-memory run`'s ai-jail checklist now remembers each checkout's answers,
+  so the next launch shows the same marks and Enter is enough. Each
+  pre-checked row says why it is recommended, the header says when the
+  answers were saved and what changed since, and `reset` goes back to the
+  recommendation. The answers live in ai-memory's data directory
+  (`jail-choices.json`), never in the repository (#1998).
+- Added extra folders inside ai-jail, for example a sibling project the agent
+  should study: `f` in the checklist opens a folder picker that starts next
+  to the checkout (type to filter, Space to select, Ctrl+W for read-write),
+  and `--jail-map DIR` / `--jail-rw-map DIR` do the same from the command
+  line. Your home, `/`, credential folders and ai-memory's own data directory
+  are refused with the reason. Needs ai-jail 2.15 (#1998).
+- When a jailed session started from the checklist ends, ai-memory prints the
+  `ai-memory run` line that repeats its choices, including the `--jail=` list,
+  the folders and the harness (#1998).
+
+### Changed
+
+- The `--yolo` warning, the ai-jail offer, the checklist and the post-run
+  harness menu are shorter and use color and icons to mark what matters (a
+  credential, host root, a recommendation). Plain text without a terminal or
+  with `NO_COLOR` (#1998).
+
 ## [3.4.1] - 2026-11-05
 
 ### Fixed

@@ -27,6 +27,7 @@ pub const FORWARDED_ENV_NAMES: &[&str] = &[
     "GOOGLE_API_KEY",
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
+    "AI_MEMORY_JAIL_NEXT_RUN",
 ];
 
 /// The ai-jail binary the `--yolo` offer may re-exec under, or `None` when
@@ -249,7 +250,30 @@ pub struct JailToggle {
     rule: ToggleRule,
 }
 
+/// How much a toggle exposes, which the checklist shows by its color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JailRisk {
+    /// A host capability such as the display or a toolchain cache.
+    Normal,
+    /// A credential the agent can then use.
+    Secret,
+    /// Equivalent to root on the host.
+    HostRoot,
+}
+
 impl JailToggle {
+    /// How much this toggle exposes.
+    #[must_use]
+    pub fn risk(&self) -> JailRisk {
+        if self.stem == "docker" {
+            JailRisk::HostRoot
+        } else if self.kind == JailToggleKind::Credential {
+            JailRisk::Secret
+        } else {
+            JailRisk::Normal
+        }
+    }
+
     /// Whether the interactive checklist can show this toggle at all.
     #[must_use]
     pub const fn in_checklist(&self) -> bool {
@@ -291,7 +315,7 @@ pub const JAIL_TOGGLES: &[JailToggle] = {
         toggle(
             "github",
             "GitHub CLI credentials",
-            "~/.config/gh, read-only",
+            "gh config and its token, read-only",
             Credential,
             CRED,
             CredentialAt(".config/gh"),
@@ -471,6 +495,13 @@ impl JailSupport {
         Self { flags }
     }
 
+    /// Whether the installed ai-jail can mount extra folders
+    /// (`--map` / `--rw-map`, ai-jail 2.15).
+    #[must_use]
+    pub fn mounts_folders(&self) -> bool {
+        self.supports("map") && self.supports("rw-map")
+    }
+
     /// Whether the installed ai-jail accepts `--<stem>`.
     #[must_use]
     pub fn supports(&self, stem: &str) -> bool {
@@ -597,6 +628,37 @@ pub fn jail_checklist(facts: &JailHostFacts, support: &JailSupport) -> Vec<JailC
             })
         })
         .collect()
+}
+
+/// Why `toggle` is pre-checked on this host, in a few words, when its smart
+/// default checks it ([`jail_checklist`]).
+#[must_use]
+pub fn checklist_reason(facts: &JailHostFacts, toggle: &JailToggle) -> Option<&'static str> {
+    match toggle.rule {
+        ToggleRule::CredentialAt(path) if facts.home_has(path) => Some("found on this machine"),
+        ToggleRule::Ssh if facts.origin_push_url.as_deref().is_some_and(is_ssh_remote) => {
+            Some("origin pushes over SSH")
+        }
+        ToggleRule::LinkedWorktree if facts.linked_worktree => Some("needed to commit here"),
+        _ => None,
+    }
+}
+
+/// The `--jail=…` value that reproduces `choices` exactly: the enabled stems,
+/// or `none`. An explicit list forces every other checklist row off
+/// ([`parse_jail_toggles`]), so the disabled rows need no mention.
+#[must_use]
+pub fn jail_spec(choices: &[JailToggleChoice]) -> String {
+    let enabled: Vec<&str> = choices
+        .iter()
+        .filter(|choice| choice.enable)
+        .map(|choice| choice.stem)
+        .collect();
+    if enabled.is_empty() {
+        "none".to_owned()
+    } else {
+        enabled.join(",")
+    }
 }
 
 /// One toggle ai-memory passes to ai-jail: `--<stem>` or `--no-<stem>`.
@@ -828,6 +890,7 @@ pub fn build_ai_jail_invocation(
     agent_state: bool,
     no_save_config: bool,
     toggles: &[JailToggleChoice],
+    folders: &[(&Path, bool)],
 ) -> Vec<OsString> {
     let mut argv = vec![OsString::from("--network")];
     if agent_state {
@@ -841,6 +904,10 @@ pub fn build_ai_jail_invocation(
         argv.push(OsString::from(*name));
     }
     argv.extend(toggles.iter().map(|toggle| OsString::from(toggle.flag())));
+    for (path, writable) in folders {
+        argv.push(OsString::from(if *writable { "--rw-map" } else { "--map" }));
+        argv.push(path.as_os_str().to_os_string());
+    }
     argv.push(OsString::from("--"));
     argv.push(exe.as_os_str().to_os_string());
     argv.extend(forwarded_args.iter().cloned());
@@ -999,7 +1066,7 @@ mod tests {
             OsString::from("--yolo"),
         ];
         let present = ["AI_MEMORY_SERVER_URL", "ANTHROPIC_API_KEY"];
-        let argv = build_ai_jail_invocation(exe, &forwarded, &present, true, true, &[]);
+        let argv = build_ai_jail_invocation(exe, &forwarded, &present, true, true, &[], &[]);
         assert_eq!(
             strings(&argv),
             [
@@ -1022,7 +1089,7 @@ mod tests {
     #[test]
     fn build_ai_jail_invocation_omits_agent_state_when_none() {
         let exe = Path::new("/usr/local/bin/ai-memory");
-        let argv = build_ai_jail_invocation(exe, &[], &[], false, false, &[]);
+        let argv = build_ai_jail_invocation(exe, &[], &[], false, false, &[], &[]);
         assert_eq!(
             strings(&argv),
             ["--network", "--", "/usr/local/bin/ai-memory"]
@@ -1032,7 +1099,8 @@ mod tests {
     #[test]
     fn build_ai_jail_invocation_only_forwards_present_env_names() {
         let exe = Path::new("/bin/ai-memory");
-        let argv = build_ai_jail_invocation(exe, &[], &["CLAUDE_CONFIG_DIR"], false, false, &[]);
+        let argv =
+            build_ai_jail_invocation(exe, &[], &["CLAUDE_CONFIG_DIR"], false, false, &[], &[]);
         assert_eq!(
             strings(&argv),
             [
@@ -1066,6 +1134,7 @@ mod tests {
             &[],
             true,
             true,
+            &[],
             &[],
         ));
         let separator = argv
@@ -1159,6 +1228,110 @@ mod tests {
 
     fn flags(choices: &[JailToggleChoice]) -> Vec<String> {
         choices.iter().map(JailToggleChoice::flag).collect()
+    }
+
+    #[test]
+    fn risk_marks_the_docker_socket_as_host_root_and_credentials_as_secrets() {
+        let risk = |stem| jail_toggle(stem).unwrap().risk();
+        assert_eq!(risk("docker"), JailRisk::HostRoot);
+        assert_eq!(risk("github"), JailRisk::Secret);
+        assert_eq!(risk("ssh"), JailRisk::Secret);
+        assert_eq!(risk("docker-config"), JailRisk::Secret);
+        assert_eq!(risk("worktree"), JailRisk::Normal);
+        assert_eq!(risk("gpu"), JailRisk::Normal);
+    }
+
+    /// A row explains itself only when its smart default checks it.
+    #[test]
+    fn checklist_reason_names_why_a_row_is_pre_checked() {
+        let home = tempfile::tempdir().unwrap();
+        let mut facts = facts_with(home.path(), &[".config/gh"]);
+        let reason =
+            |facts: &JailHostFacts, stem| checklist_reason(facts, jail_toggle(stem).unwrap());
+        assert_eq!(reason(&facts, "github"), Some("found on this machine"));
+        assert_eq!(reason(&facts, "aws"), None);
+        assert_eq!(reason(&facts, "ssh"), None);
+        assert_eq!(reason(&facts, "worktree"), None);
+        assert_eq!(reason(&facts, "docker"), None);
+        facts.origin_push_url = Some("git@github.com:acme/api.git".into());
+        facts.linked_worktree = true;
+        assert_eq!(reason(&facts, "ssh"), Some("origin pushes over SSH"));
+        assert_eq!(reason(&facts, "worktree"), Some("needed to commit here"));
+        facts.origin_push_url = Some("https://github.com/acme/api.git".into());
+        assert_eq!(reason(&facts, "ssh"), None);
+    }
+
+    /// The printed `--jail=` value round-trips through the parser to the same
+    /// enabled set, with every other checklist row forced off.
+    #[test]
+    fn jail_spec_reproduces_a_selection_through_the_parser() {
+        let home = tempfile::tempdir().unwrap();
+        let mut facts = facts_with(home.path(), &[".config/gh", ".aws"]);
+        facts.linked_worktree = true;
+        let support = support_2_5_0();
+        let items = jail_checklist(&facts, &support);
+        let chosen: Vec<JailToggleChoice> = items
+            .iter()
+            .map(|item| JailToggleChoice {
+                stem: item.toggle.stem,
+                enable: matches!(item.toggle.stem, "github" | "docker"),
+                implied: false,
+            })
+            .collect();
+        let spec = jail_spec(&chosen);
+        assert_eq!(spec, "github,docker");
+        let parsed = parse_jail_toggles(&spec, &items, &support).unwrap();
+        let enabled = |choices: &[JailToggleChoice]| {
+            let mut stems: Vec<&str> = choices
+                .iter()
+                .filter(|c| c.enable)
+                .map(|c| c.stem)
+                .collect();
+            stems.sort_unstable();
+            stems
+        };
+        assert_eq!(enabled(&parsed), enabled(&chosen));
+        assert!(parsed.iter().any(|c| c.stem == "aws" && !c.enable));
+
+        let none: Vec<JailToggleChoice> = chosen
+            .iter()
+            .map(|choice| JailToggleChoice {
+                enable: false,
+                ..*choice
+            })
+            .collect();
+        assert_eq!(jail_spec(&none), "none");
+        let parsed = parse_jail_toggles("none", &items, &support).unwrap();
+        assert!(parsed.iter().all(|choice| !choice.enable));
+    }
+
+    #[test]
+    fn extra_folders_are_mounted_before_the_separator() {
+        let argv = strings(&build_ai_jail_invocation(
+            Path::new("/usr/bin/ai-memory"),
+            &[OsString::from("run")],
+            &[],
+            false,
+            true,
+            &[],
+            &[
+                (Path::new("/home/u/Projects/ai-jail"), false),
+                (Path::new("/home/u/Projects/tap"), true),
+            ],
+        ));
+        let separator = argv.iter().position(|arg| arg == "--").unwrap();
+        let mounts = &argv[..separator];
+        assert!(
+            mounts
+                .windows(2)
+                .any(|pair| pair == ["--map", "/home/u/Projects/ai-jail"])
+        );
+        assert!(
+            mounts
+                .windows(2)
+                .any(|pair| pair == ["--rw-map", "/home/u/Projects/tap"])
+        );
+        assert!(!argv[separator..].iter().any(|arg| arg.ends_with("map")));
     }
 
     #[test]
@@ -1591,6 +1764,7 @@ mod tests {
             true,
             true,
             &toggles,
+            &[],
         ));
         assert_eq!(
             argv,

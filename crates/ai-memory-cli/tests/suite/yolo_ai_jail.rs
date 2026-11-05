@@ -40,6 +40,7 @@ fn invocation_puts_all_sandbox_flags_before_the_wrapped_exe() {
         true,
         true,
         &[],
+        &[],
     );
     let strs: Vec<String> = argv
         .iter()
@@ -81,8 +82,15 @@ fn invocation_puts_all_sandbox_flags_before_the_wrapped_exe() {
 #[test]
 fn invocation_emits_one_bare_env_flag_per_present_name() {
     let exe = Path::new("/bin/ai-memory");
-    let argv =
-        build_ai_jail_invocation(exe, &forwarded(), &["CLAUDE_CONFIG_DIR"], false, false, &[]);
+    let argv = build_ai_jail_invocation(
+        exe,
+        &forwarded(),
+        &["CLAUDE_CONFIG_DIR"],
+        false,
+        false,
+        &[],
+        &[],
+    );
     let strs: Vec<String> = argv
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
@@ -125,6 +133,7 @@ fn real_dry_run(
         true,
         no_save_config,
         toggles,
+        &[],
     );
     let output = Command::new(&ai_jail)
         .arg("--dry-run")

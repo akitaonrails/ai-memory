@@ -490,6 +490,28 @@ ai-memory run --yolo claude
   A mounted credential is usable by the unsupervised agent, so uncheck what it
   should not touch. What you see is what you get: unchecked rows are passed
   as `--no-X`, so they stay off even if your global `~/.ai-jail` enables them.
+- **Your answers come back next time.** The checklist remembers what you
+  chose for each checkout, so the next launch shows the same marks and Enter
+  is enough. Each pre-checked row says why it is recommended (`found on this
+  machine`, `origin pushes over SSH`), and the header says when your answers
+  were saved and what changed since (`new: …`, `no longer offered: …`). Type
+  `reset` to go back to the recommended marks. The answers are stored in
+  ai-memory's data directory, never in your repository.
+- **Letting the agent read a sibling project.** Press `f` in the checklist to
+  pick extra folders. The picker starts in the folder above your checkout:
+  type to filter, Space to select (read-only), Ctrl+W to make the selected one
+  read-write, Tab or → to open a folder, ← to go up, Enter when done. From the
+  command line, `ai-memory run --jail --jail-map ../ai-jail claude` mounts a
+  folder read-only and `--jail-rw-map DIR` read-write; both repeat. Your home,
+  `/`, credential folders (`~/.ssh`, `~/.aws`, `~/.config/gh`, …) and
+  ai-memory's own data directory are refused, and the error says why. Edits
+  the agent makes in a read-write sibling are captured under the current
+  project, because capture follows the session. This needs ai-jail 2.15.
+- **The same choices next time.** When the jailed session ends, ai-memory
+  prints the `ai-memory run …` line that repeats your choices, `--jail=…`
+  list, folders and harness included. Paste it, or keep it as an alias, to
+  skip the questions. Switching harness from the post-run menu keeps the same
+  jail and options.
 - **Skipping the questions.** `ai-memory run --jail claude` re-runs inside
   ai-jail straight away, turning on those pre-marked defaults and leaving
   everything else to your own ai-jail config. This works with or without

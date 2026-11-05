@@ -491,6 +491,14 @@ pub struct RunArgs {
     /// `--yolo` warning itself still shows).
     #[arg(long)]
     pub no_jail: bool,
+    /// Mount this folder read-only inside ai-jail (repeatable), e.g. a
+    /// sibling project to study. Refuses your home, credential folders and
+    /// ai-memory's data dir. Needs a jailed run; ignored inside ai-jail.
+    #[arg(long = "jail-map", value_name = "DIR")]
+    pub jail_map: Vec<PathBuf>,
+    /// Like `--jail-map`, but read-write, so the agent can change it.
+    #[arg(long = "jail-rw-map", value_name = "DIR")]
+    pub jail_rw_map: Vec<PathBuf>,
     /// Start a new native session in the selected workstream instead of
     /// resuming or adopting an existing harness session.
     #[arg(long)]
