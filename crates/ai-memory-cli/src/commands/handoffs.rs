@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::HandoffsArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -92,13 +93,21 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
             i18n.diagnostic(&format!(
                 "  {}  from {} -> {}",
                 i18n.age(now_ms.saturating_sub(h.created_at_ms) / 1_000),
-                h.from_agent,
-                target
+                terminal_text(&h.from_agent),
+                terminal_text(target)
             ))
         );
-        let _ = writeln!(out, "{}", i18n.diagnostic(&format!("    id: {}", h.id)));
+        let _ = writeln!(
+            out,
+            "{}",
+            i18n.diagnostic(&format!("    id: {}", terminal_text(&h.id)))
+        );
         if let Some(cwd) = h.cwd.as_deref() {
-            let _ = writeln!(out, "{}", i18n.diagnostic(&format!("    cwd: {cwd}")));
+            let _ = writeln!(
+                out,
+                "{}",
+                i18n.diagnostic(&format!("    cwd: {}", terminal_text(cwd)))
+            );
         }
     }
     let _ = writeln!(

@@ -10,6 +10,7 @@ use std::io::{self, BufRead, Write};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::{
     UserAddHumanArgs, UserArgs, UserCommand, UserDisableArgs, UserEnableArgs, UserListArgs,
     UserPatchArgs, UserResetPasswordArgs,
@@ -146,20 +147,20 @@ async fn list(ep: &ServerEndpoint, args: UserListArgs) -> Result<()> {
 fn write_users(users: &[UserRow], out: &mut impl Write) -> Result<()> {
     let user_w = users
         .iter()
-        .map(|u| unicode_width::UnicodeWidthStr::width(u.username.as_str()))
+        .map(|u| unicode_width::UnicodeWidthStr::width(terminal_text(&u.username).as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
     let name_w = users
         .iter()
         .filter_map(|u| u.name.as_deref())
-        .map(unicode_width::UnicodeWidthStr::width)
+        .map(|name| unicode_width::UnicodeWidthStr::width(terminal_text(name).as_str()))
         .max()
         .unwrap_or(4)
         .max(4);
     let role_w = users
         .iter()
-        .map(|u| unicode_width::UnicodeWidthStr::width(u.role.as_str()))
+        .map(|u| unicode_width::UnicodeWidthStr::width(terminal_text(&u.role).as_str()))
         .max()
         .unwrap_or(4)
         .max(4);
@@ -175,9 +176,9 @@ fn write_users(users: &[UserRow], out: &mut impl Write) -> Result<()> {
         writeln!(
             out,
             "{}  {}  {}  {:<12}",
-            pad_cell(&u.username, user_w),
-            pad_cell(u.name.as_deref().unwrap_or("-"), name_w),
-            pad_cell(&u.role, role_w),
+            pad_cell(&terminal_text(&u.username), user_w),
+            pad_cell(&terminal_text(u.name.as_deref().unwrap_or("-")), name_w),
+            pad_cell(&terminal_text(&u.role), role_w),
             u.status()
         )?;
     }
@@ -282,7 +283,10 @@ async fn patch(ep: &ServerEndpoint, args: UserPatchArgs) -> Result<()> {
             i18n.format(
                 "cli-user-updated-user",
                 &[
-                    ("value0", display_username(&resp.user.username).to_string()),
+                    (
+                        "value0",
+                        terminal_text(display_username(&resp.user.username))
+                    ),
                     ("value1", resp.user.status().to_string())
                 ]
             )
@@ -324,7 +328,7 @@ fn print_temp_password(
                 "cli-user-verb-user",
                 &[
                     ("value0", verb.to_string()),
-                    ("value1", resp.user.username.to_string())
+                    ("value1", terminal_text(&resp.user.username))
                 ]
             )
         );
@@ -332,20 +336,20 @@ fn print_temp_password(
             let _ = writeln!(
                 stderr,
                 "{}",
-                i18n.format("cli-user-name-name", &[("value0", name.to_string())])
+                i18n.format("cli-user-name-name", &[("value0", terminal_text(name))])
             );
         }
         if let Some(email) = &resp.user.email {
             let _ = writeln!(
                 stderr,
                 "{}",
-                i18n.format("cli-user-email-email", &[("value0", email.to_string())])
+                i18n.format("cli-user-email-email", &[("value0", terminal_text(email))])
             );
         }
         let _ = writeln!(
             stderr,
-            "{}", i18n.format("cli-user-role-store-this-temporary-password-now-it-will-not-be-shown-again-the-user-m", &[("value0", resp.user.role.to_string())]));
-        println!("{}", resp.temporary_password);
+            "{}", i18n.format("cli-user-role-store-this-temporary-password-now-it-will-not-be-shown-again-the-user-m", &[("value0", terminal_text(&resp.user.role))]));
+        println!("{}", terminal_text(&resp.temporary_password));
     }
     Ok(())
 }

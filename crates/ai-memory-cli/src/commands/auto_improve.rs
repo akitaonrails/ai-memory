@@ -4,6 +4,7 @@ use ai_memory_store::SkippedProposal;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::AutoImproveArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -113,33 +114,35 @@ fn render_human(i18n: &ai_memory_core::i18n::Localizer, response: &StageResponse
     if response.approval_required {
         lines.push(i18n.format(
             "cli-auto-improve-staged-auto-improve-run-for-manual-approval",
-            &[("value0", response.run_id.to_string())],
+            &[("value0", terminal_text(&response.run_id))],
         ));
     } else {
         lines.push(i18n.format(
             "cli-auto-improve-auto-approved-auto-improve-run",
-            &[("value0", response.run_id.to_string())],
+            &[("value0", terminal_text(&response.run_id))],
         ));
     }
     lines.push(i18n.format(
         "cli-auto-improve-approval-policy",
-        &[("value0", response.approval_policy.to_string())],
+        &[("value0", terminal_text(&response.approval_policy))],
     ));
     for proposal in &response.proposals {
         if let Some(page_id) = &proposal.page_id {
             lines.push(i18n.format(
                 "cli-auto-improve-page",
                 &[
-                    ("value0", proposal.id.to_string()),
-                    ("value1", proposal.status.to_string()),
-                    ("value2", page_id.to_string()),
-                    ("value3", proposal.sidecar_path.to_string()),
+                    ("value0", terminal_text(&proposal.id)),
+                    ("value1", terminal_text(&proposal.status)),
+                    ("value2", terminal_text(page_id)),
+                    ("value3", terminal_text(&proposal.sidecar_path)),
                 ],
             ));
         } else {
             lines.push(format!(
                 "  - {} [{}] ({})",
-                proposal.id, proposal.status, proposal.sidecar_path
+                terminal_text(&proposal.id),
+                terminal_text(&proposal.status),
+                terminal_text(&proposal.sidecar_path)
             ));
         }
     }

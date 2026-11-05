@@ -18,6 +18,7 @@ use ai_memory_consolidate::{
 use anyhow::{Context, Result};
 use tracing::info;
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::BootstrapArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -239,7 +240,7 @@ fn print_human_report(
             "{}",
             i18n.format(
                 "cli-move-project-ai-memory-warning-warning",
-                &[("value0", warning.to_string())]
+                &[("value0", terminal_text(warning))]
             )
         );
     }
@@ -356,14 +357,14 @@ fn print_human_report(
             )
         );
         for p in &outcome.pages_written {
-            println!("  - {p}");
+            println!("  - {}", terminal_text(p));
         }
         if !outcome.rationale.is_empty() {
             println!(
                 "{}",
                 i18n.format(
                     "cli-bootstrap-rationale",
-                    &[("value0", outcome.rationale.to_string())]
+                    &[("value0", terminal_body(&outcome.rationale))]
                 )
             );
         }

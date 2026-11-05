@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::RestorePageArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -77,13 +78,13 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
         i18n.format(
             "cli-restore-page-restored-under-from-page-id",
             &[
-                ("value0", resp.path.to_string()),
+                ("value0", terminal_text(&resp.path)),
                 ("value1", workspace.to_string()),
                 ("value2", project.to_string()),
-                ("value3", resp.restored_from.to_string()),
+                ("value3", terminal_text(&resp.restored_from)),
                 (
                     "value4",
-                    super::write_page::short_page_id(&resp.page_id).to_string()
+                    terminal_text(super::write_page::short_page_id(&resp.page_id))
                 )
             ]
         )
@@ -93,7 +94,7 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-restore-page-pre-restore-checkpoint-pre",
-                &[("value0", pre.to_string())]
+                &[("value0", terminal_text(&pre))]
             )
         );
     }
@@ -102,7 +103,7 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-restore-page-restore-checkpoint-cp",
-                &[("value0", cp.to_string())]
+                &[("value0", terminal_text(&cp))]
             )
         );
     }

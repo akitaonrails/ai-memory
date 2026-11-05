@@ -82,10 +82,16 @@ pub(crate) fn localize_failure(error: anyhow::Error, language: Language) -> anyh
 
 /// The text `main` prints for a failed run, matching Rust's own `Error: {:?}`
 /// for anything that was not rendered above.
+///
+/// An error chain can quote server text that never passed a renderer: a
+/// decode error names the unknown enum variant or field it was sent, and a
+/// `bail!` can interpolate a response field. This is the one place every
+/// failure leaves the process, so terminal controls are neutralized here.
 pub fn failure_report(error: &anyhow::Error) -> String {
-    error
+    let report = error
         .downcast_ref::<RenderedFailure>()
-        .map_or_else(|| format!("Error: {error:?}"), ToString::to_string)
+        .map_or_else(|| format!("Error: {error:?}"), ToString::to_string);
+    crate::commands::show::terminal_body(&report)
 }
 
 pub(crate) fn command(mut command: clap::Command, path: &str, i18n: &Localizer) -> clap::Command {
@@ -294,6 +300,26 @@ mod tests {
             report,
             "Erro: lendo /tmp/x\n\nCausado por:\n    permission denied"
         );
+    }
+
+    #[test]
+    fn failure_report_neutralizes_terminal_controls_in_every_language() {
+        let failure = || {
+            anyhow::anyhow!("unknown variant `x\u{1b}]52;c;cHduZWQ=\u{7}`")
+                .context("decoding caf\u{e9} \u{202e}reply")
+        };
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let report = failure_report(&localize_failure(failure(), language));
+            assert!(
+                !report.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+                "terminal control survived: {report:?}"
+            );
+            // Control: the text stays readable, accents and the multi-line
+            // cause layout included.
+            assert!(report.contains("x?]52;c;cHduZWQ=?"), "{report:?}");
+            assert!(report.contains("caf\u{e9} ?reply"), "{report:?}");
+            assert!(report.contains('\n'), "{report:?}");
+        }
     }
 
     /// Catches a new English error or status line that never reached the

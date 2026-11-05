@@ -4,6 +4,7 @@ use ai_memory_llm::{ChatRequest, LlmError, ProviderChoice, ProviderConfig, build
 use anyhow::{Context, Result};
 use tracing::info;
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::{LlmProviderChoice, LlmTestArgs};
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -84,7 +85,10 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
 
     println!(
         "{}",
-        i18n.format("cli-llm-test-model", &[("value0", resp.model.to_string())])
+        i18n.format(
+            "cli-llm-test-model",
+            &[("value0", terminal_text(&resp.model))]
+        )
     );
     if let Some(u) = resp.usage {
         println!(
@@ -98,7 +102,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
             )
         );
     }
-    println!("{}", resp.text);
+    println!("{}", terminal_body(&resp.text));
     Ok(())
 }
 
@@ -109,9 +113,12 @@ tokens with this 429 for any client that is not Claude Code; it is not a real \
 rate limit. Use `--provider anthropic` with an API key or an OpenAI-compatible \
 gateway (see docs/llm-providers.md).";
 
-fn with_oauth_hint(provider: ProviderChoice, err: LlmError) -> anyhow::Error {
+fn with_oauth_hint(provider: ProviderChoice, mut err: LlmError) -> anyhow::Error {
     let is_oauth_429 = provider == ProviderChoice::AnthropicOAuth
         && matches!(err, LlmError::Provider { status: 429, .. });
+    if let LlmError::Provider { body, .. } = &mut err {
+        *body = terminal_body(body);
+    }
     let err = anyhow::Error::new(err);
     if is_oauth_429 {
         err.context(ANTHROPIC_OAUTH_429_HINT)
@@ -162,8 +169,8 @@ async fn run_against_server(config: &Config) -> Result<()> {
         i18n.format(
             "cli-llm-test-server-provider-provider-model-latency-ms",
             &[
-                ("value0", provider.to_string()),
-                ("value1", model.to_string()),
+                ("value0", terminal_text(provider)),
+                ("value1", terminal_text(model)),
                 ("value2", format!("{}", latency))
             ]
         )

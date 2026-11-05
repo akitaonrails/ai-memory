@@ -5,6 +5,7 @@ use ai_memory_store::SkippedProposal;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::AutoImproveReportArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -78,10 +79,16 @@ pub async fn run(config: &Config, args: AutoImproveReportArgs) -> Result<()> {
 fn render_stage_human(response: &AutoImproveReportStageResponse, project: &str) -> String {
     let mut lines = vec![
         format!("\nStaged auto-improve telemetry report for {project}\n"),
-        format!("Run: {}", response.run_id),
-        format!("Proposals: {}", response.proposal_ids.join(", ")),
-        format!("Sidecars: {}", response.sidecar_paths.join(", ")),
-        format!("Summary: {}", response.report.summary),
+        format!("Run: {}", terminal_text(&response.run_id)),
+        format!(
+            "Proposals: {}",
+            terminal_text(&response.proposal_ids.join(", "))
+        ),
+        format!(
+            "Sidecars: {}",
+            terminal_text(&response.sidecar_paths.join(", "))
+        ),
+        format!("Summary: {}", terminal_body(&response.report.summary)),
     ];
     lines.extend(super::skipped_proposal_lines(&response.skipped));
     lines.join("\n")
@@ -103,7 +110,7 @@ fn print_human_report(
         "{}",
         i18n.format(
             "cli-auto-improve-report-summary",
-            &[("value0", report.summary.to_string())]
+            &[("value0", terminal_body(&report.summary))]
         )
     );
     println!(
@@ -154,7 +161,7 @@ fn print_human_report(
     if !report.aggregate.top_targets.is_empty() {
         println!("{}", i18n.text("cli-auto-improve-report-top-targets"));
         for row in report.aggregate.top_targets.iter().take(10) {
-            println!("  - {}: {}", row.key, row.count);
+            println!("  - {}: {}", terminal_text(&row.key), row.count);
         }
     }
 
@@ -168,7 +175,9 @@ fn print_human_report(
     for finding in report.findings.iter().take(10) {
         println!(
             "  - {} [{}]: {}",
-            finding.kind, finding.severity, finding.message
+            terminal_text(&finding.kind),
+            terminal_text(&finding.severity),
+            terminal_body(&finding.message)
         );
     }
     if report.findings.len() > 10 {

@@ -10,6 +10,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::DeletePageArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -70,7 +71,7 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
             "cli-delete-page-under",
             &[
                 ("value0", status.to_string()),
-                ("value1", resp.path.to_string()),
+                ("value1", terminal_text(&resp.path)),
                 ("value2", workspace.to_string()),
                 ("value3", project.to_string())
             ]

@@ -67,6 +67,10 @@ version in [`docs/changelog/`](docs/changelog/):
   restorable. A version without `session_id` cannot be distinguished from a
   legacy summary: it restores while a live manual page holds the path, and
   is refused when no live replacement exists (#1989).
+- Sanitized server-provided text in human CLI output, including HTTP error
+  messages and the error report a failed command prints on exit. Terminal
+  controls and Unicode direction and line controls now display as `?`, while
+  JSON output, document line breaks and tabs are preserved (#1987).
 
 ## [3.4.1] - 2026-11-05
 
