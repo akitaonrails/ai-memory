@@ -748,9 +748,9 @@ Additional boundary rules:
   it) with what ai-memory models: `JAIL_TOGGLES`, `RESERVED_JAIL_FLAGS` and
   `build_ai_jail_invocation` in `crates/ai-memory-workstream/src/jail.rs`, the
   wrapper contract in `jail_contract.rs` (`ai-jail capabilities --json`, the
-  `--harness` names, request kinds, `status --json` blocker codes and exit
-  codes; the real-binary tests in `jail_requests.rs` run against the installed
-  one), the checklist notes, and `docs/design-yolo-safety-ai-jail.md`. Look for new flags
+  `--harness` names, which provider keys ai-jail forwards per harness, and the
+  `status --json` blocker codes; the real-binary tests in
+  `tests/suite/yolo_ai_jail.rs` run against the installed one), the checklist notes, and `docs/design-yolo-safety-ai-jail.md`. Look for new flags
   worth offering, changed defaults or semantics (2.15's `--github` also shares
   the keyring token), and flags ai-memory passes that changed or were removed.
   Adjust the integration in the same release, or say in the release notes which
