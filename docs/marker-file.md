@@ -653,6 +653,25 @@ subtracts an ignored path. An entry using glob
 syntax the matcher cannot evaluate (`[…]`, `{…}`, `(…)`, `!`) makes the call
 **metadata-only**.
 
+OMP's `read` and `write` can name a file through a suffix of `path`: a line
+selector (`notes.txt:450-455`, `:-5`, `:raw`), an archive member
+(`vault.zip:notes/a.md`), a SQLite table or row (`app.db:users:42`), an
+executable view (`bin:main`), a video time or a query (`data.json?q=.items`).
+OMP reads the file of the full name when one exists and otherwise the part
+before the suffix, so ai-memory also matches every part of the path before a
+`:` or `?`: `secrets.env:1-20` and `key.pem:1-40` drop under `secrets.env` and
+`*.pem` like the bare names, and `vault.zip:notes/a.md` drops under
+`vault.zip`. A Windows drive or device prefix (`C:`, `\\?\`) ends no part, and
+a path with more than 32 parts is **metadata-only**.
+
+Both harnesses also rewrite a file-tool path before opening it, and ai-memory
+matches the rewritten path as well. OMP's `read`, `write` and `edit` drop a
+stray leading `:` before a path (`:/repo/secrets.env`, `:./key.pem`) and a
+leading `@` before an absolute path or `~` (`@/repo/secrets.env`). Pi's drop
+any leading `@` (`@secrets.env`). Both read a `file://` URL as the path it
+names. In the generated extension a path that starts with `:` is
+**metadata-only**, since the extension cannot place it.
+
 Recognized shell tools (`Bash`, `PowerShell`, `shell`, `exec`, `execute_bash`,
 `terminal`, Gemini CLI's `run_shell_command`, …) have no path field, so the command line is split into words lexically, the way
 a POSIX shell quotes and separates them, without expanding or running anything.
@@ -889,6 +908,12 @@ can be mentioned.
 - a value glued to a short flag is read after the flag's first letter only,
   not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
   are not decoded;
+- OMP and Pi resolve a file-tool path in ways the matcher does not follow:
+  both expand `~` and normalize Unicode spaces before opening it, Pi on
+  Windows reads a Git Bash `/c/x` as `C:\x`, and OMP splits a `read` path
+  that names no file at commas, semicolons or whitespace into several files,
+  so `ignore_paths` sees only the path as spelled, its parts before a `:` or
+  `?`, and the `:`, `@` and `file://` rewrites above;
 - in a Windows session a shell tool's `workdir` spelled `/c/x` is read only
   as Git Bash reads it (`C:\x`), so arguments resolved from it miss a native
   tool's reading (`D:\c\x` from a `cwd` on `D:`); a file-tool path or shell

@@ -74,6 +74,21 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed shell hooks injecting redirect and error response bodies as handoff
   or brief context. Only 2xx responses now supply context, with the response
   body preserved across all three authentication modes (#1986).
+- An OMP ranged read of a file that `[capture] ignore_paths` excludes, such
+  as `secrets.env:1-20`, is now dropped like the bare name. OMP's `read`
+  takes its line selector in `path`, and its `read` and `write` name archive
+  members and SQLite tables the same way (`vault.zip:notes/a.md`,
+  `app.db:users:42`), but capture matched the path as spelled, so an
+  exact-file or extension pattern missed it and the generated OMP extension
+  posted the content. The capture policy and the extension now also match
+  every part of an OMP `read` or `write` path before a `:` or `?`, and the
+  opt-in file index keys such a call by the file OMP reads (`src/app.ts` for
+  `src/app.ts:5-9`). OMP and Pi file-tool paths that the harness rewrites
+  before opening are matched as rewritten too: a stray leading `:` (OMP), a
+  leading `@` and a `file://` URL, so `@secrets.env` in Pi or
+  `@/repo/secrets.env` in OMP no longer slips past the exclusion. Run
+  `ai-memory upgrade`, or re-run `install-hooks --agent omp --apply` (or
+  `--agent pi`), to regenerate the extension (#1990).
 
 ## [3.4.1] - 2026-11-05
 
