@@ -437,4 +437,38 @@ mod tests {
         assert!(message.contains("Argumento desconhecido"), "{message}");
         assert!(message.contains("--not-a-flag"));
     }
+
+    /// `handoffs --expire-all` confirms the sweep by printing the server's
+    /// count. The line is built with `format!` and translated at the print
+    /// boundary, so the singular and the plural shapes must each be in the
+    /// catalog — a lone plural entry would leave "1 open handoff" in English.
+    #[test]
+    fn handoff_expire_reports_are_translated() {
+        let i18n = Localizer::new(Language::PortugueseBrazil);
+        let tail = "The rows are kept and remain visible in the audit log; they are no longer \
+                    offered to an agent.";
+
+        let none = i18n.diagnostic("No open handoffs to expire in default/x.");
+        assert!(
+            none.contains("Nenhum handoff aberto para expirar em default/x."),
+            "{none}"
+        );
+
+        let one = i18n.diagnostic(&format!("Expired 1 open handoff in default/x. {tail}"));
+        assert!(
+            one.starts_with("1 handoff aberto expirou em default/x."),
+            "{one}"
+        );
+        assert!(one.contains("log de auditoria"), "{one}");
+
+        let many = i18n.diagnostic(&format!("Expired 3 open handoffs in default/x. {tail}"));
+        assert!(
+            many.starts_with("3 handoffs abertos expiraram em default/x."),
+            "{many}"
+        );
+
+        let english = Localizer::new(Language::English);
+        let line = format!("Expired 3 open handoffs in default/x. {tail}");
+        assert_eq!(english.diagnostic(&line), line);
+    }
 }

@@ -12,6 +12,8 @@ use std::fmt::Write as _;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use ai_memory_core::i18n::Localizer;
+
 use super::show::terminal_text;
 use crate::cli::HandoffsArgs;
 use crate::config::Config;
@@ -43,7 +45,7 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
 
     if args.expire_all {
-        return expire(&endpoint, &workspace, &project, &args).await;
+        return expire(&endpoint, i18n, &workspace, &project, &args).await;
     }
 
     let response: OpenHandoffsResponse = get_json(
@@ -155,6 +157,7 @@ struct ExpireRequest<'a> {
 /// Clear the open handoff backlog for one scope.
 async fn expire(
     endpoint: &ServerEndpoint,
+    i18n: &Localizer,
     workspace: &str,
     project: &str,
     args: &HandoffsArgs,
@@ -187,15 +190,20 @@ async fn expire(
     .await?;
 
     let expired = report["expired"].as_u64().unwrap_or(0);
-    if expired == 0 {
-        println!("No open handoffs to expire in {workspace}/{project}.");
+    let (workspace, project) = (terminal_text(workspace), terminal_text(project));
+    let line = if expired == 0 {
+        format!("No open handoffs to expire in {workspace}/{project}.")
+    } else if expired == 1 {
+        format!(
+            "Expired {expired} open handoff in {workspace}/{project}. The rows are kept and \
+             remain visible in the audit log; they are no longer offered to an agent."
+        )
     } else {
-        println!(
-            "Expired {expired} open handoff{} in {workspace}/{project}. \
-             The rows are kept and remain visible in the audit log; they are \
-             no longer offered to an agent.",
-            if expired == 1 { "" } else { "s" }
-        );
-    }
+        format!(
+            "Expired {expired} open handoffs in {workspace}/{project}. The rows are kept and \
+             remain visible in the audit log; they are no longer offered to an agent."
+        )
+    };
+    println!("{}", i18n.diagnostic(&line));
     Ok(())
 }
