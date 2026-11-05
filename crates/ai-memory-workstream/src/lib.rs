@@ -2,6 +2,7 @@
 
 mod harness;
 mod jail;
+mod jail_contract;
 mod repository;
 mod transcript;
 
@@ -20,6 +21,13 @@ pub use jail::{
     build_ai_jail_invocation, checked_choices, checklist_reason, current_jail_os, inside_ai_jail,
     inside_ai_jail_here, jail_checklist, jail_spec, jail_toggle, marked_choices,
     parse_jail_toggles, usable_ai_jail, usable_ai_jail_here,
+};
+pub use jail_contract::{
+    JailContract, JailPreflight, JailRefusal, JailRequest, JailStatus, ServerReach,
+    ai_jail_contract, ai_jail_harness_name, contract_configure_invocation, contract_flags,
+    contract_invocation, contract_requests, contract_status_invocation,
+    exit_code as jail_exit_code, parse_capabilities, parse_status, preflight as jail_preflight,
+    request_manifest, server_reach,
 };
 pub use repository::{
     RepositoryFingerprints, RepositoryIdentity, inspect_repository, inspect_repository_fingerprints,

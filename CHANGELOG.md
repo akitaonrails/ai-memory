@@ -13,6 +13,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory run --jail` no longer shows two access checklists with ai-jail
+  3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
+  flags such as `--jail-map` no longer hide it. It lists what the session
+  needs, the harness's login state and the variables it forwards, in a
+  request file kept in ai-memory's data directory, and ai-jail's own review
+  approves them. A memory server on the same machine is reached through one
+  forwarded port instead of the full network. Before launching, ai-memory
+  asks ai-jail whether a review is pending, runs it in a terminal or prints
+  the `ai-jail configure` command without one, and stops with ai-jail's
+  reason when saved access no longer matches the machine. ai-memory's own
+  screen keeps only the extra folders. Older ai-jail releases, and Copilot
+  and Command Code, keep the previous launch (#2020).
+
 - A project name no longer turns ambiguous because an empty leftover project
   holds it literally. When a remote-derived name such as `acme-api` matches
   both the project that owns that repository and an empty project created
