@@ -144,7 +144,10 @@ pages land at `imported/claude-mem/<type>/<id>.md`; summaries use
 `refactor`, and `discovery`. Unknown types are skipped and counted without
 reading their bodies. `security_note` retains that source path and maps to the
 `gotcha` kind; the five change/discovery types map to `fact` while retaining
-their source type in the path.
+their source type in the path. claude-mem stores an observation's facts and
+file lists, and a summary's file lists, as JSON arrays; each becomes a bullet
+list, file paths in code spans, and an empty list adds no section. A value
+that is not such an array is kept as written.
 
 The importer opens the source read-only and uses SQLite's backup API to take a
 WAL-consistent private snapshot before inspection. It refuses a symlink or a
