@@ -1450,8 +1450,10 @@ nothing:
    the project id, so its sessions, observations and pages follow.
 
 On a terminal, `ai-memory run` explains this and offers to do both renames
-(default yes), then starts the session again. Off a terminal it stops before
-the agent starts and prints the two `ai-memory rename-project --project-id`
+(default yes), then starts the session again. Closing the prompt's input
+without an answer cancels the repair; pressing Enter accepts the default.
+Off a terminal it stops before the agent starts and prints the two
+`ai-memory rename-project --project-id`
 commands. When the remote-derived project already holds sessions or pages,
 nothing is renamed automatically, because either rename would leave one half
 under an unexpected name. Compare the two projects first

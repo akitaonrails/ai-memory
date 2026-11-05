@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Cancelled the project-split repair when the confirmation input reaches EOF
+  without an answer, so closing the prompt does not rename either project.
+  Pressing Enter still accepts the default (#1993).
+
 ## [3.4.1] - 2026-11-05
 
 ### Fixed
