@@ -19,7 +19,7 @@ version in [`docs/changelog/`](docs/changelog/):
   and disk unchanged. A live current manual page at the same path remains
   restorable. A version without `session_id` cannot be distinguished from a
   legacy summary: it restores while a live manual page holds the path, and
-  is refused when no live replacement exists. (#701)
+  is refused when no live replacement exists (#1989).
 
 ## [3.4.1] - 2026-11-05
 
