@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Sanitized server-provided text in human CLI output, including HTTP error
+  messages. Terminal controls and Unicode direction and line controls now
+  display as `?`, while JSON output, document line breaks and tabs are preserved.
+
 ## [3.4.1] - 2026-11-05
 
 ### Fixed

@@ -566,11 +566,13 @@ pub(crate) fn skipped_proposal_lines(skipped: &[ai_memory_store::SkippedProposal
     }
     let mut lines = Vec::with_capacity(skipped.len() + 1);
     lines.push(format!("Skipped {} proposal(s):", skipped.len()));
-    lines.extend(
-        skipped
-            .iter()
-            .map(|s| format!("  - {}: {}", s.target_path, s.reason)),
-    );
+    lines.extend(skipped.iter().map(|s| {
+        format!(
+            "  - {}: {}",
+            show::terminal_text(&s.target_path),
+            show::terminal_text(&s.reason)
+        )
+    }));
     lines
 }
 

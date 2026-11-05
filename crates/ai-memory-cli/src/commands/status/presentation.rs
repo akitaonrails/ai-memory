@@ -1,5 +1,6 @@
 //! Human report formatting; every diagnostic field and remedy is retained.
 
+use super::super::show::terminal_text;
 use super::*;
 
 pub(super) struct View<'a> {
@@ -30,8 +31,11 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
         windows_logon,
     } = view;
     terminal.header(&i18n.text("cli-presentation-status-memory-capture"));
-    terminal.line(format_args!("ai-memory {} (server)", report.version));
-    for line in client_version_lines(i18n, &report.version, CLIENT_VERSION) {
+    terminal.line(format_args!(
+        "ai-memory {} (server)",
+        terminal_text(&report.version)
+    ));
+    for line in client_version_lines(i18n, &terminal_text(&report.version), CLIENT_VERSION) {
         terminal.line(format_args!("{line}"));
     }
     terminal.section(&i18n.text("cli-presentation-connection"));
@@ -43,21 +47,21 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
         "{}",
         i18n.format(
             "cli-presentation-data-dir",
-            &[("value0", report.data_dir.to_string())]
+            &[("value0", terminal_text(&report.data_dir))]
         )
     ));
     terminal.line(format_args!(
         "{}",
         i18n.format(
             "cli-presentation-db",
-            &[("value0", report.db_path.to_string())]
+            &[("value0", terminal_text(&report.db_path))]
         )
     ));
     terminal.line(format_args!(
         "{}",
         i18n.format(
             "cli-presentation-bind",
-            &[("value0", report.bind.to_string())]
+            &[("value0", terminal_text(&report.bind))]
         )
     ));
     terminal.line(format_args!(
@@ -142,8 +146,8 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
             i18n.format(
                 "cli-presentation-dim-rows",
                 &[
-                    ("value0", triple.provider.to_string()),
-                    ("value1", triple.model.to_string()),
+                    ("value0", terminal_text(&triple.provider)),
+                    ("value1", terminal_text(&triple.model)),
                     ("value2", format!("{}", triple.dim)),
                     ("value3", format!("{}", triple.count))
                 ]
@@ -246,7 +250,7 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
             .derived
             .typed_links_from_latest_pages
             .iter()
-            .map(|(k, v)| format!("{k}: {v}"))
+            .map(|(k, v)| format!("{}: {v}", terminal_text(k)))
             .collect();
         terminal.line(format_args!(
             "{}",
@@ -269,7 +273,7 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
                     "cli-presentation-wiki-format-migrated-pre-migration-backup-still-on-disk-path",
                     &[
                         ("value0", migrated.to_string()),
-                        ("value1", path.to_string()),
+                        ("value1", terminal_text(path)),
                         (
                             "value2",
                             super::super::compact::human_bytes(bytes).to_string()
@@ -451,7 +455,7 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
             "{}",
             i18n.format(
                 "cli-presentation-retry-hint",
-                &[("value0", hint.to_string())]
+                &[("value0", terminal_text(hint))]
             )
         ));
     }
@@ -481,7 +485,14 @@ fn task_chain_lines(
             "cli-presentation-llm-task",
             &[
                 ("value0", chain.task.config_key().to_owned()),
-                ("value1", format!("{}/{}", chain.provider, chain.model)),
+                (
+                    "value1",
+                    format!(
+                        "{}/{}",
+                        terminal_text(&chain.provider),
+                        terminal_text(&chain.model)
+                    ),
+                ),
                 ("value2", i18n.status(chain.status.as_str())),
             ],
         ));

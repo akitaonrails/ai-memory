@@ -3,6 +3,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::CommitArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -46,7 +47,7 @@ pub async fn run(config: &Config, args: CommitArgs) -> Result<()> {
                 "cli-commit-committed",
                 &[(
                     "value0",
-                    resp.oid.as_deref().unwrap_or("(unknown)").to_string()
+                    terminal_text(resp.oid.as_deref().unwrap_or("(unknown)"))
                 )]
             )
         );
@@ -59,7 +60,7 @@ pub async fn run(config: &Config, args: CommitArgs) -> Result<()> {
                     "value0",
                     resp.reason
                         .as_deref()
-                        .map(|r| format!(" ({r})"))
+                        .map(|r| format!(" ({})", terminal_text(r)))
                         .unwrap_or_default()
                         .to_string()
                 )]

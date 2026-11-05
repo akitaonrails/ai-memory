@@ -4,6 +4,7 @@ use ai_memory_core::{RenameManagedWorkstreamRequest, RenamedManagedWorkstream};
 use ai_memory_workstream::inspect_repository;
 use anyhow::{Context as _, Result, bail};
 
+use super::show::terminal_text;
 use crate::cli::RenameWorkstreamArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -64,14 +65,14 @@ fn render_human(
         // would be a lie: nothing was written.
         return i18n.format(
             "cli-rename-workstream-workstream-already-has-that-name",
-            &[("value0", renamed.to.to_string())],
+            &[("value0", terminal_text(&renamed.to))],
         );
     }
     i18n.format(
         "cli-rename-workstream-renamed-workstream-to-id",
         &[
-            ("value0", renamed.from.to_string()),
-            ("value1", renamed.to.to_string()),
+            ("value0", terminal_text(&renamed.from)),
+            ("value1", terminal_text(&renamed.to)),
             ("value2", format!("{}", renamed.workstream_id)),
         ],
     )

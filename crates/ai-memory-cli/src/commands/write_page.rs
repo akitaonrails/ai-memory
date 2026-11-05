@@ -9,6 +9,7 @@ use std::io::Read;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::WritePageArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -99,7 +100,7 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-move-project-ai-memory-warning-warning",
-                &[("value0", warning.to_string())]
+                &[("value0", terminal_text(warning))]
             )
         );
     }
@@ -108,8 +109,8 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
         i18n.format(
             "cli-write-page-wrote-page-id-under",
             &[
-                ("value0", resp.path.to_string()),
-                ("value1", short_page_id(&resp.page_id).to_string()),
+                ("value0", terminal_text(&resp.path)),
+                ("value1", terminal_text(short_page_id(&resp.page_id))),
                 ("value2", workspace.to_string()),
                 ("value3", project.to_string())
             ]

@@ -10,6 +10,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::RecentArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -78,14 +79,22 @@ fn render_text(
             (Some(workspace), Some(project)) => {
                 writeln!(
                     out,
-                    "  {workspace}/{project}  {}  {}{age}",
-                    hit.path, hit.updated_at
+                    "  {}/{}  {}  {}{age}",
+                    terminal_text(workspace),
+                    terminal_text(project),
+                    terminal_text(&hit.path),
+                    terminal_text(&hit.updated_at)
                 )
             }
-            _ => writeln!(out, "  {}  {}{age}", hit.path, hit.updated_at),
+            _ => writeln!(
+                out,
+                "  {}  {}{age}",
+                terminal_text(&hit.path),
+                terminal_text(&hit.updated_at)
+            ),
         };
-        let _ = writeln!(out, "    {}", hit.title);
-        let _ = writeln!(out, "    {}", hit.snippet);
+        let _ = writeln!(out, "    {}", terminal_text(&hit.title));
+        let _ = writeln!(out, "    {}", terminal_body(&hit.snippet));
     }
     out
 }

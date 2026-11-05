@@ -3,6 +3,7 @@
 use ai_memory_core::{NativeSessionIdentity, Sanitizer, WorkstreamEvent};
 use anyhow::Result;
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::WorkstreamSearchArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -44,7 +45,7 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
                 &[
                     ("value0", format!("{}", event.sequence)),
                     ("value1", event.agent.as_str().to_string()),
-                    ("value2", role.to_string())
+                    ("value2", terminal_text(role))
                 ]
             )
         );
@@ -69,7 +70,7 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
                 )
             );
         }
-        println!("{}\n", event.content);
+        println!("{}\n", terminal_body(&event.content));
     }
     Ok(())
 }

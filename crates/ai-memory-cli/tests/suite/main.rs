@@ -46,6 +46,7 @@ mod server_profiles;
 mod service_host_windows;
 mod setup_e2e;
 mod shutdown_signals;
+mod terminal_rendering;
 mod upgrade_e2e;
 mod windows_plain_paths;
 mod workstream_provenance;

@@ -1,5 +1,6 @@
 //! Human report formatting; collection and diagnostic verdicts stay in the command.
 
+use super::super::show::terminal_text;
 use super::*;
 
 pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal) {
@@ -25,14 +26,10 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
                 &[
                     (
                         "value0",
-                        identity
-                            .operator
-                            .as_deref()
-                            .unwrap_or("anonymous")
-                            .to_string()
+                        terminal_text(identity.operator.as_deref().unwrap_or("anonymous"))
                     ),
-                    ("value1", identity.level.to_string()),
-                    ("value2", identity.version.to_string())
+                    ("value1", terminal_text(&identity.level)),
+                    ("value2", terminal_text(&identity.version))
                 ]
             )
         ));
@@ -132,7 +129,7 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
                 "cli-presentation-agent-row",
                 &[
                     ("value0", mark.to_string()),
-                    ("value1", format!("{:<14}", row.agent)),
+                    ("value1", format!("{:<14}", terminal_text(&row.agent))),
                     ("value2", format!("{:>4}", row.local_total)),
                     ("value3", format!("{}", row.local_recent)),
                     ("value4", format!("{:>11}", captured))

@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::apply_shared::{PrivateBackup, apply_atomic_with_backup, checkout_backup_stem};
+use super::show::{terminal_body, terminal_text};
 use crate::cli::{ProfileApplyArgs, ProfileArgs, ProfileCommand, ProfileScopeArgs};
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json, post_json};
@@ -88,7 +89,7 @@ async fn status(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
             i18n.format(
                 "cli-profile-profile-on-share-deployment-server",
                 &[
-                    ("value0", share.to_string()),
+                    ("value0", terminal_text(share)),
                     ("value1", deployment.to_string())
                 ]
             )
@@ -106,8 +107,8 @@ async fn status(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
         i18n.format(
             "cli-profile-enabled-share",
             &[
-                ("value0", s.enabled.to_string()),
-                ("value1", s.share.to_string())
+                ("value0", terminal_text(&s.enabled)),
+                ("value1", terminal_text(&s.share))
             ]
         )
     );
@@ -117,8 +118,8 @@ async fn status(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
             i18n.message(
                 "cli-profile-scope-entr-digest-of-bytes",
                 &[
-                    ("value0", (names.workspace.to_string()).into()),
-                    ("value1", (names.project.to_string()).into()),
+                    ("value0", (terminal_text(&names.workspace)).into()),
+                    ("value1", (terminal_text(&names.project)).into()),
                     ("value2", (format!("{}", s.entries)).into()),
                     ("value3", (s.entries).into()),
                     ("value4", (format!("{}", s.digest_bytes)).into()),
@@ -176,7 +177,11 @@ async fn status(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
             i18n.text("cli-profile-projects-that-opted-out-profile-contribute-false")
         );
         for p in &s.contribute_opt_outs {
-            println!("    {}/{}", p.workspace, p.project);
+            println!(
+                "    {}/{}",
+                terminal_text(&p.workspace),
+                terminal_text(&p.project)
+            );
         }
     }
     Ok(())
@@ -205,20 +210,24 @@ async fn list(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
         println!("{}", i18n.text("cli-profile-no-profile-entries-yet"));
         return Ok(());
     };
-    println!("{}/{}:", names.workspace, names.project);
+    println!(
+        "{}/{}:",
+        terminal_text(&names.workspace),
+        terminal_text(&names.project)
+    );
     for entry in &resp.entries {
         let applies = if entry.applies_to.is_empty() {
             String::new()
         } else {
-            format!(" [{}]", entry.applies_to.join(", "))
+            format!(" [{}]", terminal_text(&entry.applies_to.join(", ")))
         };
         let enforced = if entry.enforced_by {
             " (enforced elsewhere; not in the digest)"
         } else {
             ""
         };
-        println!("  {}{applies}{enforced}", entry.path);
-        println!("      {}", entry.statement);
+        println!("  {}{applies}{enforced}", terminal_text(&entry.path));
+        println!("      {}", terminal_text(&entry.statement));
     }
     Ok(())
 }
@@ -265,8 +274,13 @@ async fn show(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Resu
     )
     .await
     .with_context(|| format!("reading {path}"))?;
-    println!("# {} ({}/{})\n", page.path, names.workspace, names.project);
-    println!("{}", page.body);
+    println!(
+        "# {} ({}/{})\n",
+        terminal_text(&page.path),
+        terminal_text(&names.workspace),
+        terminal_text(&names.project)
+    );
+    println!("{}", terminal_body(&page.body));
     Ok(())
 }
 
@@ -296,7 +310,7 @@ async fn forget(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Re
             "{}",
             i18n.format(
                 "cli-profile-forgot-the-git-history-keeps-it",
-                &[("value0", resp.path.to_string())]
+                &[("value0", terminal_text(&resp.path))]
             )
         );
     } else {
@@ -304,7 +318,7 @@ async fn forget(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Re
             "{}",
             i18n.format(
                 "cli-profile-was-not-in-the-profile-nothing-changed",
-                &[("value0", resp.path.to_string())]
+                &[("value0", terminal_text(&resp.path))]
             )
         );
     }
@@ -359,7 +373,7 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
         i18n.message(
             "cli-profile-profile-share-entr",
             &[
-                ("value0", (share.to_string()).into()),
+                ("value0", (terminal_text(&share)).into()),
                 ("value1", (format!("{}", r.entries.len())).into()),
                 ("value2", (r.entries.len()).into())
             ]
@@ -374,15 +388,15 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
             facts.push(format!("confidence {c:.2}"));
         }
         if let Some(seen) = &entry.last_seen {
-            facts.push(format!("last seen {seen}"));
+            facts.push(format!("last seen {}", terminal_text(seen)));
         }
         facts.push(if entry.managed {
             "harvested".into()
         } else {
             "yours (never rewritten)".into()
         });
-        println!("  {}  [{}]", entry.path, facts.join(", "));
-        println!("      {}", entry.statement);
+        println!("  {}  [{}]", terminal_text(&entry.path), facts.join(", "));
+        println!("      {}", terminal_text(&entry.statement));
         if let Some(items) = entry.evidence.as_array() {
             for item in items.iter().take(3) {
                 let quote = item
@@ -393,7 +407,11 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
                     .get("project")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                println!("        \"{quote}\" ({project})");
+                println!(
+                    "        \"{}\" ({})",
+                    terminal_text(quote),
+                    terminal_text(project)
+                );
             }
         }
     }
@@ -402,7 +420,7 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-profile-next-pass-will-update",
-                &[("value0", r.pending_updates.join(", ").to_string())]
+                &[("value0", terminal_text(&r.pending_updates.join(", ")))]
             )
         );
     }
@@ -432,7 +450,7 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
                 i18n.message(
                     "cli-profile-project-more-needed-people",
                     &[
-                        ("value0", (group.statement.to_string()).into()),
+                        ("value0", (terminal_text(&group.statement)).into()),
                         ("value1", (format!("{}", group.projects)).into()),
                         ("value2", (group.projects).into()),
                         ("value3", (format!("{}", group.needs)).into()),
@@ -447,7 +465,7 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-profile-edited-by-hand-left-alone",
-                &[("value0", r.hand_edited.join(", ").to_string())]
+                &[("value0", terminal_text(&r.hand_edited.join(", ")))]
             )
         );
     }
@@ -456,7 +474,7 @@ async fn review(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-profile-forgotten-stays-out-until-you-say-it-again",
-                &[("value0", r.forgotten.join(", ").to_string())]
+                &[("value0", terminal_text(&r.forgotten.join(", ")))]
             )
         );
     }
@@ -490,7 +508,7 @@ async fn rebuild(ep: &ServerEndpoint) -> Result<()> {
             &[
                 (
                     "value0",
-                    (r.share.as_deref().unwrap_or("?").to_string()).into()
+                    (terminal_text(r.share.as_deref().unwrap_or("?"))).into()
                 ),
                 ("value1", (format!("{}", r.projects_harvested)).into()),
                 ("value2", (r.projects_harvested).into()),
@@ -519,14 +537,17 @@ async fn rebuild(ep: &ServerEndpoint) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-profile-left-alone-edited-by-hand",
-                &[("value0", r.skipped_manual.join(", ").to_string())]
+                &[("value0", terminal_text(&r.skipped_manual.join(", ")))]
             )
         );
     }
     for error in &r.errors {
         println!(
             "{}",
-            i18n.format("cli-profile-error-error", &[("value0", error.to_string())])
+            i18n.format(
+                "cli-profile-error-error",
+                &[("value0", terminal_text(error))]
+            )
         );
     }
     Ok(())
@@ -602,7 +623,7 @@ async fn apply(ep: &ServerEndpoint, config: &Config, args: &ProfileApplyArgs) ->
                 "cli-profile-would-write-to-block",
                 &[
                     ("value0", format!("{}", target.display())),
-                    ("value1", block.to_string())
+                    ("value1", terminal_body(&block))
                 ]
             )
         );

@@ -7,6 +7,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::AuditContaminationArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -79,12 +80,12 @@ pub async fn run(config: &Config, args: AuditContaminationArgs) -> Result<()> {
         let expected = f.expected_project.as_deref().unwrap_or("?");
         match f.check.as_str() {
             "session_wrong_bucket" => println!(
-                "{}", i18n.format("cli-audit-contamination-session-landed-in-but-its-cwd-resolves-to-project", &[("value0", f.confidence.to_string()), ("value1", f.entity_id.to_string()), ("value2", f.landed_workspace.to_string()), ("value3", f.landed_project.to_string()), ("value4", f.cwd.as_deref().unwrap_or("?").to_string()), ("value5", expected.to_string())])),
+                "{}", i18n.format("cli-audit-contamination-session-landed-in-but-its-cwd-resolves-to-project", &[("value0", terminal_text(&f.confidence)), ("value1", terminal_text(&f.entity_id)), ("value2", terminal_text(&f.landed_workspace)), ("value3", terminal_text(&f.landed_project)), ("value4", terminal_text(f.cwd.as_deref().unwrap_or("?"))), ("value5", terminal_text(expected))])),
             "project_name_collision" => println!(
-                "{}", i18n.format("cli-audit-contamination-project-page-s-session-s-last-activity-collides-by-with-add-a-ai-memory-toml", &[("value0", f.confidence.to_string()), ("value1", f.entity_id.to_string()), ("value2", f.landed_workspace.to_string()), ("value3", f.landed_project.to_string()), ("value4", format!("{}", f.pages.unwrap_or(0))), ("value5", format!("{}", f.sessions.unwrap_or(0))), ("value6", f.last_activity_us
-                    .map_or_else(|| "unknown".into(), |value| value.to_string()).to_string()), ("value7", f.collision_kind.as_deref().unwrap_or("spelling").to_string()), ("value8", f.peer_projects.as_deref().unwrap_or("?").to_string())])),
+                "{}", i18n.format("cli-audit-contamination-project-page-s-session-s-last-activity-collides-by-with-add-a-ai-memory-toml", &[("value0", terminal_text(&f.confidence)), ("value1", terminal_text(&f.entity_id)), ("value2", terminal_text(&f.landed_workspace)), ("value3", terminal_text(&f.landed_project)), ("value4", format!("{}", f.pages.unwrap_or(0))), ("value5", format!("{}", f.sessions.unwrap_or(0))), ("value6", f.last_activity_us
+                    .map_or_else(|| "unknown".into(), |value| value.to_string()).to_string()), ("value7", terminal_text(f.collision_kind.as_deref().unwrap_or("spelling"))), ("value8", terminal_text(f.peer_projects.as_deref().unwrap_or("?")))])),
             other => println!(
-                "{}", i18n.format("cli-audit-contamination-in", &[("value0", f.confidence.to_string()), ("value1", other.to_string()), ("value2", f.entity_id.to_string()), ("value3", f.landed_workspace.to_string()), ("value4", f.landed_project.to_string())])),
+                "{}", i18n.format("cli-audit-contamination-in", &[("value0", terminal_text(&f.confidence)), ("value1", terminal_text(other)), ("value2", terminal_text(&f.entity_id)), ("value3", terminal_text(&f.landed_workspace)), ("value4", terminal_text(&f.landed_project))])),
         }
     }
     Ok(())

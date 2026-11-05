@@ -43,6 +43,7 @@ struct PurgeProjectRequest {
 /// confirmed run or `"Would purge"` for a preview — everything else about
 /// the line is identical, so a script matching one also matches the other.
 fn purge_summary_line(verb: &str, label: &str, report: &serde_json::Value) -> String {
+    let label = super::show::terminal_text(label);
     let pages = report["pages_deleted"].as_u64().unwrap_or(0);
     let sessions = report["sessions_deleted"].as_u64().unwrap_or(0);
     let observations = report["observations_deleted"].as_u64().unwrap_or(0);
