@@ -999,3 +999,7 @@ diag-jail-folders-selected = Selected: { $names }
 diag-jail-folders-path-hint = Tab complete · → open · Enter select · Esc back
 diag-jail-folders-hint = ↑↓ move · Space select · Ctrl+W ro/rw · Tab open · ← up · Enter done · Esc cancel
 diag-run-switch-keeps = A switch keeps this workstream, its options and the same jail.
+diag-repair-split-local-link = ai-memory: the projects were joined, but this checkout's local link could not be updated ({ $error }); the next launch resolves it by the repository
+diag-repair-split-bad-id = --project-id { $project_id } is not a project id
+diag-repair-split-bad-from-id = --from-project-id { $from_project_id } is not a project id
+diag-repair-split-reading-summary = reading the server's adopt-project-identity summary

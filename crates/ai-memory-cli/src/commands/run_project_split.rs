@@ -5,10 +5,11 @@
 //! projects: the folder-named one that holds its sessions and the
 //! remote-derived one `ai-memory run` now resolves. Resuming such a session
 //! cannot link it to the run. When the remote-derived project is still empty,
-//! renaming the folder-named project to the remote-derived name joins them
-//! without losing anything: a rename keeps the project id, so sessions,
-//! observations and pages follow. The empty remote-derived project is renamed
-//! aside first, never deleted.
+//! the server can move its repository identity onto the folder-named project
+//! and give that project the remote-derived name (`ai-memory repair-split`):
+//! the project id stays, so sessions, observations and pages follow, and
+//! identity-based capture reaches them again. The empty project is kept under
+//! an archive name, never deleted.
 
 use std::fmt;
 use std::io;
@@ -17,7 +18,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, ServerResponseError, post_json};
+use crate::http_client::{ServerEndpoint, ServerResponseError};
 
 /// Server `code` for a link refused because another project holds the session.
 const NATIVE_SESSION_IN_OTHER_PROJECT: &str = ai_memory_hooks::NATIVE_SESSION_IN_OTHER_PROJECT;
@@ -64,32 +65,15 @@ impl ProjectSplit {
         format!("{}-split-{day}", self.run_project)
     }
 
-    /// The two renames, in order, and whether each re-keys the client-local
-    /// checkout links. Only the second does: links naming the old folder
-    /// project follow it to the remote-derived name, while links already on
-    /// that name must stay there rather than follow the empty project aside.
-    fn renames(&self, day: &str) -> [(&str, String, bool); 2] {
-        [
-            (self.run_project_id.as_str(), self.archive_name(day), false),
-            (
-                self.session_project_id.as_str(),
-                self.run_project.clone(),
-                true,
-            ),
-        ]
-    }
-
-    fn commands(&self, day: &str) -> String {
-        self.renames(day)
-            .iter()
-            .map(|(id, to, _)| {
-                format!(
-                    "  ai-memory rename-project --workspace {} --project-id {id} --to {to}",
-                    self.run_workspace
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// The command that applies the repair off a terminal.
+    fn command(&self, day: &str) -> String {
+        format!(
+            "  ai-memory repair-split --workspace {} --project-id {} --from-project-id {} --archive-name {}",
+            self.run_workspace,
+            self.session_project_id,
+            self.run_project_id,
+            self.archive_name(day)
+        )
     }
 }
 
@@ -104,8 +88,8 @@ impl fmt::Display for ProjectSplit {
         if self.repairable() {
             write!(
                 f,
-                ". Join them by renaming (nothing is deleted), then run again:\n{}",
-                self.commands(&today())
+                ". Join them (nothing is deleted), then run again:\n{}",
+                self.command(&today())
             )
         } else {
             write!(
@@ -142,10 +126,13 @@ pub(crate) fn confirm_repair(
         i18n.format(
             "cli-run-project-split-explain",
             &[
-                ("workspace", split.workspace.clone()),
-                ("old", split.session_project.clone()),
-                ("new", split.run_project.clone()),
-                ("archive", split.archive_name(&today())),
+                ("workspace", super::show::terminal_text(&split.workspace)),
+                ("old", super::show::terminal_text(&split.session_project)),
+                ("new", super::show::terminal_text(&split.run_project)),
+                (
+                    "archive",
+                    super::show::terminal_text(&split.archive_name(&today()))
+                ),
             ]
         )
     )?;
@@ -161,40 +148,27 @@ pub(crate) fn confirm_repair(
     ))
 }
 
-/// Apply both renames through the server's rename route, re-keying the
-/// client-local checkout links as [`ProjectSplit::renames`] says.
+/// Join the projects on the server and point this checkout at the result
+/// ([`super::repair_split::adopt`]).
 pub(crate) async fn apply_repair(config: &Config, split: &ProjectSplit) -> Result<()> {
     let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-    let day = today();
-    for (project_id, to, rekey) in split.renames(&day) {
-        let body = serde_json::json!({
-            "workspace": split.run_workspace,
-            "project_id": project_id,
-            "to": to,
-        });
-        let summary: serde_json::Value =
-            post_json(&endpoint, "/admin/rename-project", &body).await?;
-        if rekey && let Some(from) = summary["from"].as_str() {
-            // The checkout link is a client-side convenience; the server
-            // rename is what joins the projects.
-            let _ = super::project_registry::rekey_scope(
-                config,
-                &endpoint,
-                &split.run_workspace,
-                from,
-                &split.run_workspace,
-                &to,
-            );
-        }
-    }
+    let adopted = super::repair_split::adopt(
+        config,
+        &endpoint,
+        &split.run_workspace,
+        &split.session_project_id,
+        &split.run_project_id,
+        Some(&split.archive_name(&today())),
+    )
+    .await?;
     eprintln!(
         "{}",
         config.i18n.format(
             "cli-run-project-split-repaired",
             &[
                 ("workspace", split.run_workspace.clone()),
-                ("old", split.session_project.clone()),
-                ("new", split.run_project.clone()),
+                ("old", super::show::terminal_text(&adopted.previous)),
+                ("new", super::show::terminal_text(&adopted.project)),
             ]
         )
     );
@@ -294,42 +268,32 @@ mod tests {
         }
     }
 
-    /// The empty project is renamed aside first, without moving the
-    /// checkout links that already name it; only the folder project's
-    /// links follow its rename.
+    /// Off a terminal the repair is one command naming the session project,
+    /// the empty one, and the archive name the prompt would have used.
     #[test]
-    fn the_repair_archives_the_empty_project_before_taking_its_name() {
-        let split = split();
+    fn the_repair_command_names_both_projects_and_the_archive() {
         assert_eq!(
-            split.renames("20261105"),
-            [
-                (
-                    "01a19da2-094f-7830-9807-1d32f2fdb464",
-                    "acme-api-split-20261105".to_owned(),
-                    false
-                ),
-                (
-                    "01a19c51-63d5-7dc2-8dc1-90201095ba96",
-                    "acme-api".to_owned(),
-                    true
-                ),
-            ]
+            split().command("20261105"),
+            "  ai-memory repair-split --workspace default \
+             --project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96 \
+             --from-project-id 01a19da2-094f-7830-9807-1d32f2fdb464 \
+             --archive-name acme-api-split-20261105"
         );
     }
 
     #[test]
     fn the_error_prints_the_commands_only_when_the_repair_is_safe() {
         let repairable = split().to_string();
-        assert!(
-            repairable.contains("--project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96 --to acme-api")
-        );
+        assert!(repairable.contains(
+            "ai-memory repair-split --workspace default --project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96"
+        ));
         assert!(repairable.contains("nothing is deleted"));
         let busy = ProjectSplit {
             run_sessions: 3,
             ..split()
         }
         .to_string();
-        assert!(!busy.contains("rename-project"));
+        assert!(!busy.contains("repair-split"));
         assert!(busy.contains("already holds its own sessions or pages"));
     }
 

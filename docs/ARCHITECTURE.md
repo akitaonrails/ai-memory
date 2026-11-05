@@ -1061,7 +1061,7 @@ upgrade                     auth                  user
 completions                 handoffs             purge-session
 compact                     api-key              export-okf
 message                     doctor               backfill
-project                     reclaim-ledger-versions
+project                     reclaim-ledger-versions  repair-split
 repair-backfill-timestamps  server               backup-agents
 restore-agents              profile              setup
 ```

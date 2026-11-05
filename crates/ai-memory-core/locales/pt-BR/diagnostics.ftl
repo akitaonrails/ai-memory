@@ -1008,3 +1008,7 @@ diag-jail-folders-selected = Selecionadas: { $names }
 diag-jail-folders-path-hint = Tab completa · → abrir · Enter seleciona · Esc volta
 diag-jail-folders-hint = ↑↓ mover · Espaço seleciona · Ctrl+W ro/rw · Tab abrir · ← subir · Enter concluir · Esc cancelar
 diag-run-switch-keeps = Trocar mantém este workstream, suas opções e o mesmo jail.
+diag-repair-split-local-link = ai-memory: os projetos foram unidos, mas o vínculo local deste checkout não pôde ser atualizado ({ $error }); a próxima execução o resolve pelo repositório
+diag-repair-split-bad-id = --project-id { $project_id } não é um id de projeto
+diag-repair-split-bad-from-id = --from-project-id { $from_project_id } não é um id de projeto
+diag-repair-split-reading-summary = lendo o resumo de adopt-project-identity do servidor

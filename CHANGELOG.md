@@ -38,6 +38,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The project-split repair now joins the two projects instead of only
+  renaming them. 3.4.1's two renames left the repository identity on the
+  archived project, so identity-based capture and the checkout's saved
+  project binding kept reaching it. The server now moves the identity onto
+  the project that holds the sessions (`POST /admin/adopt-project-identity`),
+  and `ai-memory run` re-points the checkout. The new `ai-memory repair-split`
+  command applies the same repair off a terminal and to pairs already renamed
+  by hand (#1993).
 - Cancelled the project-split repair when the confirmation input reaches EOF
   without an answer, so closing the prompt does not rename either project.
   Pressing Enter still accepts the default (#1993).

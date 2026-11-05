@@ -100,6 +100,7 @@ pub mod render_plugins;
 pub mod render_shared;
 pub mod reorg;
 pub mod repair_backfill_timestamps;
+pub mod repair_split;
 pub mod reset;
 pub mod restore;
 pub mod restore_agents;

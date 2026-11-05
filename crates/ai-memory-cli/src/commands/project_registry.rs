@@ -272,6 +272,35 @@ pub(super) fn rekey_scope(
     })
 }
 
+/// Point every checkout binding of this server that named `from` at `into`,
+/// under its current name, after the server moved `from`'s repository
+/// identity onto `into` (#1993). Without it a checkout bound to the emptied
+/// project would keep selecting it by id.
+pub(super) fn rebind_project(
+    config: &Config,
+    endpoint: &ServerEndpoint,
+    from: ai_memory_core::ProjectId,
+    into: ai_memory_core::ProjectId,
+    into_name: &str,
+) -> Result<()> {
+    let server = endpoint.identity();
+    update_registry(config, |registry| {
+        let mut changed = false;
+        for binding in registry
+            .bindings
+            .iter_mut()
+            .filter(|binding| binding.server == server)
+        {
+            if binding.scope.project_id == from || binding.scope.project_id == into {
+                binding.scope.project_id = into;
+                binding.scope.project = into_name.to_owned();
+                changed = true;
+            }
+        }
+        Ok(changed)
+    })
+}
+
 /// Remember the store a session was linked under, after the server accepted
 /// the link (at launch, or at finish for an id discovered after the run).
 pub(super) fn record_session_store(
@@ -480,6 +509,73 @@ mod tests {
 
     fn endpoint(url: &str) -> ServerEndpoint {
         ServerEndpoint::from_pair(Some(url.to_owned()), None)
+    }
+
+    /// After the server moves a split project's identity (#1993), a checkout
+    /// bound to the emptied project selects the session project instead, and
+    /// another server's bindings are left alone.
+    #[test]
+    fn rebind_project_points_bindings_at_the_session_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&checkout)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let config = config_at(&tmp.path().join("data"));
+        let server = endpoint("http://memory:49374");
+        let other_server = endpoint("http://other:49374");
+        let emptied = ai_memory_core::ProjectId::new();
+        let sessions = ai_memory_core::ProjectId::new();
+        let scope = ManagedProjectScope {
+            workspace_id: ai_memory_core::WorkspaceId::new(),
+            project_id: emptied,
+            workspace: "default".into(),
+            project: "acme-api".into(),
+        };
+        let fingerprints = inspect_repository_fingerprints(&checkout).unwrap();
+        record_project_binding(
+            &config,
+            &server,
+            "acme-api",
+            &checkout,
+            &scope,
+            &fingerprints,
+        )
+        .unwrap();
+        record_project_binding(
+            &config,
+            &other_server,
+            "acme-api",
+            &checkout,
+            &scope,
+            &fingerprints,
+        )
+        .unwrap();
+
+        rebind_project(&config, &server, emptied, sessions, "acme-api").unwrap();
+
+        let bound = project_binding(&config, &server, "default", "acme-api", &checkout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (bound.project_id, bound.project.as_str()),
+            (sessions, "acme-api")
+        );
+        let untouched = project_binding(&config, &other_server, "default", "acme-api", &checkout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            untouched.project_id, emptied,
+            "another server keeps its own binding"
+        );
     }
 
     #[test]

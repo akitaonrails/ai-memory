@@ -808,3 +808,4 @@ cli-error-caused-by = Causado por:
 cli-run-project-split-explain = 🔀 Esta sessão está em { $workspace }/{ $old } (nome da pasta, de antes de o repositório ter remote); este checkout agora é { $workspace }/{ $new }, ainda vazio. Renomear { $old } → { $new } mantém todas as sessões e páginas, e o projeto vazio fica guardado como { $archive }.
 cli-run-project-split-prompt = Renomear e continuar? [S/n]{ " " }
 cli-run-project-split-repaired = Renomeado { $workspace }/{ $old } → { $workspace }/{ $new }; iniciando a sessão de novo.
+cli-repair-split-done = Unidos: { $workspace }/{ $project } agora é dono de { $identity }; o projeto vazio fica guardado como { $workspace }/{ $archived }.

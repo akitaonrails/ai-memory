@@ -1443,21 +1443,28 @@ session).
 
 When the folder-named project is the remote-derived project's old name and
 the remote-derived project has no sessions or pages yet, the repair loses
-nothing:
+nothing. The server moves the repository identity from the empty project onto
+the folder-named one, gives it the remote-derived name, and keeps the empty
+project as `<name>-split-<date>`. The project id stays, so sessions,
+observations and pages follow, and identity-based capture and later launches
+reach them. This client's checkout links and saved project binding are
+re-pointed too.
 
-1. rename the empty remote-derived project aside, to `<name>-split-<date>`;
-2. rename the folder-named project to the remote-derived name. A rename keeps
-   the project id, so its sessions, observations and pages follow.
+On a terminal, `ai-memory run` explains this and offers the repair (default
+yes), then starts the session again. Closing the prompt's input without an
+answer cancels it; pressing Enter accepts the default. Off a terminal it stops
+before the agent starts and prints the command:
 
-On a terminal, `ai-memory run` explains this and offers to do both renames
-(default yes), then starts the session again. Closing the prompt's input
-without an answer cancels the repair; pressing Enter accepts the default.
-Off a terminal it stops before the agent starts and prints the two
-`ai-memory rename-project --project-id`
-commands. When the remote-derived project already holds sessions or pages,
-nothing is renamed automatically, because either rename would leave one half
-under an unexpected name. Compare the two projects first
-([lifecycle operations](lifecycle-ops.md)).
+```
+ai-memory repair-split --workspace <ws> --project-id <folder project id> \
+  --from-project-id <remote project id>
+```
+
+The same command repairs a pair that was renamed by hand, where renaming
+alone left the identity on the archived project. It refuses when the
+remote-derived project holds its own sessions or pages, or a managed run is
+still active in it, because joining them would hide data. Compare the two
+projects first ([lifecycle operations](lifecycle-ops.md)).
 
 ## Manual acceptance
 

@@ -658,6 +658,14 @@ pub(crate) enum WriteCmd {
     /// Rename a project's `name` column without moving any files (the wiki
     /// is flat on disk). Fails with [`crate::error::StoreError::ProjectNameTaken`]
     /// when `new_name` is already used in the same workspace.
+    AdoptProjectIdentity {
+        workspace_id: WorkspaceId,
+        into: ProjectId,
+        from: ProjectId,
+        archive_name: Option<String>,
+        author_id: Option<ai_memory_core::UserId>,
+        reply: oneshot::Sender<StoreResult<ops::AdoptedProjectIdentity>>,
+    },
     RenameProject {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -2945,6 +2953,33 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Move the repository identity of the empty project `from` onto `into`
+    /// ([`ops::adopt_project_identity`], #1993).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or the
+    /// operation's own refusal.
+    pub async fn adopt_project_identity(
+        &self,
+        workspace_id: WorkspaceId,
+        into: ProjectId,
+        from: ProjectId,
+        archive_name: Option<String>,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> StoreResult<ops::AdoptedProjectIdentity> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::AdoptProjectIdentity {
+            workspace_id,
+            into,
+            from,
+            archive_name,
+            author_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Conform every latest page row to OKF in place (docs/okf.md);
     /// returns the rewritten pages so the wiki layer can align files.
     ///
@@ -4990,6 +5025,24 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     commit,
                 );
                 send_or_warn(reply, result, "repair_session_times");
+            }
+            WriteCmd::AdoptProjectIdentity {
+                workspace_id,
+                into,
+                from,
+                archive_name,
+                author_id,
+                reply,
+            } => {
+                let result = ops::adopt_project_identity(
+                    &mut conn,
+                    &workspace_id,
+                    &into,
+                    &from,
+                    archive_name.as_deref(),
+                    author_id,
+                );
+                send_or_warn(reply, result, "adopt_project_identity");
             }
             WriteCmd::RenameProject {
                 workspace_id,

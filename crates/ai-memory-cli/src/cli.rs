@@ -373,6 +373,11 @@ pub enum Command {
     /// Useful after renaming the project's directory on disk so the hook
     /// router keeps writing into the same logical project.
     RenameProject(RenameProjectArgs),
+    /// Join a checkout split in two by its git remote's arrival: move the
+    /// empty remote-named project's repository identity onto the project that
+    /// holds the sessions, and keep the empty one under an archive name.
+    /// Nothing is deleted.
+    RepairSplit(RepairSplitArgs),
     /// Move a project into another workspace. A fresh destination is a
     /// lossless TRUE MOVE (re-stamp workspace_id, keep project_id, rename the
     /// dir) — sessions/observations/handoffs and history all survive. A
@@ -1717,6 +1722,25 @@ pub struct RenameProjectArgs {
     /// New project name. Must be non-empty and contain no slashes.
     #[arg(long)]
     pub to: String,
+}
+
+/// Arguments for `repair-split`.
+#[derive(Debug, Args)]
+pub struct RepairSplitArgs {
+    /// Workspace name. Defaults to the nearest `.ai-memory.toml` marker's
+    /// `workspace`, else `default`.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// The project that holds the checkout's sessions (UUID).
+    #[arg(long)]
+    pub project_id: String,
+    /// The empty project that holds the repository identity (UUID).
+    #[arg(long)]
+    pub from_project_id: String,
+    /// Name for the empty project when it held the remote-derived name.
+    /// Defaults to `<name>-split-<YYYYMMDD>`.
+    #[arg(long)]
+    pub archive_name: Option<String>,
 }
 
 /// Arguments for `move-project`.

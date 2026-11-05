@@ -708,3 +708,106 @@ async fn rename_project_refuses_both_from_and_project_id() {
         "an ambiguous request must not rename anything"
     );
 }
+
+/// `POST /admin/adopt-project-identity` joins a split checkout (#1993): the
+/// session-holding project takes the repository identity and the
+/// remote-derived name, the empty one is archived, a refusal is a 409 that
+/// changes nothing, and a repeat is a no-op 200.
+#[tokio::test]
+async fn adopt_project_identity_joins_a_split_and_refuses_with_409() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    seed_page(&store, &state.wiki, "api").await;
+    let folder = store
+        .writer
+        .get_or_create_project(ws, "api", None)
+        .await
+        .unwrap();
+    let identity = || RepositoryIdentity {
+        identity: "github.com/acme/api".into(),
+        source: IdentitySource::GitRemote,
+    };
+    let (remote, _) = store
+        .writer
+        .resolve_project_by_identity(
+            ws,
+            identity(),
+            IdentityStyle::Path,
+            "acme-api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(folder, remote);
+    let adopt = |from: &str, into: &str| {
+        json!({
+            "workspace": "default",
+            "project_id": into,
+            "from_project_id": from,
+            "archive_name": "acme-api-split-20261105",
+        })
+    };
+
+    // Reversed: the session-holding project is not empty, so nothing moves.
+    let refused = post(
+        state.clone(),
+        "/admin/adopt-project-identity",
+        adopt(&folder.to_string(), &remote.to_string()),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let body = body_json(refused).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("holds its own sessions or pages"),
+        "{body}"
+    );
+
+    let joined = post(
+        state.clone(),
+        "/admin/adopt-project-identity",
+        adopt(&remote.to_string(), &folder.to_string()),
+    )
+    .await;
+    assert_eq!(joined.status(), StatusCode::OK);
+    let body = body_json(joined).await;
+    assert_eq!(body["project"], "acme-api", "{body}");
+    assert_eq!(body["archived"], "acme-api-split-20261105", "{body}");
+    assert_eq!(body["identity"], "github.com/acme/api", "{body}");
+    let (resolved, _) = store
+        .writer
+        .resolve_project_by_identity(
+            ws,
+            identity(),
+            IdentityStyle::Path,
+            "acme-api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved, folder,
+        "identity resolution now reaches the session project"
+    );
+
+    let again = post(
+        state,
+        "/admin/adopt-project-identity",
+        adopt(&remote.to_string(), &folder.to_string()),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::OK, "a repeat is a no-op");
+}

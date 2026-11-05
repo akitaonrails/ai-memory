@@ -808,3 +808,4 @@ cli-error-caused-by = Caused by:
 cli-run-project-split-explain = 🔀 This session lives in { $workspace }/{ $old } (named after the folder, before the repo had a remote); this checkout is now { $workspace }/{ $new }, still empty. Renaming { $old } → { $new } keeps every session and page, and the empty project is kept as { $archive }.
 cli-run-project-split-prompt = Rename and continue? [Y/n]{ " " }
 cli-run-project-split-repaired = Renamed { $workspace }/{ $old } → { $workspace }/{ $new }; starting the session again.
+cli-repair-split-done = Joined: { $workspace }/{ $project } now owns { $identity }; the empty project is kept as { $workspace }/{ $archived }.

@@ -992,6 +992,11 @@ async fn jail_maps_named_folders_read_only_and_read_write() {
     )
     .await;
     let text = stderr(&output);
+    assert!(
+        fixture.jail_argv().is_some(),
+        "ai-jail was not exec'd (status {:?}):\n{text}",
+        output.status
+    );
     assert_eq!(
         fixture.mounts(),
         [

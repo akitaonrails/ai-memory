@@ -791,14 +791,11 @@ async fn a_split_project_link_prints_the_rename_commands_off_a_terminal() {
     );
     assert!(
         stderr.contains(
-            "ai-memory rename-project --workspace default --project-id \
-             01a19c51-63d5-7dc2-8dc1-90201095ba96 --to acme-api"
+            "ai-memory repair-split --workspace default \
+             --project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96 \
+             --from-project-id 01a19da2-094f-7830-9807-1d32f2fdb464 --archive-name acme-api-split-"
         ),
-        "the lossless rename is printed:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("--project-id 01a19da2-094f-7830-9807-1d32f2fdb464 --to acme-api-split-"),
-        "the empty project is renamed aside, not deleted:\n{stderr}"
+        "the lossless repair is printed:\n{stderr}"
     );
     assert!(!stderr.contains("managed run is not active"), "{stderr}");
     assert!(!fixture.claude_ran.exists(), "the agent must not start");
