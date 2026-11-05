@@ -1418,6 +1418,76 @@ mod tests {
         );
     }
 
+    /// A page the 3.4.0 importer wrote, with claude-mem's JSON lists copied
+    /// as text, is this import's own output: a rerun writes the new layout
+    /// over it and keeps it in the chain. The same body with one edit is
+    /// still refused and left as it was.
+    #[tokio::test]
+    async fn rerun_replaces_the_earlier_list_layout_but_never_an_edited_page() {
+        let (_dir, database) = fixture(true);
+        let snapshot = snapshot_database(&database).unwrap();
+        let plan = plan_snapshot(&snapshot, &mapping(), DEFAULT_DEST_PREFIX).unwrap();
+        let path = "imported/claude-mem/decision/1.md";
+        let planned = plan
+            .pages
+            .iter()
+            .find(|page| page.path == path)
+            .unwrap()
+            .versions[0]
+            .clone();
+        let [earlier] = planned.previous_bodies.as_slice() else {
+            panic!("no earlier body: {planned:?}");
+        };
+        assert!(earlier.contains("## Facts\n\n[]"), "{earlier}");
+        assert!(!planned.body.contains("## Facts"), "{}", planned.body);
+        for edited in [false, true] {
+            let stored = if edited {
+                earlier.replace("Chosen", "Chosen, then edited")
+            } else {
+                earlier.clone()
+            };
+            let files = tempfile::tempdir().unwrap();
+            let mapping_file = files.path().join("mapping.json");
+            fs::write(
+                &mapping_file,
+                r#"{"projects":{"api":{"workspace":"acme","project":"api"}}}"#,
+            )
+            .unwrap();
+            let server = MockServer::start(&[("acme", "api")]);
+            server.state().pages.insert(
+                ("acme".into(), "api".into(), path.into()),
+                vec![crate::agentmemory::mock::StoredVersion {
+                    page_id: "page-from-3.4.0".into(),
+                    body: stored.clone(),
+                    arguments: serde_json::json!({}),
+                }],
+            );
+            let result = run(ClaudeMemArgs {
+                database: Some(database.clone()),
+                mapping: mapping_file,
+                dest_prefix: DEFAULT_DEST_PREFIX.into(),
+                server_url: server.url.clone(),
+                apply: true,
+                manifest_out: Some(files.path().join("manifest.json")),
+                show_body: false,
+            })
+            .await;
+            let chain = server.state().chain("acme", "api", path);
+            if edited {
+                let error = result.unwrap_err();
+                assert!(format!("{error:#}").contains("did not write"), "{error:#}");
+                assert_eq!(chain.len(), 1);
+                assert_eq!(chain[0].body, stored);
+            } else {
+                result.unwrap();
+                assert_eq!(chain.len(), 2);
+                assert_eq!(chain[0].body, *earlier);
+                assert_eq!(chain[1].body, planned.body);
+                assert_eq!(server.state().stored_versions(), 4);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn all_destinations_are_preflighted_before_the_first_batch() {
         let (_dir, database) = fixture(false);
