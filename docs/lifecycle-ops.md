@@ -1087,6 +1087,14 @@ Failure modes:
   pre-restore checkpoint remains as an audit breadcrumb.
 - **Page-version UUID is malformed** → 400 before a checkpoint or mutation.
 - **Page version is absent or belongs to another project/path** → 404.
+- **Session summary belongs to a purged session** → 409 for either source;
+  no page row is added and any newly installed file is removed. Legacy
+  summaries without `session_id` are also refused unless a live manual
+  replacement survives at that path. A live current manual page remains
+  restorable. An older retained manual version alone does not authorize a
+  restore: without a live replacement, it cannot be distinguished from a
+  legacy summary without `session_id` (#701). MCP `memory_restore_page`
+  applies the same guard to its checkpoint restores.
 - **Historical markdown is malformed or non-UTF-8** → 500, live file is not
   replaced.
 - **SQLite rejects the restored version** (for example, the historical path
@@ -1118,10 +1126,19 @@ before anything is written. Other frontmatter keys are not carried over.
 Scope is resolved once, without creating anything, and the listing, the read
 and the write all use that one project.
 
+Before writing, `memory_restore_page` checks the checkpoint's original
+frontmatter, including `session_id`, against the session-purge tombstone.
+A purged session summary is refused with an invalid-parameters error,
+leaving disk, index and git unchanged. A live current manual page at the
+same path remains restorable; an older retained manual version without a
+live replacement is refused because it is indistinguishable from a legacy
+summary without `session_id`. Listing checkpoints and reading history stay
+available to admins.
+
 Who may call it: an admin, the same authority as `/admin/restore-page`. Git
 history keeps every version the live wiki dropped, including pages a root
 deleted, pages a session purge removed and expired pages the forget sweep
-hard-deleted, so listing names them and restoring brings their text back. A DB
+hard-deleted, so listing can name text that a restore must refuse. A DB
 user or proxied operator is refused for both, even on a project they can write
 and even for their own per-user slot. On a server that tells no operators
 apart (anonymous loopback, or a root bearer with no users) the caller is root

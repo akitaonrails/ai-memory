@@ -460,8 +460,9 @@ should be proposed from a completed session, or at explicit wrap-up \
   bring back a deleted page. Admin only (implicit on a single-operator \
   server); project pages only, not `scope: \"profile\"` pages. Without \
   `rev` it lists the page's checkpoints; with `rev` it writes that version, \
-  frontmatter included, back through the `memory_write_page` path. Follow \
-  the client-aware project-scope rule above.\n\
+  frontmatter included, back through the `memory_write_page` path. Purged \
+  session summaries are refused. Follow the client-aware project-scope \
+  rule above.\n\
 - `memory_feedback` — right after a `memory_query` / `memory_read_page` \
   hit proves useful or misleading, and whenever the user says a recalled \
   page is out of date or wrong. Pass the exact `path` from the hit plus \
@@ -6429,7 +6430,7 @@ impl AiMemoryServer {
     }
 
     /// List a page's checkpoints, or restore it from one through the
-    /// normal write path.
+    /// normal write path, refusing purged session summaries.
     #[tool(
         annotations(
             title = "Restore memory page",
@@ -6448,7 +6449,8 @@ impl AiMemoryServer {
         `memory_delete_page`), writes that version back, frontmatter \
         included, as a new current version through the `memory_write_page` \
         path, so sanitization, admission, attribution and supersession \
-        apply; the version it replaces stays reachable. Project pages only: \
+        apply; the version it replaces stays reachable. Purged session \
+        summaries are refused before writing. Project pages only: \
         `scope: \"profile\"` pages cannot be restored here. Pass \
         `workspace` + `project` together on static clients. Use only when \
         the user asks to restore or undo a page change."
@@ -6460,8 +6462,8 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         // Git history keeps every version the live wiki dropped: pages a root
         // deleted, purge-session removed or the forget sweep expired. Listing
-        // names those versions and restoring resurrects them, so both need
-        // `/admin/restore-page`'s authority, not a reader's or writer's grant.
+        // names those versions; restoring refuses purged session summaries.
+        // Both need `/admin/restore-page`'s authority, beyond a read/write grant.
         self.require_admin_capability(&parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let Some(wiki) = self.wiki.as_ref() else {
@@ -6507,6 +6509,18 @@ impl AiMemoryServer {
             .await
             .map_err(|e| {
                 McpError::invalid_params(format!("cannot read {path} at {rev}: {e}"), None)
+            })?;
+        // Check existing tombstones before provenance is dropped. This check
+        // precedes the normal write; a race requires a concurrent purge of
+        // this same session during an admin restore.
+        self.reader
+            .check_page_restore_allowed(ws, proj, path.clone(), md.frontmatter.clone())
+            .await
+            .map_err(|e| match e {
+                ai_memory_store::StoreError::SessionPurged(_) => {
+                    McpError::invalid_params(format!("cannot restore {path}: {e}"), None)
+                }
+                _ => McpError::internal_error(e.to_string(), None),
             })?;
         let fm = &md.frontmatter;
         let metadata = checkpoint_write_metadata(fm)?;
@@ -24562,6 +24576,244 @@ mod tests {
             after.frontmatter
         );
         assert_eq!(after.body, before.body);
+    }
+
+    #[derive(Clone, Copy)]
+    enum SessionCheckpointCase {
+        PurgedSummary,
+        PurgedLegacySummary,
+        PurgedSummaryOverManual,
+        LiveManual,
+        UnpurgedSummary,
+        OrdinaryPage,
+    }
+
+    async fn check_session_checkpoint_restore(case: SessionCheckpointCase) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki.clone());
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let path = PagePath::new(if matches!(case, SessionCheckpointCase::OrdinaryPage) {
+            "notes/session-note.md".to_owned()
+        } else {
+            format!("sessions/{sid}.md")
+        })
+        .unwrap();
+        let mut historical = WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: path.clone(),
+            frontmatter: serde_json::json!({}),
+            body: "# Historical\n\nCheckpoint body.".into(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        };
+        if !matches!(
+            case,
+            SessionCheckpointCase::PurgedLegacySummary | SessionCheckpointCase::LiveManual
+        ) {
+            historical.frontmatter["session_id"] = serde_json::json!(sid.to_string());
+        }
+        wiki.write_page(historical.clone()).await.unwrap();
+        let rev = wiki
+            .commit_all("historical checkpoint")
+            .unwrap()
+            .unwrap()
+            .to_string();
+        let mut current = historical.clone();
+        current.body = "# Current\n\nCurrent body.".into();
+        current.frontmatter["session_id"] = serde_json::json!(sid.to_string());
+        if matches!(case, SessionCheckpointCase::OrdinaryPage) {
+            current.path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        }
+        let summary_id = wiki.write_page(current.clone()).await.unwrap();
+        store
+            .writer
+            .end_session(sid, Some(summary_id))
+            .await
+            .unwrap();
+        if matches!(
+            case,
+            SessionCheckpointCase::LiveManual | SessionCheckpointCase::PurgedSummaryOverManual
+        ) {
+            current
+                .frontmatter
+                .as_object_mut()
+                .unwrap()
+                .remove("session_id");
+            current.body = "# Manual\n\nLive manual body.".into();
+            wiki.write_page(current).await.unwrap();
+        }
+        if !matches!(case, SessionCheckpointCase::UnpurgedSummary) {
+            wiki.purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip)
+                .await
+                .unwrap();
+            assert!(wiki.purged_sessions(ws, proj).await.unwrap().contains(&sid));
+            assert!(
+                store
+                    .reader
+                    .find_session_scope(sid)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        wiki.commit_all("current state").unwrap();
+        let listed = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args(path.as_str(), None, Some("scratch"))),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            listed["checkpoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["rev"] == rev)
+        );
+        assert_eq!(
+            wiki.page_at_checkpoint(ws, proj, &path, &rev)
+                .await
+                .unwrap()
+                .body,
+            historical.body
+        );
+
+        let abs = wiki.project_root(ws, proj).join(path.as_str());
+        let file_before = std::fs::read(&abs).ok();
+        let git_index = wiki.root().join(".git/index");
+        let git_index_before = std::fs::read(&git_index).unwrap();
+        let versions_before = store
+            .reader
+            .page_versions(ws, proj, path.to_string(), 10, 0)
+            .await
+            .unwrap()
+            .total;
+        let head_before = wiki.recent_checkpoints(1).unwrap();
+        let result = server
+            .memory_restore_page(
+                Parameters(restore_args(path.as_str(), Some(&rev), Some("scratch"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        let latest = store
+            .reader
+            .page_body_by_ids(ws, proj, path.as_str())
+            .await
+            .unwrap();
+        if matches!(
+            case,
+            SessionCheckpointCase::PurgedSummary
+                | SessionCheckpointCase::PurgedLegacySummary
+                | SessionCheckpointCase::PurgedSummaryOverManual
+        ) {
+            let error = result.expect_err("a purged session checkpoint must be refused");
+            assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(error.message.contains("purged"), "{error}");
+            assert_eq!(
+                store
+                    .reader
+                    .page_versions(ws, proj, path.to_string(), 10, 0)
+                    .await
+                    .unwrap()
+                    .total,
+                versions_before
+            );
+            assert_eq!(
+                std::fs::read(&abs).ok(),
+                file_before,
+                "refusal must leave disk untouched"
+            );
+            assert_eq!(
+                wiki.recent_checkpoints(1).unwrap()[0].oid,
+                head_before[0].oid,
+                "refusal must not checkpoint"
+            );
+            assert_eq!(
+                std::fs::read(git_index).unwrap(),
+                git_index_before,
+                "refusal must not stage changes"
+            );
+            if matches!(case, SessionCheckpointCase::PurgedSummaryOverManual) {
+                assert_eq!(latest.unwrap().body, "# Manual\n\nLive manual body.");
+            } else {
+                assert!(latest.is_none(), "refusal must not revive the index");
+                assert!(!abs.exists(), "refusal must not recreate the file");
+            }
+        } else {
+            let restored = result.unwrap();
+            assert!(!restored.is_error.unwrap_or(false), "{restored:?}");
+            assert_eq!(result_json(&restored)["restored_from"], rev);
+            assert_eq!(latest.unwrap().body, historical.body);
+            assert_eq!(
+                wiki.read_page(ws, proj, &path).unwrap().body,
+                historical.body
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_purge_refuses_session_checkpoint() {
+        check_session_checkpoint_restore(SessionCheckpointCase::PurgedSummary).await;
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_purge_refuses_legacy_checkpoint() {
+        check_session_checkpoint_restore(SessionCheckpointCase::PurgedLegacySummary).await;
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_purge_refuses_summary_over_live_manual() {
+        check_session_checkpoint_restore(SessionCheckpointCase::PurgedSummaryOverManual).await;
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_purge_allows_live_manual() {
+        check_session_checkpoint_restore(SessionCheckpointCase::LiveManual).await;
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_purge_allows_unpurged_session() {
+        check_session_checkpoint_restore(SessionCheckpointCase::UnpurgedSummary).await;
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_purge_allows_ordinary_path_with_session_id() {
+        check_session_checkpoint_restore(SessionCheckpointCase::OrdinaryPage).await;
     }
 
     #[tokio::test]
