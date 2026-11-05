@@ -2578,6 +2578,107 @@ mod tests {
         assert_eq!(matches(&conn, "observations_fts", "ops.rs"), 1);
     }
 
+    /// V100 gives both indexes a second spelling of `title`/`body` with `-`
+    /// and `_` turned into spaces, so the parts of a hyphenated word match.
+    /// A store that already holds such rows gets them re-indexed by the
+    /// rebuild, and the whole token keeps matching (#2013).
+    #[test]
+    fn v100_indexes_the_parts_of_a_hyphenated_word_on_an_existing_store() {
+        use crate::fts_query::{FtsStopwords, prepare_fts5_query};
+
+        const TABLES: [&str; 2] = ["pages_fts", "observations_fts"];
+        const BODY: &str = "the zebrafinch-marker-alpha tag and the zebra_finch_keeper log";
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 99).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let page = [4_u8; 16];
+        conn.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, pinned, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'notes/markers.md', 'title', 'semantic', ?4, zeroblob(32), '{}', \
+                     1, 0, 1, 1)",
+            params![
+                page.as_slice(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                BODY,
+            ],
+        )
+        .unwrap();
+        crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool file".into(),
+                body: BODY.into(),
+                importance: 5,
+                file_path: None,
+            },
+        )
+        .unwrap();
+
+        let stopwords = FtsStopwords::default();
+        let matches = |conn: &Connection, table: &str, raw: &str| -> i64 {
+            let query = prepare_fts5_query(raw, &stopwords);
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1"),
+                [query],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        for table in TABLES {
+            assert_eq!(matches(&conn, table, "alpha"), 0, "{table} at V99");
+        }
+
+        run(&mut conn).unwrap();
+
+        for table in TABLES {
+            for part in ["alpha", "marker", "zebrafinch", "keeper"] {
+                assert_eq!(matches(&conn, table, part), 1, "{table} query {part:?}");
+            }
+            // The whole token keeps matching: the tokenizer was not touched.
+            assert_eq!(
+                matches(&conn, table, "zebrafinch-marker-alpha"),
+                1,
+                "{table} whole token"
+            );
+        }
+
+        // The recreated triggers keep both spellings in step with later writes.
+        conn.execute(
+            "UPDATE pages SET body = 'nothing hyphenated here' WHERE id = ?1",
+            params![page.as_slice()],
+        )
+        .unwrap();
+        assert_eq!(matches(&conn, "pages_fts", "marker"), 0);
+        assert_eq!(matches(&conn, "pages_fts", "hyphenated"), 1);
+    }
+
     /// V99 adds `file_path` to a store that already holds observations: an
     /// existing row keeps its columns and reads NULL, a new row stores its
     /// path, and a path lookup uses the partial index.

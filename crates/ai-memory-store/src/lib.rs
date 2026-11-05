@@ -2881,6 +2881,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_matches_the_parts_of_a_hyphenated_word() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let body = format!(
+            "{DIRECTORY_PATH_BODY} the zebrafinch-marker-alpha tag and the zebra_finch_keeper log"
+        );
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "markers.md", &body))
+            .await
+            .unwrap();
+
+        // #2013: the content tokenizer keeps `-` and `_` inside tokens, so a
+        // `zebrafinch-marker-alpha` mention indexed as one term and no
+        // component word could reach it. Each part must now match on its own,
+        // in the project scope and in the unscoped search alike.
+        for query in ["alpha", "marker", "zebrafinch", "keeper"] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "query {query:?}");
+            assert_eq!(hits[0].path.as_str(), "markers.md", "query {query:?}");
+
+            let global = store
+                .reader
+                .search_pages(query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(global.len(), 1, "unscoped query {query:?}");
+        }
+
+        // The whole token keeps working as a single term (the reason the
+        // tokenizer was left alone), and an unrelated word still finds nothing.
+        for query in ["ai-memory", "zebrafinch-marker-alpha"] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "whole token {query:?}");
+        }
+        let misses = store
+            .reader
+            .search_pages_for_project(ws, proj, "zebrafinches".into(), 10, None)
+            .await
+            .unwrap();
+        assert!(
+            misses.is_empty(),
+            "no false positives from the split column"
+        );
+    }
+
+    #[tokio::test]
     async fn search_finds_an_observation_naming_a_file_with_its_directory() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();

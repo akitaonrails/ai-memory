@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Search now matches the parts of a hyphenated or underscored word: `alpha`
+  finds a note that writes `foo-bar-alpha`, `memory` finds `ai-memory`, and
+  the whole token keeps matching too. The index gained a second spelling of
+  the same text (migration V100), so the tokenizer stays as it was and no
+  stored row changes; the migration rebuilds the search index once on open
+  (#2013).
+
 ## [3.4.2] - 2026-11-05
 
 ### Added

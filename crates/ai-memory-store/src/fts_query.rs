@@ -489,6 +489,12 @@ fn quote_fts5_token(token: &str) -> String {
     // `current.md` → `syntax error` bug.) With no punctuation the two coincide
     // and we emit a single phrase.
     //
+    // Since V100 (#2013) the content index carries both surfaces too: the
+    // `*_parts` generated columns hold `-`/`_` turned into spaces, so `"ai
+    // memory"` also reaches a body that writes `ai-memory`, and a search for
+    // one part (`alpha`) reaches `zebrafinch-marker-alpha`. The OR below stays
+    // as is — it now hits on either column instead of only on the path index.
+    //
     // A trailing `*` is the FTS5 prefix operator. Inside a quoted string it is
     // only a separator, so it moves outside each closing quote instead:
     // `ai-mem*` becomes `("ai-mem"* OR "ai mem"*)`, which FTS5 reads as a
