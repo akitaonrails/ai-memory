@@ -299,7 +299,10 @@ their ai-memory 3.0 compatibility. The claude-mem manifest contains source
 ids, destinations, counts, and hashes, but never imported bodies or skipped
 sensitive/security bodies. Each imported page carries a deterministic
 source-row key, while resume authority still requires an exact full-body
-match; retaining the footer on an edited page does not permit overwrite.
+match; retaining the footer on an edited page does not permit overwrite. The
+one other body a rerun accepts is the exact body the 3.4.0 importer planned for
+the same row, with the lists copied as text: the rerun writes the current
+layout over it, and the old version stays in the page's history.
 
 The document route adds these boundaries:
 
