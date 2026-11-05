@@ -257,6 +257,11 @@ pub(crate) struct PlannedVersion {
     pub(crate) tier: &'static str,
     pub(crate) tags: Vec<String>,
     pub(crate) expires_at: Option<String>,
+    /// Complete bodies an earlier importer release planned for this version.
+    /// A batched rerun that finds one at the destination is reading its own
+    /// older output, so it writes this version over it and the old one stays
+    /// in the page's history; any other body is still refused.
+    pub(crate) previous_bodies: Vec<String>,
 }
 
 /// One destination page and its versions, oldest first.
@@ -604,6 +609,16 @@ pub(crate) async fn apply_pages_batched(
                     .rposition(|version| current.body == version.body)
                     .filter(|found| *found >= start)
                 else {
+                    // This import's own earlier output for the next version:
+                    // write that version over it, conditioned on its id. A
+                    // second refusal against the same id is not retried.
+                    if current.page_id.is_some()
+                        && states[page_index].latest != current.page_id
+                        && page.versions[start].previous_bodies.contains(&current.body)
+                    {
+                        states[page_index].latest = current.page_id;
+                        continue;
+                    }
                     let entry = &mut manifest.pages[page_index].versions[start];
                     entry.status = VersionStatus::Failed;
                     entry.error = Some("destination page was not written by this import".into());

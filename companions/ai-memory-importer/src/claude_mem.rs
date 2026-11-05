@@ -968,6 +968,7 @@ fn page(
             tier: "episodic",
             tags: tags_from(tags.iter().copied()),
             expires_at: None,
+            previous_bodies: Vec::new(),
         }],
     }
 }
