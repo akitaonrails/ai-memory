@@ -53,7 +53,17 @@ host_path() {
 # --- only successful HTTP replies become context ----------------------
 # Exercise real curl, including all three auth branches. Without the status
 # guard, a redirect or error page is printed as the agent's handoff or brief.
-python3 - "$TMP/http-port" <<'PY' &
+# Windows runners ship `python` but not always a working `python3` (Git Bash
+# may find only the Store alias), so take the first that runs Python 3.
+HTTP_PYTHON=""
+for HTTP_CANDIDATE in python3 python; do
+    if "$HTTP_CANDIDATE" -c 'import sys; sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then
+        HTTP_PYTHON=$HTTP_CANDIDATE
+        break
+    fi
+done
+[ -n "$HTTP_PYTHON" ] || { printf 'the HTTP fixture needs Python 3 (python3 or python)\n' >&2; exit 1; }
+"$HTTP_PYTHON" - "$TMP/http-port" <<'PY' &
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlsplit
