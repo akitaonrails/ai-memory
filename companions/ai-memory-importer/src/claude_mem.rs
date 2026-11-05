@@ -1462,7 +1462,7 @@ mod tests {
                     arguments: serde_json::json!({}),
                 }],
             );
-            let result = run(ClaudeMemArgs {
+            let args = ClaudeMemArgs {
                 database: Some(database.clone()),
                 mapping: mapping_file,
                 dest_prefix: DEFAULT_DEST_PREFIX.into(),
@@ -1470,8 +1470,8 @@ mod tests {
                 apply: true,
                 manifest_out: Some(files.path().join("manifest.json")),
                 show_body: false,
-            })
-            .await;
+            };
+            let result = run(args.clone()).await;
             let chain = server.state().chain("acme", "api", path);
             if edited {
                 let error = result.unwrap_err();
@@ -1483,6 +1483,11 @@ mod tests {
                 assert_eq!(chain.len(), 2);
                 assert_eq!(chain[0].body, *earlier);
                 assert_eq!(chain[1].body, planned.body);
+                assert_eq!(server.state().stored_versions(), 4);
+                // Once upgraded, a further rerun finds its own current body
+                // and writes nothing.
+                run(args).await.unwrap();
+                assert_eq!(server.state().chain("acme", "api", path).len(), 2);
                 assert_eq!(server.state().stored_versions(), 4);
             }
         }
