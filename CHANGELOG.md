@@ -11,6 +11,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `ai-memory run` no longer fails with `409 managed run is not active` when it
+  resumes a session captured before the repository had its git remote. That
+  session lives in the project named after the folder, while the run resolves
+  the remote-derived name. The server now reports the split with a
+  `native_session_in_other_project` conflict that names both projects (only to
+  the operator and harness that recorded the session). When the remote-derived
+  project is still empty, `ai-memory run` offers on a terminal to rename it
+  aside and give the folder-named project its name, then starts the session
+  again; nothing is deleted, and the project id keeps every session,
+  observation and page. Off a terminal it prints the two `rename-project`
+  commands instead (#1993).
+
 ## [3.4.0] - 2026-11-04
 
 ### Added

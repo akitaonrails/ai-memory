@@ -314,9 +314,50 @@ pub(super) async fn run_from_with_wiring(
     cwd: &Path,
     wire_overrides: &super::run_autowire::WireOverrides,
 ) -> Result<i32> {
-    run_once_with_wiring(config, args, cwd, wire_overrides)
+    run_once_repairing_split(config, args, cwd, wire_overrides)
         .await
         .map(|outcome| outcome.exit_code)
+}
+
+/// [`run_once_with_wiring`], offering once on a terminal to join a project
+/// split by the git remote's arrival and then launching again (#1993).
+async fn run_once_repairing_split(
+    config: &Config,
+    args: RunArgs,
+    cwd: &Path,
+    wire_overrides: &super::run_autowire::WireOverrides,
+) -> Result<RunOutcome> {
+    let error = match run_once_with_wiring(config, args.clone(), cwd, wire_overrides).await {
+        Ok(outcome) => return Ok(outcome),
+        Err(error) => error,
+    };
+    let Some(split) = error
+        .downcast_ref::<super::run_project_split::ProjectSplit>()
+        .cloned()
+    else {
+        return Err(error);
+    };
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        return Err(error);
+    }
+    let i18n = config.i18n.clone();
+    let prompt_split = split.clone();
+    let accepted = tokio::task::spawn_blocking(move || {
+        super::run_project_split::confirm_repair(
+            &i18n,
+            &prompt_split,
+            &mut io::stdin().lock(),
+            &mut io::stderr(),
+        )
+    })
+    .await
+    .context("waiting for the project rename confirmation")?
+    .context("reading the project rename confirmation from stdin")?;
+    if !accepted {
+        return Err(error);
+    }
+    super::run_project_split::apply_repair(config, &split).await?;
+    run_once_with_wiring(config, args, cwd, wire_overrides).await
 }
 
 #[derive(Debug)]
@@ -346,7 +387,7 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
     preserve_trailing_run_options(&mut next_args);
 
     loop {
-        let outcome = run_once_with_wiring(
+        let outcome = run_once_repairing_split(
             config,
             next_args.clone(),
             cwd,
@@ -1236,7 +1277,15 @@ async fn run_once_with_wiring(
                 },
             )
             .await
-            .context("linking the managed native session; the agent was not started")
+            .map_err(|error| {
+                // A session recorded under this checkout's old project name
+                // gets the repair offer instead of a bare conflict (#1993).
+                match super::run_project_split::ProjectSplit::from_error(&error) {
+                    Some(split) => anyhow::Error::new(split),
+                    None => error
+                        .context("linking the managed native session; the agent was not started"),
+                }
+            })
         );
         remember_session_store(
             config,

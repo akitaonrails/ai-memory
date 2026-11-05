@@ -133,10 +133,10 @@ pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
     LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, OperationalWorkstreamSummary,
-    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
-    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamOperationalStatus,
-    WorkstreamSelection, WorkstreamSelector,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
+    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
+    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 

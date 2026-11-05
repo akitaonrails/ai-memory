@@ -105,6 +105,7 @@ pub mod restore_page;
 pub mod resume;
 pub mod run;
 pub mod run_autowire;
+pub(crate) mod run_project_split;
 pub mod search;
 pub mod serve;
 pub mod server;

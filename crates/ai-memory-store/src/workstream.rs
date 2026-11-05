@@ -423,6 +423,33 @@ pub struct StoredManagedRunStatus {
     pub state: String,
 }
 
+/// The project that already holds the native session a managed run asked to
+/// link, when it is not the run's own project (#1993).
+///
+/// Only reported for a session with the run's harness and owner: the caller
+/// owns that session, so naming its project discloses nothing new.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSessionHolder {
+    /// Workspace holding the session.
+    pub workspace: String,
+    /// Project holding the session.
+    pub project: String,
+    /// That project's id.
+    pub project_id: ProjectId,
+    /// Project the managed run was prepared in.
+    pub run_project: String,
+    /// The run project's id.
+    pub run_project_id: ProjectId,
+    /// Workspace of the run project.
+    pub run_workspace: String,
+    /// The run project's legacy folder-name key, if it has one.
+    pub run_legacy_name: Option<String>,
+    /// Sessions already recorded in the run project.
+    pub run_sessions: u64,
+    /// Pages (every version) already written in the run project.
+    pub run_pages: u64,
+}
+
 /// Checkout-local workstream metadata used by read-only discovery surfaces.
 #[derive(Debug, Clone)]
 pub struct StoredWorkstreamSummary {
@@ -1731,6 +1758,69 @@ fn validate_finished_recovery(
 }
 
 /// Reader-side managed-run status.
+/// The other project holding `native_session_id` for this run's harness and
+/// owner, if any (see [`NativeSessionHolder`]).
+pub(crate) fn native_session_holder(
+    conn: &Connection,
+    run_id: ManagedRunId,
+    native_session_id: &str,
+) -> StoreResult<Option<NativeSessionHolder>> {
+    let session_id = ai_memory_core::SessionId::from_native(native_session_id);
+    conn.query_row(
+        "SELECT ws.name, p.name, p.id, rp.name, rp.id, rws.name, NULLIF(rp.legacy_name, ''), \
+                (SELECT COUNT(*) FROM sessions WHERE project_id = rp.id), \
+                (SELECT COUNT(*) FROM pages WHERE project_id = rp.id) \
+         FROM managed_runs mr \
+         JOIN workstreams w ON w.id = mr.workstream_id \
+         JOIN projects rp ON rp.id = w.project_id \
+         JOIN workspaces rws ON rws.id = w.workspace_id \
+         JOIN sessions s ON s.id = ?2 \
+         JOIN projects p ON p.id = s.project_id \
+         JOIN workspaces ws ON ws.id = s.workspace_id \
+         WHERE mr.id = ?1 AND s.agent_kind = mr.agent_kind \
+           AND s.actor_user IS mr.owner_user \
+           AND (s.workspace_id <> w.workspace_id OR s.project_id <> w.project_id)",
+        params![run_id.as_bytes(), session_id.as_bytes()],
+        |row| {
+            Ok((
+                (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ),
+                (
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ),
+                (row.get::<_, i64>(7)?, row.get::<_, i64>(8)?),
+            ))
+        },
+    )
+    .optional()?
+    .map(
+        |(
+            (workspace, project, project_id),
+            (run_project, run_project_id, run_workspace, run_legacy_name),
+            (run_sessions, run_pages),
+        )| {
+            Ok(NativeSessionHolder {
+                workspace,
+                project,
+                project_id: ProjectId::from_slice(&project_id)?,
+                run_project,
+                run_project_id: ProjectId::from_slice(&run_project_id)?,
+                run_workspace,
+                run_legacy_name,
+                run_sessions: u64::try_from(run_sessions).unwrap_or(0),
+                run_pages: u64::try_from(run_pages).unwrap_or(0),
+            })
+        },
+    )
+    .transpose()
+}
+
 pub(crate) fn run_status(
     conn: &Connection,
     run_id: ManagedRunId,

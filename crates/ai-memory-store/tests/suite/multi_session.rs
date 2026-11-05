@@ -5709,3 +5709,110 @@ async fn observations_for_file_maps_sessions_to_readable_targets() {
         .unwrap();
     assert_eq!(read.records[0].id, newest);
 }
+
+/// A refused link names the project already holding the session only when
+/// the same operator and harness recorded it there (#1993). Another
+/// operator's session, another harness's, or one in the run's own project
+/// stays a bare refusal, so the probe never discloses a foreign project.
+#[tokio::test]
+async fn a_refused_link_names_the_holder_only_for_the_runs_own_operator_and_harness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let old = store
+        .writer
+        .get_or_create_project(ws, "api".to_string(), None)
+        .await
+        .unwrap();
+    let new = store
+        .writer
+        .get_or_create_project(ws, "acme-api".to_string(), None)
+        .await
+        .unwrap();
+    let run = store
+        .writer
+        .prepare_workstream_run(PrepareWorkstreamRun {
+            scope_by_id: true,
+            workspace_id: ws,
+            project_id: new,
+            repo_fingerprint: "repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            cwd: "/repo".into(),
+            agent: AgentKind::ClaudeCode,
+            automatic_harness: false,
+            available_agents: Vec::new(),
+            selection: WorkstreamSelection::Current,
+            lease_owner: "launcher".into(),
+        })
+        .await
+        .unwrap();
+    let begin = async |native: &str, project, agent_kind, actor_user: Option<&str>| {
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: SessionId::from_native(native),
+                workspace_id: ws,
+                project_id: project,
+                agent_kind,
+                cwd: Some("/repo".into()),
+                actor_user: actor_user.map(operator),
+            })
+            .await
+            .unwrap();
+    };
+    begin("mine-old", old, AgentKind::ClaudeCode, None).await;
+    begin("theirs-old", old, AgentKind::ClaudeCode, Some("mallory")).await;
+    begin("codex-old", old, AgentKind::Codex, None).await;
+    begin("mine-new", new, AgentKind::ClaudeCode, None).await;
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE projects SET legacy_name = 'api' WHERE id = ?1",
+        [new.as_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+    let holder = async |native: &str| {
+        store
+            .reader
+            .managed_run_native_session_holder(run.run_id, native.into())
+            .await
+            .unwrap()
+    };
+
+    // The violation: the session sits in another project, so the link is
+    // refused; the holder is the operator's own old project.
+    assert!(
+        !store
+            .writer
+            .link_managed_run_session(run.run_id, AgentKind::ClaudeCode, "mine-old")
+            .await
+            .unwrap()
+    );
+    let mine = holder("mine-old")
+        .await
+        .expect("own split session is named");
+    assert_eq!(
+        (
+            mine.project.as_str(),
+            mine.project_id,
+            mine.run_project.as_str()
+        ),
+        ("api", old, "acme-api")
+    );
+    assert_eq!(mine.run_legacy_name.as_deref(), Some("api"));
+    assert_eq!((mine.run_sessions, mine.run_pages), (1, 0));
+
+    // Adversarial: another operator's and another harness's sessions in
+    // that same project are never named.
+    assert_eq!(holder("theirs-old").await, None);
+    assert_eq!(holder("codex-old").await, None);
+    // Control: a session already in the run's project, and one never
+    // recorded, are not splits.
+    assert_eq!(holder("mine-new").await, None);
+    assert_eq!(holder("never-seen").await, None);
+}

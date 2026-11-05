@@ -80,7 +80,7 @@ pub use router::{
     hook_router,
 };
 pub use synth::{SessionDigest, synthesize_session_page};
-pub use workstream::{WorkstreamState, workstream_router};
+pub use workstream::{NATIVE_SESSION_IN_OTHER_PROJECT, WorkstreamState, workstream_router};
 
 /// Request header every first-party client (native hook and CLI, the shell and
 /// PowerShell hook bundles, the generated TypeScript integrations) sends to the

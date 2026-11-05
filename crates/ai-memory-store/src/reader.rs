@@ -3253,6 +3253,19 @@ impl ReaderPool {
             .await
     }
 
+    /// The other project already holding a native session this run could not
+    /// link (#1993).
+    pub async fn managed_run_native_session_holder(
+        &self,
+        run_id: ManagedRunId,
+        native_session_id: String,
+    ) -> StoreResult<Option<crate::NativeSessionHolder>> {
+        self.with_conn(move |conn| {
+            crate::workstream::native_session_holder(conn, run_id, &native_session_id)
+        })
+        .await
+    }
+
     /// Return the unseen portable range assigned to a managed SessionStart.
     pub async fn managed_run_context(
         &self,

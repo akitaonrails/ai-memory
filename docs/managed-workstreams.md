@@ -1431,6 +1431,32 @@ to seed the new managed workstream. Keep the old checkout path available until
 recovery is verified. Automatic discovery intentionally requires the recorded
 checkout to match exactly.
 
+### A repository that gained its remote after capture began
+
+A project's name comes from the git remote, or from the folder name when the
+checkout has no remote. Sessions captured before the remote was added stay in
+the folder-named project, while `ai-memory run` resolves the remote-derived
+one, so resuming one of those sessions cannot link it to the run. The server
+refuses the link with the `native_session_in_other_project` conflict, which
+names both projects (only for the operator and harness that recorded the
+session).
+
+When the folder-named project is the remote-derived project's old name and
+the remote-derived project has no sessions or pages yet, the repair loses
+nothing:
+
+1. rename the empty remote-derived project aside, to `<name>-split-<date>`;
+2. rename the folder-named project to the remote-derived name. A rename keeps
+   the project id, so its sessions, observations and pages follow.
+
+On a terminal, `ai-memory run` explains this and offers to do both renames
+(default yes), then starts the session again. Off a terminal it stops before
+the agent starts and prints the two `ai-memory rename-project --project-id`
+commands. When the remote-derived project already holds sessions or pages,
+nothing is renamed automatically, because either rename would leave one half
+under an unexpected name. Compare the two projects first
+([lifecycle operations](lifecycle-ops.md)).
+
 ## Manual acceptance
 
 The opt-in acceptance runner exercises launcher edge cases and then orchestrates
