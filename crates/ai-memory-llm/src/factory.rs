@@ -21,7 +21,7 @@ use crate::auth::{AuthRequirement, CopilotAuth, ProviderAuth};
 use crate::embedding::{Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
-use crate::openai::REQUEST_ID_HEADER;
+use crate::openai::{REQUEST_ID_HEADER, REQUEST_METADATA_HEADERS};
 use crate::provider::LlmProvider;
 
 /// LLM providers available to ai-memory.
@@ -157,6 +157,12 @@ pub struct ProviderConfig {
     /// through this rather than per-provider special cases. Parsed once from
     /// `AI_MEMORY_LLM_HEADERS` by `Config::load`; empty by default.
     pub extra_headers: crate::ExtraHeaders,
+    /// OpenAI-compat only: send the `x-ai-memory-*` request metadata headers
+    /// (the operation's workload, and the workspace, project and username
+    /// it names) on every chat attempt. Opt-in, off by default, ignored by
+    /// every other provider. Sourced once from
+    /// `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` by `Config::load`.
+    pub request_metadata_headers: bool,
 }
 
 /// Embedding providers available to ai-memory.
@@ -441,6 +447,20 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                      with the logical operation id"
                 )));
             }
+            // Refused whether or not the metadata is on: a gateway that reads
+            // these names must never see a static value posing as a
+            // per-operation one, and turning the setting on later must not
+            // turn a working configuration into a startup failure.
+            if let Some(name) = REQUEST_METADATA_HEADERS
+                .into_iter()
+                .find(|name| extra_headers.contains(name))
+            {
+                return Err(LlmError::NotConfigured(format!(
+                    "AI_MEMORY_LLM_HEADERS must not set {name}: the openai-compat \
+                     provider reserves it for the per-operation request metadata \
+                     (llm_request_metadata_headers)"
+                )));
+            }
             let extra_headers = with_default_openrouter_headers(&base, extra_headers);
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
@@ -450,7 +470,8 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                     .with_timeout_secs(timeout)
                     .with_reasoning_effort(config.reasoning_effort)
                     .with_extra_headers(extra_headers)
-                    .with_request_id_header(),
+                    .with_request_id_header()
+                    .with_request_metadata_headers(config.request_metadata_headers),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
@@ -689,6 +710,7 @@ mod tests {
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers: crate::ExtraHeaders::default(),
+            request_metadata_headers: false,
         };
 
         let err = match build_provider(cfg) {
@@ -710,6 +732,7 @@ mod tests {
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers,
+            request_metadata_headers: false,
         }
     }
 
@@ -764,6 +787,30 @@ mod tests {
         );
     }
 
+    /// The request metadata names are reserved the same way, whether or not
+    /// the metadata is on, so enabling it later never breaks a working
+    /// configuration and a static value never poses as a per-operation one.
+    #[test]
+    fn openai_compat_refuses_a_static_request_metadata_header() {
+        for name in REQUEST_METADATA_HEADERS {
+            for enabled in [false, true] {
+                let headers =
+                    crate::ExtraHeaders::parse([format!("{}: static", name.to_uppercase())])
+                        .expect("valid");
+                let mut config = compat_config(headers);
+                config.request_metadata_headers = enabled;
+                let err = match build_provider(config) {
+                    Ok(_) => panic!("{name} must be refused at startup"),
+                    Err(err) => err,
+                };
+                let rendered = err.to_string();
+                assert!(matches!(err, LlmError::NotConfigured(_)), "{rendered}");
+                assert!(rendered.contains(name), "{rendered}");
+                assert!(rendered.contains("openai-compat"), "{rendered}");
+            }
+        }
+    }
+
     /// The refusal is scoped to the provider that owns the header: the same
     /// static entry is a legitimate operator configuration everywhere else.
     #[test]
@@ -783,6 +830,7 @@ mod tests {
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
             extra_headers: headers,
+            request_metadata_headers: false,
         };
         assert!(
             build_provider(cfg).is_ok(),
@@ -815,7 +863,7 @@ mod tests {
         let provider = build_provider(cfg).expect("provider builds");
         let operation_id = crate::LlmOperationId::new();
         provider
-            .complete_with_operation_id(crate::ChatRequest::user_prompt("hi"), operation_id)
+            .complete_with_operation_id(crate::ChatRequest::user_prompt("hi"), operation_id.clone())
             .await
             .expect("completion succeeds");
 

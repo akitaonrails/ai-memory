@@ -146,7 +146,9 @@ where
 {
     let mut attempt = 1;
     loop {
-        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
+        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id.clone())
+            .await
+        {
             Ok(value) => return Ok(value),
             Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
                 let wait = consolidation_retry_wait(&e, retry_delay);
@@ -5232,7 +5234,7 @@ mod tests {
 
     /// Gateway compatibility of a fresh operation id: the 36-character
     /// hyphenated UUID v7 form a gateway records in `X-Request-Id`.
-    fn assert_fresh_gateway_form(id: LlmOperationId) {
+    fn assert_fresh_gateway_form(id: &LlmOperationId) {
         let s = id.to_string();
         assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
         let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
@@ -5303,8 +5305,8 @@ mod tests {
                 single1[0], single2[0],
                 "two single invocations of one session get distinct operation ids"
             );
-            assert_fresh_gateway_form(single1[0]);
-            assert_fresh_gateway_form(single2[0]);
+            assert_fresh_gateway_form(&single1[0]);
+            assert_fresh_gateway_form(&single2[0]);
             assert_eq!(
                 single1[0].workload(),
                 ai_memory_llm::LlmWorkload::Consolidation
@@ -5373,8 +5375,8 @@ mod tests {
                 multi1[0], multi2[0],
                 "two multi invocations of one session get distinct operation ids"
             );
-            assert_fresh_gateway_form(multi1[0]);
-            assert_fresh_gateway_form(multi2[0]);
+            assert_fresh_gateway_form(&multi1[0]);
+            assert_fresh_gateway_form(&multi2[0]);
             assert_eq!(
                 multi1[0].workload(),
                 ai_memory_llm::LlmWorkload::Consolidation

@@ -363,7 +363,7 @@ async fn complete_chunk_with_retry(
         match complete_structured_with_operation_id::<BootstrapBatch>(
             llm,
             request.clone(),
-            operation_id,
+            operation_id.clone(),
         )
         .await
         {

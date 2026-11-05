@@ -809,18 +809,23 @@ mod tests {
                     request_timeout_secs: 5,
                     reasoning_effort: Some(ReasoningEffort::High),
                     extra_headers: ExtraHeaders::parse(["x-test: routed"]).unwrap(),
+                    request_metadata_headers: false,
                 })
                 .unwrap();
                 let operation_id = LlmOperationId::new();
                 let request = ChatRequest::user_prompt("hello");
                 let response = provider
-                    .complete_with_operation_id(request.clone(), operation_id)
+                    .complete_with_operation_id(request.clone(), operation_id.clone())
                     .await
                     .unwrap();
                 assert_eq!(response.model, model);
                 let schema = json!({"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]});
                 let result = provider
-                    .complete_structured_raw_with_operation_id(request, schema, operation_id)
+                    .complete_structured_raw_with_operation_id(
+                        request,
+                        schema,
+                        operation_id.clone(),
+                    )
                     .await
                     .unwrap();
                 assert_eq!(result, json!({"ok": true}));
@@ -1119,7 +1124,7 @@ mod tests {
         .unwrap();
         let operation_id = LlmOperationId::new();
         let response = provider
-            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id)
+            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id.clone())
             .await
             .unwrap();
 
@@ -1160,7 +1165,7 @@ mod tests {
         .unwrap();
         let operation_id = LlmOperationId::new();
         let response = provider
-            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id)
+            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id.clone())
             .await
             .unwrap();
 
@@ -1333,7 +1338,7 @@ mod tests {
         .unwrap();
         let operation_id = LlmOperationId::new();
         provider
-            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id)
+            .complete_with_operation_id(ChatRequest::user_prompt("hello"), operation_id.clone())
             .await
             .unwrap();
 
@@ -1386,7 +1391,7 @@ mod tests {
             .complete_structured_raw_with_operation_id(
                 ChatRequest::user_prompt("emit JSON"),
                 schema,
-                operation_id,
+                operation_id.clone(),
             )
             .await
             .unwrap();
