@@ -6,7 +6,7 @@ use std::fs;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
-use super::{ClaudeMemArgs, DEFAULT_DEST_PREFIX, run};
+use super::{ClaudeMemArgs, DEFAULT_DEST_PREFIX, Mapping, plan_snapshot, run, snapshot_database};
 use crate::agentmemory::e2e::{start, tool};
 
 #[tokio::test]
@@ -126,4 +126,80 @@ async fn e2e_claude_mem_batch_is_searchable_private_and_idempotent() {
     assert_eq!(second["present_versions"], 2, "{second}");
     assert_eq!(second["dropped"]["sensitive_observations"], 1);
     assert!(!second.to_string().contains("E2E-SENSITIVE-SENTINEL-1840"));
+}
+
+/// A page the 3.4.0 importer wrote, with claude-mem's JSON lists copied as
+/// text, is this import's own output: a rerun on a real server writes the new
+/// layout over it.
+#[tokio::test]
+async fn e2e_claude_mem_rerun_replaces_the_earlier_list_layout() {
+    let Some(server) = start().await else { return };
+    let scope = json!({"workspace": "e2e", "project": "claude-mem-upgrade"});
+    let mut seed = scope.clone();
+    seed["path"] = json!("seed.md");
+    seed["body"] = json!("# Import destination");
+    seed["kind"] = json!("fact");
+    seed["tier"] = json!("semantic");
+    seed["create_only"] = json!(true);
+    tool(&server, "memory_write_page", seed).await;
+
+    let files = tempfile::tempdir().unwrap();
+    let database = files.path().join("claude-mem.db");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_versions(id INTEGER PRIMARY KEY, version INTEGER UNIQUE NOT NULL, applied_at TEXT NOT NULL);\
+             INSERT INTO schema_versions(version,applied_at) VALUES(53,'now');\
+             CREATE TABLE sdk_sessions(memory_session_id TEXT UNIQUE, project TEXT NOT NULL, cwd TEXT);\
+             INSERT INTO sdk_sessions VALUES('memory-1','api','/checkout/api');\
+             CREATE TABLE observations(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, text TEXT, type TEXT NOT NULL, title TEXT, subtitle TEXT, facts TEXT, narrative TEXT, files_read TEXT, files_modified TEXT, created_at TEXT NOT NULL);\
+             INSERT INTO observations VALUES(1,'memory-1','api',NULL,'decision','Use the bounded writer',NULL,'[\"Writes commit in one batch\"]','Batch writes preserve atomicity','[\"src/writer.rs\"]','[]','2026-10-31');\
+             CREATE TABLE session_summaries(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, request TEXT, learned TEXT, created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+    drop(connection);
+    let mapping = files.path().join("mapping.json");
+    fs::write(
+        &mapping,
+        r#"{"projects":{"api":{"workspace":"e2e","project":"claude-mem-upgrade"}}}"#,
+    )
+    .unwrap();
+    let path = "imported/claude-mem/decision/1.md";
+    let snapshot = snapshot_database(&database).unwrap();
+    let plan = plan_snapshot(
+        &snapshot,
+        &Mapping::load(&mapping).unwrap(),
+        DEFAULT_DEST_PREFIX,
+    )
+    .unwrap();
+    let version = &plan
+        .pages
+        .iter()
+        .find(|page| page.path == path)
+        .unwrap()
+        .versions[0];
+    let mut earlier = scope.clone();
+    earlier["path"] = json!(path);
+    earlier["title"] = json!(version.title);
+    earlier["body"] = json!(version.previous_bodies[0]);
+    earlier["kind"] = json!(version.kind);
+    earlier["tier"] = json!(version.tier);
+    earlier["create_only"] = json!(true);
+    tool(&server, "memory_write_page", earlier).await;
+
+    run(ClaudeMemArgs {
+        database: Some(database.clone()),
+        mapping,
+        dest_prefix: DEFAULT_DEST_PREFIX.into(),
+        server_url: server.url.clone(),
+        apply: true,
+        manifest_out: Some(files.path().join("manifest.json")),
+        show_body: false,
+    })
+    .await
+    .unwrap();
+    let mut read = scope.clone();
+    read["path"] = json!(path);
+    let page = tool(&server, "memory_read_page", read).await;
+    assert_eq!(page["body"].as_str(), Some(version.body.as_str()), "{page}");
 }
