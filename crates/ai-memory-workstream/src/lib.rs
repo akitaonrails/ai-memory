@@ -23,11 +23,9 @@ pub use jail::{
     parse_jail_toggles, usable_ai_jail, usable_ai_jail_here,
 };
 pub use jail_contract::{
-    JailContract, JailPreflight, JailRefusal, JailRequest, JailStatus, ServerReach,
-    ai_jail_contract, ai_jail_harness_name, contract_configure_invocation, contract_flags,
-    contract_invocation, contract_requests, contract_status_invocation,
-    exit_code as jail_exit_code, parse_capabilities, parse_status, preflight as jail_preflight,
-    request_manifest, server_reach,
+    JailContract, JailRefusal, JailStatus, ServerReach, ai_jail_contract, ai_jail_harness_name,
+    contract_flags, contract_invocation, contract_status_invocation, harness_env_names,
+    parse_capabilities, parse_status, server_reach, status_refusal,
 };
 pub use repository::{
     RepositoryFingerprints, RepositoryIdentity, inspect_repository, inspect_repository_fingerprints,

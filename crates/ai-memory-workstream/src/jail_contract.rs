@@ -1,13 +1,18 @@
 //! ai-jail's wrapper integration contract (ai-jail 3.0.1 and newer).
 //!
 //! Vendor doc: <https://github.com/akitaonrails/ai-jail/blob/v3.0.1/docs/WRAPPER_INTEGRATION.md>.
-//! ai-memory declares the harness it launches (`--harness`) and describes what
-//! it needs in a request manifest (`--request-file`). A request is never a
-//! grant: ai-jail's own review shows it, the user approves or denies it there,
-//! and ai-jail saves the approval outside the checkout. A read-only
-//! `status --json` tells the wrapper, before it launches, whether a review is
-//! still needed. Everything here is pure so each case of the doc is
-//! unit-tested without a sandbox.
+//! ai-memory names the harness it launches (`--harness`) so ai-jail neither
+//! guesses it from ai-memory's argv nor reviews it as an unknown command, and
+//! asks the read-only `status --json` whether the launch can start at all.
+//!
+//! What the session needs is passed as command-line flags (`--agent-state`,
+//! `--env NAME`), which ai-jail applies without a prompt. The contract's
+//! request manifest is not used: ai-jail asks a separate yes/no for every
+//! request, one per variable, and the flags carry the same names with no
+//! prompt. ai-jail's own first-run review stays the one place the user decides
+//! the rest (network, credentials, SSH).
+//!
+//! Everything here is pure so each case is unit-tested without a sandbox.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -30,8 +35,6 @@ struct Capabilities {
     schema_version: u32,
     #[serde(default)]
     flags: Vec<String>,
-    #[serde(default)]
-    request_kinds: Vec<String>,
     features: CapabilityFeatures,
 }
 
@@ -40,33 +43,20 @@ struct CapabilityFeatures {
     #[serde(default)]
     harness_flag: bool,
     #[serde(default)]
-    request_file: bool,
-    #[serde(default)]
     status_json: bool,
-    #[serde(default)]
-    configure_requests: bool,
 }
 
 /// Read `ai-jail capabilities --json`. `None` unless it is schema version 1
-/// and offers every piece ai-memory relies on: `--harness`, `--request-file`,
-/// `status --json`, `configure` with requests, and the `env` and
-/// `agent_state` request kinds. Anything less keeps the older flag-based
-/// launch.
+/// with `--harness` and `status --json`; anything less keeps the older
+/// flag-only launch.
 #[must_use]
 pub fn parse_capabilities(json: &str) -> Option<JailContract> {
     let capabilities: Capabilities = serde_json::from_str(json).ok()?;
     let features = &capabilities.features;
-    let has_flag = |flag: &str| capabilities.flags.iter().any(|known| known == flag);
-    let has_kind = |kind: &str| capabilities.request_kinds.iter().any(|known| known == kind);
     (capabilities.schema_version == 1
         && features.harness_flag
-        && features.request_file
         && features.status_json
-        && features.configure_requests
-        && has_flag("--harness")
-        && has_flag("--request-file")
-        && has_kind("env")
-        && has_kind("agent_state"))
+        && capabilities.flags.iter().any(|flag| flag == "--harness"))
     .then_some(JailContract {
         version: capabilities.version,
     })
@@ -74,10 +64,10 @@ pub fn parse_capabilities(json: &str) -> Option<JailContract> {
 
 /// Ask the installed ai-jail for its wrapper contract. An older ai-jail treats
 /// any unknown word as the command to sandbox, so `capabilities` is only asked
-/// of one whose `--help` already lists `--harness` and `--request-file`.
+/// of one whose `--help` already lists `--harness`.
 #[must_use]
 pub fn ai_jail_contract(ai_jail: &Path, support: &JailSupport) -> Option<JailContract> {
-    if !(support.supports("harness") && support.supports("request-file")) {
+    if !support.supports("harness") {
         return None;
     }
     let output = std::process::Command::new(ai_jail)
@@ -93,7 +83,7 @@ pub fn ai_jail_contract(ai_jail: &Path, support: &JailSupport) -> Option<JailCon
 }
 
 /// The name ai-jail knows `harness` by, for `--harness`. `None` for a harness
-/// ai-jail has no preset for; those keep the flag-based launch, because
+/// ai-jail has no preset for; those keep the flag-only launch, because
 /// ai-jail refuses an unknown `--harness` name.
 #[must_use]
 pub const fn ai_jail_harness_name(harness: ManagedHarness) -> Option<&'static str> {
@@ -110,6 +100,65 @@ pub const fn ai_jail_harness_name(harness: ManagedHarness) -> Option<&'static st
         ManagedHarness::Antigravity => Some("antigravity"),
         ManagedHarness::CommandCode | ManagedHarness::Copilot => None,
     }
+}
+
+/// Every provider credential in [`crate::FORWARDED_ENV_NAMES`].
+const PROVIDER_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+];
+
+/// The provider credentials `harness` itself reads, or `None` for a
+/// multi-provider harness that may use any of them.
+const fn harness_keys(harness: ManagedHarness) -> Option<&'static [&'static str]> {
+    match harness {
+        ManagedHarness::Claude => Some(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ]),
+        ManagedHarness::Codex => Some(&["OPENAI_API_KEY"]),
+        ManagedHarness::Antigravity => Some(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+        ManagedHarness::Copilot => Some(&["COPILOT_GITHUB_TOKEN"]),
+        // Their keys are not in FORWARDED_ENV_NAMES; ai-jail forwards
+        // XAI_API_KEY and MOONSHOT_API_KEY itself with the harness state.
+        ManagedHarness::Grok | ManagedHarness::Kimi => Some(&[]),
+        ManagedHarness::OpenCode
+        | ManagedHarness::OpenCode2
+        | ManagedHarness::Pi
+        | ManagedHarness::Crush
+        | ManagedHarness::Omp
+        | ManagedHarness::Kiro
+        | ManagedHarness::KiroV3
+        | ManagedHarness::CommandCode => None,
+    }
+}
+
+/// The forwarded variable names that `harness` needs, from those set: every
+/// ai-memory routing name, `CLAUDE_CONFIG_DIR` for Claude only, and only the
+/// harness's own provider keys. A Claude session has no use for an OpenAI key,
+/// so it never enters that jail.
+#[must_use]
+pub fn harness_env_names(harness: ManagedHarness, present: &[&'static str]) -> Vec<&'static str> {
+    present
+        .iter()
+        .copied()
+        .filter(|name| {
+            if *name == "CLAUDE_CONFIG_DIR" {
+                return harness == ManagedHarness::Claude;
+            }
+            if !PROVIDER_KEYS.contains(name) {
+                return true;
+            }
+            harness_keys(harness).is_none_or(|keys| keys.contains(name))
+        })
+        .collect()
 }
 
 /// How the jailed harness reaches the memory server.
@@ -164,95 +213,26 @@ pub fn server_reach(url: &str) -> ServerReach {
     }
 }
 
-/// One entry of the request manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JailRequest {
-    /// Pass this environment variable's name (ai-jail copies the value from
-    /// its own environment; the manifest never holds it).
-    Env(&'static str),
-    /// Mount the harness's own login and state directories.
-    AgentState,
-}
-
-/// Why ai-memory asks for `name`, shown in ai-jail's review.
-fn env_reason(name: &str) -> &'static str {
-    match name {
-        "AI_MEMORY_SERVER_URL" | "AI_MEMORY_HOOK_URL" | "AI_MEMORY_BASE_PATH" => {
-            "where ai-memory hooks send the session's activity"
-        }
-        "AI_MEMORY_AUTH_TOKEN" => "ai-memory server login for the hooks",
-        "AI_MEMORY_DATA_DIR" => "ai-memory's data directory",
-        "AI_MEMORY_JAIL_NEXT_RUN" => "the command ai-memory prints for the next launch",
-        "CLAUDE_CONFIG_DIR" => "where Claude Code keeps its settings",
-        _ => "the harness's own API login",
-    }
-}
-
-/// The manifest ai-memory hands ai-jail: schema version 1, requester
-/// `ai-memory`, one item per request with the reason the review shows. The
-/// order is fixed (agent state, then `env_names` in the given order) so an
-/// unchanged launch writes an identical file and ai-jail's exact approval
-/// match keeps holding.
-#[must_use]
-pub fn request_manifest(requests: &[JailRequest]) -> String {
-    let items: Vec<serde_json::Value> = requests
-        .iter()
-        .map(|request| match request {
-            JailRequest::AgentState => serde_json::json!({
-                "kind": "agent_state",
-                "value": true,
-                "reason": "the harness keeps its login between jailed runs",
-            }),
-            JailRequest::Env(name) => serde_json::json!({
-                "kind": "env",
-                "value": name,
-                "reason": env_reason(name),
-            }),
-        })
-        .collect();
-    let manifest = serde_json::json!({
-        "version": 1,
-        "requester": "ai-memory",
-        "requests": items,
-    });
-    let mut text = serde_json::to_string_pretty(&manifest).unwrap_or_default();
-    text.push('\n');
-    text
-}
-
-/// The requests for one launch: the harness's state, then each forwarded
-/// environment name actually present.
-#[must_use]
-pub fn contract_requests(env_names_present: &[&'static str]) -> Vec<JailRequest> {
-    std::iter::once(JailRequest::AgentState)
-        .chain(env_names_present.iter().copied().map(JailRequest::Env))
-        .collect()
-}
-
 /// The sandbox flags of a contract launch, without the command: the declared
-/// harness, the manifest, how the server is reached, `--no-save-config`, the
-/// user's own toggles and the extra folders. Toggles and folders stay flags:
-/// the user chose them in ai-memory (`--jail=…`, the folder picker,
-/// `--jail-map`), which is the consent a request would ask for again.
+/// harness, how the server is reached, the harness state, `--no-save-config`,
+/// one `--env NAME` per variable, the user's own toggles and the extra
+/// folders. All are command-line grants, which ai-jail applies without a
+/// prompt.
 ///
-/// `--no-save-config` stops ai-jail from saving these flags as permanent
+/// With `--agent-state` ai-jail also forwards the declared harness's own API
+/// key. `--no-save-config` stops ai-jail from saving these flags as permanent
 /// project restrictions (an unchecked `--no-ssh` would otherwise keep SSH off
-/// after the user approved it in ai-jail's review). The review's own approvals
+/// after the user approved it in ai-jail's review); the review's own approvals
 /// are saved either way.
 #[must_use]
 pub fn contract_flags(
     harness: &str,
-    request_file: &Path,
     reach: ServerReach,
+    env_names: &[&str],
     toggles: &[crate::JailToggleChoice],
     folders: &[(&Path, bool)],
 ) -> Vec<OsString> {
-    let mut argv = vec![
-        OsString::from("--harness"),
-        OsString::from(harness),
-        OsString::from("--request-file"),
-        request_file.as_os_str().to_os_string(),
-    ];
+    let mut argv = vec![OsString::from("--harness"), OsString::from(harness)];
     match reach {
         ServerReach::Loopback { port } => {
             argv.push(OsString::from("--forward-port"));
@@ -260,7 +240,12 @@ pub fn contract_flags(
         }
         ServerReach::Network => argv.push(OsString::from("--network")),
     }
+    argv.push(OsString::from("--agent-state"));
     argv.push(OsString::from("--no-save-config"));
+    for name in env_names {
+        argv.push(OsString::from("--env"));
+        argv.push(OsString::from(*name));
+    }
     argv.extend(toggles.iter().map(|toggle| OsString::from(toggle.flag())));
     for (path, writable) in folders {
         argv.push(OsString::from(if *writable { "--rw-map" } else { "--map" }));
@@ -300,26 +285,11 @@ pub fn contract_status_invocation(
     argv
 }
 
-/// `configure --harness H --request-file P`: ai-jail's review of the requests.
-#[must_use]
-pub fn contract_configure_invocation(harness: &str, request_file: &Path) -> Vec<OsString> {
-    vec![
-        OsString::from("configure"),
-        OsString::from("--harness"),
-        OsString::from(harness),
-        OsString::from("--request-file"),
-        request_file.as_os_str().to_os_string(),
-    ]
-}
-
-/// What `status --json` reported that ai-memory acts on.
+/// The blockers `status --json` reported, as stable code and ai-jail's
+/// message.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JailStatus {
-    /// Every declared harness finished ai-jail's first-run review here.
-    pub onboarding_complete: bool,
-    /// Requests ai-jail has not approved, as `kind value`.
-    pub pending: Vec<String>,
-    /// Stable blocker codes with ai-jail's message.
+    /// `(code, message)` per blocker.
     pub blockers: Vec<(String, String)>,
 }
 
@@ -327,29 +297,7 @@ pub struct JailStatus {
 struct StatusJson {
     schema_version: u32,
     #[serde(default)]
-    harnesses: Vec<StatusHarness>,
-    #[serde(default)]
-    requests: StatusRequests,
-    #[serde(default)]
     blockers: Vec<StatusBlocker>,
-}
-
-#[derive(Deserialize)]
-struct StatusHarness {
-    #[serde(default)]
-    onboarding_complete: bool,
-}
-
-#[derive(Deserialize, Default)]
-struct StatusRequests {
-    #[serde(default)]
-    pending: Vec<StatusRequest>,
-}
-
-#[derive(Deserialize)]
-struct StatusRequest {
-    kind: String,
-    value: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -363,27 +311,7 @@ struct StatusBlocker {
 #[must_use]
 pub fn parse_status(json: &str) -> Option<JailStatus> {
     let status: StatusJson = serde_json::from_str(json).ok()?;
-    if status.schema_version != 1 {
-        return None;
-    }
-    Some(JailStatus {
-        onboarding_complete: !status.harnesses.is_empty()
-            && status
-                .harnesses
-                .iter()
-                .all(|harness| harness.onboarding_complete),
-        pending: status
-            .requests
-            .pending
-            .into_iter()
-            .map(|request| {
-                let value = match request.value {
-                    serde_json::Value::String(text) => text,
-                    other => other.to_string(),
-                };
-                format!("{} {value}", request.kind)
-            })
-            .collect(),
+    (status.schema_version == 1).then(|| JailStatus {
         blockers: status
             .blockers
             .into_iter()
@@ -392,73 +320,33 @@ pub fn parse_status(json: &str) -> Option<JailStatus> {
     })
 }
 
-/// What to do before the launch, from [`JailStatus`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JailPreflight {
-    /// Launch. On a first run in a terminal, ai-jail's own review covers the
-    /// requests.
-    Launch,
-    /// Run ai-jail's review (`configure`) first: a reviewed project gained a
-    /// request, and ai-jail refuses to launch until it is approved.
-    Configure,
-    /// The launch cannot succeed now; the reason says why and what to do.
-    Refuse(JailRefusal),
-}
-
-/// Why a contract launch was refused before it started.
+/// Why a contract launch cannot start, with ai-jail's own message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JailRefusal {
-    /// The sandbox backend is missing or untrusted (ai-jail's message).
+    /// The sandbox backend is missing or untrusted.
     Backend(String),
     /// A saved approval no longer matches this host: a missing variable, a
-    /// replaced folder, a changed SSH key (ai-jail's message).
+    /// replaced folder, a changed SSH key.
     Drift(String),
-    /// A review is needed and there is no terminal to hold it.
-    NeedsReview,
 }
 
-/// Blocker codes for a saved approval that drifted from the host
-/// (`status --json`, exit 4).
+/// Blocker codes for a saved approval that drifted from the host.
 const DRIFT_BLOCKERS: &[&str] = &["missing_approved_env", "directory_drift", "changed_ssh_key"];
 
-/// Decide the preflight. A backend or drift blocker refuses; pending requests
-/// in a reviewed project need `configure`; a first run needs a terminal for
-/// ai-jail's review. Unknown blocker codes are left to ai-jail, which states
-/// them itself when it refuses.
+/// The refusal `status` calls for, if any. Only a missing backend and drifted
+/// approvals stop the launch here: a first run is ai-jail's own review to
+/// hold, and an unknown code is ai-jail's to explain when it refuses.
 #[must_use]
-pub fn preflight(status: &JailStatus, interactive: bool) -> JailPreflight {
-    for (code, message) in &status.blockers {
+pub fn status_refusal(status: &JailStatus) -> Option<JailRefusal> {
+    status.blockers.iter().find_map(|(code, message)| {
         if code == "backend_unavailable" {
-            return JailPreflight::Refuse(JailRefusal::Backend(message.clone()));
+            Some(JailRefusal::Backend(message.clone()))
+        } else if DRIFT_BLOCKERS.contains(&code.as_str()) {
+            Some(JailRefusal::Drift(message.clone()))
+        } else {
+            None
         }
-        if DRIFT_BLOCKERS.contains(&code.as_str()) {
-            return JailPreflight::Refuse(JailRefusal::Drift(message.clone()));
-        }
-    }
-    let review_needed = !status.onboarding_complete || !status.pending.is_empty();
-    if !review_needed {
-        return JailPreflight::Launch;
-    }
-    if !interactive {
-        return JailPreflight::Refuse(JailRefusal::NeedsReview);
-    }
-    if status.onboarding_complete {
-        JailPreflight::Configure
-    } else {
-        JailPreflight::Launch
-    }
-}
-
-/// ai-jail's machine exit codes (`capabilities --json` `exit_codes`).
-pub mod exit_code {
-    /// A request is refused, changed, or not approved.
-    pub const REQUIRED_GRANT: i32 = 3;
-    /// A saved approval is blocked by host drift.
-    pub const BLOCKED: i32 = 4;
-    /// The platform sandbox backend is unavailable.
-    pub const BACKEND_UNAVAILABLE: i32 = 5;
-    /// The user cancelled the review.
-    pub const CANCELLED: i32 = 130;
+    })
 }
 
 #[cfg(test)]
@@ -499,15 +387,8 @@ mod tests {
         for (from, to) in [
             (r#""schema_version": 1"#, r#""schema_version": 2"#),
             (r#""harness_flag": true"#, r#""harness_flag": false"#),
-            (r#""request_file": true"#, r#""request_file": false"#),
             (r#""status_json": true"#, r#""status_json": false"#),
-            (
-                r#""configure_requests": true"#,
-                r#""configure_requests": false"#,
-            ),
             (r#""--harness", "#, ""),
-            (r#""agent_state", "#, ""),
-            (r#""env", "#, ""),
         ] {
             let json = CAPABILITIES_3_0_1.replace(from, to);
             assert_ne!(json, CAPABILITIES_3_0_1, "{from}");
@@ -528,6 +409,23 @@ mod tests {
         );
     }
 
+    const ALL_HARNESSES: [ManagedHarness; 14] = [
+        ManagedHarness::Claude,
+        ManagedHarness::Codex,
+        ManagedHarness::OpenCode,
+        ManagedHarness::OpenCode2,
+        ManagedHarness::Pi,
+        ManagedHarness::Crush,
+        ManagedHarness::Omp,
+        ManagedHarness::Kimi,
+        ManagedHarness::CommandCode,
+        ManagedHarness::Kiro,
+        ManagedHarness::KiroV3,
+        ManagedHarness::Grok,
+        ManagedHarness::Antigravity,
+        ManagedHarness::Copilot,
+    ];
+
     #[test]
     fn every_managed_harness_maps_to_an_ai_jail_preset_or_none() {
         // The names ai-jail 3.0.1 accepts for `--harness` (src/command.rs
@@ -544,28 +442,79 @@ mod tests {
             "kimi",
             "kiro-cli",
         ];
-        for harness in [
-            ManagedHarness::Claude,
-            ManagedHarness::Codex,
-            ManagedHarness::OpenCode,
-            ManagedHarness::OpenCode2,
-            ManagedHarness::Pi,
-            ManagedHarness::Crush,
-            ManagedHarness::Omp,
-            ManagedHarness::Kimi,
-            ManagedHarness::CommandCode,
-            ManagedHarness::Kiro,
-            ManagedHarness::KiroV3,
-            ManagedHarness::Grok,
-            ManagedHarness::Antigravity,
-            ManagedHarness::Copilot,
-        ] {
+        for harness in ALL_HARNESSES {
             if let Some(name) = ai_jail_harness_name(harness) {
                 assert!(ACCEPTED.contains(&name), "{harness:?} -> {name}");
             }
         }
         assert_eq!(ai_jail_harness_name(ManagedHarness::Copilot), None);
         assert_eq!(ai_jail_harness_name(ManagedHarness::CommandCode), None);
+    }
+
+    #[test]
+    fn a_harness_gets_only_its_own_provider_keys() {
+        let present = crate::FORWARDED_ENV_NAMES;
+        let claude = harness_env_names(ManagedHarness::Claude, present);
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        ] {
+            assert!(claude.contains(&key), "{key}");
+        }
+        for key in [
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+        ] {
+            assert!(!claude.contains(&key), "claude got {key}");
+        }
+        let codex = harness_env_names(ManagedHarness::Codex, present);
+        assert!(codex.contains(&"OPENAI_API_KEY"));
+        assert!(!codex.contains(&"ANTHROPIC_API_KEY"));
+        assert!(!codex.contains(&"CLAUDE_CONFIG_DIR"));
+        let grok = harness_env_names(ManagedHarness::Grok, present);
+        assert!(
+            PROVIDER_KEYS.iter().all(|key| !grok.contains(key)),
+            "{grok:?}"
+        );
+        // Multi-provider harnesses keep every key that is set.
+        let opencode = harness_env_names(ManagedHarness::OpenCode, present);
+        assert!(
+            PROVIDER_KEYS.iter().all(|key| opencode.contains(key)),
+            "{opencode:?}"
+        );
+        // ai-memory's own routing reaches every harness.
+        for harness in ALL_HARNESSES {
+            let names = harness_env_names(harness, present);
+            for name in [
+                "AI_MEMORY_SERVER_URL",
+                "AI_MEMORY_AUTH_TOKEN",
+                "AI_MEMORY_JAIL_NEXT_RUN",
+            ] {
+                assert!(names.contains(&name), "{harness:?} lost {name}");
+            }
+        }
+        // Only names that are set are ever passed.
+        assert_eq!(
+            harness_env_names(ManagedHarness::Claude, &["AI_MEMORY_SERVER_URL"]),
+            ["AI_MEMORY_SERVER_URL"]
+        );
+    }
+
+    #[test]
+    fn every_forwarded_name_is_either_routing_or_a_known_provider_key() {
+        // A new provider key added to FORWARDED_ENV_NAMES must be classified
+        // here, or it would reach every harness's jail.
+        for name in crate::FORWARDED_ENV_NAMES {
+            assert!(
+                PROVIDER_KEYS.contains(name)
+                    || name.starts_with("AI_MEMORY_")
+                    || *name == "CLAUDE_CONFIG_DIR",
+                "{name} is unclassified"
+            );
+        }
     }
 
     #[test]
@@ -600,36 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn the_manifest_is_schema_1_with_reasons_and_no_values() {
-        let manifest = request_manifest(&contract_requests(&[
-            "AI_MEMORY_SERVER_URL",
-            "AI_MEMORY_AUTH_TOKEN",
-        ]));
-        let parsed: serde_json::Value = serde_json::from_str(&manifest).unwrap();
-        assert_eq!(parsed["version"], 1);
-        assert_eq!(parsed["requester"], "ai-memory");
-        let requests = parsed["requests"].as_array().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[0]["kind"], "agent_state");
-        assert_eq!(requests[0]["value"], true);
-        assert_eq!(requests[1]["kind"], "env");
-        assert_eq!(requests[1]["value"], "AI_MEMORY_SERVER_URL");
-        assert_eq!(requests[2]["value"], "AI_MEMORY_AUTH_TOKEN");
-        for request in requests {
-            assert!(!request["reason"].as_str().unwrap().is_empty(), "{request}");
-        }
-        // Stable bytes: an unchanged launch writes the same manifest.
-        assert_eq!(
-            manifest,
-            request_manifest(&contract_requests(&[
-                "AI_MEMORY_SERVER_URL",
-                "AI_MEMORY_AUTH_TOKEN"
-            ]))
-        );
-    }
-
-    #[test]
-    fn contract_flags_declare_the_harness_and_reach_the_server() {
+    fn contract_flags_are_grants_without_any_request() {
         let toggles = [JailToggleChoice {
             stem: "github",
             enable: true,
@@ -637,8 +557,8 @@ mod tests {
         }];
         let flags = contract_flags(
             "claude",
-            Path::new("/data/jail-requests/abc.json"),
             ServerReach::Loopback { port: 49374 },
+            &["AI_MEMORY_SERVER_URL", "ANTHROPIC_API_KEY"],
             &toggles,
             &[(Path::new("/src/sibling"), false)],
         );
@@ -647,39 +567,35 @@ mod tests {
             [
                 "--harness",
                 "claude",
-                "--request-file",
-                "/data/jail-requests/abc.json",
                 "--forward-port",
                 "49374",
+                "--agent-state",
                 "--no-save-config",
+                "--env",
+                "AI_MEMORY_SERVER_URL",
+                "--env",
+                "ANTHROPIC_API_KEY",
                 "--github",
                 "--map",
                 "/src/sibling",
             ]
         );
-        let lan = contract_flags(
-            "codex",
-            Path::new("/r.json"),
-            ServerReach::Network,
-            &[],
-            &[],
+        assert!(
+            !strings(&flags)
+                .iter()
+                .any(|flag| flag == "--request-file" || flag == "--request"),
+            "every request is a separate prompt in ai-jail"
         );
+        let lan = contract_flags("codex", ServerReach::Network, &[], &[], &[]);
         assert_eq!(
             strings(&lan),
             [
                 "--harness",
                 "codex",
-                "--request-file",
-                "/r.json",
                 "--network",
+                "--agent-state",
                 "--no-save-config"
             ]
-        );
-        // No `--agent-state` and no `--env`: those are requests now.
-        assert!(
-            !strings(&flags)
-                .iter()
-                .any(|flag| flag == "--agent-state" || flag == "--env")
         );
     }
 
@@ -712,90 +628,51 @@ mod tests {
                 "claude"
             ]
         );
-        assert_eq!(
-            strings(&contract_configure_invocation(
-                "claude",
-                Path::new("/r.json")
-            )),
-            [
-                "configure",
-                "--harness",
-                "claude",
-                "--request-file",
-                "/r.json"
-            ]
-        );
     }
 
-    /// The status 3.0.1 printed for a fresh project with four requests.
+    /// The status 3.0.1 printed for a fresh project.
     const STATUS_FRESH: &str = r#"{
       "version": "3.0.1", "schema_version": 1,
       "project": {"canonical_path": "/p", "profile_present": false},
       "harnesses": [{"name": "claude", "onboarding_complete": false}],
       "grants": {"restricted": ["unrestricted_network"], "allowed": [], "open": []},
-      "requests": {"approved": [], "pending": [
-        {"requester": "ai-memory", "kind": "private_host", "value": "192.168.0.90", "port": 49374},
-        {"requester": "ai-memory", "kind": "agent_state", "value": "true"}
-      ]},
+      "requests": {"approved": [], "pending": []},
       "blockers": [
-        {"code": "onboarding_required", "message": "Interactive onboarding is required before launch"},
-        {"code": "required_grant_not_approved", "message": "One or more wrapper requests are pending approval"}
+        {"code": "onboarding_required", "message": "Interactive onboarding is required before launch"}
       ]
     }"#;
 
     #[test]
-    fn status_of_a_fresh_project_needs_the_first_run_review() {
+    fn a_first_run_is_left_to_ai_jails_own_review() {
         let status = parse_status(STATUS_FRESH).unwrap();
-        assert!(!status.onboarding_complete);
-        assert_eq!(
-            status.pending,
-            ["private_host 192.168.0.90", "agent_state true"]
-        );
-        assert_eq!(preflight(&status, true), JailPreflight::Launch);
-        assert_eq!(
-            preflight(&status, false),
-            JailPreflight::Refuse(JailRefusal::NeedsReview)
-        );
+        assert_eq!(status.blockers.len(), 1);
+        assert_eq!(status_refusal(&status), None);
     }
 
     #[test]
-    fn preflight_decision_table() {
-        let reviewed = |pending: &[&str], blockers: &[(&str, &str)]| JailStatus {
-            onboarding_complete: true,
-            pending: pending.iter().map(|text| (*text).to_owned()).collect(),
-            blockers: blockers
-                .iter()
-                .map(|(code, message)| ((*code).to_owned(), (*message).to_owned()))
-                .collect(),
+    fn only_a_missing_backend_or_drifted_access_refuses() {
+        let with = |code: &str| JailStatus {
+            blockers: vec![(code.to_owned(), "why".to_owned())],
         };
-        // Reviewed and nothing pending: launch, with or without a terminal.
-        assert_eq!(preflight(&reviewed(&[], &[]), true), JailPreflight::Launch);
-        assert_eq!(preflight(&reviewed(&[], &[]), false), JailPreflight::Launch);
-        // A new request in a reviewed project: configure first, or refuse
-        // without a terminal (ai-jail would exit 3 either way).
-        let new = reviewed(&["env AI_MEMORY_AUTH_TOKEN"], &[]);
-        assert_eq!(preflight(&new, true), JailPreflight::Configure);
-        assert_eq!(
-            preflight(&new, false),
-            JailPreflight::Refuse(JailRefusal::NeedsReview)
-        );
-        // Drift and a missing backend refuse even in a terminal, quoting ai-jail.
         for code in DRIFT_BLOCKERS {
             assert_eq!(
-                preflight(&reviewed(&[], &[(code, "why")]), true),
-                JailPreflight::Refuse(JailRefusal::Drift("why".to_owned())),
+                status_refusal(&with(code)),
+                Some(JailRefusal::Drift("why".to_owned())),
                 "{code}"
             );
         }
         assert_eq!(
-            preflight(&reviewed(&[], &[("backend_unavailable", "no bwrap")]), true),
-            JailPreflight::Refuse(JailRefusal::Backend("no bwrap".to_owned()))
+            status_refusal(&with("backend_unavailable")),
+            Some(JailRefusal::Backend("why".to_owned()))
         );
-        // An unknown code is ai-jail's to explain.
-        assert_eq!(
-            preflight(&reviewed(&[], &[("future_code", "x")]), true),
-            JailPreflight::Launch
-        );
+        for code in [
+            "onboarding_required",
+            "required_grant_not_approved",
+            "future_code",
+        ] {
+            assert_eq!(status_refusal(&with(code)), None, "{code}");
+        }
+        assert_eq!(status_refusal(&JailStatus::default()), None);
     }
 
     #[test]
@@ -806,8 +683,5 @@ mod tests {
         );
         assert_eq!(parse_status("{}"), None);
         assert_eq!(parse_status("nope"), None);
-        // No harness listed is not a completed review.
-        let none = parse_status(r#"{"schema_version": 1}"#).unwrap();
-        assert!(!none.onboarding_complete);
     }
 }

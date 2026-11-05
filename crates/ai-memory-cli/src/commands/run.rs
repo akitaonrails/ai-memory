@@ -14,22 +14,21 @@ use ai_memory_core::{
 };
 use ai_memory_workstream::{
     AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, FORWARDED_ENV_NAMES,
-    JailChecklistItem, JailHostFacts, JailPreflight, JailRefusal, JailRisk, JailSupport,
-    JailToggleChoice, JailToggleKind, LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness,
-    NativeSessionCandidate, ServerReach, ai_jail_contract, ai_jail_harness_name, ai_jail_support,
+    JailChecklistItem, JailHostFacts, JailRefusal, JailRisk, JailSupport, JailToggleChoice,
+    JailToggleKind, LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate,
+    ServerReach, ai_jail_contract, ai_jail_harness_name, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_jail_process_isolation,
     apply_yolo, build_ai_jail_invocation, build_launch_plan, build_launch_plan_with_env_lookup,
     checklist_reason, claude_continued_session, claude_continued_sessions,
-    claude_live_background_attach_id, claude_session_ran_in_background, clean_path,
-    contract_configure_invocation, contract_flags, contract_invocation, contract_requests,
-    contract_status_invocation, crush_global_config_path, discover_native_session,
-    export_transcript, has_native_session_selector, inside_ai_jail_here, inspect_repository,
-    is_interactive_session_invocation, jail_checklist, jail_exit_code, jail_preflight, jail_spec,
-    jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
+    claude_live_background_attach_id, claude_session_ran_in_background, clean_path, contract_flags,
+    contract_invocation, contract_status_invocation, crush_global_config_path,
+    discover_native_session, export_transcript, harness_env_names, has_native_session_selector,
+    inside_ai_jail_here, inspect_repository, is_interactive_session_invocation, jail_checklist,
+    jail_spec, jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
     kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
     kiro_v3_resume_uses_default_store, list_native_sessions, marked_choices, native_session_exists,
     native_session_in_checkout, native_store_root, omp_profile_flag, omp_profile_flag_env,
-    parse_jail_toggles, parse_status, request_manifest, server_reach, store_override_vars,
+    parse_jail_toggles, parse_status, server_reach, status_refusal, store_override_vars,
     transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
     wait_for_transcript_flush,
 };
@@ -828,8 +827,6 @@ async fn run_once_with_wiring(
             JailLaunch {
                 support: &support,
                 contract: contract.as_ref(),
-                interactive,
-                checkout_key: &jail_inputs.checkout_key,
             },
             &toggles,
             jail_facts.project_config,
@@ -3576,9 +3573,6 @@ async fn confirm_yolo_and_maybe_reexec(
         JailLaunch {
             support: &support,
             contract: contract.as_ref(),
-            // The offer is only made in a terminal.
-            interactive: true,
-            checkout_key: &inputs.checkout_key,
         },
         &toggles,
         facts.project_config,
@@ -3590,6 +3584,8 @@ async fn confirm_yolo_and_maybe_reexec(
 /// The installed ai-jail speaks the wrapper contract for this harness.
 #[derive(Debug, Clone)]
 struct ContractTarget {
+    /// The harness launched.
+    managed: ManagedHarness,
     /// The `--harness` name.
     harness: &'static str,
     /// ai-jail's version, for the summary line.
@@ -3604,9 +3600,11 @@ fn jail_contract_for(
     support: &JailSupport,
     harness: Option<ManagedHarness>,
 ) -> Option<ContractTarget> {
-    let name = ai_jail_harness_name(harness?)?;
+    let managed = harness?;
+    let name = ai_jail_harness_name(managed)?;
     let contract = ai_jail_contract(ai_jail, support)?;
     Some(ContractTarget {
+        managed,
         harness: name,
         version: contract.version,
     })
@@ -3617,28 +3615,21 @@ fn jail_contract_for(
 struct JailLaunch<'a> {
     support: &'a JailSupport,
     contract: Option<&'a ContractTarget>,
-    /// Whether a terminal can hold ai-jail's review.
-    interactive: bool,
-    /// The checkout the request manifest belongs to.
-    checkout_key: &'a str,
 }
 
 /// What a contract launch needs from [`exec_under_ai_jail`].
 #[derive(Clone, Copy)]
 struct ContractExec<'a> {
     contract: &'a ContractTarget,
-    interactive: bool,
-    checkout_key: &'a str,
     exe: &'a Path,
     forwarded: &'a [OsString],
     present: &'a [&'static str],
     resolved: &'a [(&'static str, String)],
 }
 
-/// Re-exec under ai-jail 3.0.1+ through its wrapper contract
-/// (docs/design-yolo-safety-ai-jail.md §6): declare the harness, hand over
-/// the request manifest, ask the read-only `status --json` whether ai-jail
-/// still has to review anything, run that review when it must, and launch.
+/// Re-exec under ai-jail 3.0.1+ (docs/design-yolo-safety-ai-jail.md §6):
+/// declare the harness, pass what it needs as command-line grants, ask the
+/// read-only `status --json` whether the launch can start, and launch.
 /// Returns only on failure.
 fn exec_under_ai_jail_contract(
     ai_jail: &Path,
@@ -3648,44 +3639,26 @@ fn exec_under_ai_jail_contract(
     folders: &[super::jail_folders::ExtraFolder],
 ) -> anyhow::Error {
     let i18n = &config.i18n;
-    let manifest = request_manifest(&contract_requests(exec.present));
-    let request_file =
-        match super::jail_requests::write(&config.data_dir, exec.checkout_key, &manifest) {
-            Ok(path) => path,
-            Err(error) => return error.context("preparing the ai-jail request file"),
-        };
     let reach = server_reach(&config.server_url);
     let folder_pairs: Vec<(&Path, bool)> = folders
         .iter()
         .map(|folder| (folder.path.as_path(), folder.writable))
         .collect();
+    let env_names = harness_env_names(exec.contract.managed, exec.present);
     let flags = contract_flags(
         exec.contract.harness,
-        &request_file,
         reach,
+        &env_names,
         toggles,
         &folder_pairs,
     );
-    let review = std::iter::once(ai_jail.as_os_str().to_os_string())
-        .chain(contract_configure_invocation(
-            exec.contract.harness,
-            &request_file,
-        ))
-        .map(|word| super::render_shared::shell_quote(&word.to_string_lossy()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let read_status = || {
-        jail_status(
-            ai_jail,
-            &contract_status_invocation(&flags, exec.exe, exec.forwarded),
-            exec.resolved,
-        )
-    };
-    let hold_review = || run_jail_review(ai_jail, &review, exec, &request_file);
-    if let Err(error) =
-        settle_jail_review(i18n, &review, exec.interactive, read_status, hold_review)
-    {
-        return error;
+    let status = jail_status(
+        ai_jail,
+        &contract_status_invocation(&flags, exec.exe, exec.forwarded),
+        exec.resolved,
+    );
+    if let Some(refusal) = status.as_ref().and_then(status_refusal) {
+        return jail_refusal_error(i18n, ai_jail, exec.contract.harness, refusal);
     }
     eprintln!("{}", jail_summary(toggles, false, folders));
     eprintln!(
@@ -3699,56 +3672,27 @@ fn exec_under_ai_jail_contract(
     )
 }
 
-/// Bring ai-jail to a state where the launch can start, or say why not:
-/// read the status of the exact launch, refuse on a missing backend or
-/// drifted approval, hold ai-jail's review when a reviewed project gained a
-/// request, and check after the review that nothing is left pending (ai-jail
-/// itself would refuse the launch with exit 3 otherwise). A status that cannot
-/// be read lets the launch go ahead: ai-jail then explains any refusal.
-fn settle_jail_review(
+/// The error for a launch `status --json` says cannot start, quoting
+/// ai-jail's reason. Drifted access names the command that reviews it again.
+fn jail_refusal_error(
     i18n: &ai_memory_core::i18n::Localizer,
-    review: &str,
-    interactive: bool,
-    read_status: impl Fn() -> Option<ai_memory_workstream::JailStatus>,
-    hold_review: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let Some(status) = read_status() else {
-        return Ok(());
-    };
-    match jail_preflight(&status, interactive) {
-        JailPreflight::Launch => Ok(()),
-        JailPreflight::Configure => {
-            eprintln!(
-                "{}",
-                i18n.diagnostic(&format!(
-                    "ai-memory: ai-jail has to review new access for this project first: {}",
-                    status.pending.join(", ")
-                ))
+    ai_jail: &Path,
+    harness: &str,
+    refusal: JailRefusal,
+) -> anyhow::Error {
+    match refusal {
+        JailRefusal::Backend(message) => anyhow!(i18n.diagnostic(&format!(
+            "ai-jail cannot start its sandbox on this machine: {message}"
+        ))),
+        JailRefusal::Drift(message) => {
+            let review = format!(
+                "{} configure {harness}",
+                super::render_shared::shell_quote(&ai_jail.to_string_lossy())
             );
-            hold_review()?;
-            match read_status() {
-                Some(after) if !after.pending.is_empty() => Err(anyhow!(i18n.diagnostic(
-                    &format!(
-                        "ai-jail did not approve {}; the agent was not started. Review it again with: {review}",
-                        after.pending.join(", ")
-                    )
-                ))),
-                _ => Ok(()),
-            }
-        }
-        JailPreflight::Refuse(JailRefusal::Backend(message)) => Err(anyhow!(i18n.diagnostic(
-            &format!("ai-jail cannot start its sandbox on this machine: {message}")
-        ))),
-        JailPreflight::Refuse(JailRefusal::Drift(message)) => Err(anyhow!(i18n.diagnostic(
-            &format!(
+            anyhow!(i18n.diagnostic(&format!(
                 "ai-jail's saved access for this project no longer matches this machine: {message}. Review it with: {review}"
-            )
-        ))),
-        JailPreflight::Refuse(JailRefusal::NeedsReview) => Err(anyhow!(i18n.diagnostic(
-            &format!(
-                "ai-jail has to review this project's access first, and that needs a terminal. Run this, then launch again: {review}"
-            )
-        ))),
+            )))
+        }
     }
 }
 
@@ -3791,33 +3735,6 @@ fn jail_status(
     parse_status(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Hold ai-jail's review of the requests in this terminal.
-fn run_jail_review(
-    ai_jail: &Path,
-    review: &str,
-    exec: ContractExec<'_>,
-    request_file: &Path,
-) -> Result<()> {
-    let status = std::process::Command::new(ai_jail)
-        .args(contract_configure_invocation(
-            exec.contract.harness,
-            request_file,
-        ))
-        .envs(exec.resolved.iter().map(|(name, value)| (name, value)))
-        .status()
-        .with_context(|| format!("running {review}"))?;
-    match status.code() {
-        Some(0) => Ok(()),
-        Some(jail_exit_code::CANCELLED) => Err(anyhow!(
-            "ai-jail review cancelled; the agent was not started"
-        )),
-        code => Err(anyhow!(
-            "ai-jail review ended without approving the access (exit {}); the agent was not started. Run it again with: {review}",
-            code.map_or_else(|| "signal".to_owned(), |code| code.to_string())
-        )),
-    }
-}
-
 /// Re-exec the original invocation under `ai_jail` with `toggles`, after the
 /// one-line summary. Returns only on failure.
 fn exec_under_ai_jail(
@@ -3853,8 +3770,6 @@ fn exec_under_ai_jail(
             config,
             ContractExec {
                 contract,
-                interactive: launch.interactive,
-                checkout_key: launch.checkout_key,
                 exe: &exe,
                 forwarded: &forwarded,
                 present: &present,
@@ -6535,155 +6450,6 @@ mod tests {
             contract_summary(&i18n, "3.0.1", "codex", ServerReach::Network)
                 .contains("full network, because the memory server is not on this machine")
         );
-    }
-
-    fn jail_status_of(
-        onboarding_complete: bool,
-        pending: &[&str],
-        blockers: &[(&str, &str)],
-    ) -> ai_memory_workstream::JailStatus {
-        ai_memory_workstream::JailStatus {
-            onboarding_complete,
-            pending: pending.iter().map(|item| (*item).to_owned()).collect(),
-            blockers: blockers
-                .iter()
-                .map(|(code, message)| ((*code).to_owned(), (*message).to_owned()))
-                .collect(),
-        }
-    }
-
-    /// Run [`settle_jail_review`] against a scripted sequence of statuses and
-    /// a review outcome; report the result, how many statuses were read and
-    /// how many reviews were held.
-    fn settle(
-        statuses: Vec<Option<ai_memory_workstream::JailStatus>>,
-        interactive: bool,
-        review: Result<()>,
-    ) -> (Result<()>, usize, usize) {
-        let i18n = ai_memory_core::i18n::Localizer::default();
-        let reads = std::cell::Cell::new(0);
-        let held = std::cell::Cell::new(0);
-        let result = settle_jail_review(
-            &i18n,
-            "ai-jail configure --harness claude --request-file /r.json",
-            interactive,
-            || {
-                let index = reads.get();
-                reads.set(index + 1);
-                statuses.get(index).cloned().flatten()
-            },
-            || {
-                held.set(held.get() + 1);
-                review
-            },
-        );
-        (result, reads.get(), held.get())
-    }
-
-    #[test]
-    fn a_review_that_approves_everything_lets_the_launch_go() {
-        let (result, reads, held) = settle(
-            vec![
-                Some(jail_status_of(true, &["env AI_MEMORY_AUTH_TOKEN"], &[])),
-                Some(jail_status_of(true, &[], &[])),
-            ],
-            true,
-            Ok(()),
-        );
-        assert!(result.is_ok(), "{result:?}");
-        assert_eq!((reads, held), (2, 1));
-    }
-
-    /// The user denied a request in ai-jail's review: ai-jail exits 0 from
-    /// `configure`, but the launch would exit 3, so ai-memory stops first and
-    /// says how to review again.
-    #[test]
-    fn a_review_that_leaves_a_request_pending_stops_the_launch() {
-        let (result, reads, held) = settle(
-            vec![
-                Some(jail_status_of(true, &["env AI_MEMORY_AUTH_TOKEN"], &[])),
-                Some(jail_status_of(true, &["env AI_MEMORY_AUTH_TOKEN"], &[])),
-            ],
-            true,
-            Ok(()),
-        );
-        let error = result.unwrap_err().to_string();
-        assert!(
-            error.contains("did not approve env AI_MEMORY_AUTH_TOKEN"),
-            "{error}"
-        );
-        assert!(error.contains("the agent was not started"), "{error}");
-        assert!(
-            error.contains("configure --harness claude --request-file /r.json"),
-            "{error}"
-        );
-        assert_eq!((reads, held), (2, 1));
-    }
-
-    #[test]
-    fn a_cancelled_review_stops_without_reading_the_status_again() {
-        let (result, reads, held) = settle(
-            vec![Some(jail_status_of(true, &["agent_state true"], &[]))],
-            true,
-            Err(anyhow!(
-                "ai-jail review cancelled; the agent was not started"
-            )),
-        );
-        assert!(result.unwrap_err().to_string().contains("cancelled"));
-        assert_eq!((reads, held), (1, 1));
-    }
-
-    #[test]
-    fn refusals_never_hold_a_review() {
-        let cases = [
-            (
-                jail_status_of(true, &["agent_state true"], &[]),
-                false,
-                "needs a terminal",
-            ),
-            (
-                jail_status_of(false, &["agent_state true"], &[]),
-                false,
-                "needs a terminal",
-            ),
-            (
-                jail_status_of(
-                    true,
-                    &[],
-                    &[("missing_approved_env", "AI_MEMORY_SERVER_URL is not set")],
-                ),
-                true,
-                "no longer matches this machine: AI_MEMORY_SERVER_URL is not set",
-            ),
-            (
-                jail_status_of(true, &[], &[("backend_unavailable", "bwrap not found")]),
-                true,
-                "cannot start its sandbox on this machine: bwrap not found",
-            ),
-        ];
-        for (status, interactive, expected) in cases {
-            let (result, _, held) = settle(vec![Some(status.clone())], interactive, Ok(()));
-            let error = result.expect_err(expected).to_string();
-            assert!(error.contains(expected), "{error}");
-            assert_eq!(held, 0, "{status:?}");
-        }
-    }
-
-    /// A first run in a terminal goes straight to the launch: ai-jail's own
-    /// first-run review covers the requests. An unreadable status also
-    /// launches, leaving any refusal to ai-jail.
-    #[test]
-    fn a_first_run_or_an_unreadable_status_launches_without_a_separate_review() {
-        let (result, _, held) = settle(
-            vec![Some(jail_status_of(false, &["agent_state true"], &[]))],
-            true,
-            Ok(()),
-        );
-        assert!(result.is_ok());
-        assert_eq!(held, 0);
-        let (result, reads, held) = settle(vec![None], false, Ok(()));
-        assert!(result.is_ok());
-        assert_eq!((reads, held), (1, 0));
     }
 
     fn run_checklist(input: &str) -> (io::Result<Vec<String>>, String) {
