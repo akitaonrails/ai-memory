@@ -11,6 +11,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- An OMP ranged read of a file that `[capture] ignore_paths` excludes, such
+  as `secrets.env:1-20`, is now dropped like the bare name. OMP's `read`
+  takes its line selector in `path`, and its `read` and `write` name archive
+  members and SQLite tables the same way (`vault.zip:notes/a.md`,
+  `app.db:users:42`), but capture matched the path as spelled, so an
+  exact-file or extension pattern missed it and the generated OMP extension
+  posted the content. The capture policy and the extension now also match
+  every part of an OMP `read` or `write` path before a `:` or `?`, and the
+  opt-in file index keys such a call by the file OMP reads (`src/app.ts` for
+  `src/app.ts:5-9`). Run `ai-memory upgrade`, or re-run `install-hooks
+  --agent omp --apply`, to regenerate the extension (#1990).
+
 ## [3.4.0] - 2026-11-04
 
 ### Added
