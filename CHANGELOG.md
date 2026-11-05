@@ -71,6 +71,9 @@ version in [`docs/changelog/`](docs/changelog/):
   messages and the error report a failed command prints on exit. Terminal
   controls and Unicode direction and line controls now display as `?`, while
   JSON output, document line breaks and tabs are preserved (#1987).
+- Fixed shell hooks injecting redirect and error response bodies as handoff
+  or brief context. Only 2xx responses now supply context, with the response
+  body preserved across all three authentication modes (#1986).
 
 ## [3.4.1] - 2026-11-05
 

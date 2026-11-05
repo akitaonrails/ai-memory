@@ -3332,6 +3332,17 @@ fn assert_every_ts_request_carries_client_marker(name: &str, source: &str) {
             call.contains("redirect: \"error\","),
             "{name}: a fetch that follows redirects:\n{call}"
         );
+        // A request without a method is a context read (handoff or recap):
+        // its body becomes agent context, so a 401 or 500 error page must
+        // read as "no context", as in the native hook and the shell bundle.
+        let options_end = source[at..].find("})").map_or(source.len(), |end| at + end);
+        if !source[at..options_end].contains("method:") {
+            let after: String = source[options_end..].chars().take(80).collect();
+            assert!(
+                after.contains("if (!response.ok) return undefined;"),
+                "{name}: a context read that injects a non-2xx body:\n{call}"
+            );
+        }
     }
     assert!(
         requests >= 3,

@@ -1092,13 +1092,22 @@ ai_memory_get_handoff() {
     esac
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" \
-            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" \
+            -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN") || return $?
     elif [ -n "$_amhdr" ]; then
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1" -H @"$_amhdr"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" -H @"$_amhdr") || return $?
     else
-        curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" "$1"
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1") || return $?
     fi
+    # Appending the status preserves the body's final newlines in the command
+    # substitution. Redirect and error bodies must never become agent context.
+    _amhandoff_code=${_amhandoff##*'
+'}
+    case "$_amhandoff_code" in
+        2??) printf '%s' "${_amhandoff%'
+'*}" ;;
+    esac
+    return 0
 }
 
 # True when SessionStart payload "$1" is the one an agent fires right after a
