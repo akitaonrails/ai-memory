@@ -1053,6 +1053,21 @@ session is open. The panel and session totals refresh every ten seconds. To
 enable capture, update the native client on each agent machine as well as the
 server.
 
+Pi sends cumulative session totals at `agent_end` and `session_shutdown`.
+Update both the server and client binary, run
+`ai-memory install-hooks --agent pi --apply`, then `/reload` in an existing Pi
+session. The extension reads saved entries, so reloads, resumes and repeated
+reports do not reset or double-count the totals. Fresh input, output, cache
+reads and cache writes stay separate; missing usage stays unknown. Saved
+compaction, branch-summary, cache-warming and nested-tool usage also count when
+Pi records them.
+
+These totals follow Pi's `/session` accounting: all entries in the session,
+including abandoned branches and history copied into a fork. A fork's total
+therefore includes inherited usage, not only work billed after the fork.
+Pi does **not** yet send individual response records to the Token usage ledger;
+session totals and coverage can be present while its response table is empty.
+
 The metric cards are navigation controls. Workspace cards sort the project
 list by the selected count, and Open sessions also selects projects that have
 an unfinished session. Project cards open the matching Agents, Sessions,
