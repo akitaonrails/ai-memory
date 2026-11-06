@@ -456,8 +456,8 @@ See [`managed-workstreams.md`](managed-workstreams.md).
 ## Recipe: run an unsupervised agent safely (`--yolo` + ai-jail)
 
 `--yolo` maps to each harness's dangerous-mode flag (Claude Code →
-`--dangerously-skip-permissions`), which runs every tool call with no
-confirmation. `ai-memory run --yolo` adds guardrails around that, gated
+`--dangerously-skip-permissions`, plus `--settings` forcing
+`bypassPermissions`), which runs every tool call with no confirmation. `ai-memory run --yolo` adds guardrails around that, gated
 entirely on a real interactive terminal (stdin and stderr both TTYs), so
 scripts, hooks, and CI are never prompted:
 
@@ -553,13 +553,11 @@ ai-memory run --yolo claude
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with
   `(jail) `); it fails open (shows the warning) when undetectable, never
   open to skipping it silently.
-- **Claude "true yolo".** `--true-yolo` includes everything `--yolo` does
-  (`ai-memory run claude --true-yolo` is enough; adding `--yolo` too is
-  harmless) and, for Claude, also forces `bypassPermissions` over any
-  `defaultMode` in your settings. For other harnesses it is the same as
-  `--yolo`. `claude_true_yolo = true` in `config.toml` /
-  `AI_MEMORY_CLAUDE_TRUE_YOLO=true` applies the Claude extra to every `--yolo`
-  launch, never to a run without it.
+- **Claude's own permission settings.** For Claude, `--yolo` also forces
+  `bypassPermissions` over any `defaultMode` in your settings, so an `auto` or
+  `acceptEdits` default cannot narrow the run. Through 3.4.2 that took a separate
+  `--true-yolo`; it is now a hidden alias of `--yolo` (it prints a one-line
+  note), and `claude_true_yolo` in `config.toml` is ignored (remove it).
   **It cannot remove your own `ask` rules**: Claude Code honors explicit
   `permissions.ask` rules (and its built-in command-safety checks) in every
   mode, so a rule like `Bash(docker run *)` in `~/.claude/settings.json` still

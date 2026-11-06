@@ -207,14 +207,9 @@ log_level = "info"
 # `ai-memory run --no-autowire`.
 # run_autowire = true
 
-# When true, `ai-memory run --yolo` on Claude also injects `--settings` that
-# force `bypassPermissions` over any `defaultMode` in the user's settings. A
-# launch without `--yolo` never bypasses permissions, and Claude Code still
-# enforces the user's own `ask` rules. No effect on other harnesses. Off by
-# default; best paired with ai-jail (docs/design-yolo-safety-ai-jail.md). Env
-# equivalent: `AI_MEMORY_CLAUDE_TRUE_YOLO=true`. `ai-memory run --true-yolo`
-# requests it for one launch.
-# claude_true_yolo = false
+# `claude_true_yolo` is deprecated and ignored since 3.4.3: `ai-memory run
+# --yolo` on Claude now always forces `bypassPermissions` over any settings
+# `defaultMode`. An older config that sets it still loads; remove the line.
 
 # Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
 # contradiction: same topic without being a near-duplicate. Pages at or above

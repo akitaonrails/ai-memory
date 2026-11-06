@@ -1,6 +1,6 @@
 //! Native command planning without filtering harness arguments.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 use ai_memory_core::AgentKind;
@@ -599,7 +599,8 @@ pub fn build_launch_plan_with_env_lookup(
 
 /// Apply the wrapper-owned dangerous-mode flag using native harness syntax.
 /// Harnesses that already execute tools without a permission gate need no
-/// extra argument.
+/// extra argument. For Claude it also forces `bypassPermissions` through
+/// `--settings` (see `CLAUDE_BYPASS_SETTINGS`). Idempotent.
 pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
     let flag = match harness {
         ManagedHarness::Claude => Some("--dangerously-skip-permissions"),
@@ -643,6 +644,28 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
             args.push(OsString::from(flag));
         }
     }
+    if harness == ManagedHarness::Claude && !has_claude_bypass_settings(args) {
+        args.push(OsString::from("--settings"));
+        args.push(OsString::from(CLAUDE_BYPASS_SETTINGS));
+    }
+}
+
+/// The `--settings` value Claude's `--yolo` adds on top of
+/// `--dangerously-skip-permissions`. `--skip` alone loses to a `defaultMode`
+/// in the user's or project's settings.json; a `--settings` flag outranks
+/// both, so this forces `bypassPermissions` over it. Claude Code still
+/// enforces explicit `ask` and `deny` rules and its own command-safety checks
+/// in every permission mode (documented: "Actions no mode auto-approves"), and
+/// `--settings` permission arrays union with the other scopes rather than
+/// replacing them, so this cannot silence an `ask` rule; the user removes
+/// those. Through 3.4.2 this was the separate `--true-yolo`. See
+/// `docs/design-yolo-safety-ai-jail.md` §4.
+const CLAUDE_BYPASS_SETTINGS: &str = r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#;
+
+fn has_claude_bypass_settings(args: &[OsString]) -> bool {
+    args.windows(2).any(|pair| {
+        pair[0] == OsStr::new("--settings") && pair[1] == OsStr::new(CLAUDE_BYPASS_SETTINGS)
+    })
 }
 
 /// Keep OpenCode's server and tool processes inside an ai-jail lifecycle.
@@ -664,26 +687,6 @@ pub fn apply_jail_process_isolation(harness: ManagedHarness, args: &mut Vec<OsSt
     }
     args.push(OsString::from("--standalone"));
     true
-}
-
-/// Opt-in Claude-only "true yolo": on top of [`apply_yolo`]'s
-/// `--dangerously-skip-permissions`, force `bypassPermissions` through
-/// `--settings`, whose CLI-flag precedence beats a `defaultMode` in the user's
-/// or project's settings.json. Claude Code still enforces explicit `ask` and
-/// `deny` rules and its own command-safety checks in every permission mode
-/// (documented: "Actions no mode auto-approves"), and `--settings` permission
-/// arrays union with the other scopes rather than replacing them — so this
-/// cannot silence an `ask` rule; the user removes those. See
-/// `docs/design-yolo-safety-ai-jail.md` §4. A no-op for every harness other
-/// than [`ManagedHarness::Claude`].
-pub fn apply_claude_true_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
-    if harness != ManagedHarness::Claude {
-        return;
-    }
-    args.push(OsString::from("--settings"));
-    args.push(OsString::from(
-        r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
-    ));
 }
 
 /// Whether a native invocation may use ai-memory's one-time adoption prompt.
@@ -1813,14 +1816,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_claude_true_yolo_forces_bypass_permissions_for_claude() {
+    fn claude_yolo_also_forces_bypass_permissions_once() {
         let mut args = vec![OsString::from("--model"), OsString::from("opus")];
-        apply_claude_true_yolo(ManagedHarness::Claude, &mut args);
+        apply_yolo(ManagedHarness::Claude, &mut args);
+        apply_yolo(ManagedHarness::Claude, &mut args);
         assert_eq!(
             strings(&args),
             [
                 "--model",
                 "opus",
+                "--dangerously-skip-permissions",
                 "--settings",
                 r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
             ]
@@ -1831,10 +1836,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_claude_true_yolo_is_noop_for_other_harnesses() {
-        let mut args = vec![OsString::from("--yolo")];
-        apply_claude_true_yolo(ManagedHarness::Codex, &mut args);
-        assert_eq!(strings(&args), ["--yolo"]);
+    fn non_claude_yolo_adds_no_claude_settings() {
+        for harness in [ManagedHarness::Codex, ManagedHarness::Antigravity] {
+            let mut args = Vec::new();
+            apply_yolo(harness, &mut args);
+            assert!(
+                !strings(&args).iter().any(|arg| arg == "--settings"),
+                "{} --yolo must not get Claude's settings",
+                harness.as_str()
+            );
+        }
     }
 
     #[test]
@@ -2194,11 +2205,8 @@ mod tests {
 
     #[test]
     fn wrapper_yolo_uses_each_harness_native_flag_without_duplicates() {
+        // Claude adds `--settings` too: `claude_yolo_also_forces_bypass_permissions_once`.
         for (harness, expected) in [
-            (
-                ManagedHarness::Claude,
-                Some("--dangerously-skip-permissions"),
-            ),
             (
                 ManagedHarness::Codex,
                 Some("--dangerously-bypass-approvals-and-sandbox"),

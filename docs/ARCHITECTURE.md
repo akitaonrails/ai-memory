@@ -1250,7 +1250,7 @@ contradiction_band_max = 0.75      # (lower/upper cosine-similarity edge). The b
 
 # Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
 # override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
-# AI_MEMORY_RUN_AUTOWIRE / AI_MEMORY_CLAUDE_TRUE_YOLO).
+# AI_MEMORY_RUN_AUTOWIRE).
 capture_assistant = false          # server-side opt-in: honor a Claude Code / Codex
                                    # client's sanitized assistant-final-message marker
                                    # on Stop (#196). Client half is baked separately by
@@ -1264,13 +1264,6 @@ run_autowire = true                # `ai-memory run <harness>` auto-installs tha
                                    # hooks + MCP on first launch if missing (idempotent,
                                    # one-time per harness+version+install location).
                                    # Also `--no-autowire`.
-claude_true_yolo = false           # opt-in: on a Claude `ai-memory run --yolo`, also
-                                   # silence the residual `--dangerously-skip-permissions`
-                                   # prompts (rm timeout/confirmation, PowerShell rm deny)
-                                   # and force `bypassPermissions` via `--settings`.
-                                   # Claude-only, no-op for every other harness. Also
-                                   # `--true-yolo`. See
-                                   # docs/design-yolo-safety-ai-jail.md.
 release_base_url = ""              # override the GitHub releases base URL that `ai-memory
                                    # upgrade` checks and downloads from (#801). Empty =
                                    # https://github.com/akitaonrails/ai-memory/releases.
