@@ -1443,14 +1443,14 @@ async fn canonical_target_conflict_rolls_back_the_promotion() {
             rusqlite::params![conflict.as_bytes().to_vec(), ws.as_bytes().to_vec()],
         )
         .unwrap();
-    let error =
+    // The empty, identity-less twin no longer makes the canonical name
+    // ambiguous (#2018): it reaches the repository owner. The promotion of the
+    // owner to that name still rolls back, because the twin holds it.
+    let resolved =
         create_explicit_scope_guarded(&store.reader, &store.writer, "default", "acme-api", None)
             .await
-            .unwrap_err();
-    assert!(matches!(
-        error,
-        ScopeResolutionError::ProjectNameAmbiguous { .. }
-    ));
+            .unwrap();
+    assert_eq!(resolved.scope.project_id, legacy);
     assert_eq!(row(&store, legacy).0, "api");
     assert_eq!(row(&store, conflict).0, "acme-api");
 }
@@ -1633,8 +1633,14 @@ async fn an_ambiguous_name_names_its_holders_but_not_a_restricted_one() {
     assert!(error.is_bad_request());
     assert_eq!(
         error.to_string(),
-        "project 'widget' is ambiguous in workspace 'default': it is the name of \
-         project 'widget' and the legacy key of project 'acme-widget'"
+        format!(
+            "project 'widget' is ambiguous in workspace 'default': it is the name of \
+             project 'widget' (empty) and the legacy key of project 'acme-widget' (owns \
+             repository github.com/acme/widget); for the project of repository \
+             github.com/acme/widget, pass project 'acme-widget'; the empty project 'widget' \
+             can be renamed out of the way with \
+             `ai-memory rename-project --project-id {declared} --to widget-empty`"
+        )
     );
 
     store
@@ -1647,8 +1653,12 @@ async fn an_ambiguous_name_names_its_holders_but_not_a_restricted_one() {
         .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "project 'widget' is ambiguous in workspace 'default': it is the name of \
-         project 'widget' and the legacy key of a restricted project"
+        format!(
+            "project 'widget' is ambiguous in workspace 'default': it is the name of \
+             project 'widget' (empty) and the legacy key of a restricted project; the empty \
+             project 'widget' can be renamed out of the way with \
+             `ai-memory rename-project --project-id {declared} --to widget-empty`"
+        )
     );
     assert!(!error.to_string().contains("acme-widget"));
 }
@@ -1658,7 +1668,7 @@ async fn an_ambiguous_name_on_the_write_path_names_the_workspace() {
     let tmp = tempfile::TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let ws = workspace(&store).await;
-    store
+    let declared = store
         .writer
         .get_or_create_project(ws, "widget", None)
         .await
@@ -1679,8 +1689,14 @@ async fn an_ambiguous_name_on_the_write_path_names_the_workspace() {
             .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "project 'widget' is ambiguous in workspace 'default': it is the name of \
-         project 'widget' and the legacy key of project 'acme-widget'"
+        format!(
+            "project 'widget' is ambiguous in workspace 'default': it is the name of \
+             project 'widget' (empty) and the legacy key of project 'acme-widget' (owns \
+             repository github.com/acme/widget); for the project of repository \
+             github.com/acme/widget, pass project 'acme-widget'; the empty project 'widget' \
+             can be renamed out of the way with \
+             `ai-memory rename-project --project-id {declared} --to widget-empty`"
+        )
     );
 }
 
@@ -1878,4 +1894,130 @@ async fn a_capture_of_an_existing_exact_name_still_lands_there() {
         .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 2, "no third row");
+}
+
+/// The state a pre-guard server can hold (#2018): the repository owner kept
+/// its folder name `api` (canonical key `acme-api`), and an empty,
+/// identity-less row was created under the literal `acme-api` before new rows
+/// were refused under another project's key.
+async fn owner_and_empty_canonical_twin(store: &Store) -> (WorkspaceId, ProjectId, ProjectId) {
+    let ws = workspace(store).await;
+    let owner = store
+        .writer
+        .get_or_create_project(ws, "api", None)
+        .await
+        .unwrap();
+    let twin = ProjectId::new();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE projects SET identity = 'github.com/acme/api', identity_source = 'git_remote', \
+         canonical_name = 'acme-api', legacy_name = 'api' WHERE id = ?1",
+        [owner.as_bytes().to_vec()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, 'acme-api', 0)",
+        rusqlite::params![twin.as_bytes().to_vec(), ws.as_bytes().to_vec()],
+    )
+    .unwrap();
+    (ws, owner, twin)
+}
+
+/// The repository's own remote-derived name reaches the project that owns
+/// the repository when the only other holder is an empty, identity-less
+/// leftover: on the read path, on the create-or-get write path, and without
+/// creating another row (#2018).
+#[tokio::test]
+async fn a_canonical_name_shadowed_by_an_empty_twin_reaches_the_repository_owner() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (_, owner, twin) = owner_and_empty_canonical_twin(&store).await;
+
+    let read = lookup_existing_scope(&store.reader, "default", "acme-api")
+        .await
+        .unwrap();
+    assert_eq!(read.project_id, owner);
+    assert_ne!(read.project_id, twin);
+    let write =
+        create_explicit_scope_guarded(&store.reader, &store.writer, "default", "acme-api", None)
+            .await
+            .unwrap();
+    assert_eq!(write.scope.project_id, owner);
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2, "no third project is created");
+    // The owner's own name still reaches it directly.
+    assert_eq!(
+        lookup_existing_scope(&store.reader, "default", "api")
+            .await
+            .unwrap()
+            .project_id,
+        owner
+    );
+}
+
+/// Adversarial: a twin that holds data, or any restricted candidate, keeps the
+/// name ambiguous. The refusal says which project owns the repository, which
+/// is empty, what to pass instead and how to move an empty one aside, and
+/// never names a restricted project or its repository.
+#[tokio::test]
+async fn a_twin_with_data_or_a_restricted_candidate_stays_ambiguous_with_a_way_forward() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, _owner, twin) = owner_and_empty_canonical_twin(&store).await;
+    store
+        .writer
+        .begin_session(ai_memory_core::NewSession {
+            occurred_at: None,
+            id: ai_memory_core::SessionId::new(),
+            workspace_id: ws,
+            project_id: twin,
+            agent_kind: ai_memory_core::AgentKind::Codex,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    let error = lookup_existing_scope(&store.reader, "default", "acme-api")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ScopeResolutionError::ProjectNameAmbiguous { .. }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "project 'acme-api' is ambiguous in workspace 'default': it is the name of project \
+         'acme-api' and the canonical key of project 'api' (owns repository \
+         github.com/acme/api); for the project of repository github.com/acme/api, pass \
+         project 'api'"
+    );
+
+    // The same pair with the twin empty but the owner restricted: still
+    // ambiguous, and the owner stays anonymous.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (_, owner, twin) = owner_and_empty_canonical_twin(&store).await;
+    store
+        .writer
+        .set_access_mode(owner, AccessMode::Restricted)
+        .await
+        .unwrap();
+    let error = lookup_existing_scope(&store.reader, "default", "acme-api")
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert_eq!(
+        message,
+        format!(
+            "project 'acme-api' is ambiguous in workspace 'default': it is the name of project \
+             'acme-api' (empty) and the canonical key of a restricted project; the empty \
+             project 'acme-api' can be renamed out of the way with \
+             `ai-memory rename-project --project-id {twin} --to acme-api-empty`"
+        )
+    );
+    assert!(!message.contains("github.com/acme/api"));
+    assert!(!message.contains(&owner.to_string()));
 }

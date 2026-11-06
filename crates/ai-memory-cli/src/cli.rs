@@ -80,6 +80,7 @@ fn delimit_run_native_args(args: &mut Vec<OsString>) {
         return;
     };
 
+    let value_flags = run_value_flags();
     index = run_index + 1;
     while index < args.len() {
         let Some(raw) = args[index].to_str() else {
@@ -88,21 +89,7 @@ fn delimit_run_native_args(args: &mut Vec<OsString>) {
         if raw == "--" {
             return;
         }
-        let key = raw.split_once('=').map_or(raw, |(key, _)| key);
-        let takes_separate_value = matches!(
-            key,
-            "--workspace"
-                | "--language"
-                | "--project"
-                | "--workstream"
-                | "--new"
-                | "--executable"
-                | "--profile"
-                | "--env"
-                | "--env-file"
-                | "--data-dir"
-                | "--config"
-        ) && !raw.contains('=');
+        let takes_separate_value = !raw.contains('=') && value_flags.iter().any(|flag| flag == raw);
         if takes_separate_value {
             index += 2;
             continue;
@@ -118,6 +105,24 @@ fn delimit_run_native_args(args: &mut Vec<OsString>) {
         }
         return;
     }
+}
+
+/// The `--long` options of `run` (including the global ones) that take their
+/// value as the next token, read from the clap definition itself so a new
+/// value-taking flag can never be mistaken for the harness (#1998). An option
+/// with `require_equals` (`--jail`) takes its value only after `=`.
+fn run_value_flags() -> Vec<String> {
+    let root = <Cli as clap::CommandFactory>::command();
+    let run_args = root
+        .find_subcommand("run")
+        .map(|run| run.get_arguments().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    root.get_arguments()
+        .cloned()
+        .chain(run_args)
+        .filter(|arg| arg.get_action().takes_values() && !arg.is_require_equals_set())
+        .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+        .collect()
 }
 
 /// Top-level CLI for the `ai-memory` binary.
@@ -3864,6 +3869,44 @@ mod tests {
     /// dotenv spelling `KEY = value` used to produce a key with a trailing
     /// space — an entry no shell and no harness can read, so the override
     /// silently did nothing.
+    /// The folder flags take one value each and combine in any order
+    /// before the harness (#1998).
+    #[test]
+    fn run_jail_folder_flags_repeat_and_combine_before_the_harness() {
+        let parse = |argv: &[&str]| {
+            let cli =
+                try_parse_from(argv.iter().copied()).unwrap_or_else(|error| panic!("{error}"));
+            let Command::Run(args) = cli.command else {
+                panic!("not run")
+            };
+            args
+        };
+        let args = parse(&[
+            "ai-memory",
+            "run",
+            "--jail=none",
+            "--jail-map",
+            "../ai-jail",
+            "--jail-rw-map",
+            "/srv/tap",
+            "--jail-map",
+            "../docs",
+            "claude",
+            "--model",
+            "opus",
+        ]);
+        assert_eq!(
+            args.jail_map,
+            [PathBuf::from("../ai-jail"), PathBuf::from("../docs")]
+        );
+        assert_eq!(args.jail_rw_map, [PathBuf::from("/srv/tap")]);
+        assert_eq!(args.harness, Some(RunHarnessChoice::Claude));
+        assert_eq!(
+            args.native_args,
+            ["--model", "opus"].map(std::ffi::OsString::from)
+        );
+    }
+
     #[test]
     fn env_entries_with_a_whitespace_key_are_refused() {
         for raw in [

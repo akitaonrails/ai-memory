@@ -61,6 +61,22 @@ always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
 
+## Recipe: stop the agent repeating something you rejected
+
+> "No, don't mock the database in this integration test. Last month a mock hid
+> a broken migration; use the shared test Postgres."
+
+With an LLM provider configured you don't have to ask for this to be
+remembered. After the session completes, the auto-improvement reviewer picks
+up a correction that comes with a reason, whatever language you wrote it in.
+It proposes a `_rules/` page, or a patch to the one already on that topic,
+saying what to avoid, why, and what to do instead, and it quotes your words as
+evidence. The proposal goes through your `[auto_improve]` approval policy. A
+plain "no" or a one-off rename does not become a rule. Details and limits are
+in [`auto-improvement-loop.md`](auto-improvement-loop.md#user-corrections).
+If the agent still repeats the mistake with the rule in place, turn the rule
+into a hook or a test.
+
 ## Recipe: notice when a page's code has changed
 
 > "Remember this deploy gotcha; it is about `bin/deploy.sh`."
@@ -538,6 +554,16 @@ ai-memory run --yolo claude
   automatically there, enable them in your global `~/.ai-jail` or pass
   `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
   run never writes its own flags into your repository's `.ai-jail`.
+- **With ai-jail 3.0.1 or newer.** ai-jail reviews the access itself, once
+  per project, so ai-memory's screen keeps only the extra folders (`f`).
+  ai-memory names the harness for ai-jail and passes what the session needs
+  as plain grants, with no extra prompts: the harness's login state, the
+  `AI_MEMORY_*` variables, and only that harness's own API key (a Claude jail
+  never gets your OpenAI key). A memory server on this machine is reached
+  through one forwarded port, so the network stays filtered unless you open
+  it in ai-jail's review; a server on another machine keeps full network,
+  which ai-jail labels OPEN. Copilot and Command Code, which ai-jail has no
+  preset for, keep the checklist above.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
   directly, so `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with

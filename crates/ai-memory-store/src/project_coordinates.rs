@@ -79,9 +79,12 @@ pub(crate) struct ProjectCoordinateMatch {
 }
 
 impl ProjectCoordinateMatch {
-    fn ambiguous_holder(&self) -> AmbiguousProjectHolder {
+    /// Describe this candidate for an ambiguity error. A restricted project
+    /// stays anonymous: the lookup runs before any caller is authorized.
+    fn ambiguous_holder(&self, empty: bool) -> AmbiguousProjectHolder {
+        let visible = !self.restricted;
         AmbiguousProjectHolder {
-            name: (!self.restricted).then(|| self.current_name.clone()),
+            name: visible.then(|| self.current_name.clone()),
             matched_by: if self.provenance.exact {
                 AmbiguousMatch::Name
             } else if self.provenance.canonical_compat {
@@ -89,8 +92,60 @@ impl ProjectCoordinateMatch {
             } else {
                 AmbiguousMatch::LegacyKey
             },
+            id: visible.then_some(self.id),
+            repository: self.identity.clone().filter(|_| visible),
+            empty: visible && empty,
         }
     }
+}
+
+/// Whether the project holds nothing a caller could mean by naming it: no
+/// sessions, observations, pages, handoffs or workstreams.
+fn project_is_empty(conn: &Connection, id: ProjectId) -> StoreResult<bool> {
+    Ok(conn.query_row(
+        "SELECT NOT (EXISTS(SELECT 1 FROM sessions WHERE project_id = ?1) \
+           OR EXISTS(SELECT 1 FROM observations WHERE project_id = ?1) \
+           OR EXISTS(SELECT 1 FROM pages WHERE project_id = ?1) \
+           OR EXISTS(SELECT 1 FROM handoffs WHERE project_id = ?1) \
+           OR EXISTS(SELECT 1 FROM workstreams WHERE project_id = ?1))",
+        [id.as_bytes()],
+        |row| row.get(0),
+    )?)
+}
+
+/// The one ambiguity that has a single sensible answer (#2018): the requested
+/// name is the canonical key (the full remote-derived name static clients are
+/// told to derive) of exactly one candidate that owns a repository identity,
+/// and every other candidate is an empty, identity-less project. Such a
+/// leftover row cannot be what a caller means by the repository's own name,
+/// and nothing can be read from it or lost by skipping it.
+///
+/// A legacy (basename) key match stays ambiguous: a marker may declare that
+/// folder-style name for a project that is simply not used yet (#1144). Any
+/// restricted candidate keeps the name ambiguous too, so an unauthorized
+/// caller never learns which project wins.
+fn identity_owner_over_empty_twins(
+    candidates: &[ProjectCoordinateMatch],
+    empty: &[bool],
+) -> Option<usize> {
+    if candidates.iter().any(|candidate| candidate.restricted) {
+        return None;
+    }
+    let mut owners = candidates.iter().enumerate().filter(|(_, candidate)| {
+        candidate.identity.is_some() && candidate.provenance.canonical_compat
+    });
+    let (owner, _) = owners.next()?;
+    if owners.next().is_some() {
+        return None;
+    }
+    candidates
+        .iter()
+        .zip(empty)
+        .enumerate()
+        .all(|(index, (candidate, empty))| {
+            index == owner || (*empty && candidate.identity.is_none())
+        })
+        .then_some(owner)
 }
 
 fn ambiguous(name: &str, holders: AmbiguousProjectHolders) -> StoreError {
@@ -216,15 +271,25 @@ pub(crate) fn resolve(
     match matches.len() {
         0 => Ok(None),
         1 => Ok(matches.pop()),
-        _ => Err(ambiguous(
-            requested,
-            AmbiguousProjectHolders(
-                matches
-                    .iter()
-                    .map(ProjectCoordinateMatch::ambiguous_holder)
-                    .collect(),
-            ),
-        )),
+        _ => {
+            let empty = matches
+                .iter()
+                .map(|candidate| project_is_empty(conn, candidate.id))
+                .collect::<StoreResult<Vec<_>>>()?;
+            if let Some(owner) = identity_owner_over_empty_twins(&matches, &empty) {
+                return Ok(Some(matches.swap_remove(owner)));
+            }
+            Err(ambiguous(
+                requested,
+                AmbiguousProjectHolders(
+                    matches
+                        .iter()
+                        .zip(&empty)
+                        .map(|(candidate, empty)| candidate.ambiguous_holder(*empty))
+                        .collect(),
+                ),
+            ))
+        }
     }
 }
 
@@ -311,6 +376,63 @@ pub(crate) fn resolve_aliases(
     Ok(Some(candidate))
 }
 
+/// An empty, identity-less project whose name is another project's canonical
+/// key: a leftover from before new rows were refused under another
+/// project's key (#2018). Name resolution already skips it; startup reports
+/// it so the operator can rename it out of the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShadowingTwin {
+    /// Workspace name.
+    pub(crate) workspace: String,
+    /// The empty project's id.
+    pub(crate) id: ProjectId,
+    /// Its name, which is also the owner's canonical key.
+    pub(crate) name: String,
+    /// The repository owner's current name.
+    pub(crate) owner: String,
+}
+
+/// Report up to `limit` [`ShadowingTwin`]s. Read-only.
+pub(crate) fn shadowing_empty_twins(
+    conn: &Connection,
+    limit: usize,
+) -> StoreResult<Vec<ShadowingTwin>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare(
+        "SELECT w.name, t.id, t.name, o.name FROM projects t \
+         JOIN projects o ON o.workspace_id = t.workspace_id AND o.id <> t.id \
+           AND o.canonical_name = t.name AND o.identity <> '' \
+         JOIN workspaces w ON w.id = t.workspace_id \
+         WHERE t.identity = '' AND t.access_mode <> 'restricted' AND o.access_mode <> 'restricted' \
+           AND NOT EXISTS(SELECT 1 FROM sessions WHERE project_id = t.id) \
+           AND NOT EXISTS(SELECT 1 FROM observations WHERE project_id = t.id) \
+           AND NOT EXISTS(SELECT 1 FROM pages WHERE project_id = t.id) \
+           AND NOT EXISTS(SELECT 1 FROM handoffs WHERE project_id = t.id) \
+           AND NOT EXISTS(SELECT 1 FROM workstreams WHERE project_id = t.id) \
+         ORDER BY w.name, t.name LIMIT ?1",
+    )?;
+    let rows = statement
+        .query_map([limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(workspace, id, name, owner)| {
+            Ok(ShadowingTwin {
+                workspace,
+                id: ProjectId::from_slice(&id)?,
+                name,
+                owner,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn promotion_target<'a>(
     candidate: &'a ProjectCoordinateMatch,
     requested: &str,
@@ -363,6 +485,55 @@ pub(crate) fn backfill(conn: &mut Connection) -> StoreResult<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Startup reports an empty, identity-less row holding another project's
+    /// canonical key, and only that: not once it holds data, and not for a
+    /// legacy (basename) key, which a marker may declare on purpose (#2018).
+    #[test]
+    fn shadowing_empty_twins_reports_only_empty_canonical_key_holders() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        let workspace = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let owner = crate::ops::get_or_create_project(&mut conn, &workspace, "api", None).unwrap();
+        conn.execute(
+            "UPDATE projects SET identity = 'github.com/acme/api', identity_source = 'git_remote', \
+             canonical_name = 'acme-api', legacy_name = 'api-legacy' WHERE id = ?1",
+            [owner.as_bytes()],
+        )
+        .unwrap();
+        let twin = ProjectId::new();
+        let legacy_twin = ProjectId::new();
+        for (id, name) in [(twin, "acme-api"), (legacy_twin, "api-legacy")] {
+            conn.execute(
+                "INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, ?3, 0)",
+                params![id.as_bytes(), workspace.as_bytes(), name],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            shadowing_empty_twins(&conn, 10).unwrap(),
+            [ShadowingTwin {
+                workspace: "default".into(),
+                id: twin,
+                name: "acme-api".into(),
+                owner: "api".into(),
+            }]
+        );
+        crate::ops::begin_session(
+            &mut conn,
+            &ai_memory_core::NewSession {
+                occurred_at: None,
+                id: ai_memory_core::SessionId::new(),
+                workspace_id: workspace,
+                project_id: twin,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        assert!(shadowing_empty_twins(&conn, 10).unwrap().is_empty());
+    }
 
     #[test]
     fn shared_candidate_query_deduplicates_before_bound_and_uses_only_indexes() {

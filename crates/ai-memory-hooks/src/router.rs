@@ -5350,20 +5350,21 @@ async fn process_authorized(
         }
         && !managed
         && !body_is_subagent(&env.raw);
-    if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
-        // Token-usage visibility (docs: session usage tracking): the native
-        // hook spliced an optional `_ai_memory_usage` object into the
-        // session-end body it POSTed (see `ai-memory-cli`'s `hook.rs`). Best
-        // effort and independent of the ephemeral/substantive branching
-        // below — a session with zero generated artifacts still spent
-        // tokens, so this must not be skipped for the lifecycle-only path.
-        // A malformed or absent object, or a write failure, never fails the
-        // SessionEnd request itself.
+    if matches!(env.event, HookEvent::SessionEnd)
+        || turn_checkpoint
+        || (env.agent == AgentKind::Pi && env.event == HookEvent::Stop)
+    {
+        // Cumulative snapshots are independent of summary/handoff creation.
+        // Pi reports at agent_end too, while the session is still open.
+        // Admission above already pins the session identity and scope; maxima
+        // in the writer make repeated or out-of-order reports idempotent.
         if let Some(usage) = parse_reported_session_usage(&env.raw, session_id)
             && let Err(e) = state.writer.upsert_session_usage(usage).await
         {
             warn!(error = %e, session = %session_id, "session usage upsert failed; continuing");
         }
+    }
+    if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
         // A checkpoint writes where the session's end will: the session row's
         // scope, not wherever this Stop resolved (a marker may have appeared
         // mid-session). One that lost the race with the end writes nothing.
@@ -5752,8 +5753,8 @@ const MAX_REPORTED_SESSION_TOKENS: u64 = 1_000_000_000;
 /// `model` is trimmed and capped at this many bytes before storage.
 const MAX_REPORTED_MODEL_BYTES: usize = 64;
 
-/// Parse the optional `_ai_memory_usage` object the native hook splices
-/// into a session-end body (see `ai-memory-cli`'s `hook.rs`). Every field is
+/// Parse the optional `_ai_memory_usage` snapshot from a native session-end
+/// hook or a Pi stop/session-end (see `ai-memory-cli`). Every field is
 /// optional and defaults to 0/`None` — a malformed number, an object with no
 /// usable fields at all, or the key's absence all read as "nothing to
 /// record" (`None`), never as a zeroed report that would clobber a real one.
@@ -27331,6 +27332,86 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(session.unwrap().ended_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn pi_session_usage_requires_admission_and_stays_owner_and_scope_bound() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let event = |session: &str, input: u64| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some("pi".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({"sessionID": session, "_ai_memory_usage": {"input_tokens": input}}),
+            )
+        };
+        let alice = Some(IdentityKey::User("alice".into()));
+        let bob = Some(IdentityKey::User("bob".into()));
+        process(&state, event("pi-owned", 100), alice.clone(), Vec::new())
+            .await
+            .unwrap();
+        let err = process_authorized(
+            &state,
+            event("pi-owned", 9999),
+            bob.clone(),
+            ai_memory_core::AuthLevel::User,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionCollision)
+        ));
+        process(&state, event("pi-bob", 7), bob, Vec::new())
+            .await
+            .unwrap();
+        for (owner, expected) in [("user:alice", 100), ("user:bob", 7)] {
+            let usage = state
+                .reader
+                .total_session_usage(
+                    state.workspace_id,
+                    state.project_id,
+                    ai_memory_core::OwnerFilter::User(owner.into()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(usage.input_tokens, expected, "{owner}");
+        }
+        for (workspace, project) in [
+            (WorkspaceId::new(), state.project_id),
+            (state.workspace_id, ProjectId::new()),
+        ] {
+            assert!(
+                state
+                    .reader
+                    .total_session_usage(workspace, project, ai_memory_core::OwnerFilter::Any)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let session = state
+            .reader
+            .session_summary_scoped(
+                state.workspace_id,
+                state.project_id,
+                SessionId::from_native("pi-owned"),
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            session.ended_at.is_none(),
+            "a Pi stop must not end the session"
+        );
     }
 
     /// Token-cost visibility: the native hook splices this object

@@ -6046,6 +6046,14 @@ fn build_pi_extension(
         .replace("install-hooks --agent omp --apply", "install-hooks --agent pi --apply")
         .replace("const AGENT = \"omp\";", "const AGENT = \"pi\";")
         .replace(
+            "postHook(\"stop\", sessionPayload(ctx));",
+            "postHook(\"stop\", piSessionPayload(ctx));",
+        )
+        .replace(
+            "postHook(\"session-end\", sessionPayload(ctx));",
+            "postHook(\"session-end\", piSessionPayload(ctx));",
+        )
+        .replace(
             r#"
   api.on("session.compacting", (_event: any, ctx: any) => {
     postPreCompact(ctx);
@@ -6056,13 +6064,51 @@ fn build_pi_extension(
         .replace(
             "export default function AiMemoryExtension(api: any): void {",
             &format!(
-                "{}\nexport default function AiMemoryExtension(pi: any): void {{\n  try {{ void bootstrapMcpBridge(pi); }} catch (_e) {{}}",
+                "{}\n{}\nexport default function AiMemoryExtension(pi: any): void {{\n  try {{ void bootstrapMcpBridge(pi); }} catch (_e) {{}}",
+                pi_session_usage_source(),
                 pi_mcp_bridge_source()
             ),
         )
         .replace("api.on(\"", "pi.on(\"");
     debug_assert!(!lifecycle.contains(".omp"));
     lifecycle
+}
+
+fn pi_session_usage_source() -> &'static str {
+    r#"
+// Pi persists final messages before agent_end. Recompute from ALL entries,
+// not the compacted context or an event accumulator, so reload/replay and
+// /tree navigation preserve the same totals as Pi's /session command.
+// https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md
+function piSessionPayload(ctx: any): Record<string, unknown> {
+  const payload = sessionPayload(ctx);
+  try {
+    const totals = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+    for (const entry of ctx?.sessionManager?.getEntries?.() ?? []) {
+      const message = entry?.type === "message" ? entry.message : undefined;
+      const usage = message?.role === "assistant" || message?.role === "toolResult"
+        ? message.usage
+        : ["usage", "compaction", "branch_summary"].includes(entry?.type) ? entry.usage : undefined;
+      if (!usage) continue;
+      const counts = [usage.input, usage.output, usage.cacheRead, usage.cacheWrite];
+      if (!counts.every((n) => Number.isSafeInteger(n) && n >= 0)) continue;
+      // Pi input is already fresh input; reasoning and cacheWrite1h are
+      // subsets of output/cacheWrite, not additional tokens.
+      totals.input_tokens += usage.input;
+      totals.output_tokens += usage.output;
+      totals.cache_read_tokens += usage.cacheRead;
+      totals.cache_write_tokens += usage.cacheWrite;
+    }
+    const counts = Object.values(totals);
+    if (counts.every(Number.isSafeInteger) && counts.some((n) => n > 0)) {
+      payload._ai_memory_usage = { ...totals, model: modelName(ctx?.model) };
+    }
+  } catch (_e) {
+    // Missing/incompatible session APIs must not interrupt lifecycle capture.
+  }
+  return payload;
+}
+"#
 }
 
 fn pi_mcp_bridge_source() -> &'static str {

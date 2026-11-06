@@ -13,6 +13,55 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added Pi session token totals from saved usage at agent stops and shutdown.
+  Reloads, resumes and repeated reports preserve cumulative input, output and
+  cache counts; missing usage stays unknown. Totals follow Pi's session history,
+  including copied fork history. Per-response Pi ledger records remain
+  unsupported; update the server and reinstall the Pi extension to enable
+  session reporting (#1984, #1985).
+
+### Changed
+
+- The auto-improvement reviewer now has explicit instructions for user
+  corrections. When the user rejects, corrects, interrupts or undoes the
+  agent's work and gives a reason, it proposes a `_rules/` page, or a patch to
+  the one already on that topic, saying what to avoid, why and what to do
+  instead, and quotes the user verbatim as evidence. An approach that failed
+  for a technical reason goes to `gotchas/`. It recognizes a correction by
+  meaning rather than by keywords, so the language does not matter, counts
+  only `user-prompt` observations, and skips a refusal with no reason or a
+  one-off rename. Proposals still follow the approval policy. (#1992)
+
+### Fixed
+
+- `ai-memory run --jail` no longer shows two access checklists with ai-jail
+  3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
+  flags such as `--jail-map` no longer hide it, and ai-jail's own review is
+  the only one. What the session needs is passed as grants that ai-jail
+  applies without a prompt: the harness's login state, the `AI_MEMORY_*`
+  variables, and only that harness's own API key, so a Claude jail no longer
+  receives OpenAI or Gemini keys. A memory server on the same machine is
+  reached through one forwarded port instead of the full network. Before
+  launching, ai-memory asks ai-jail whether the sandbox can start and stops
+  with ai-jail's reason when it cannot or when saved access no longer matches
+  the machine. ai-memory's own screen keeps only the extra folders. Older
+  ai-jail releases, and Copilot and Command Code, keep the previous launch
+  (#2020).
+
+- A project name no longer turns ambiguous because an empty leftover project
+  holds it literally. When a remote-derived name such as `acme-api` matches
+  both the project that owns that repository and an empty project created
+  under the literal name, reads, writes and `memory_message_send` now reach
+  the repository owner. A leftover that holds data, or any restricted
+  candidate, still refuses, and the error now says which holder owns which
+  repository, which project name to pass instead, and the
+  `rename-project --project-id` command that moves an empty holder out of the
+  way. The server also logs such a leftover at startup (#2018).
+
+## [3.4.2] - 2026-11-05
+
+### Added
+
 - `ai-memory run`'s ai-jail checklist now remembers each checkout's answers,
   so the next launch shows the same marks and Enter is enough. Each
   pre-checked row says why it is recommended, the header says when the
@@ -4254,7 +4303,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.2...HEAD
+[3.4.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.2
 [3.4.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.1
 [3.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.0
 [3.3.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.3

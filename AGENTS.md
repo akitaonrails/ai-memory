@@ -747,7 +747,10 @@ Additional boundary rules:
   release (`gh release list -R akitaonrails/ai-jail`, and `ai-jail --help` from
   it) with what ai-memory models: `JAIL_TOGGLES`, `RESERVED_JAIL_FLAGS` and
   `build_ai_jail_invocation` in `crates/ai-memory-workstream/src/jail.rs`, the
-  checklist notes, and `docs/design-yolo-safety-ai-jail.md`. Look for new flags
+  wrapper contract in `jail_contract.rs` (`ai-jail capabilities --json`, the
+  `--harness` names, which provider keys ai-jail forwards per harness, and the
+  `status --json` blocker codes; the real-binary tests in
+  `tests/suite/yolo_ai_jail.rs` run against the installed one), the checklist notes, and `docs/design-yolo-safety-ai-jail.md`. Look for new flags
   worth offering, changed defaults or semantics (2.15's `--github` also shares
   the keyring token), and flags ai-memory passes that changed or were removed.
   Adjust the integration in the same release, or say in the release notes which
@@ -837,7 +840,7 @@ Additional boundary rules:
 - **Branch model.** `main` is the patch line: it takes fixes and docs only
   (`[Unreleased]` holds only `### Fixed`), and patch tags are cut from it.
   Additive work targets the standing `release/X.Y` branch for the next
-  minor or major (currently `release/3.4`; 3.3.0 shipped from `main`). Keep `main` an
+  minor or major (currently `release/3.5`; 3.4.0 shipped from `main`). Keep `main` an
   ancestor of it by forward-merging
   `main` into it after every fix lands, never the reverse; when a patch
   release ships, rebuild the branch's `[Unreleased]` as only its own entries

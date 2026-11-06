@@ -10,7 +10,7 @@
         "source": "git-subdir",
         "url": "https://github.com/akitaonrails/ai-memory.git",
         "path": "plugins/codex",
-        "ref": "v3.4.1"
+        "ref": "v3.4.2"
       },
       "policy": {
         "installation": "AVAILABLE",

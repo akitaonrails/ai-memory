@@ -1009,6 +1009,9 @@ mod tests {
         assert_eq!(fixture.check("crates"), Err(FolderRefusal::IsCheckout));
     }
 
+    // POSIX path spellings: ai-jail, and so folder mounting, exists only on
+    // Linux and macOS.
+    #[cfg(unix)]
     #[test]
     fn jail_folders_validate_refuses_root_home_and_credential_stores() {
         let fixture = Fixture::new();
@@ -1076,6 +1079,9 @@ mod tests {
         assert_eq!(fixture.check("../jail-alias"), Ok(alias));
     }
 
+    // POSIX path spellings: ai-jail, and so folder mounting, exists only on
+    // Linux and macOS.
+    #[cfg(unix)]
     #[test]
     fn jail_folders_refusals_read_as_sentences() {
         let i18n = Localizer::default();
