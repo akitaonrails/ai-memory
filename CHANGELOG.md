@@ -37,6 +37,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `rename-project --project-id` command that moves an empty holder out of the
   way. The server also logs such a leftover at startup (#2018).
 
+- Search now matches the parts of a hyphenated or underscored word: `alpha`
+  finds a note that writes `foo-bar-alpha`, `memory` finds `ai-memory`, and
+  the whole token keeps matching too. A `title:` or `body:` filter reaches
+  the parts as well. The page and observation search indexes gained a second
+  spelling of the same text (migration V100), so the tokenizer stays as it
+  was and no stored row changes. The first start after upgrading rebuilds
+  both indexes once, which takes longer on a large store, and they grow to
+  roughly twice their previous size (#2013).
+
 ### Security
 
 - `ai-memory restore` no longer brings back the parts of the wiki's git
