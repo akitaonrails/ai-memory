@@ -545,12 +545,15 @@ pub(crate) fn ensure_wired_with_env(
     let warn_hooks = |reason: &str| {
         eprintln!(
             "{}",
-            config.i18n.diagnostic(&format!(
-                "ai-memory: could not auto-install {} hooks ({reason}); continuing launch. \
+            crate::localization::diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not auto-install {} hooks ({reason}); continuing launch. \
              Wire them manually with `ai-memory install-hooks --agent {} --apply`.",
-                harness.as_str(),
-                agent.kind().as_str()
-            ))
+                    harness.as_str(),
+                    agent.kind().as_str()
+                )
+            )
         );
     };
     // Install MCP first so a major-version migration has one canonical selected
@@ -605,12 +608,15 @@ pub(crate) fn ensure_wired_with_env(
     if let Some(reason) = &mcp_failure {
         eprintln!(
             "{}",
-            config.i18n.diagnostic(&format!(
-                "ai-memory: could not auto-install the {} MCP server ({reason}); continuing \
+            crate::localization::diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not auto-install the {} MCP server ({reason}); continuing \
              launch. Wire it manually with `ai-memory install-mcp --client {} --apply`.",
-                harness.as_str(),
-                agent.kind().as_str()
-            ))
+                    harness.as_str(),
+                    agent.kind().as_str()
+                )
+            )
         );
     }
 

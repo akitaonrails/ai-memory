@@ -25,6 +25,9 @@ pub(crate) fn language_hint(args: &[OsString], environment: Option<&OsStr>) -> L
 
 /// Translate a message from a path that never loads configuration. Hooks run
 /// before `Config::load`, so only `AI_MEMORY_LANGUAGE` reaches them.
+///
+/// Hook warnings quote transport and server errors (a failed handoff fetch,
+/// a spool error), so the rendered line is neutralized like [`diagnostic`].
 pub(crate) fn process_diagnostic(text: &str) -> String {
     let language = language_hint(
         &[],
@@ -32,10 +35,12 @@ pub(crate) fn process_diagnostic(text: &str) -> String {
             .var_os("AI_MEMORY_LANGUAGE")
             .as_deref(),
     );
-    if language == Language::English {
-        return text.to_owned();
-    }
-    Localizer::new(language).diagnostic(text)
+    let rendered = if language == Language::English {
+        text.to_owned()
+    } else {
+        Localizer::new(language).diagnostic(text)
+    };
+    crate::commands::show::terminal_text(&rendered)
 }
 
 /// A failure already rendered for the terminal in the operator's language.
@@ -92,6 +97,18 @@ pub fn failure_report(error: &anyhow::Error) -> String {
         .downcast_ref::<RenderedFailure>()
         .map_or_else(|| format!("Error: {error:?}"), ToString::to_string);
     crate::commands::show::terminal_body(&report)
+}
+
+/// The text of a diagnostic printed while the command keeps running.
+///
+/// A recoverable failure continues the run, so its message never reaches
+/// [`failure_report`]: the one place every *fatal* failure is neutralized.
+/// These messages quote the same foreign text, though — a decode error names
+/// the value it was sent, and an HTTP detail is whatever the server returned —
+/// so the rendered line is neutralized here. Translating first keeps the
+/// language catalog keyed on the untouched English text (#2000).
+pub(crate) fn diagnostic(i18n: &Localizer, text: impl std::fmt::Display) -> String {
+    crate::commands::show::terminal_text(&i18n.diagnostic(&text.to_string()))
 }
 
 pub(crate) fn command(mut command: clap::Command, path: &str, i18n: &Localizer) -> clap::Command {
@@ -322,6 +339,108 @@ mod tests {
         }
     }
 
+    /// #2000: a recoverable failure keeps the command running, so it never
+    /// passes `failure_report`. Its diagnostic still quotes a server value —
+    /// a decode error names the token it was sent — and must print inert.
+    #[test]
+    fn mid_run_diagnostic_neutralizes_terminal_controls_in_every_language() {
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum Status {
+            Ready,
+        }
+        let error =
+            serde_json::from_str::<Status>("\"\\u001b]52;c;cHduZWQ=\\u0007\\u202e\\u200f\"")
+                .expect_err("the payload is not a known status");
+        assert!(
+            format!("{error:#}").contains('\u{1b}'),
+            "control: serde quotes the decoded value"
+        );
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let line = diagnostic(
+                &Localizer::new(language),
+                format!("decoding reply ({error:#})"),
+            );
+            assert!(
+                !line.contains(['\u{1b}', '\u{7}', '\u{202e}', '\u{200f}']),
+                "terminal control survived: {line:?}"
+            );
+            assert!(line.contains("?]52;c;cHduZWQ=???"), "{line:?}");
+            assert!(!line.contains('\n'), "{line:?}");
+        }
+    }
+
+    /// #2000: hook warnings quote transport and server errors too; whatever
+    /// language the process runs in, the line prints inert.
+    #[test]
+    fn process_diagnostic_neutralizes_terminal_controls() {
+        let line = process_diagnostic(
+            "ai-memory hook warning: handoff fetch failed (\u{1b}]52;c;eA==\u{7}\u{202e}); \
+             recover a pending one with memory_handoff_accept",
+        );
+        assert!(
+            !line.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+            "terminal control survived: {line:?}"
+        );
+        assert!(line.contains("?]52;c;eA==??"), "{line:?}");
+    }
+
+    /// #2000: an error, warning or failure quoted mid-run is foreign text, so
+    /// the line goes through [`diagnostic`], which neutralizes it, never
+    /// through the bare `Localizer::diagnostic` that only translates.
+    #[test]
+    fn mid_run_error_diagnostics_use_the_neutralizing_helper() {
+        fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        // The bare method form up to the end of its first line of arguments
+        // and the next two, which is where every such call names its values.
+        let raw_call =
+            regex::Regex::new(r"\.diagnostic\(\s*&format!\((?:[^\n]*\n){0,4}[^\n]*").unwrap();
+        let foreign = regex::Regex::new(
+            r"\{(?:error|err|e|warning|failure|reason)[}:]|\bstderr\b|\bheld\.owner\b",
+        )
+        .unwrap();
+        let test_module =
+            regex::Regex::new(r"(?m)^\s*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\(crate\))? )?mod \w+")
+                .unwrap();
+        let mut files = Vec::new();
+        visit(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut raw = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n");
+            let body = test_module
+                .find(&source)
+                .map_or(source.as_str(), |found| &source[..found.start()]);
+            for call in raw_call.find_iter(body) {
+                let text = call.as_str();
+                let end = text.find("))").map_or(text.len(), |end| end);
+                if foreign.is_match(&text[..end]) {
+                    let line = body[..call.start()].lines().count() + 1;
+                    raw.push(format!("{}:{line}", file.display()));
+                }
+            }
+        }
+        assert!(
+            raw.is_empty(),
+            "quote these through localization::diagnostic:\n{}",
+            raw.join("\n")
+        );
+    }
+
     /// Catches a new English error or status line that never reached the
     /// catalog. Add it to both `diagnostics.ftl` files with the source wording.
     #[test]
@@ -382,7 +501,9 @@ mod tests {
             }
         }
         let call = regex::Regex::new(
-            r#"(?:\bbail!|\banyhow!|\.context|\.with_context|\bdiagnostic)\s*\(\s*(?:\|\|\s*)?&?(?:format!\(\s*)?"((?:[^"\\]|\\[\s\S])*)""#,
+            // `diagnostic(i18n, format!("…"))` is the neutralizing form (#2000);
+            // its receiver argument comes before the literal.
+            r#"(?:\bbail!|\banyhow!|\.context|\.with_context|\bdiagnostic)\s*\(\s*(?:\|\|\s*)?(?:&?[\w.]+,\s*)?&?(?:format!\(\s*)?"((?:[^"\\]|\\[\s\S])*)""#,
         )
         .unwrap();
         let test_module =

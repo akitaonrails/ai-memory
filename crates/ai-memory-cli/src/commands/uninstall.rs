@@ -17,6 +17,7 @@ use crate::commands::path_util::{
 use crate::commands::user_service::{self, ServiceManager};
 use crate::commands::{agent_plugins, data_purge, install_hooks, install_mcp, openclaw_plugin};
 use crate::config::Config;
+use crate::localization::diagnostic;
 use ai_memory_core::routing_skills::{
     AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
     GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER, GROK_RULES_DIR, GROK_SKILL_DIR,
@@ -953,8 +954,16 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         && !bridge_keeps_key
         && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir)
     {
-        eprintln!("{}", i18n.diagnostic(&format!("ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
-            config.data_dir.display())));
+        eprintln!(
+            "{}",
+            diagnostic(
+                i18n,
+                format!(
+                    "ai-memory uninstall warning: could not remove the stored auth token under {}: {error}",
+                    config.data_dir.display()
+                )
+            )
+        );
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
     // reasoning applies; the registry of URLs stays. The root bearer the
@@ -963,8 +972,16 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     if let Err(error) =
         crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
     {
-        eprintln!("{}", i18n.diagnostic(&format!("ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
-            config.data_dir.display())));
+        eprintln!(
+            "{}",
+            diagnostic(
+                i18n,
+                format!(
+                    "ai-memory uninstall warning: could not remove the stored server-profile tokens under {}: {error}",
+                    config.data_dir.display()
+                )
+            )
+        );
     }
 
     if args.purge_data {
@@ -1011,9 +1028,25 @@ fn uninstall_plugins(
         let shown = format!("{program} {}", args.join(" "));
         match runner.run(program, &args) {
             Ok(outcome) if outcome.success => println!("✓ {shown}"),
-            Ok(outcome) => eprintln!("{}", i18n.diagnostic(&format!("ai-memory uninstall warning: `{shown}` failed ({}); run it yourself",
-                outcome.stderr.trim()))),
-            Err(error) => eprintln!("{}", i18n.diagnostic(&format!("ai-memory uninstall warning: could not run `{shown}` ({error:#}); run it yourself"))),
+            Ok(outcome) => eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory uninstall warning: `{shown}` failed ({}); run it yourself",
+                        outcome.stderr.trim()
+                    )
+                )
+            ),
+            Err(error) => eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory uninstall warning: could not run `{shown}` ({error:#}); run it yourself"
+                    )
+                )
+            ),
         }
     }
 }

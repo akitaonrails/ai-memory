@@ -440,6 +440,78 @@ directly.
   routing values (§2). It never turns a config-file bearer into an environment
   variable, and the toggle flags carry no values or secrets.
 
+### 6. ai-jail 3.0.1+: the wrapper contract
+
+ai-jail 3.0.0 moved its policy out of the checkout (`~/.config/ai-jail`), runs
+its own first-run review for known harnesses, and treats unrestricted network
+as OPEN. ai-memory's flag-based launch still works there, but the user saw two
+checklists, ai-memory opened the full network, and ai-jail had to guess the
+harness from ai-memory's argv (a wrapper flag it did not know, such as
+`--jail-map`, made it give up). ai-jail 3.0.1 added a wrapper contract
+([WRAPPER_INTEGRATION.md](https://github.com/akitaonrails/ai-jail/blob/v3.0.1/docs/WRAPPER_INTEGRATION.md)),
+and ai-memory uses part of it (#2020).
+
+**When.** The installed ai-jail's `--help` lists `--harness`,
+`ai-jail capabilities --json` reports schema 1 with `harness_flag` and
+`status_json`, and the harness has an ai-jail preset (`ai_jail_harness_name`:
+Copilot and Command Code do not). `capabilities` is never asked of an older
+ai-jail, which would sandbox a command by that name. An explicit `--jail`
+with an automatic harness keeps the flag launch, because the server picks the
+harness after the re-exec decision. Otherwise the launch is the §2/§5 one.
+
+**Launch.** `ai-jail --harness H <reach> --agent-state --no-save-config
+--env NAME… <toggles> <folders> -- ai-memory run …`. Every part is a
+command-line grant, which ai-jail applies without a prompt:
+
+- *No request file.* The contract's `--request-file` was tried first and
+  dropped: ai-jail asks a separate yes/no for every request, so eight
+  forwarded variables meant eight prompts before the agent started. The same
+  names passed as `--env NAME` need none. ai-jail's own first-run review
+  (network, credentials, SSH) stays the one place the user decides.
+- *Only the harness's own keys.* `harness_env_names` passes every ai-memory
+  routing name that is set, `CLAUDE_CONFIG_DIR` for Claude only, and the
+  provider keys that harness reads: Claude gets the Anthropic ones, Codex the
+  OpenAI one, Antigravity the Gemini/Google ones. Grok and Kimi get none from
+  ai-memory, because ai-jail forwards `XAI_API_KEY` and `MOONSHOT_API_KEY` itself
+  with `--agent-state`. Multi-provider harnesses (OpenCode, Pi, Crush, Omp,
+  Kiro) keep every key that is set. A test fails when a new provider key is
+  added to `FORWARDED_ENV_NAMES` without being classified.
+- *Reaching the server.* A server on `localhost` or `127.0.0.0/8` gets
+  `--forward-port PORT`: that one host port on the jail's loopback, and the
+  network stays filtered. Any other server keeps `--network`, labelled OPEN
+  in ai-jail's review: ai-jail's filter reaches LAN and remote services only
+  through its HTTP proxy, and ai-memory's hook clients bypass proxies on
+  purpose (§2). `[::1]` is not bridged by `--forward-port`, so it also keeps
+  `--network`.
+- *`--no-save-config` stays.* Without it ai-jail saves the launch's
+  restrictive flags (an unchecked `--no-ssh`) as permanent project
+  constraints, which a later approval in its review cannot lift. The review's
+  own approvals are saved either way.
+
+**Preflight.** `status --json` for the exact launch argv. A
+`backend_unavailable` blocker stops the launch quoting ai-jail;
+`missing_approved_env`, `directory_drift` and `changed_ssh_key` stop it
+quoting ai-jail plus `ai-jail configure H`. Anything else, including a first
+run, launches: ai-jail holds its own review in a terminal and, without one,
+runs once with restricted defaults plus the command-line grants, which is what
+its guide asks of automation. An unreadable status also launches and leaves
+any refusal to ai-jail.
+
+**Checklist.** ai-jail's review owns credentials, SSH and network, so
+ai-memory's screen shows only the extra folders (`f`, `reset`, Enter). The
+remembered toggle answers are kept for a later launch that falls back to
+flags, and the next-run line is a bare `--jail` plus the folders.
+
+**Tests.** `jail_contract.rs` covers capability parsing (every missing piece
+falls back), harness names against ai-jail's accepted list, per-harness
+variable names, server reach, argv assembly and the refusal codes.
+`yolo_ai_jail.rs` runs the real installed ai-jail (3.0.1+ on `PATH`): it
+accepts the launch with `--dry-run`, and its status of that launch has no
+pending request and writes nothing. `jail_toggles_e2e.rs` drives the built
+binary against a fake ai-jail 3.0.1 for the launch argv (no other provider's
+key in a Claude jail), the first run without a terminal, the drift stop and
+the preset fallback.
+
 ## OS support matrix
 
 | Concern | Linux | macOS | Windows |

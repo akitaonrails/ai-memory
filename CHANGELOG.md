@@ -13,6 +13,40 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory run --jail` no longer shows two access checklists with ai-jail
+  3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
+  flags such as `--jail-map` no longer hide it, and ai-jail's own review is
+  the only one. What the session needs is passed as grants that ai-jail
+  applies without a prompt: the harness's login state, the `AI_MEMORY_*`
+  variables, and only that harness's own API key, so a Claude jail no longer
+  receives OpenAI or Gemini keys. A memory server on the same machine is
+  reached through one forwarded port instead of the full network. Before
+  launching, ai-memory asks ai-jail whether the sandbox can start and stops
+  with ai-jail's reason when it cannot or when saved access no longer matches
+  the machine. ai-memory's own screen keeps only the extra folders. Older
+  ai-jail releases, and Copilot and Command Code, keep the previous launch
+  (#2020).
+
+- A project name no longer turns ambiguous because an empty leftover project
+  holds it literally. When a remote-derived name such as `acme-api` matches
+  both the project that owns that repository and an empty project created
+  under the literal name, reads, writes and `memory_message_send` now reach
+  the repository owner. A leftover that holds data, or any restricted
+  candidate, still refuses, and the error now says which holder owns which
+  repository, which project name to pass instead, and the
+  `rename-project --project-id` command that moves an empty holder out of the
+  way. The server also logs such a leftover at startup (#2018).
+
+- A warning printed while a command keeps going, such as a recoverable
+  error during `ai-memory run`, `uninstall`, `restore` or the project-split
+  repair, or a lifecycle hook warning, is now neutralized like the final
+  failure report, so a value read back from the server cannot reach the
+  terminal as an escape sequence. The sanitizer also covers the direction
+  marks (U+061C, U+200E/U+200F) and the zero-width space, word joiner and
+  byte-order mark (U+200B, U+2060–U+2064, U+FEFF) it used to keep. The
+  zero-width joiner and non-joiner still print, since emoji sequences and
+  Persian or Indic text need them (#2000, #2010).
+
 - `ai-memory handoffs --expire-all` now reports the sweep in the selected
   language and neutralizes terminal controls in the workspace and project it
   echoes. The confirmation line was the last English-only output in that
