@@ -39,7 +39,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             "{}", i18n.text("cli-resume-ai-memory-resume-needs-a-terminal-use-ai-memory-workstreams-to-list-a-checko"));
     }
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let cwd =
         std::env::current_dir().context(i18n.text("cli-resume-reading-the-current-checkout"))?;
     let candidates = if args.all {

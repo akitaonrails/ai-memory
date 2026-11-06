@@ -76,7 +76,7 @@ pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let ep = ServerEndpoint::for_checkout(config).await?;
 
     let page: PageContent = if let Some(raw_path) = path {
         get_json(

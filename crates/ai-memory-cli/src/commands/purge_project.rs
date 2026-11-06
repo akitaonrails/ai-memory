@@ -234,7 +234,7 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             "{}", i18n.format("cli-purge-project-purge-project-is-destructive-and-irreversible-re-run-with-confirm-to-proceed", &[("value0", confirm_command(&workspace, &target_flag, &args).to_string())]));
     }
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     // The name was derived, not typed: say so before the irreparable step, and
     // name the exact command that would have been unambiguous (#1642).
     if args.project.is_none() && args.project_id.is_none() {

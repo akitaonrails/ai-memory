@@ -25,7 +25,7 @@ use crate::http_client::ServerEndpoint;
 /// Resolve the newest still-valid checkout and continue it.
 pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
     let i18n = &config.i18n;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let links = project_registry::links_for_server(config, &endpoint)?;
     let candidates = filter_workspace(links, args.workspace.as_deref());
     if candidates.is_empty() {

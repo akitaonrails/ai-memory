@@ -338,6 +338,65 @@ pub(crate) fn resolve(
     with_token(data_dir, name, profile)
 }
 
+/// Which server a checkout's events and commands go to (#992, #2016).
+#[derive(Debug)]
+pub(crate) enum Route {
+    /// No marker selects a server: the install's own server (the hook's
+    /// install-time `--server-url`, a command's config), exactly as before
+    /// profiles existed.
+    InstallDefault,
+    /// The marker's profile resolved; its URL and token replace the install's.
+    Profile(ResolvedServer),
+    /// The marker selects a profile that did not resolve. Nothing is sent.
+    Rejected {
+        /// The selected name, when it is a valid one (safe to print).
+        name: Option<ProfileName>,
+        reason: Rejection,
+    },
+}
+
+impl Route {
+    pub(crate) fn profile_name(&self) -> Option<&ProfileName> {
+        match self {
+            Self::InstallDefault => None,
+            Self::Profile(resolved) => Some(&resolved.name),
+            Self::Rejected { name, .. } => name.as_ref(),
+        }
+    }
+
+    /// Label for `--check-capture`. Never a URL, path, or token.
+    pub(crate) fn resolution(&self) -> &'static str {
+        match self {
+            Self::InstallDefault => "install-default",
+            Self::Profile(_) => "marker",
+            Self::Rejected { reason, .. } => reason.as_str(),
+        }
+    }
+}
+
+/// The route for work done in `cwd`: the nearest marker on the walk that
+/// declares `server` decides, through [`resolve`]. Hooks route each event
+/// with it and checkout-scoped commands their requests, so both reach the
+/// same server for the same directory.
+pub(crate) fn route_for_cwd(data_dir: &Path, cwd: &str, home: Option<&Path>) -> Route {
+    let Some(selection) = crate::marker::find_server_selection(cwd, home) else {
+        return Route::InstallDefault;
+    };
+    let Some(raw_name) = selection.name else {
+        return Route::Rejected {
+            name: None,
+            reason: Rejection::UnreadableMarker,
+        };
+    };
+    match resolve(data_dir, &raw_name, &selection.marker_dir, home) {
+        Ok(resolved) => Route::Profile(resolved),
+        Err(reason) => Route::Rejected {
+            name: ProfileName::parse(&raw_name),
+            reason,
+        },
+    }
+}
+
 /// A registered profile's URL and stored token, without the `roots` check.
 ///
 /// For a caller acting on a selection the hook already vetted against the

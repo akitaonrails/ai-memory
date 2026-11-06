@@ -151,7 +151,7 @@ pub(crate) fn confirm_repair(
 /// Join the projects on the server and point this checkout at the result
 /// ([`super::repair_split::adopt`]).
 pub(crate) async fn apply_repair(config: &Config, split: &ProjectSplit) -> Result<()> {
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let adopted = super::repair_split::adopt(
         config,
         &endpoint,

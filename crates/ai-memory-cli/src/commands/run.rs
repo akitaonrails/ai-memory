@@ -782,6 +782,7 @@ async fn run_once_with_wiring(
     // cancelled again.
     if let (JailMode::Explicit(spec), Some(ai_jail)) = (&jail_plan.mode, &ai_jail) {
         ensure_jail_does_not_export_config_token(config)?;
+        ensure_jail_does_not_need_a_server_profile(config)?;
         let support = ai_jail_support(ai_jail)
             .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
         // Only a harness named on the command line is known this early; an
@@ -835,7 +836,7 @@ async fn run_once_with_wiring(
         ));
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let project_id = if let Some(id) = args.project_id {
         Some(id)
     } else if args.project.is_none() {
@@ -3560,6 +3561,7 @@ async fn confirm_yolo_and_maybe_reexec(
         (choices, outcome.folders, Some(next))
     };
     ensure_jail_does_not_export_config_token(config)?;
+    ensure_jail_does_not_need_a_server_profile(config)?;
     // The re-exec replaces this process (or, off Unix, this process exits
     // once the child does), so its own prepared lease must be released here
     // rather than left to the 90s orphan timeout — the jailed re-run opens
@@ -3873,6 +3875,25 @@ fn ensure_jail_does_not_export_config_token(config: &Config) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// A checkout whose marker selects a server profile (#2016) talks to that
+/// profile's server with its stored token, which the jailed re-run cannot
+/// read from ai-jail's private home and which must not be copied into the
+/// harness's environment either. Refuse instead of letting the jailed run
+/// fail on the profile or fall back to another server.
+fn ensure_jail_does_not_need_a_server_profile(config: &Config) -> Result<()> {
+    match crate::http_client::checkout_route(config) {
+        crate::server_profiles::Route::InstallDefault => Ok(()),
+        route => Err(anyhow!(
+            "--jail cannot carry this checkout's server profile{} into the managed harness: \
+             the jailed run cannot read its stored token. Set AI_MEMORY_SERVER_URL and a \
+             least-privilege AI_MEMORY_AUTH_TOKEN for this launch, or run without --jail",
+            route
+                .profile_name()
+                .map_or_else(String::new, |name| format!(" `{name}`")),
+        )),
+    }
 }
 
 /// Replace this process with `<ai_jail> <jail_args>` on Unix (never returns
@@ -6807,6 +6828,50 @@ mod tests {
             gave_up.is_err(),
             "repeated garbage aborts rather than guessing what to mount"
         );
+    }
+
+    /// #2016: a checkout routed to a server profile cannot be jailed, since
+    /// the jailed run cannot read the profile's token; an explicit
+    /// `AI_MEMORY_SERVER_URL` or an unrouted checkout still can.
+    #[test]
+    fn jail_refuses_a_checkout_routed_to_a_server_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("team-b").join("repo");
+        let data_dir = home.join("data");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::server_profiles::add(
+            &data_dir,
+            &crate::server_profiles::ProfileName::parse("team-b").unwrap(),
+            "https://b.example",
+            &[],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        let config = |server_url: Option<&str>| Config {
+            data_dir: data_dir.clone(),
+            runtime_env: crate::config::RuntimeEnv::for_checkout_tests(
+                repo.to_string_lossy(),
+                home.to_string_lossy(),
+                server_url,
+                false,
+            ),
+            ..Config::default()
+        };
+
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None)).is_ok());
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"team-b\"\n").unwrap();
+        let error = ensure_jail_does_not_need_a_server_profile(&config(None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`team-b`"), "{error}");
+        assert!(!error.contains("PROFILE-TOKEN"), "{error}");
+        assert!(
+            ensure_jail_does_not_need_a_server_profile(&config(Some("https://env.example")))
+                .is_ok()
+        );
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"nobody\"\n").unwrap();
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None)).is_err());
     }
 
     /// A jailed re-run keeps routing but must not turn a server bearer loaded

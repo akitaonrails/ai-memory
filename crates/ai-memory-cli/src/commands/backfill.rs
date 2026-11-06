@@ -353,7 +353,7 @@ async fn backfill_endpoint(
         .await;
         return Ok(ServerEndpoint::for_hook_target(url.to_owned(), token));
     }
-    Ok(ServerEndpoint::from_config_resolving_auth(config).await)
+    ServerEndpoint::for_checkout(config).await
 }
 
 /// Run the backfill.

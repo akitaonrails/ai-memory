@@ -19,7 +19,7 @@ pub async fn run(config: &Config, args: WorkstreamsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting managed workstream checkout")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let fingerprints = inspect_repository_fingerprints(&cwd)?;
     let project_id = if args.project_id.is_some() || args.project.is_some() {
         args.project_id

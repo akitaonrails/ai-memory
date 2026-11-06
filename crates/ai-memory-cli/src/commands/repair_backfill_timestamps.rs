@@ -195,7 +195,7 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
         return Ok(());
     }
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let mut responses = Vec::new();
     for chunk in items.chunks(MAX_SESSIONS_PER_REQUEST) {
         let response: RepairSessionTimesResponse = post_json(

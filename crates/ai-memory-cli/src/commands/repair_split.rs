@@ -38,7 +38,7 @@ pub(crate) struct Adopted {
 pub async fn run(config: &Config, args: RepairSplitArgs) -> Result<()> {
     super::refuse_empty_explicit(args.workspace.as_deref(), "--workspace")?;
     let workspace = super::resolve_workspace(config, args.workspace.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let adopted = adopt(
         config,
         &endpoint,

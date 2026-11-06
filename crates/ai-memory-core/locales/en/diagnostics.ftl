@@ -1013,3 +1013,5 @@ diag-jail-contract-forwarded-port = memory server through forwarded port { $port
 diag-jail-contract-full-network = full network, because the memory server is not on this machine
 diag-restore-left-out-git = ai-memory: left out { $value0 } file(s) from the backup's wiki git directory that git could run or follow ({ $listed }); the wiki's git config was rebuilt
 diag-restore-generating-git-config = generating a git config for the restored wiki
+diag-jail-cannot-carry-this-checkouts-server-profile = --jail cannot carry this checkout's server profile{ $value0 } into the managed harness: the jailed run cannot read its stored token. Set AI_MEMORY_SERVER_URL and a least-privilege AI_MEMORY_AUTH_TOKEN for this launch, or run without --jail
+diag-this-checkouts-marker-selects-a-refused-server-profile = this checkout's .ai-memory.toml selects server profile { $value0 }, which was refused ({ $value1 }); nothing was sent. Run `ai-memory hook --check-capture` here or `ai-memory server list` to see why, or set AI_MEMORY_SERVER_URL to choose a server for this command

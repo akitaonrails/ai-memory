@@ -13,6 +13,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Commands that work on the checkout they run in (`run`, `resume`,
+  `continue`, `workstreams`, `doctor`, `search`, `read-page`, `write-page`,
+  `handoffs`, `message` and the other project-scoped commands) now reach the
+  server that the nearest `.ai-memory.toml` selects with `server = "<name>"`,
+  with that profile's stored token, the same way hooks route capture. Before,
+  they used the configured server and fell back to `127.0.0.1`. A profile
+  that does not resolve fails the command with the hook's reason instead of
+  falling back. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
+  profile-routed checkout because the jailed run cannot read the profile's
+  token (#2016).
+
 - A section that `memory_patch_page` adds now gets a blank line before and
   after its heading, so the page no longer reads as one run-on block and
   passes Markdown linters (MD022). The docs now say that an `end_of_page`

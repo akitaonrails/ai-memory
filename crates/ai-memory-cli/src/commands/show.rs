@@ -149,7 +149,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
         .context(i18n.text("cli-profile-reading-the-current-directory"))?
         .canonicalize()
         .context(i18n.text("cli-show-canonicalizing-the-current-directory"))?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let candidates = collect_candidates(
         config,
         &endpoint,
