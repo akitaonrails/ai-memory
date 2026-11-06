@@ -26,6 +26,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `backfill_on_start` | `true` | `AI_MEMORY_BACKFILL_ON_START` | Import a project's existing local harness history once, when SessionStart finds its store empty. |
 | `run_autowire` | `true` | `AI_MEMORY_RUN_AUTOWIRE` | Install a harness's hooks and MCP server on the first `ai-memory run` launch when they are missing. |
 | `claude_true_yolo` | `false` | `AI_MEMORY_CLAUDE_TRUE_YOLO` | Make `ai-memory run --yolo` on Claude force `bypassPermissions` over any settings `defaultMode`. |
+| `pi_tool_exposure` | `"direct"` | `AI_MEMORY_PI_TOOL_EXPOSURE` | How the generated Pi extension registers ai-memory's MCP tools: `direct` (declared to the model) or `codemode` (reached through Pi's codemode tool). |
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
 | `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`. The only value is `llm`, which needs an LLM provider. |

@@ -227,6 +227,15 @@ log_level = "info"
 # requests it for one launch.
 # claude_true_yolo = false
 
+# How the generated Pi extension registers ai-memory's MCP tools. `direct`
+# declares every tool to the model, as before. `codemode` registers them with
+# Pi's `exposure: "codemode"`: Pi's codemode tool lists and calls them, and
+# their schemas are no longer sent to the model on every request. Tool names,
+# session headers and lifecycle capture do not change. Re-run
+# `ai-memory install-hooks --agent pi --apply` and restart Pi after changing
+# it. Env equivalent: `AI_MEMORY_PI_TOOL_EXPOSURE`.
+# pi_tool_exposure = "direct"
+
 # Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
 # contradiction: same topic without being a near-duplicate. Pages at or above
 # the min and below the max are flagged; at or above the max they count as

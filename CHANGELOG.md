@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `pi_tool_exposure` (`AI_MEMORY_PI_TOOL_EXPOSURE`) chooses how the generated
+  Pi extension registers ai-memory's MCP tools. `direct`, the default, keeps
+  today's behavior. `codemode` registers each tool with Pi's
+  `exposure: "codemode"`, so Pi's codemode tool lists and calls them without
+  their schemas being declared to the model. Preview, `--apply` and the
+  `ai-memory upgrade` refresh all read the setting; tool names, session
+  headers and lifecycle capture are unchanged (#1988).
 - Added an opt-in, development-only Raw-RAG retrieval baseline to
   `ai-memory-eval`: overlapping source windows, local dense retrieval and
   cross-encoder reranking, with pinned models and per-window provenance.

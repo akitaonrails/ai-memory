@@ -1259,6 +1259,9 @@ claude_true_yolo = false           # opt-in: on a Claude `ai-memory run --yolo`,
                                    # Claude-only, no-op for every other harness. Also
                                    # `--true-yolo`. See
                                    # docs/design-yolo-safety-ai-jail.md.
+pi_tool_exposure = "direct"        # how the generated Pi extension registers the MCP
+                                   # tools: "direct" (declared to the model) or
+                                   # "codemode" (reached through Pi's codemode tool).
 release_base_url = ""              # override the GitHub releases base URL that `ai-memory
                                    # upgrade` checks and downloads from (#801). Empty =
                                    # https://github.com/akitaonrails/ai-memory/releases.
