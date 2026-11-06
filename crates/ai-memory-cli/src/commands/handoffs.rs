@@ -83,32 +83,36 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     let _ = writeln!(
         out,
         "{}",
-        i18n.diagnostic(&format!(
-            "Open handoffs for {workspace}/{project} (oldest first):"
-        ))
+        crate::localization::diagnostic(
+            i18n,
+            format!("Open handoffs for {workspace}/{project} (oldest first):")
+        )
     );
     for h in &response.handoffs {
         let target = h.to_agent.as_deref().unwrap_or("any agent");
         let _ = writeln!(
             out,
             "{}",
-            i18n.diagnostic(&format!(
-                "  {}  from {} -> {}",
-                i18n.age(now_ms.saturating_sub(h.created_at_ms) / 1_000),
-                terminal_text(&h.from_agent),
-                terminal_text(target)
-            ))
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "  {}  from {} -> {}",
+                    i18n.age(now_ms.saturating_sub(h.created_at_ms) / 1_000),
+                    terminal_text(&h.from_agent),
+                    terminal_text(target)
+                )
+            )
         );
         let _ = writeln!(
             out,
             "{}",
-            i18n.diagnostic(&format!("    id: {}", terminal_text(&h.id)))
+            crate::localization::diagnostic(i18n, format!("    id: {}", terminal_text(&h.id)))
         );
         if let Some(cwd) = h.cwd.as_deref() {
             let _ = writeln!(
                 out,
                 "{}",
-                i18n.diagnostic(&format!("    cwd: {}", terminal_text(cwd)))
+                crate::localization::diagnostic(i18n, format!("    cwd: {}", terminal_text(cwd)))
             );
         }
     }
@@ -181,17 +185,24 @@ async fn expire(
 fn expire_report(i18n: &Localizer, expired: u64, workspace: &str, project: &str) -> String {
     let (workspace, project) = (terminal_text(workspace), terminal_text(project));
     match expired {
-        0 => i18n.diagnostic(&format!(
-            "No open handoffs to expire in {workspace}/{project}."
-        )),
-        1 => i18n.diagnostic(&format!(
-            "Expired {expired} open handoff in {workspace}/{project}. The rows are kept and \
+        0 => crate::localization::diagnostic(
+            i18n,
+            format!("No open handoffs to expire in {workspace}/{project}."),
+        ),
+        1 => crate::localization::diagnostic(
+            i18n,
+            format!(
+                "Expired {expired} open handoff in {workspace}/{project}. The rows are kept and \
              remain visible in the audit log; they are no longer offered to an agent."
-        )),
-        _ => i18n.diagnostic(&format!(
-            "Expired {expired} open handoffs in {workspace}/{project}. The rows are kept and \
+            ),
+        ),
+        _ => crate::localization::diagnostic(
+            i18n,
+            format!(
+                "Expired {expired} open handoffs in {workspace}/{project}. The rows are kept and \
              remain visible in the audit log; they are no longer offered to an agent."
-        )),
+            ),
+        ),
     }
 }
 

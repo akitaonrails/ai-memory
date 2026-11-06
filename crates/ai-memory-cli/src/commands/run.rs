@@ -212,7 +212,7 @@ impl HeartbeatHealth {
 
     fn notify(&mut self, notice: String) {
         if !self.defer_notices {
-            eprintln!("{notice}");
+            eprintln!("{}", super::show::terminal_text(&notice));
             return;
         }
         self.deferred_count = self.deferred_count.saturating_add(1);
@@ -499,11 +499,14 @@ fn choose_after_run(
         output,
         "{} {}",
         paint.green("✓"),
-        paint.bold(&i18n.diagnostic(&format!(
-            "ai-memory: {} exited successfully in workstream '{}'.",
-            current.as_str(),
-            workstream_name
-        )))
+        paint.bold(&diagnostic(
+            i18n,
+            format!(
+                "ai-memory: {} exited successfully in workstream '{}'.",
+                current.as_str(),
+                workstream_name
+            )
+        ))
     )?;
     writeln!(
         output,
@@ -516,17 +519,20 @@ fn choose_after_run(
         writeln!(
             output,
             "{}",
-            i18n.diagnostic(&format!(
-                "  {}) switch to {}",
-                index + 1,
-                managed_harness(*choice).as_str()
-            ))
+            diagnostic(
+                i18n,
+                format!(
+                    "  {}) switch to {}",
+                    index + 1,
+                    managed_harness(*choice).as_str()
+                )
+            )
         )?;
     }
     writeln!(
         output,
         "{}",
-        i18n.diagnostic(&format!("  r) run {} again", current.as_str()))
+        diagnostic(i18n, format!("  r) run {} again", current.as_str()))
     )?;
     writeln!(output, "{}", i18n.diagnostic("  q) quit (default)"))?;
 
@@ -1157,10 +1163,18 @@ async fn run_once_with_wiring(
         if let Some(error) = store_mismatch_error(harness, &orphaned_session, recorded, &current) {
             acquired_try!(Err(error));
         }
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
-            harness.as_str(),
-            display_session_id(&orphaned_session),
-            prepared.workstream_name)));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
+                    harness.as_str(),
+                    display_session_id(&orphaned_session),
+                    prepared.workstream_name
+                )
+            )
+        );
         // The hint tells the user to repeat their own command with a selector
         // right after the harness name, which only works when they typed one
         // and launched an interactive session (`codex exec` and `opencode run`
@@ -1177,17 +1191,20 @@ async fn run_once_with_wiring(
             if let Some(hint) =
                 orphan_resume_hint(harness, &orphaned_session, sessions, SystemTime::now())
             {
-                eprintln!("{hint}");
+                eprintln!("{}", super::show::terminal_text(&hint));
             }
         }
     } else if force_fresh && plan.mode == LaunchMode::Session {
         eprintln!(
             "{}",
-            config.i18n.diagnostic(&format!(
-                "ai-memory: starting a fresh {} session in workstream '{}'",
-                harness.as_str(),
-                prepared.workstream_name
-            ))
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: starting a fresh {} session in workstream '{}'",
+                    harness.as_str(),
+                    prepared.workstream_name
+                )
+            )
         );
     }
     if automatic_harness
@@ -1215,11 +1232,14 @@ async fn run_once_with_wiring(
         ));
         eprintln!(
             "{}",
-            config.i18n.diagnostic(&format!(
-                "ai-memory: continuing newest checkout-local {} session {}",
-                harness.as_str(),
-                display_session_id(&candidate.session.native_session_id)
-            ))
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: continuing newest checkout-local {} session {}",
+                    harness.as_str(),
+                    display_session_id(&candidate.session.native_session_id)
+                )
+            )
         );
     } else if prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
@@ -1433,11 +1453,19 @@ async fn run_once_with_wiring(
         None
     };
     if let Some(attach_id) = &attached_background {
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
-            plan.expected_session_id
-                .as_deref()
-                .map(display_session_id)
-                .unwrap_or_default())));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
+                    plan.expected_session_id
+                        .as_deref()
+                        .map(display_session_id)
+                        .unwrap_or_default()
+                )
+            )
+        );
         plan.args = vec![OsString::from("attach"), OsString::from(attach_id)];
     }
 
@@ -1607,7 +1635,7 @@ async fn run_once_with_wiring(
         }
     };
     for notice in heartbeat_health.into_deferred() {
-        eprintln!("{notice}");
+        eprintln!("{}", super::show::terminal_text(&notice));
     }
     let status = acquired_try!(waited.context("waiting for managed harness"));
     let exit_code = status.code().unwrap_or(1);
@@ -1817,12 +1845,20 @@ async fn run_once_with_wiring(
                 )
             );
             if !left_behind_session_ids.is_empty() {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
-                    left_behind_session_ids
-                        .iter()
-                        .map(|id| display_session_id(id))
-                        .collect::<Vec<_>>()
-                        .join(", "))));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
+                            left_behind_session_ids
+                                .iter()
+                                .map(|id| display_session_id(id))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    )
+                );
             }
             journal_finish_failed_run(
                 config,
@@ -1874,10 +1910,13 @@ async fn run_once_with_wiring(
     }
     eprintln!(
         "{}",
-        config.i18n.diagnostic(&format!(
-            "ai-memory: workstream '{}' saved {imported} new event(s)",
-            prepared.workstream_name
-        ))
+        diagnostic(
+            &config.i18n,
+            format!(
+                "ai-memory: workstream '{}' saved {imported} new event(s)",
+                prepared.workstream_name
+            )
+        )
     );
     interrupt_task.abort();
     if let Some((session, finalized)) = finalize_hookless_session(
@@ -1895,9 +1934,10 @@ async fn run_once_with_wiring(
             Ok(ids) if !ids.is_empty() => {
                 eprintln!(
                     "{}",
-                    config.i18n.diagnostic(&format!(
-                        "ai-memory: finalized the {agent} session {session}"
-                    ))
+                    diagnostic(
+                        &config.i18n,
+                        format!("ai-memory: finalized the {agent} session {session}")
+                    )
                 );
             }
             // No session under that id for this agent and owner in this
@@ -2122,10 +2162,13 @@ async fn degraded_launch(
     let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&config.data_dir));
     eprintln!(
         "{}",
-        config.i18n.diagnostic(&format!(
-            "ai-memory: this run was not recorded on the server; {}",
-            spooled_events_note(&spool)
-        ))
+        diagnostic(
+            &config.i18n,
+            format!(
+                "ai-memory: this run was not recorded on the server; {}",
+                spooled_events_note(&spool)
+            )
+        )
     );
     journal_degraded_run(
         config,
@@ -2255,8 +2298,16 @@ async fn journal_degraded_run(
             }
         };
         let Some(final_cursor) = exact_export.source_cursor.clone() else {
-            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
-                launch.harness.as_str())));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
+                        launch.harness.as_str()
+                    )
+                )
+            );
             return;
         };
         (
@@ -3095,15 +3146,16 @@ fn render_checklist(
     }
     let mut changes = Vec::new();
     if let Some(saved) = &view.last_saved {
-        changes.push(paint.dim(&i18n.diagnostic(&format!("your choices from {saved}"))));
+        changes.push(paint.dim(&diagnostic(i18n, format!("your choices from {saved}"))));
     }
     if !view.new.is_empty() {
-        changes.push(paint.cyan(&i18n.diagnostic(&format!("new: {}", view.new.join(", ")))));
+        changes.push(paint.cyan(&diagnostic(i18n, format!("new: {}", view.new.join(", ")))));
     }
     if !view.gone.is_empty() {
-        changes.push(
-            paint.yellow(&i18n.diagnostic(&format!("no longer offered: {}", view.gone.join(", ")))),
-        );
+        changes.push(paint.yellow(&diagnostic(
+            i18n,
+            format!("no longer offered: {}", view.gone.join(", ")),
+        )));
     }
     if !changes.is_empty() {
         writeln!(output, "   {}", changes.join(&paint.dim(" · ")))?;
@@ -3780,17 +3832,21 @@ fn jail_refusal_error(
     refusal: JailRefusal,
 ) -> anyhow::Error {
     match refusal {
-        JailRefusal::Backend(message) => anyhow!(i18n.diagnostic(&format!(
-            "ai-jail cannot start its sandbox on this machine: {message}"
-        ))),
+        JailRefusal::Backend(message) => anyhow!(diagnostic(
+            i18n,
+            format!("ai-jail cannot start its sandbox on this machine: {message}")
+        )),
         JailRefusal::Drift(message) => {
             let review = format!(
                 "{} configure {harness}",
                 super::render_shared::shell_quote(&ai_jail.to_string_lossy())
             );
-            anyhow!(i18n.diagnostic(&format!(
-                "ai-jail's saved access for this project no longer matches this machine: {message}. Review it with: {review}"
-            )))
+            anyhow!(diagnostic(
+                i18n,
+                format!(
+                    "ai-jail's saved access for this project no longer matches this machine: {message}. Review it with: {review}"
+                )
+            ))
         }
     }
 }
@@ -3805,15 +3861,18 @@ fn contract_summary(
 ) -> String {
     let server = match reach {
         ServerReach::Loopback { port } => {
-            i18n.diagnostic(&format!("memory server through forwarded port {port}"))
+            diagnostic(i18n, format!("memory server through forwarded port {port}"))
         }
         ServerReach::Network => {
             i18n.diagnostic("full network, because the memory server is not on this machine")
         }
     };
-    i18n.diagnostic(&format!(
-        "ai-memory: ai-jail {version} reviews the rest of the access for {harness} ({server})"
-    ))
+    diagnostic(
+        i18n,
+        format!(
+            "ai-memory: ai-jail {version} reviews the rest of the access for {harness} ({server})"
+        ),
+    )
 }
 
 /// Run `status --json` for the exact launch. `None` when it fails or prints
@@ -4067,11 +4126,14 @@ fn follow_claude_continued_session(
             };
             eprintln!(
                 "{}",
-                i18n.diagnostic(&format!(
-                    "ai-memory: Claude session {} {how} {}; the workstream now follows it",
-                    display_session_id(&own),
-                    display_session_id(continuation.session_id())
-                ))
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: Claude session {} {how} {}; the workstream now follows it",
+                        display_session_id(&own),
+                        display_session_id(continuation.session_id())
+                    )
+                )
             );
             continuation.session_id().to_owned()
         }
@@ -4803,7 +4865,7 @@ fn default_claude_wrapper(
     let Some(spelling) = spelling else { return };
     match claude_wrapper_executable(spelling, search) {
         Ok(wrapper) => *executable = Some(wrapper),
-        Err(warning) => eprintln!("{warning}"),
+        Err(warning) => eprintln!("{}", super::show::terminal_text(&warning.to_string())),
     }
 }
 
@@ -5387,11 +5449,14 @@ fn choose_native_session(
     writeln!(
         output,
         "{}",
-        i18n.diagnostic(&format!(
-            "ai-memory: no {} session is linked to workstream '{}'.",
-            harness.as_str(),
-            workstream_name
-        ))
+        diagnostic(
+            i18n,
+            format!(
+                "ai-memory: no {} session is linked to workstream '{}'.",
+                harness.as_str(),
+                workstream_name
+            )
+        )
     )?;
     writeln!(
         output,
@@ -5402,18 +5467,24 @@ fn choose_native_session(
         writeln!(
             output,
             "{}",
-            i18n.diagnostic(&format!(
-                "  {}) {} (updated {})",
-                index + 1,
-                display_session_id(&candidate.native_session_id),
-                session_age(candidate.updated_at, now)
-            ))
+            diagnostic(
+                i18n,
+                format!(
+                    "  {}) {} (updated {})",
+                    index + 1,
+                    display_session_id(&candidate.native_session_id),
+                    session_age(candidate.updated_at, now)
+                )
+            )
         )?;
     }
     writeln!(
         output,
         "{}",
-        i18n.diagnostic(&format!("  0) Start a new {} session", harness.as_str()))
+        diagnostic(
+            i18n,
+            format!("  0) Start a new {} session", harness.as_str())
+        )
     )?;
 
     loop {
@@ -5439,7 +5510,7 @@ fn choose_native_session(
         writeln!(
             output,
             "{}",
-            i18n.diagnostic(&format!("Enter 0 through {}.", candidates.len()))
+            diagnostic(i18n, format!("Enter 0 through {}.", candidates.len()))
         )?;
     }
 }
@@ -5448,13 +5519,15 @@ fn choose_native_session(
 /// cannot flood the line. CodeQL's `rust/cleartext-logging` barrier model
 /// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
 /// names this function, so every session id the CLI prints goes through it.
+/// The id comes from a harness transcript or the server, so it is also
+/// neutralized for the terminal (#2000).
 pub(crate) fn display_session_id(value: &str) -> String {
     const MAX_CHARS: usize = 64;
     let mut output = value.chars().take(MAX_CHARS).collect::<String>();
     if value.chars().count() > MAX_CHARS {
         output.push_str("...");
     }
-    output
+    super::show::terminal_text(&output)
 }
 
 /// Age of a native session, rendered the way every other read-only listing
@@ -7269,6 +7342,78 @@ mod tests {
         assert!(output.contains("1) switch to codex"));
         assert!(output.contains("r) run claude again"));
         assert!(output.contains("q) quit (default)"));
+    }
+
+    /// A session id read from a transcript is printed by `backfill`,
+    /// `finalize-session` and `reorg` as well as by `run`, all through this
+    /// helper: it stays bounded and prints inert, and an ordinary id is
+    /// unchanged.
+    #[test]
+    fn display_session_id_is_bounded_and_inert() {
+        let id = "01a16548-23e9-7cf1-b3d6-ab3405055748";
+        assert_eq!(display_session_id(id), id);
+        assert_eq!(
+            display_session_id("abc\u{1b}]52;c;eA==\u{7}\u{202e}def"),
+            "abc?]52;c;eA==??def"
+        );
+        let long = "x".repeat(80);
+        assert_eq!(display_session_id(&long), format!("{}...", "x".repeat(64)));
+    }
+
+    /// #2010: the workstream name comes back from the server and a session
+    /// id from a harness transcript. A hostile value carrying an OSC 52
+    /// clipboard write, a CSI and a bidi override prints inert in both
+    /// prompts, in English and in Portuguese, while the rest of the line is
+    /// still there.
+    #[test]
+    fn server_and_transcript_names_print_inert_in_run_prompts() {
+        use ai_memory_core::i18n::{Language, Localizer};
+        let name = "re\u{1b}]52;c;cHduZWQ=\u{7}search\u{1b}[2J\u{202e}";
+        let id = "new\u{1b}[31mest";
+        let has_control = |text: &str| text.contains(['\u{1b}', '\u{7}', '\u{202e}']);
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let i18n = Localizer::new(language);
+            let mut output = Vec::new();
+            choose_after_run(
+                &i18n,
+                Paint::PLAIN,
+                ManagedHarness::Claude,
+                name,
+                &[RunHarnessChoice::Codex],
+                &mut Cursor::new(b"\n"),
+                &mut output,
+            )
+            .unwrap();
+            let after_run = String::from_utf8(output).unwrap();
+            assert!(!has_control(&after_run), "{after_run:?}");
+            assert!(
+                after_run.contains("re?]52;c;cHduZWQ=?search?[2J?"),
+                "{after_run:?}"
+            );
+
+            let mut output = Vec::new();
+            let candidates = [NativeSessionCandidate {
+                native_session_id: id.into(),
+                updated_at: SystemTime::UNIX_EPOCH,
+            }];
+            choose_native_session(
+                &i18n,
+                ManagedHarness::Codex,
+                name,
+                &candidates,
+                &mut Cursor::new(b"0\n"),
+                &mut output,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            )
+            .unwrap();
+            let adoption = String::from_utf8(output).unwrap();
+            assert!(!has_control(&adoption), "{adoption:?}");
+            assert!(
+                adoption.contains("re?]52;c;cHduZWQ=?search?[2J?"),
+                "{adoption:?}"
+            );
+            assert!(adoption.contains("new?[31mest"), "{adoption:?}");
+        }
     }
 
     #[test]

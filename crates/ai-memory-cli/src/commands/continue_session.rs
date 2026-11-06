@@ -38,7 +38,8 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
     for link in invalid_timestamps {
         eprintln!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-continue-session-skipping-client-registry-has-an-invalid-linked-at-timestamp",
                 &[("value0", scope_label(&link).to_string())]
             )
@@ -57,7 +58,8 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 let label = scope_label(&link);
                 eprintln!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-continue-session-skipping-label",
                         &[
                             ("value0", label.to_string()),
@@ -71,7 +73,8 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
         };
         eprintln!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-continue-session-continuing-in",
                 &[
                     ("value0", scope_label(&link).to_string()),
@@ -125,7 +128,13 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
     }
 
     bail!(
-        "{}", i18n.format("cli-continue-session-no-linked-checkout-is-still-usable-skipped-pick-one-explicitly-with-ai-memor", &[("value0", format!("{}", rejected))]))
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-continue-session-no-linked-checkout-is-still-usable-skipped-pick-one-explicitly-with-ai-memor",
+            &[("value0", format!("{}", rejected))]
+        )
+    )
 }
 
 fn filter_workspace(links: Vec<ProjectLink>, workspace: Option<&str>) -> Vec<ProjectLink> {
@@ -187,7 +196,8 @@ pub(super) fn resolve_target(config: &Config, link: &ProjectLink) -> Result<Path
         }
         bail!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-continue-session-checkout-now-resolves-to",
                 &[
                     ("value0", terminal_text(&workspace).to_string()),

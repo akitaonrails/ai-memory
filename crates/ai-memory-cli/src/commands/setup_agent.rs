@@ -839,9 +839,10 @@ fn emit_other(
     );
     println!(
         "{}",
-        i18n.diagnostic(&format!(
-            "Also run `ai-memory install-mcp --client {label}` to wire MCP separately."
-        ))
+        crate::localization::diagnostic(
+            i18n,
+            format!("Also run `ai-memory install-mcp --client {label}` to wire MCP separately.")
+        )
     );
 }
 

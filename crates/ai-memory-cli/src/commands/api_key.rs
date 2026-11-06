@@ -122,12 +122,15 @@ fn write_credentials(
     writeln!(
         out,
         "{}",
-        i18n.diagnostic(&format!(
-            "{}  {}  {:<8}  PREVIEW",
-            pad_cell("ID", id_w),
-            pad_cell("LABEL", label_w),
-            "STATUS"
-        ))
+        crate::localization::diagnostic(
+            i18n,
+            format!(
+                "{}  {}  {:<8}  PREVIEW",
+                pad_cell("ID", id_w),
+                pad_cell("LABEL", label_w),
+                "STATUS"
+            )
+        )
     )?;
     for c in credentials {
         writeln!(

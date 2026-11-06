@@ -360,7 +360,7 @@ fn print_outcome(i18n: &ai_memory_core::i18n::Localizer, outcome: &EnableOutcome
                 println!("{}", i18n.format("cli-auth-enable-mcp-client-targets-url-another-server-left-unchanged", &[("value0", client.to_string()), ("value1", display_url(url))]));
             }
             Wiring::Manual(reason) => {
-                println!("{}", i18n.format("cli-auth-enable-mcp-client-needs-a-manual-change-reason", &[("value0", client.to_string()), ("value1", reason.to_string())]));
+                println!("{}", crate::localization::format(i18n, "cli-auth-enable-mcp-client-needs-a-manual-change-reason", &[("value0", client.to_string()), ("value1", reason.to_string())]));
             }
         }
     }

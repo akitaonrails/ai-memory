@@ -73,10 +73,10 @@ impl FolderRefusal {
         match self {
             Self::Missing => i18n.diagnostic("the folder does not exist"),
             Self::NotADirectory => i18n.diagnostic("it is not a folder"),
-            Self::Sensitive(path) => i18n.diagnostic(&format!(
-                "it would expose {}",
-                terminal_text(&abbreviate(path, home))
-            )),
+            Self::Sensitive(path) => crate::localization::diagnostic(
+                i18n,
+                format!("it would expose {}", terminal_text(&abbreviate(path, home))),
+            ),
             Self::IsCheckout => i18n.diagnostic("the checkout is already mounted"),
         }
     }
@@ -612,10 +612,13 @@ impl PickerState {
         header.push(
             &format!(
                 "📁 {}",
-                i18n.diagnostic(&format!(
-                    "Extra folders for the jail — {}",
-                    terminal_text(&abbreviate(&self.dir, view.home))
-                ))
+                crate::localization::diagnostic(
+                    i18n,
+                    format!(
+                        "Extra folders for the jail — {}",
+                        terminal_text(&abbreviate(&self.dir, view.home))
+                    )
+                )
             ),
             Paint::Bold,
         );
@@ -664,7 +667,10 @@ impl PickerState {
                 .map(|folder| terminal_text(&folder.label()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            summary.push(&i18n.diagnostic(&format!("Selected: {names}")), Paint::Dim);
+            summary.push(
+                &crate::localization::diagnostic(i18n, format!("Selected: {names}")),
+                Paint::Dim,
+            );
         }
         lines.push(summary.finish(view));
         let mut hint = Line::default();

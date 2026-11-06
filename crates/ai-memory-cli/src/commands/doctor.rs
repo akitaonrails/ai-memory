@@ -1113,7 +1113,8 @@ fn render_project_coordinate(
                 let _ = writeln!(
                     output,
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-doctor-collision-reason",
                         &[("value0", format!("{}", reason))]
                     )
@@ -1124,7 +1125,8 @@ fn render_project_coordinate(
             let _ = writeln!(
                 output,
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-doctor-project-coordinate-unavailable",
                     &[(
                         "value0",

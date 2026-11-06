@@ -123,7 +123,8 @@ pub(crate) fn confirm_repair(
     writeln!(
         output,
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-run-project-split-explain",
             &[
                 ("workspace", super::show::terminal_text(&split.workspace)),
@@ -163,7 +164,8 @@ pub(crate) async fn apply_repair(config: &Config, split: &ProjectSplit) -> Resul
     .await?;
     eprintln!(
         "{}",
-        config.i18n.format(
+        crate::localization::format(
+            &config.i18n,
             "cli-run-project-split-repaired",
             &[
                 ("workspace", split.run_workspace.clone()),

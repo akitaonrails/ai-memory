@@ -164,7 +164,8 @@ fn omp_agent_dirs(
         Ok(dir) => dirs.push(dir),
         Err(error) => eprintln!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-uninstall-warning-skipping-the-active-omp-profile-error",
                 &[("value0", format!("{:#}", error))]
             )

@@ -111,6 +111,18 @@ pub(crate) fn diagnostic(i18n: &Localizer, text: impl std::fmt::Display) -> Stri
     crate::commands::show::terminal_text(&i18n.diagnostic(&text.to_string()))
 }
 
+/// A catalog line printed by `ai-memory run` and the commands that recover,
+/// resume or report its workstreams. Their values are server or transcript
+/// text (workstream, project and session names, journaled failure reasons),
+/// so each one is neutralized before it is placed in the message (#2010).
+pub(crate) fn format(i18n: &Localizer, id: &str, values: &[(&str, String)]) -> String {
+    let values = values
+        .iter()
+        .map(|(name, value)| (*name, crate::commands::show::terminal_text(value)))
+        .collect::<Vec<_>>();
+    i18n.format(id, &values)
+}
+
 pub(crate) fn command(mut command: clap::Command, path: &str, i18n: &Localizer) -> clap::Command {
     if i18n.language() == Language::English {
         return command;
@@ -386,11 +398,40 @@ mod tests {
         assert!(line.contains("?]52;c;eA==??"), "{line:?}");
     }
 
-    /// #2000: an error, warning or failure quoted mid-run is foreign text, so
-    /// the line goes through [`diagnostic`], which neutralizes it, never
-    /// through the bare `Localizer::diagnostic` that only translates.
+    /// #2010: a catalog line around `ai-memory run` quotes a workspace,
+    /// project or workstream name the server returned; each value prints
+    /// inert in both languages.
     #[test]
-    fn mid_run_error_diagnostics_use_the_neutralizing_helper() {
+    fn run_catalog_lines_neutralize_their_values() {
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let line = format(
+                &Localizer::new(language),
+                "cli-workstreams-managed-workstreams-for-workspace-project",
+                &[
+                    ("value0", "default".to_owned()),
+                    ("value1", "api\u{1b}]0;owned\u{7}\u{202e}".to_owned()),
+                ],
+            );
+            assert!(
+                !line.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+                "terminal control survived: {line:?}"
+            );
+            assert!(line.contains("default/api?]0;owned??"), "{line:?}");
+        }
+    }
+
+    /// #2000, #2010: a diagnostic that interpolates a value prints error,
+    /// server or transcript text (a workstream, project or session name, a
+    /// profile name, a failure reason), so it goes through [`diagnostic`],
+    /// which neutralizes it, never the bare `Localizer::diagnostic` that only
+    /// translates. The one exception is a multi-line message, which
+    /// `diagnostic` would flatten: each of its values is passed positionally
+    /// and wrapped in `terminal_text`/`terminal_body` at the call. The
+    /// commands around `ai-memory run` print catalog lines only through
+    /// [`format`], and anywhere else a catalog line that quotes an error or a
+    /// reason does too.
+    #[test]
+    fn interpolated_cli_lines_use_the_neutralizing_helpers() {
         fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(path).unwrap() {
                 let path = entry.unwrap().path();
@@ -401,14 +442,73 @@ mod tests {
                 }
             }
         }
-        // The bare method form up to the end of its first line of arguments
-        // and the next two, which is where every such call names its values.
-        let raw_call =
-            regex::Regex::new(r"\.diagnostic\(\s*&format!\((?:[^\n]*\n){0,4}[^\n]*").unwrap();
-        let foreign = regex::Regex::new(
-            r"\{(?:error|err|e|warning|failure|reason)[}:]|\bstderr\b|\bheld\.owner\b",
-        )
-        .unwrap();
+        /// The text between `open` (just past a `(`) and its matching `)`,
+        /// skipping string literals.
+        fn call_body(source: &str, open: usize) -> &str {
+            let bytes = source.as_bytes();
+            let (mut depth, mut index) = (1usize, open);
+            while depth > 0 && index < bytes.len() {
+                match bytes[index] {
+                    b'"' => {
+                        index += 1;
+                        while index < bytes.len() && bytes[index] != b'"' {
+                            index += if bytes[index] == b'\\' { 2 } else { 1 };
+                        }
+                    }
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                index += 1;
+            }
+            &source[open..index.saturating_sub(1)]
+        }
+        /// Split top-level arguments on commas outside parentheses, brackets
+        /// and strings.
+        fn arguments(body: &str) -> Vec<&str> {
+            let bytes = body.as_bytes();
+            let (mut depth, mut start, mut index, mut out) = (0i32, 0, 0, Vec::new());
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'"' => {
+                        index += 1;
+                        while index < bytes.len() && bytes[index] != b'"' {
+                            index += if bytes[index] == b'\\' { 2 } else { 1 };
+                        }
+                    }
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    b',' if depth == 0 => {
+                        out.push(body[start..index].trim());
+                        start = index + 1;
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+            out.push(body[start..].trim());
+            out.retain(|argument| !argument.is_empty());
+            out
+        }
+        const RUN_COMMANDS: &[&str] = &[
+            "continue_session.rs",
+            "finalize_session.rs",
+            "project_registry.rs",
+            "recovery.rs",
+            "rename_workstream.rs",
+            "resume.rs",
+            "run.rs",
+            "run_autowire.rs",
+            "run_project_split.rs",
+            "workstream_search.rs",
+            "workstreams.rs",
+        ];
+        let bare = regex::Regex::new(r"\.diagnostic\(\s*&format!\(").unwrap();
+        let bare_format = regex::Regex::new(r"\bi18n\s*\.\s*format\(").unwrap();
+        let placeholder = regex::Regex::new(r"\{[^{}]*\}").unwrap();
+        let foreign =
+            regex::Regex::new(r"\b(?:err|error|e|reason|problem|stderr|server_problem)\b").unwrap();
+        let named = regex::Regex::new(r"\{[A-Za-z_][\w.]*(?::[^{}]*)?\}").unwrap();
         let test_module =
             regex::Regex::new(r"(?m)^\s*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\(crate\))? )?mod \w+")
                 .unwrap();
@@ -425,18 +525,72 @@ mod tests {
             let body = test_module
                 .find(&source)
                 .map_or(source.as_str(), |found| &source[..found.start()]);
-            for call in raw_call.find_iter(body) {
-                let text = call.as_str();
-                let end = text.find("))").map_or(text.len(), |end| end);
-                if foreign.is_match(&text[..end]) {
-                    let line = body[..call.start()].lines().count() + 1;
-                    raw.push(format!("{}:{line}", file.display()));
+            let at = |offset: usize| {
+                format!(
+                    "{}:{}",
+                    file.display(),
+                    body[..offset].lines().count().max(1)
+                )
+            };
+            for call in bare.find_iter(body) {
+                let args = arguments(call_body(body, call.end()));
+                let Some(literal) = args.first() else {
+                    continue;
+                };
+                let literal = literal.replace("{{", "").replace("}}", "");
+                if !placeholder.is_match(&literal) {
+                    continue;
+                }
+                let multi_line = literal.replace("\\\n", "").contains("\\n");
+                let wrapped = args[1..].iter().all(|argument| {
+                    [
+                        "terminal_text(",
+                        "terminal_body(",
+                        "super::show::terminal_text(",
+                    ]
+                    .iter()
+                    .any(|helper| argument.starts_with(helper))
+                });
+                if !multi_line || named.is_match(&literal) || !wrapped {
+                    raw.push(at(call.start()));
+                }
+            }
+            let name = file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            for call in bare_format.find_iter(body) {
+                if RUN_COMMANDS.contains(&name) {
+                    raw.push(at(call.start()));
+                    continue;
+                }
+                // Elsewhere a catalog line that quotes an error or a reason
+                // is the same mid-run shape as a diagnostic.
+                let args = arguments(call_body(body, call.end()));
+                let values = args.get(1).map_or("", |values| {
+                    values
+                        .trim_start_matches('&')
+                        .trim()
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                });
+                let quotes_error = arguments(values).iter().any(|pair| {
+                    let pair = pair.trim().trim_start_matches('(').trim_end_matches(')');
+                    arguments(pair).get(1).is_some_and(|value| {
+                        foreign.is_match(value)
+                            && !["terminal_text(", "terminal_body(", "super::show::terminal_"]
+                                .iter()
+                                .any(|helper| value.starts_with(helper))
+                    })
+                });
+                if quotes_error {
+                    raw.push(at(call.start()));
                 }
             }
         }
         assert!(
             raw.is_empty(),
-            "quote these through localization::diagnostic:\n{}",
+            "neutralize these through localization::diagnostic / localization::format:\n{}",
             raw.join("\n")
         );
     }

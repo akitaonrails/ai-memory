@@ -251,10 +251,13 @@ async fn stage_then_swap(
         );
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!(
-                "ai-memory: left out {} file(s) from the backup's wiki git directory that git could run or follow ({listed}); the wiki's git config was rebuilt",
-                left_out.len()
-            ))
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "ai-memory: left out {} file(s) from the backup's wiki git directory that git could run or follow ({listed}); the wiki's git config was rebuilt",
+                    left_out.len()
+                )
+            )
         );
     }
     // tar stops at its zero header, before the gzip decoder necessarily reads

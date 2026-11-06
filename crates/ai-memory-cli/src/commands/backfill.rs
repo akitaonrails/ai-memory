@@ -477,7 +477,8 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
                 // detached worker's stderr is the operator's diagnostic log.
                 eprintln!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-backfill-ai-memory-backfill-of-session-failed-error",
                         &[
                             ("value0", session.harness.as_str().to_string()),

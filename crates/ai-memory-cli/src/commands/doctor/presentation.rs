@@ -58,7 +58,8 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
     if let Some(problem) = &report.capture_coverage_problem {
         terminal.line(format_args!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-presentation-capture-coverage-unavailable",
                 &[("value0", problem.reason.to_string())]
             )
@@ -93,7 +94,7 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
 
     if let Some(problem) = &report.marker_capture_problem {
         terminal.line(format_args!(
-            "{}", i18n.format("cli-presentation-the-settings-marker-has-an-invalid-capture-section-it-fails-closed-file-and", &[("value0", problem.classification.to_string())])));
+            "{}", crate::localization::format(i18n, "cli-presentation-the-settings-marker-has-an-invalid-capture-section-it-fails-closed-file-and", &[("value0", problem.classification.to_string())])));
     }
 
     if !report.native_memory.is_empty() {
