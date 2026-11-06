@@ -13,6 +13,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The built-in `api_key` sanitizer rule no longer starts inside an ordinary
+  word. Because nothing anchored its left side, `sk-` matched inside
+  identifiers such as `task-release-…`, `disk-usage-…` and
+  `background-task-…`, and the captured text or wiki page kept
+  `ta[REDACTED:api_key]` instead of the word. That corruption is
+  irreversible, and it turned page paths, branch names and cross-references
+  into dead links. A match no longer starts right after an ASCII letter, so
+  a key after punctuation, a space, a digit, `_`, a CJK character or a
+  percent escape (`%3D`) is still redacted. The Stripe `sk_live_`/`rk_live_` rule had the
+  same flaw (`task_live_…`, `network_live_…`) and is anchored the same
+  way. (#2025)
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is
