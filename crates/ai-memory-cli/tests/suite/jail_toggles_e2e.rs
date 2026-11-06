@@ -1175,3 +1175,264 @@ async fn the_checklist_remembers_answers_and_hands_in_the_next_run_command() {
     assert!(reset_argv.contains(&format!("--no-{flipped}")), "{reset}");
     handle.abort();
 }
+
+/// `--help` of an ai-jail that speaks the wrapper contract (3.0.1).
+fn help_with_contract() -> String {
+    format!(
+        "{HELP_2_4_1}{HELP_2_5_0_EXTRA}{HELP_MAPS}\
+    --harness <NAME>               Declare the effective harness explicitly
+    --request-file <PATH>          Load a versioned wrapper request manifest
+    --forward-port <PORT>          Expose the host's 127.0.0.1:PORT on the sandbox's own
+"
+    )
+}
+
+/// `capabilities --json` of ai-jail 3.0.1.
+const CAPABILITIES: &str = r#"{"version":"3.0.1","schema_version":1,
+"flags":["--harness","--request-file","--request","--json"],
+"request_kinds":["private_host","host","env","secret","agent_state","map"],
+"features":{"harness_flag":true,"request_file":true,"status_json":true,
+"secret_private_http":true,"configure_requests":true,"inside_marker":false},
+"exit_codes":{"cancelled":130,"required_grant":3,"blocked":4,"backend_unavailable":5}}"#;
+
+/// `status --json` for a project whose review is done and approves everything.
+const STATUS_REVIEWED: &str = r#"{"version":"3.0.1","schema_version":1,
+"project":{"canonical_path":"/p","profile_present":true},
+"harnesses":[{"name":"claude","onboarding_complete":true}],
+"grants":{"restricted":[],"allowed":[],"open":[]},
+"requests":{"approved":[],"pending":[]},"blockers":[]}"#;
+
+/// `status --json` for a project ai-jail has not reviewed yet.
+const STATUS_FIRST_RUN: &str = r#"{"version":"3.0.1","schema_version":1,
+"project":{"canonical_path":"/p","profile_present":false},
+"harnesses":[{"name":"claude","onboarding_complete":false}],
+"grants":{"restricted":["unrestricted_network"],"allowed":[],"open":[]},
+"requests":{"approved":[],"pending":[]},
+"blockers":[{"code":"onboarding_required","message":"Interactive onboarding is required before launch"}]}"#;
+
+impl Fixture {
+    /// Turn the fake into ai-jail 3.0.1: it answers `capabilities --json` and,
+    /// for `status --json`, prints `status` and records that argv too.
+    fn with_contract(self, status: &str) -> Self {
+        let root = self.repo.parent().unwrap().to_path_buf();
+        let help = root.join("ai-jail-help.txt");
+        fs::write(&help, help_with_contract()).unwrap();
+        let capabilities = root.join("ai-jail-capabilities.json");
+        fs::write(&capabilities, CAPABILITIES).unwrap();
+        let status_file = root.join("ai-jail-status.json");
+        fs::write(&status_file, status).unwrap();
+        write_script(
+            &self.bin.join("ai-jail"),
+            &format!(
+                "if [ \"$1\" = --help ]; then cat '{help}'; exit 0; fi\n\
+                 if [ \"$1\" = --dry-run ]; then exit 0; fi\n\
+                 if [ \"$1\" = capabilities ]; then cat '{caps}'; exit 0; fi\n\
+                 for arg in \"$@\"; do\n\
+                 [ \"$arg\" = -- ] && break\n\
+                 if [ \"$arg\" = status ]; then printf '%s\\n' \"$@\" > '{status_argv}'; cat '{status}'; exit 0; fi\n\
+                 done\n\
+                 printf '%s\\n' \"$@\" > '{argv}'\n\
+                 printf '%s' \"$AI_MEMORY_JAIL_NEXT_RUN\" > '{next}'\n",
+                help = help.display(),
+                caps = capabilities.display(),
+                status_argv = root.join("ai-jail-status-argv.txt").display(),
+                status = status_file.display(),
+                argv = self.jail_argv.display(),
+                next = self.next_run.display(),
+            ),
+        );
+        self
+    }
+
+    fn recorded(&self, name: &str) -> Option<Vec<String>> {
+        fs::read_to_string(self.repo.parent().unwrap().join(name))
+            .ok()
+            .map(|text| text.lines().map(str::to_owned).collect())
+    }
+}
+
+/// With ai-jail 3.0.1 the launch declares the harness and passes what the
+/// session needs as command-line grants, which ai-jail applies without a
+/// prompt: no request file, whose every entry would be its own yes/no. A
+/// loopback server gets only its port forwarded, never the whole network,
+/// and only this harness's own provider key is passed. The read-only status
+/// call previews exactly that launch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ai_jail_3_gets_the_harness_and_grants_without_prompts() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new("", true, None).with_contract(STATUS_REVIEWED);
+    let (server, requests, handle) = mock_server().await;
+    let port = server.rsplit(':').next().unwrap().to_owned();
+    let mut command = command(
+        &fixture,
+        &server,
+        &["run", "--no-autowire", "claude", "--jail=github"],
+    );
+    command
+        .env("ANTHROPIC_API_KEY", "sk-ant-fixture")
+        .env("OPENAI_API_KEY", "sk-openai-fixture")
+        .env("GEMINI_API_KEY", "gemini-fixture");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .expect("ai-memory run finished")
+        .expect("spawn ai-memory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail was never exec'd:\n{}", stderr(&output)));
+    let (flags, wrapped) = split_at_separator(&argv);
+    assert_eq!(
+        flags[..6],
+        [
+            "--harness",
+            "claude",
+            "--forward-port",
+            port.as_str(),
+            "--agent-state",
+            "--no-save-config"
+        ],
+        "a loopback server gets its port forwarded, never the whole network: {flags:?}"
+    );
+    let env: Vec<&str> = flags
+        .windows(2)
+        .filter(|pair| pair[0] == "--env")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert!(env.contains(&"AI_MEMORY_SERVER_URL"), "{env:?}");
+    assert!(env.contains(&"ANTHROPIC_API_KEY"), "{env:?}");
+    for other in ["OPENAI_API_KEY", "GEMINI_API_KEY"] {
+        assert!(!env.contains(&other), "a Claude jail got {other}: {env:?}");
+    }
+    assert_eq!(flags.last().map(String::as_str), Some("--github"));
+    for absent in ["--network", "--request-file", "--request"] {
+        assert!(
+            !flags.iter().any(|flag| flag == absent),
+            "{absent}: {flags:?}"
+        );
+    }
+    assert_eq!(
+        wrapped,
+        [
+            exe().as_str(),
+            "run",
+            "--no-autowire",
+            "claude",
+            "--jail=github"
+        ]
+    );
+    let status = fixture
+        .recorded("ai-jail-status-argv.txt")
+        .expect("status ran");
+    let (status_flags, status_wrapped) = split_at_separator(&status);
+    assert_eq!(status_flags[..status_flags.len() - 2], *flags);
+    assert_eq!(status_flags[status_flags.len() - 2..], ["status", "--json"]);
+    assert_eq!(status_wrapped, wrapped);
+    assert!(
+        !fixture.home.join("data").join("jail-requests").exists(),
+        "no request file is written"
+    );
+    assert!(
+        stderr(&output).contains("ai-jail 3.0.1 reviews the rest of the access for claude"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    handle.abort();
+}
+
+/// A first run with no terminal is not refused by ai-memory: ai-jail runs it
+/// once with restricted defaults plus the command-line grants, which is what
+/// its own guide asks of automation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_run_without_a_terminal_still_launches_with_the_grants() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new("", true, None).with_contract(STATUS_FIRST_RUN);
+    let (server, _requests, handle) = mock_server().await;
+    let output = run(
+        &fixture,
+        &server,
+        &["run", "--no-autowire", "claude", "--jail"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail was never exec'd:\n{}", stderr(&output)));
+    let (flags, _) = split_at_separator(&argv);
+    assert_eq!(flags[..2], ["--harness", "claude"]);
+    handle.abort();
+}
+
+/// A harness ai-jail has no preset for cannot be declared (ai-jail refuses
+/// an unknown `--harness`), so it keeps the flag-based launch, and no status
+/// call is made for a contract it is not using.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_harness_without_an_ai_jail_preset_keeps_the_flag_launch() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new("", true, None).with_contract(STATUS_REVIEWED);
+    write_script(&fixture.bin.join("copilot"), "exit 0\n");
+    let (server, _requests, handle) = mock_server().await;
+    let output = run(
+        &fixture,
+        &server,
+        &["run", "--no-autowire", "copilot", "--jail"],
+    )
+    .await;
+    let argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail was never exec'd:\n{}", stderr(&output)));
+    let (flags, _) = split_at_separator(&argv);
+    assert!(
+        !flags
+            .iter()
+            .any(|flag| flag == "--harness" || flag == "--request-file"),
+        "{flags:?}"
+    );
+    assert_eq!(
+        flags[..3],
+        ["--network", "--agent-state", "--no-save-config"]
+    );
+    assert!(fixture.recorded("ai-jail-status-argv.txt").is_none());
+    handle.abort();
+}
+
+/// A saved approval that no longer matches the host (here an approved
+/// variable that is not set any more) stops the launch before exec, quoting
+/// ai-jail's reason and the review command, instead of letting ai-jail fail
+/// inside the re-exec with exit 4.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drifted_ai_jail_access_stops_before_the_launch_with_the_reason() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let status = STATUS_REVIEWED.replace(
+        r#""blockers":[]"#,
+        r#""blockers":[{"code":"missing_approved_env","message":"approved variable OPENAI_API_KEY is not set"}]"#,
+    );
+    assert_ne!(status, STATUS_REVIEWED);
+    let fixture = Fixture::new("", true, None).with_contract(&status);
+    let (server, _requests, handle) = mock_server().await;
+    let output = run(
+        &fixture,
+        &server,
+        &["run", "--no-autowire", "claude", "--jail"],
+    )
+    .await;
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(
+        text.contains(
+            "no longer matches this machine: approved variable OPENAI_API_KEY is not set"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("ai-jail configure claude"), "{text}");
+    assert!(fixture.jail_argv().is_none(), "nothing was launched");
+    handle.abort();
+}
