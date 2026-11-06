@@ -62,7 +62,7 @@ use anyhow::{Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ClientJsonRpcMessage, ClientRequest,
-    CustomNotification, JsonObject, ListToolsResult, PaginatedRequestParams, ServerConfig,
+    CustomNotification, ListToolsResult, PaginatedRequestParams, ServerConfig,
     ServerJsonRpcMessage, ServerNotification, ServerPeerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, ServiceError};
@@ -115,42 +115,21 @@ impl LaunchScope {
         if !self.tools.contains(request.name.as_ref()) {
             return request;
         }
-        let mut arguments = request.arguments.take().unwrap_or_default();
-        if !names_a_scope(&arguments) {
-            arguments.insert("workspace".into(), self.workspace.clone().into());
-            arguments.insert("project".into(), self.project.clone().into());
-        }
-        request.arguments = Some(arguments);
+        let arguments = request.arguments.take().unwrap_or_default();
+        request.arguments = Some(ai_memory_mcp::launch_scope::fill(
+            arguments,
+            &self.workspace,
+            &self.project,
+        ));
         request
     }
-}
-
-/// Whether a call's arguments already choose where it goes. A `null` key
-/// counts as absent, the way the server's optional arguments read it. Any
-/// other value is the caller's, even a malformed one, which the server then
-/// refuses on its own terms rather than the bridge replacing it.
-fn names_a_scope(arguments: &JsonObject) -> bool {
-    let given = |key: &str| arguments.get(key).filter(|value| !value.is_null());
-    ["workspace", "project", "project_id"]
-        .into_iter()
-        .any(|key| given(key).is_some())
-        || given("scopes").is_some_and(|scopes| scopes.as_array().is_none_or(|s| !s.is_empty()))
-        || given("global").is_some_and(|global| global.as_bool() != Some(false))
-        || given("scope").is_some_and(|scope| scope.as_str() != Some("project"))
 }
 
 /// Tools whose input schema declares both `workspace` and `project`.
 fn project_scoped_tools(tools: &[Tool]) -> HashSet<String> {
     tools
         .iter()
-        .filter(|tool| {
-            tool.input_schema
-                .get("properties")
-                .and_then(serde_json::Value::as_object)
-                .is_some_and(|properties| {
-                    properties.contains_key("workspace") && properties.contains_key("project")
-                })
-        })
+        .filter(|tool| ai_memory_mcp::launch_scope::takes_workspace_and_project(tool))
         .map(|tool| tool.name.to_string())
         .collect()
 }
@@ -361,6 +340,7 @@ pub(crate) fn upstream_config(
     server_url: &str,
     session_id: Option<&str>,
     auth_token: Option<&str>,
+    fallback_scope: Option<&(String, String)>,
 ) -> Result<StreamableHttpClientTransportConfig> {
     // Every transport in this module is built from a config this function
     // produced, so installing here covers each of them. Doing it only in
@@ -376,6 +356,23 @@ pub(crate) fn upstream_config(
             HeaderValue::from_str(session_id)
                 .context("the session id contains characters that are invalid in an HTTP header")?,
         );
+    }
+    if let Some((workspace, project)) = fallback_scope {
+        use ai_memory_mcp::launch_scope::{
+            FALLBACK_PROJECT_HEADER, FALLBACK_WORKSPACE_HEADER, encode_header_value,
+        };
+        // Percent-encoding leaves only visible ASCII, which every header
+        // value accepts; the server needs both halves or ignores the pair.
+        if let (Ok(workspace), Ok(project)) = (
+            HeaderValue::from_str(&encode_header_value(workspace)),
+            HeaderValue::from_str(&encode_header_value(project)),
+        ) {
+            headers.insert(
+                HeaderName::from_static(FALLBACK_WORKSPACE_HEADER),
+                workspace,
+            );
+            headers.insert(HeaderName::from_static(FALLBACK_PROJECT_HEADER), project);
+        }
     }
 
     let mut config =
@@ -396,9 +393,10 @@ pub(crate) fn upstream_transport(
     server_url: &str,
     session_id: Option<&str>,
     auth_token: Option<&str>,
+    fallback_scope: Option<&(String, String)>,
 ) -> Result<StreamableHttpClientTransport<reqwest_mcp::Client>> {
     // First: it installs the crypto provider the client builder needs.
-    let config = upstream_config(server_url, session_id, auth_token)?;
+    let config = upstream_config(server_url, session_id, auth_token, fallback_scope)?;
     let client = reqwest_mcp::Client::builder()
         .no_proxy()
         .pool_max_idle_per_host(0)
@@ -701,10 +699,14 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         &config.server_url,
     ));
     let bearer = bridge_bearer(config, &server_url)?;
-    let launch_project = if args.no_session_id {
-        launch_dir(config).and_then(|dir| launch_project(config, &dir))
+    // The session-less bridge fills its launch project into unscoped calls;
+    // the session-aware one sends it for the server to use only when this
+    // session's own active-project pointer misses (#2005).
+    let launch_project = launch_dir(config).and_then(|dir| launch_project(config, &dir));
+    let (launch_project, fallback_scope) = if args.no_session_id {
+        (launch_project, None)
     } else {
-        None
+        (None, launch_project)
     };
     let inbox_channel = args.channel.map(|_channel| {
         let session = session_id.unwrap_or_default().to_owned();
@@ -714,7 +716,12 @@ pub async fn run(config: &Config, args: McpBridgeArgs) -> Result<()> {
         let url = inbox_channel_url(&server_url, &cwd, &session);
         (session, url)
     });
-    let transport = upstream_transport(&server_url, session_id, bearer.as_deref())?;
+    let transport = upstream_transport(
+        &server_url,
+        session_id,
+        bearer.as_deref(),
+        fallback_scope.as_ref(),
+    )?;
 
     // Connecting before serving stdio means a refused credential (401) or an
     // unreachable server ends the process with this error at once; the client
@@ -928,7 +935,12 @@ mod tests {
     /// the contract so the call is not quietly deleted.
     #[test]
     fn upstream_config_leaves_a_crypto_provider_installed() {
-        let config = upstream_config("http://127.0.0.1:1/mcp", Some("session-for-provider"), None);
+        let config = upstream_config(
+            "http://127.0.0.1:1/mcp",
+            Some("session-for-provider"),
+            None,
+            None,
+        );
         assert!(config.is_ok(), "config build must succeed");
         assert!(
             rustls::crypto::CryptoProvider::get_default().is_some(),
@@ -948,6 +960,7 @@ mod tests {
     }
     use super::*;
     use crate::config::RuntimeEnv;
+    use rmcp::model::JsonObject;
     use std::sync::{Arc, Mutex};
 
     use axum::Router;
@@ -1089,7 +1102,7 @@ mod tests {
         wait_for_server(&url, Duration::from_secs(5), Duration::from_millis(50))
             .await
             .unwrap();
-        let upstream = ().serve(upstream_transport(&url, None, None).unwrap()).await.unwrap();
+        let upstream = ().serve(upstream_transport(&url, None, None, None).unwrap()).await.unwrap();
         assert!(upstream.peer_info().is_some());
         upstream.cancel().await.unwrap();
         http_server.abort();
@@ -1145,10 +1158,27 @@ mod tests {
             "https://memory.example/mcp",
             Some("550e8400-e29b-41d4-a716-446655440000"),
             Some("secret-token"),
+            Some(&("team".to_owned(), "r\u{e9}po notes".to_owned())),
         )
         .unwrap();
 
         assert_eq!(config.auth_header.as_deref(), Some("secret-token"));
+        // #2005: the launch scope travels percent-encoded for the server's
+        // pointer-miss fallback.
+        let header = |name| {
+            config
+                .custom_headers
+                .get(&HeaderName::from_static(name))
+                .and_then(|value| value.to_str().ok())
+        };
+        assert_eq!(
+            header(ai_memory_mcp::launch_scope::FALLBACK_WORKSPACE_HEADER),
+            Some("team")
+        );
+        assert_eq!(
+            header(ai_memory_mcp::launch_scope::FALLBACK_PROJECT_HEADER),
+            Some("r%C3%A9po%20notes")
+        );
         assert_eq!(
             config
                 .custom_headers
@@ -1165,6 +1195,7 @@ mod tests {
         let error = upstream_config(
             "https://memory.example/mcp",
             Some("session\ninjected"),
+            None,
             None,
         )
         .unwrap_err();
@@ -1253,7 +1284,7 @@ mod tests {
     /// `CLAUDE_CODE_SESSION_ID` is inherited (it is not even consulted).
     #[test]
     fn a_session_less_upstream_config_carries_no_session_header() {
-        let config = upstream_config("https://memory.example/mcp", None, Some("t")).unwrap();
+        let config = upstream_config("https://memory.example/mcp", None, Some("t"), None).unwrap();
         assert!(!config.custom_headers.contains_key(&ACTOR_SESSION_HEADER));
         assert_eq!(config.auth_header.as_deref(), Some("t"));
     }
@@ -1282,6 +1313,7 @@ mod tests {
         let upstream_transport = upstream_transport(
             &format!("http://{address}/mcp"),
             Some("claude-session-244"),
+            None,
             None,
         )
         .unwrap();
@@ -1667,10 +1699,12 @@ mod tests {
             ),
         ];
         for scoped in [true, false] {
-            let upstream =
-                ().serve(upstream_transport(&format!("http://{address}/mcp"), None, None).unwrap())
-                    .await
-                    .unwrap();
+            let upstream = ()
+                .serve(
+                    upstream_transport(&format!("http://{address}/mcp"), None, None, None).unwrap(),
+                )
+                .await
+                .unwrap();
             let launch_scope = if scoped {
                 launch_scope(upstream.peer(), ("team".into(), "notes".into())).await
             } else {

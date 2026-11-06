@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- After `/resume` or `/clear` in Claude Code, unscoped `memory_*` calls
+  through the session-aware `mcp-bridge` no longer fall back to
+  `default/scratch` (reads) or refuse with "the active-project pointer does
+  not match this caller" (writes). The bridge keeps its launch-time session
+  id, so its pointer lookup missed. It now sends its launch directory's
+  project in two headers, and the server uses that project only when the
+  session's own pointer does not resolve. A pointer the hooks published still
+  wins, the project is authorized like an explicit scope, and a directory
+  that resolves to no project keeps the old behaviour (#2005).
+
 - Commands that work on the checkout they run in (`run`, `resume`,
   `continue`, `workstreams`, `doctor`, `search`, `read-page`, `write-page`,
   `handoffs`, `message` and the other project-scoped commands) now reach the

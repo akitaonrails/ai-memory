@@ -1274,8 +1274,12 @@ async fn memory_status(config: &Config) -> Result<()> {
     use rmcp::model::CallToolRequestParams;
 
     let url = install_mcp::mcp_server_url_from_base(&config.server_url);
-    let transport =
-        super::mcp_bridge::upstream_transport(&url, None, config.auth.bearer_token.as_deref())?;
+    let transport = super::mcp_bridge::upstream_transport(
+        &url,
+        None,
+        config.auth.bearer_token.as_deref(),
+        None,
+    )?;
     let client = ()
         .serve(transport)
         .await
