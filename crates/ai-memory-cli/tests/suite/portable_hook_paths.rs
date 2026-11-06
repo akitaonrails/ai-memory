@@ -89,6 +89,31 @@ fn binary_file_name() -> String {
         .into_owned()
 }
 
+/// The `shell_quote` rule: bare when only `[A-Za-z0-9-_./:@%+=,]`, else single-quoted.
+fn posix_quote(text: &str) -> String {
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:@%+=,".contains(c))
+    {
+        return text.to_string();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Every ai-memory hook must be exactly `<quoted exe> --data-dir <quoted data dir> hook --event …`.
+fn assert_absolute_hook_commands(config: &Path, data_dir: &Path) {
+    let hook_commands = ai_memory_hook_commands(config);
+    assert!(!hook_commands.is_empty(), "no ai-memory hook written");
+    let expected_start = format!(
+        "{} --data-dir {} hook --event ",
+        posix_quote(binary()),
+        posix_quote(&data_dir.to_string_lossy()),
+    );
+    for command in &hook_commands {
+        assert!(command.starts_with(&expected_start), "{command}");
+    }
+}
+
 #[test]
 fn install_hooks_writes_home_relative_exe() {
     let dir = tempfile::tempdir().unwrap();
@@ -155,13 +180,7 @@ fn install_hooks_absolute_paths_flag_writes_absolute_exe() {
         &[],
     );
 
-    let hook_commands = ai_memory_hook_commands(&config);
-    assert!(!hook_commands.is_empty(), "no ai-memory hook written");
-    let exe = binary();
-    for command in &hook_commands {
-        assert!(!command.contains("$HOME"), "{command}");
-        assert!(command.contains(exe), "{command}");
-    }
+    assert_absolute_hook_commands(&config, &dir.path().canonicalize().unwrap().join("data"));
 }
 
 #[test]
@@ -175,10 +194,5 @@ fn install_hooks_env_opt_out_writes_absolute_exe() {
         &[("AI_MEMORY_HOOK_ABSOLUTE_PATHS", "1")],
     );
 
-    let hook_commands = ai_memory_hook_commands(&config);
-    assert!(!hook_commands.is_empty(), "no ai-memory hook written");
-    for command in &hook_commands {
-        assert!(!command.contains("$HOME"), "{command}");
-        assert!(command.contains(binary()), "{command}");
-    }
+    assert_absolute_hook_commands(&config, &dir.path().canonicalize().unwrap().join("data"));
 }

@@ -509,7 +509,9 @@ with the same layout, and re-applying leaves it unchanged. A path outside
 `$HOME`, or one with `"`, `$`, `` ` `` or `\` in it, stays absolute. Pass
 `--absolute-paths` to `install-hooks` or `setup`, or set
 `AI_MEMORY_HOOK_ABSOLUTE_PATHS=1` (which `upgrade` also honours), to keep
-absolute paths everywhere. Hermes and Pool always get absolute paths, because
+absolute paths everywhere. The agent must run the hook with `HOME` set, because
+the `"$HOME/..."` form expands it in the shell; if the agent cannot provide `HOME`,
+use `--absolute-paths`. Hermes and Pool always get absolute paths, because
 they do not run the command through a shell.
 
 The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,

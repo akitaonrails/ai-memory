@@ -2547,12 +2547,29 @@ pub(crate) fn set_absolute_hook_paths(absolute: bool) {
 /// The home that native POSIX hook commands write as `"$HOME"`, read from the
 /// environment and the process opt-out. See [`portable_hook_home_from`].
 fn portable_hook_home(agent: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = test_home_override() {
+        return portable_hook_home_from(agent, home.map(std::ffi::OsString::from), false, None);
+    }
     portable_hook_home_from(
         agent,
         std::env::var_os("HOME"),
         ABSOLUTE_HOOK_PATHS.load(std::sync::atomic::Ordering::Relaxed),
         std::env::var_os("AI_MEMORY_HOOK_ABSOLUTE_PATHS"),
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only stand-in for `HOME`: `Some(Some(dir))` renders `dir` as home,
+    /// `Some(None)` simulates an unset `HOME`, `None` reads the real environment.
+    static TEST_HOME_OVERRIDE: std::cell::RefCell<Option<Option<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_home_override() -> Option<Option<PathBuf>> {
+    TEST_HOME_OVERRIDE.with(|home| home.borrow().clone())
 }
 
 /// The home to substitute as `"$HOME"`, or `None` for absolute paths.
@@ -6115,44 +6132,227 @@ $payload = [Console]::In.ReadToEnd()
         );
     }
 
-    #[test]
-    fn portable_shell_agents_get_home_form() {
-        let agents = [
-            "claude-code",
-            "grok",
-            "devin",
-            "dsh",
-            "antigravity-cli",
-            "kimi-code",
-            "kiro-cli",
-            "droid",
-            "muse",
-            "codebuddy",
-            "qoder",
-            "ibm-bob",
-            "qwen-code",
-        ];
-        for agent in agents {
-            let home = portable_home(agent);
-            let cmd = posix_native_hook_command_with(
-                &portable_exe(),
-                home.as_deref(),
-                Path::new("stop.sh"),
-                "http://127.0.0.1:49374",
-                None,
-                portable_ctx(agent, None),
-            );
-            let prefix = format!(
-                "\"$HOME/.local/share/ai-memory/native-runner/ai-memory\" hook --event stop --agent {agent} "
-            );
-            assert!(cmd.starts_with(&prefix), "{agent}: {cmd}");
+    /// Forces [`portable_hook_home`] to see `home` as `HOME` for this thread.
+    /// Restores the real environment on drop.
+    struct HomeOverride;
+
+    impl HomeOverride {
+        fn set(home: Option<PathBuf>) -> Self {
+            TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(home));
+            Self
         }
     }
 
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    const PORTABLE_TEST_URL: &str = "http://127.0.0.1:49374";
+
+    /// Every `command` string in a payload, in document order.
+    fn payload_commands(payload: &serde_json::Value) -> Vec<String> {
+        fn walk(value: &serde_json::Value, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        match (key.as_str(), child.as_str()) {
+                            ("command", Some(text)) => found.push(text.to_string()),
+                            _ => walk(child, found),
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|item| walk(item, found));
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(payload, &mut found);
+        found
+    }
+
+    type PortableBuilder = fn(&Path) -> Vec<String>;
+
+    fn row(agent: &'static str, build: PortableBuilder) -> (&'static str, PortableBuilder) {
+        (agent, build)
+    }
+
+    /// The 13 shell agents, each through the builder `install-hooks` calls.
+    #[cfg(unix)]
+    fn portable_shell_builders() -> [(&'static str, PortableBuilder); 13] {
+        [
+            row("claude-code", |data: &Path| {
+                payload_commands(&build_claude_code_payload_with_data_dir(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                    false,
+                ))
+            }),
+            row("grok", |data: &Path| {
+                payload_commands(&build_grok_payload_with_data_dir(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("devin", |data: &Path| {
+                payload_commands(&build_devin_payload_with_data_dir(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("dsh", |data: &Path| {
+                payload_commands(&build_dsh_hooks_payload(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("antigravity-cli", |data: &Path| {
+                payload_commands(&build_antigravity_payload_with_data_dir(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("kimi-code", |data: &Path| {
+                kimi_code_hook_commands(Path::new(""), PORTABLE_TEST_URL, None, Some(data), None)
+                    .into_iter()
+                    .map(|(_, command)| command)
+                    .collect()
+            }),
+            row("kiro-cli", |data: &Path| {
+                payload_commands(&build_kiro_cli_v3_hooks_value(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("droid", |data: &Path| {
+                payload_commands(&build_droid_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("muse", |data: &Path| {
+                payload_commands(&build_muse_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("codebuddy", |data: &Path| {
+                payload_commands(&build_codebuddy_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("qoder", |data: &Path| {
+                payload_commands(&build_qoder_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("ibm-bob", |data: &Path| {
+                payload_commands(&build_ibm_bob_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("qwen-code", |data: &Path| {
+                payload_commands(&build_qwen_code_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_shell_agents_get_home_form() {
+        let exe = hook_embedded_exe_path();
+        let exe_file = exe.file_name().unwrap().to_string_lossy().into_owned();
+        let home = exe.parent().unwrap().to_path_buf();
+        let data = home.join(".local/share/ai-memory");
+        let absolute_exe = shell_quote(&exe.to_string_lossy());
+        let _home = HomeOverride::set(Some(home.clone()));
+        let expected_prefix = format!("\"$HOME/{exe_file}\" ");
+        for (agent, build) in portable_shell_builders() {
+            let commands = build(&data);
+            let hook_commands: Vec<&String> = commands
+                .iter()
+                .filter(|command| command.contains(" hook --event "))
+                .collect();
+            assert!(!hook_commands.is_empty(), "{agent}: no hook commands");
+            assert!(
+                hook_commands
+                    .iter()
+                    .any(|command| command.contains(&expected_prefix)),
+                "{agent}: {commands:?}"
+            );
+            for command in hook_commands {
+                assert!(!command.contains(&absolute_exe), "{agent}: {command}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn portable_argv_agents_keep_absolute() {
+        let exe = hook_embedded_exe_path();
+        let absolute_exe = shell_quote(&exe.to_string_lossy());
+        let home = exe.parent().unwrap().to_path_buf();
+        let data = home.join(".local/share/ai-memory");
+        let _home = HomeOverride::set(Some(home.clone()));
         for agent in ["hermes", "pool"] {
             assert_eq!(portable_home(agent), None, "{agent}");
+        }
+        let hermes = build_hermes_hooks_yaml(
+            PORTABLE_TEST_URL,
+            None,
+            Some(&data),
+            None,
+            HermesHookSet::Full,
+        );
+        let pool = build_pool_settings_yaml_with_data_dir(
+            Path::new(""),
+            PORTABLE_TEST_URL,
+            None,
+            Some(&data),
+            None,
+        );
+        for (agent, rendered) in [("hermes", hermes), ("pool", pool)] {
+            assert!(rendered.contains(&absolute_exe), "{agent}: {rendered}");
+            assert!(!rendered.contains("$HOME"), "{agent}: {rendered}");
         }
     }
 
