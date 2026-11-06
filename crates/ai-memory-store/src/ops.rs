@@ -616,6 +616,20 @@ pub struct ProjectAliasWriteResolution {
     pub promoted_from: Option<String>,
 }
 
+/// Whether a project other than `except` is named `name` in the workspace.
+fn name_held_by_another_project(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    except: ai_memory_core::ProjectId,
+) -> StoreResult<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2 AND id <> ?3)",
+        params![workspace_id.as_bytes(), name, except.as_bytes()],
+        |row| row.get(0),
+    )?)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_project_name_for_write(
     conn: &mut Connection,
@@ -644,6 +658,16 @@ pub(crate) fn resolve_project_name_for_write(
             .then(|| crate::project_coordinates::promotion_target(&matched, requested))
             .flatten()
             .map(str::to_owned);
+        // A leftover row may still hold the canonical name (#2018); the owner
+        // keeps its current name rather than failing the write.
+        let promote_to = match promote_to {
+            Some(canonical)
+                if name_held_by_another_project(&tx, workspace_id, &canonical, matched.id)? =>
+            {
+                None
+            }
+            other => other,
+        };
         let promoted_from = if let Some(canonical) = promote_to {
             rename_project_in_tx(
                 &tx,

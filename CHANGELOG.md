@@ -11,6 +11,42 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `ai-memory run --jail` no longer shows two access checklists with ai-jail
+  3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
+  flags such as `--jail-map` no longer hide it, and ai-jail's own review is
+  the only one. What the session needs is passed as grants that ai-jail
+  applies without a prompt: the harness's login state, the `AI_MEMORY_*`
+  variables, and only that harness's own API key, so a Claude jail no longer
+  receives OpenAI or Gemini keys. A memory server on the same machine is
+  reached through one forwarded port instead of the full network. Before
+  launching, ai-memory asks ai-jail whether the sandbox can start and stops
+  with ai-jail's reason when it cannot or when saved access no longer matches
+  the machine. ai-memory's own screen keeps only the extra folders. Older
+  ai-jail releases, and Copilot and Command Code, keep the previous launch
+  (#2020).
+
+- A project name no longer turns ambiguous because an empty leftover project
+  holds it literally. When a remote-derived name such as `acme-api` matches
+  both the project that owns that repository and an empty project created
+  under the literal name, reads, writes and `memory_message_send` now reach
+  the repository owner. A leftover that holds data, or any restricted
+  candidate, still refuses, and the error now says which holder owns which
+  repository, which project name to pass instead, and the
+  `rename-project --project-id` command that moves an empty holder out of the
+  way. The server also logs such a leftover at startup (#2018).
+
+- The dashboard's icons now render on every platform. The three shipped
+  web fonts are Latin subsets, so the geometric and symbol characters the
+  templates use as icons were absent from them and fell through to the
+  platform UI font, which carries only a few: on macOS 4 of the 17 the
+  dashboard uses, leaving the other 13 as tofu boxes. The base font stacks
+  now name the symbol face each platform ships, after `system-ui`, so Latin
+  text is unchanged (#2003).
+
+## [3.4.2] - 2026-11-05
+
 ### Added
 
 - `ai-memory run`'s ai-jail checklist now remembers each checkout's answers,
@@ -38,13 +74,6 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- The dashboard's icons now render on every platform. The three shipped
-  web fonts are Latin subsets, so the geometric and symbol characters the
-  templates use as icons were absent from them and fell through to the
-  platform UI font, which carries only a few: on macOS 4 of the 17 the
-  dashboard uses, leaving the other 13 as tofu boxes. The base font stacks
-  now name the symbol face each platform ships, after `system-ui`, so Latin
-  text is unchanged.
 - The project-split repair now joins the two projects instead of only
   renaming them. 3.4.1's two renames left the repository identity on the
   archived project, so identity-based capture and the checkout's saved
@@ -4251,7 +4280,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.1...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.2...HEAD
+[3.4.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.2
 [3.4.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.1
 [3.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.0
 [3.3.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.3.3
