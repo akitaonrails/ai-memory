@@ -1517,6 +1517,7 @@ mod tests {
         assert!(!wiki_git_entry_kept(Path::new("wiki/sub/.git"), dir));
     }
 
+    #[cfg(unix)]
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("git")
             .arg("-C")
