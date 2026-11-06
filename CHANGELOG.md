@@ -11,6 +11,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- `ai-memory run --yolo` is now the only yolo switch. For Claude it also
+  forces `bypassPermissions` over a `defaultMode` in your settings, which
+  used to need `--true-yolo`; other harnesses are unchanged. `--true-yolo`
+  still works as a hidden alias of `--yolo` (on `run`, `show`, `continue` and
+  `resume`) and prints a one-line note in a terminal. The `claude_true_yolo`
+  config key and `AI_MEMORY_CLAUDE_TRUE_YOLO` still load but are ignored;
+  `ai-memory run` asks you to remove them. The line printed after a jailed
+  run now repeats the launch with `--yolo`. Claude's own `ask` rules still
+  pause the run, and the `--yolo` warning and ai-jail offer are unchanged
+  (maintainer request).
+
 ### Fixed
 
 - The built-in `api_key` sanitizer rule no longer starts inside an ordinary

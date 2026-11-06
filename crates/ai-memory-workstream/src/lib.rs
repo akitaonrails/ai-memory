@@ -8,12 +8,12 @@ mod transcript;
 
 pub use harness::{
     LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness, OpenCodeDialect, TranscriptCapability,
-    allows_native_session_adoption, apply_claude_true_yolo, apply_jail_process_isolation,
-    apply_yolo, build_launch_plan, build_launch_plan_with_env, build_launch_plan_with_env_lookup,
-    clean_path, crush_data_dir, crush_global_config_path, env_dir_override,
-    has_native_session_selector, is_interactive_session_invocation, kiro_explicit_session_id,
-    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine, omp_agent_dir,
-    omp_profile_flag, omp_profile_flag_env, store_override_vars,
+    allows_native_session_adoption, apply_jail_process_isolation, apply_yolo, build_launch_plan,
+    build_launch_plan_with_env, build_launch_plan_with_env_lookup, clean_path, crush_data_dir,
+    crush_global_config_path, env_dir_override, has_native_session_selector,
+    is_interactive_session_invocation, kiro_explicit_session_id, kiro_selects_non_default_engine,
+    kiro_selects_v2_engine, kiro_selects_v3_engine, omp_agent_dir, omp_profile_flag,
+    omp_profile_flag_env, store_override_vars,
 };
 pub use jail::{
     FORWARDED_ENV_NAMES, JAIL_TOGGLES, JailChecklistItem, JailEnv, JailHostFacts, JailOs, JailRisk,

@@ -3,8 +3,8 @@
 Status: accepted (release/2.5). Tracks the 2.5 feature that makes
 `ai-memory run … --yolo` warn before it disarms an agent's safety prompts,
 offers to run the session inside [ai-jail](https://github.com/akitaonrails/ai-jail)
-when it is usable, and adds an opt-in "true yolo" that implies `--yolo` and,
-for Claude Code, also forces `bypassPermissions` over a settings `defaultMode`.
+when it is usable, and, for Claude Code, also forces `bypassPermissions` over
+a settings `defaultMode` (through 3.4.2 a separate opt-in "true yolo").
 
 ## Motivation
 
@@ -151,13 +151,14 @@ When detected as already jailed, both the warning and the ai-jail offer are
 skipped and the run proceeds directly, so a user who typed
 `ai-jail ai-memory run … --yolo` sees no extra friction.
 
-### 4. Claude "true yolo" (opt-in, all OSes; recommended only under ai-jail)
+### 4. Claude's `--yolo` forces `bypassPermissions` (all OSes)
 
-Opt-in `[run] claude_true_yolo` (config) / `--true-yolo` (flag) additionally,
-**for the Claude harness only**, injects
-`--settings '{"permissions":{"defaultMode":"bypassPermissions"}}'` on the
-Claude argv. CLI-flag precedence sits above user and project settings, so a
-`defaultMode` there (e.g. `auto` or `acceptEdits`) cannot narrow the run.
+On the Claude harness, `--yolo` adds
+`--settings '{"permissions":{"defaultMode":"bypassPermissions"}}'` to the
+Claude argv next to `--dangerously-skip-permissions` (`apply_yolo`).
+CLI-flag precedence sits above user and project settings, so a `defaultMode`
+there (e.g. `auto` or `acceptEdits`) cannot narrow the run. Other harnesses
+get only their dangerous-mode flag.
 
 What it deliberately does **not** claim to do, verified against Claude Code
 2.1.280 and its documentation:
@@ -174,19 +175,29 @@ What it deliberately does **not** claim to do, verified against Claude Code
   and its env-var reference), so they were removed rather than left implying a
   protection that never existed.
 
-True-yolo is documented as "best paired with a clean sandbox," i.e. ai-jail.
+Up to 3.4.2 this was a separate opt-in, `--true-yolo` (flag) or
+`claude_true_yolo` (config), on top of `--yolo`. Two switches that differed
+only for Claude confused more than they protected, so 3.4.3 folded it into
+`--yolo`. The safety story is unchanged: the extra only takes effect behind
+the same §1 warning and confirmation, and the §2 ai-jail offer, that every
+`--yolo` gets, and what it adds is closing the gap a settings `defaultMode`
+left in a run the user already confirmed as unsupervised. A sandbox is still
+the recommended place for any `--yolo` run.
 
-Off by default. **`--true-yolo` is a superset of `--yolo`**: it implies
-`--yolo` (the §1 warning, the §2 offer, and each harness's dangerous-mode
-mapping) and adds the Claude extras above, so passing both is redundant but
-harmless. For every non-Claude harness it is simply interchangeable with
-`--yolo`. Like `--yolo`, it is recognized anywhere after `run`, including
-after native arguments (`run claude --model opus --true-yolo`) where clap
-leaves it in the native argv, and it is never forwarded to the harness as an
-unknown flag.
-The `claude_true_yolo` config key only upgrades a launch that is already
-`--yolo`/`--true-yolo`; on its own it never turns an ordinary run into a
-permission-bypassing one without the warning.
+The retired spellings keep working so existing aliases and scripts do not
+break:
+
+- `--true-yolo` is a hidden alias of `--yolo` on `run`, `show`, `continue`
+  and `resume`, recognized anywhere after `run` (including after native
+  arguments, where clap leaves it in the native argv) and never forwarded to
+  the harness. A jailed re-exec receives the original argv, so it parses there
+  too. In a terminal, `ai-memory run` prints one line saying it is the same as
+  `--yolo` now.
+- The `claude_true_yolo` config key (and `AI_MEMORY_CLAUDE_TRUE_YOLO`) still
+  loads and is ignored. When it is true, `ai-memory run` prints one terminal
+  line asking to remove it. Removing the key outright would have been silent
+  (top-level keys are not strict), which hides a behavior change from the one
+  operator who set it.
 
 ### 5. Choosing what the jail exposes: `--jail`, `--no-jail`, the checklist
 
@@ -394,7 +405,7 @@ Next time, start with the same jail choices:
   ai-memory run --yolo --jail=github,ssh --jail-map /home/u/Projects/ai-jail claude
 ```
 
-It names `--yolo`/`--true-yolo`, `--no-autowire`, `--workspace`, `--project`,
+It names `--yolo` (also for a launch typed with the retired `--true-yolo`), `--no-autowire`, `--workspace`, `--project`,
 `--profile`, `--env-file`, the enabled toggles as an exact `--jail=` list (or
 `--jail=none`), the folders and the harness. One-off parts stay out: a resume
 selector, native arguments (they may hold a prompt), and `--env` values (they
@@ -520,7 +531,7 @@ the preset fallback.
 | already-jailed detect | hostname `ai-sandbox` | `PS1` `(jail) ` | always "no" |
 | `--network` loopback reach | shared net ns | profile-allowed | n/a |
 | warning prompt | ✓ | ✓ | ✓ |
-| true-yolo env vars | ✓ | ✓ | ✓ (incl. powershell var) |
+| Claude `bypassPermissions` settings | ✓ | ✓ | ✓ |
 
 ## Code shape
 
@@ -532,14 +543,15 @@ the preset fallback.
 - `ai-memory-cli/src/commands/run.rs`: the interactive prompt + orchestration
   (gate → warn → offer → re-exec or proceed), reusing the existing
   `is_terminal` gate and a `confirm`-style reader.
-- `ai-memory-cli/src/config.rs`: `[run] claude_true_yolo: bool` (default false).
+- `ai-memory-cli/src/config.rs`: `claude_true_yolo: bool`, deprecated and
+  ignored since 3.4.3 (§4).
 - §5: the toggle table, `--help` support detection (`JailSupport`), host facts
   (`JailHostFacts`, fed by `inspect_repository`'s `origin_push_url` /
   `linked_worktree`), `jail_checklist`, and `parse_jail_toggles` live in
   `jail.rs`; `run.rs` owns `--jail`/`--no-jail` parsing, the `jail_decision`
   table, and the checklist reader.
-- `ai-memory-workstream/src/harness.rs`: `apply_claude_true_yolo(env, args)`
-  next to `apply_yolo`.
+- `ai-memory-workstream/src/harness.rs`: `apply_yolo` adds Claude's
+  `--settings` next to `--dangerously-skip-permissions`.
 
 ## Security considerations
 
@@ -549,7 +561,8 @@ the preset fallback.
 - Re-exec forwards only environment names that are already set and non-secret
   routing values resolved from config. It introduces no new secret surface and
   does not log token values.
-- true-yolo is off by default, Claude-only, and documented as sandbox-first.
+- Claude's `bypassPermissions` settings ride on `--yolo` only, behind the
+  same warning and ai-jail offer; a run without `--yolo` never gets them.
 - Detection failure fails *open* to the safe side: if we cannot tell we are
   jailed, we show the warning (never silently skip it).
 
@@ -561,8 +574,8 @@ the preset fallback.
 - `run.rs`: prompt gate is off without a TTY; decline aborts before launch;
   already-jailed skips the prompt; the ai-jail offer is absent when ai-jail is
   not found.
-- `harness.rs`: `apply_claude_true_yolo` sets the three env vars + the
-  `--settings` arg for Claude and is a no-op for other harnesses.
+- `harness.rs`: `apply_yolo` adds the `--settings` arg for Claude, once, and
+  never for other harnesses.
 - CHANGELOG `### Added` (minor); support-matrix + cookbook updated in the same
   change.
 - §5: `jail.rs` unit tests cover list parsing, support detection against
