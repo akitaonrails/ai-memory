@@ -100,20 +100,20 @@ pub use reader::{
     DerivedIndexStatus, EmbeddingTripleCount, FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START,
     FeedbackFinding, FileSessionRef, GraphVia, HealthDetail, HealthPage, HybridSearch,
     HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate,
-    LinkGraph, LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
-    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
-    PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
-    PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
-    PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
-    ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
-    ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
-    SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
-    SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
-    SessionPromptTitles, SessionSummary, SessionToolTitles, SessionUsageView, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
-    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
+    LinkGraph, LinkGraphEdge, LinkGraphNode, LintSummary, ObservationHit, ObservationOrder,
+    ObservationPage, ObservationPageResult, ObservationProjectionTotals, ObservationRecord,
+    OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor,
+    PageFilter, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary,
+    PageVersion, PageVersionBody, PageVersions, ProjectCoordinateCollisionReason,
+    ProjectCoordinateDiagnostic, ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH,
+    RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
+    RrfContributions, SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow,
+    SearchExplain, SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary,
+    SessionDependentRows, SessionEndDisposition, SessionKindSummary, SessionLine,
+    SessionObservationSnapshot, SessionPromptTitles, SessionSummary, SessionToolTitles,
+    SessionUsageView, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
+    StreamTimings, TokenCallOrder, TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
     project_name_fold_key,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
@@ -280,6 +280,21 @@ impl Store {
             tracing::info!(
                 projects = coordinate_keys,
                 "project coordinate keys backfilled"
+            );
+        }
+        for twin in project_coordinates::shadowing_empty_twins(&conn, 20)? {
+            tracing::warn!(
+                workspace = %twin.workspace,
+                project = %twin.name,
+                owner = %twin.owner,
+                "empty project '{}' holds the canonical name of '{}'; it is skipped when \
+                 resolving that name, and can be renamed out of the way with \
+                 `ai-memory rename-project --workspace {} --project-id {} --to {}-empty`",
+                twin.name,
+                twin.owner,
+                twin.workspace,
+                twin.id,
+                twin.name
             );
         }
         let cjk_backfill = ops::backfill_cjk_indexes(&mut conn)?;
@@ -2877,6 +2892,101 @@ mod tests {
                 .unwrap();
             assert_eq!(hits.len(), 1, "query {query:?}");
             assert_eq!(hits[0].path.as_str(), "notes/edit.md", "query {query:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_matches_the_parts_of_a_hyphenated_word() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let body = format!(
+            "{DIRECTORY_PATH_BODY} the zebrafinch-marker-alpha tag and the zebra_finch_keeper log"
+        );
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "markers.md", &body))
+            .await
+            .unwrap();
+
+        // #2013: the content tokenizer keeps `-` and `_` inside tokens, so a
+        // `zebrafinch-marker-alpha` mention indexed as one term and no
+        // component word could reach it. Each part must now match on its own,
+        // in the project scope and in the unscoped search alike.
+        for query in ["alpha", "marker", "zebrafinch", "keeper"] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "query {query:?}");
+            assert_eq!(hits[0].path.as_str(), "markers.md", "query {query:?}");
+
+            let global = store
+                .reader
+                .search_pages(query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(global.len(), 1, "unscoped query {query:?}");
+        }
+
+        // The whole token keeps working as a single term (the reason the
+        // tokenizer was left alone), and an unrelated word still finds nothing.
+        for query in ["ai-memory", "zebrafinch-marker-alpha"] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1, "whole token {query:?}");
+        }
+        let misses = store
+            .reader
+            .search_pages_for_project(ws, proj, "zebrafinches".into(), 10, None)
+            .await
+            .unwrap();
+        assert!(
+            misses.is_empty(),
+            "no false positives from the split column"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_column_filter_matches_the_parts_of_a_hyphenated_word() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let mut titled = sample_page(ws, proj, "titled.md", "nothing to see here");
+        titled.title = "my-payment-gateway".into();
+        store.writer.upsert_page(titled).await.unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "bodied.md",
+                "the run-managed launcher",
+            ))
+            .await
+            .unwrap();
+
+        // #2013: `title:` and `body:` must reach the `_parts` twin, or a
+        // filter narrows away the very hit the bare word finds. Each filter
+        // keeps its own column: the title word does not match `body:`.
+        for (query, expected) in [
+            ("title:gateway", vec!["titled.md"]),
+            ("body:managed", vec!["bodied.md"]),
+            ("title:my-payment-gateway", vec!["titled.md"]),
+            ("body:gateway", Vec::new()),
+            ("title:managed", Vec::new()),
+        ] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            let paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+            assert_eq!(paths, expected, "query {query:?}");
         }
     }
 

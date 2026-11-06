@@ -733,6 +733,7 @@ async fn s1_similarity_lint_flags_band_pair_without_deleting() {
             }),
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            keep_llm_findings: false,
         },
     )
     .await

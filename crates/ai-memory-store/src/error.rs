@@ -24,6 +24,15 @@ pub struct AmbiguousProjectHolder {
     pub name: Option<String>,
     /// The key that matched.
     pub matched_by: AmbiguousMatch,
+    /// The project's id, `None` for a restricted project (same reason as
+    /// `name`).
+    pub id: Option<ai_memory_core::ProjectId>,
+    /// The repository identity the project owns, if any (`None` for a
+    /// restricted project).
+    pub repository: Option<String>,
+    /// Whether the project holds nothing: no sessions, observations, pages,
+    /// handoffs or workstreams. Always `false` for a restricted project.
+    pub empty: bool,
 }
 
 /// The projects behind a [`StoreError::ProjectNameAmbiguous`], rendered as
@@ -49,6 +58,39 @@ impl std::fmt::Display for AmbiguousProjectHolders {
             match &holder.name {
                 Some(name) => write!(f, "project '{name}'")?,
                 None => f.write_str("a restricted project")?,
+            }
+            if let Some(repository) = &holder.repository {
+                write!(f, " (owns repository {repository})")?;
+            } else if holder.empty {
+                f.write_str(" (empty)")?;
+            }
+        }
+        // Say what to pass instead, so an agent or operator does not have to
+        // guess (#2018).
+        let owners: Vec<&AmbiguousProjectHolder> = self
+            .0
+            .iter()
+            .filter(|holder| holder.repository.is_some() && holder.name.is_some())
+            .collect();
+        if let [owner] = owners.as_slice()
+            && let (Some(name), Some(repository)) = (&owner.name, &owner.repository)
+        {
+            write!(
+                f,
+                "; for the project of repository {repository}, pass project '{name}'"
+            )?;
+        }
+        for holder in self
+            .0
+            .iter()
+            .filter(|holder| holder.empty && holder.repository.is_none())
+        {
+            if let (Some(name), Some(id)) = (&holder.name, holder.id) {
+                write!(
+                    f,
+                    "; the empty project '{name}' can be renamed out of the way with \
+                     `ai-memory rename-project --project-id {id} --to {name}-empty`"
+                )?;
             }
         }
         Ok(())
@@ -135,6 +177,17 @@ pub enum StoreError {
     /// session tuple or operator. Deliberately carries no row details.
     #[error("session collision")]
     SessionCollision,
+
+    /// A hook event named a session its own operator owns (or a shared one)
+    /// under a different agent than the session was first captured with
+    /// (#2023). Raised only after the owner check admitted the caller, so the
+    /// bound agent names nothing a foreign operator could not already see;
+    /// a foreign owner still gets the opaque [`Self::SessionCollision`].
+    #[error("session is bound to agent {}", bound.as_str())]
+    SessionAgentMismatch {
+        /// The agent the session row was created with.
+        bound: ai_memory_core::AgentKind,
+    },
 
     /// A `spawn_blocking` task panicked or was cancelled.
     #[error("reader pool task did not complete: {0}")]

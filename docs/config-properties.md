@@ -25,7 +25,8 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `consolidate_on_session_end` | `false` | `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` | Queue LLM consolidation on SessionEnd when an LLM provider is configured. |
 | `backfill_on_start` | `true` | `AI_MEMORY_BACKFILL_ON_START` | Import a project's existing local harness history once, when SessionStart finds its store empty. |
 | `run_autowire` | `true` | `AI_MEMORY_RUN_AUTOWIRE` | Install a harness's hooks and MCP server on the first `ai-memory run` launch when they are missing. |
-| `claude_true_yolo` | `false` | `AI_MEMORY_CLAUDE_TRUE_YOLO` | Make `ai-memory run --yolo` on Claude force `bypassPermissions` over any settings `defaultMode`. |
+| `claude_true_yolo` | `false` | `AI_MEMORY_CLAUDE_TRUE_YOLO` | Deprecated and ignored since 3.4.3: `ai-memory run --yolo` on Claude always forces `bypassPermissions` now. Still loads; `ai-memory run` asks you to remove it. |
+| `pi_tool_exposure` | `"direct"` | `AI_MEMORY_PI_TOOL_EXPOSURE` | How the generated Pi extension registers ai-memory's MCP tools: `direct` (declared to the model) or `codemode` (reached through Pi's codemode tool). |
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
 | `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`. The only value is `llm`, which needs an LLM provider. |
@@ -37,6 +38,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `llm_compat_disable_thinking` | `false` | `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` | Send `chat_template_kwargs: {"enable_thinking": false}` on every `openai-compat` chat request. |
 | `llm_compat_stream` | unset | `AI_MEMORY_LLM_COMPAT_STREAM` | Set `false` to request non-streaming JSON from `openai-compat`; `true` is rejected because SSE is unsupported. |
 | `llm_timeout_secs` | `300` (`ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS`) | `AI_MEMORY_LLM_TIMEOUT_SECS` | Per-request timeout for chat completions and the Copilot token exchange. The openai-oauth token refresh keeps its own ceiling. |
+| `llm_request_metadata_headers` | `false` | `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` | Add `x-ai-memory-workload` (`consolidation`, `profile`, `dream`, `lint`, ...) to every `openai-compat` chat attempt, plus `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when the operation reads one scope or acts for one user. Values are names, never page content. Other providers never send them. |
 | `bootstrap_max_concurrent` | `1` | `AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT` | How many live `bootstrap` runs may call the LLM at once across projects. Runs for the same project always wait for each other. Must be at least 1. |
 | `llm_reasoning_effort` | unset (the model default applies) | `AI_MEMORY_LLM_REASONING_EFFORT` | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` or `persistent`. |
 | `llm_headers` | `[]` | `AI_MEMORY_LLM_HEADERS` | Extra HTTP headers on every LLM chat request, as `Name: Value` or `Name=Value` entries. |
@@ -65,8 +67,9 @@ An array of tables. Each entry is tried in order after the primary provider, onl
 Each optional task profile selects a separate provider chain. The task keys are
 `consolidation`, `bootstrap`, `auto_improve`, `experience`, `dream`, `lint`,
 `profile`, `rerank` and `query_answer`. The last covers both
-`memory_query(answer=true)` and `memory_explore`. Scheduled lint remains
-rule-only.
+`memory_query(answer=true)` and `memory_explore`. Scheduled lint is
+rule-only unless `[maintenance] lint_llm_interval_secs` turns on the LLM pass,
+which uses the `lint` provider.
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
@@ -100,6 +103,8 @@ An array of tables, defined by `WebhookConfig` in `ai-memory-wiki`. The default 
 | `failure_policy` | `ignore` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `ignore` logs a warning and continues. `reject` aborts the write. |
 | `events` | required | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | Operations the webhook subscribes to. An empty list means it never fires. |
 | `blocking` | `true` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `true` runs inside the write path and can change the page. `false` fires after the page lands and ignores the response. |
+| `projects` | `[]` (every project) | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `workspace/project` entries the webhook is told about. A workspace-wide event matches by workspace. A malformed entry stops the server. |
+| `headers` | `[]` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | Extra request headers, each `{ name, value_file }`. The file is read once at server start (relative paths resolve against the data dir) and its value is never logged. Reserved names (`Content-Type`, `Content-Length`, `Host`, `X-Memory-Op`) and a missing or empty file stop the server. |
 
 `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` takes a JSON array of these entries and replaces the list from the file. Valid `events` are `write_page`, `consolidate`, `delete`, `delete_event_ledger`, `purge_project`, `purge_session`, `purge_workspace`, `move_project`, `move_session`, `handoff_begin`, `handoff_accept`, `handoff_cancel`, `message_send`, `message_pop` and `message_cancel`.
 
@@ -158,6 +163,7 @@ Per-tier half-lives in days. A tier that sets one decays at `ln(2) / days`. A ti
 | `enabled` | `true` | `AI_MEMORY_MAINTENANCE__ENABLED` | Master switch for scheduled server jobs. |
 | `forget_sweep_interval_secs` | `86400` | `AI_MEMORY_MAINTENANCE__FORGET_SWEEP_INTERVAL_SECS` | Interval of the retention forget sweep. 0 disables the job. |
 | `lint_interval_secs` | `86400` | `AI_MEMORY_MAINTENANCE__LINT_INTERVAL_SECS` | Interval of rule-based wiki lint. 0 disables the job. |
+| `lint_llm_interval_secs` | `0` (off) | `AI_MEMORY_MAINTENANCE__LINT_LLM_INTERVAL_SECS` | Interval of lint with the LLM contradiction pass across every project. Off by default because it calls the `lint` provider; skipped with one warning when no provider is configured. |
 | `embedding_backfill_interval_secs` | `0` (off) | `AI_MEMORY_MAINTENANCE__EMBEDDING_BACKFILL_INTERVAL_SECS` | Interval of embedding backfill. Off by default because it may call a paid provider. |
 | `reconcile_tombstones_deleted_pages` | `false` | `AI_MEMORY_MAINTENANCE__RECONCILE_TOMBSTONES_DELETED_PAGES` | Let the watcher tombstone an OKF-imported page whose file stayed missing on two consecutive passes. |
 

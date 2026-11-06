@@ -13,6 +13,9 @@ pub enum MaintenanceJob {
     ForgetSweep,
     /// Rule-based lint across every existing scope.
     RuleLint,
+    /// Lint with the LLM contradiction pass across every existing scope
+    /// (`[maintenance] lint_llm_interval_secs`, #2021).
+    LlmLint,
 }
 
 impl MaintenanceJob {
@@ -22,6 +25,7 @@ impl MaintenanceJob {
         match self {
             Self::ForgetSweep => "forget_sweep",
             Self::RuleLint => "rule_lint",
+            Self::LlmLint => "llm_lint",
         }
     }
 }

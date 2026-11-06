@@ -346,6 +346,12 @@ compacted or merged stays in git and the supersession chain, recoverable with
 - **Keep used memory longer:** nothing to configure. A page you open, search,
   or reach through a related-pages walk is reinforced automatically and resists
   decay.
+- **Check for contradictions on a schedule:** set `[maintenance]
+  lint_llm_interval_secs = 604800` to run the LLM contradiction pass weekly
+  across every project, with the `lint` provider (`[llm.lint]` or the default
+  one). `memory_briefing` then reports the warning count of each project's
+  `_lint/report.md`, and a session start in a project with warnings gets one
+  line pointing at the report.
 - **Review similar knowledge:** run `memory_lint` (through your agent or the
   CLI); with embeddings configured it emits `similarity_candidate` findings
   for same-topic page pairs, advisory only. Similarity reads shared vocabulary
@@ -472,8 +478,8 @@ See [`managed-workstreams.md`](managed-workstreams.md).
 ## Recipe: run an unsupervised agent safely (`--yolo` + ai-jail)
 
 `--yolo` maps to each harness's dangerous-mode flag (Claude Code →
-`--dangerously-skip-permissions`), which runs every tool call with no
-confirmation. `ai-memory run --yolo` adds guardrails around that, gated
+`--dangerously-skip-permissions`, plus `--settings` forcing
+`bypassPermissions`), which runs every tool call with no confirmation. `ai-memory run --yolo` adds guardrails around that, gated
 entirely on a real interactive terminal (stdin and stderr both TTYs), so
 scripts, hooks, and CI are never prompted:
 
@@ -554,18 +560,26 @@ ai-memory run --yolo claude
   automatically there, enable them in your global `~/.ai-jail` or pass
   `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
   run never writes its own flags into your repository's `.ai-jail`.
+- **With ai-jail 3.0.1 or newer.** ai-jail reviews the access itself, once
+  per project, so ai-memory's screen keeps only the extra folders (`f`).
+  ai-memory names the harness for ai-jail and passes what the session needs
+  as plain grants, with no extra prompts: the harness's login state, the
+  `AI_MEMORY_*` variables, and only that harness's own API key (a Claude jail
+  never gets your OpenAI key). A memory server on this machine is reached
+  through one forwarded port, so the network stays filtered unless you open
+  it in ai-jail's review; a server on another machine keeps full network,
+  which ai-jail labels OPEN. Copilot and Command Code, which ai-jail has no
+  preset for, keep the checklist above.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
   directly, so `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with
   `(jail) `); it fails open (shows the warning) when undetectable, never
   open to skipping it silently.
-- **Claude "true yolo".** `--true-yolo` includes everything `--yolo` does
-  (`ai-memory run claude --true-yolo` is enough; adding `--yolo` too is
-  harmless) and, for Claude, also forces `bypassPermissions` over any
-  `defaultMode` in your settings. For other harnesses it is the same as
-  `--yolo`. `claude_true_yolo = true` in `config.toml` /
-  `AI_MEMORY_CLAUDE_TRUE_YOLO=true` applies the Claude extra to every `--yolo`
-  launch, never to a run without it.
+- **Claude's own permission settings.** For Claude, `--yolo` also forces
+  `bypassPermissions` over any `defaultMode` in your settings, so an `auto` or
+  `acceptEdits` default cannot narrow the run. Through 3.4.2 that took a separate
+  `--true-yolo`; it is now a hidden alias of `--yolo` (it prints a one-line
+  note), and `claude_true_yolo` in `config.toml` is ignored (remove it).
   **It cannot remove your own `ask` rules**: Claude Code honors explicit
   `permissions.ask` rules (and its built-in command-safety checks) in every
   mode, so a rule like `Bash(docker run *)` in `~/.claude/settings.json` still
@@ -619,7 +633,9 @@ server = "team-b"
 
 Repositories without a `server` key keep using the server `install-hooks`
 configured. The marker only ever names a profile; a profile that does not
-resolve drops the event rather than sending it anywhere else. Details, the
+resolve drops the event rather than sending it anywhere else. Commands you run
+inside the repository (`run`, `workstreams`, `doctor`, `search`, ...) use the
+same profile. Details, the
 fail-closed rules, and which integrations support it:
 [`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 

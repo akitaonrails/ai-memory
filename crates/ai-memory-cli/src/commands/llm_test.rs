@@ -42,6 +42,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         extra_headers: config
             .llm_extra_headers()
             .context(i18n.text("cli-llm-test-parsing-ai-memory-llm-headers-llm-headers"))?,
+        request_metadata_headers: config.llm_request_metadata_headers,
     };
     let client =
         build_provider(provider_config).context(i18n.text("cli-llm-test-building-llm-provider"))?;

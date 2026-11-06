@@ -1,6 +1,6 @@
 <script id="project-tabs-behavior">
 (function(){
-  var list=document.querySelector('[role="tablist"][aria-label="Project sections"]'),tabs=Array.from(list.querySelectorAll('[role="tab"]'));
+  var list=document.querySelector('[role="tablist"][data-project-tabs]'),tabs=Array.from(list.querySelectorAll('[role="tab"]'));
   var legacy={"agents":"agents","token-usage":"tokens","session-token-table":"sessions","knowledge":"knowledge","overview":"overview"};
   function show(tab,focus){
     tabs.forEach(function(item){

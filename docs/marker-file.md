@@ -467,6 +467,30 @@ handoff is fetched, and a one-line warning goes to the hook's stderr. It never
 falls back to the install default, because that would deliver one team's
 capture to another team's server.
 
+The commands that work on the checkout you run them in follow the same route,
+so they reach the server your hooks capture to: `run`, `resume`, `continue`,
+`show`, `workstreams`, `workstream-search`, `rename-workstream`, `doctor`,
+`search`, `recent`, `read-page`, `write-page`, `delete-page`,
+`restore-page`, `handoffs`, `message`, `pending-writes`, `profile`, `lint`,
+`forget-sweep`, `curator`, `auto-improve`, `auto-improve-report`, `embed`,
+`bootstrap`, `backfill`, `repair-backfill-timestamps`, `repair-split`,
+`finalize-session`, `rename-project`, `move-project`, `move-session`,
+`purge-project` and `purge-session`. They use the profile's
+URL and stored token, never the bearer from your config, and they fail
+closed with the same reason the hook reports when the profile does not
+resolve. They match the profile's roots against the directory as your
+shell names it (`PWD`, when it is the same directory as the process's working
+directory), the way a harness reports it to the hooks, so a checkout reached
+through a symlink, or macOS's `/var` (really `/private/var`), routes the same
+for both. `AI_MEMORY_SERVER_URL` in the environment still wins for one
+invocation, and `AI_MEMORY_IGNORE_MARKER=1` skips the marker as it does for
+scope. Install-wide commands (`status`, `list-projects`, `backup`, `user`,
+`api-key`, `project access`, `setup` and the other admin commands) keep using
+the configured server. `run --jail` refuses a profile-routed checkout,
+because the jailed run cannot read the profile's token; set
+`AI_MEMORY_SERVER_URL` and a least-privilege `AI_MEMORY_AUTH_TOKEN` for that
+launch instead.
+
 Routing is inherited down the tree, unlike the other keys. The nearest marker
 that declares `server` decides, so a nested marker that only sets `workspace`,
 or only `[capture]`, keeps its ancestor's profile. A nested marker can select

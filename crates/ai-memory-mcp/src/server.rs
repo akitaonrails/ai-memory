@@ -2830,6 +2830,39 @@ impl AiMemoryServer {
         format!("{ws_name}/{proj_name}")
     }
 
+    /// What an LLM call made for a request reads and whom it acts for, for
+    /// the opt-in request metadata headers: the caller's username, and the
+    /// scope only when the call reads exactly one. Unlike [`Self::scope_names`],
+    /// an unknown name stays unset rather than becoming a placeholder.
+    async fn llm_subject(
+        &self,
+        actor: &ai_memory_core::ActorContext,
+        scope: Option<(ai_memory_core::WorkspaceId, ai_memory_core::ProjectId)>,
+    ) -> ai_memory_llm::LlmSubject {
+        let (workspace, project) = match scope {
+            Some((ws, proj)) => (
+                self.reader.workspace_name_by_id(ws).await.ok().flatten(),
+                self.reader
+                    .project_name_by_id(ws, proj)
+                    .await
+                    .ok()
+                    .flatten(),
+            ),
+            None => (None, None),
+        };
+        let user = actor
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|user| !user.is_empty())
+            .map(str::to_owned);
+        ai_memory_llm::LlmSubject {
+            workspace,
+            project,
+            user,
+        }
+    }
+
     /// Workspace and project names for a resolved scope, with the same
     /// placeholders as [`Self::scope_label`] when a lookup fails.
     async fn scope_names(
@@ -2901,11 +2934,25 @@ impl AiMemoryServer {
         session_id: Option<SessionId>,
         actor: &ai_memory_core::ActorContext,
     ) -> Result<Option<AgentKind>, McpError> {
+        Ok(self
+            .caller_session_in_scope(ws, proj, session_id, actor)
+            .await?
+            .map(|summary| AgentKind::from_wire(&summary.agent_kind)))
+    }
+
+    /// The caller's session row, under the same scope and owner rule as
+    /// [`Self::caller_session_agent_in_scope`].
+    async fn caller_session_in_scope(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: Option<SessionId>,
+        actor: &ai_memory_core::ActorContext,
+    ) -> Result<Option<ai_memory_store::SessionSummary>, McpError> {
         let Some(session_id) = session_id else {
             return Ok(None);
         };
-        let summary = self
-            .reader
+        self.reader
             .session_summary_scoped(
                 ws,
                 proj,
@@ -2913,8 +2960,7 @@ impl AiMemoryServer {
                 ai_memory_core::OwnerFilter::for_actor_context(actor),
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(summary.map(|summary| AgentKind::from_wire(&summary.agent_kind)))
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
     /// Refuse a message-queue change whose project was inferred rather than
@@ -3717,8 +3763,14 @@ impl AiMemoryServer {
                         match ai_memory_llm::complete_structured_with_operation_id::<AnswerSynthesis>(
                         llm.as_ref(),
                         request,
+                        // Evidence can span projects and the `_global`
+                        // scope, so only the caller is named.
                         ai_memory_llm::LlmOperationId::for_workload(
                             ai_memory_llm::LlmWorkload::QueryAnswer,
+                        )
+                        .with_subject(
+                            self.llm_subject(&crate::actor::actor_from_parts(&parts), None)
+                                .await,
                         ),
                     )
                     .await
@@ -4346,6 +4398,7 @@ impl AiMemoryServer {
                     }),
                 contradiction_band_min: self.contradiction_band_min,
                 contradiction_band_max: self.contradiction_band_max,
+                keep_llm_findings: false,
             },
         )
         .await
@@ -6819,13 +6872,39 @@ impl AiMemoryServer {
                 })?;
             ai_memory_core::owner_stamp(creator.identity_key().as_ref(), distinguishes)
         };
+        // Attribute the handoff to the caller's own hook session the way
+        // `memory_message_send` attributes a message: the session id comes from
+        // the session-aware client (a header the caller controls), so it counts
+        // only when that session is recorded in this handoff's scope under the
+        // caller's owner filter. Anything else, a static client included, is
+        // a handoff with no source session, exactly as before (#2014).
+        let caller_session = self
+            .caller_session_in_scope(
+                ws,
+                proj,
+                Self::caller_hook_session_id(&parts)
+                    .as_deref()
+                    .map(SessionId::from_native),
+                &creator,
+            )
+            .await?;
+        let from_agent = caller_session
+            .as_ref()
+            .map(|session| AgentKind::from_wire(&session.agent_kind))
+            .or_else(|| creator.agent.as_deref().map(AgentKind::from_wire))
+            .unwrap_or(AgentKind::Other);
+        let cwd = args.cwd.or_else(|| {
+            caller_session
+                .as_ref()
+                .and_then(|session| session.cwd.clone())
+        });
         let handoff = NewHandoff {
             workspace_id: ws,
             project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::Other,
+            from_session_id: caller_session.as_ref().map(|session| session.session_id),
+            from_agent,
             to_agent: None,
-            cwd: args.cwd.map(std::path::PathBuf::from),
+            cwd: cwd.map(std::path::PathBuf::from),
             summary: cap_text_with_marker(
                 &s.scrub(&args.summary),
                 HANDOFF_SUMMARY_MAX_CHARS,
@@ -6846,12 +6925,16 @@ impl AiMemoryServer {
             .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffBegin, &parts)
             .await
             .map_err(|error| Self::with_manifest_warning(error, manifest_warning.as_ref()))?;
-        let id = self.writer.insert_handoff(handoff).await.map_err(|e| {
-            Self::with_manifest_warning(
-                McpError::internal_error(e.to_string(), None),
-                manifest_warning.as_ref(),
-            )
-        })?;
+        let id = self
+            .writer
+            .insert_manual_handoff(handoff)
+            .await
+            .map_err(|e| {
+                Self::with_manifest_warning(
+                    McpError::internal_error(e.to_string(), None),
+                    manifest_warning.as_ref(),
+                )
+            })?;
         self.notify_operation_observers(admission.as_ref());
         let mut result = serde_json::json!({ "handoff_id": id.to_string() });
         if let Some(warning) = manifest_warning {
@@ -7073,13 +7156,29 @@ impl AiMemoryServer {
                 // session (or a caller the owner does not admit) gets `false`
                 // here; returning the handoff anyway would hand the same baton
                 // to two agents.
+                // Record the claiming harness the way handoff_begin records the
+                // sender: from the caller's own session in this scope, never a
+                // free argument. The session itself stays off the claim, whose
+                // receiver check allows one baton per session and is the
+                // SessionStart hook's to spend.
+                let accepting_agent = self
+                    .caller_session_agent_in_scope(
+                        ws,
+                        proj,
+                        Self::caller_hook_session_id(&parts)
+                            .as_deref()
+                            .map(SessionId::from_native),
+                        &crate::actor::actor_from_parts(&parts),
+                    )
+                    .await?
+                    .unwrap_or(AgentKind::Other);
                 let claimed = self
                     .writer
                     .accept_handoff(ai_memory_core::HandoffAcceptance {
                         handoff_id: h.scope.id,
                         workspace_id: ws,
                         project_id: proj,
-                        accepting_agent: AgentKind::Other,
+                        accepting_agent,
                         accepting_session: None,
                         accepting_user: actor_user.clone(),
                         owner_filter: owner_filter.clone(),
@@ -7089,8 +7188,24 @@ impl AiMemoryServer {
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 if claimed {
                     self.notify_operation_observers(admission.as_ref());
+                    // Return the row as the claim left it, not the open row read
+                    // before it (#2014). Only a purge between the commit and
+                    // this read can miss it; the pre-claim row then gets the
+                    // claim's own fields.
+                    let claimed_row = self
+                        .reader
+                        .handoff_by_id_in_scope(ws, proj, h.scope.id, owner_filter)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                        .unwrap_or_else(|| {
+                            let mut row = h;
+                            row.lifecycle.state = HandoffState::Accepted;
+                            row.lifecycle.accepted_by = Some(accepting_agent);
+                            row.lifecycle.accepted_by_user = actor_user;
+                            row
+                        });
                     ok_json(&serde_json::json!({
-                        "handoff": h,
+                        "handoff": claimed_row,
                         "status": HandoffAcceptStatus::Claimed,
                     }))
                 } else {
@@ -7407,7 +7522,7 @@ impl AiMemoryServer {
         // Admission is asked at the crossing point (the recipient scope): a
         // per-operator webhook can refuse prompt-derived text entering another
         // project.
-        let admission = self
+        let mut admission = self
             .authorize_operation(
                 to_ws,
                 to_proj,
@@ -7415,11 +7530,16 @@ impl AiMemoryServer {
                 &parts,
             )
             .await?;
+        let queued_to_agent = message.to_agent;
         let id = self
             .writer
             .insert_message(message)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let (Some(wiki), Some(ctx)) = (self.wiki.as_ref(), admission.as_mut()) {
+            wiki.describe_queued_message(ctx, id, queued_to_agent, from_ws, from_proj)
+                .await;
+        }
         self.notify_operation_observers(admission.as_ref());
         ok_json(&serde_json::json!({
             "message_id": id.to_string(),
@@ -7738,9 +7858,11 @@ impl AiMemoryServer {
         project state; use `memory_explore` if you want an LLM-composed \
         prose summary on top of the same data. Pass `settled_first: true` \
         to also lead the briefing with the project's settled rule/decision \
-        pages (highest-standing, ordered by evidence then recency). `scope` \
-        names the project briefed — pass it to memory_message_pop when \
-        `pending_message_count` is non-zero."
+        pages (highest-standing, ordered by evidence then recency). `lint`, \
+        when present, counts the warnings in the project's latest \
+        `_lint/report.md`; read that page before relying on the pages it \
+        flags. `scope` names the project briefed — pass it to \
+        memory_message_pop when `pending_message_count` is non-zero."
     )]
     async fn memory_briefing(
         &self,
@@ -7903,7 +8025,8 @@ impl AiMemoryServer {
                 request,
                 ai_memory_llm::LlmOperationId::for_workload(
                     ai_memory_llm::LlmWorkload::QueryAnswer,
-                ),
+                )
+                .with_subject(self.llm_subject(&actor, Some((ws, proj))).await),
             )
             .await
         {
@@ -8106,6 +8229,7 @@ impl ServerHandler for AiMemoryServer {
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         // rmcp moves params._meta into RequestContext before dispatch.
         attach_native_session(&mut context.extensions, &context.meta);
+        let request = self.fill_launch_scope_on_pointer_miss(request, &context);
         self.record_client_activity(&request.name, &context);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
@@ -8142,6 +8266,64 @@ impl ServerHandler for AiMemoryServer {
                 restricted_schema_tool_list(tools, dialect),
             ))
         }
+    }
+}
+
+impl AiMemoryServer {
+    /// Fill a session-aware bridge's launch-directory scope into an unscoped
+    /// call when the caller's own keyed active-project pointer does not
+    /// resolve (#2005; see [`crate::launch_scope`]). A pointer the hooks
+    /// published for this session always wins, and so does the shared slot
+    /// of a `single`-mode or hook-less install, so a call the pointer routes
+    /// today is never re-routed. The filled scope is an ordinary explicit
+    /// argument: the tool resolves and authorizes it as if the client had
+    /// sent it, which the client could always do.
+    fn fill_launch_scope_on_pointer_miss(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: &rmcp::service::RequestContext<RoleServer>,
+    ) -> rmcp::model::CallToolRequestParams {
+        use crate::launch_scope::{
+            FALLBACK_PROJECT_HEADER, FALLBACK_WORKSPACE_HEADER, decode_header_value, fill,
+            takes_workspace_and_project,
+        };
+        let Some(parts) = context.extensions.get::<http::request::Parts>() else {
+            return request;
+        };
+        let hint = |name| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(decode_header_value)
+        };
+        let (Some(workspace), Some(project)) = (
+            hint(FALLBACK_WORKSPACE_HEADER),
+            hint(FALLBACK_PROJECT_HEADER),
+        ) else {
+            return request;
+        };
+        let actor = Self::actor_key_from_parts(Some(parts));
+        if actor.session_id.is_none() {
+            return request;
+        }
+        match self.active_project.read_pointer(&actor) {
+            ai_memory_core::ReadPointer::Session(..)
+            | ai_memory_core::ReadPointer::SharedSlot(..) => return request,
+            ai_memory_core::ReadPointer::StartupSeed(..)
+            | ai_memory_core::ReadPointer::Mismatch
+            | ai_memory_core::ReadPointer::Unset => {}
+        }
+        if !self
+            .tool_router
+            .get(&request.name)
+            .is_some_and(takes_workspace_and_project)
+        {
+            return request;
+        }
+        let arguments = request.arguments.take().unwrap_or_default();
+        request.arguments = Some(fill(arguments, &workspace, &project));
+        request
     }
 }
 
@@ -19483,6 +19665,70 @@ mod tests {
         assert!(
             !text.contains("\"settled\""),
             "settled must be omitted by default:\n{text}"
+        );
+        assert!(
+            !text.contains("\"lint\""),
+            "a project without a lint report has no lint summary:\n{text}"
+        );
+    }
+
+    /// #2021: `memory_briefing` reports the counts of the project's latest
+    /// lint report and points at it.
+    #[tokio::test]
+    async fn memory_briefing_reports_the_lint_summary() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("_lint/report.md").unwrap(),
+                title: "Lint report".into(),
+                body: "# Lint findings".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({
+                    "kind": "lint-report",
+                    "findings": 3,
+                    "warnings": 2,
+                    "warning_pages": ["foo.md"],
+                }),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let result = server
+            .memory_briefing(
+                Parameters(BriefingArgs {
+                    recent_pages_limit: Some(5),
+                    recent_sessions_limit: None,
+                    project: None,
+                    workspace: None,
+                    settled_first: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let lint = &json["lint"];
+        assert_eq!(lint["report_path"], "_lint/report.md", "{text}");
+        assert_eq!(lint["warnings"], 2, "{text}");
+        assert_eq!(lint["findings"], 3, "{text}");
+        assert_eq!(
+            lint["warning_pages"],
+            serde_json::json!(["foo.md"]),
+            "{text}"
         );
     }
 

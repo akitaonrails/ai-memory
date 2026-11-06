@@ -218,6 +218,8 @@ async fn compaction_does_not_supersede_a_concurrent_fresh_write() {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap(),
     );

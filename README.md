@@ -290,6 +290,20 @@ yay -S ai-memory        # builds from source
 ai-memory setup         # data dir, user service, agents, self-check
 ```
 
+### Homebrew (macOS and Linux)
+
+The tap installs the prebuilt binary and its hook sources on macOS and on
+Linux, including atomic distributions such as Bazzite or Fedora Silverblue
+where Homebrew is the usual way to add tools:
+
+```bash
+brew install akitaonrails/tap/ai-memory
+ai-memory setup         # data dir, user service, agents, self-check
+```
+
+Use either `ai-memory setup` or `brew services start ai-memory`, not both.
+Details are in [`docs/install.md`](docs/install.md#homebrew-macos-and-linux).
+
 ### Fedora (RPM)
 
 Download the `x86_64` or `aarch64` RPM from the

@@ -2371,6 +2371,89 @@ pub struct BriefingSnapshot {
     /// shape byte-for-byte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned: Vec<BriefingPage>,
+    /// The project's latest lint report, from `_lint/report.md` (#2021).
+    /// Project-scoped briefings only; omitted when the project has no report
+    /// or the report predates the counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lint: Option<LintSummary>,
+}
+
+/// Counts from a project's `_lint/report.md`, written by every lint run
+/// (scheduled or manual) into the report's frontmatter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LintSummary {
+    /// Always `_lint/report.md`; read it for the findings themselves.
+    pub report_path: String,
+    /// ISO-8601 time the report was written.
+    pub updated_at: String,
+    /// Findings of `warning` severity.
+    pub warnings: u64,
+    /// All findings, `info` included.
+    pub findings: u64,
+    /// The first few distinct pages the warnings name.
+    pub warning_pages: Vec<String>,
+}
+
+/// Path of the per-project lint report; matches `ai-memory-consolidate`'s
+/// `REPORT_PATH`.
+const LINT_REPORT_PATH: &str = "_lint/report.md";
+/// Upper bound on `LintSummary::warning_pages`, whatever the frontmatter
+/// holds: the report is an ordinary page and can be edited by hand.
+const LINT_WARNING_PAGES_MAX: usize = 5;
+
+/// The project's lint summary, or `None` when no current report carries the
+/// counts.
+fn lint_summary_in(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    now_us: i64,
+) -> StoreResult<Option<LintSummary>> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            &format!(
+                "SELECT frontmatter_json, updated_at FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                 AND is_latest = 1{not_expired}",
+                not_expired = not_expired("pages", "?4"),
+            ),
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                LINT_REPORT_PATH,
+                now_us
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((frontmatter, updated_at)) = row else {
+        return Ok(None);
+    };
+    let Ok(frontmatter) = serde_json::from_str::<serde_json::Value>(&frontmatter) else {
+        return Ok(None);
+    };
+    let count = |key: &str| frontmatter.get(key).and_then(serde_json::Value::as_u64);
+    let (Some(warnings), Some(findings)) = (count("warnings"), count("findings")) else {
+        return Ok(None);
+    };
+    let warning_pages = frontmatter
+        .get("warning_pages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .take(LINT_WARNING_PAGES_MAX)
+        .map(str::to_owned)
+        .collect();
+    Ok(Some(LintSummary {
+        report_path: LINT_REPORT_PATH.to_owned(),
+        updated_at: jiff::Timestamp::from_microsecond(updated_at)
+            .map(|ts| ts.to_string())
+            .unwrap_or_default(),
+        warnings,
+        findings,
+        warning_pages,
+    }))
 }
 
 /// Trimmed page view for the briefing — path, title, kind, updated_at
@@ -9359,10 +9442,9 @@ impl ReaderPool {
 
     /// Return the open handoff the next session should pick up.
     ///
-    /// A manual handoff (`memory_handoff_begin`, which always sets
-    /// `from_session_id = None`) is project-wide and always a candidate,
-    /// whatever cwd it carries. An auto SessionEnd handoff
-    /// (`from_session_id = Some`) is a candidate only when its cwd is an
+    /// A manual handoff (`memory_handoff_begin`, or a row left without a
+    /// source session) is project-wide and always a candidate, whatever cwd
+    /// it carries. An auto SessionEnd handoff is a candidate only when its cwd is an
     /// ancestor-or-equal of `cwd_filter` (path-boundary, the prior art's
     /// check rather than exact equality: a handoff left in `/repo` reaches a
     /// session in `/repo/api`, but never `/repo-other`). Among candidates a
@@ -9435,10 +9517,10 @@ impl ReaderPool {
             let busy_index = if owner_param.is_some() { 4 } else { 3 };
             let busy_clause = if busy_since.is_some() {
                 format!(
-                    " AND NOT EXISTS (SELECT 1 FROM sessions s \
+                    " AND (manual = 1 OR NOT EXISTS (SELECT 1 FROM sessions s \
                          WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
                            AND EXISTS (SELECT 1 FROM observations o \
-                                       WHERE o.session_id = s.id AND o.created_at > ?{busy_index}))"
+                                       WHERE o.session_id = s.id AND o.created_at > ?{busy_index})))"
                 )
             } else {
                 String::new()
@@ -9447,7 +9529,7 @@ impl ReaderPool {
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
                         created_at, accepted_by, accepted_at, accepted_by_session, \
-                        owner_user, accepted_by_user \
+                        owner_user, accepted_by_user, manual \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'{owner_clause}{busy_clause} \
                  ORDER BY created_at DESC"
@@ -9615,6 +9697,27 @@ impl ReaderPool {
         .await
     }
 
+    /// The project's lint summary (#2021): counts from the frontmatter of
+    /// its current `_lint/report.md`, or `None` when there is none.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn lint_summary(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<LintSummary>> {
+        self.with_conn(move |conn| {
+            lint_summary_in(
+                conn,
+                workspace_id,
+                project_id,
+                jiff::Timestamp::now().as_microsecond(),
+            )
+        })
+        .await
+    }
+
     /// Count pending messages addressed to a project's inbox (V64). Backs the
     /// on-start inbox notice and `memory_briefing`'s `pending_message_count`.
     ///
@@ -9692,7 +9795,7 @@ impl ReaderPool {
                     "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                             cwd, summary, open_questions, next_steps, files_touched, state, \
                             created_at, accepted_by, accepted_at, accepted_by_session, \
-                            owner_user, accepted_by_user \
+                            owner_user, accepted_by_user, manual \
                      FROM handoffs WHERE id = ?1",
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
@@ -9725,7 +9828,7 @@ impl ReaderPool {
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
                         created_at, accepted_by, accepted_at, accepted_by_session, \
-                        owner_user, accepted_by_user \
+                        owner_user, accepted_by_user, manual \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND id = ?3{owner_clause}"
             );
@@ -9962,6 +10065,7 @@ impl ReaderPool {
                 // The pinned standing-context list is a project-scoped signal;
                 // an aggregate current/workspace briefing leaves it empty.
                 pinned: Vec::new(),
+                lint: None,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -10223,6 +10327,7 @@ impl ReaderPool {
                 cross_project_dependencies,
                 settled,
                 pinned,
+                lint: lint_summary_in(conn, workspace_id, project_id, now_us)?,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -10416,7 +10521,7 @@ impl ReaderPool {
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
                         created_at, accepted_by, accepted_at, accepted_by_session, \
-                        owner_user, accepted_by_user \
+                        owner_user, accepted_by_user, manual \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND state = 'open'{owner_clause}{visible} \
                  ORDER BY created_at DESC LIMIT 1"
@@ -10682,6 +10787,7 @@ impl ReaderPool {
                 // The pinned standing-context list is a project-scoped signal;
                 // an aggregate current/workspace briefing leaves it empty.
                 pinned: Vec::new(),
+                lint: None,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -14919,7 +15025,7 @@ fn handoff_listing_sql(
     const SELECT: &str = "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                 cwd, summary, open_questions, next_steps, files_touched, state, \
                 created_at, accepted_by, accepted_at, accepted_by_session, \
-                owner_user, accepted_by_user \
+                owner_user, accepted_by_user, manual \
          FROM handoffs";
     let state_clause = if has_state { " AND state = ?3" } else { "" };
     let owner_index = if has_state { 4 } else { 3 };
@@ -16106,12 +16212,13 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>, owner_filter: &Ow
     if !owner_filter.admits(h.origin.owner_user.as_deref()) {
         return false;
     }
-    // Manual handoffs (memory_handoff_begin always sets from_session_id = None)
-    // are project-wide and always candidates, whatever cwd they carry. Only auto
-    // SessionEnd handoffs are cwd-path-boundary scoped. This makes "a manual
-    // handoff always beats the auto one" deterministic on from_session_id,
-    // instead of relying on a manual handoff happening to have a NULL cwd.
-    if h.origin.from_session_id.is_none() {
+    // Manual handoffs (memory_handoff_begin, whether or not it recorded the
+    // caller's session) are project-wide and always candidates, whatever cwd
+    // they carry. Only auto SessionEnd handoffs are cwd-path-boundary scoped.
+    // This makes "a manual handoff always beats the auto one" deterministic on
+    // the row's origin, instead of relying on a manual handoff happening to
+    // have a NULL cwd.
+    if h.origin.is_manual() {
         return true;
     }
     auto_handoff_matches_cwd(h.origin.cwd.as_deref(), cwd_filter)
@@ -16159,13 +16266,13 @@ pub(crate) fn handoff_selection_key(
 
 fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
     handoff_selection_key(
-        a.origin.from_session_id.is_none(),
+        a.origin.is_manual(),
         a.lifecycle.created_at.as_microsecond(),
         a.origin.cwd.as_deref(),
         a.scope.id,
     )
     .cmp(&handoff_selection_key(
-        b.origin.from_session_id.is_none(),
+        b.origin.is_manual(),
         b.lifecycle.created_at.as_microsecond(),
         b.origin.cwd.as_deref(),
         b.scope.id,
@@ -16186,7 +16293,7 @@ fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Op
         .max_by(prefer_handoff)
 }
 
-/// Build a [`Handoff`] from a row selected with the 18-column handoff SELECT
+/// Build a [`Handoff`] from a row selected with the 19-column handoff SELECT
 /// every handoff query in this file shares.
 ///
 /// Reading the row here (instead of destructuring it into a long positional
@@ -16211,6 +16318,7 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
     let accepted_by_session_bytes: Option<Vec<u8>> = row.get(15)?;
     let owner_user: Option<String> = row.get(16)?;
     let accepted_by_user: Option<String> = row.get(17)?;
+    let manual: bool = row.get(18)?;
 
     Ok((|| {
         for (label, value) in [
@@ -16242,6 +16350,7 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
             },
             origin: HandoffOrigin {
                 from_session_id: from_session,
+                manual,
                 from_agent: parse_agent(&from_agent),
                 to_agent: to_agent.as_deref().map(parse_agent),
                 cwd,
@@ -17218,6 +17327,7 @@ mod tests {
             },
             origin: HandoffOrigin {
                 from_session_id: if manual { None } else { Some(SessionId::new()) },
+                manual: false,
                 from_agent: AgentKind::ClaudeCode,
                 to_agent: None,
                 cwd: cwd.map(str::to_string),
@@ -17361,6 +17471,16 @@ mod tests {
             handoff("auto", Some("/repo"), false, 2),
         ];
         assert_eq!(pick(c, Some("/repo")), "MAN");
+    }
+
+    #[test]
+    fn explicit_handoff_with_a_source_session_stays_project_wide_and_wins() {
+        // #2014: memory_handoff_begin now records the caller's session, so the
+        // explicit flag, not a NULL from_session_id, is what keeps it manual.
+        let mut explicit = handoff("explicit", Some("/some/other/place"), false, 1);
+        explicit.origin.manual = true;
+        let c = vec![explicit, handoff("auto", Some("/repo"), false, 2)];
+        assert_eq!(pick(c, Some("/repo")), "explicit");
     }
 
     #[test]

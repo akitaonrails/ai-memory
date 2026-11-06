@@ -593,6 +593,28 @@ take precedence; see
 
 ---
 
+## Homebrew (macOS and Linux)
+
+The `akitaonrails/tap` formula installs the release binary and its hook
+sources for macOS (Apple Silicon and Intel) and Linux (x86_64 and aarch64).
+On Linux it works with Homebrew on Linux, which is how atomic distributions
+such as Bazzite and Fedora Silverblue usually add command-line tools.
+
+```bash
+brew install akitaonrails/tap/ai-memory
+ai-memory setup
+```
+
+`ai-memory setup` creates the data directory and its bearer token, installs
+and starts its own user service (a LaunchAgent on macOS, a systemd user unit
+on Linux), wires the agents it finds and checks the result. The formula also
+defines a `brew services` entry. Use one or the other, not both: with
+`brew services start ai-memory`, run `ai-memory init` first and wire the
+agents with `ai-memory setup --no-service`. `brew upgrade ai-memory` replaces
+the binary under a versioned Cellar path, so a service started by
+`ai-memory setup` should point at the stable `$(brew --prefix)/bin/ai-memory`
+(see the note on versioned package locations above).
+
 ## Fedora (RPM)
 
 Download the `x86_64` or `aarch64` RPM from the
@@ -2275,6 +2297,22 @@ and launch share the same captured environment plus `--env` / `--env-file`
 overrides. Malformed output, a timeout, or an unsupported future major fails with
 an actionable error instead of guessing.
 
+OpenCode 1 and 2 load plugins from the same `~/.config/opencode/plugins/`
+directory, and OpenCode 2 refuses the V1 plugin with "Plugin must export a
+default definition with an id and an effect or setup function". After upgrading
+OpenCode itself to 2.x, run `ai-memory install-hooks --agent opencode --apply`
+again (or `ai-memory upgrade`, which probes the installed major the same way):
+it writes `ai-memory-opencode2.ts` and removes the V1 `ai-memory.ts` it owns.
+
+A Claude Code compatibility layer inside OpenCode (such as oh-my-opencode's
+`claude_code.hooks`) may also run the hooks from `~/.claude/settings.json`. On
+native Windows those entries use Claude Code's exec form: `command` is the bare
+path to `ai-memory.exe` and the arguments sit in `args`, which Claude Code
+spawns without a shell, so a path with spaces is correct there. A layer that
+runs `command` through a shell and drops `args` splits that path at the first
+space and fails with `unrecognized subcommand`. Turn its Claude hooks off; the
+OpenCode plugin already captures those events.
+
 ### OpenCode V2 compatibility
 
 The generated plugin targets the OpenCode 2.0.10+ event API (checked against
@@ -2443,6 +2481,30 @@ ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
 
 Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
 separate and continues to use `.omp` paths.
+
+#### Pi codemode
+
+By default the extension declares every ai-memory tool to the model, schema
+included. To reach them through Pi's `codemode` tool instead, set this in
+ai-memory's `config.toml` (or `AI_MEMORY_PI_TOOL_EXPOSURE=codemode`) and
+regenerate the extension:
+
+```toml
+pi_tool_exposure = "codemode"
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Each tool is then registered with Pi's
+[`exposure: "codemode"`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure):
+codemode scripts can list and call it, and the model no longer receives its
+schema unless you activate the tool yourself. Tool names, the session headers
+that route each call to the current project, and lifecycle capture stay the
+same. Preview output and every later `--apply` (including the refresh that
+`ai-memory upgrade` runs) read the same setting, so regenerating keeps your
+choice. Set it back to `direct`, or remove it, to return to the default.
 
 ### Bind mounts vs docker cp
 

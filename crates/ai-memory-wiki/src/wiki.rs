@@ -404,9 +404,16 @@ impl Wiki {
                 Vec::new(),
             )
             .await?;
+        let (to_agent, from_ws, from_proj) = (
+            message.to_agent,
+            message.from_workspace_id,
+            message.from_project_id,
+        );
         let id = self.writer.insert_message(message).await?;
-        if let Some(ctx) = admission.as_ref() {
-            self.notify_operation_observers(ctx);
+        if let Some(mut ctx) = admission {
+            self.describe_queued_message(&mut ctx, id, to_agent, from_ws, from_proj)
+                .await;
+            self.notify_operation_observers(&ctx);
         }
         Ok(id)
     }
@@ -470,10 +477,56 @@ impl Wiki {
             .writer
             .finish_message_edit(to_workspace_id, to_project_id, id, Some((subject, body)))
             .await?;
-        if saved && let Some(ctx) = admission.as_ref() {
-            self.notify_operation_observers(ctx);
+        if saved && let Some(mut ctx) = admission {
+            ctx.message_id = Some(id.to_string());
+            // The requeued message keeps its sender and harness; read them back
+            // so the observer hears the same fields a first send carries.
+            if let Some(reader) = &self.store_reader
+                && let Ok(Some(message)) = reader
+                    .message_in_mailbox(to_workspace_id, to_project_id, id)
+                    .await
+            {
+                self.describe_queued_message(
+                    &mut ctx,
+                    id,
+                    message.to_agent,
+                    message.origin.from_workspace_id,
+                    message.origin.from_project_id,
+                )
+                .await;
+            }
+            self.notify_operation_observers(&ctx);
         }
         Ok(saved)
+    }
+
+    /// Tell `message_send` observers which message was queued: its id, the
+    /// harness it is addressed to and the sender's names. Never its text, which
+    /// reaches an agent only through a deliberate pop. Every path that queues a
+    /// message calls this between the commit and
+    /// [`Self::notify_operation_observers`], so a bot woken by the webhook gets
+    /// the same fields whichever surface sent the mail.
+    pub async fn describe_queued_message(
+        &self,
+        ctx: &mut AdmissionContext,
+        id: ai_memory_core::MessageId,
+        to_agent: Option<ai_memory_core::AgentKind>,
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+    ) {
+        ctx.message_id = Some(id.to_string());
+        ctx.to_agent = to_agent;
+        if let Some(reader) = &self.store_reader {
+            if let Ok(Some(name)) = reader.workspace_name_by_id(from_workspace_id).await {
+                ctx.from_workspace = Some(name);
+            }
+            if let Ok(Some(name)) = reader
+                .project_name_by_id(from_workspace_id, from_project_id)
+                .await
+            {
+                ctx.from_project = Some(name);
+            }
+        }
     }
 
     /// Attach an embedder. When set, every page-writing path (`write_page`,
@@ -1888,10 +1941,26 @@ impl Wiki {
             // resurrected page's embedding (if any) is recovered later by
             // `ai-memory embed` / the scheduled backfill, same as any other
             // gap in `page_embeddings`.
-            let (id, _pending_embed) = self
+            //
+            // A leftover file from a purged session is the one reindex that
+            // must not fail the cleanup (#1999): the store refuses to
+            // recreate a tombstoned summary, and that refusal says nothing
+            // about this tombstone's chain. Skipping the reindex leaves
+            // `current_latest` at `None` — the state an absent file also
+            // gives — and the chain below is still deleted.
+            match self
                 .reindex_page_locked(workspace_id, project_id, path.clone())
-                .await?;
-            current_latest = Some(id);
+                .await
+            {
+                Ok((id, _pending_embed)) => current_latest = Some(id),
+                Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+                    tracing::debug!(
+                        path = %path,
+                        "decay cleanup: skipping a purged session's leftover page file"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         self.writer
@@ -5309,6 +5378,8 @@ mod tests {
                 failure_policy: FailurePolicy::Ignore,
                 events: vec![AdmissionOp::WritePage, AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6469,6 +6540,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::WritePage],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6547,6 +6620,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::WritePage],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6704,6 +6779,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6858,6 +6935,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6930,6 +7009,8 @@ mod tests {
                 failure_policy: FailurePolicy::Ignore,
                 events: vec![AdmissionOp::Delete],
                 blocking: false,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -7132,6 +7213,88 @@ mod tests {
                 .len(),
             1,
             "cleanup failure must leave the tombstone for a safe retry"
+        );
+    }
+
+    /// #1999: a purged session's page file can outlive its rows when the
+    /// purge could not remove it. The reindex `hard_delete_decay_tombstone`
+    /// performs then hits the store's purge guard, and that refusal must only
+    /// skip the file — it must not fail the decay pass, and it must not
+    /// resurrect the summary.
+    ///
+    /// The purge deletes the session's tombstones with its rows, so the
+    /// forget sweep reaches this only through its list-then-delete window: a
+    /// tombstone listed by `decay_tombstones_before`, then a purge, then the
+    /// cleanup call. The test runs those steps in that order.
+    #[tokio::test]
+    async fn decay_cleanup_skips_a_purged_sessions_leftover_page_file() {
+        use ai_memory_core::IdentityKey;
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, user, sid, path) = owned_session_with_page(&tmp).await;
+        let abs = wiki.abs_path(ws, proj, &path);
+        let body = std::fs::read(&abs).unwrap();
+        let latest = store
+            .reader
+            .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+            .await
+            .unwrap()
+            .expect("the session page is indexed");
+        assert!(
+            wiki.evict_page_if_latest(ws, proj, &path, latest, None)
+                .await
+                .unwrap()
+        );
+        let listed = store
+            .reader
+            .decay_tombstones_before(ws, proj, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "the sweep lists the decayed page");
+        let page_id = listed[0].id;
+        // A directory in place of the file makes cleanup fail on every
+        // platform, so the purge leaves the file behind while still
+        // tombstoning the session.
+        std::fs::create_dir(&abs).unwrap();
+        let outcome = wiki
+            .purge_owned_session(
+                ws,
+                proj,
+                sid,
+                IdentityKey::User("purge-owner".into()),
+                Some(user),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.files_failed, vec![path.clone()]);
+        assert!(wiki.purged_sessions(ws, proj).await.unwrap().contains(&sid));
+        // The leftover file comes back during recovery, and decay cleanup
+        // later runs over the same path.
+        std::fs::remove_dir(&abs).unwrap();
+        std::fs::write(&abs, &body).unwrap();
+
+        let deleted = wiki
+            .hard_delete_decay_tombstone(ws, proj, &path, page_id, i64::MAX)
+            .await
+            .expect("a purged session's leftover file must not fail the cleanup pass");
+        assert_eq!(deleted, 0, "the purged chain has no row left to delete");
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+            "the purged summary must not be re-indexed"
+        );
+        assert!(abs.exists(), "cleanup deletes rows, not the leftover file");
+        assert!(
+            store
+                .reader
+                .decay_tombstones_before(ws, proj, i64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no tombstone is left for the next sweep to retry"
         );
     }
 
@@ -7636,6 +7799,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::Consolidate],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -7725,6 +7890,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::Consolidate],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -7932,6 +8099,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
 

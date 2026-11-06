@@ -1,6 +1,6 @@
 # `evals/` — evaluation harnesses
 
-One Rust binary (`ai-memory-eval`) with four subcommands:
+One Rust binary (`ai-memory-eval`) with five subcommands:
 
 - **`ab`** — runs the EXACT consolidation prompt ai-memory uses in
   production against two LLM providers side by side, saves both
@@ -10,8 +10,10 @@ One Rust binary (`ai-memory-eval`) with four subcommands:
   facts the observation projection lets into the prompt at all. No
   provider, no network.
 - **`retrieval`** — LongMemEval and bundled coding-session retrieval checks,
-  driven through a real `ai-memory serve` subprocess. Published baselines
-  live in `docs/benchmarks/`.
+  through a real server or independent grep/Raw-RAG source-history baselines.
+  Published measurements live in `docs/benchmarks/`.
+- **`retrieval-compare`** — compares saved runs by question, including
+  movements across retrieval cutoffs.
 - **`abstention`** — offline evidence-sufficiency signals and threshold sweeps
   over versioned answerable, hard-negative, conflicting, partial, and
   missing-channel fixtures, with optional structured LLM answerability.
@@ -470,6 +472,97 @@ just accuracy:
 - **context tokens** — the context an agent would ingest from the result,
   estimated as **chars / 4** over each returned hit's `title` + `snippet`
   (a documented heuristic, not a real tokenizer), reported **mean / median**.
+
+### `retrieval --engine raw-rag` — source-preserving local baseline
+
+This opt-in engine adapts the fixed Raw-RAG pipeline from
+[arXiv:2610.30755v1, Appendix B](https://arxiv.org/html/2610.30755v1#A2):
+index overlapping source windows, retrieve dense candidates, rerank them,
+and optionally display complete source turns. It runs inside the evaluator
+without an `ai-memory` server, store writes or production configuration changes.
+
+The defaults are 256-token windows with 32-token overlap, dense top-128 and
+cross-encoder top-15. Models are **all-MiniLM-L6-v2** for embeddings and
+**cross-encoder/ms-marco-MiniLM-L6-v2** for reranking, both on the CPU. Every
+model file is SHA-256 pinned. The cross-encoder revision is
+`233902d25c440f23af6f7d6e94d2946bac0bee0a`; an on-demand test checks its logits
+against the example in its model card.
+
+These are local-model experiments, **not reproductions of the paper's scores**:
+windows use MiniLM's WordPiece tokenizer, not the paper's GPT-4 tokenizer;
+models differ; windows reset at each supplied session boundary so every
+window has one session attribution. Each source turn includes its session
+date and role. Original body bytes are preserved by tokenizer offsets rather
+than decoded back from token ids. Retrieval never reads gold answers,
+`answer_session_ids`, or `has_answer` flags.
+
+Download models explicitly once (about 175 MiB combined), then run offline:
+
+```bash
+cargo build --release -p ai-memory-eval -p ai-memory-cli
+target/release/ai-memory-eval retrieval --engine raw-rag \
+  --dataset-variant coding-v1 --raw-rag-fetch-models --ks 1,3,5,10,15
+
+# No download; also independent of --server-bin:
+target/release/ai-memory-eval retrieval --engine raw-rag \
+  --dataset-variant coding-v1 --ks 1,3,5,10,15
+```
+
+Model files live under `evals/models/` by default (`--raw-rag-models` changes
+the root). Missing or changed files fail with fetch instructions. There is
+no automatic download or fallback to lexical scoring. Oversized dense
+inputs or cross-encoder pairs fail instead of silently truncating them;
+reduce the window size for long queries.
+
+The protocol knobs are `--raw-rag-chunk-tokens`, `--raw-rag-overlap-tokens`,
+`--raw-rag-candidates`, `--raw-rag-top-k` and
+`--raw-rag-no-turn-expansion`. Whole-turn display is on by default. It changes
+reader-visible context only: the cross-encoder always scores the selected
+window. Repeated turns in different selected windows are retained, in
+relevance order, as in the reference condition. There is no extra evidence
+token cap. `--ks` must fit within the selected-window budget.
+
+Raw-RAG processes questions sequentially with a fresh in-memory index for
+each question's supplied haystack, with no additional temporal filtering or
+chronological reordering of selected evidence. It does not use the server's embedding
+cache. Candidate/server/ingest/reachability knobs are rejected on this
+engine; use separate runs with the same dataset, question selection, cutoffs
+and build to compare with the existing modes:
+
+```bash
+for mode in hooks whole-session captured-session; do
+  target/release/ai-memory-eval retrieval --dataset-variant coding-v1 \
+    --ingest "$mode" --embeddings local --concurrency 1 --ks 1,3,5,10,15
+done
+
+target/release/ai-memory-eval retrieval-compare \
+  --baseline evals/runs/<hooks-run> --candidate evals/runs/<raw-rag-run>
+```
+
+JSON and Markdown reports reuse the existing session-level hit/recall/
+recall-all scoring, query latency and chars/4 context estimate. Multiple
+windows from one session count once for retrieval metrics, but all displayed
+evidence contributes to context cost. Raw-RAG JSON adds a `raw_rag` object
+with protocol settings, file hashes, indexing/dense/reranking timings and
+each selected window's session UUID, token/byte offsets and logit. Existing
+server/grep reports do not gain this field. Query latency excludes indexing,
+model loading and downloads; indexing times are reported separately.
+
+`--qa` reuses the existing answerer/judge configuration over the actual
+selected evidence; credentials are optional, and missing QA configuration
+produces the existing reported skip. Retrieval metrics alone do not measure
+answer accuracy, causal-path coverage or how an agent uses follow-up reads.
+Raw-RAG's expanded raw turns and production snippets have different context
+budgets and capture policies, so report their context costs and do not treat
+session hit@k as a like-for-like answer-quality comparison.
+
+Ordinary tests use no models or network. After the explicit download, run the
+two additional checks deliberately:
+
+```bash
+cargo test -p ai-memory-eval cross_encoder_matches_the_model_cards_reference_logits -- --ignored
+cargo test -p ai-memory-eval raw_rag_scores_a_fixture_without_a_server_and_records_its_protocol -- --ignored
+```
 
 ### `retrieval` A/B mode (R2)
 

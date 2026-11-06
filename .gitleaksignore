@@ -47,3 +47,5 @@ b19ee0c040fb766a5c7405c9e22159fdbc1e2ef4:companions/ai-memory-importer/src/agent
 05477cd44a86c923eeeb1b70352bf612fd8c60ac:tests/fixtures/sanitizer_vectors.json:generic-api-key:11
 05477cd44a86c923eeeb1b70352bf612fd8c60ac:tests/fixtures/sanitizer_vectors.json:generic-api-key:12
 05477cd44a86c923eeeb1b70352bf612fd8c60ac:crates/ai-memory-core/src/sanitize.rs:generic-api-key:2393
+1fb318c891cc3c7e1f9ed22cdc061a9470812bd2:tests/fixtures/sanitizer_vectors.json:generic-api-key:12
+f269b640037ad48de6b90feb7d1088e64f9e4cb6:crates/ai-memory-core/src/sanitize.rs:stripe-access-token:1176

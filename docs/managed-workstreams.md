@@ -189,7 +189,7 @@ was a session, and `--executable` was not used; utility commands, failed or
 interrupted exits, and non-interactive launches do not prompt. A switch or
 re-run does not replay the previous harness's native arguments, which may be
 specific to that CLI; wrapper settings such as `--workspace`, `--project`,
-`--yolo` / `--true-yolo`, ai-jail controls, `--no-autowire`, `--no-exit-prompt`,
+`--yolo`, ai-jail controls, `--no-autowire`, `--no-exit-prompt`,
 `--env`, and `--env-file` remain in effect. The initial `--fresh` choice applies
 only to the first launch.
 

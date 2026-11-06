@@ -33,7 +33,7 @@ pub async fn run(config: &Config, args: RenameWorkstreamArgs) -> Result<()> {
     let repository = inspect_repository(&cwd)?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let renamed: RenamedManagedWorkstream = post_json(
         &endpoint,
         "/workstream/rename",
@@ -63,12 +63,14 @@ fn render_human(
     if renamed.from == renamed.to {
         // A repeated rename is not a failure, but reporting it as a change
         // would be a lie: nothing was written.
-        return i18n.format(
+        return crate::localization::format(
+            i18n,
             "cli-rename-workstream-workstream-already-has-that-name",
             &[("value0", terminal_text(&renamed.to))],
         );
     }
-    i18n.format(
+    crate::localization::format(
+        i18n,
         "cli-rename-workstream-renamed-workstream-to-id",
         &[
             ("value0", terminal_text(&renamed.from)),

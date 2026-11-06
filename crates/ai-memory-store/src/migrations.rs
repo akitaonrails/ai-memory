@@ -2578,6 +2578,169 @@ mod tests {
         assert_eq!(matches(&conn, "observations_fts", "ops.rs"), 1);
     }
 
+    const V100_TABLES: [&str; 2] = ["pages_fts", "observations_fts"];
+
+    /// Seed a V99 store with one page and one observation whose body holds a
+    /// hyphenated and an underscored word, written under the pre-V100 index.
+    /// Returns the page id.
+    fn seed_v99_hyphenated_rows(conn: &mut Connection) -> [u8; 16] {
+        const BODY: &str = "the zebrafinch-marker-alpha tag and the zebra_finch_keeper log";
+
+        run_to(conn, 99).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            },
+        )
+        .unwrap();
+        let page = [4_u8; 16];
+        conn.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, pinned, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'notes/markers.md', 'title', 'semantic', ?4, zeroblob(32), '{}', \
+                     1, 0, 1, 1)",
+            params![
+                page.as_slice(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                BODY,
+            ],
+        )
+        .unwrap();
+        crate::ops::insert_observation(
+            conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool file".into(),
+                body: BODY.into(),
+                importance: 5,
+                file_path: None,
+            },
+        )
+        .unwrap();
+        page
+    }
+
+    fn v100_matches(conn: &Connection, table: &str, raw: &str) -> i64 {
+        use crate::fts_query::{FtsStopwords, prepare_fts5_query};
+
+        let query = prepare_fts5_query(raw, &FtsStopwords::default());
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1"),
+            [query],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// V100 gives both indexes a second spelling of `title`/`body` with `-`
+    /// and `_` turned into spaces, so the parts of a hyphenated word match.
+    /// A store that already holds such rows gets them re-indexed by the
+    /// rebuild, and the whole token keeps matching (#2013).
+    #[test]
+    fn v100_indexes_the_parts_of_a_hyphenated_word_on_an_existing_store() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let page = seed_v99_hyphenated_rows(&mut conn);
+        for table in V100_TABLES {
+            assert_eq!(v100_matches(&conn, table, "alpha"), 0, "{table} at V99");
+        }
+
+        run(&mut conn).unwrap();
+
+        for table in V100_TABLES {
+            for part in ["alpha", "marker", "zebrafinch", "keeper"] {
+                assert_eq!(
+                    v100_matches(&conn, table, part),
+                    1,
+                    "{table} query {part:?}"
+                );
+            }
+            // The whole token keeps matching: the tokenizer was not touched.
+            assert_eq!(
+                v100_matches(&conn, table, "zebrafinch-marker-alpha"),
+                1,
+                "{table} whole token"
+            );
+        }
+
+        // The recreated triggers keep both spellings in step with later writes.
+        conn.execute(
+            "UPDATE pages SET body = 'nothing hyphenated here' WHERE id = ?1",
+            params![page.as_slice()],
+        )
+        .unwrap();
+        assert_eq!(v100_matches(&conn, "pages_fts", "marker"), 0);
+        assert_eq!(v100_matches(&conn, "pages_fts", "hyphenated"), 1);
+    }
+
+    /// V100 rebuilds `pages_fts` before it reaches `observations`. When the
+    /// observations half fails, the pages half must roll back with it: the
+    /// store stays a working V99 store (old columns, old triggers, whole-token
+    /// search intact), and a re-run after the cause is removed converges.
+    #[test]
+    fn v100_failing_partway_rolls_back_to_a_searchable_v99_store() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        seed_v99_hyphenated_rows(&mut conn);
+        // V100 adds `observations.body_parts`; a column already holding that
+        // name fails the migration after the pages half has run.
+        conn.execute("ALTER TABLE observations ADD COLUMN body_parts TEXT", [])
+            .unwrap();
+
+        let err = run(&mut conn).unwrap_err();
+        assert!(matches!(err, StoreError::Migration(_)), "{err:?}");
+        assert_eq!(applied_versions(&conn).last(), Some(&99));
+        let pages_parts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_xinfo('pages') \
+                 WHERE name IN ('title_parts', 'body_parts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pages_parts, 0, "the pages half must roll back");
+        for table in V100_TABLES {
+            assert_eq!(
+                v100_matches(&conn, table, "zebrafinch-marker-alpha"),
+                1,
+                "{table} keeps its V99 index"
+            );
+            assert_eq!(v100_matches(&conn, table, "alpha"), 0, "{table} at V99");
+        }
+
+        conn.execute("ALTER TABLE observations DROP COLUMN body_parts", [])
+            .unwrap();
+        run(&mut conn).unwrap();
+        assert_eq!(
+            applied_versions(&conn).last(),
+            Some(&i64::from(max_supported_version()))
+        );
+        for table in V100_TABLES {
+            assert_eq!(
+                v100_matches(&conn, table, "alpha"),
+                1,
+                "{table} after re-run"
+            );
+        }
+    }
+
     /// V99 adds `file_path` to a store that already holds observations: an
     /// existing row keeps its columns and reads NULL, a new row stores its
     /// path, and a path lookup uses the partial index.

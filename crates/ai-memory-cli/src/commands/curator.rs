@@ -42,7 +42,7 @@ pub async fn run(config: &Config, args: CuratorArgs) -> Result<()> {
         );
     }
     let dry_run = args.dry_run || !args.stage;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let request = CuratorRequest {

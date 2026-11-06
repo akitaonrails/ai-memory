@@ -34,6 +34,7 @@ mod message_e2e;
 mod opencode_dialect;
 mod packaging;
 mod pi_session_usage;
+mod pi_tool_exposure;
 mod plugins;
 mod profile_e2e;
 mod removal;

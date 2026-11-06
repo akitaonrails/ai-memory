@@ -20,6 +20,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::config::{Config, DEFAULT_SERVER_URL};
+use crate::server_profiles::Route;
 use ai_memory_web::normalize_prefix;
 
 /// [`ai_memory_hooks::CLIENT_MARKER_HEADER`] value for CLI subcommands.
@@ -169,6 +170,41 @@ impl ServerEndpoint {
         endpoint
     }
 
+    /// Build the endpoint for a command that works on the checkout it runs
+    /// in (#2016): the server the hooks capture to from the same directory.
+    ///
+    /// Precedence: `AI_MEMORY_SERVER_URL` in the environment, then the server
+    /// profile the nearest marker selects (its URL and stored token, never the
+    /// config bearer, which belongs to another server), then config, as
+    /// [`Self::from_config_resolving_auth`]. `AI_MEMORY_IGNORE_MARKER` skips
+    /// the marker here as it does for scope.
+    ///
+    /// # Errors
+    /// A marker that selects a profile which does not resolve fails closed,
+    /// like the hook drops the event: falling back to config would send this
+    /// checkout's requests to another team's server.
+    pub(crate) async fn for_checkout(config: &Config) -> Result<Self> {
+        match checkout_route(config) {
+            Route::InstallDefault => Ok(Self::from_config_resolving_auth(config).await),
+            Route::Profile(profile) => {
+                let mut endpoint = Self::build(Some(profile.url), Some(profile.token), true, None);
+                endpoint.i18n = config.i18n.clone();
+                Ok(endpoint)
+            }
+            Route::Rejected { name, reason } => Err(anyhow::anyhow!(
+                "this checkout's .ai-memory.toml selects server profile {}, which was refused \
+                 ({}); nothing was sent. Run `ai-memory hook --check-capture` here or \
+                 `ai-memory server list` to see why, or set AI_MEMORY_SERVER_URL to choose \
+                 a server for this command",
+                name.map_or_else(
+                    || "(unreadable marker)".to_owned(),
+                    |name| format!("`{name}`")
+                ),
+                reason.as_str(),
+            )),
+        }
+    }
+
     /// Build for a target the spawning hook already resolved: its URL
     /// (including any mount path, as `install-hooks` rendered it) and the
     /// bearer it authenticates with. No config or environment is consulted.
@@ -263,6 +299,29 @@ impl ServerEndpoint {
             None => req,
         }
     }
+}
+
+/// The server route for the directory this command runs in; see
+/// [`ServerEndpoint::for_checkout`].
+pub(crate) fn checkout_route(config: &Config) -> Route {
+    let env = &config.runtime_env;
+    if env.server_url().is_some() || env.ignore_marker() {
+        return Route::InstallDefault;
+    }
+    let Some((_, lookup_cwd)) = crate::commands::scope_directories(config) else {
+        return Route::InstallDefault;
+    };
+    // The hooks route the harness's logical cwd, so match a profile's roots
+    // against the same spelling of this directory (#2016).
+    let lookup_cwd = crate::commands::path_util::logical_dir(
+        Path::new(&lookup_cwd),
+        env.var_os("PWD").as_deref(),
+    );
+    crate::server_profiles::route_for_cwd(
+        &config.data_dir,
+        &lookup_cwd.to_string_lossy(),
+        env.home_dir().map(Path::new),
+    )
 }
 
 /// Split a server URL into `(origin, path)` where `origin` is
@@ -1251,6 +1310,160 @@ mod tests {
     fn probe_timeout_is_bounded_to_about_two_seconds() {
         assert!(PROBE_TIMEOUT <= Duration::from_secs(2));
         assert!(!PROBE_TIMEOUT.is_zero());
+    }
+
+    /// A checkout whose marker selects a server profile, the profile
+    /// registered with a token, and an install whose own server and bearer
+    /// are something else (#2016).
+    struct ProfiledCheckout {
+        _tmp: tempfile::TempDir,
+        home: std::path::PathBuf,
+        repo: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+    }
+
+    impl ProfiledCheckout {
+        fn new(marker: &str) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let repo = home.join("work").join("team-b").join("repo");
+            let data_dir = home.join("data");
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::create_dir_all(&data_dir).unwrap();
+            std::fs::write(repo.join(".ai-memory.toml"), marker).unwrap();
+            let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+            crate::server_profiles::add(
+                &data_dir,
+                &name,
+                "https://b.example/memory",
+                &[home
+                    .join("work")
+                    .join("team-b")
+                    .to_string_lossy()
+                    .into_owned()],
+                Some("PROFILE-TOKEN"),
+            )
+            .unwrap();
+            Self {
+                _tmp: tmp,
+                home,
+                repo,
+                data_dir,
+            }
+        }
+
+        fn config_in(&self, cwd: &Path, server_url: Option<&str>, ignore_marker: bool) -> Config {
+            let mut config = Config {
+                data_dir: self.data_dir.clone(),
+                server_url: server_url.unwrap_or("https://install.example").to_owned(),
+                runtime_env: crate::config::RuntimeEnv::for_checkout_tests(
+                    cwd.to_string_lossy(),
+                    self.home.to_string_lossy(),
+                    server_url,
+                    ignore_marker,
+                ),
+                ..Config::default()
+            };
+            config.auth.bearer_token = Some("INSTALL-TOKEN".to_owned());
+            config
+        }
+
+        fn config(&self, server_url: Option<&str>, ignore_marker: bool) -> Config {
+            self.config_in(&self.repo, server_url, ignore_marker)
+        }
+    }
+
+    /// The marker's profile decides the server and the bearer, the same way
+    /// the hook routes capture from this directory; the install's own bearer
+    /// never travels to the profile's server.
+    #[tokio::test]
+    async fn a_checkout_command_uses_the_marker_profile_like_the_hook() {
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        let config = checkout.config(None, false);
+        let hook = crate::server_profiles::route_for_cwd(
+            &checkout.data_dir,
+            &checkout.repo.to_string_lossy(),
+            Some(&checkout.home),
+        );
+        assert_eq!(hook.resolution(), "marker");
+
+        let ep = ServerEndpoint::for_checkout(&config).await.unwrap();
+        assert_eq!(ep.url, "https://b.example");
+        assert_eq!(ep.base_path, "/memory");
+        assert_eq!(ep.auth_token.as_deref(), Some("PROFILE-TOKEN"));
+
+        // A subdirectory inherits the routing.
+        let nested = checkout.repo.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let ep = ServerEndpoint::for_checkout(&checkout.config_in(&nested, None, false))
+            .await
+            .unwrap();
+        assert_eq!(ep.auth_token.as_deref(), Some("PROFILE-TOKEN"));
+    }
+
+    /// `AI_MEMORY_SERVER_URL` outranks the marker, and
+    /// `AI_MEMORY_IGNORE_MARKER` skips it; both keep the install's bearer.
+    /// Without a `server` key the command keeps its config.
+    #[tokio::test]
+    async fn explicit_env_and_unrouted_checkouts_keep_the_config_server() {
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        let ep = ServerEndpoint::for_checkout(&checkout.config(Some("https://env.example"), false))
+            .await
+            .unwrap();
+        assert_eq!(ep.url, "https://env.example");
+        assert_eq!(ep.auth_token.as_deref(), Some("INSTALL-TOKEN"));
+
+        let ep = ServerEndpoint::for_checkout(&checkout.config(None, true))
+            .await
+            .unwrap();
+        assert_eq!(ep.url, "https://install.example");
+        assert_eq!(ep.auth_token.as_deref(), Some("INSTALL-TOKEN"));
+
+        let unrouted = ProfiledCheckout::new("workspace = \"team-b\"\n");
+        let ep = ServerEndpoint::for_checkout(&unrouted.config(None, false))
+            .await
+            .unwrap();
+        assert_eq!(ep.url, "https://install.example");
+        assert_eq!(ep.auth_token.as_deref(), Some("INSTALL-TOKEN"));
+    }
+
+    /// A selection the hook would refuse fails the command closed; it never
+    /// falls back to the install's server with this checkout's request.
+    #[tokio::test]
+    async fn a_refused_marker_profile_fails_closed() {
+        for (marker, reason) in [
+            ("server = \"nobody\"\n", "rejected-unknown-profile"),
+            ("server = \"../x\"\n", "rejected-invalid-profile-name"),
+        ] {
+            let checkout = ProfiledCheckout::new(marker);
+            let error = ServerEndpoint::for_checkout(&checkout.config(None, false))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{error}");
+            assert!(!error.contains("install.example"), "{error}");
+            assert!(!error.contains("TOKEN"), "{error}");
+        }
+
+        // The profile's roots do not admit a checkout outside them.
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        let outside = checkout.home.join("work").join("team-c");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(".ai-memory.toml"), "server = \"team-b\"\n").unwrap();
+        let error = ServerEndpoint::for_checkout(&checkout.config_in(&outside, None, false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rejected-outside-roots"), "{error}");
+
+        // A profile without a stored token is refused too.
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        std::fs::remove_file(checkout.data_dir.join("auth-tokens").join("team-b")).unwrap();
+        let error = ServerEndpoint::for_checkout(&checkout.config(None, false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rejected-no-token"), "{error}");
     }
 
     #[tokio::test]

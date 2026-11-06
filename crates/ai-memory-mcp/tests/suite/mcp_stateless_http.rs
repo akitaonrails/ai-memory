@@ -938,3 +938,128 @@ async fn stateless_tools_list_without_flavor_is_root_combinator_free() {
         );
     }
 }
+
+/// Every result a 2026-07-28 server sends carries `resultType`; a client
+/// treats an absent field as `"complete"` only for servers on an earlier
+/// revision, which never send it
+/// (<https://modelcontextprotocol.io/specification/2026-07-28/basic#resulttype>).
+/// The cacheable `tools/list` also carries `ttlMs` and `cacheScope`. Requests
+/// at an older revision keep the earlier shape. Covers every method that
+/// answers with a result, stateless and stateful (#2022).
+#[tokio::test]
+async fn results_carry_result_type_only_at_the_2026_revision() {
+    const MODERN_META: &str = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"strict","version":"1.0"}}"#;
+    let calls: [(&str, Option<&str>, &str); 5] = [
+        ("tools/list", None, ""),
+        (
+            "tools/call",
+            Some("memory_status"),
+            r#""name":"memory_status","arguments":{}"#,
+        ),
+        ("resources/list", None, ""),
+        ("resources/templates/list", None, ""),
+        ("prompts/list", None, ""),
+    ];
+    for stateful in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let (router, _store) = make_router(&tmp, stateful).await;
+        for (method, name, params) in calls {
+            let separator = if params.is_empty() { "" } else { "," };
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":9,"method":"{method}","params":{{{params}{separator}{MODERN_META}}}}}"#
+            );
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", method);
+            if let Some(name) = name {
+                request = request.header("mcp-name", name);
+            }
+            let resp = router
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+            let json = response_json(resp).await;
+            let result = json["result"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{method} (stateful={stateful}): {json}"));
+            assert_eq!(
+                result.get("resultType"),
+                Some(&serde_json::json!("complete")),
+                "{method} (stateful={stateful}): {json}"
+            );
+            if method.ends_with("/list") {
+                assert_eq!(result.get("ttlMs"), Some(&serde_json::json!(0)), "{json}");
+                assert_eq!(
+                    result.get("cacheScope"),
+                    Some(&serde_json::json!("private")),
+                    "{json}"
+                );
+            }
+        }
+
+        // The legacy era: `initialize` at 2025-06-18, then plain requests.
+        let resp = router
+            .clone()
+            .oneshot(post_to(
+                "/mcp",
+                INITIALIZE.replace("2024-11-05", "2025-06-18"),
+            ))
+            .await
+            .unwrap();
+        let session = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let init = response_json(resp).await;
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18", "{init}");
+        assert!(init["result"].get("resultType").is_none(), "{init}");
+        if let Some(session) = &session {
+            let mut notify = post_to("/mcp", INITIALIZED_NOTIFICATION);
+            notify
+                .headers_mut()
+                .insert("mcp-session-id", session.parse().unwrap());
+            router.clone().oneshot(notify).await.unwrap();
+        }
+        for (method, _, params) in calls {
+            let body =
+                format!(r#"{{"jsonrpc":"2.0","id":9,"method":"{method}","params":{{{params}}}}}"#);
+            let mut request = post_to("/mcp", body);
+            request
+                .headers_mut()
+                .insert("mcp-protocol-version", "2025-06-18".parse().unwrap());
+            if let Some(session) = &session {
+                request
+                    .headers_mut()
+                    .insert("mcp-session-id", session.parse().unwrap());
+            }
+            let json = response_json(router.clone().oneshot(request).await.unwrap()).await;
+            let result = json["result"]
+                .as_object()
+                .unwrap_or_else(|| panic!("legacy {method} (stateful={stateful}): {json}"));
+            assert!(
+                result.get("resultType").is_none(),
+                "legacy {method} (stateful={stateful}): {json}"
+            );
+            assert!(result.get("ttlMs").is_none(), "{json}");
+        }
+    }
+}
+
+/// The JSON-RPC message in a Streamable HTTP reply, whether the server
+/// answered with plain JSON (stateless) or one SSE event (stateful).
+async fn response_json(resp: axum::response::Response) -> serde_json::Value {
+    let body = body_string(resp).await;
+    let payload = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .find(|data| !data.trim().is_empty())
+        .unwrap_or(&body);
+    serde_json::from_str(payload.trim()).unwrap_or_else(|_| panic!("not JSON-RPC: {body}"))
+}

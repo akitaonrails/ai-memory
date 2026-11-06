@@ -25,7 +25,7 @@ use crate::http_client::{ServerEndpoint, get_json, post_json};
 /// Transport failures, a non-root token on a multi-user server, or an entry
 /// that does not exist.
 pub async fn run(config: &Config, args: ProfileArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let ep = ServerEndpoint::for_checkout(config).await?;
     match args.command {
         ProfileCommand::Status(scope) => status(&ep, &scope).await,
         ProfileCommand::List(scope) => list(&ep, &scope).await,

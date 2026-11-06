@@ -85,7 +85,9 @@ struct Section {
 
 /// Where an insertion goes among others at the same offset. Every edit
 /// resolves against the captured body, so text for an existing section comes
-/// first, then an `end_of_page` append, then new headings. Request order alone
+/// first, then an `end_of_page` append (the end of the page that was read),
+/// then new headings. Text after a new heading belongs to that section, so a
+/// caller who wants it there puts it in the `add_section` content. Request order alone
 /// would put a section append that follows an `add_section` under the new
 /// heading whenever both land at the end of the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -185,7 +187,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 let heading = format!("{} {}", "#".repeat(level as usize), title);
                 Change {
                     range: body.len()..body.len(),
-                    replacement: appended(body, &format!("{heading}\n{content}")),
+                    replacement: new_section(&heading, content),
                     placement: Placement::NewSection,
                     heading: None,
                 }
@@ -233,11 +235,23 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
 
     changes.sort_by_key(|change| (change.range.start, change.range.end, change.placement));
     let mut merged: Vec<Change> = Vec::with_capacity(changes.len());
-    for change in changes {
-        if let Some(previous) = merged.last_mut()
-            && previous.range.is_empty()
-            && change.range == previous.range
-        {
+    for mut change in changes {
+        let joins_previous = merged
+            .last()
+            .is_some_and(|previous| previous.range.is_empty() && change.range == previous.range);
+        if change.placement == Placement::NewSection {
+            // A heading needs a blank line before it (MD022), measured
+            // against whatever lands right before it: another insertion at
+            // the same offset, or the page text.
+            let preceding = match merged.last() {
+                Some(previous) if joins_previous => previous.replacement.as_str(),
+                _ => &body[..change.range.start],
+            };
+            change
+                .replacement
+                .insert_str(0, blank_line_before(preceding));
+        }
+        if joins_previous && let Some(previous) = merged.last_mut() {
             previous.replacement.push_str(&change.replacement);
             continue;
         }
@@ -415,6 +429,28 @@ fn appended(existing: &str, content: &str) -> String {
     format!("{prefix}{content}{suffix}")
 }
 
+/// A new section's heading, a blank line, then its text (MD022). The blank
+/// line before the heading depends on what precedes it, so the merge step
+/// adds it.
+fn new_section(heading: &str, content: &str) -> String {
+    let content = content.trim_start_matches('\n');
+    if content.is_empty() {
+        return format!("{heading}\n");
+    }
+    let suffix = if content.ends_with('\n') { "" } else { "\n" };
+    format!("{heading}\n\n{content}{suffix}")
+}
+
+fn blank_line_before(preceding: &str) -> &'static str {
+    if preceding.is_empty() || preceding.ends_with("\n\n") {
+        ""
+    } else if preceding.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    }
+}
+
 fn section_content(content: &str) -> String {
     let suffix = if content.is_empty() || content.ends_with('\n') {
         ""
@@ -534,7 +570,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             patched,
-            "# T\n## Log\none\nnext\n## Tail\ntwo\n## Fresh\nnew\n"
+            "# T\n## Log\none\nnext\n## Tail\ntwo\n\n## Fresh\n\nnew\n"
         );
     }
 
@@ -571,7 +607,7 @@ mod tests {
             let batch = order.map(|index| edits[index].clone());
             assert_eq!(
                 apply(body, &batch).unwrap(),
-                "# Status\n## Log\nold\nentry\nfooter\n## Decisions\nd1\n",
+                "# Status\n## Log\nold\nentry\nfooter\n\n## Decisions\n\nd1\n",
                 "request order {order:?}"
             );
         }
@@ -583,7 +619,55 @@ mod tests {
         };
         assert_eq!(
             apply(body, &[added("Beta"), added("Alpha")]).unwrap(),
-            "# Status\n## Log\nold\n## Beta\nbeta\n## Alpha\nalpha\n"
+            "# Status\n## Log\nold\n\n## Beta\n\nbeta\n\n## Alpha\n\nalpha\n"
+        );
+    }
+
+    /// #2015: an added heading gets a blank line on each side (MD022),
+    /// whatever precedes it, and `end_of_page` stays the end of the page that
+    /// was read, so it lands before the section the same batch adds.
+    #[test]
+    fn an_added_section_is_separated_by_blank_lines() {
+        let body = "# Test\n\n## Section A\n\nline alpha\n";
+        let edits = [
+            PagePatchEdit::Append {
+                target: AppendTarget::Section,
+                anchor: Some("Section A".into()),
+                content: "line beta".into(),
+            },
+            PagePatchEdit::AddSection {
+                anchor: "## Section B".into(),
+                content: "line gamma".into(),
+            },
+            PagePatchEdit::Append {
+                target: AppendTarget::EndOfPage,
+                anchor: None,
+                content: "line delta".into(),
+            },
+        ];
+        assert_eq!(
+            apply(body, &edits).unwrap(),
+            "# Test\n\n## Section A\n\nline alpha\nline beta\nline delta\n\n## Section B\n\nline gamma\n"
+        );
+        let add = |content: &str| PagePatchEdit::AddSection {
+            anchor: "## New".into(),
+            content: content.into(),
+        };
+        // No newline at EOF, an existing blank line, an empty page, an empty
+        // section and content that already opens with a blank line.
+        assert_eq!(
+            apply("# T\nx", &[add("y")]).unwrap(),
+            "# T\nx\n\n## New\n\ny\n"
+        );
+        assert_eq!(
+            apply("# T\n\n", &[add("y")]).unwrap(),
+            "# T\n\n## New\n\ny\n"
+        );
+        assert_eq!(apply("", &[add("y")]).unwrap(), "## New\n\ny\n");
+        assert_eq!(apply("# T\n", &[add("")]).unwrap(), "# T\n\n## New\n");
+        assert_eq!(
+            apply("# T\n", &[add("\ny")]).unwrap(),
+            "# T\n\n## New\n\ny\n"
         );
     }
 
@@ -654,7 +738,7 @@ mod tests {
         };
         assert_eq!(
             apply(last, &[replace(last, "One", "new"), end_of_page, next]).unwrap(),
-            "# T\n## Zero\nz\n## One\nnew\nfooter\n## Next\nn\n"
+            "# T\n## Zero\nz\n## One\nnew\nfooter\n\n## Next\n\nn\n"
         );
         assert_eq!(
             apply(last, &[replace(last, "One", "new"), append("Child")]),
@@ -722,7 +806,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             patched,
-            "# T\n## Notes on C#\nold\nmore\n## Tail ##\nend\n## F#\nnew\n"
+            "# T\n## Notes on C#\nold\nmore\n## Tail ##\nend\n\n## F#\n\nnew\n"
         );
     }
 }

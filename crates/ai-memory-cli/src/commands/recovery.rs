@@ -714,7 +714,13 @@ async fn recover(config: &Config, budgets: &RecoverBudgets) -> Result<RecoverRep
     let spool_incomplete = spool_is_incomplete(&spool);
     if spool.dropped > 0 {
         eprintln!(
-            "{}", i18n.format("cli-recovery-ai-memory-recovery-count-hook-event-s-were-dropped-recovery-remains-incomple", &[("value0", format!("{}", spool.dropped))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-recovery-ai-memory-recovery-count-hook-event-s-were-dropped-recovery-remains-incomple",
+                &[("value0", format!("{}", spool.dropped))]
+            )
+        );
     }
 
     let mut sessions = Vec::with_capacity(journal.len());
@@ -1141,7 +1147,8 @@ fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) 
     if !report.reachable {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-recovery-ai-memory-server-at-is-unreachable-nothing-to-recover-yet",
                 &[("value0", report.server.to_string())]
             )
@@ -1149,7 +1156,8 @@ fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) 
         if let Some(error) = &report.journal_error {
             println!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-recovery-journal-unreadable-error",
                     &[("value0", error.to_string())]
                 )
@@ -1160,7 +1168,8 @@ fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) 
         }
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-recovery-spool-hook-event-s-queued-locally",
                 &[("value0", format!("{}", report.spool.remaining))]
             )
@@ -1171,7 +1180,8 @@ fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) 
     }
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-recovery-ai-memory-recovering-against",
             &[("value0", report.server.to_string())]
         )
@@ -1186,7 +1196,8 @@ fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) 
     } else {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-recovery-spool-hook-event-s-delivered-remain-queued-dropped",
                 &[
                     ("value0", format!("{}", report.spool.sent)),
@@ -1205,7 +1216,8 @@ fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) 
             || i18n.text("cli-recovery-no-session-id"),
             super::run::display_session_id,
         );
-        let mut line = i18n.format(
+        let mut line = crate::localization::format(
+            i18n,
             "cli-recovery-in",
             &[
                 ("value0", session.kind.to_string()),
@@ -1217,14 +1229,15 @@ fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) 
             ],
         );
         if session.imported_events > 0 {
-            line.push_str(&i18n.format(
+            line.push_str(&crate::localization::format(
+                i18n,
                 "cli-recovery-events",
                 &[("value0", format!("{}", session.imported_events))],
             ));
         }
         println!("{line}");
         if let Some(detail) = &session.detail {
-            println!("      {detail}");
+            println!("      {}", super::show::terminal_text(detail));
         }
     }
     println!(
@@ -1243,7 +1256,8 @@ fn print_report(i18n: &ai_memory_core::i18n::Localizer, report: &RecoverReport) 
     if let Some(error) = &report.journal_error {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-recovery-recovery-journal-error-error",
                 &[("value0", error.to_string())]
             )

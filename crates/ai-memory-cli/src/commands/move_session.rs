@@ -49,7 +49,7 @@ pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
     super::refuse_empty_explicit(args.to_workspace.as_deref(), "--to-workspace")?;
     super::refuse_empty_explicit(Some(args.to.as_str()), "--to")?;
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
 
     // The batch source is a scope like any other command's: marker, else
     // literal. The destination stays literal.

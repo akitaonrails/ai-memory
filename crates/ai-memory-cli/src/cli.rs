@@ -464,18 +464,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub executable: Option<PathBuf>,
     /// Disable native permission prompts using the selected harness's
-    /// equivalent dangerous-mode option.
+    /// equivalent dangerous-mode option; for Claude also force
+    /// `bypassPermissions` over a settings `defaultMode`.
     #[arg(long)]
     pub yolo: bool,
-    /// Everything `--yolo` does, plus — for Claude — forcing
-    /// `bypassPermissions` via `--settings` over any settings `defaultMode`.
-    /// Claude still honors your own explicit `ask` rules in every mode. For
-    /// every other harness it is interchangeable with `--yolo`; passing both
-    /// is redundant but fine. Off by default; `[claude_true_yolo]` in
-    /// config.toml applies the same Claude extra to an explicit `--yolo`
-    /// launch. Best paired with ai-jail — see
-    /// `docs/design-yolo-safety-ai-jail.md`.
-    #[arg(long = "true-yolo")]
+    /// Deprecated alias of `--yolo`
+    // Hidden: one `--yolo` now does what `--true-yolo` did (for Claude it also
+    // forces `bypassPermissions`). Kept so 3.4.x aliases, scripts and printed
+    // next-run lines, and a jail re-exec of such a launch, keep working.
+    #[arg(long = "true-yolo", hide = true)]
     pub true_yolo: bool,
     /// Re-run this session inside ai-jail without asking. Bare `--jail` uses
     /// the smart defaults (credentials present on this host, SSH for an SSH
@@ -712,8 +709,9 @@ pub struct ShowArgs {
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
     pub yolo: bool,
-    /// Claude-only true-yolo (see `RunArgs::true_yolo`). Forwarded to `run`.
-    #[arg(long = "true-yolo")]
+    /// Deprecated alias of `--yolo`
+    // Hidden, like `RunArgs::true_yolo`. Forwarded to `run`.
+    #[arg(long = "true-yolo", hide = true)]
     pub true_yolo: bool,
     /// Start a new native session instead of resuming or adopting an existing
     /// harness session. Forwarded to `run`.
@@ -738,8 +736,9 @@ pub struct ContinueArgs {
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
     pub yolo: bool,
-    /// Claude-only true-yolo (see `RunArgs::true_yolo`). Forwarded to `run`.
-    #[arg(long = "true-yolo")]
+    /// Deprecated alias of `--yolo`
+    // Hidden, like `RunArgs::true_yolo`. Forwarded to `run`.
+    #[arg(long = "true-yolo", hide = true)]
     pub true_yolo: bool,
     /// Start a new native session instead of resuming the linked one.
     /// Forwarded to `run`.
@@ -772,8 +771,9 @@ pub struct ResumeArgs {
     /// equivalent dangerous-mode option. Forwarded to `run`.
     #[arg(long)]
     pub yolo: bool,
-    /// Claude-only true-yolo (see `RunArgs::true_yolo`). Forwarded to `run`.
-    #[arg(long = "true-yolo")]
+    /// Deprecated alias of `--yolo`
+    // Hidden, like `RunArgs::true_yolo`. Forwarded to `run`.
+    #[arg(long = "true-yolo", hide = true)]
     pub true_yolo: bool,
     /// Start a new native session instead of resuming the linked one.
     /// Forwarded to `run`.

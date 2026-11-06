@@ -1,5 +1,7 @@
 //! Provider-neutral request/response types.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -11,10 +13,28 @@ use uuid::Uuid;
 /// operation. It is never derived from an agent session id — two
 /// operations of the same session (or a crash-resumed or re-claimed run)
 /// must not look like one operation on the provider side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LlmOperationId {
     id: Uuid,
     workload: LlmWorkload,
+    subject: Option<Arc<LlmSubject>>,
+}
+
+/// What one LLM operation reads and whom it acts for, carried next to its
+/// workload for the opt-in `openai-compat` request metadata headers
+/// (`llm_request_metadata_headers`).
+///
+/// Every field is an identifier, never page content, and is set only when
+/// the call site knows a single value: a gateway reading the headers must be
+/// able to trust that an absent one means "not one value", not a guess.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct LlmSubject {
+    /// Workspace name the operation reads from.
+    pub workspace: Option<String>,
+    /// Project name the operation reads from.
+    pub project: Option<String>,
+    /// Username the operation acts for.
+    pub user: Option<String>,
 }
 
 /// Closed workload labels for passive LLM telemetry.
@@ -132,13 +152,28 @@ impl LlmOperationId {
         Self {
             id: Uuid::now_v7(),
             workload,
+            subject: None,
         }
+    }
+
+    /// Attach the scope and user this operation acts on. Shared, not copied,
+    /// by every attempt; an empty subject is dropped.
+    #[must_use]
+    pub fn with_subject(mut self, subject: LlmSubject) -> Self {
+        self.subject = (subject != LlmSubject::default()).then(|| Arc::new(subject));
+        self
     }
 
     /// Workload assigned by the call site.
     #[must_use]
-    pub const fn workload(self) -> LlmWorkload {
+    pub const fn workload(&self) -> LlmWorkload {
         self.workload
+    }
+
+    /// Subject assigned by the call site, if it named one.
+    #[must_use]
+    pub fn subject(&self) -> Option<&LlmSubject> {
+        self.subject.as_deref()
     }
 }
 

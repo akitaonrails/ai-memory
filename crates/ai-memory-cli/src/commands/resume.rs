@@ -39,7 +39,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
             "{}", i18n.text("cli-resume-ai-memory-resume-needs-a-terminal-use-ai-memory-workstreams-to-list-a-checko"));
     }
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let cwd =
         std::env::current_dir().context(i18n.text("cli-resume-reading-the-current-checkout"))?;
     let candidates = if args.all {
@@ -82,7 +82,8 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
     let harness = selected_harness(harness_indices[index], &harnesses);
     eprintln!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-resume-resuming-workstream-with-harness-in-at",
             &[
                 ("value0", terminal_text(&selected.summary.name).to_string()),
@@ -148,7 +149,8 @@ async fn candidates_for_checkout(
     {
         bail!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-resume-current-checkout-belongs-to-not-workspace",
                 &[
                     ("value0", scope_label(&link).to_string()),
@@ -170,7 +172,13 @@ async fn candidates_for_checkout(
     .await?;
     if summaries.is_empty() {
         bail!(
-            "{}", i18n.format("cli-resume-no-managed-workstreams-for-the-current-checkout-launch-one-here-with-ai-memo", &[("value0", scope_label(&link).to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-resume-no-managed-workstreams-for-the-current-checkout-launch-one-here-with-ai-memo",
+                &[("value0", scope_label(&link).to_string())]
+            )
+        );
     }
     let mut candidates = summaries
         .into_iter()
@@ -208,7 +216,8 @@ async fn candidates_across_checkouts(
         }
         Err(error) => eprintln!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-resume-skipping-current-checkout",
                 &[("value0", terminal_text(&format!("{error:#}")).to_string())]
             )
@@ -227,7 +236,8 @@ async fn candidates_across_checkouts(
             Err(error) => {
                 eprintln!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-continue-session-skipping-label",
                         &[
                             ("value0", scope_label(&link).to_string()),
@@ -252,7 +262,8 @@ async fn candidates_across_checkouts(
             Err(error) => {
                 eprintln!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-resume-skipping-could-not-list-managed-workstreams",
                         &[
                             ("value0", scope_label(&link).to_string()),
@@ -284,7 +295,13 @@ async fn candidates_across_checkouts(
             )
         };
         bail!(
-            "{}", i18n.format("cli-resume-no-managed-workstreams-are-available-detail-launch-one-with-ai-memory-run-ha", &[("value0", detail.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-resume-no-managed-workstreams-are-available-detail-launch-one-with-ai-memory-run-ha",
+                &[("value0", detail.to_string())]
+            )
+        );
     }
     order_candidates(&mut candidates);
     apply_limit(&mut candidates, args, "any local checkout")?;

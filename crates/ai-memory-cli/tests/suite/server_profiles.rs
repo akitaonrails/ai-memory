@@ -507,3 +507,240 @@ fn uninstall_removes_profile_tokens_and_keeps_the_registry() {
     let rows: serde_json::Value = serde_json::from_str(&listing).unwrap();
     assert_eq!(rows[0]["token"], "missing", "{listing}");
 }
+
+/// The install's own server for the #2016 tests: a dead endpoint in
+/// `config.toml`, so a command that ignored the marker's profile fails to
+/// connect instead of reaching whatever listens on the default port.
+fn point_config_at_a_dead_server(sb: &Sandbox) -> String {
+    let dead = ai_memory_test_support::dead_http_endpoint();
+    std::fs::create_dir_all(&sb.data_dir).unwrap();
+    std::fs::write(
+        sb.data_dir.join("config.toml"),
+        format!("server_url = \"{dead}\"\n"),
+    )
+    .unwrap();
+    dead
+}
+
+fn in_repo(sb: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Output {
+    in_dir(sb, &sb.repo, args, env)
+}
+
+/// Run a command in `dir` the way a shell does: `PWD` holds the logical
+/// path, while the process's own cwd is the physical one (macOS reports a
+/// tempdir under `/var` as `/private/var`).
+fn in_dir(sb: &Sandbox, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = sb.cmd();
+    cmd.current_dir(dir)
+        .env("PWD", dir)
+        .args(args)
+        .stdin(Stdio::null());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output()
+        .unwrap_or_else(|e| panic!("spawn `{}`: {e}", args.join(" ")))
+}
+
+/// #2016: every command that works on this checkout reaches the server its
+/// marker selects, with the profile's stored token, as the hooks do. The
+/// install's server is dead and server B refuses any other token, so each
+/// command that succeeds went to B with B's token. `AI_MEMORY_SERVER_URL`
+/// still outranks the marker.
+#[tokio::test]
+async fn checkout_commands_reach_the_marker_profile_server() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    let server_b = RealServer::start("TOKEN-B").await;
+    sb.run_ok(
+        &[
+            "server",
+            "add",
+            "team-b",
+            "--url",
+            &server_b.base,
+            "--root",
+            &sb.root(),
+            "--auth-token-stdin",
+        ],
+        Some("TOKEN-B\n"),
+    );
+    sb.write_marker("workspace = \"team-b\"\nproject = \"repo\"\nserver = \"team-b\"\n");
+
+    let commands: &[&[&str]] = &[
+        &[
+            "write-page",
+            "--path",
+            "notes/routed.md",
+            "--body",
+            "# Routed\n\nprofile-routed body",
+        ],
+        &["read-page", "--path", "notes/routed.md"],
+        &["search", "profile-routed"],
+        &["recent"],
+        &["handoffs"],
+        &["message", "list"],
+        &["workstreams"],
+        &["pending-writes", "list"],
+        &["doctor"],
+    ];
+    for args in commands {
+        let out = in_repo(&sb, args, &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "`{}` did not reach the profile's server: {stderr}",
+            args.join(" ")
+        );
+        assert!(!stderr.contains(&dead), "`{}`: {stderr}", args.join(" "));
+    }
+    let read = in_repo(&sb, &["read-page", "--path", "notes/routed.md"], &[]);
+    assert!(
+        String::from_utf8_lossy(&read.stdout).contains("profile-routed body"),
+        "the page written through the profile is on server B"
+    );
+
+    // Control: an explicit AI_MEMORY_SERVER_URL wins over the marker, so the
+    // same command now dials the dead server.
+    let out = in_repo(&sb, &["recent"], &[("AI_MEMORY_SERVER_URL", &dead)]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&dead), "{stderr}");
+}
+
+/// #2016: a marker selecting a profile that does not resolve fails the
+/// command closed with the hook's reason, and `run --require-server` probes
+/// the profile's server rather than the install's.
+#[test]
+fn checkout_commands_fail_closed_on_a_refused_profile_and_run_probes_the_profile() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    sb.write_marker("server = \"nobody\"\n");
+    for args in [&["recent"][..], &["workstreams"], &["doctor"]] {
+        let out = in_repo(&sb, args, &[]);
+        assert!(!out.status.success(), "`{}`", args.join(" "));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("rejected-unknown-profile"), "{stderr}");
+        assert!(
+            !stderr.contains(&dead),
+            "nothing dialed the install's server: {stderr}"
+        );
+    }
+
+    let profile_server = ai_memory_test_support::dead_http_endpoint();
+    let root = sb.root();
+    sb.run_ok(
+        &[
+            "server",
+            "add",
+            "team-b",
+            "--url",
+            &profile_server,
+            "--root",
+            &root,
+            "--auth-token-stdin",
+        ],
+        Some("TOKEN-B\n"),
+    );
+    sb.write_marker("server = \"team-b\"\n");
+    // The probe runs before the harness starts; a shebang script stands in
+    // for it, so this half needs Unix.
+    if !cfg!(unix) {
+        return;
+    }
+    let harness = sb.home.join("fake-claude");
+    std::fs::write(&harness, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let out = in_repo(
+        &sb,
+        &[
+            "run",
+            "--require-server",
+            "--no-jail",
+            "--executable",
+            &harness.to_string_lossy(),
+            "claude",
+        ],
+        &[],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&profile_server), "{stderr}");
+    assert!(!stderr.contains(&dead), "{stderr}");
+}
+
+/// #2016 on any Unix: the profile's root is registered through a symlink, as
+/// a harness reports the checkout, while the command's own cwd is the
+/// physical directory. The command follows the hooks and routes to the
+/// profile; a `PWD` that names another directory is ignored, so the physical
+/// path is matched and refused, as is a missing `PWD`.
+#[cfg(unix)]
+#[test]
+fn checkout_commands_match_profile_roots_through_a_symlinked_checkout() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    let physical = sb.home.join("physical").join("team-b");
+    std::fs::create_dir_all(physical.join("repo")).unwrap();
+    std::fs::write(
+        physical.join("repo").join(".ai-memory.toml"),
+        "server = \"team-b\"\n",
+    )
+    .unwrap();
+    let linked = sb.home.join("work").join("linked");
+    std::os::unix::fs::symlink(&physical, &linked).unwrap();
+    let repo = linked.join("repo");
+    let profile_server = ai_memory_test_support::dead_http_endpoint();
+    let root = linked.to_string_lossy().into_owned();
+    sb.run_ok(
+        &[
+            "server",
+            "add",
+            "team-b",
+            "--url",
+            &profile_server,
+            "--root",
+            &root,
+            "--auth-token-stdin",
+        ],
+        Some("TOKEN-B\n"),
+    );
+
+    // The hook, given the harness's logical cwd, routes to the profile.
+    let check = sb.hook_at(&repo, DEFAULT_SERVER, None, "user-prompt-submit", true);
+    let check: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(check["server_resolution"], "marker");
+
+    // So does the command: it dials the profile's (dead) server, never the
+    // install's, and is not refused.
+    let out = in_dir(&sb, &repo, &["recent"], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&profile_server), "{stderr}");
+    assert!(!stderr.contains("rejected-outside-roots"), "{stderr}");
+    assert!(!stderr.contains(&dead), "{stderr}");
+
+    // A PWD naming another directory, or none, leaves the physical path,
+    // which lies outside the root: refused, nothing sent anywhere.
+    for pwd in [Some(sb.home.as_path()), None] {
+        let mut cmd = sb.cmd();
+        cmd.current_dir(&repo).arg("recent").stdin(Stdio::null());
+        match pwd {
+            Some(pwd) => cmd.env("PWD", pwd),
+            None => cmd.env_remove("PWD"),
+        };
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            stderr.contains("rejected-outside-roots"),
+            "{pwd:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&dead) && !stderr.contains(&profile_server),
+            "{stderr}"
+        );
+    }
+}

@@ -699,7 +699,13 @@ mod tests {
         assert_eq!(input["candidates"][0]["title"], candidates[0].title);
         assert_eq!(input["candidates"][0]["text"], candidates[0].snippet);
         assert_eq!(
-            provider.operation_id.lock().unwrap().unwrap().workload(),
+            provider
+                .operation_id
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .workload(),
             LlmWorkload::Rerank
         );
     }

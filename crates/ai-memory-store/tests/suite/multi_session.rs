@@ -5816,3 +5816,224 @@ async fn a_refused_link_names_the_holder_only_for_the_runs_own_operator_and_harn
     assert_eq!(holder("mine-new").await, None);
     assert_eq!(holder("never-seen").await, None);
 }
+
+/// #2023: a hook event that names a session under another agent is refused
+/// with the bound agent, so the client can tell what went wrong — but only
+/// once the owner check has admitted the caller. Another operator naming the
+/// same session id under any agent still gets the opaque collision, which
+/// says nothing about whose session it is or which harness holds it.
+#[tokio::test]
+async fn agent_mismatch_names_the_bound_agent_only_to_an_admitted_owner() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let session = |id: SessionId, agent_kind: AgentKind, owner: Option<&str>| NewSession {
+        occurred_at: None,
+        id,
+        workspace_id: ws,
+        project_id: proj,
+        agent_kind,
+        cwd: Some("/repo".into()),
+        actor_user: owner.map(str::to_owned),
+    };
+    let event = |id: SessionId| {
+        Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "body".into(),
+                importance: 3,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        )
+    };
+    let admit = |new: NewSession, filter: OwnerFilter| {
+        let id = new.id;
+        store
+            .writer
+            .admit_hook_session_event(new, event(id), filter, None, None)
+    };
+
+    let owned = SessionId::new();
+    admit(
+        session(owned, AgentKind::ClaudeCode, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await
+    .unwrap();
+
+    // Another operator, under the bound agent and under another one: opaque.
+    for agent in [AgentKind::ClaudeCode, AgentKind::Dsh] {
+        let refused = admit(
+            session(owned, agent, Some(&operator("bob"))),
+            OwnerFilter::User(operator("bob")),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(StoreError::SessionCollision)),
+            "a foreign owner must not learn the bound agent ({agent:?}): {refused:?}"
+        );
+    }
+    // The owner under another agent learns which agent holds the session.
+    let mismatch = admit(
+        session(owned, AgentKind::Dsh, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await;
+    assert!(
+        matches!(
+            mismatch,
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::ClaudeCode
+            })
+        ),
+        "{mismatch:?}"
+    );
+
+    // A shared (unowned) session is everyone's, so any caller may learn it.
+    let shared = SessionId::new();
+    admit(
+        session(shared, AgentKind::ClaudeCode, None),
+        OwnerFilter::Unattributed,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        admit(
+            session(shared, AgentKind::Dsh, Some(&operator("bob"))),
+            OwnerFilter::User(operator("bob")),
+        )
+        .await,
+        Err(StoreError::SessionAgentMismatch {
+            bound: AgentKind::ClaudeCode
+        })
+    ));
+
+    // Control: the owner under the bound agent is stored; no refusal stored
+    // anything.
+    admit(
+        session(owned, AgentKind::ClaudeCode, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await
+    .unwrap();
+    let stored = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                [owned.as_bytes()],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, 2, "only the owner's two same-agent events land");
+}
+
+/// #2014: an explicit handoff that records its source session is not held back
+/// while that session is still at work, as an automatic baton is: the agent
+/// wrote it on purpose for the next session. It is still claimed exactly once.
+#[tokio::test]
+async fn an_explicit_handoff_from_a_live_session_is_delivered_and_claimed_once() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let source = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: source,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "still working".into(),
+                importance: 5,
+                occurred_at: None,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    let baton = |summary: &str| NewHandoff {
+        workspace_id: ws,
+        project_id: proj,
+        from_session_id: Some(source),
+        from_agent: AgentKind::ClaudeCode,
+        to_agent: None,
+        cwd: Some("/repo".into()),
+        summary: summary.into(),
+        open_questions: Vec::new(),
+        next_steps: Vec::new(),
+        files_touched: Vec::new(),
+        owner_user: None,
+    };
+    let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
+    let startup = || {
+        store
+            .reader
+            .startup_handoff(ws, proj, Some("/repo".into()), OwnerFilter::Any, cutoff)
+    };
+
+    // Control: the busy session's automatic baton is not offered.
+    store
+        .writer
+        .checkpoint_session_handoff(baton("checkpoint"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(startup().await.unwrap().is_none());
+
+    let explicit = store
+        .writer
+        .insert_manual_handoff(baton("explicit"))
+        .await
+        .unwrap();
+    let offered = startup().await.unwrap().expect("the explicit handoff");
+    assert_eq!(offered.scope.id, explicit);
+
+    let claim = |receiver| HandoffAcceptance {
+        handoff_id: explicit,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::Codex,
+        accepting_session: Some(receiver),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: Some("/repo".into()),
+    };
+    let first = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let delivered = store
+        .writer
+        .accept_startup_context(Some(claim(first)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(
+        delivered.handoff_accepted,
+        "a busy source keeps no explicit baton"
+    );
+    let second = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let again = store
+        .writer
+        .accept_startup_context(Some(claim(second)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(!again.handoff_accepted, "claimed exactly once");
+}

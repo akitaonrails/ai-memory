@@ -29,6 +29,9 @@
 //! - `--ingest whole-session|captured-session` writes one page per session
 //!   through the real page write path instead of replaying hooks;
 //! - `--date-prefix turn|session-start|none` moves the per-turn date.
+//!
+//! `--engine raw-rag` is an independent local-model reference over source
+//! windows, with its own `--raw-rag-*` protocol settings and no server.
 
 pub(crate) mod compare;
 pub(crate) mod dataset;
@@ -36,6 +39,7 @@ pub(crate) mod grep;
 pub(crate) mod ingest;
 pub(crate) mod qa;
 pub(crate) mod query;
+mod raw_rag;
 mod reachability;
 pub(crate) mod report;
 mod score;
@@ -91,10 +95,14 @@ pub struct RetrievalArgs {
     #[arg(long = "question-id", value_delimiter = ',')]
     question_ids: Vec<String>,
 
-    /// `server` (the default) drives a real `ai-memory serve`; `grep`
-    /// scores the whole-session term-overlap baseline with no server.
+    /// `server` drives a real `ai-memory serve`; `grep` scores whole-session
+    /// term overlap; `raw-rag` runs local dense-window retrieval and a
+    /// cross-encoder without a server (see the `--raw-rag-*` options).
     #[arg(long, value_enum, default_value_t = Engine::Server)]
     engine: Engine,
+
+    #[command(flatten)]
+    raw_rag: raw_rag::Args,
 
     /// After ingest, report how much answer-bearing evidence reaches the
     /// page, the observations, and the local embedder's 512-token window.
@@ -242,6 +250,7 @@ impl Variant {
 enum Engine {
     Server,
     Grep,
+    RawRag,
 }
 
 /// Where local-embeddings runs keep haystack document vectors between runs,
@@ -385,6 +394,27 @@ fn parse_query_args(
 }
 
 pub async fn run(args: RetrievalArgs) -> Result<()> {
+    if args.engine != Engine::RawRag && !args.raw_rag.is_default() {
+        bail!("--raw-rag-* options require --engine raw-rag");
+    }
+    if args.engine == Engine::RawRag {
+        args.raw_rag.validate()?;
+        if args.ab_mode()
+            || args.reachability
+            || args.reranker
+            || args.embeddings != "none"
+            || !args.server_env.is_empty()
+            || !args.query_arg.is_empty()
+            || args.ingest != IngestMode::Hooks
+            || args.date_prefix != DatePrefix::Turn
+            || args.keep_data_dir
+            || args.no_embedding_cache
+        {
+            bail!(
+                "--engine raw-rag runs alone: use --raw-rag-* options, not server/candidate/ingest/reachability knobs; --qa is supported"
+            );
+        }
+    }
     // Captured at launch: a long run must not stamp its report with a
     // commit that landed while it was in flight.
     let commit = report::commit_sha();
@@ -440,6 +470,29 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
             bail!("--engine grep runs alone: no candidate, --reachability, or --qa");
         }
         let report = run_grep(&args, variant, &questions, abstention.len(), &commit);
+        std::fs::create_dir_all(&run_dir)?;
+        std::fs::write(
+            run_dir.join("report.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        let md = report::to_markdown(&report);
+        std::fs::write(run_dir.join("report.md"), &md)?;
+        println!("{md}");
+        println!("run dir: {}", run_dir.display());
+        return Ok(());
+    }
+
+    if args.engine == Engine::RawRag {
+        let run = RunContext {
+            args: &args,
+            variant,
+            questions: &questions,
+            abstention_n: abstention.len(),
+            commit: &commit,
+            qa: resolve_qa(&args.qa),
+            embed_window: None,
+        };
+        let report = raw_rag::run(&run).await?;
         std::fs::create_dir_all(&run_dir)?;
         std::fs::write(
             run_dir.join("report.json"),
@@ -511,22 +564,7 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
     // grader once and share them across both configs. If QA is requested but
     // a provider/key can't be resolved, SKIP cleanly (retrieval metrics are
     // unaffected) rather than failing the run — mirroring live-LLM tests.
-    let qa_engine = if args.qa.enabled {
-        match qa::QaEngine::resolve(&args.qa) {
-            Ok(engine) => {
-                println!("QA-accuracy mode ON (live LLM): {}", engine.summary());
-                tracing::info!(qa = engine.summary(), "QA-accuracy mode enabled");
-                Some(Arc::new(engine))
-            }
-            Err(e) => {
-                println!("QA-accuracy mode requested but SKIPPED: {e:#}");
-                tracing::warn!(error = %format!("{e:#}"), "QA-accuracy mode skipped");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let qa_engine = resolve_qa(&args.qa);
 
     // The embedder-window check reads the model's own tokenizer.
     let embed_window = if args.reachability {
@@ -573,6 +611,24 @@ pub async fn run(args: RetrievalArgs) -> Result<()> {
     }
     println!("run dir: {}", run_dir.display());
     Ok(())
+}
+
+fn resolve_qa(args: &qa::QaArgs) -> Option<Arc<qa::QaEngine>> {
+    if !args.enabled {
+        return None;
+    }
+    match qa::QaEngine::resolve(args) {
+        Ok(engine) => {
+            println!("QA-accuracy mode ON (live LLM): {}", engine.summary());
+            tracing::info!(qa = engine.summary(), "QA-accuracy mode enabled");
+            Some(Arc::new(engine))
+        }
+        Err(e) => {
+            println!("QA-accuracy mode requested but SKIPPED: {e:#}");
+            tracing::warn!(error = %format!("{e:#}"), "QA-accuracy mode skipped");
+            None
+        }
+    }
 }
 
 /// Everything a config run shares with its A/B twin.
@@ -781,6 +837,7 @@ async fn run_config(run: &RunContext<'_>, knobs: &Knobs) -> Result<report::Repor
             slices: reachability::aggregate(&reaches),
             per_question: reaches,
         }),
+        raw_rag: None,
         slices,
         per_question: scores,
     })
@@ -838,6 +895,7 @@ fn run_grep(
         qa: None,
         ingest: None,
         reachability: None,
+        raw_rag: None,
         slices,
         per_question: scores,
     }

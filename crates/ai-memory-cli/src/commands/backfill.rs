@@ -353,7 +353,7 @@ async fn backfill_endpoint(
         .await;
         return Ok(ServerEndpoint::for_hook_target(url.to_owned(), token));
     }
-    Ok(ServerEndpoint::from_config_resolving_auth(config).await)
+    ServerEndpoint::for_checkout(config).await
 }
 
 /// Run the backfill.
@@ -477,7 +477,8 @@ async fn run_in(config: &Config, args: crate::cli::BackfillArgs, cwd: PathBuf) -
                 // detached worker's stderr is the operator's diagnostic log.
                 eprintln!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-backfill-ai-memory-backfill-of-session-failed-error",
                         &[
                             ("value0", session.harness.as_str().to_string()),
@@ -1932,7 +1933,7 @@ mod tests {
     async fn real_hook_router_replay_is_idempotent_and_reports_outcomes() {
         use ai_memory_core::{ActiveProject, IngestMetrics, Sanitizer, SessionId};
         use ai_memory_hooks::{
-            CwdProbes, HookState, IngestGates, IngestRateLimiter, ProjectCacheStore,
+            CwdProbes, HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SessionAgents,
             SubagentSessionSet, hook_router,
         };
         use ai_memory_store::Store;
@@ -1961,6 +1962,7 @@ mod tests {
             ingest_metrics: Arc::new(IngestMetrics::default()),
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             ingest_gates: IngestGates::default(),
+            session_agents: SessionAgents::default(),
             cwd_probes: CwdProbes::default(),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             consolidate_on_session_end: false,
@@ -2136,7 +2138,7 @@ mod tests {
     async fn two_sequential_recovery_intervals_on_one_resumed_session_replay_exactly_once() {
         use ai_memory_core::{ActiveProject, IngestMetrics, ObservationKind, Sanitizer, SessionId};
         use ai_memory_hooks::{
-            CwdProbes, HookState, IngestGates, IngestRateLimiter, ProjectCacheStore,
+            CwdProbes, HookState, IngestGates, IngestRateLimiter, ProjectCacheStore, SessionAgents,
             SubagentSessionSet, hook_router,
         };
         use ai_memory_store::Store;
@@ -2165,6 +2167,7 @@ mod tests {
             ingest_metrics: Arc::new(IngestMetrics::default()),
             ingest_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
             ingest_gates: IngestGates::default(),
+            session_agents: SessionAgents::default(),
             cwd_probes: CwdProbes::default(),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
             consolidate_on_session_end: false,

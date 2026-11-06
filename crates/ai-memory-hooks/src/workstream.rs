@@ -2505,13 +2505,14 @@ mod tests {
             .unwrap();
         // The key starts 18 bytes before the cap: capping first would keep
         // `sk-` plus 15 characters, one short of the 16 the pattern needs.
-        // The space before the tail matters — without it the greedy key
+        // The key follows a space, since the rule skips an `sk-` glued to a
+        // letter. The space before the tail matters — without it the greedy key
         // pattern would swallow the tail into the same match and the
         // scrubbed text would never reach the cap.
         let credential = format!("sk-{}", "A".repeat(40));
         let content = format!(
-            "{}{credential} {}",
-            "x".repeat(MAX_EVENT_CONTENT_BYTES - 18),
+            "{} {credential} {}",
+            "x".repeat(MAX_EVENT_CONTENT_BYTES - 19),
             "y".repeat(2 * 1024),
         );
         let response = finish_run(
@@ -5173,16 +5174,29 @@ mod tests {
         // The twin an earlier name-only run created under the derived name,
         // inserted directly: the capture path under test no longer mints it, so
         // this has to stand in for the row an older release left behind.
+        let twin = ai_memory_core::ProjectId::new();
         rusqlite::Connection::open(store.db_path())
             .unwrap()
             .execute(
                 "INSERT INTO projects (id, workspace_id, name, created_at) \
                  VALUES (?1, ?2, 'victorcesc-unknown-system', 0)",
-                rusqlite::params![
-                    ai_memory_core::ProjectId::new().as_bytes().to_vec(),
-                    workspace_id.as_bytes().to_vec()
-                ],
+                rusqlite::params![twin.as_bytes().to_vec(), workspace_id.as_bytes().to_vec()],
             )
+            .unwrap();
+        // The twin holds a session, so the name stays ambiguous: an empty twin
+        // would resolve to the identity owner by name alone (#2018).
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: ai_memory_core::SessionId::new(),
+                workspace_id,
+                project_id: twin,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
             .unwrap();
 
         // By name alone the derived name names both projects.

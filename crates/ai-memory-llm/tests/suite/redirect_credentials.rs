@@ -59,6 +59,7 @@ fn config(provider: ProviderChoice, auth: ProviderAuth, base_url: String) -> Pro
         request_timeout_secs: 5,
         reasoning_effort: None,
         extra_headers: ExtraHeaders::parse(["x-gateway-key: gateway-secret"]).expect("valid"),
+        request_metadata_headers: false,
     }
 }
 

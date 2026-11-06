@@ -47,10 +47,10 @@ pub(crate) fn apply(
             println!();
             println!(
                 "{}",
-                i18n.diagnostic(&format!(
-                    "OpenClaw plugin installed from {}.",
-                    plugin_dir.display()
-                ))
+                crate::localization::diagnostic(
+                    i18n,
+                    format!("OpenClaw plugin installed from {}.", plugin_dir.display())
+                )
             );
             println!(
                 "{}",

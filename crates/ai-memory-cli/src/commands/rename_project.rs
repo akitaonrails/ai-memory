@@ -25,7 +25,7 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     super::refuse_empty_explicit(args.from.as_deref(), "--from")?;
     super::refuse_empty_explicit(args.project_id.as_deref(), "--project-id")?;
     super::refuse_empty_explicit(Some(args.to.as_str()), "--to")?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     // Rename happens inside one workspace, so the marker resolves it the same
     // way it does for every other command. `--to` stays literal: it names the
     // new project, it does not select a scope.
@@ -67,7 +67,13 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
         config, &endpoint, &workspace, &old_name, &workspace, &args.to,
     ) {
         eprintln!(
-            "{}", i18n.format("cli-rename-project-ai-memory-project-renamed-but-the-client-local-checkout-link-could-not-be-up", &[("value0", format!("{:#}", error))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-rename-project-ai-memory-project-renamed-but-the-client-local-checkout-link-could-not-be-up",
+                &[("value0", format!("{:#}", error))]
+            )
+        );
     }
     println!(
         "{}",
