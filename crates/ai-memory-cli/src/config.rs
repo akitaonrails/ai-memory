@@ -407,6 +407,13 @@ pub struct Config {
     /// ceiling (observed with free aggregator tiers). Set with
     /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
     pub llm_timeout_secs: u64,
+    /// OpenAI-compat only: add the `x-ai-memory-*` request metadata headers
+    /// (the operation's workload, and the workspace, project and username it
+    /// names when it has exactly one) to every chat attempt, so a gateway
+    /// can attribute and limit traffic. Values are identifiers, never page
+    /// content. Ignored by every other provider; off by default. Set with
+    /// `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`.
+    pub llm_request_metadata_headers: bool,
     /// How many live `bootstrap` runs may call the LLM at once, across
     /// projects. A second run for the same project always waits for the
     /// first. Defaults to 1 (strictly one at a time); raise it when the
@@ -1497,6 +1504,7 @@ impl Default for Config {
             llm_compat_disable_thinking: false,
             llm_compat_stream: None,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            llm_request_metadata_headers: false,
             bootstrap_max_concurrent: 1,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
@@ -2980,6 +2988,7 @@ impl Config {
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
+            request_metadata_headers: self.llm_request_metadata_headers,
         })
     }
 
@@ -6993,6 +7002,73 @@ input_token_safety_margin = {margin}
         assert!(!cfg.llm_compat_disable_thinking);
     }
 
+    /// Request metadata is opt-in: off by default, so an existing gateway
+    /// sees no new headers, and forwarded verbatim once turned on.
+    #[test]
+    fn llm_request_metadata_headers_defaults_off_and_is_forwarded() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!cfg.llm_request_metadata_headers);
+        cfg.llm_provider = Some("openai-compat".into());
+        cfg.llm_model = Some("qwen3:32b".into());
+        cfg.llm_base_url = Some("http://localhost:11434/v1".into());
+        assert!(
+            !cfg.llm_provider_config()
+                .unwrap()
+                .unwrap()
+                .request_metadata_headers
+        );
+
+        cfg.llm_request_metadata_headers = true;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(provider.request_metadata_headers);
+    }
+
+    #[test]
+    fn load_accepts_llm_request_metadata_headers_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_request_metadata_headers = true\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(cfg.llm_request_metadata_headers);
+    }
+
+    /// `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` turns it on through the env.
+    /// Child-process marker pattern: `std::env::set_var` is unsafe and
+    /// forbidden in this crate's multi-threaded test binary.
+    #[test]
+    fn llm_request_metadata_headers_env_turns_it_on() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_REQUEST_METADATA_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+            assert!(config.llm_request_metadata_headers);
+            println!("request-metadata-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::llm_request_metadata_headers_env_turns_it_on")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_LLM_REQUEST_METADATA_HEADERS", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("request-metadata-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn load_accepts_llm_compat_stream_from_toml() {
         let tmp = TempDir::new().unwrap();
@@ -7695,6 +7771,28 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
             provider_cfg.auth.require_api_key().unwrap().expose_secret(),
             "sk-fallback-test"
         );
+    }
+
+    /// `llm_request_metadata_headers` is server-wide, as `docs/llm-providers.md`
+    /// warns: an `openai-compat` fallback sends the metadata to its own
+    /// endpoint too.
+    #[test]
+    fn an_openai_compat_fallback_inherits_request_metadata_headers() {
+        let cfg = Config {
+            llm_request_metadata_headers: true,
+            ..Config::default()
+        };
+        let profile = FallbackProfile {
+            provider: "openai-compat".into(),
+            model: "qwen3:32b".into(),
+            base_url: Some("http://gateway.internal/v1".into()),
+            api_key_env: Some("COMPAT_FALLBACK_KEY".into()),
+        };
+        let provider_cfg = cfg
+            .fallback_provider_config(0, &profile, Some(SecretString::from("sk-fallback-test")))
+            .unwrap();
+        assert_eq!(provider_cfg.provider, ProviderChoice::OpenAiCompat);
+        assert!(provider_cfg.request_metadata_headers);
     }
 
     #[test]

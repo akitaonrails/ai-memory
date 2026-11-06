@@ -342,6 +342,7 @@ pub async fn run_lint(
             workspace_id,
             project_id,
             &candidates,
+            crate::llm_subject::scope(reader, workspace_id, Some(project_id)).await,
         )
         .await
         {
@@ -655,6 +656,7 @@ async fn contradiction_pass(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     candidates: &[DecayCandidate],
+    subject: ai_memory_llm::LlmSubject,
 ) -> Result<Vec<LintFinding>, LintError> {
     // Focus on semantic / procedural pages — those are the ones the
     // user actually compounds knowledge on.
@@ -700,7 +702,7 @@ async fn contradiction_pass(
     let report: LintReport = complete_structured_with_operation_id(
         &*provider,
         request,
-        LlmOperationId::for_workload(LlmWorkload::Lint),
+        LlmOperationId::for_workload(LlmWorkload::Lint).with_subject(subject),
     )
     .await?;
     Ok(report.findings)
