@@ -227,7 +227,8 @@ pub async fn run_experience_review(
     let raw: AutoImproveLlmResponse = complete_structured_with_operation_id(
         llm,
         request,
-        LlmOperationId::for_workload(LlmWorkload::Experience),
+        LlmOperationId::for_workload(LlmWorkload::Experience)
+            .with_subject(crate::llm_subject::scope(reader, workspace_id, Some(project_id)).await),
     )
     .await
     .map_err(AutoImproveError::from)?;

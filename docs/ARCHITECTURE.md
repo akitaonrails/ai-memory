@@ -281,8 +281,8 @@ from hook paths.
    the store is only read, and a legacy `pages` row for a deleted ledger is left
    for `reclaim-ledger-versions`. A dry run reports the files and bytes it would
    delete (`ledgers_prunable`, `ledger_bytes_prunable`) and deletes nothing.
-   Scheduled sweep, rule-based lint, and opt-in embedding backfill ticks
-   enumerate every existing workspace/project scope before doing per-project
+   Scheduled sweep, rule-based lint, opt-in LLM lint, and opt-in embedding
+   backfill ticks enumerate every existing workspace/project scope before doing per-project
    work, matching the auto-improvement scheduler's store-wide scope model. A
    separate daily cleanup removes week-old project rows only when they contain
    no pages, sessions, observations, handoffs, managed workstreams, sent or
@@ -840,7 +840,7 @@ does not need to ride on the public protocol change.
 | `memory_patch_page` | destructive | Atomically append inside a parsed Markdown section or at EOF, add a unique level 2-6 section, or replace a section. It requires the current page id; replacement also requires the read-returned exact section hash. All edits resolve against one captured body, ambiguity/conflicts fail before writing, and the resulting full page goes through `Wiki::write_page_if`, preserving frontmatter and the normal sanitizer, admission, attribution, supersession, index, rollback and git-checkpoint boundaries. Existing-scope write authorization is fail-closed and cannot create a target. |
 | `memory_read_session_observations` | read-only | Page through ONE session's raw hook observations (`ObservationRecord` with full sanitized body, capped per row by `body_max_chars`), restricted to the rows that landed in the resolved scope and to sessions the caller may see; `total` and `elided_other_scope` report the in-scope count and the rows the session left in another project. `session_id` omitted reads the visible session with the newest captured work other than the caller's own, ended or cut off (`ReaderPool::recent_session_activity` over 30 days, preferring the caller session's cwd), else the latest completed visible session. `session_id: "current"` resolves to the caller's own hook session when the client forwards it (`X-Memory-Actor-Session-Id`) and is refused otherwise (#1983). |
 | `memory_status` | read-only | Counts, paths, version, plus the `scope` that answered: `workspace`, `project`, and `resolved_by` (`explicit`, `session`, `shared_slot`, `startup_seed`, `default`, `default_after_mismatch`). Unscoped reads resolved by `startup_seed` or `default_after_mismatch` also log a server warning. |
-| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. Project-scoped snapshots also carry a bounded `pinned` list (up to 10) of the project's pinned latest pages (`pinned = 1`, newest first) as standing SessionStart hot-context, distinct from `slots`, which is keyed by the `_slots/` path prefix; empty and omitted from JSON when the project has no pins, so the default shape is unchanged. Opt-in `settled_first: true` leads with up to 8 of the project's highest-standing `rule`/`decision` pages, ordered by evidence count then recency; off by default. `scope` names the workspace/project briefed and `resolved_by` how it was chosen. `recent_sessions_limit` (1-50) sets how many recent sessions it lists. |
+| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. Project-scoped snapshots also carry a bounded `pinned` list (up to 10) of the project's pinned latest pages (`pinned = 1`, newest first) as standing SessionStart hot-context, distinct from `slots`, which is keyed by the `_slots/` path prefix; empty and omitted from JSON when the project has no pins, so the default shape is unchanged. Opt-in `settled_first: true` leads with up to 8 of the project's highest-standing `rule`/`decision` pages, ordered by evidence count then recency; off by default. `scope` names the workspace/project briefed and `resolved_by` how it was chosen. `recent_sessions_limit` (1-50) sets how many recent sessions it lists. `lint`, present once a lint run has written `_lint/report.md` with its counts, gives the report's `warnings`, `findings`, `updated_at` and up to five `warning_pages`; the session-start context adds one count-only line when `warnings` is non-zero. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. An optional `reasoning` tier (`minimal` (default) / `low` / `medium` / `high` / `max`) scales the digest's max-token budget off its base (16 000; same 1x/1.5x/2x/3x/4x mapping as `memory_query`); inert on the no-provider briefing-only path, and `minimal` is byte-identical. |
 | `memory_handoff_begin` | destructive | Open an owner-scoped handoff for the next agent; `shared=true` deliberately publishes it to the project. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_list` | read-only | List open own/shared handoffs with inspectable body and identity fields; does not claim or expire. Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
@@ -1264,6 +1264,9 @@ run_autowire = true                # `ai-memory run <harness>` auto-installs tha
                                    # hooks + MCP on first launch if missing (idempotent,
                                    # one-time per harness+version+install location).
                                    # Also `--no-autowire`.
+pi_tool_exposure = "direct"        # how the generated Pi extension registers the MCP
+                                   # tools: "direct" (declared to the model) or
+                                   # "codemode" (reached through Pi's codemode tool).
 release_base_url = ""              # override the GitHub releases base URL that `ai-memory
                                    # upgrade` checks and downloads from (#801). Empty =
                                    # https://github.com/akitaonrails/ai-memory/releases.
@@ -1292,6 +1295,9 @@ enabled = true                     # master switch for the scheduled jobs below
 forget_sweep_interval_secs = 86400 # retention forget sweep; 0 disables. Cadence persists
                                    # across restarts; overdue work starts after a bounded delay
 lint_interval_secs = 86400         # rule-based wiki lint; 0 disables (same persistence)
+lint_llm_interval_secs = 0         # lint with the LLM contradiction pass; 0 = off (calls
+                                   # the lint provider; skipped with one warning without
+                                   # one). While on, the rule run keeps its findings.
 embedding_backfill_interval_secs = 0  # embedding backfill; 0 = off (may call a paid provider)
 reconcile_tombstones_deleted_pages = false
                                    # opt-in (#929/#964): the 30s reconcile pass soft-tombstones
@@ -1650,6 +1656,12 @@ AI_MEMORY_LLM_COMPAT_DISABLE_THINKING  openai-compat only, false by default; tru
 AI_MEMORY_LLM_COMPAT_STREAM optional false to request non-streaming openai-compat JSON;
                            omitted by default; true is rejected because SSE is unsupported
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
+AI_MEMORY_LLM_REQUEST_METADATA_HEADERS  openai-compat only, false by default; true adds
+                           x-ai-memory-workload to every chat attempt, plus
+                           x-ai-memory-workspace / x-ai-memory-project when the
+                           operation reads one scope and x-ai-memory-user when it
+                           acts for one username. Unknown values are omitted,
+                           never guessed; values are names, never page content
 AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT  bootstrap runs in flight at once
                            (`bootstrap_max_concurrent`); 1 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
@@ -1668,9 +1680,10 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            content-type, x-api-key, x-goog-api-key,
                            anthropic-version, anthropic-beta, openai-beta,
                            host, content-length) are refused at startup.
-                           `x-request-id` is additionally refused at
+                           `x-request-id` and the `x-ai-memory-*` request
+                           metadata names are additionally refused at
                            initialization for the `openai-compat` provider,
-                           which sends the operation's request id itself.
+                           which sends them itself.
                            Values are never logged. A header value cannot
                            contain a comma through the env var — use
                            `llm_headers = [...]` in config.toml for that.

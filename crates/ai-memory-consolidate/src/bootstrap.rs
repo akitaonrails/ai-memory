@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use ai_memory_core::{PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, LlmWorkload, Role,
+    ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, LlmSubject, LlmWorkload, Role,
     complete_structured_with_operation_id,
 };
 use ai_memory_store::ReaderPool;
@@ -355,15 +355,16 @@ fn chunk_retry_wait(err: &LlmError, fallback: Duration) -> Duration {
 async fn complete_chunk_with_retry(
     llm: &(dyn LlmProvider + 'static),
     request: ChatRequest,
+    subject: LlmSubject,
     retry_delay: Duration,
 ) -> Result<BootstrapBatch, LlmError> {
     let mut attempt = 1;
-    let operation_id = LlmOperationId::for_workload(LlmWorkload::Bootstrap);
+    let operation_id = LlmOperationId::for_workload(LlmWorkload::Bootstrap).with_subject(subject);
     loop {
         match complete_structured_with_operation_id::<BootstrapBatch>(
             llm,
             request.clone(),
-            operation_id,
+            operation_id.clone(),
         )
         .await
         {
@@ -551,6 +552,8 @@ impl Bootstrap {
             }
         }
 
+        let subject =
+            crate::llm_subject::scope(&self.reader, cfg.workspace_id, Some(cfg.project_id)).await;
         for (idx, chunk) in chunks.iter().enumerate() {
             if completed.contains(&idx) {
                 debug!(
@@ -574,8 +577,13 @@ impl Bootstrap {
                     .sum::<usize>(),
                 "bootstrap LLM chunk",
             );
-            let batch: BootstrapBatch =
-                complete_chunk_with_retry(&*self.llm, request, BOOTSTRAP_CHUNK_RETRY_DELAY).await?;
+            let batch: BootstrapBatch = complete_chunk_with_retry(
+                &*self.llm,
+                request,
+                subject.clone(),
+                BOOTSTRAP_CHUNK_RETRY_DELAY,
+            )
+            .await?;
 
             let pages_json = serde_json::to_string(&batch.pages).unwrap_or_else(|_| "[]".into());
             self.writer
@@ -1849,9 +1857,10 @@ mod tests {
             permanent: false,
             retry_after: None,
         };
-        let batch = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
-            .await
-            .expect("a transient failure that clears within the attempt budget must succeed");
+        let batch =
+            complete_chunk_with_retry(&llm, chunk_request(), LlmSubject::default(), Duration::ZERO)
+                .await
+                .expect("a transient failure that clears within the attempt budget must succeed");
         assert!(batch.pages.is_empty());
         assert_eq!(
             llm.calls.load(Ordering::SeqCst),
@@ -1873,9 +1882,10 @@ mod tests {
             permanent: false,
             retry_after: None,
         };
-        let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
-            .await
-            .expect_err("a persistently transient failure must eventually give up");
+        let err =
+            complete_chunk_with_retry(&llm, chunk_request(), LlmSubject::default(), Duration::ZERO)
+                .await
+                .expect_err("a persistently transient failure must eventually give up");
         assert!(err.is_transient());
         assert_eq!(
             llm.calls.load(Ordering::SeqCst),
@@ -1893,9 +1903,10 @@ mod tests {
             permanent: true, // returns Auth — not transient
             retry_after: None,
         };
-        let err = complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
-            .await
-            .expect_err("an auth error must not be retried");
+        let err =
+            complete_chunk_with_retry(&llm, chunk_request(), LlmSubject::default(), Duration::ZERO)
+                .await
+                .expect_err("an auth error must not be retried");
         assert!(!err.is_transient());
         assert_eq!(
             llm.calls.load(Ordering::SeqCst),
@@ -1939,7 +1950,7 @@ mod tests {
             retry_after: Some(Duration::from_millis(150)),
         };
         let started = std::time::Instant::now();
-        complete_chunk_with_retry(&llm, chunk_request(), Duration::ZERO)
+        complete_chunk_with_retry(&llm, chunk_request(), LlmSubject::default(), Duration::ZERO)
             .await
             .expect("the retry after the hinted wait succeeds");
         assert_eq!(llm.calls.load(Ordering::SeqCst), 2);

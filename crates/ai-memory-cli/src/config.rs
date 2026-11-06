@@ -280,6 +280,25 @@ pub struct ResolvedTaskLlm {
     pub fallbacks: Vec<ProviderConfig>,
 }
 
+/// The `exposure` the generated Pi extension gives each bridged MCP tool.
+///
+/// Pi documents five values; only the two that keep every tool reachable by
+/// the model are offered. `model-only` would stop codemode scripts calling the
+/// tools, `deferred` hides them from codemode's own listing, and `hidden`
+/// withdraws them. See
+/// <https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure>.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PiToolExposure {
+    /// Pi's default: declared to the model while active. The generated file
+    /// omits the property, so it stays byte-identical to earlier releases.
+    #[default]
+    Direct,
+    /// Callable whenever registered and listed by Pi's `codemode` tool, but
+    /// not declared to the model unless activated explicitly.
+    Codemode,
+}
+
 /// Top-level runtime configuration.
 ///
 /// `deny_unknown_fields` is intentionally NOT set: figment's
@@ -407,6 +426,13 @@ pub struct Config {
     /// ceiling (observed with free aggregator tiers). Set with
     /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
     pub llm_timeout_secs: u64,
+    /// OpenAI-compat only: add the `x-ai-memory-*` request metadata headers
+    /// (the operation's workload, and the workspace, project and username it
+    /// names when it has exactly one) to every chat attempt, so a gateway
+    /// can attribute and limit traffic. Values are identifiers, never page
+    /// content. Ignored by every other provider; off by default. Set with
+    /// `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`.
+    pub llm_request_metadata_headers: bool,
     /// How many live `bootstrap` runs may call the LLM at once, across
     /// projects. A second run for the same project always waits for the
     /// first. Defaults to 1 (strictly one at a time); raise it when the
@@ -522,6 +548,14 @@ pub struct Config {
     /// `AI_MEMORY_CLAUDE_TRUE_YOLO` from an older release keeps loading; when
     /// true, `ai-memory run` prints a terminal note asking to remove it.
     pub claude_true_yolo: bool,
+    /// How the generated Pi extension exposes ai-memory's MCP tools to the
+    /// model (#1988). `direct` (the default) declares every tool, as before;
+    /// `codemode` registers them with Pi's `exposure: "codemode"`, so Pi's
+    /// codemode tool lists and calls them without their schemas being sent on
+    /// every request. Read by `install-hooks --agent pi`, preview and
+    /// `--apply` alike, so regenerating the extension keeps the choice. Set
+    /// with `AI_MEMORY_PI_TOOL_EXPOSURE` or `pi_tool_exposure` in config.toml.
+    pub pi_tool_exposure: PiToolExposure,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -1259,6 +1293,29 @@ impl AuthSettings {
     }
 }
 
+/// Parse `AI_MEMORY_ADMISSION_WEBHOOKS_JSON`: the same webhook list a
+/// `[[admission_webhooks]]` table holds, as one JSON array.
+fn parse_admission_webhooks_json(raw: &str) -> Result<Vec<ai_memory_wiki::WebhookConfig>> {
+    serde_json::from_str(raw).with_context(|| {
+        "parsing AI_MEMORY_ADMISSION_WEBHOOKS_JSON (must be a JSON array of \
+         {name,url,timeout_ms?,failure_policy?,events,blocking?,projects?,headers?})"
+    })
+}
+
+/// Resolve each webhook header's relative `value_file` against the data dir.
+///
+/// Only the path is resolved here. The file holds a secret only the server
+/// sends, and every hook and thin client loads this same config, so it is
+/// read once by `AdmissionChain::new` when `serve` builds the chain; a missing
+/// file then stops the server, not the hooks.
+fn resolve_admission_header_files(webhooks: &mut [ai_memory_wiki::WebhookConfig], data_dir: &Path) {
+    for header in webhooks.iter_mut().flat_map(|hook| hook.headers.iter_mut()) {
+        if header.value_file.is_relative() {
+            header.value_file = data_dir.join(&header.value_file);
+        }
+    }
+}
+
 /// What [`apply_bearer_token_file`] needs to know about the load.
 struct TokenFileContext<'a> {
     data_dir: &'a Path,
@@ -1493,6 +1550,7 @@ impl Default for Config {
             llm_compat_disable_thinking: false,
             llm_compat_stream: None,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            llm_request_metadata_headers: false,
             bootstrap_max_concurrent: 1,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
@@ -1507,6 +1565,7 @@ impl Default for Config {
             run_autowire: true,
             run: RunSettings::default(),
             claude_true_yolo: false,
+            pi_tool_exposure: PiToolExposure::default(),
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -1966,6 +2025,13 @@ pub struct MaintenanceSettings {
     /// persist cadence across restarts; overdue work starts after a bounded
     /// startup delay.
     pub lint_interval_secs: u64,
+    /// Interval for lint with the LLM contradiction pass (#2021). `0` (the
+    /// default) disables this job, because each run makes one `[llm.lint]`
+    /// provider call per project with enough semantic pages. Without a lint
+    /// provider the job is skipped with one startup warning. Cadence persists
+    /// like `lint_interval_secs`, and while it is on the rule-based run keeps
+    /// the last LLM findings in `_lint/report.md`.
+    pub lint_llm_interval_secs: u64,
     /// Interval for embedding backfill. `0` disables this job.
     /// Defaults to off because it may call a paid provider.
     pub embedding_backfill_interval_secs: u64,
@@ -2003,6 +2069,7 @@ impl Default for MaintenanceSettings {
             enabled: true,
             forget_sweep_interval_secs: 86_400,
             lint_interval_secs: 86_400,
+            lint_llm_interval_secs: 0,
             embedding_backfill_interval_secs: 0,
             reconcile_tombstones_deleted_pages: false,
         }
@@ -2534,12 +2601,7 @@ impl Config {
         if let Ok(raw) = std::env::var("AI_MEMORY_ADMISSION_WEBHOOKS_JSON")
             && !raw.trim().is_empty()
         {
-            let parsed: Vec<ai_memory_wiki::WebhookConfig> = serde_json::from_str(&raw)
-                .with_context(|| {
-                    "parsing AI_MEMORY_ADMISSION_WEBHOOKS_JSON (must be a JSON array of \
-                     {name,url,timeout_ms?,failure_policy?,events})"
-                })?;
-            config.admission_webhooks = parsed;
+            config.admission_webhooks = parse_admission_webhooks_json(&raw)?;
         }
         // FTS stopword list (issue #953): CSV env override, applied as data
         // (see `apply_fts_stopwords_env`'s doc comment for why this can't go
@@ -2593,6 +2655,8 @@ impl Config {
         // server WAS on the default port -- which is how the reporter wrote
         // test pages into their real store.
         derive_server_url_from_bind(&mut config, explicit_server_url);
+        // After the data dir is final, as for the bearer token file below.
+        resolve_admission_header_files(&mut config.admission_webhooks, &config.data_dir);
         apply_bearer_token_file(
             &mut config.auth,
             &TokenFileContext {
@@ -2979,6 +3043,7 @@ impl Config {
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
+            request_metadata_headers: self.llm_request_metadata_headers,
         })
     }
 
@@ -4525,6 +4590,7 @@ mod tests {
         assert!(cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
+        assert_eq!(cfg.maintenance.lint_llm_interval_secs, 0);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
         assert_eq!(cfg.decay.breadth_weight, 0.0);
         // Observation pruning must stay OFF by default: an install that never
@@ -6075,6 +6141,35 @@ input_token_safety_margin = {margin}
         );
     }
 
+    /// #1988: the Pi extension's tool exposure defaults to Pi's `direct` and
+    /// accepts `codemode`. Pi's other documented values would make the tools
+    /// unreachable from the model or from codemode's listing, so they fail
+    /// config load like any unknown value.
+    #[rstest]
+    #[case::absent("", Ok(PiToolExposure::Direct))]
+    #[case::direct("pi_tool_exposure = \"direct\"\n", Ok(PiToolExposure::Direct))]
+    #[case::codemode("pi_tool_exposure = \"codemode\"\n", Ok(PiToolExposure::Codemode))]
+    #[case::model_only("pi_tool_exposure = \"model-only\"\n", Err(()))]
+    #[case::deferred("pi_tool_exposure = \"deferred\"\n", Err(()))]
+    #[case::hidden("pi_tool_exposure = \"hidden\"\n", Err(()))]
+    #[case::uppercase("pi_tool_exposure = \"Codemode\"\n", Err(()))]
+    fn load_parses_pi_tool_exposure(#[case] toml: &str, #[case] want: Result<PiToolExposure, ()>) {
+        match (load_with_toml(toml), want) {
+            (Ok(cfg), Ok(want)) => assert_eq!(cfg.pi_tool_exposure, want),
+            (Err(error), Err(())) => {
+                let rendered = format!("{error:#}");
+                assert!(
+                    rendered.contains("pi_tool_exposure") && rendered.contains("unknown variant"),
+                    "unexpected error: {rendered}"
+                );
+            }
+            (got, want) => panic!(
+                "{toml:?}: got {:?}, want {want:?}",
+                got.map(|c| c.pi_tool_exposure)
+            ),
+        }
+    }
+
     #[test]
     fn defaults_bound_consolidation_prompts_for_a_large_context_provider() {
         let tmp = TempDir::new().unwrap();
@@ -6214,6 +6309,7 @@ input_token_safety_margin = {margin}
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
+            lint_llm_interval_secs = 604800
 
             [auto_improve]
             mode = "dry_run"
@@ -6269,6 +6365,7 @@ input_token_safety_margin = {margin}
         assert!(!cfg.handoff.create_on_session_end);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
+        assert_eq!(cfg.maintenance.lint_llm_interval_secs, 604_800);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 1_800);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 4);
@@ -7001,6 +7098,73 @@ input_token_safety_margin = {margin}
         assert!(!cfg.llm_compat_disable_thinking);
     }
 
+    /// Request metadata is opt-in: off by default, so an existing gateway
+    /// sees no new headers, and forwarded verbatim once turned on.
+    #[test]
+    fn llm_request_metadata_headers_defaults_off_and_is_forwarded() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!cfg.llm_request_metadata_headers);
+        cfg.llm_provider = Some("openai-compat".into());
+        cfg.llm_model = Some("qwen3:32b".into());
+        cfg.llm_base_url = Some("http://localhost:11434/v1".into());
+        assert!(
+            !cfg.llm_provider_config()
+                .unwrap()
+                .unwrap()
+                .request_metadata_headers
+        );
+
+        cfg.llm_request_metadata_headers = true;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(provider.request_metadata_headers);
+    }
+
+    #[test]
+    fn load_accepts_llm_request_metadata_headers_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_request_metadata_headers = true\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(cfg.llm_request_metadata_headers);
+    }
+
+    /// `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` turns it on through the env.
+    /// Child-process marker pattern: `std::env::set_var` is unsafe and
+    /// forbidden in this crate's multi-threaded test binary.
+    #[test]
+    fn llm_request_metadata_headers_env_turns_it_on() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_REQUEST_METADATA_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+            assert!(config.llm_request_metadata_headers);
+            println!("request-metadata-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::llm_request_metadata_headers_env_turns_it_on")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_LLM_REQUEST_METADATA_HEADERS", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("request-metadata-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn load_accepts_llm_compat_stream_from_toml() {
         let tmp = TempDir::new().unwrap();
@@ -7291,6 +7455,43 @@ input_token_safety_margin = {margin}
         let config_path = tmp.path().join("config.toml");
         std::fs::write(&config_path, toml).unwrap();
         Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+    }
+
+    #[test]
+    fn admission_webhook_bot_wake_config_is_the_same_from_toml_and_json() {
+        let toml = r#"
+[[admission_webhooks]]
+name = "grok-bot-wake"
+url = "https://example.test/hook"
+events = ["message_send"]
+blocking = false
+projects = ["fuad/grok-bot"]
+headers = [{ name = "Authorization", value_file = "secrets/wake" }]
+"#;
+        // The secret file does not exist: loading the config must not open it,
+        // or every hook and thin client would fail on a server-only secret.
+        let config = load_with_toml(toml).unwrap();
+        let mut from_json = parse_admission_webhooks_json(
+            r#"[{"name":"grok-bot-wake","url":"https://example.test/hook",
+                "events":["message_send"],"blocking":false,
+                "projects":["fuad/grok-bot"],
+                "headers":[{"name":"Authorization","value_file":"secrets/wake"}]}]"#,
+        )
+        .unwrap();
+        resolve_admission_header_files(&mut from_json, &config.data_dir);
+
+        assert_eq!(
+            serde_json::to_value(&config.admission_webhooks).unwrap(),
+            serde_json::to_value(&from_json).unwrap(),
+            "TOML and the JSON env override describe the same webhook"
+        );
+        let hook = &config.admission_webhooks[0];
+        assert_eq!(hook.projects, ["fuad/grok-bot"]);
+        assert_eq!(
+            hook.headers[0].value_file,
+            config.data_dir.join("secrets/wake"),
+            "a relative value_file resolves against the data dir"
+        );
     }
 
     fn load_with_oauth_fixture(tmp: &TempDir, toml: &str) -> Config {
@@ -7666,6 +7867,28 @@ input_token_safety_margin = {margin}
             provider_cfg.auth.require_api_key().unwrap().expose_secret(),
             "sk-fallback-test"
         );
+    }
+
+    /// `llm_request_metadata_headers` is server-wide, as `docs/llm-providers.md`
+    /// warns: an `openai-compat` fallback sends the metadata to its own
+    /// endpoint too.
+    #[test]
+    fn an_openai_compat_fallback_inherits_request_metadata_headers() {
+        let cfg = Config {
+            llm_request_metadata_headers: true,
+            ..Config::default()
+        };
+        let profile = FallbackProfile {
+            provider: "openai-compat".into(),
+            model: "qwen3:32b".into(),
+            base_url: Some("http://gateway.internal/v1".into()),
+            api_key_env: Some("COMPAT_FALLBACK_KEY".into()),
+        };
+        let provider_cfg = cfg
+            .fallback_provider_config(0, &profile, Some(SecretString::from("sk-fallback-test")))
+            .unwrap();
+        assert_eq!(provider_cfg.provider, ProviderChoice::OpenAiCompat);
+        assert!(provider_cfg.request_metadata_headers);
     }
 
     #[test]

@@ -579,6 +579,7 @@ diag-binding = vinculando { $bind }
 diag-reading-bound-http-listener-address = lendo o endereço do listener HTTP vinculado
 diag-scheduled-forget-sweep-had-scope-errors = a limpeza agendada de esquecimento teve { $value0 } erro(s) de escopo
 diag-scheduled-rule-based-lint-had-scope-errors = o lint agendado baseado em regras teve { $value0 } erro(s) de escopo
+diag-scheduled-llm-lint-had-scope-errors = o lint agendado com LLM teve { $value0 } erro(s) de escopo
 diag-building-embedder-from-config = criando o embedder a partir da configuração
 diag-ai-memory-reranker-llm-requires-ai-memory = AI_MEMORY_RERANKER=llm exige AI_MEMORY_LLM_PROVIDER: o reranker avalia candidatos com o provedor LLM configurado. Defina um provedor ou remova AI_MEMORY_RERANKER.
 diag-building-llm-provider-chain-from-config = montando a cadeia de provedores LLM a partir da configuração

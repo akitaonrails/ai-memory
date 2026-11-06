@@ -75,6 +75,8 @@ fn hook(
         failure_policy: ai_memory_wiki::FailurePolicy::Ignore,
         events,
         blocking,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }
 }
 

@@ -11,8 +11,9 @@
 
 use ai_memory_llm::types::ChatRequest;
 use ai_memory_llm::{
-    DEFAULT_USER_AGENT, ExtraHeaders, OPENROUTER_HTTP_REFERER, OPENROUTER_X_TITLE, ProviderAuth,
-    ProviderChoice, ProviderConfig, build_provider,
+    DEFAULT_USER_AGENT, ExtraHeaders, LlmOperationId, LlmSubject, LlmWorkload,
+    OPENROUTER_HTTP_REFERER, OPENROUTER_X_TITLE, ProviderAuth, ProviderChoice, ProviderConfig,
+    build_provider,
 };
 use secrecy::SecretString;
 use serde_json::json;
@@ -57,6 +58,7 @@ async fn captured_request(headers: ExtraHeaders) -> Request {
         request_timeout_secs: 30,
         reasoning_effort: None,
         extra_headers: headers,
+        request_metadata_headers: false,
     })
     .expect("provider builds");
 
@@ -160,6 +162,7 @@ async fn openrouter_app_headers_reach_the_provider_request() {
         request_timeout_secs: 30,
         reasoning_effort: None,
         extra_headers: ExtraHeaders::default(),
+        request_metadata_headers: false,
     })
     .expect("provider builds");
 
@@ -208,6 +211,7 @@ async fn an_operator_base_url_redirects_the_opencode_provider() {
         request_timeout_secs: 30,
         reasoning_effort: None,
         extra_headers: ExtraHeaders::default(),
+        request_metadata_headers: false,
     })
     .expect("provider builds");
 
@@ -267,6 +271,7 @@ async fn factory_opencode_chat_completions_sends_structured_response_format() {
         request_timeout_secs: 30,
         reasoning_effort: None,
         extra_headers: ExtraHeaders::default(),
+        request_metadata_headers: false,
     })
     .expect("provider builds");
 
@@ -321,6 +326,7 @@ async fn an_operator_base_url_redirects_the_anthropic_provider() {
         request_timeout_secs: 30,
         reasoning_effort: None,
         extra_headers: ExtraHeaders::default(),
+        request_metadata_headers: false,
     })
     .expect("provider builds");
 
@@ -360,6 +366,7 @@ async fn an_operator_base_url_redirects_the_openai_provider() {
         request_timeout_secs: 30,
         reasoning_effort: None,
         extra_headers: ExtraHeaders::default(),
+        request_metadata_headers: false,
     })
     .expect("provider builds");
 
@@ -406,6 +413,7 @@ async fn an_operator_session_header_beats_the_per_operation_default() {
             "user-agent: ai-memory-fork/9",
         ])
         .expect("valid"),
+        request_metadata_headers: false,
     })
     .expect("provider builds");
 
@@ -421,4 +429,117 @@ async fn an_operator_session_header_beats_the_per_operation_default() {
     let request = &received[0];
     assert_eq!(values(request, "x-opencode-session"), vec!["homelab-01"]);
     assert_eq!(values(request, "user-agent"), vec!["ai-memory-fork/9"]);
+}
+
+const METADATA_HEADERS: [&str; 4] = [
+    "x-ai-memory-workload",
+    "x-ai-memory-workspace",
+    "x-ai-memory-project",
+    "x-ai-memory-user",
+];
+
+/// Drive one attributed completion through `build_provider` with the request
+/// metadata turned on, and hand back every request the mock received. The
+/// mock answers any path with an OpenAI-shaped body: providers that speak
+/// another wire format may fail to parse it, which is irrelevant here, since
+/// only the headers they sent are asserted.
+async fn requests_with_metadata_on(
+    provider: ProviderChoice,
+    auth: ProviderAuth,
+    model: &str,
+) -> Vec<Request> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+        .mount(&server)
+        .await;
+
+    let llm = build_provider(ProviderConfig {
+        provider,
+        model: model.into(),
+        auth,
+        base_url: Some(server.uri()),
+        compat_strict: false,
+        compat_disable_thinking: false,
+        compat_stream: None,
+        request_timeout_secs: 30,
+        reasoning_effort: None,
+        extra_headers: ExtraHeaders::default(),
+        request_metadata_headers: true,
+    })
+    .expect("provider builds");
+    let operation_id = LlmOperationId::for_workload(LlmWorkload::Dream).with_subject(LlmSubject {
+        workspace: Some("acme".into()),
+        project: Some("billing-api".into()),
+        user: Some("alice".into()),
+    });
+    let _ = llm
+        .complete_with_operation_id(ChatRequest::user_prompt("hi"), operation_id)
+        .await;
+
+    let received = server
+        .received_requests()
+        .await
+        .expect("mock recorded requests");
+    assert!(!received.is_empty(), "the request reached the mock");
+    received
+}
+
+/// The configured `openai-compat` provider is the one that sends the
+/// metadata, each header exactly once.
+#[tokio::test]
+async fn the_compat_provider_sends_the_request_metadata_when_enabled() {
+    let received = requests_with_metadata_on(
+        ProviderChoice::OpenAiCompat,
+        ProviderAuth::optional_api_key_from_env("LLM_API_KEY", None),
+        "mistral-nemo",
+    )
+    .await;
+    for request in &received {
+        for (name, expected) in
+            METADATA_HEADERS
+                .into_iter()
+                .zip(["dream", "acme", "billing-api", "alice"])
+        {
+            assert_eq!(values(request, name), vec![expected], "{name}");
+        }
+    }
+}
+
+/// The official providers and OpenCode never send it, even with the setting
+/// on: it is an `openai-compat` gateway contract, not a vendor one.
+#[tokio::test]
+async fn other_providers_never_send_the_request_metadata() {
+    let key = || Some(SecretString::from("sk-test"));
+    for (provider, auth, model) in [
+        (
+            ProviderChoice::OpenAi,
+            ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", key()),
+            "gpt-5.4-mini",
+        ),
+        (
+            ProviderChoice::Anthropic,
+            ProviderAuth::required_api_key_from_env("ANTHROPIC_API_KEY", key()),
+            "claude-haiku-4-5",
+        ),
+        (
+            ProviderChoice::Gemini,
+            ProviderAuth::required_api_key_from_env("GEMINI_API_KEY", key()),
+            "gemini-3.5-flash",
+        ),
+        (
+            ProviderChoice::OpenCode,
+            ProviderAuth::required_api_key_from_env("OPENCODE_API_KEY", key()),
+            "mistral-nemo",
+        ),
+    ] {
+        for request in requests_with_metadata_on(provider, auth, model).await {
+            for name in METADATA_HEADERS {
+                assert!(
+                    values(&request, name).is_empty(),
+                    "{provider:?} sent {name}"
+                );
+            }
+        }
+    }
 }

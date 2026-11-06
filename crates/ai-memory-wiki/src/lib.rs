@@ -21,7 +21,7 @@ mod wiki;
 
 pub use admission::{
     AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, MAX_ADMISSION_WEBHOOKS,
-    MAX_RESPONSE_BYTES, WebhookConfig,
+    MAX_RESPONSE_BYTES, WebhookConfig, WebhookHeader,
 };
 pub use atomic::{rename_with_retry, write_atomic};
 pub use confinement::validate_wiki_tree;

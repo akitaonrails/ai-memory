@@ -16,24 +16,52 @@ version in [`docs/changelog/`](docs/changelog/):
 - Showed the harness's session name beside its short ID in the agent dashboard.
   Codex reports names and renames at the end of a turn (#1948).
 
+- `[maintenance] lint_llm_interval_secs` (default `0`, off) runs the LLM
+  contradiction pass across every project on its own persisted cadence, with
+  one `lint` provider call per project that has enough semantic pages. With no
+  provider it is skipped with one warning. While it is on, the daily rule-based
+  lint keeps the last LLM findings in `_lint/report.md`, and the two scheduled
+  jobs never run at the same time. `memory_briefing` and the `/api/v1` briefing
+  now carry `lint`, the warning and finding counts of the project's latest
+  report, and a session start in a project whose report lists warnings gets one
+  count-only line pointing at it (#2021).
+- `pi_tool_exposure` (`AI_MEMORY_PI_TOOL_EXPOSURE`) chooses how the generated
+  Pi extension registers ai-memory's MCP tools. `direct`, the default, keeps
+  today's behavior. `codemode` registers each tool with Pi's
+  `exposure: "codemode"`, so Pi's codemode tool lists and calls them without
+  their schemas being declared to the model. Preview, `--apply` and the
+  `ai-memory upgrade` refresh all read the setting; tool names, session
+  headers and lifecycle capture are unchanged (#1988).
+- Added an opt-in, development-only Raw-RAG retrieval baseline to
+  `ai-memory-eval`: overlapping source windows, local dense retrieval and
+  cross-encoder reranking, with pinned models and per-window provenance.
+  The shipped server, capture pipeline and retrieval defaults are unchanged (#2017).
 - Added Pi session token totals from saved usage at agent stops and shutdown.
   Reloads, resumes and repeated reports preserve cumulative input, output and
   cache counts; missing usage stays unknown. Totals follow Pi's session history,
   including copied fork history. Per-response Pi ledger records remain
   unsupported; update the server and reinstall the Pi extension to enable
   session reporting (#1984, #1985).
+- `llm_request_metadata_headers` (`AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`),
+  off by default, makes the `openai-compat` provider tell a gateway what each
+  call is for: every chat attempt carries `x-ai-memory-workload`
+  (`consolidation`, `profile`, `dream`, `lint`, ...), and
+  `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when
+  the operation reads one scope or acts for one user, such as the session
+  owner in consolidation or the operator of a private profile. A value that is
+  not known as one name is left out, never guessed, and page content is never
+  sent. Other providers never send these headers, and `AI_MEMORY_LLM_HEADERS`
+  now refuses the four names for `openai-compat` at startup (#2001, #2004).
+- Added `projects` and `headers` to `[[admission_webhooks]]`, so a bot can be
+  woken straight from an observer webhook with no relay. `projects` limits a
+  webhook to `workspace/project` entries; `headers` sends request headers whose
+  values the server reads once from files at startup and never logs. A
+  `message_send` webhook now also receives the message id, the addressed
+  harness and the sending project (never the subject or body), on the MCP,
+  admin, `/web` composer and `/web` edit paths, so the bot can pop exactly the
+  message that woke it. Configs without the new keys behave as before (#2008, #2009).
 
 ### Changed
-
-- The auto-improvement reviewer now has explicit instructions for user
-  corrections. When the user rejects, corrects, interrupts or undoes the
-  agent's work and gives a reason, it proposes a `_rules/` page, or a patch to
-  the one already on that topic, saying what to avoid, why and what to do
-  instead, and quotes the user verbatim as evidence. An approach that failed
-  for a technical reason goes to `gotchas/`. It recognizes a correction by
-  meaning rather than by keywords, so the language does not matter, counts
-  only `user-prompt` observations, and skips a refusal with no reason or a
-  one-off rename. Proposals still follow the approval policy. (#1992)
 
 - `ai-memory run --yolo` is now the only yolo switch. For Claude it also
   forces `bypassPermissions` over a `defaultMode` in your settings, which
@@ -45,6 +73,16 @@ version in [`docs/changelog/`](docs/changelog/):
   run now repeats the launch with `--yolo`. Claude's own `ask` rules still
   pause the run, and the `--yolo` warning and ai-jail offer are unchanged
   (maintainer request).
+
+- The auto-improvement reviewer now has explicit instructions for user
+  corrections. When the user rejects, corrects, interrupts or undoes the
+  agent's work and gives a reason, it proposes a `_rules/` page, or a patch to
+  the one already on that topic, saying what to avoid, why and what to do
+  instead, and quotes the user verbatim as evidence. An approach that failed
+  for a technical reason goes to `gotchas/`. It recognizes a correction by
+  meaning rather than by keywords, so the language does not matter, counts
+  only `user-prompt` observations, and skips a refusal with no reason or a
+  one-off rename. Proposals still follow the approval policy. (#1992)
 
 ### Fixed
 
@@ -129,7 +167,10 @@ version in [`docs/changelog/`](docs/changelog/):
   with that profile's stored token, the same way hooks route capture. Before,
   they used the configured server and fell back to `127.0.0.1`. A profile
   that does not resolve fails the command with the hook's reason instead of
-  falling back. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
+  falling back. Roots are matched against the directory as the shell names it
+  (`PWD`, when it is the same directory), as the hooks match the harness's
+  cwd, so a checkout under a symlink or macOS's `/var` routes the same for
+  both. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
   profile-routed checkout because the jailed run cannot read the profile's
   token (#2016).
 

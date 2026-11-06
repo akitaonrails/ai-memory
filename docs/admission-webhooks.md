@@ -244,15 +244,26 @@ a second header.)
       "session_id": "019e6d-..."
     },
     "op": "write_page",                      // write_page | consolidate | delete | purge_project | purge_session | purge_workspace | move_project | move_session
-    "partial_failure": true                  // purge_project/purge_session/purge_workspace only, and ONLY when set
+    "partial_failure": true,                 // purge_project/purge_session/purge_workspace only, and ONLY when set
                                              //   (skipped on the wire when false).
                                              //   true → the DB rows were purged but
                                              //   filesystem cleanup failed afterwards;
                                              //   a filesystem-tracking mirror (git push)
                                              //   should refuse to drop its own copy.
+    "message_id": "019a6e…",                 // message_send only: the queued message's id
+    "to_agent": "codex",                     // message_send only: addressed harness; omitted for shared mail
+    "from_workspace": "default",             // message_send only: sender's workspace name
+    "from_project": "orchestrator"           // message_send only: sender's project name
   }
 }
 ```
+
+A `message_send` payload names the message but never carries its text: the
+subject and body still reach an agent only through `memory_message_pop`. The
+four fields are filled on every path that queues a message (the
+`memory_message_send` tool, `POST /admin/messages/send`, the `/web` composer
+and a saved `/web` edit, which requeues the same id) and are absent from every
+other op.
 
 The `WebhookRequestBody` / `WebhookPagePayload` / `ActorContext` /
 `AdmissionContext` types in
@@ -406,6 +417,33 @@ does not reliably reconstruct `Vec<Struct>` from indexed nested variables.
 Empty config = no chain attached → zero overhead per write (no client
 built, no per-write branch).
 
+### `projects` (default: every project)
+
+A list of `workspace/project` entries. With entries, the webhook is told only
+about operations in those projects, on every dispatch path; an operation on a
+workspace as a whole (`purge_workspace`, empty `ctx.project`) matches an entry
+by its workspace. A move matches by its source project. An entry that is not
+exactly `workspace/project` stops the server at startup, naming the webhook
+and the entry. Without the key, or with an empty list, the webhook sees every
+project as before.
+
+### `headers` (default: none)
+
+Extra request headers, each `{ name, value_file }`, for an endpoint that
+authenticates the caller (`Authorization: Bearer …`, an API key header). The
+config holds only the path; a relative `value_file` resolves against the data
+dir. The server reads each file once, when it builds the chain at startup, and
+trims surrounding whitespace. Only `serve` reads it: hooks and thin clients
+that load the same config never open the file. A missing, unreadable or empty
+file, an invalid header name or value, and the reserved names `Content-Type`,
+`Content-Length`, `Host` and `X-Memory-Op` stop the server with an error that
+names the webhook and the file, never the value. The value is marked sensitive
+and never appears in logs, errors or `Debug` output, and a redirect is still
+followed only on the same origin, so the header never reaches another host.
+The server does not encrypt the header itself: over an `http://` URL it
+travels in clear text, so give a webhook with `headers` an `https://` URL
+unless the endpoint is on loopback or a network you trust.
+
 ## 9. Worked examples
 
 ### Mutating: append the writer to `frontmatter.contributors`
@@ -447,6 +485,24 @@ repo, batches commits, and pushes asynchronously. The engine doesn't
 wait for the push; only the local enqueue runs inside the write path
 under the webhook's `timeout_ms`.
 
+### Observer: wake a bot when mail reaches its project
+
+```toml
+[[admission_webhooks]]
+name     = "bot-wake"
+url      = "https://bot.example.test/wake"
+blocking = false
+events   = ["message_send"]
+projects = ["default/ops-bot"]
+headers  = [{ name = "Authorization", value_file = "secrets/bot-wake" }]
+```
+
+The bot's endpoint receives the `message_send` context directly (no relay to
+filter the project or add the bearer), then calls `memory_message_pop` with
+`ctx.message_id` to collect exactly the message that woke it. Delivery stays
+best effort (see `blocking`): keep a periodic `memory_message_list` as the
+fallback for a dropped event.
+
 ## 10. Tests
 
 `crates/ai-memory-wiki/tests/suite/admission.rs` covers the wire contract end
@@ -464,6 +520,13 @@ to end against an axum loopback server. Categories:
 - `MAX_ADMISSION_WEBHOOKS` rejection at construct time.
 - `MAX_RESPONSE_BYTES` cap drops oversized responses.
 - `workspace` / `project` resolution propagates into the payload.
+
+`crates/ai-memory-wiki/tests/suite/admission_bot_wake.rs` covers the
+`projects` filter on every dispatch path, `headers` read once from a file and
+sent on every path, the startup refusals, a planted secret absent from logs,
+`Debug` and errors, the same-origin redirect, and the `message_send` fields on
+the `/web` send and edit paths. `crates/ai-memory-mcp/tests/suite/agent_messages_webhook.rs`
+covers the MCP send and a pop by the id the webhook received.
 
 `crates/ai-memory-wiki/src/wiki.rs::tests::write_page_resolves_workspace_and_project_names_for_chain`
 covers the integrated path (`Wiki::write_page` → store reader resolution

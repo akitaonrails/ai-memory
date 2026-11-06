@@ -66,6 +66,8 @@ fn chain(url: String, timeout_ms: u64, failure_policy: FailurePolicy) -> Admissi
         failure_policy,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap()
 }

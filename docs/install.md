@@ -2482,6 +2482,30 @@ ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
 Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
 separate and continues to use `.omp` paths.
 
+#### Pi codemode
+
+By default the extension declares every ai-memory tool to the model, schema
+included. To reach them through Pi's `codemode` tool instead, set this in
+ai-memory's `config.toml` (or `AI_MEMORY_PI_TOOL_EXPOSURE=codemode`) and
+regenerate the extension:
+
+```toml
+pi_tool_exposure = "codemode"
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Each tool is then registered with Pi's
+[`exposure: "codemode"`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure):
+codemode scripts can list and call it, and the model no longer receives its
+schema unless you activate the tool yourself. Tool names, the session headers
+that route each call to the current project, and lifecycle capture stay the
+same. Preview output and every later `--apply` (including the refresh that
+`ai-memory upgrade` runs) read the same setting, so regenerating keeps your
+choice. Set it back to `direct`, or remove it, to return to the default.
+
 ### Bind mounts vs docker cp
 
 The `setup-agent` subcommand does the extract + render in one shot
