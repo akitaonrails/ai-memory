@@ -33,6 +33,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `ai-memory-eval`: overlapping source windows, local dense retrieval and
   cross-encoder reranking, with pinned models and per-window provenance.
   The shipped server, capture pipeline and retrieval defaults are unchanged (#2017).
+- Added Brazilian Portuguese translations of 24 product guides under
+  `docs/pt-BR/`. The built-in documentation page serves them when the interface
+  language is pt-BR, including the Markdown view and guide search, and falls back
+  to English for guides without a translation (the changelog). The
+  installation-state cards link to the matching translated section. The
+  authenticated `/api/v1/docs` catalog keeps returning the English text (#2027).
 - Added Pi session token totals from saved usage at agent stops and shutdown.
   Reloads, resumes and repeated reports preserve cumulative input, output and
   cache counts; missing usage stays unknown. Totals follow Pi's session history,
