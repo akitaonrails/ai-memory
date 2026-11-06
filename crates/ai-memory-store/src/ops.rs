@@ -3445,14 +3445,20 @@ pub fn admit_hook_session_event(
         Some((ws, project, agent, owner, ended_at, ended_count, cwd)) => {
             // Corrupt owners fail closed, including for Any recovery. Owner
             // and agent identify WHO the session belongs to, so a mismatch
-            // there is a genuine UUID collision and is terminal.
+            // there is a genuine UUID collision and is terminal. The owner is
+            // checked first and stays opaque: only a caller the owner check
+            // admitted learns which agent holds the session (#2023).
             if owner
                 .as_deref()
                 .is_some_and(|value| IdentityKey::from_storage_key(value).is_none())
-                || agent != session.agent_kind.as_str()
                 || !owner_filter.admits(owner.as_deref())
             {
                 return Err(StoreError::SessionCollision);
+            }
+            if agent != session.agent_kind.as_str() {
+                return Err(StoreError::SessionAgentMismatch {
+                    bound: AgentKind::from_wire(&agent),
+                });
             }
             // Scope is NOT identity. Under the default `follow-cwd` routing a
             // mid-session `cd` into another project legitimately resolves this
@@ -19780,7 +19786,9 @@ pub(crate) mod tests {
                 None,
                 None,
             ),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::Codex
+            })
         ));
 
         let observations: u64 = conn
@@ -19999,7 +20007,9 @@ pub(crate) mod tests {
         let end = session_end_observation(&drifted);
         assert!(matches!(
             admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::OpenCode
+            })
         ));
     }
 
@@ -20088,7 +20098,9 @@ pub(crate) mod tests {
                 Some("agent-key"),
                 None,
             ),
-            Err(StoreError::SessionCollision)
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::Codex
+            })
         ));
         let counts: (u64, u64) = conn
             .query_row(

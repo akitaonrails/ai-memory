@@ -1156,6 +1156,9 @@ that touch the relevant area.
    in every domain row from day one. (basic-memory #783 / #834.)
 5. **Hooks are fire-and-forget.** Hook scripts hard-timeout at
    ≤200 ms; server returns 202 immediately or 429 when saturated.
+   The one exception is a 409 for a session the server already knows is
+   bound to another agent for that caller, decided from an in-memory view
+   (`SessionAgents`) with no database round trip (#2023).
    (agentmemory #221 / #143.) The router's filesystem probes of an event's
    cwd (git discovery, canonicalization) never run on an async worker: they
    go through `CwdProbes`, a blocking-pool path with four permits and a

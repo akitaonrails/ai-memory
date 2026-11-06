@@ -178,6 +178,17 @@ pub enum StoreError {
     #[error("session collision")]
     SessionCollision,
 
+    /// A hook event named a session its own operator owns (or a shared one)
+    /// under a different agent than the session was first captured with
+    /// (#2023). Raised only after the owner check admitted the caller, so the
+    /// bound agent names nothing a foreign operator could not already see;
+    /// a foreign owner still gets the opaque [`Self::SessionCollision`].
+    #[error("session is bound to agent {}", bound.as_str())]
+    SessionAgentMismatch {
+        /// The agent the session row was created with.
+        bound: ai_memory_core::AgentKind,
+    },
+
     /// A `spawn_blocking` task panicked or was cancelled.
     #[error("reader pool task did not complete: {0}")]
     PoolPanic(String),
