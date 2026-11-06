@@ -129,7 +129,7 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
         }
     };
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let resp: SendMessageResponse = post_json(
         &endpoint,
         "/admin/messages/send",
@@ -171,7 +171,7 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
     let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let mailbox = if args.outbox { "outbox" } else { "inbox" };
 
     let response: ListMessagesResponse = get_json(
@@ -268,7 +268,7 @@ async fn pop(config: &Config, args: MessagePopArgs) -> Result<()> {
     super::refuse_empty_explicit(args.id.as_deref(), "--id")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
 
     let resp: PopMessageResponse = post_json(
         &endpoint,
@@ -464,7 +464,7 @@ async fn cancel(config: &Config, args: MessageCancelArgs) -> Result<()> {
 
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
 
     let resp: CancelMessagesResponse = post_json(
         &endpoint,

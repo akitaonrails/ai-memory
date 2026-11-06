@@ -33,7 +33,7 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// collection fails, or when the server returns a non-2xx response.
 pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     let i18n = &config.i18n;
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let ep = ServerEndpoint::for_checkout(config).await?;
     info!(server = %ep.url, auth = ep.auth_token.is_some(), "bootstrap CLI configured");
 
     // ---- repo path — auto-detect via libgit2, fall back to CWD ----

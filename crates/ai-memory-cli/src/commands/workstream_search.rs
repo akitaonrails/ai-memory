@@ -11,7 +11,7 @@ use crate::http_client::{ServerEndpoint, get_json};
 /// Search or tail one portable managed-workstream ledger.
 pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
     let i18n = &config.i18n;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let path = format!("/workstream/{}/events", args.workstream_id);
     let limit = args.limit.to_string();
     let mut events: Vec<WorkstreamEvent> = get_json(

@@ -8181,6 +8181,7 @@ impl ServerHandler for AiMemoryServer {
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         // rmcp moves params._meta into RequestContext before dispatch.
         attach_native_session(&mut context.extensions, &context.meta);
+        let request = self.fill_launch_scope_on_pointer_miss(request, &context);
         self.record_client_activity(&request.name, &context);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
@@ -8217,6 +8218,64 @@ impl ServerHandler for AiMemoryServer {
                 restricted_schema_tool_list(tools, dialect),
             ))
         }
+    }
+}
+
+impl AiMemoryServer {
+    /// Fill a session-aware bridge's launch-directory scope into an unscoped
+    /// call when the caller's own keyed active-project pointer does not
+    /// resolve (#2005; see [`crate::launch_scope`]). A pointer the hooks
+    /// published for this session always wins, and so does the shared slot
+    /// of a `single`-mode or hook-less install, so a call the pointer routes
+    /// today is never re-routed. The filled scope is an ordinary explicit
+    /// argument: the tool resolves and authorizes it as if the client had
+    /// sent it, which the client could always do.
+    fn fill_launch_scope_on_pointer_miss(
+        &self,
+        mut request: rmcp::model::CallToolRequestParams,
+        context: &rmcp::service::RequestContext<RoleServer>,
+    ) -> rmcp::model::CallToolRequestParams {
+        use crate::launch_scope::{
+            FALLBACK_PROJECT_HEADER, FALLBACK_WORKSPACE_HEADER, decode_header_value, fill,
+            takes_workspace_and_project,
+        };
+        let Some(parts) = context.extensions.get::<http::request::Parts>() else {
+            return request;
+        };
+        let hint = |name| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(decode_header_value)
+        };
+        let (Some(workspace), Some(project)) = (
+            hint(FALLBACK_WORKSPACE_HEADER),
+            hint(FALLBACK_PROJECT_HEADER),
+        ) else {
+            return request;
+        };
+        let actor = Self::actor_key_from_parts(Some(parts));
+        if actor.session_id.is_none() {
+            return request;
+        }
+        match self.active_project.read_pointer(&actor) {
+            ai_memory_core::ReadPointer::Session(..)
+            | ai_memory_core::ReadPointer::SharedSlot(..) => return request,
+            ai_memory_core::ReadPointer::StartupSeed(..)
+            | ai_memory_core::ReadPointer::Mismatch
+            | ai_memory_core::ReadPointer::Unset => {}
+        }
+        if !self
+            .tool_router
+            .get(&request.name)
+            .is_some_and(takes_workspace_and_project)
+        {
+            return request;
+        }
+        let arguments = request.arguments.take().unwrap_or_default();
+        request.arguments = Some(fill(arguments, &workspace, &project));
+        request
     }
 }
 

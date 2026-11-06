@@ -71,6 +71,39 @@ version in [`docs/changelog/`](docs/changelog/):
   `sessions/<id>.md` page, where opt-in SessionEnd LLM consolidation writes the
   session's open items after the template handoff was created (#2012).
 
+- `ai-memory upgrade` no longer rewrites the OpenCode 1 plugin after OpenCode
+  itself moved to 2.x. It probes the installed OpenCode first, so on 2.x it
+  writes `ai-memory-opencode2.ts` and removes the old `ai-memory.ts` that
+  OpenCode 2 refuses to load ("Plugin must export a default definition with an
+  id and an effect or setup function") (#1887).
+
+- After `/resume` or `/clear` in Claude Code, unscoped `memory_*` calls
+  through the session-aware `mcp-bridge` no longer fall back to
+  `default/scratch` (reads) or refuse with "the active-project pointer does
+  not match this caller" (writes). The bridge keeps its launch-time session
+  id, so its pointer lookup missed. It now sends its launch directory's
+  project in two headers, and the server uses that project only when the
+  session's own pointer does not resolve. A pointer the hooks published still
+  wins, the project is authorized like an explicit scope, and a directory
+  that resolves to no project keeps the old behaviour (#2005).
+
+- Commands that work on the checkout they run in (`run`, `resume`,
+  `continue`, `workstreams`, `doctor`, `search`, `read-page`, `write-page`,
+  `handoffs`, `message` and the other project-scoped commands) now reach the
+  server that the nearest `.ai-memory.toml` selects with `server = "<name>"`,
+  with that profile's stored token, the same way hooks route capture. Before,
+  they used the configured server and fell back to `127.0.0.1`. A profile
+  that does not resolve fails the command with the hook's reason instead of
+  falling back. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
+  profile-routed checkout because the jailed run cannot read the profile's
+  token (#2016).
+
+- A section that `memory_patch_page` adds now gets a blank line before and
+  after its heading, so the page no longer reads as one run-on block and
+  passes Markdown linters (MD022). The docs now say that an `end_of_page`
+  append means the end of the page that was read, so it lands before a
+  section the same batch adds (#2015).
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is

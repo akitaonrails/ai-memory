@@ -75,7 +75,7 @@ pub(crate) async fn finalize(
     let agent = args.agent;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let sessions = fetch_open_sessions(
         &endpoint,
         &workspace,

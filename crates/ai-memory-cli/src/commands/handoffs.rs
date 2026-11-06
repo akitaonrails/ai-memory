@@ -42,7 +42,7 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     let i18n = &config.i18n;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
 
     if args.expire_all {
         return expire(&endpoint, i18n, &workspace, &project, &args).await;

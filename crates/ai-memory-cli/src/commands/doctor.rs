@@ -614,7 +614,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     let home = super::run::native_home(config)
         .context(i18n.text("cli-backfill-locating-the-local-harness-session-stores"))?;
 
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let ep = ServerEndpoint::for_checkout(config).await?;
     let project_coordinate = Some(
         project_coordinate_report(
             &ep,
