@@ -107,6 +107,14 @@ several hooks before all responses appear. Large-context, long-output and
 above-average signals are investigation hints, not confirmed failures or
 monetary costs. See [dashboard usage](usage.md#investigate-token-usage-in-the-dashboard).
 
+The agent's Sessions table shows a harness name beside the short ID when available.
+At the end of a turn the native Codex hook checks the last 64 KiB of its session
+index for that thread's latest name. Other adapters can send
+`"_ai_memory_session_name": {"name": "Fix webhook retries", "updated_at": "2026-01-02T12:00:00Z"}`
+on an existing event. Use the name's original RFC 3339 timestamp. An omitted
+name or an older revision leaves the stored label alone. If the session moves
+into another project or workspace, its previous scope's label is cleared.
+
 ## Themes and responsive navigation
 
 Choose "Light", "Dark" or "System" in the header. The browser saves your

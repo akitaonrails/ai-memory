@@ -5163,6 +5163,11 @@ async fn process_authorized(
         env.project_source,
         true,
     );
+    let display_name = env
+        .session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .and_then(|_| crate::session_name::from_marker(&env.raw, &state.sanitizer));
     let caller = actor.as_ref().map(IdentityKey::storage_key);
     let mut attempts = 0;
     // Keep the successful keyed-ingest gate until every downstream effect has
@@ -5206,12 +5211,13 @@ async fn process_authorized(
         };
         let result = state
             .writer
-            .admit_hook_session_event(
+            .admit_hook_session_event_with_name(
                 new_session,
                 sanitized,
                 owner_filter.clone(),
                 ingest_key.clone(),
                 moved_from_cwd.clone(),
+                display_name.clone(),
             )
             .await;
         match result {
@@ -25838,12 +25844,14 @@ pub(crate) mod tests {
             },
             serde_json::json!({
                 "session_id": "native-metadata", "cwd": "/repo",
+                "_ai_memory_session_name": {"name":"Private", "updated_at":"2025-01-01T00:00:00Z"},
                 "tool_family": "file", "tool_name": "file", "tool_call_id": "safe-ID.1",
                 "_ai_memory_capture": capture_protocol("metadata-only", "invalid", "file", 1, "extracted"),
             }),
         );
         let env = inspect_capture_envelope(env).unwrap();
         assert_eq!(env.raw["session_id"], "native-metadata");
+        assert!(env.raw.get(crate::session_name::MARKER).is_none());
         assert_eq!(env.raw["cwd"], "/repo");
         assert_eq!(env.raw["tool_call_id"], "safe-ID.1");
         assert_eq!(

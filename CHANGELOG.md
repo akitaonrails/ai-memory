@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Showed the harness's session name beside its short ID in the agent dashboard.
+  Codex reports names and renames at the end of a turn (#1948).
+
 - `[maintenance] lint_llm_interval_secs` (default `0`, off) runs the LLM
   contradiction pass across every project on its own persisted cadence, with
   one `lint` provider call per project that has enough semantic pages. With no

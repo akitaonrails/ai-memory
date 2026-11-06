@@ -165,6 +165,60 @@ mod tests {
     use rusqlite::{Connection, params};
 
     #[test]
+    fn session_display_name_upgrade_preserves_existing_sessions_and_is_repeatable() {
+        let version = migrations::runner()
+            .get_migrations()
+            .iter()
+            .find(|migration| migration.name() == "session_display_name")
+            .map(refinery::Migration::version)
+            .expect("the session_display_name migration is embedded");
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, version - 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO workspaces(id,name,created_at) VALUES(zeroblob(16),'team',1);
+             INSERT INTO projects(id,workspace_id,name,created_at) VALUES(zeroblob(16),zeroblob(16),'app',1);
+             INSERT INTO sessions(id,workspace_id,project_id,agent_kind,started_at,cwd)
+                 VALUES(zeroblob(16),zeroblob(16),zeroblob(16),'codex',123,'/app');",
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+        run(&mut conn).unwrap();
+
+        let row: (String, i64, String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT agent_kind,started_at,cwd,display_name,display_name_updated_ns FROM sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("codex".into(), 123, "/app".into(), None, None));
+        conn.execute(
+            "UPDATE sessions SET display_name = 'Existing session', display_name_updated_ns = 456",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let label: (String, i64) = conn
+            .query_row(
+                "SELECT display_name,display_name_updated_ns FROM sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(label, ("Existing session".into(), 456));
+        assert_eq!(
+            applied_versions(&conn)
+                .iter()
+                .filter(|&&applied| applied == i64::from(version))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn v94_preserves_old_response_rows_and_cascades_context() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();

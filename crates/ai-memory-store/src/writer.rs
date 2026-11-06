@@ -14,7 +14,7 @@ use ai_memory_core::{
     AgentKind, AgentMessage, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey,
     ManagedRunId, MessageClaim, MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage,
     NewSession, NewSessionUsage, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
-    Sanitized, SessionId, UserId, UserRole, WorkspaceId,
+    Sanitized, SessionDisplayName, SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -276,6 +276,7 @@ pub(crate) enum WriteCmd {
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
+        display_name: Option<SessionDisplayName>,
         reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
     },
     EndAdmittedSession {
@@ -1743,6 +1744,27 @@ impl WriterHandle {
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
     ) -> StoreResult<HookSessionAdmission> {
+        self.admit_hook_session_event_with_name(
+            session,
+            obs,
+            owner_filter,
+            ingest_key,
+            moved_from_cwd,
+            None,
+        )
+        .await
+    }
+
+    /// Admit an event and apply its optional harness rename in the same transaction.
+    pub async fn admit_hook_session_event_with_name(
+        &self,
+        session: NewSession,
+        obs: Sanitized<NewObservation>,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
+        display_name: Option<SessionDisplayName>,
+    ) -> StoreResult<HookSessionAdmission> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AdmitHookSessionEvent {
             session,
@@ -1750,6 +1772,7 @@ impl WriterHandle {
             owner_filter,
             ingest_key,
             moved_from_cwd,
+            display_name,
             reply: tx,
         })
         .await?;
@@ -4436,6 +4459,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 owner_filter,
                 ingest_key,
                 moved_from_cwd,
+                display_name,
                 reply,
             } => {
                 let result = ops::admit_hook_session_event(
@@ -4445,6 +4469,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &owner_filter,
                     ingest_key.as_deref(),
                     moved_from_cwd.as_deref(),
+                    display_name.as_ref(),
                 );
                 send_or_warn(reply, result, "admit_hook_session_event");
             }

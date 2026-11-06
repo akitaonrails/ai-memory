@@ -3415,6 +3415,7 @@ pub fn admit_hook_session_event(
     owner_filter: &OwnerFilter,
     ingest_key: Option<&str>,
     moved_from_cwd: Option<&str>,
+    display_name: Option<&ai_memory_core::SessionDisplayName>,
 ) -> StoreResult<HookSessionAdmission> {
     if obs.session_id != session.id
         || obs.workspace_id != session.workspace_id
@@ -3640,6 +3641,24 @@ pub fn admit_hook_session_event(
                 session.project_id.as_bytes(),
                 target.to_string_lossy(),
                 session.id.as_bytes()
+            ],
+        )?;
+    }
+    if let Some(label) = display_name
+        && matches!(ingest, IngestObservationOutcome::Inserted(_))
+    {
+        // An observation can follow cwd into another project. Only the owning
+        // scope may rename this row, even when a foreign observation is valid.
+        tx.execute(
+            "UPDATE sessions SET display_name = ?1, display_name_updated_ns = ?2 \
+             WHERE id = ?3 AND workspace_id = ?4 AND project_id = ?5 \
+             AND (display_name_updated_ns IS NULL OR display_name_updated_ns < ?2)",
+            params![
+                label.name,
+                label.updated_ns,
+                session.id.as_bytes(),
+                session.workspace_id.as_bytes(),
+                session.project_id.as_bytes()
             ],
         )?;
     }
@@ -11845,6 +11864,7 @@ pub(crate) mod tests {
                     &owner,
                     None,
                     None,
+                    None,
                 )
                 .unwrap(),
             )
@@ -12866,6 +12886,7 @@ pub(crate) mod tests {
                 session,
                 &hook_observation(session),
                 &OwnerFilter::Any,
+                None,
                 None,
                 None,
             )
@@ -19810,6 +19831,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User(bob.into()),
                 Some("fresh-key"),
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -19828,6 +19850,7 @@ pub(crate) mod tests {
                 &bob_event,
                 &OwnerFilter::User(alice.into()),
                 Some("fresh-key"),
+                None,
                 None,
             )
             .unwrap(),
@@ -19862,6 +19885,7 @@ pub(crate) mod tests {
                 &moved,
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -19966,7 +19990,15 @@ pub(crate) mod tests {
             let owner = OwnerFilter::User(owner.into());
             assert!(
                 matches!(
-                    admit_hook_session_event(&mut conn, &moved, &start, &owner, key, Some(from)),
+                    admit_hook_session_event(
+                        &mut conn,
+                        &moved,
+                        &start,
+                        &owner,
+                        key,
+                        Some(from),
+                        None
+                    ),
                     Ok(HookSessionAdmission::Observation {
                         ingest: IngestObservationOutcome::Inserted(_),
                         ..
@@ -19994,6 +20026,66 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn session_display_name_resets_only_on_a_scope_transfer() {
+        let (_tmp, mut conn, ws, source) = fresh_db();
+        let target = get_or_create_project(&mut conn, &ws, "beta", None).unwrap();
+        let id = SessionId::new();
+        let event = |conn: &mut Connection, project, cwd: &str, from, key: &str, name| {
+            let mut session = hook_session(id, ws, project, Some("user:alice"));
+            session.agent_kind = AgentKind::OpenCode;
+            session.cwd = Some(cwd.into());
+            let mut start = hook_observation(&session);
+            start.kind = ObservationKind::SessionStart;
+            admit_hook_session_event(
+                conn,
+                &session,
+                &start,
+                &OwnerFilter::User("user:alice".into()),
+                Some(key),
+                from,
+                name,
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT display_name, display_name_updated_ns FROM sessions WHERE id = ?1",
+                [id.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let a = ai_memory_core::SessionDisplayName {
+            name: "Source only".into(),
+            updated_ns: 20,
+        };
+        let b = ai_memory_core::SessionDisplayName {
+            name: "Target only".into(),
+            updated_ns: 10,
+        };
+        event(&mut conn, source, "/alpha", None, "start", Some(&a));
+        assert_eq!(
+            event(&mut conn, source, "/nested", Some("/alpha"), "within", None),
+            (Some(a.name.clone()), Some(20))
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", Some("/nested"), "move", None),
+            (None, None)
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", None, "rename", Some(&b)),
+            (Some(b.name.clone()), Some(10))
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", Some("/nested"), "move", None),
+            (Some(b.name.clone()), Some(10))
+        );
+    }
+
     // Identity still wins over a move: a foreign operator's move is refused
     // before anything is written, and a completed move replayed after the
     // session moved back never rebinds it to the stale target.
@@ -20017,7 +20109,8 @@ pub(crate) mod tests {
                 &start,
                 &OwnerFilter::User("user:bob".into()),
                 Some("move"),
-                Some("/repo/alpha")
+                Some("/repo/alpha"),
+                None
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20034,6 +20127,7 @@ pub(crate) mod tests {
             &owner,
             Some("move"),
             Some("/repo/alpha"),
+            None,
         )
         .unwrap();
         complete_observation_ingest(&mut conn, &target, "move").unwrap();
@@ -20046,6 +20140,7 @@ pub(crate) mod tests {
             &owner,
             Some("return"),
             Some("/repo/beta"),
+            None,
         )
         .unwrap();
         complete_observation_ingest(&mut conn, &proj, "return").unwrap();
@@ -20056,7 +20151,8 @@ pub(crate) mod tests {
                 &start,
                 &owner,
                 Some("move"),
-                Some("/repo/alpha")
+                Some("/repo/alpha"),
+                None
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -20097,6 +20193,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:bob".into()),
                 None,
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20110,6 +20207,7 @@ pub(crate) mod tests {
                 &other_agent,
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             ),
@@ -20143,6 +20241,7 @@ pub(crate) mod tests {
                 &moved,
                 &end,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -20266,7 +20365,7 @@ pub(crate) mod tests {
             let end = session_end_observation(&drifted);
 
             let result =
-                admit_hook_session_event(&mut conn, &drifted, &end, owner, Some("end"), None);
+                admit_hook_session_event(&mut conn, &drifted, &end, owner, Some("end"), None, None);
             let ended: Option<i64> = conn
                 .query_row(
                     "SELECT ended_at FROM sessions WHERE id = ?1",
@@ -20333,7 +20432,7 @@ pub(crate) mod tests {
         drifted.agent_kind = AgentKind::ClaudeCode;
         let end = session_end_observation(&drifted);
         assert!(matches!(
-            admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None),
+            admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None, None),
             Err(StoreError::SessionAgentMismatch {
                 bound: AgentKind::OpenCode
             })
@@ -20361,6 +20460,7 @@ pub(crate) mod tests {
                     &hook_observation(&session),
                     &OwnerFilter::User(owner.into()),
                     Some(key),
+                    None,
                     None,
                 )
             })
@@ -20399,6 +20499,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("tuple-key"),
                 None,
+                None,
             ),
             Err(StoreError::InvalidState(_))
         ));
@@ -20423,6 +20524,7 @@ pub(crate) mod tests {
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
                 Some("agent-key"),
+                None,
                 None,
             ),
             Err(StoreError::SessionAgentMismatch {
@@ -20451,6 +20553,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:bob".into()),
                 Some("denied-owner"),
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20465,6 +20568,7 @@ pub(crate) mod tests {
             &shared,
             &hook_observation(&shared),
             &OwnerFilter::User("user:alice".into()),
+            None,
             None,
             None,
         )
@@ -20486,6 +20590,7 @@ pub(crate) mod tests {
                 &hook_observation(&shared),
                 &OwnerFilter::User("user:bob".into()),
                 Some("shared-bob"),
+                None,
                 None,
             )
             .unwrap(),
@@ -20520,6 +20625,7 @@ pub(crate) mod tests {
                 &session_end_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
                 Some(key),
+                None,
                 None,
             )
             .unwrap();
@@ -20560,6 +20666,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some(key),
                 None,
+                None,
             )
             .unwrap();
             match admission {
@@ -20589,6 +20696,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("missing-end"),
                 None,
+                None,
             )
             .unwrap(),
             HookSessionAdmission::InvalidMissingEnd
@@ -20617,6 +20725,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("ordinary-complete"),
                 None,
+                None,
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -20636,6 +20745,7 @@ pub(crate) mod tests {
                 &session,
                 &hook_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -20687,6 +20797,7 @@ pub(crate) mod tests {
                 &receiver,
                 &lifecycle_observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )

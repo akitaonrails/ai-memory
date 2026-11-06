@@ -111,6 +111,15 @@ impl std::str::FromStr for ObservationKind {
     }
 }
 
+/// A sanitized harness label and the native revision that supplied it.
+#[derive(Debug, Clone)]
+pub struct SessionDisplayName {
+    /// Text shown next to the stable session id.
+    pub name: String,
+    /// Unix nanoseconds of the harness's name update, independent of activity.
+    pub updated_ns: i64,
+}
+
 /// Input for inserting an observation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewObservation {
