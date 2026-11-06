@@ -9,7 +9,11 @@
   "credential_fields": [
     {"input": "{\"auth_mode\":\"static\",\"token\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"attempts\":0}", "secret": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "kept": ["attempts"]},
     {"input": "{\"stdout\":\"{\\\"auth_mode\\\":\\\"static\\\",\\\"token\\\":\\\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\\",\\\"attempts\\\":0}\\n\"}", "secret": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "kept": ["attempts"]},
-    {"input": "token = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"", "secret": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+    {"input": "token = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"", "secret": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+    {"input": "cfg foo_sk-abcdefghijklmnopqrstuvwxyz0123 done", "secret": "abcdefghijklmnop", "kept": ["cfg foo_", " done"]},
+    {"input": "日本sk-abcdefghijklmnopqrstuvwxyz0123", "secret": "abcdefghijklmnop", "kept": ["日本"]},
+    {"input": "?api_key%3Dsk-abcdefghijklmnopqrstuvwxyz0123", "secret": "abcdefghijklmnop", "kept": ["?api_key%3D"]},
+    {"input": "v9sk-abcdefghijklmnopqrstuvwxyz0123", "secret": "abcdefghijklmnop", "kept": ["v9"]}
   ],
   "invisibles": [
     "\u200b",
@@ -85,6 +89,7 @@
     "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmQENBFakeFakeFakeFakeFakeFakeFake\n-----END PGP PUBLIC KEY BLOCK-----",
     "The file starts with -----BEGIN OPENSSH PRIVATE KEY----- and that is expected.",
     "-----BEGIN RSA PRIVATE KEY-----\nThat header marks a PKCS#1 key.",
-    "const HEADER: &str = \"-----BEGIN RSA PRIVATE KEY-----\";\nparseHeaderLineFromInput(x)"
+    "const HEADER: &str = \"-----BEGIN RSA PRIVATE KEY-----\";\nparseHeaderLineFromInput(x)",
+    "background-task-indexing-after-return_disk-reclaimable-pct"
   ]
 }

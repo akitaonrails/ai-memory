@@ -21,9 +21,11 @@ version in [`docs/changelog/`](docs/changelog/):
   irreversible, and it turned page paths, branch names and cross-references
   into dead links. A match no longer starts right after an ASCII letter, so
   a key after punctuation, a space, a digit, `_`, a CJK character or a
-  percent escape (`%3D`) is still redacted. The Stripe `sk_live_`/`rk_live_` rule had the
-  same flaw (`task_live_…`, `network_live_…`) and is anchored the same
-  way. (#2025)
+  percent escape (`%3D`) is still redacted. The Stripe `sk_live_`/`rk_live_`
+  rule had the same flaw (`task_live_…`, `network_live_…`) and is anchored
+  the same way. The scrub shared by the relay and importer companions now
+  uses the same anchor, so it also redacts a key glued to `_`, a digit, a
+  CJK character or a percent escape (#2025).
 
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
