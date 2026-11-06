@@ -478,7 +478,11 @@ so they reach the server your hooks capture to: `run`, `resume`, `continue`,
 `purge-project` and `purge-session`. They use the profile's
 URL and stored token, never the bearer from your config, and they fail
 closed with the same reason the hook reports when the profile does not
-resolve. `AI_MEMORY_SERVER_URL` in the environment still wins for one
+resolve. They match the profile's roots against the directory as your
+shell names it (`PWD`, when it is the same directory as the process's working
+directory), the way a harness reports it to the hooks, so a checkout reached
+through a symlink, or macOS's `/var` (really `/private/var`), routes the same
+for both. `AI_MEMORY_SERVER_URL` in the environment still wins for one
 invocation, and `AI_MEMORY_IGNORE_MARKER=1` skips the marker as it does for
 scope. Install-wide commands (`status`, `list-projects`, `backup`, `user`,
 `api-key`, `project access`, `setup` and the other admin commands) keep using
