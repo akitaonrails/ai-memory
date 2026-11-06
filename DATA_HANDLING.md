@@ -71,6 +71,11 @@ to turn on.
    that vendor's cloud under your existing login. With no provider
    configured, every one of these features either runs rule-based locally
    or stays off; see `docs/ARCHITECTURE.md` ("Zero-LLM default path").
+   Turning on `llm_request_metadata_headers` additionally sends, as
+   `openai-compat` request headers, the workload name and, when an
+   operation has exactly one, the workspace name, project name and
+   username it acts on: identifiers, never page content
+   ([`docs/llm-providers.md`](docs/llm-providers.md)).
 3. **Assistant/Stop capture** (`SECURITY.md`, "Assistant/Stop capture is
    opt-in and sanitized"). Persisting the coding assistant's final-turn
    text requires a double opt-in: `capture_assistant` on the server *and*

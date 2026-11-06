@@ -2830,6 +2830,39 @@ impl AiMemoryServer {
         format!("{ws_name}/{proj_name}")
     }
 
+    /// What an LLM call made for a request reads and whom it acts for, for
+    /// the opt-in request metadata headers: the caller's username, and the
+    /// scope only when the call reads exactly one. Unlike [`Self::scope_names`],
+    /// an unknown name stays unset rather than becoming a placeholder.
+    async fn llm_subject(
+        &self,
+        actor: &ai_memory_core::ActorContext,
+        scope: Option<(ai_memory_core::WorkspaceId, ai_memory_core::ProjectId)>,
+    ) -> ai_memory_llm::LlmSubject {
+        let (workspace, project) = match scope {
+            Some((ws, proj)) => (
+                self.reader.workspace_name_by_id(ws).await.ok().flatten(),
+                self.reader
+                    .project_name_by_id(ws, proj)
+                    .await
+                    .ok()
+                    .flatten(),
+            ),
+            None => (None, None),
+        };
+        let user = actor
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|user| !user.is_empty())
+            .map(str::to_owned);
+        ai_memory_llm::LlmSubject {
+            workspace,
+            project,
+            user,
+        }
+    }
+
     /// Workspace and project names for a resolved scope, with the same
     /// placeholders as [`Self::scope_label`] when a lookup fails.
     async fn scope_names(
@@ -3717,8 +3750,14 @@ impl AiMemoryServer {
                         match ai_memory_llm::complete_structured_with_operation_id::<AnswerSynthesis>(
                         llm.as_ref(),
                         request,
+                        // Evidence can span projects and the `_global`
+                        // scope, so only the caller is named.
                         ai_memory_llm::LlmOperationId::for_workload(
                             ai_memory_llm::LlmWorkload::QueryAnswer,
+                        )
+                        .with_subject(
+                            self.llm_subject(&crate::actor::actor_from_parts(&parts), None)
+                                .await,
                         ),
                     )
                     .await
@@ -7407,7 +7446,7 @@ impl AiMemoryServer {
         // Admission is asked at the crossing point (the recipient scope): a
         // per-operator webhook can refuse prompt-derived text entering another
         // project.
-        let admission = self
+        let mut admission = self
             .authorize_operation(
                 to_ws,
                 to_proj,
@@ -7415,11 +7454,16 @@ impl AiMemoryServer {
                 &parts,
             )
             .await?;
+        let queued_to_agent = message.to_agent;
         let id = self
             .writer
             .insert_message(message)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let (Some(wiki), Some(ctx)) = (self.wiki.as_ref(), admission.as_mut()) {
+            wiki.describe_queued_message(ctx, id, queued_to_agent, from_ws, from_proj)
+                .await;
+        }
         self.notify_operation_observers(admission.as_ref());
         ok_json(&serde_json::json!({
             "message_id": id.to_string(),
@@ -7903,7 +7947,8 @@ impl AiMemoryServer {
                 request,
                 ai_memory_llm::LlmOperationId::for_workload(
                     ai_memory_llm::LlmWorkload::QueryAnswer,
-                ),
+                )
+                .with_subject(self.llm_subject(&actor, Some((ws, proj))).await),
             )
             .await
         {

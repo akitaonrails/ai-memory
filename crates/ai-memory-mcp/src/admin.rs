@@ -3715,10 +3715,15 @@ async fn handle_send_message(
             );
         }
     };
+    let queued_to_agent = message.to_agent;
     match state.writer.insert_message(message).await {
         Ok(id) => {
-            if let Some(ctx) = admission.as_ref() {
-                state.wiki.notify_operation_observers(ctx);
+            if let Some(mut ctx) = admission {
+                state
+                    .wiki
+                    .describe_queued_message(&mut ctx, id, queued_to_agent, from_ws, from_proj)
+                    .await;
+                state.wiki.notify_operation_observers(&ctx);
             }
             (
                 StatusCode::OK,
@@ -10227,6 +10232,8 @@ mod tests {
             },
             events: vec![AdmissionOp::MessageSend],
             blocking: reject,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -10281,6 +10288,36 @@ mod tests {
         assert_eq!(payload["ctx"]["actor"]["user"], "alice");
         assert_eq!(
             payload["page"]["body"], "",
+            "observer must not copy message text"
+        );
+        release.notify_one();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_message_send_webhook_ctx_names_the_message() {
+        let (_tmp, _store, router, _ws, _recipient, mut rx, release, server) =
+            message_send_fixture(false).await;
+        let response = router.oneshot(message_send_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let (payload, _) = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = &payload["ctx"];
+        assert_eq!(
+            ctx["message_id"], sent["message_id"],
+            "the id the send returned"
+        );
+        assert_eq!(ctx["from_workspace"], "default");
+        assert_eq!(ctx["from_project"], "sender");
+        assert!(ctx["to_agent"].is_null(), "admin sends shared mail: {ctx}");
+        assert!(
+            !payload.to_string().contains("Synthetic result"),
             "observer must not copy message text"
         );
         release.notify_one();
@@ -14152,6 +14189,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -14265,6 +14304,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -14371,6 +14412,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -14483,6 +14526,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())

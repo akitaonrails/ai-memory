@@ -13,12 +13,34 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added an opt-in, development-only Raw-RAG retrieval baseline to
+  `ai-memory-eval`: overlapping source windows, local dense retrieval and
+  cross-encoder reranking, with pinned models and per-window provenance.
+  The shipped server, capture pipeline and retrieval defaults are unchanged (#2017).
 - Added Pi session token totals from saved usage at agent stops and shutdown.
   Reloads, resumes and repeated reports preserve cumulative input, output and
   cache counts; missing usage stays unknown. Totals follow Pi's session history,
   including copied fork history. Per-response Pi ledger records remain
   unsupported; update the server and reinstall the Pi extension to enable
   session reporting (#1984, #1985).
+- `llm_request_metadata_headers` (`AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`),
+  off by default, makes the `openai-compat` provider tell a gateway what each
+  call is for: every chat attempt carries `x-ai-memory-workload`
+  (`consolidation`, `profile`, `dream`, `lint`, ...), and
+  `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when
+  the operation reads one scope or acts for one user, such as the session
+  owner in consolidation or the operator of a private profile. A value that is
+  not known as one name is left out, never guessed, and page content is never
+  sent. Other providers never send these headers, and `AI_MEMORY_LLM_HEADERS`
+  now refuses the four names for `openai-compat` at startup (#2001, #2004).
+- Added `projects` and `headers` to `[[admission_webhooks]]`, so a bot can be
+  woken straight from an observer webhook with no relay. `projects` limits a
+  webhook to `workspace/project` entries; `headers` sends request headers whose
+  values the server reads once from files at startup and never logs. A
+  `message_send` webhook now also receives the message id, the addressed
+  harness and the sending project (never the subject or body), on the MCP,
+  admin, `/web` composer and `/web` edit paths, so the bot can pop exactly the
+  message that woke it. Configs without the new keys behave as before (#2008, #2009).
 
 ### Changed
 

@@ -762,12 +762,13 @@ impl LlmProvider for HealthRecordingLlmProvider {
     ) -> LlmResult<ChatResponse> {
         let estimated_input = estimate_request_tokens(&request);
         let started = Instant::now();
+        let workload = operation_id.workload();
         let result = self
             .inner
             .complete_with_operation_id(request, operation_id)
             .await;
         self.record(
-            operation_id.workload(),
+            workload,
             started,
             estimated_input,
             &result,
@@ -804,12 +805,13 @@ impl LlmProvider for HealthRecordingLlmProvider {
     ) -> LlmResult<serde_json::Value> {
         let estimated_input = estimate_structured_input_tokens(&request, &schema);
         let started = Instant::now();
+        let workload = operation_id.workload();
         let result = self
             .inner
             .complete_structured_raw_with_operation_id(request, schema, operation_id)
             .await;
         self.record(
-            operation_id.workload(),
+            workload,
             started,
             estimated_input,
             &result,
@@ -1206,18 +1208,18 @@ mod tests {
         let llm = health.wrap_llm_provider(inner.clone(), "openai", "gpt-test", None);
         let id = LlmOperationId::for_workload(LlmWorkload::Consolidation);
 
-        llm.complete_with_operation_id(ChatRequest::user_prompt("ping"), id)
+        llm.complete_with_operation_id(ChatRequest::user_prompt("ping"), id.clone())
             .await
             .unwrap();
         llm.complete_structured_raw_with_operation_id(
             ChatRequest::user_prompt("ping"),
             serde_json::json!({}),
-            id,
+            id.clone(),
         )
         .await
         .unwrap();
 
-        assert_eq!(*inner.seen.lock().unwrap(), vec![id, id]);
+        assert_eq!(*inner.seen.lock().unwrap(), vec![id.clone(), id.clone()]);
         let snapshot = health.snapshot();
         assert_eq!(snapshot.llm.status, ProviderHealthStatus::Ok);
         let consolidation = snapshot

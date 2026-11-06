@@ -160,7 +160,7 @@ pub use response::{provider_error, provider_error_body};
 pub use routes::LlmProviders;
 pub use stored_token::StoredOAuthToken;
 pub use types::{
-    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, LlmWorkload,
+    ChatMessage, ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, LlmSubject, LlmWorkload,
     ReasoningEffort, Role, Usage,
 };
 

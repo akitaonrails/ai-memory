@@ -569,6 +569,7 @@ impl From<ResolvedConfig> for ProviderConfig {
             // the default user agent, which is what a gateway needs to
             // attribute harness traffic.
             extra_headers: ai_memory_llm::ExtraHeaders::default(),
+            request_metadata_headers: false,
         }
     }
 }

@@ -404,9 +404,16 @@ impl Wiki {
                 Vec::new(),
             )
             .await?;
+        let (to_agent, from_ws, from_proj) = (
+            message.to_agent,
+            message.from_workspace_id,
+            message.from_project_id,
+        );
         let id = self.writer.insert_message(message).await?;
-        if let Some(ctx) = admission.as_ref() {
-            self.notify_operation_observers(ctx);
+        if let Some(mut ctx) = admission {
+            self.describe_queued_message(&mut ctx, id, to_agent, from_ws, from_proj)
+                .await;
+            self.notify_operation_observers(&ctx);
         }
         Ok(id)
     }
@@ -470,10 +477,56 @@ impl Wiki {
             .writer
             .finish_message_edit(to_workspace_id, to_project_id, id, Some((subject, body)))
             .await?;
-        if saved && let Some(ctx) = admission.as_ref() {
-            self.notify_operation_observers(ctx);
+        if saved && let Some(mut ctx) = admission {
+            ctx.message_id = Some(id.to_string());
+            // The requeued message keeps its sender and harness; read them back
+            // so the observer hears the same fields a first send carries.
+            if let Some(reader) = &self.store_reader
+                && let Ok(Some(message)) = reader
+                    .message_in_mailbox(to_workspace_id, to_project_id, id)
+                    .await
+            {
+                self.describe_queued_message(
+                    &mut ctx,
+                    id,
+                    message.to_agent,
+                    message.origin.from_workspace_id,
+                    message.origin.from_project_id,
+                )
+                .await;
+            }
+            self.notify_operation_observers(&ctx);
         }
         Ok(saved)
+    }
+
+    /// Tell `message_send` observers which message was queued: its id, the
+    /// harness it is addressed to and the sender's names. Never its text, which
+    /// reaches an agent only through a deliberate pop. Every path that queues a
+    /// message calls this between the commit and
+    /// [`Self::notify_operation_observers`], so a bot woken by the webhook gets
+    /// the same fields whichever surface sent the mail.
+    pub async fn describe_queued_message(
+        &self,
+        ctx: &mut AdmissionContext,
+        id: ai_memory_core::MessageId,
+        to_agent: Option<ai_memory_core::AgentKind>,
+        from_workspace_id: WorkspaceId,
+        from_project_id: ProjectId,
+    ) {
+        ctx.message_id = Some(id.to_string());
+        ctx.to_agent = to_agent;
+        if let Some(reader) = &self.store_reader {
+            if let Ok(Some(name)) = reader.workspace_name_by_id(from_workspace_id).await {
+                ctx.from_workspace = Some(name);
+            }
+            if let Ok(Some(name)) = reader
+                .project_name_by_id(from_workspace_id, from_project_id)
+                .await
+            {
+                ctx.from_project = Some(name);
+            }
+        }
     }
 
     /// Attach an embedder. When set, every page-writing path (`write_page`,
@@ -5325,6 +5378,8 @@ mod tests {
                 failure_policy: FailurePolicy::Ignore,
                 events: vec![AdmissionOp::WritePage, AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6485,6 +6540,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::WritePage],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6563,6 +6620,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::WritePage],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6720,6 +6779,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6874,6 +6935,8 @@ mod tests {
                 failure_policy: FailurePolicy::Reject,
                 events: vec![AdmissionOp::Delete],
                 blocking: true,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -6946,6 +7009,8 @@ mod tests {
                 failure_policy: FailurePolicy::Ignore,
                 events: vec![AdmissionOp::Delete],
                 blocking: false,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
@@ -7734,6 +7799,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::Consolidate],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -7823,6 +7890,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::Consolidate],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -8030,6 +8099,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
 

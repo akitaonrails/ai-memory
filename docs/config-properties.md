@@ -37,6 +37,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `llm_compat_disable_thinking` | `false` | `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` | Send `chat_template_kwargs: {"enable_thinking": false}` on every `openai-compat` chat request. |
 | `llm_compat_stream` | unset | `AI_MEMORY_LLM_COMPAT_STREAM` | Set `false` to request non-streaming JSON from `openai-compat`; `true` is rejected because SSE is unsupported. |
 | `llm_timeout_secs` | `300` (`ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS`) | `AI_MEMORY_LLM_TIMEOUT_SECS` | Per-request timeout for chat completions and the Copilot token exchange. The openai-oauth token refresh keeps its own ceiling. |
+| `llm_request_metadata_headers` | `false` | `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` | Add `x-ai-memory-workload` (`consolidation`, `profile`, `dream`, `lint`, ...) to every `openai-compat` chat attempt, plus `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when the operation reads one scope or acts for one user. Values are names, never page content. Other providers never send them. |
 | `bootstrap_max_concurrent` | `1` | `AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT` | How many live `bootstrap` runs may call the LLM at once across projects. Runs for the same project always wait for each other. Must be at least 1. |
 | `llm_reasoning_effort` | unset (the model default applies) | `AI_MEMORY_LLM_REASONING_EFFORT` | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` or `persistent`. |
 | `llm_headers` | `[]` | `AI_MEMORY_LLM_HEADERS` | Extra HTTP headers on every LLM chat request, as `Name: Value` or `Name=Value` entries. |
@@ -100,6 +101,8 @@ An array of tables, defined by `WebhookConfig` in `ai-memory-wiki`. The default 
 | `failure_policy` | `ignore` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `ignore` logs a warning and continues. `reject` aborts the write. |
 | `events` | required | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | Operations the webhook subscribes to. An empty list means it never fires. |
 | `blocking` | `true` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `true` runs inside the write path and can change the page. `false` fires after the page lands and ignores the response. |
+| `projects` | `[]` (every project) | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `workspace/project` entries the webhook is told about. A workspace-wide event matches by workspace. A malformed entry stops the server. |
+| `headers` | `[]` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | Extra request headers, each `{ name, value_file }`. The file is read once at server start (relative paths resolve against the data dir) and its value is never logged. Reserved names (`Content-Type`, `Content-Length`, `Host`, `X-Memory-Op`) and a missing or empty file stop the server. |
 
 `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` takes a JSON array of these entries and replaces the list from the file. Valid `events` are `write_page`, `consolidate`, `delete`, `delete_event_ledger`, `purge_project`, `purge_session`, `purge_workspace`, `move_project`, `move_session`, `handoff_begin`, `handoff_accept`, `handoff_cancel`, `message_send`, `message_pop` and `message_cancel`.
 

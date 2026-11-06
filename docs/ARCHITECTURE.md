@@ -1645,6 +1645,12 @@ AI_MEMORY_LLM_COMPAT_DISABLE_THINKING  openai-compat only, false by default; tru
 AI_MEMORY_LLM_COMPAT_STREAM optional false to request non-streaming openai-compat JSON;
                            omitted by default; true is rejected because SSE is unsupported
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
+AI_MEMORY_LLM_REQUEST_METADATA_HEADERS  openai-compat only, false by default; true adds
+                           x-ai-memory-workload to every chat attempt, plus
+                           x-ai-memory-workspace / x-ai-memory-project when the
+                           operation reads one scope and x-ai-memory-user when it
+                           acts for one username. Unknown values are omitted,
+                           never guessed; values are names, never page content
 AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT  bootstrap runs in flight at once
                            (`bootstrap_max_concurrent`); 1 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
@@ -1663,9 +1669,10 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            content-type, x-api-key, x-goog-api-key,
                            anthropic-version, anthropic-beta, openai-beta,
                            host, content-length) are refused at startup.
-                           `x-request-id` is additionally refused at
+                           `x-request-id` and the `x-ai-memory-*` request
+                           metadata names are additionally refused at
                            initialization for the `openai-compat` provider,
-                           which sends the operation's request id itself.
+                           which sends them itself.
                            Values are never logged. A header value cannot
                            contain a comma through the env var — use
                            `llm_headers = [...]` in config.toml for that.
