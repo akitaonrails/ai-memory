@@ -2830,8 +2830,6 @@ impl AiMemoryServer {
         format!("{ws_name}/{proj_name}")
     }
 
-    /// Workspace and project names for a resolved scope, with the same
-    /// placeholders as [`Self::scope_label`] when a lookup fails.
     /// What an LLM call made for a request reads and whom it acts for, for
     /// the opt-in request metadata headers: the caller's username, and the
     /// scope only when the call reads exactly one. Unlike [`Self::scope_names`],
@@ -2865,6 +2863,8 @@ impl AiMemoryServer {
         }
     }
 
+    /// Workspace and project names for a resolved scope, with the same
+    /// placeholders as [`Self::scope_label`] when a lookup fails.
     async fn scope_names(
         &self,
         ws: ai_memory_core::WorkspaceId,

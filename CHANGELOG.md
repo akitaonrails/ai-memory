@@ -19,6 +19,16 @@ version in [`docs/changelog/`](docs/changelog/):
   including copied fork history. Per-response Pi ledger records remain
   unsupported; update the server and reinstall the Pi extension to enable
   session reporting (#1984, #1985).
+- `llm_request_metadata_headers` (`AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`),
+  off by default, makes the `openai-compat` provider tell a gateway what each
+  call is for: every chat attempt carries `x-ai-memory-workload`
+  (`consolidation`, `profile`, `dream`, `lint`, ...), and
+  `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when
+  the operation reads one scope or acts for one user, such as the session
+  owner in consolidation or the operator of a private profile. A value that is
+  not known as one name is left out, never guessed, and page content is never
+  sent. Other providers never send these headers, and `AI_MEMORY_LLM_HEADERS`
+  now refuses the four names for `openai-compat` at startup (#2001, #2004).
 
 ### Changed
 
@@ -77,16 +87,6 @@ version in [`docs/changelog/`](docs/changelog/):
 - When a jailed session started from the checklist ends, ai-memory prints the
   `ai-memory run` line that repeats its choices, including the `--jail=` list,
   the folders and the harness (#1998).
-- `llm_request_metadata_headers` (`AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`),
-  off by default, makes the `openai-compat` provider tell a gateway what each
-  call is for: every chat attempt carries `x-ai-memory-workload`
-  (`consolidation`, `profile`, `dream`, `lint`, ...), and
-  `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when
-  the operation reads one scope or acts for one user, such as the session
-  owner in consolidation or the operator of a private profile. A value that is
-  not known as one name is left out, never guessed, and page content is never
-  sent. Other providers never send these headers, and `AI_MEMORY_LLM_HEADERS`
-  now refuses the four names for `openai-compat` at startup (#2001).
 
 ### Changed
 

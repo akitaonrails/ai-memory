@@ -68,7 +68,7 @@ to turn on.
    session observations and page text to the configured provider and
    receive generated pages and proposals back. The `codex`, `copilot`, and
    `cursor` provider options spawn the vendor's own CLI, which talks to
-   that vendor's    cloud under your existing login. With no provider
+   that vendor's cloud under your existing login. With no provider
    configured, every one of these features either runs rule-based locally
    or stays off; see `docs/ARCHITECTURE.md` ("Zero-LLM default path").
    Turning on `llm_request_metadata_headers` additionally sends, as
