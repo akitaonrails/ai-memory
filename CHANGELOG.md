@@ -19,8 +19,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `background-task-…`, and the captured text or wiki page kept
   `ta[REDACTED:api_key]` instead of the word. That corruption is
   irreversible, and it turned page paths, branch names and cross-references
-  into dead links. The rule now requires a word boundary before `sk-`; real
-  vendor keys start a token, so every delimited key is still redacted. (#2025)
+  into dead links. A match no longer starts right after an ASCII letter, so
+  a key after punctuation, a space, a digit, `_`, a CJK character or a
+  percent escape (`%3D`) is still redacted. The Stripe `sk_live_`/`rk_live_` rule had the
+  same flaw (`task_live_…`, `network_live_…`) and is anchored the same
+  way. (#2025)
 
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper

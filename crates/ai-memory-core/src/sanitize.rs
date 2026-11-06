@@ -438,13 +438,23 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     ),
     // Bearer-style tokens.
     (r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#, "bearer_token"),
-    // Vendor-prefixed API keys. The leading \b keeps identifiers such as
-    // `task-…` from matching; a real key starts a token.
-    (r"\bsk-[A-Za-z0-9_\-]{16,}", "api_key"),
+    // Vendor-prefixed API keys. A letter right before the prefix means it
+    // ends a word (`task-…`, `disk-…`), so that is the one place a match may
+    // not start; only the `secret` group is redacted. A plain `\b` would also
+    // skip a key glued to `_`, a digit, a CJK character or a percent escape
+    // (`?key%3Dsk-…`), all of which a real key can follow.
+    (
+        r"(?:^|[^A-Za-z]|%[0-9A-Fa-f]{2})(?P<secret>sk-[A-Za-z0-9_\-]{16,})",
+        "api_key",
+    ),
     // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
     // full-access, but the scope is operator-chosen and routinely includes
-    // charges/refunds — not meaningfully safer than `sk_live_`.
-    (r"(?:sk|rk)_live_[A-Za-z0-9_\-]{16,}", "stripe_key"),
+    // charges/refunds — not meaningfully safer than `sk_live_`. Anchored like
+    // `api_key` above, so `task_live_…` and `network_live_…` stay intact.
+    (
+        r"(?:^|[^A-Za-z]|%[0-9A-Fa-f]{2})(?P<secret>(?:sk|rk)_live_[A-Za-z0-9_\-]{16,})",
+        "stripe_key",
+    ),
     // Every GitHub token prefix, not only personal-access: `gho_` (OAuth —
     // what `gh auth login` stores on disk), `ghu_` (user-to-server),
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
@@ -1127,7 +1137,8 @@ mod tests {
             "_rules/organize-dotfiles-docs-by-task-and-strip-trivial-prose.md",
             "background-task-indexing-after-return",
             "storage-on-disk-reclaimable-pct",
-            "foo_sk-abcdefghijklmnopqrstuvwxyz",
+            "task_live_progress_tracking_handler",
+            "network_live_streaming_dashboard",
         ] {
             let scrubbed = s().scrub(keep);
             assert_eq!(scrubbed, keep, "{keep}");
@@ -1140,9 +1151,32 @@ mod tests {
             "key=sk-or-v1-deadbeefcafebabe1234567890abcdef",
             r#"{"stdout":"sk-FAKEfake0123456789abcdef"}"#,
             "sk-abcdefghijklmnopqrstuvwxyz at line start",
+            "foo_sk-abcdefghijklmnopqrstuvwxyz",
+            "日本sk-abcdefghijklmnopqrstuvwxyz",
+            "https://x.test/?api_key%3Dsk-abcdefghijklmnopqrstuvwxyz",
+            "Authorization:%20sk-abcdefghijklmnopqrstuvwxyz",
+            "9sk-abcdefghijklmnopqrstuvwxyz",
         ] {
             let scrubbed = s().scrub(key);
             assert!(scrubbed.contains("[REDACTED:api_key]"), "{scrubbed}");
+            assert!(!scrubbed.contains("abcdefghijklmnop"), "{scrubbed}");
+        }
+        // Only the key is redacted; the character before it stays.
+        assert_eq!(
+            s().scrub("key=x sk-abcdefghijklmnopqrstuvwxyz"),
+            "key=x [REDACTED:api_key]"
+        );
+        assert_eq!(
+            s().scrub("?k%3Dsk-abcdefghijklmnopqrstuvwxyz"),
+            "?k%3D[REDACTED:api_key]"
+        );
+        for key in [
+            "stripe=rk_live_FAKEfakeFAKE1234",
+            "my_sk_live_FAKEfakeFAKE1234",
+            "?k%3Dsk_live_FAKEfakeFAKE1234",
+        ] {
+            let scrubbed = s().scrub(key);
+            assert!(scrubbed.contains("[REDACTED:stripe_key]"), "{scrubbed}");
         }
     }
 
