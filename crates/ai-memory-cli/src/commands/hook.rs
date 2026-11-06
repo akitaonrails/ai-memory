@@ -219,8 +219,14 @@ fn compute_live_calls(
     let batch = super::session_usage::extract_live_calls(&path, agent, data_dir, routing_key)?;
     // Claude Code subagents write their own transcripts. Their responses ride
     // only on the main conversation's events: `drop_subagent_captures` drops
-    // a subagent's own event, usage included, after its cursor has moved.
-    if agent == AgentKind::ClaudeCode && !payload_is_subagent(json) {
+    // an event that carries `agent_id` (the router's `body_is_subagent`),
+    // usage included, after its cursor has moved. `agent_type` alone is a
+    // `claude --agent` main session, whose events keep them.
+    let subagent_event = json
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty());
+    if agent == AgentKind::ClaudeCode && !subagent_event {
         return Some(batch.with_claude_subagents(&path, data_dir, routing_key));
     }
     Some(batch)
