@@ -1180,13 +1180,15 @@ The rendered hooks config looks like:
   nothing new is a harmless no-op). See
   [`docs/install.md`](install.md#antigravity-lifecycle-hooks) for the
   transcript read's limits.
-- `memory_handoff_begin` always creates an explicit manual handoff with no
-  `from_session_id` and `from_agent = other`; it is project-wide for cwd
-  matching but belongs to the creating operator by default. Pass `shared=true`
-  only to publish it to every operator in the project. That session-neutral
-  shape is the same for every MCP client. Handoffs carrying a
-  Codex or Claude session id came from canonical SessionEnd processing, not
-  from the manual tool. Use the explicit Antigravity finalizer when the
+- `memory_handoff_begin` always creates an explicit manual handoff; it is
+  project-wide for cwd matching but belongs to the creating operator by
+  default. Pass `shared=true` only to publish it to every operator in the
+  project. A client that forwards its hook session id (the session-aware
+  bridge, OpenCode 2) gets that session's id, harness and cwd recorded on the
+  handoff, but only when the server recorded that session in the handoff's
+  project for the same operator. Antigravity's static HTTP connection forwards
+  no session, so its manual handoff has no `from_session_id` and
+  `from_agent = other`. Use the explicit Antigravity finalizer when the
   session itself must end and produce an attributed automatic handoff.
 - The built-in `/web` route displays compiled wiki pages, not raw session or
   observation rows. To verify hook capture, compare the `sessions` and
