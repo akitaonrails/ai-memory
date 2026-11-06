@@ -2275,6 +2275,22 @@ and launch share the same captured environment plus `--env` / `--env-file`
 overrides. Malformed output, a timeout, or an unsupported future major fails with
 an actionable error instead of guessing.
 
+OpenCode 1 and 2 load plugins from the same `~/.config/opencode/plugins/`
+directory, and OpenCode 2 refuses the V1 plugin with "Plugin must export a
+default definition with an id and an effect or setup function". After upgrading
+OpenCode itself to 2.x, run `ai-memory install-hooks --agent opencode --apply`
+again (or `ai-memory upgrade`, which probes the installed major the same way):
+it writes `ai-memory-opencode2.ts` and removes the V1 `ai-memory.ts` it owns.
+
+A Claude Code compatibility layer inside OpenCode (such as oh-my-opencode's
+`claude_code.hooks`) may also run the hooks from `~/.claude/settings.json`. On
+native Windows those entries use Claude Code's exec form: `command` is the bare
+path to `ai-memory.exe` and the arguments sit in `args`, which Claude Code
+spawns without a shell, so a path with spaces is correct there. A layer that
+runs `command` through a shell and drops `args` splits that path at the first
+space and fails with `unrecognized subcommand`. Turn its Claude hooks off; the
+OpenCode plugin already captures those events.
+
 ### OpenCode V2 compatibility
 
 The generated plugin targets the OpenCode 2.0.10+ event API (checked against
