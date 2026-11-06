@@ -57,3 +57,37 @@ fn png_response(bytes: &'static [u8]) -> (StatusCode, HeaderMap, &'static [u8]) 
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
     (StatusCode::OK, headers, bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    /// #2003: the three shipped faces are Latin subsets, so the Unicode
+    /// characters the templates use as icons fall through every text stack.
+    /// Each stack has to reach a symbol face, after `system-ui` so Latin text
+    /// keeps the platform font it had.
+    #[test]
+    fn text_font_stacks_reach_a_symbol_face_after_system_ui() {
+        let stacks: Vec<&str> = super::TAILWIND_CSS
+            .split("font-family:")
+            .skip(1)
+            .filter_map(|rest| rest.split([';', '}']).next())
+            .filter(|stack| {
+                stack.starts_with("Management Sans,") || stack.starts_with("Management Display,")
+            })
+            .collect();
+        assert!(!stacks.is_empty(), "no text font stack in the stylesheet");
+        for stack in stacks {
+            let system_ui = stack.find("system-ui").unwrap_or_else(|| panic!("{stack}"));
+            for face in [
+                "Apple Symbols",
+                "Segoe UI Symbol",
+                "Noto Sans Symbols",
+                "DejaVu Sans",
+            ] {
+                let at = stack
+                    .find(face)
+                    .unwrap_or_else(|| panic!("{face} missing from {stack}"));
+                assert!(system_ui < at, "{face} precedes system-ui in {stack}");
+            }
+        }
+    }
+}

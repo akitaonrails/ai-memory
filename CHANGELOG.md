@@ -37,13 +37,13 @@ version in [`docs/changelog/`](docs/changelog/):
   `rename-project --project-id` command that moves an empty holder out of the
   way. The server also logs such a leftover at startup (#2018).
 
-- The dashboard's icons now render on every platform. The three shipped
-  web fonts are Latin subsets, so the geometric and symbol characters the
-  templates use as icons were absent from them and fell through to the
-  platform UI font, which carries only a few: on macOS 4 of the 17 the
-  dashboard uses, leaving the other 13 as tofu boxes. The base font stacks
-  now name the symbol face each platform ships, after `system-ui`, so Latin
-  text is unchanged (#2003).
+- The dashboard's icons no longer show as empty boxes on macOS. The three
+  shipped web fonts are Latin subsets, so the geometric and symbol
+  characters the templates use as icons fell through to the platform UI
+  font, which on macOS carries only 4 of the 17. The text font stacks now
+  name the symbol fonts macOS, Windows and Linux ship (Apple Symbols, Segoe
+  UI Symbol, Noto Sans Symbols 2, DejaVu Sans) after `system-ui`, so Latin
+  text keeps its font (#2003).
 
 ## [3.4.2] - 2026-11-05
 
