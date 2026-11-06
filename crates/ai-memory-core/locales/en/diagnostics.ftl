@@ -1020,3 +1020,5 @@ diag-restore-left-out-git = ai-memory: left out { $value0 } file(s) from the bac
 diag-restore-generating-git-config = generating a git config for the restored wiki
 diag-jail-cannot-carry-this-checkouts-server-profile = --jail cannot carry this checkout's server profile{ $value0 } into the managed harness: the jailed run cannot read its stored token. Set AI_MEMORY_SERVER_URL and a least-privilege AI_MEMORY_AUTH_TOKEN for this launch, or run without --jail
 diag-this-checkouts-marker-selects-a-refused-server-profile = this checkout's .ai-memory.toml selects server profile { $value0 }, which was refused ({ $value1 }); nothing was sent. Run `ai-memory hook --check-capture` here or `ai-memory server list` to see why, or set AI_MEMORY_SERVER_URL to choose a server for this command
+diag-true-yolo-is-now-yolo = ai-memory: --true-yolo is now the same as --yolo; use --yolo
+diag-claude-true-yolo-deprecated = ai-memory: claude_true_yolo is deprecated and ignored: --yolo on Claude always forces bypassPermissions now; remove it from config.toml

@@ -311,9 +311,15 @@ pub(crate) fn checkout_route(config: &Config) -> Route {
     let Some((_, lookup_cwd)) = crate::commands::scope_directories(config) else {
         return Route::InstallDefault;
     };
+    // The hooks route the harness's logical cwd, so match a profile's roots
+    // against the same spelling of this directory (#2016).
+    let lookup_cwd = crate::commands::path_util::logical_dir(
+        Path::new(&lookup_cwd),
+        env.var_os("PWD").as_deref(),
+    );
     crate::server_profiles::route_for_cwd(
         &config.data_dir,
-        &lookup_cwd,
+        &lookup_cwd.to_string_lossy(),
         env.home_dir().map(Path::new),
     )
 }

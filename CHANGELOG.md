@@ -60,6 +60,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- `ai-memory run --yolo` is now the only yolo switch. For Claude it also
+  forces `bypassPermissions` over a `defaultMode` in your settings, which
+  used to need `--true-yolo`; other harnesses are unchanged. `--true-yolo`
+  still works as a hidden alias of `--yolo` (on `run`, `show`, `continue` and
+  `resume`) and prints a one-line note in a terminal. The `claude_true_yolo`
+  config key and `AI_MEMORY_CLAUDE_TRUE_YOLO` still load but are ignored;
+  `ai-memory run` asks you to remove them. The line printed after a jailed
+  run now repeats the launch with `--yolo`. Claude's own `ask` rules still
+  pause the run, and the `--yolo` warning and ai-jail offer are unchanged
+  (maintainer request).
+
 - The auto-improvement reviewer now has explicit instructions for user
   corrections. When the user rejects, corrects, interrupts or undoes the
   agent's work and gives a reason, it proposes a `_rules/` page, or a patch to
@@ -153,7 +164,10 @@ version in [`docs/changelog/`](docs/changelog/):
   with that profile's stored token, the same way hooks route capture. Before,
   they used the configured server and fell back to `127.0.0.1`. A profile
   that does not resolve fails the command with the hook's reason instead of
-  falling back. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
+  falling back. Roots are matched against the directory as the shell names it
+  (`PWD`, when it is the same directory), as the hooks match the harness's
+  cwd, so a checkout under a symlink or macOS's `/var` routes the same for
+  both. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
   profile-routed checkout because the jailed run cannot read the profile's
   token (#2016).
 

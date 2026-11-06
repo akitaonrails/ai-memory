@@ -25,7 +25,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `consolidate_on_session_end` | `false` | `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` | Queue LLM consolidation on SessionEnd when an LLM provider is configured. |
 | `backfill_on_start` | `true` | `AI_MEMORY_BACKFILL_ON_START` | Import a project's existing local harness history once, when SessionStart finds its store empty. |
 | `run_autowire` | `true` | `AI_MEMORY_RUN_AUTOWIRE` | Install a harness's hooks and MCP server on the first `ai-memory run` launch when they are missing. |
-| `claude_true_yolo` | `false` | `AI_MEMORY_CLAUDE_TRUE_YOLO` | Make `ai-memory run --yolo` on Claude force `bypassPermissions` over any settings `defaultMode`. |
+| `claude_true_yolo` | `false` | `AI_MEMORY_CLAUDE_TRUE_YOLO` | Deprecated and ignored since 3.4.3: `ai-memory run --yolo` on Claude always forces `bypassPermissions` now. Still loads; `ai-memory run` asks you to remove it. |
 | `pi_tool_exposure` | `"direct"` | `AI_MEMORY_PI_TOOL_EXPOSURE` | How the generated Pi extension registers ai-memory's MCP tools: `direct` (declared to the model) or `codemode` (reached through Pi's codemode tool). |
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |

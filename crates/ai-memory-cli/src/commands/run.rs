@@ -17,8 +17,8 @@ use ai_memory_workstream::{
     JailChecklistItem, JailHostFacts, JailRefusal, JailRisk, JailSupport, JailToggleChoice,
     JailToggleKind, LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate,
     ServerReach, ai_jail_contract, ai_jail_harness_name, ai_jail_support,
-    allows_native_session_adoption, apply_claude_true_yolo, apply_jail_process_isolation,
-    apply_yolo, build_ai_jail_invocation, build_launch_plan, build_launch_plan_with_env_lookup,
+    allows_native_session_adoption, apply_jail_process_isolation, apply_yolo,
+    build_ai_jail_invocation, build_launch_plan, build_launch_plan_with_env_lookup,
     checklist_reason, claude_continued_session, claude_continued_sessions,
     claude_live_background_attach_id, claude_session_ran_in_background, clean_path, contract_flags,
     contract_invocation, contract_status_invocation, crush_global_config_path,
@@ -587,6 +587,8 @@ fn apply_after_run_action(
     args.workstream = Some(outcome.workstream_name.clone());
     args.new_workstream = None;
     args.fresh = false;
+    // The first launch already noted that `--true-yolo` is `--yolo` now.
+    args.yolo |= std::mem::take(&mut args.true_yolo);
     true
 }
 
@@ -626,7 +628,6 @@ async fn run_once_with_wiring(
         .collect();
     let mut next_run = NextRun {
         yolo: false,
-        true_yolo: args.true_yolo,
         no_autowire: args.no_autowire,
         workspace: args.workspace.clone(),
         project: args.project.clone(),
@@ -637,20 +638,14 @@ async fn run_once_with_wiring(
     };
     let mut executable = args.executable.map(PathBuf::into_os_string);
     let mut native_args = args.native_args;
-    let trailing_yolo = remove_wrapper_yolo(&mut native_args);
-    let trailing_true_yolo = remove_wrapper_true_yolo(&mut native_args);
+    let (yolo_requested, true_yolo_typed) =
+        take_wrapper_yolo(args.yolo, args.true_yolo, &mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
     let trailing_force_unlock = remove_wrapper_force_unlock(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
     remove_wrapper_no_exit_prompt(&mut native_args);
     let trailing_jail = remove_wrapper_jail(&mut native_args);
     let jail_request = jail_request(args.jail, args.no_jail, trailing_jail)?;
-    let yolo_modes = yolo_modes(
-        args.yolo || trailing_yolo,
-        args.true_yolo || trailing_true_yolo,
-        config.claude_true_yolo,
-    );
-    let yolo_requested = yolo_modes.yolo;
     let force_fresh = args.fresh || trailing_fresh;
     let force_unlock = args.force_unlock || trailing_force_unlock;
     let no_autowire = args.no_autowire || trailing_no_autowire;
@@ -757,6 +752,12 @@ async fn run_once_with_wiring(
     // Inside ai-jail every jail flag is moot (no nesting), so neither the
     // binary lookup nor its errors apply there.
     let jailed = inside_ai_jail_here();
+    // Only the outer process speaks: a jailed re-run gets the same argv.
+    if interactive && !jailed {
+        for note in yolo_deprecation_notes(true_yolo_typed, config.claude_true_yolo) {
+            eprintln!("{}", config.i18n.diagnostic(note));
+        }
+    }
     let ai_jail = if jailed { None } else { usable_ai_jail_here() };
     let jail_facts = JailHostFacts::here(&repository);
     let jail_plan = jail_decision(
@@ -768,7 +769,6 @@ async fn run_once_with_wiring(
         jail_facts.project_config,
     )?;
     next_run.yolo = yolo_requested;
-    next_run.true_yolo |= trailing_true_yolo;
     next_run.no_autowire = no_autowire;
     // Inside the jail the folders are already mounted; the forwarded flags
     // only describe them.
@@ -888,7 +888,7 @@ async fn run_once_with_wiring(
                 workspace: &workspace,
                 project: &project,
                 force_fresh,
-                yolo_modes,
+                yolo: yolo_requested,
                 jail_plan: &jail_plan,
                 ai_jail: ai_jail.as_deref(),
                 jail_facts: &jail_facts,
@@ -1330,13 +1330,6 @@ async fn run_once_with_wiring(
             );
         }
         apply_yolo(harness, &mut plan.args);
-    }
-    // Claude's extra "true yolo" bypass (`docs/design-yolo-safety-ai-jail.md`
-    // §4), applied to the same env/args the child command is built from below.
-    // Every other harness already got the plain `--yolo` mapping above, which
-    // is all `--true-yolo` means for them.
-    if yolo_modes.claude_true_yolo && harness == ManagedHarness::Claude {
-        apply_claude_true_yolo(harness, &mut plan.args);
     }
     let planned_native_identity = acquired_try!(
         plan.expected_session_id
@@ -1983,7 +1976,7 @@ struct DegradedLaunch<'a> {
     workspace: &'a str,
     project: &'a str,
     force_fresh: bool,
-    yolo_modes: YoloModes,
+    yolo: bool,
     jail_plan: &'a JailPlan,
     ai_jail: Option<&'a Path>,
     jail_facts: &'a JailHostFacts,
@@ -2054,7 +2047,7 @@ async fn degraded_launch(
         interrupted,
     )
     .await?;
-    if launch.yolo_modes.yolo {
+    if launch.yolo {
         // Same Kiro caveat as the online path: v3 has no verified dangerous
         // mode, so the wrapper maps nothing there and says so.
         if launch.harness == ManagedHarness::KiroV3
@@ -2069,9 +2062,6 @@ async fn degraded_launch(
             );
         }
         apply_yolo(launch.harness, &mut plan.args);
-    }
-    if launch.yolo_modes.claude_true_yolo && launch.harness == ManagedHarness::Claude {
-        apply_claude_true_yolo(launch.harness, &mut plan.args);
     }
     let launch_env = |name: &str| launch.child_env.get(name).map(OsStr::to_os_string);
     // Auto-wire keeps the hook install (it is local and idempotent, and
@@ -3350,7 +3340,6 @@ fn jail_summary(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NextRun {
     yolo: bool,
-    true_yolo: bool,
     no_autowire: bool,
     workspace: Option<String>,
     project: Option<String>,
@@ -3436,9 +3425,7 @@ fn next_run_command(
     folders: &[super::jail_folders::ExtraFolder],
 ) -> String {
     let mut words = vec!["ai-memory".to_owned(), "run".to_owned()];
-    if next.true_yolo {
-        words.push("--true-yolo".to_owned());
-    } else if next.yolo {
+    if next.yolo {
         words.push("--yolo".to_owned());
     }
     if next.no_autowire {
@@ -4494,29 +4481,35 @@ fn remove_wrapper_true_yolo(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
-/// The effective permission modes for a launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct YoloModes {
-    /// Map the harness's dangerous-mode option, with the `--yolo` warning and
-    /// ai-jail offer.
-    yolo: bool,
-    /// Additionally apply Claude's `bypassPermissions` + residual-prompt
-    /// silencing (only acted on for the Claude harness).
-    claude_true_yolo: bool,
+/// Whether the launch asked for yolo, and whether it used the retired
+/// `--true-yolo` spelling, from the parsed flags plus either flag left in the
+/// native argv (stripped there, so the harness never sees it). `--true-yolo`
+/// is a deprecated alias: one `--yolo` now does it all.
+fn take_wrapper_yolo(
+    yolo_flag: bool,
+    true_yolo_flag: bool,
+    native_args: &mut Vec<OsString>,
+) -> (bool, bool) {
+    let trailing_yolo = remove_wrapper_yolo(native_args);
+    let true_yolo = true_yolo_flag | remove_wrapper_true_yolo(native_args);
+    (yolo_flag || trailing_yolo || true_yolo, true_yolo)
 }
 
-/// `--true-yolo` is a superset of `--yolo`: it requests yolo on every harness
-/// (where, outside Claude, it is simply interchangeable with `--yolo`) plus the
-/// Claude-only bypass, so passing both is redundant but harmless. The
-/// `claude_true_yolo` config key only upgrades a launch that is already yolo —
-/// it never turns an ordinary run into a permission-bypassing one without the
-/// `--yolo` warning.
-fn yolo_modes(yolo_flag: bool, true_yolo_flag: bool, config_true_yolo: bool) -> YoloModes {
-    let yolo = yolo_flag || true_yolo_flag;
-    YoloModes {
-        yolo,
-        claude_true_yolo: yolo && (true_yolo_flag || config_true_yolo),
+/// Terminal notes for the retired true-yolo spellings. Both still load and
+/// launch: `--true-yolo` is a hidden alias of `--yolo`, and the
+/// `claude_true_yolo` config key is accepted and ignored, because a Claude
+/// `--yolo` now always forces `bypassPermissions`.
+fn yolo_deprecation_notes(true_yolo_flag: bool, config_true_yolo: bool) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if true_yolo_flag {
+        notes.push("ai-memory: --true-yolo is now the same as --yolo; use --yolo");
     }
+    if config_true_yolo {
+        notes.push(
+            "ai-memory: claude_true_yolo is deprecated and ignored: --yolo on Claude always forces bypassPermissions now; remove it from config.toml",
+        );
+    }
+    notes
 }
 
 fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
@@ -6818,8 +6811,9 @@ mod tests {
             "ai-memory run --yolo --workspace team --jail=github,ssh \
              --jail-map /home/u/Projects/ai-jail --jail-rw-map '/home/u/My Projects/tap' claude"
         );
+        // A launch typed with the retired `--true-yolo` repeats as `--yolo`.
         let bare = NextRun {
-            true_yolo: true,
+            yolo: true,
             ..NextRun::default()
         };
         let off = [JailToggleChoice {
@@ -6829,7 +6823,7 @@ mod tests {
         }];
         assert_eq!(
             next_run_command(&bare, Some(&off), &[]),
-            "ai-memory run --true-yolo --jail=none"
+            "ai-memory run --yolo --jail=none"
         );
         let full = NextRun {
             yolo: true,
@@ -7550,7 +7544,10 @@ mod tests {
         assert!(!args.fresh);
         assert!(args.native_args.is_empty());
         assert!(args.yolo);
-        assert!(args.true_yolo);
+        assert!(
+            !args.true_yolo,
+            "a relaunch carries --yolo, not the alias that prints its note again"
+        );
         assert!(args.no_jail);
         assert!(args.no_autowire);
         assert_eq!(args.env, [("MODEL_HOME".into(), "custom".into())]);
@@ -9399,60 +9396,98 @@ mod tests {
         assert_eq!(native, ["--model", "opus"].map(OsString::from));
     }
 
+    /// `--true-yolo` stays a hidden alias so 3.4.x aliases, scripts and
+    /// printed next-run lines keep launching; it parses in `run`, `show`,
+    /// `continue` and `resume`, and is gone from `--help`.
     #[test]
-    fn true_yolo_flag_implies_yolo_on_every_harness() {
+    fn true_yolo_is_a_hidden_alias_on_every_launch_command() {
+        for argv in [
+            &["ai-memory", "run", "--true-yolo", "claude"][..],
+            &["ai-memory", "show", "--true-yolo"],
+            &["ai-memory", "continue", "--true-yolo"],
+            &["ai-memory", "resume", "--true-yolo"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        let mut command = <Cli as clap::CommandFactory>::command();
+        for name in ["run", "show", "continue", "resume"] {
+            let help = command
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(!help.contains("true-yolo"), "{name} --help: {help}");
+        }
+    }
+
+    /// `--true-yolo` in either position requests exactly what `--yolo` does,
+    /// so a 3.4.x alias still gets the warning, the ai-jail offer and the
+    /// harness's dangerous mode (Claude's `--settings` included).
+    #[test]
+    fn true_yolo_alias_requests_yolo_in_either_position() {
+        let parse = |argv: &[&str]| {
+            let CliCommand::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("expected run command");
+            };
+            args
+        };
+        let take = |argv: &[&str]| {
+            let mut args = parse(argv);
+            let taken = take_wrapper_yolo(args.yolo, args.true_yolo, &mut args.native_args);
+            (taken, args.native_args)
+        };
+        let opus = ["--model", "opus"].map(OsString::from).to_vec();
         assert_eq!(
-            yolo_modes(false, true, false),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: true
-            },
-            "--true-yolo alone must still warn/offer ai-jail and map the harness's yolo"
+            take(&[
+                "ai-memory",
+                "run",
+                "--true-yolo",
+                "claude",
+                "--model",
+                "opus"
+            ]),
+            ((true, true), opus.clone())
         );
-        // Both together are redundant, never an error or a different result.
         assert_eq!(
-            yolo_modes(true, true, false),
-            yolo_modes(false, true, false)
+            take(&[
+                "ai-memory",
+                "run",
+                "claude",
+                "--model",
+                "opus",
+                "--true-yolo"
+            ]),
+            ((true, true), opus.clone())
+        );
+        assert_eq!(
+            take(&["ai-memory", "run", "claude", "--model", "opus", "--yolo"]),
+            ((true, false), opus.clone())
+        );
+        assert_eq!(
+            take(&["ai-memory", "run", "claude", "--model", "opus"]),
+            ((false, false), opus)
         );
     }
 
     #[test]
-    fn plain_yolo_does_not_bypass_claude_permissions_by_itself() {
-        assert_eq!(
-            yolo_modes(true, false, false),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: false
-            }
-        );
-        assert_eq!(
-            yolo_modes(false, false, false),
-            YoloModes {
-                yolo: false,
-                claude_true_yolo: false
-            }
-        );
-    }
-
-    /// The config key upgrades a yolo launch, but alone must never turn an
-    /// ordinary managed run into a `bypassPermissions` one with no `--yolo`
-    /// warning (it previously did).
-    #[test]
-    fn claude_true_yolo_config_only_upgrades_a_yolo_launch() {
-        assert_eq!(
-            yolo_modes(false, false, true),
-            YoloModes {
-                yolo: false,
-                claude_true_yolo: false
-            }
-        );
-        assert_eq!(
-            yolo_modes(true, false, true),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: true
-            }
-        );
+    fn retired_true_yolo_spellings_print_a_note_each() {
+        assert!(yolo_deprecation_notes(false, false).is_empty());
+        let flag = yolo_deprecation_notes(true, false);
+        assert_eq!(flag.len(), 1);
+        assert!(flag[0].contains("--true-yolo is now the same as --yolo"));
+        let key = yolo_deprecation_notes(false, true);
+        assert_eq!(key.len(), 1);
+        assert!(key[0].contains("claude_true_yolo is deprecated and ignored"));
+        assert_eq!(yolo_deprecation_notes(true, true).len(), 2);
+        let catalog =
+            ai_memory_core::i18n::Localizer::new(ai_memory_core::i18n::Language::PortugueseBrazil);
+        for note in yolo_deprecation_notes(true, true) {
+            assert_ne!(
+                catalog.diagnostic(note),
+                note,
+                "pt-BR catalog entry for {note}"
+            );
+        }
     }
 
     #[test]
