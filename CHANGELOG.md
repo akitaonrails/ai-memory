@@ -37,9 +37,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `rename-project --project-id` command that moves an empty holder out of the
   way. The server also logs such a leftover at startup (#2018).
 
-- Decay cleanup no longer fails the pass on a purged session's leftover page
-  file: the reindex is skipped (the summary stays deleted) and the tombstoned
-  chain is still removed (#1999).
+- The forget sweep's decay cleanup no longer logs a failure when a session
+  is purged after the sweep has listed its decayed page and the purge could
+  not remove the page file. The leftover file is left unindexed, so the
+  purged summary stays deleted, and the cleanup finishes (#1999, #2007).
 
 ## [3.4.2] - 2026-11-05
 

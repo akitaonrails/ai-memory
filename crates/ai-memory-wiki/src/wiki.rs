@@ -7156,6 +7156,11 @@ mod tests {
     /// performs then hits the store's purge guard, and that refusal must only
     /// skip the file — it must not fail the decay pass, and it must not
     /// resurrect the summary.
+    ///
+    /// The purge deletes the session's tombstones with its rows, so the
+    /// forget sweep reaches this only through its list-then-delete window: a
+    /// tombstone listed by `decay_tombstones_before`, then a purge, then the
+    /// cleanup call. The test runs those steps in that order.
     #[tokio::test]
     async fn decay_cleanup_skips_a_purged_sessions_leftover_page_file() {
         use ai_memory_core::IdentityKey;
@@ -7163,16 +7168,27 @@ mod tests {
         let (store, wiki, ws, proj, user, sid, path) = owned_session_with_page(&tmp).await;
         let abs = wiki.abs_path(ws, proj, &path);
         let body = std::fs::read(&abs).unwrap();
-        let page_id = store
+        let latest = store
             .reader
             .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
             .await
             .unwrap()
             .expect("the session page is indexed");
+        assert!(
+            wiki.evict_page_if_latest(ws, proj, &path, latest, None)
+                .await
+                .unwrap()
+        );
+        let listed = store
+            .reader
+            .decay_tombstones_before(ws, proj, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "the sweep lists the decayed page");
+        let page_id = listed[0].id;
         // A directory in place of the file makes cleanup fail on every
         // platform, so the purge leaves the file behind while still
         // tombstoning the session.
-        std::fs::remove_file(&abs).unwrap();
         std::fs::create_dir(&abs).unwrap();
         let outcome = wiki
             .purge_owned_session(
@@ -7206,6 +7222,15 @@ mod tests {
             "the purged summary must not be re-indexed"
         );
         assert!(abs.exists(), "cleanup deletes rows, not the leftover file");
+        assert!(
+            store
+                .reader
+                .decay_tombstones_before(ws, proj, i64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no tombstone is left for the next sweep to retry"
+        );
     }
 
     /// #929: the reindex `hard_delete_decay_tombstone` performs when a
