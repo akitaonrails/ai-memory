@@ -289,7 +289,7 @@ pub(crate) enum WriteCmd {
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
         occurred_at: Option<i64>,
-        reply: oneshot::Sender<StoreResult<HandoffId>>,
+        reply: oneshot::Sender<StoreResult<Option<HandoffId>>>,
     },
     EndAdmittedLifecycleOnlySession {
         admitted: AdmittedSession,
@@ -1777,7 +1777,9 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Guarded hook end plus automatic handoff.
+    /// Guarded hook end plus automatic handoff; `None` when the session still
+    /// has an open explicit handoff of its own, which the end keeps instead.
+    /// See `ops::end_admitted_session_with_handoff`.
     ///
     /// `occurred_at` is the SessionEnd event's own original time (microseconds),
     /// when known; `None` falls back to "now" at the store boundary.
@@ -1787,7 +1789,7 @@ impl WriterHandle {
         summary_page_id: Option<PageId>,
         handoff: NewHandoff,
         occurred_at: Option<i64>,
-    ) -> StoreResult<HandoffId> {
+    ) -> StoreResult<Option<HandoffId>> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::EndAdmittedSessionWithHandoff {
             admitted,
@@ -1993,7 +1995,8 @@ impl WriterHandle {
     }
 
     /// Publish a live session's turn-checkpoint baton; `None` when the session
-    /// already ended or is gone. See `ops::checkpoint_session_handoff`.
+    /// already ended or is gone, or still has an open explicit handoff of its
+    /// own. See `ops::checkpoint_session_handoff`.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.

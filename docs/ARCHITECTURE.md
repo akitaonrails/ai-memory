@@ -422,6 +422,12 @@ same transaction expires older eligible automatic handoffs while preserving
 manual and sibling-directory work. Insertion also expires prior open automatic
 handoffs from the exact cwd, bounding repeated SessionEnds before any receiver
 starts.
+A session that still has an open `memory_handoff_begin` handoff of its own
+ends without an automatic baton, and its turn checkpoints write none; writing
+that explicit handoff also expires the session's own open automatic batons
+(#2012). The startup block for a handoff with a source session names its
+`sessions/<id>.md` page, which opt-in SessionEnd consolidation rewrites after
+the baton was written.
 `GET /recap?session_id=` answers a prompt that starts with `reload context`
 (Claude Code and Codex in the `UserPromptSubmit` envelope, Grok on the next
 `PostToolUse`, OpenCode through its system/context hooks). It is read-only and

@@ -498,10 +498,11 @@ async fn claude_session(
 /// session id is a header the caller controls, so it counts only for a session
 /// recorded in the handoff's own project under the caller's owner filter: a
 /// colleague forwarding Alice's id, and Alice naming her session in another
-/// project, get an unattributed handoff.
+/// project, get an unattributed handoff and cannot retire the batons of the
+/// session they named.
 #[tokio::test]
 async fn handoff_begin_records_only_the_callers_own_session() {
-    use ai_memory_core::AgentKind;
+    use ai_memory_core::{AgentKind, NewHandoff};
 
     let h = harness(Some("dj"), true).await;
     let alice = proxied("x-memory-actor-user", "alice");
@@ -520,6 +521,25 @@ async fn handoff_begin_records_only_the_callers_own_session() {
         .expect("other project");
     let session = claude_session(&h, h.proj, "alice-claude", &owner).await;
     claude_session(&h, other_proj, "alice-elsewhere", &owner).await;
+    let checkpoint = h
+        .store
+        .writer
+        .checkpoint_session_handoff(NewHandoff {
+            workspace_id: h.ws,
+            project_id: h.proj,
+            from_session_id: Some(session),
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: Some("/repo".into()),
+            summary: "turn-checkpoint".into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: Some(owner.clone()),
+        })
+        .await
+        .expect("checkpoint")
+        .expect("a live session publishes its baton");
 
     begin(
         &h.http,
@@ -544,6 +564,11 @@ async fn handoff_begin_records_only_the_callers_own_session() {
         assert_eq!(origin.from_agent, AgentKind::Other, "{label}");
         assert_eq!(origin.cwd, None, "{label}");
     }
+    assert_eq!(
+        rows["turn-checkpoint"].lifecycle.state,
+        ai_memory_core::HandoffState::Open,
+        "a foreign caller retired the named session's baton",
+    );
 
     begin(&h.http, "alices-own", &with_session(alice, "alice-claude")).await;
     let rows = handoffs_by_summary(&h).await;
@@ -551,6 +576,15 @@ async fn handoff_begin_records_only_the_callers_own_session() {
     assert_eq!(own.from_session_id, Some(session));
     assert_eq!(own.from_agent, AgentKind::ClaudeCode);
     assert_eq!(own.cwd.as_deref(), Some("/repo"));
+    let replaced = rows
+        .values()
+        .find(|handoff| handoff.scope.id == checkpoint)
+        .expect("checkpoint row");
+    assert_eq!(
+        replaced.lifecycle.state,
+        ai_memory_core::HandoffState::Expired,
+        "the explicit handoff supersedes its own session's automatic baton",
+    );
 }
 
 /// #2014: `memory_handoff_accept` returns the row as the claim left it, with

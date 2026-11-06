@@ -3625,6 +3625,17 @@ fn render_handoff_markdown_with_budget(h: &Handoff, budget: Option<usize>) -> St
         from = h.origin.from_agent.as_str(),
         ts = h.lifecycle.created_at,
     ));
+    // The baton is written when the session ends, from the first prompt and
+    // the last reply; opt-in LLM consolidation lands later and rewrites only
+    // the session page, where the session's open items then are (#2012). The
+    // path is built from the typed session id, never from stored text.
+    if let Some(session_id) = h.origin.from_session_id {
+        buf.push_str(&format!(
+            "> session record: `sessions/{session_id}.md` — read it with \
+             `memory_read_page` for the full session; when LLM consolidation is \
+             enabled it is rewritten there shortly after the session ends.\n",
+        ));
+    }
     buf.push_str("> **Security boundary:** ");
     buf.push_str(ai_memory_core::UNTRUSTED_MEMORY_NOTICE);
     buf.push_str("\n\n");
@@ -5589,7 +5600,10 @@ async fn process_authorized(
         // The end stamp and the baton commit in one transaction: a crash
         // between them would leave an ended session whose successor has
         // nothing to pick up. A managed run and an admission refusal both take
-        // the second arm, ending the session with no handoff at all.
+        // the second arm, ending the session with no handoff at all. A baton
+        // that was admitted but not written means the session still has an
+        // open explicit handoff of its own, which the store keeps instead.
+        let baton_admitted = handoff.is_some();
         let handoff_id = if turn_checkpoint {
             match handoff {
                 Some(handoff) => state.writer.checkpoint_session_handoff(handoff).await?,
@@ -5597,7 +5611,7 @@ async fn process_authorized(
             }
         } else {
             match handoff {
-                Some(handoff) => Some(
+                Some(handoff) => {
                     state
                         .writer
                         .end_admitted_session_with_handoff(
@@ -5606,8 +5620,8 @@ async fn process_authorized(
                             handoff,
                             env.occurred_at_micros(),
                         )
-                        .await?,
-                ),
+                        .await?
+                }
                 None => {
                     state
                         .writer
@@ -5666,6 +5680,12 @@ async fn process_authorized(
                     page = %new_page.path,
                     handoff = %handoff_id,
                     "session ended; summary page + open handoff created",
+                );
+            } else if baton_admitted {
+                info!(
+                    session = %session_id,
+                    page = %new_page.path,
+                    "session ended; summary page written, keeping the session's open explicit handoff instead of a template one",
                 );
             } else if managed || child_session {
                 info!(
@@ -9070,6 +9090,56 @@ pub(crate) mod tests {
         assert!(output.contains("CONTINUITY NOTICE"));
         assert!(output.contains("INBOX NOTICE"));
         assert!(!output.contains("profile"));
+    }
+
+    /// #2012: the startup block points at the source session's page, where
+    /// opt-in LLM consolidation writes the session's open items after the
+    /// template baton already exists. A handoff with no source session has no
+    /// page to point at.
+    #[test]
+    fn handoff_block_points_at_the_source_sessions_page() {
+        let session = SessionId::new();
+        let mut handoff = Handoff {
+            scope: ai_memory_core::HandoffScope {
+                id: ai_memory_core::HandoffId::new(),
+                workspace_id: WorkspaceId::new(),
+                project_id: ProjectId::new(),
+            },
+            origin: ai_memory_core::HandoffOrigin {
+                from_session_id: Some(session),
+                manual: false,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                owner_user: None,
+            },
+            content: ai_memory_core::HandoffContent {
+                summary: "Started: fix the bug".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+            },
+            lifecycle: ai_memory_core::HandoffLifecycle {
+                state: ai_memory_core::HandoffState::Open,
+                created_at: jiff::Timestamp::UNIX_EPOCH,
+                accepted_by: None,
+                accepted_at: None,
+                accepted_by_session: None,
+                accepted_by_user: None,
+            },
+        };
+        let rendered = render_handoff_markdown_with_budget(&handoff, Some(400));
+        let pointer = rendered
+            .find(&format!("`sessions/{session}.md`"))
+            .expect("the block names the session page");
+        assert!(
+            pointer < rendered.find(UNTRUSTED_HISTORY_START).unwrap(),
+            "the pointer is server metadata, outside the stored-history fence",
+        );
+
+        handoff.origin.from_session_id = None;
+        let rendered = render_handoff_markdown_with_budget(&handoff, None);
+        assert!(!rendered.contains("sessions/"), "{rendered}");
     }
 
     #[test]

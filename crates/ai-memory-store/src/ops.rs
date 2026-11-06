@@ -3700,13 +3700,17 @@ pub fn end_admitted_lifecycle_only_session(
 }
 
 /// Guarded hook end plus automatic handoff in one transaction.
+///
+/// Returns `None` when the session still has an open explicit handoff of its
+/// own ([`session_has_open_manual_handoff`]): the session ends, and no
+/// template baton is left to linger next to the one the agent wrote (#2012).
 pub fn end_admitted_session_with_handoff(
     conn: &mut Connection,
     admitted: &AdmittedSession,
     page: Option<&PageId>,
     handoff: &NewHandoff,
     occurred_at: Option<i64>,
-) -> StoreResult<HandoffId> {
+) -> StoreResult<Option<HandoffId>> {
     if handoff.from_session_id != Some(admitted.session_id)
         || handoff.workspace_id != admitted.workspace_id
         || handoff.project_id != admitted.project_id
@@ -3717,9 +3721,38 @@ pub fn end_admitted_session_with_handoff(
     let tx = conn.transaction()?;
     validate_admitted_session(&tx, admitted)?;
     end_session_row(&tx, &admitted.session_id, page, occurred_at)?;
-    let id = insert_handoff_row(&tx, handoff, false)?;
+    let id = if session_has_open_manual_handoff(&tx, handoff)? {
+        None
+    } else {
+        Some(insert_handoff_row(&tx, handoff, false)?)
+    };
     tx.commit()?;
     Ok(id)
+}
+
+/// Whether the automatic baton's source session already left an explicit
+/// `memory_handoff_begin` handoff that nobody has claimed yet.
+///
+/// The explicit one is what the agent wrote on purpose while wrapping up, and
+/// it wins delivery over any automatic baton, so a template baton written
+/// beside it would only be offered later as a stale pending handoff. Once the
+/// explicit one is claimed or cancelled, later automatic batons of the session
+/// carry work newer than it and are written again.
+fn session_has_open_manual_handoff(tx: &Transaction<'_>, h: &NewHandoff) -> StoreResult<bool> {
+    let Some(session_id) = h.from_session_id.as_ref() else {
+        return Ok(false);
+    };
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM handoffs \
+             WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND manual = 1 AND state = 'open')",
+        params![
+            session_id.as_bytes(),
+            h.workspace_id.as_bytes(),
+            h.project_id.as_bytes()
+        ],
+        |row| row.get(0),
+    )?)
 }
 
 /// An idle auto-end candidate as selected by the server-side tick
@@ -5157,11 +5190,37 @@ pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<Hand
 ///
 /// It stays manual whatever `from_session_id` it carries: project-wide for cwd
 /// matching, preferred over automatic batons, and never refreshed or swept by
-/// them (#2014). The caller must have checked that a `from_session_id` is the
-/// caller's own session, in this scope.
+/// them. When it names its source session, that session's own open automatic
+/// batons (a turn checkpoint's, say) are retired in the same transaction: the
+/// explicit wrap-up supersedes them, and they would otherwise surface later as
+/// stale pending handoffs (#2012). The caller must have checked that the
+/// session is the caller's own, in this scope.
 pub fn insert_manual_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
     let tx = conn.transaction()?;
     let id = insert_handoff_row(&tx, h, true)?;
+    if let Some(session_id) = h.from_session_id.as_ref() {
+        let expired = tx.execute(
+            "UPDATE handoffs SET state = 'expired' \
+             WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+               AND manual = 0 AND state = 'open'",
+            params![
+                session_id.as_bytes(),
+                h.workspace_id.as_bytes(),
+                h.project_id.as_bytes()
+            ],
+        )?;
+        if expired > 0 {
+            audit(
+                &tx,
+                "expire_superseded_handoffs",
+                Some(h.workspace_id.as_bytes()),
+                Some(h.project_id.as_bytes()),
+                None,
+                None,
+                Timestamp::now().as_microsecond(),
+            )?;
+        }
+    }
     tx.commit()?;
     Ok(id)
 }
@@ -5175,7 +5234,9 @@ pub fn insert_manual_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResu
 /// scope and owner, the same contract as [`end_session_with_handoff`]; a
 /// checkpoint that lost the race with the session's end, or with a purge,
 /// returns `None` and touches nothing, so it can neither retire the end's
-/// baton nor resurrect a claimed one.
+/// baton nor resurrect a claimed one. A session that still has an open
+/// explicit handoff of its own also gets `None`: the checkpoint keeps that
+/// wrap-up instead of writing a template baton beside it (#2012).
 pub fn checkpoint_session_handoff(
     conn: &mut Connection,
     handoff: &NewHandoff,
@@ -5204,6 +5265,9 @@ pub fn checkpoint_session_handoff(
         return Err(StoreError::InvalidState(
             "checkpoint handoff scope or owner does not match its session".into(),
         ));
+    }
+    if session_has_open_manual_handoff(&tx, handoff)? {
+        return Ok(None);
     }
     let existing: Option<Vec<u8>> = tx
         .query_row(
@@ -11745,6 +11809,164 @@ pub(crate) mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    fn open_handoff_summaries(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT summary FROM handoffs WHERE state = 'open' ORDER BY summary")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    // #2012: a session that wrapped up with `memory_handoff_begin` ends
+    // without a template baton beside it, and its turn checkpoints write none
+    // while that explicit handoff is open. A session with no explicit handoff
+    // still gets its baton, and once the explicit one is claimed the session's
+    // later checkpoints publish again.
+    #[test]
+    fn an_open_explicit_handoff_replaces_the_sessions_template_baton() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let owner = OwnerFilter::User("user:alice".into());
+        let admit = |conn: &mut Connection, session: &NewSession| {
+            admitted_session(
+                admit_hook_session_event(
+                    conn,
+                    session,
+                    &hook_observation(session),
+                    &owner,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let wrapped = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let wrapped_guard = admit(&mut conn, &wrapped);
+        let plain = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        let plain_guard = admit(&mut conn, &plain);
+
+        let explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(wrapped.id), "/repo", "explicit"),
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_session_handoff(
+                &mut conn,
+                &session_baton(ws, proj, Some(wrapped.id), "/repo", "checkpoint"),
+            )
+            .unwrap(),
+            None,
+            "a turn checkpoint keeps the open explicit handoff instead",
+        );
+        assert_eq!(
+            end_admitted_session_with_handoff(
+                &mut conn,
+                &wrapped_guard,
+                None,
+                &session_baton(ws, proj, Some(wrapped.id), "/repo", "template"),
+                None,
+            )
+            .unwrap(),
+            None,
+            "the session ends without a template baton",
+        );
+        let ended: bool = conn
+            .query_row(
+                "SELECT ended_at IS NOT NULL FROM sessions WHERE id = ?1",
+                params![wrapped.id.as_bytes()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ended, "the end itself still lands");
+        assert_eq!(handoff_state(&conn, &explicit), "open");
+
+        let plain_baton = end_admitted_session_with_handoff(
+            &mut conn,
+            &plain_guard,
+            None,
+            &session_baton(ws, proj, Some(plain.id), "/other", "plain template"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            plain_baton.is_some(),
+            "another session's explicit handoff does not suppress this one's baton",
+        );
+        assert_eq!(
+            open_handoff_summaries(&conn),
+            vec!["explicit".to_owned(), "plain template".to_owned()],
+        );
+
+        let live = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &live).unwrap();
+        let live_explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(live.id), "/live", "live explicit"),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE handoffs SET state = 'accepted' WHERE id = ?1",
+            params![live_explicit.as_bytes()],
+        )
+        .unwrap();
+        assert!(
+            checkpoint_session_handoff(
+                &mut conn,
+                &session_baton(ws, proj, Some(live.id), "/live", "later turn"),
+            )
+            .unwrap()
+            .is_some(),
+            "work after a claimed explicit handoff gets a baton again",
+        );
+    }
+
+    // #2012: writing an explicit handoff retires its own session's open
+    // automatic batons, and nothing else: another open session's baton, the
+    // session's baton in another project and a claimed one all stay as they were.
+    #[test]
+    fn an_explicit_handoff_retires_only_its_own_sessions_automatic_batons() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let other_proj = get_or_create_project(&mut conn, &ws, "other", None).unwrap();
+        let session = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &session).unwrap();
+        let sibling = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &sibling).unwrap();
+
+        let own = checkpoint_session_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(session.id), "/repo", "own checkpoint"),
+        )
+        .unwrap()
+        .unwrap();
+        let siblings = checkpoint_session_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(sibling.id), "/repo", "sibling checkpoint"),
+        )
+        .unwrap()
+        .unwrap();
+        let elsewhere = insert_handoff(
+            &mut conn,
+            &session_baton(ws, other_proj, Some(session.id), "/repo", "elsewhere"),
+        )
+        .unwrap();
+
+        insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(session.id), "/repo", "explicit"),
+        )
+        .unwrap();
+
+        assert_eq!(handoff_state(&conn, &own), "expired");
+        assert_eq!(handoff_state(&conn, &siblings), "open");
+        assert_eq!(handoff_state(&conn, &elsewhere), "open");
+
+        // Without a source session an explicit handoff retires nothing.
+        insert_manual_handoff(&mut conn, &session_baton(ws, proj, None, "/repo", "bare")).unwrap();
+        assert_eq!(handoff_state(&conn, &siblings), "open");
     }
 
     // #2014: an explicit handoff that records its session stays manual. A

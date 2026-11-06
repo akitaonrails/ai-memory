@@ -24,6 +24,14 @@ version in [`docs/changelog/`](docs/changelog/):
   "accepted"`, `accepted_at`, `accepted_by`) rather than the open row it read
   before claiming it (#2014).
 
+- A session that ends, or finishes a turn checkpoint, while its own
+  `memory_handoff_begin` handoff is still open no longer leaves an automatic
+  template handoff beside it, and writing the explicit handoff expires that
+  session's earlier automatic one, so no stale pending handoff is left behind.
+  The startup handoff block now names the source session's
+  `sessions/<id>.md` page, where opt-in SessionEnd LLM consolidation writes the
+  session's open items after the template handoff was created (#2012).
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is
