@@ -507,13 +507,13 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for HeadingIdAssigner<'a, I> {
 
 /// State for tracking and deduplicating heading slugs across a rendered page.
 #[derive(Default)]
-struct HeadingSlugger {
+pub(crate) struct HeadingSlugger {
     seen: HashSet<String>,
     counts: HashMap<String, usize>,
 }
 
 impl HeadingSlugger {
-    fn slugify(&mut self, text: &str) -> String {
+    pub(crate) fn slugify(&mut self, text: &str) -> String {
         let base = slugify(text);
         self.deduplicate(&base)
     }
@@ -1589,7 +1589,7 @@ mod reference_document_tests {
         let doc = crate::documentation::find("features").unwrap();
         let rendered = super::render_reference_document(
             "# Example\n\n<script>alert(1)</script>\n\n[x](javascript:alert) [guide](install.md) [local](#example)\n\n```text\n[[private-page]]\n```",
-            |url| crate::documentation::link(doc, "docs/features", url),
+            |url| crate::documentation::link_from(doc.source, "docs/features", url),
         );
         assert!(!rendered.html.contains("<script>"));
         assert!(rendered.html.contains("&lt;script&gt;"));
