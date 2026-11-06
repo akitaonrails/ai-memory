@@ -62,8 +62,8 @@ use anyhow::{Context, Result};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ClientJsonRpcMessage, ClientRequest,
-    CustomNotification, JsonObject, ListToolsResult, PaginatedRequestParams, ServerConfig,
-    ServerJsonRpcMessage, ServerNotification, ServerPeerInfo, Tool,
+    CustomNotification, JsonObject, ListToolsResult, PaginatedRequestParams, ResultType,
+    ServerConfig, ServerJsonRpcMessage, ServerNotification, ServerPeerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleClient, RoleServer, ServiceError};
 use rmcp::transport::async_rw::AsyncRwTransport;
@@ -203,6 +203,13 @@ fn launch_project(config: &Config, dir: &Path) -> Option<(String, String)> {
     super::resolve_scope_for_path(config, &dir).ok()
 }
 
+/// The upstream leg runs on an older protocol revision, so rmcp strips the
+/// `resultType` discriminator from its results there. A 2026-07-28 client
+/// requires the field on every result, and an absent one means `"complete"`
+/// only for servers on an earlier revision
+/// (<https://modelcontextprotocol.io/specification/2026-07-28/basic#resulttype>),
+/// so the forwarded results restore it. rmcp's server handler removes it again
+/// for a downstream client on an older revision (#2022).
 impl ServerHandler for SessionAwareBridge {
     fn get_info(&self) -> ServerConfig {
         self.server_config.clone()
@@ -213,10 +220,13 @@ impl ServerHandler for SessionAwareBridge {
         request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        self.upstream
+        let mut result = self
+            .upstream
             .list_tools(request)
             .await
-            .map_err(upstream_error)
+            .map_err(upstream_error)?;
+        result.result_type.get_or_insert(ResultType::COMPLETE);
+        Ok(result)
     }
 
     async fn call_tool(
@@ -233,10 +243,15 @@ impl ServerHandler for SessionAwareBridge {
             Some(scope) => scope.apply(request),
             None => request,
         };
-        self.upstream
+        let mut response = self
+            .upstream
             .call_tool_once(request)
             .await
-            .map_err(upstream_error)
+            .map_err(upstream_error)?;
+        if let CallToolResponse::Complete(result) = &mut response {
+            result.result_type.get_or_insert(ResultType::COMPLETE);
+        }
+        Ok(response)
     }
 }
 

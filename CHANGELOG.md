@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory mcp-bridge`, the stdio entry most clients use on a token-file
+  install, now includes `resultType: "complete"` in the `tools/list` and
+  `tools/call` results it forwards to a client on MCP revision 2026-07-28.
+  That revision requires the field, and a strict client such as
+  `@modelcontextprotocol/client` 2.2 rejected the tool list and reconnected
+  forever with no tools. Clients on an older revision still receive results
+  without it, and the direct HTTP endpoint already sent it (#2022).
+
 - The project page's tabs work again when the web UI is shown in a language
   other than English. Their script looked up the tab bar by its English
   accessible name, so a Portuguese page left every tab panel hidden. The

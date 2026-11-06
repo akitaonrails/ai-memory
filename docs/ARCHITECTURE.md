@@ -908,7 +908,10 @@ delegates tool calls to the configured HTTP server through rmcp's client
 transport. It uses the bearer `Config::load` resolved, or the install's stored
 hook key before a discovered root key, which it sends only to a loopback
 server. The server therefore keeps the same auth, scope resolver, and tool handlers as direct
-HTTP clients. It has two modes, chosen by the entry that launches it:
+HTTP clients. Its upstream leg runs on an older MCP revision, so the bridge
+restores the `resultType: "complete"` field the 2026-07-28 revision requires on
+the `tools/list` and `tools/call` results it forwards; rmcp drops it again for a
+stdio client on an older revision. It has two modes, chosen by the entry that launches it:
 
 - session-aware (Claude Code, `install-mcp --client claude-code
   --session-aware`, and every Claude Code entry on a token-file install; and
