@@ -39,10 +39,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Search now matches the parts of a hyphenated or underscored word: `alpha`
   finds a note that writes `foo-bar-alpha`, `memory` finds `ai-memory`, and
-  the whole token keeps matching too. The index gained a second spelling of
-  the same text (migration V100), so the tokenizer stays as it was and no
-  stored row changes; the migration rebuilds the search index once on open
-  (#2013).
+  the whole token keeps matching too. A `title:` or `body:` filter reaches
+  the parts as well. The page and observation search indexes gained a second
+  spelling of the same text (migration V100), so the tokenizer stays as it
+  was and no stored row changes. The first start after upgrading rebuilds
+  both indexes once, which takes longer on a large store, and they grow to
+  roughly twice their previous size (#2013).
 
 ## [3.4.2] - 2026-11-05
 
