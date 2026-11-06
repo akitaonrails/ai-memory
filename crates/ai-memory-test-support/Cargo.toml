@@ -16,6 +16,8 @@ test = false
 doctest = false
 
 [dependencies]
+# Same version ai-memory-cli uses; only for `refusing_port`.
+socket2 = "0.6.3"
 
 [lints]
 workspace = true

@@ -495,7 +495,8 @@ ai-memory run --yolo claude
   with its sandbox backend present: `bwrap` on Linux, `sandbox-exec` on
   macOS) and you are not already inside it, a second question offers to
   re-run the session inside it. When it is not usable (or on Windows) there is
-  no second question; the run just proceeds. Accepting re-execs the original
+  no second question; the run just proceeds. With an ai-jail older than
+  3.0.1, accepting re-execs the original
   command under `ai-jail --network --agent-state --env <NAME>... --`,
   forwarding only the credential/config
   environment variables that are already set (server/hook URL,

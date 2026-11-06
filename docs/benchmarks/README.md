@@ -13,6 +13,8 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-11-06** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.4.3 release)** | **0.951** | [longmemeval-s-3.4.3-release.md](longmemeval-s-3.4.3-release.md) |
+| **2026-11-06** | LongMemEval-S (v1) | **local embeddings + observation stream (3.4.3 release)** | **0.943** | [longmemeval-s-3.4.3-release.md](longmemeval-s-3.4.3-release.md) |
 | **2026-11-04** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.4.0 release)** | **0.951** | [longmemeval-s-3.4.0-release.md](longmemeval-s-3.4.0-release.md) |
 | **2026-11-04** | LongMemEval-S (v1) | **local embeddings + observation stream (3.4.0 release)** | **0.940** | [longmemeval-s-3.4.0-release.md](longmemeval-s-3.4.0-release.md) |
 | **2026-11-03** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.3.3 release)** | **0.951** | [longmemeval-s-3.3.3-release.md](longmemeval-s-3.3.3-release.md) |

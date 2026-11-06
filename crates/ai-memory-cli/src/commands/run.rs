@@ -3101,10 +3101,12 @@ struct ChecklistOutcome {
     folders: Vec<super::jail_folders::ExtraFolder>,
 }
 
+/// A folder's name is a directory entry, possibly inside a cloned
+/// repository, so it is neutralized like the folder picker's own summary.
 fn folder_names(folders: &[super::jail_folders::ExtraFolder]) -> String {
     folders
         .iter()
-        .map(super::jail_folders::ExtraFolder::label)
+        .map(|folder| super::show::terminal_text(&folder.label()))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -7182,6 +7184,19 @@ mod tests {
     }
 
     #[test]
+    fn jail_summary_neutralizes_terminal_controls_in_folder_names() {
+        let summary = jail_summary(
+            &[],
+            false,
+            &[folder("/w/evil\u{1b}]0;x\u{7}\u{202e}dir", false)],
+        );
+        assert!(!summary.contains('\u{1b}'), "{summary:?}");
+        assert!(!summary.contains('\u{7}'), "{summary:?}");
+        assert!(!summary.contains('\u{202e}'), "{summary:?}");
+        assert!(summary.contains("evil"), "{summary:?}");
+    }
+
+    #[test]
     fn jail_summary_groups_credentials_capabilities_and_forced_off() {
         let choice = |stem, enable| JailToggleChoice {
             stem,
@@ -8230,10 +8245,8 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_notice_reports_an_unreachable_server_as_unavailable() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let endpoint = ServerEndpoint::from_pair(Some(format!("http://{address}")), None);
+        let refusing = ai_memory_test_support::refusing_port();
+        let endpoint = ServerEndpoint::from_pair(Some(refusing.url()), None);
         let mut health = HeartbeatHealth::default();
 
         let error = send_managed_heartbeat_with_timeout(

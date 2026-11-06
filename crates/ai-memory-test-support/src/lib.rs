@@ -8,7 +8,73 @@
 //! workspace costs a link and, on macOS and Windows, a first-run scan, and the
 //! helpers here are exercised by every test that calls them.
 
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
+
+/// A loopback port that refuses every connection and stays reserved for as
+/// long as this value lives.
+///
+/// A port found by binding a listener and dropping it is free again at once,
+/// so under `cargo test`, where a binary's tests run as threads in one process,
+/// another test's server can take it. The "dead" endpoint then answers and
+/// counts requests that were never its own (#2030). Here the socket stays
+/// bound but never listens: the kernel refuses connections to it, and nothing
+/// else can bind the port. Unlike [`dead_http_endpoint`], a connection to it
+/// fails before it is established, which is what tests of connect-level
+/// failures need.
+pub struct RefusingPort {
+    socket: socket2::Socket,
+    addr: SocketAddr,
+}
+
+impl RefusingPort {
+    /// The reserved loopback address.
+    #[must_use]
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// `http://127.0.0.1:<port>`.
+    #[must_use]
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Start listening on the reserved port, for a test whose server comes
+    /// back at the same address. The listener is non-blocking, ready for
+    /// `tokio::net::TcpListener::from_std`.
+    ///
+    /// # Panics
+    /// Panics if the socket cannot listen.
+    #[must_use]
+    pub fn into_listener(self) -> TcpListener {
+        self.socket
+            .listen(128)
+            .expect("listen on the reserved port");
+        let listener: TcpListener = self.socket.into();
+        listener
+            .set_nonblocking(true)
+            .expect("set the listener non-blocking");
+        listener
+    }
+}
+
+/// Reserve a loopback port that refuses connections; see [`RefusingPort`].
+///
+/// # Panics
+/// Panics if a loopback TCP socket cannot be created or bound.
+#[must_use]
+pub fn refusing_port() -> RefusingPort {
+    use socket2::{Domain, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).expect("create a TCP socket");
+    let any: SocketAddr = "127.0.0.1:0".parse().expect("loopback address");
+    socket.bind(&any.into()).expect("bind a loopback port");
+    let addr = socket
+        .local_addr()
+        .expect("read the bound address")
+        .as_socket()
+        .expect("an IP socket address");
+    RefusingPort { socket, addr }
+}
 
 /// A loopback HTTP endpoint that accepts every connection and closes it at
 /// once, so a request to it fails immediately with a connection error.

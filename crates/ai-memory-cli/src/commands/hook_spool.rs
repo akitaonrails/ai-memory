@@ -3443,13 +3443,10 @@ mod tests {
     /// 7-day TTL. An unreachable must not charge the attempt budget.
     #[tokio::test]
     async fn unreachable_outage_never_charges_attempt_budget() {
-        // A port with nothing on it: bind, read the address, then drop.
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_port = ai_memory_test_support::refusing_port();
+        let dead = dead_port.addr();
 
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
@@ -3493,12 +3490,10 @@ mod tests {
         use tokio::io::AsyncWriteExt as _;
 
         // Phase 1 — outage: nothing listens where the events were captured.
-        let dead_addr = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_addr_port = ai_memory_test_support::refusing_port();
+        let dead_addr = dead_addr_port.addr();
 
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
@@ -3524,11 +3519,9 @@ mod tests {
         }
         assert_eq!(sorted_attempts(&spool), vec![0, 0, 0]);
 
-        // Phase 2 — recovery: the server restarts on the same port. The
-        // listener never accepted, so the port carries no TIME_WAIT and the
-        // rebind is immediate.
-        let listener = tokio::net::TcpListener::bind(dead_addr)
-            .await
+        // Phase 2 — recovery: the server restarts on the same port, which
+        // the test held reserved during the outage.
+        let listener = tokio::net::TcpListener::from_std(dead_addr_port.into_listener())
             .expect("restart on the same port after the outage");
         tokio::spawn(async move {
             while let Ok((mut s, _)) = listener.accept().await {
@@ -4304,13 +4297,10 @@ mod tests {
         )
         .await;
 
-        // A port with nothing on it: bind, read the address, then drop.
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_port = ai_memory_test_support::refusing_port();
+        let dead = dead_port.addr();
 
         let tmp = tempfile::tempdir().unwrap();
         let spool = spool_dir(tmp.path());
@@ -4384,12 +4374,10 @@ mod tests {
             "200 OK",
         )
         .await;
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_port = ai_memory_test_support::refusing_port();
+        let dead = dead_port.addr();
 
         let tmp = tempfile::tempdir().unwrap();
         // Point this store's config at the server that is actually up.
@@ -4438,12 +4426,10 @@ mod tests {
     async fn a_profile_entry_on_a_dead_loopback_port_is_not_rerouted_to_the_default() {
         let default_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let live = serve_counting_hook(default_hits.clone(), "200 OK").await;
-        let dead = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = l.local_addr().unwrap();
-            drop(l);
-            a
-        };
+        // Bound but never listening: connections are refused and no parallel
+        // test can take the port (#2030).
+        let dead_port = ai_memory_test_support::refusing_port();
+        let dead = dead_port.addr();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("config.toml"),

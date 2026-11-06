@@ -28,11 +28,6 @@ type RecoveryServerState = (
     Arc<Mutex<Vec<(String, Value)>>>,
 );
 
-/// A loopback address nothing listens on: `free_port` binds and releases.
-fn closed_port_url() -> String {
-    format!("http://127.0.0.1:{}", crate::e2e_support::free_port())
-}
-
 fn write_script(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -273,7 +268,9 @@ async fn fake_recovery_server_on(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_run_launches_the_harness_without_the_server() {
     let fixture = Fixture::new();
-    let server = closed_port_url();
+    // Reserved and never listening, so no parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
     let output = run(&fixture, &server, &["run", "--no-autowire", "claude"]).await;
     assert!(output.status.success(), "{}", stderr_text(&output));
 
@@ -360,7 +357,9 @@ async fn unsupported_exporter_is_journaled_by_a_real_degraded_run_as_spool_only(
     drop(connection);
     write_script(&fixture.bin.join("agy"), "exit 0\n");
 
-    let server = closed_port_url();
+    // Reserved and never listening, so no parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
     let output = run(
         &fixture,
         &server,
@@ -536,7 +535,9 @@ async fn recover_drains_spool_then_replays_exact_degraded_transcript_idempotentl
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn require_server_fails_closed_when_offline() {
     let fixture = Fixture::new();
-    let server = closed_port_url();
+    // Reserved and never listening, so no parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
     let output = run(
         &fixture,
         &server,
@@ -565,7 +566,9 @@ async fn require_server_fails_closed_when_offline() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_autowire_wires_hooks_but_not_mcp() {
     let fixture = Fixture::new();
-    let server = closed_port_url();
+    // Reserved and never listening, so no parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
     let output = run(&fixture, &server, &["run", "claude"]).await;
     assert!(output.status.success(), "{}", stderr_text(&output));
     let output_stderr = stderr_text(&output);

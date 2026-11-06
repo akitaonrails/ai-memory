@@ -60,6 +60,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- The auto-improvement reviewer now has explicit instructions for user
+  corrections. When the user rejects, corrects, interrupts or undoes the
+  agent's work and gives a reason, it proposes a `_rules/` page, or a patch to
+  the one already on that topic, saying what to avoid, why and what to do
+  instead, and quotes the user verbatim as evidence. An approach that failed
+  for a technical reason goes to `gotchas/`. It recognizes a correction by
+  meaning rather than by keywords, so the language does not matter, counts
+  only `user-prompt` observations, and skips a refusal with no reason or a
+  one-off rename. Proposals still follow the approval policy. (#1992)
+
+## [3.4.3] - 2026-11-06
+
+### Changed
+
 - `ai-memory run --yolo` is now the only yolo switch. For Claude it also
   forces `bypassPermissions` over a `defaultMode` in your settings, which
   used to need `--true-yolo`; other harnesses are unchanged. `--true-yolo`
@@ -71,17 +85,16 @@ version in [`docs/changelog/`](docs/changelog/):
   pause the run, and the `--yolo` warning and ai-jail offer are unchanged
   (maintainer request).
 
-- The auto-improvement reviewer now has explicit instructions for user
-  corrections. When the user rejects, corrects, interrupts or undoes the
-  agent's work and gives a reason, it proposes a `_rules/` page, or a patch to
-  the one already on that topic, saying what to avoid, why and what to do
-  instead, and quotes the user verbatim as evidence. An approach that failed
-  for a technical reason goes to `gotchas/`. It recognizes a correction by
-  meaning rather than by keywords, so the language does not matter, counts
-  only `user-prompt` observations, and skips a refusal with no reason or a
-  one-off rename. Proposals still follow the approval policy. (#1992)
-
 ### Fixed
+
+- The abandoned-session sweep no longer queues an auto-improvement review for
+  every session it closes. Closing a session stamps `ended_at`, which made it a
+  scheduled review candidate, so the first sweep after an upgrade could queue
+  every long-idle session at once. The sweep now parks a claim for each session
+  it closes, in the same transaction. A real `SessionEnd` with new observations,
+  or a handoff that reopens the session, removes the claim. The experience pass
+  no longer counts these sessions, and manual `ai-memory auto-improve
+  --session-id` still reviews them (#2026).
 
 - The built-in `api_key` sanitizer rule no longer starts inside an ordinary
   word. Because nothing anchored its left side, `sk-` matched inside
@@ -229,7 +242,8 @@ version in [`docs/changelog/`](docs/changelog/):
   spelling of the same text (migration V100), so the tokenizer stays as it
   was and no stored row changes. The first start after upgrading rebuilds
   both indexes once, which takes longer on a large store, and they grow to
-  roughly twice their previous size (#2013).
+  roughly twice their previous size. A 3.4.2 binary refuses a store this
+  release has upgraded, so keep a backup if you may need to go back (#2013).
 
 - The dashboard's icons no longer show as empty boxes on macOS. The three
   shipped web fonts are Latin subsets, so the geometric and symbol
@@ -4490,7 +4504,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.2...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.3...HEAD
+[3.4.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.3
 [3.4.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.2
 [3.4.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.1
 [3.4.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.0

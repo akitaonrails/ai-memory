@@ -429,8 +429,8 @@ pub enum Command {
     /// file. Requires the root bearer token on a multi-user server.
     Profile(ProfileArgs),
     /// Manage local server profiles, which a repository's `.ai-memory.toml`
-    /// selects with `server = "<name>"` to route its hook capture to a
-    /// different ai-memory server.
+    /// selects with `server = "<name>"` to route its hook capture, and the
+    /// project-scoped commands run there, to a different ai-memory server.
     Server(ServerArgs),
     /// Print a shell-completion script to stdout. Generated from this
     /// binary's own command tree, so it never drifts from the real CLI

@@ -361,7 +361,15 @@ Default-available auto-improvement must not surprise existing installs:
    records a per-session claim before scheduled LLM work. Historical sessions are
    not reviewed automatically on upgrade, and failed scheduled reviews are not
    retried forever. Manual auto-improve remains the catch-up path for old or
-   failed scheduled sessions.
+   failed scheduled sessions. A session the abandoned-session sweep closes
+   (open with no activity for 48 hours and no `SessionEnd`) also gets a parked
+   claim in the same transaction, so the sweep itself never queues a review:
+   a real `SessionEnd` with new observations or a handoff that reopens the
+   session un-parks the claim, a `SessionEnd` without new observations answers
+   `AlreadyEnded` and leaves it parked, and `experience_pass_due` does not count
+   sweep-parked sessions. Manual
+   `ai-memory auto-improve --session-id` reviews a sweep-closed session either
+   way.
 4. Pending proposal storage must use additive, idempotent migrations that
     preserve all existing wiki files and session/observation rows.
 5. Existing installed `CLAUDE.md`/`AGENTS.md` blocks remain valid. Operators pick
