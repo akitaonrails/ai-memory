@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A hook event whose session was first captured under another agent label is
+  no longer accepted with `202` and then dropped without a trace on every
+  delivery. The server logs the drop once per session, naming the agent that
+  holds the session, and answers that caller's later `POST /hook` events for
+  the session with `409` and `{"error":"agent_mismatch","bound_agent":"…"}`,
+  so a client can tell what happened. Only the session's own operator learns
+  the bound agent; another operator's events for the same id get the same
+  opaque drop as before. Every first-party hook client treats the 409 as
+  final, and the native client no longer spends retry attempts on it. Drops
+  still count under `dropped_collision` in `ai-memory status` (#2023).
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is

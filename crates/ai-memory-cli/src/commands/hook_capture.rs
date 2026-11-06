@@ -960,9 +960,10 @@ pub enum PostOutcome {
     /// so the drain can skip past them instead of stopping at the first one
     /// (#493).
     Unreachable,
-    /// `403` — the server understood the request and will never accept it.
-    /// Today that means the author may not write the project
-    /// the event belongs to.
+    /// `403` or `409` — the server understood the request and will never
+    /// accept it. A 403 means the author may not write the project the event
+    /// belongs to; a 409 means the session was first captured under another
+    /// agent (#2023).
     ///
     /// Terminal, and that is the whole point of separating it from
     /// [`Self::Failed`]. A refusal that counts as a failure gets re-sent until
@@ -1007,7 +1008,14 @@ pub async fn post_hook(
             PostOutcome::Saturated
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => PostOutcome::Unauthorized,
-        Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => PostOutcome::Refused,
+        Ok(resp)
+            if matches!(
+                resp.status(),
+                reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::CONFLICT
+            ) =>
+        {
+            PostOutcome::Refused
+        }
         Ok(_) => PostOutcome::Failed,
         Err(_) => PostOutcome::Unreachable,
     }
@@ -1393,6 +1401,19 @@ mod tests {
             PostOutcome::Failed,
             "a refusal must never be charged a retry attempt"
         );
+    }
+
+    #[tokio::test]
+    async fn post_hook_agent_mismatch_409_is_terminal_not_a_failure() {
+        // #2023: a 409 names the agent the session is bound to. Re-sending the
+        // same event cannot change that, so it must not burn retry attempts.
+        let url = serve_once(
+            "409 Conflict",
+            r#"{"error":"agent_mismatch","bound_agent":"claude-code"}"#,
+        )
+        .await;
+        let outcome = post_hook(&build_client(), &url, "{}", None, Duration::from_secs(1)).await;
+        assert_eq!(outcome, PostOutcome::Refused);
     }
 
     #[tokio::test]

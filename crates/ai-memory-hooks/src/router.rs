@@ -155,6 +155,81 @@ const CWD_PROBE_MAX_IN_FLIGHT: usize = 4;
 /// How long one cwd resolution waits for its probe, permit included.
 const CWD_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long [`SessionAgents`] trusts what it learned about a session. A
+/// session's agent never changes, so this bounds only the rare staleness of a
+/// session row deleted by a purge and recreated under another agent.
+const SESSION_AGENT_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Most `(session, caller)` pairs [`SessionAgents`] remembers at once.
+const SESSION_AGENT_MAX_ENTRIES: usize = 4096;
+
+type SessionAgentKey = (SessionId, Option<String>);
+
+/// The agent each recently admitted hook session is bound to, per caller
+/// (#2023).
+///
+/// `POST /hook` answers before the store sees the event, so the agent check
+/// in `admit_hook_session_event` cannot reach the client. This in-memory view
+/// of what the store already decided lets the handler refuse a session it
+/// knows is bound to another agent with a `409` instead of a `202` that
+/// silently drops, without a database round trip on the hook path. It only
+/// ever refuses: an empty, expired or evicted entry falls through to the
+/// store, which stays the authority. Keys carry the caller's identity, so a
+/// caller learns only what the store's owner check already told that caller.
+#[derive(Clone, Default)]
+pub struct SessionAgents {
+    entries: Arc<std::sync::Mutex<HashMap<SessionAgentKey, (AgentKind, std::time::Instant)>>>,
+}
+
+impl SessionAgents {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<SessionAgentKey, (AgentKind, std::time::Instant)>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The agent `session` is bound to, as last seen for `caller`.
+    fn bound_agent(
+        &self,
+        session: SessionId,
+        caller: Option<&str>,
+        now: std::time::Instant,
+    ) -> Option<AgentKind> {
+        self.lock()
+            .get(&(session, caller.map(str::to_owned)))
+            .filter(|(_, seen)| now.saturating_duration_since(*seen) < SESSION_AGENT_TTL)
+            .map(|(agent, _)| *agent)
+    }
+
+    /// Remember that the store bound `session` to `agent` for `caller`.
+    /// Returns whether this is news (first sighting, a changed agent, or an
+    /// expired entry), so a refusal is logged once rather than per event.
+    fn record(
+        &self,
+        session: SessionId,
+        caller: Option<&str>,
+        agent: AgentKind,
+        now: std::time::Instant,
+    ) -> bool {
+        let mut entries = self.lock();
+        let key = (session, caller.map(str::to_owned));
+        if !entries.contains_key(&key) && entries.len() >= SESSION_AGENT_MAX_ENTRIES {
+            entries.retain(|_, (_, seen)| now.saturating_duration_since(*seen) < SESSION_AGENT_TTL);
+            if entries.len() >= SESSION_AGENT_MAX_ENTRIES {
+                // Full of live sessions: remember nothing new. The store
+                // still refuses the event; only the early 409 is lost.
+                return true;
+            }
+        }
+        entries
+            .insert(key, (agent, now))
+            .is_none_or(|(previous, seen)| {
+                previous != agent || now.saturating_duration_since(seen) >= SESSION_AGENT_TTL
+            })
+    }
+}
+
 /// Runs the hook resolver's filesystem probes of a caller-supplied cwd (git
 /// discovery, canonicalization) off the async workers (#1514).
 ///
@@ -569,6 +644,9 @@ pub struct HookState {
     /// Project/key gates that serialize an original delivery with an
     /// overlapping retry until the first processor marks completion or exits.
     pub ingest_gates: IngestGates,
+    /// Agent each recently admitted session is bound to, so `POST /hook` can
+    /// answer a mismatched agent with `409` (#2023).
+    pub session_agents: SessionAgents,
     /// Bounded blocking path for the resolver's filesystem probes of a
     /// caller's cwd, so a stuck `open()` cannot stall the async workers.
     pub cwd_probes: CwdProbes,
@@ -814,10 +892,25 @@ async fn handle_hook(
 ) -> impl IntoResponse {
     let metrics = state.ingest_metrics.clone();
     let _timer = metrics.hook_latency().start();
-    admit_hook(
+    let (status, reason) = admit_hook(
         state, query, actor_ext, level_ext, viewer_ext, headers, body,
     )
-    .await
+    .await;
+    hook_reply(status, reason)
+}
+
+/// Render an [`admit_hook`] answer. A `409` is the one refusal a client can
+/// act on — resend under the bound agent, or fix its label — so its reason,
+/// the bound agent's wire name, goes out as JSON (#2023).
+fn hook_reply(status: StatusCode, reason: &'static str) -> Response {
+    if status == StatusCode::CONFLICT {
+        return (
+            status,
+            Json(serde_json::json!({ "error": "agent_mismatch", "bound_agent": reason })),
+        )
+            .into_response();
+    }
+    (status, reason).into_response()
 }
 
 async fn admit_hook(
@@ -887,6 +980,26 @@ async fn admit_hook(
     // Capture request extensions before the spawned processor owns the event.
     let actor = actor_identity(actor_ext);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
+    // A session the store already bound to another agent for this caller is
+    // refused here, where the client can still see it (#2023). In memory
+    // only, and ahead of the semaphore, so it costs no capacity.
+    if let Some(bound) = env.session_id.as_deref().and_then(|raw| {
+        state.session_agents.bound_agent(
+            SessionId::from_native(raw),
+            actor_storage_key.as_deref(),
+            std::time::Instant::now(),
+        )
+    }) && bound != env.agent
+    {
+        HookProcessingOutcome::DroppedCollision.record(&state.ingest_metrics);
+        debug!(
+            agent = %env.agent.as_str(),
+            bound_agent = %bound.as_str(),
+            event = ?env.event,
+            "hook event names a session bound to another agent; answering 409"
+        );
+        return (StatusCode::CONFLICT, bound.as_str());
+    }
     let skip_webhooks = admission_skips(level_ext, &headers);
     let Ok(permit) = state.ingest_semaphore.clone().try_acquire_owned() else {
         state.ingest_metrics.record_shed_saturated();
@@ -1267,6 +1380,15 @@ async fn handle_hook_batch(
                 ) =>
             {
                 warn!(session = ?session, agent = %agent.as_str(), event = ?event, reason = SESSION_COLLISION_REASON, "hook batch session collision dropped");
+                HookProcessingOutcome::DroppedCollision
+            }
+            // Already logged once per session by `process_authorized`.
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<StoreError>(),
+                    Some(StoreError::SessionAgentMismatch { .. })
+                ) =>
+            {
                 HookProcessingOutcome::DroppedCollision
             }
             Err(e)
@@ -4554,6 +4676,15 @@ async fn process_envelope(
             );
             HookProcessingOutcome::DroppedCollision
         }
+        // Already logged once per session by `process_authorized`.
+        Err(e)
+            if matches!(
+                e.downcast_ref::<StoreError>(),
+                Some(StoreError::SessionAgentMismatch { .. })
+            ) =>
+        {
+            HookProcessingOutcome::DroppedCollision
+        }
         Err(e)
             if matches!(
                 e.downcast_ref::<StoreError>(),
@@ -4709,7 +4840,7 @@ async fn process(
         Err(error)
             if matches!(
                 error.downcast_ref::<StoreError>(),
-                Some(StoreError::SessionCollision)
+                Some(StoreError::SessionCollision | StoreError::SessionAgentMismatch { .. })
             ) =>
         {
             Ok(())
@@ -4979,6 +5110,7 @@ async fn process_authorized(
         env.project_source,
         true,
     );
+    let caller = actor.as_ref().map(IdentityKey::storage_key);
     let mut attempts = 0;
     // Keep the successful keyed-ingest gate until every downstream effect has
     // completed. A replay that observes `ResumePending` must not race the first
@@ -5030,7 +5162,35 @@ async fn process_authorized(
             )
             .await;
         match result {
-            Ok(admission) => break (admission, log_title, ingest_guard),
+            Ok(admission) => {
+                state.session_agents.record(
+                    session_id,
+                    caller.as_deref(),
+                    env.agent,
+                    std::time::Instant::now(),
+                );
+                break (admission, log_title, ingest_guard);
+            }
+            Err(StoreError::SessionAgentMismatch { bound }) => {
+                // Once per session and caller: the handler answers this
+                // caller's later deliveries with 409 instead (#2023).
+                if state.session_agents.record(
+                    session_id,
+                    caller.as_deref(),
+                    bound,
+                    std::time::Instant::now(),
+                ) {
+                    warn!(
+                        session = %session_id,
+                        agent = %env.agent.as_str(),
+                        bound_agent = %bound.as_str(),
+                        event = ?env.event,
+                        "hook event dropped: its session was first captured under another agent; \
+                         later deliveries from this caller are answered 409"
+                    );
+                }
+                return Err(StoreError::SessionAgentMismatch { bound }.into());
+            }
             Err(error)
                 if pinned_scope.is_none()
                     && attempts == 0
@@ -8556,6 +8716,7 @@ pub(crate) mod tests {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             ingest_gates: IngestGates::default(),
+            session_agents: SessionAgents::default(),
             cwd_probes: CwdProbes::default(),
             per_user_slots: false,
             mid_session_routing: MidSessionRouting::default(),
@@ -14765,6 +14926,157 @@ pub(crate) mod tests {
         assert_ne!(
             proj_new, proj,
             "a fresh project replaced the moved one for this cwd"
+        );
+    }
+
+    /// The session-agent view is bounded and forgets: an expired entry no
+    /// longer refuses, a full map of live sessions remembers nothing new (the
+    /// store still refuses), and the same fact is news only once.
+    #[test]
+    fn session_agents_expire_stay_bounded_and_report_news_once() {
+        let agents = SessionAgents::default();
+        let now = std::time::Instant::now();
+        let first = SessionId::new();
+        assert!(agents.record(first, Some("user:alice"), AgentKind::ClaudeCode, now));
+        assert!(!agents.record(first, Some("user:alice"), AgentKind::ClaudeCode, now));
+        assert_eq!(
+            agents.bound_agent(first, Some("user:alice"), now),
+            Some(AgentKind::ClaudeCode)
+        );
+        assert_eq!(agents.bound_agent(first, Some("user:bob"), now), None);
+        assert_eq!(agents.bound_agent(first, None, now), None);
+        assert_eq!(
+            agents.bound_agent(first, Some("user:alice"), now + SESSION_AGENT_TTL),
+            None,
+            "an expired entry must fall through to the store"
+        );
+
+        for _ in 1..SESSION_AGENT_MAX_ENTRIES {
+            agents.record(SessionId::new(), None, AgentKind::Codex, now);
+        }
+        let late = SessionId::new();
+        agents.record(late, None, AgentKind::Codex, now);
+        assert_eq!(
+            agents.bound_agent(late, None, now),
+            None,
+            "full: nothing new"
+        );
+        assert_eq!(agents.lock().len(), SESSION_AGENT_MAX_ENTRIES);
+        // Once the old entries expire, room is made again.
+        let later = now + SESSION_AGENT_TTL;
+        agents.record(late, None, AgentKind::Codex, later);
+        assert_eq!(
+            agents.bound_agent(late, None, later),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(agents.lock().len(), 1);
+    }
+
+    /// #2023: once the store has bound a session to an agent, `POST /hook`
+    /// answers that caller's events under another agent with a 409 naming the
+    /// bound agent instead of a 202 that silently drops them. Another
+    /// operator naming the same session id learns nothing: it still gets the
+    /// ordinary 202 and the store's opaque refusal.
+    #[tokio::test]
+    async fn agent_mismatch_is_a_409_naming_the_bound_agent_only_to_its_caller() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.trusted_proxy_identity = true;
+        let cwd = "/home/user/mismatch-project";
+        let session = "8d6f1f9e-2b7c-4a55-9a51-0c0f6f1f2023";
+        let alice = IdentityKey::User("alice".into());
+        let as_user = |name: &str| {
+            Some(axum::Extension(ai_memory_core::ActorContext {
+                user: Some(name.into()),
+                ..Default::default()
+            }))
+        };
+        let post = |state: HookState, user: &'static str, agent: &'static str| async move {
+            let response = handle_hook(
+                State(Arc::new(state)),
+                Query(HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some(agent.into()),
+                    cwd: Some(cwd.into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                }),
+                as_user(user),
+                None,
+                None,
+                HeaderMap::new(),
+                Json(serde_json::json!({ "session_id": session, "cwd": cwd })),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        };
+
+        process(
+            &state,
+            session_envelope("session-start", session, cwd),
+            Some(alice.clone()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let drops = state.ingest_metrics.snapshot().dropped_collision;
+
+        let (status, body) = post(state.clone(), "alice", "dsh").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({ "error": "agent_mismatch", "bound_agent": "claude-code" })
+        );
+        assert_eq!(
+            state.ingest_metrics.snapshot().dropped_collision,
+            drops + 1,
+            "the refusal is counted with the other collisions"
+        );
+        // Another operator naming the same id, under either agent, is not
+        // told which harness holds it.
+        for agent in ["dsh", "claude-code"] {
+            assert_eq!(
+                post(state.clone(), "bob", agent).await,
+                (StatusCode::ACCEPTED, "queued".into()),
+                "{agent}"
+            );
+        }
+        // Control: the owner under the bound agent is queued as before.
+        assert_eq!(
+            post(state.clone(), "alice", "claude-code").await,
+            (StatusCode::ACCEPTED, "queued".into())
+        );
+
+        // The first mismatched delivery after a restart still reaches the
+        // store, which refuses it and teaches the handler for the next one.
+        state.session_agents = SessionAgents::default();
+        let mut dsh = session_envelope("post-tool-use", session, cwd);
+        dsh.agent = AgentKind::Dsh;
+        let error = process_authorized(
+            &state,
+            dsh,
+            Some(alice),
+            ai_memory_core::AuthLevel::Anonymous,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::SessionAgentMismatch {
+                bound: AgentKind::ClaudeCode
+            })
+        ));
+        assert_eq!(
+            post(state.clone(), "alice", "dsh").await.0,
+            StatusCode::CONFLICT
         );
     }
 

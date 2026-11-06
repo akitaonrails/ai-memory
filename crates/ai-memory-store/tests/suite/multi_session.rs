@@ -5816,3 +5816,127 @@ async fn a_refused_link_names_the_holder_only_for_the_runs_own_operator_and_harn
     assert_eq!(holder("mine-new").await, None);
     assert_eq!(holder("never-seen").await, None);
 }
+
+/// #2023: a hook event that names a session under another agent is refused
+/// with the bound agent, so the client can tell what went wrong — but only
+/// once the owner check has admitted the caller. Another operator naming the
+/// same session id under any agent still gets the opaque collision, which
+/// says nothing about whose session it is or which harness holds it.
+#[tokio::test]
+async fn agent_mismatch_names_the_bound_agent_only_to_an_admitted_owner() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let alice = operator("alice");
+    let session = |id: SessionId, agent_kind: AgentKind, owner: Option<&str>| NewSession {
+        occurred_at: None,
+        id,
+        workspace_id: ws,
+        project_id: proj,
+        agent_kind,
+        cwd: Some("/repo".into()),
+        actor_user: owner.map(str::to_owned),
+    };
+    let event = |id: SessionId| {
+        Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "body".into(),
+                importance: 3,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        )
+    };
+    let admit = |new: NewSession, filter: OwnerFilter| {
+        let id = new.id;
+        store
+            .writer
+            .admit_hook_session_event(new, event(id), filter, None, None)
+    };
+
+    let owned = SessionId::new();
+    admit(
+        session(owned, AgentKind::ClaudeCode, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await
+    .unwrap();
+
+    // Another operator, under the bound agent and under another one: opaque.
+    for agent in [AgentKind::ClaudeCode, AgentKind::Dsh] {
+        let refused = admit(
+            session(owned, agent, Some(&operator("bob"))),
+            OwnerFilter::User(operator("bob")),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(StoreError::SessionCollision)),
+            "a foreign owner must not learn the bound agent ({agent:?}): {refused:?}"
+        );
+    }
+    // The owner under another agent learns which agent holds the session.
+    let mismatch = admit(
+        session(owned, AgentKind::Dsh, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await;
+    assert!(
+        matches!(
+            mismatch,
+            Err(StoreError::SessionAgentMismatch {
+                bound: AgentKind::ClaudeCode
+            })
+        ),
+        "{mismatch:?}"
+    );
+
+    // A shared (unowned) session is everyone's, so any caller may learn it.
+    let shared = SessionId::new();
+    admit(
+        session(shared, AgentKind::ClaudeCode, None),
+        OwnerFilter::Unattributed,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        admit(
+            session(shared, AgentKind::Dsh, Some(&operator("bob"))),
+            OwnerFilter::User(operator("bob")),
+        )
+        .await,
+        Err(StoreError::SessionAgentMismatch {
+            bound: AgentKind::ClaudeCode
+        })
+    ));
+
+    // Control: the owner under the bound agent is stored; no refusal stored
+    // anything.
+    admit(
+        session(owned, AgentKind::ClaudeCode, Some(&alice)),
+        OwnerFilter::User(alice.clone()),
+    )
+    .await
+    .unwrap();
+    let stored = store
+        .reader
+        .with_conn(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                [owned.as_bytes()],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, 2, "only the owner's two same-agent events land");
+}
