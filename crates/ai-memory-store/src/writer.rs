@@ -345,6 +345,10 @@ pub(crate) enum WriteCmd {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
     },
+    InsertManualHandoff {
+        handoff: NewHandoff,
+        reply: oneshot::Sender<StoreResult<HandoffId>>,
+    },
     CheckpointSessionHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<Option<HandoffId>>>,
@@ -1972,6 +1976,18 @@ impl WriterHandle {
     pub async fn insert_handoff(&self, handoff: NewHandoff) -> StoreResult<HandoffId> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::InsertHandoff { handoff, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Insert an explicit `memory_handoff_begin` handoff in `open` state. See
+    /// `ops::insert_manual_handoff`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn insert_manual_handoff(&self, handoff: NewHandoff) -> StoreResult<HandoffId> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertManualHandoff { handoff, reply: tx })
             .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
@@ -4551,6 +4567,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
                 send_or_warn(reply, result, "insert_handoff");
+            }
+            WriteCmd::InsertManualHandoff { handoff, reply } => {
+                let result = ops::insert_manual_handoff(&mut conn, &handoff);
+                send_or_warn(reply, result, "insert_manual_handoff");
             }
             WriteCmd::CheckpointSessionHandoff { handoff, reply } => {
                 let result = ops::checkpoint_session_handoff(&mut conn, &handoff);

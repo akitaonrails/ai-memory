@@ -2901,11 +2901,25 @@ impl AiMemoryServer {
         session_id: Option<SessionId>,
         actor: &ai_memory_core::ActorContext,
     ) -> Result<Option<AgentKind>, McpError> {
+        Ok(self
+            .caller_session_in_scope(ws, proj, session_id, actor)
+            .await?
+            .map(|summary| AgentKind::from_wire(&summary.agent_kind)))
+    }
+
+    /// The caller's session row, under the same scope and owner rule as
+    /// [`Self::caller_session_agent_in_scope`].
+    async fn caller_session_in_scope(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: Option<SessionId>,
+        actor: &ai_memory_core::ActorContext,
+    ) -> Result<Option<ai_memory_store::SessionSummary>, McpError> {
         let Some(session_id) = session_id else {
             return Ok(None);
         };
-        let summary = self
-            .reader
+        self.reader
             .session_summary_scoped(
                 ws,
                 proj,
@@ -2913,8 +2927,7 @@ impl AiMemoryServer {
                 ai_memory_core::OwnerFilter::for_actor_context(actor),
             )
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(summary.map(|summary| AgentKind::from_wire(&summary.agent_kind)))
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
     /// Refuse a message-queue change whose project was inferred rather than
@@ -6819,13 +6832,39 @@ impl AiMemoryServer {
                 })?;
             ai_memory_core::owner_stamp(creator.identity_key().as_ref(), distinguishes)
         };
+        // Attribute the handoff to the caller's own hook session the way
+        // `memory_message_send` attributes a message: the session id comes from
+        // the session-aware client (a header the caller controls), so it counts
+        // only when that session is recorded in this handoff's scope under the
+        // caller's owner filter. Anything else, a static client included, is
+        // a handoff with no source session, exactly as before (#2014).
+        let caller_session = self
+            .caller_session_in_scope(
+                ws,
+                proj,
+                Self::caller_hook_session_id(&parts)
+                    .as_deref()
+                    .map(SessionId::from_native),
+                &creator,
+            )
+            .await?;
+        let from_agent = caller_session
+            .as_ref()
+            .map(|session| AgentKind::from_wire(&session.agent_kind))
+            .or_else(|| creator.agent.as_deref().map(AgentKind::from_wire))
+            .unwrap_or(AgentKind::Other);
+        let cwd = args.cwd.or_else(|| {
+            caller_session
+                .as_ref()
+                .and_then(|session| session.cwd.clone())
+        });
         let handoff = NewHandoff {
             workspace_id: ws,
             project_id: proj,
-            from_session_id: None,
-            from_agent: AgentKind::Other,
+            from_session_id: caller_session.as_ref().map(|session| session.session_id),
+            from_agent,
             to_agent: None,
-            cwd: args.cwd.map(std::path::PathBuf::from),
+            cwd: cwd.map(std::path::PathBuf::from),
             summary: cap_text_with_marker(
                 &s.scrub(&args.summary),
                 HANDOFF_SUMMARY_MAX_CHARS,
@@ -6846,12 +6885,16 @@ impl AiMemoryServer {
             .authorize_operation(ws, proj, ai_memory_wiki::AdmissionOp::HandoffBegin, &parts)
             .await
             .map_err(|error| Self::with_manifest_warning(error, manifest_warning.as_ref()))?;
-        let id = self.writer.insert_handoff(handoff).await.map_err(|e| {
-            Self::with_manifest_warning(
-                McpError::internal_error(e.to_string(), None),
-                manifest_warning.as_ref(),
-            )
-        })?;
+        let id = self
+            .writer
+            .insert_manual_handoff(handoff)
+            .await
+            .map_err(|e| {
+                Self::with_manifest_warning(
+                    McpError::internal_error(e.to_string(), None),
+                    manifest_warning.as_ref(),
+                )
+            })?;
         self.notify_operation_observers(admission.as_ref());
         let mut result = serde_json::json!({ "handoff_id": id.to_string() });
         if let Some(warning) = manifest_warning {
@@ -7073,13 +7116,29 @@ impl AiMemoryServer {
                 // session (or a caller the owner does not admit) gets `false`
                 // here; returning the handoff anyway would hand the same baton
                 // to two agents.
+                // Record the claiming harness the way handoff_begin records the
+                // sender: from the caller's own session in this scope, never a
+                // free argument. The session itself stays off the claim, whose
+                // receiver check allows one baton per session and is the
+                // SessionStart hook's to spend.
+                let accepting_agent = self
+                    .caller_session_agent_in_scope(
+                        ws,
+                        proj,
+                        Self::caller_hook_session_id(&parts)
+                            .as_deref()
+                            .map(SessionId::from_native),
+                        &crate::actor::actor_from_parts(&parts),
+                    )
+                    .await?
+                    .unwrap_or(AgentKind::Other);
                 let claimed = self
                     .writer
                     .accept_handoff(ai_memory_core::HandoffAcceptance {
                         handoff_id: h.scope.id,
                         workspace_id: ws,
                         project_id: proj,
-                        accepting_agent: AgentKind::Other,
+                        accepting_agent,
                         accepting_session: None,
                         accepting_user: actor_user.clone(),
                         owner_filter: owner_filter.clone(),
@@ -7089,8 +7148,24 @@ impl AiMemoryServer {
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 if claimed {
                     self.notify_operation_observers(admission.as_ref());
+                    // Return the row as the claim left it, not the open row read
+                    // before it (#2014). Only a purge between the commit and
+                    // this read can miss it; the pre-claim row then gets the
+                    // claim's own fields.
+                    let claimed_row = self
+                        .reader
+                        .handoff_by_id_in_scope(ws, proj, h.scope.id, owner_filter)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                        .unwrap_or_else(|| {
+                            let mut row = h;
+                            row.lifecycle.state = HandoffState::Accepted;
+                            row.lifecycle.accepted_by = Some(accepting_agent);
+                            row.lifecycle.accepted_by_user = actor_user;
+                            row
+                        });
                     ok_json(&serde_json::json!({
-                        "handoff": h,
+                        "handoff": claimed_row,
                         "status": HandoffAcceptStatus::Claimed,
                     }))
                 } else {

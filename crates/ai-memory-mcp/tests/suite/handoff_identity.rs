@@ -454,3 +454,163 @@ async fn consumed_by_hook_is_reported_only_to_the_session_that_claimed_it() {
         "claimed",
     );
 }
+
+/// Open handoffs by summary, read straight from the store.
+async fn handoffs_by_summary(
+    h: &Harness,
+) -> std::collections::HashMap<String, ai_memory_core::Handoff> {
+    h.store
+        .reader
+        .list_handoffs(h.ws, h.proj, None, ai_memory_core::OwnerFilter::Any, 50)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|handoff| (handoff.content.summary.clone(), handoff))
+        .collect()
+}
+
+/// Begin a live Claude Code session under `native` for `owner` in `proj`.
+async fn claude_session(
+    h: &Harness,
+    proj: ai_memory_core::ProjectId,
+    native: &str,
+    owner: &str,
+) -> ai_memory_core::SessionId {
+    let id = ai_memory_core::SessionId::from_native(native);
+    h.store
+        .writer
+        .begin_session(ai_memory_core::NewSession {
+            occurred_at: None,
+            id,
+            workspace_id: h.ws,
+            project_id: proj,
+            agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+            cwd: Some("/repo".into()),
+            actor_user: Some(owner.to_owned()),
+        })
+        .await
+        .expect("session");
+    id
+}
+
+/// #2014: a handoff begun through the session-aware bridge records the
+/// caller's session, harness and cwd, as `memory_message_send` does. The
+/// session id is a header the caller controls, so it counts only for a session
+/// recorded in the handoff's own project under the caller's owner filter: a
+/// colleague forwarding Alice's id, and Alice naming her session in another
+/// project, get an unattributed handoff.
+#[tokio::test]
+async fn handoff_begin_records_only_the_callers_own_session() {
+    use ai_memory_core::AgentKind;
+
+    let h = harness(Some("dj"), true).await;
+    let alice = proxied("x-memory-actor-user", "alice");
+    let bob = proxied("x-memory-actor-user", "bob");
+    begin(&h.http, "static-client", &alice).await;
+    let owner = handoffs_by_summary(&h).await["static-client"]
+        .origin
+        .owner_user
+        .clone()
+        .expect("a proxied operator owns the baton");
+    let other_proj = h
+        .store
+        .writer
+        .get_or_create_project(h.ws, "other", None)
+        .await
+        .expect("other project");
+    let session = claude_session(&h, h.proj, "alice-claude", &owner).await;
+    claude_session(&h, other_proj, "alice-elsewhere", &owner).await;
+
+    begin(
+        &h.http,
+        "bob-forwarding-alices-session",
+        &with_session(bob, "alice-claude"),
+    )
+    .await;
+    begin(
+        &h.http,
+        "alice-naming-another-project",
+        &with_session(alice.clone(), "alice-elsewhere"),
+    )
+    .await;
+    let rows = handoffs_by_summary(&h).await;
+    for label in [
+        "static-client",
+        "bob-forwarding-alices-session",
+        "alice-naming-another-project",
+    ] {
+        let origin = &rows[label].origin;
+        assert_eq!(origin.from_session_id, None, "{label} borrowed a session");
+        assert_eq!(origin.from_agent, AgentKind::Other, "{label}");
+        assert_eq!(origin.cwd, None, "{label}");
+    }
+
+    begin(&h.http, "alices-own", &with_session(alice, "alice-claude")).await;
+    let rows = handoffs_by_summary(&h).await;
+    let own = &rows["alices-own"].origin;
+    assert_eq!(own.from_session_id, Some(session));
+    assert_eq!(own.from_agent, AgentKind::ClaudeCode);
+    assert_eq!(own.cwd.as_deref(), Some("/repo"));
+}
+
+/// #2014: `memory_handoff_accept` returns the row as the claim left it, with
+/// the claiming harness taken from the caller's own session. A colleague
+/// forwarding that session id is recorded as `other`, and a second accept
+/// still finds nothing to claim.
+#[tokio::test]
+async fn handoff_accept_returns_the_claimed_row() {
+    let h = harness(Some("dj"), true).await;
+    let alice = proxied("x-memory-actor-user", "alice");
+    begin(&h.http, "alices-baton", &alice).await;
+    let owner = handoffs_by_summary(&h).await["alices-baton"]
+        .origin
+        .owner_user
+        .clone()
+        .expect("owner");
+    claude_session(&h, h.proj, "alice-claude", &owner).await;
+
+    let got = call(
+        &h.http,
+        "memory_handoff_accept",
+        json!({ "workspace": "default", "project": "scratch" }),
+        &with_session(alice.clone(), "alice-claude"),
+    )
+    .await;
+    assert_eq!(got["status"], "claimed", "{got}");
+    assert_eq!(got["handoff"]["summary"], "alices-baton");
+    assert_eq!(got["handoff"]["state"], "accepted", "{got}");
+    assert_eq!(got["handoff"]["accepted_by"], "claude-code", "{got}");
+    assert_eq!(got["handoff"]["accepted_by_user"], owner.as_str(), "{got}");
+    assert!(got["handoff"]["accepted_at"].is_string(), "{got}");
+    assert_eq!(
+        accept_status(&h.http, &with_session(alice.clone(), "alice-claude")).await,
+        "none_pending",
+        "a claimed handoff is claimed exactly once",
+    );
+
+    call(
+        &h.http,
+        "memory_handoff_begin",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "summary": "shared-baton",
+            "shared": true,
+        }),
+        &alice,
+    )
+    .await;
+    let got = call(
+        &h.http,
+        "memory_handoff_accept",
+        json!({ "workspace": "default", "project": "scratch" }),
+        &with_session(proxied("x-memory-actor-user", "bob"), "alice-claude"),
+    )
+    .await;
+    assert_eq!(got["handoff"]["summary"], "shared-baton", "{got}");
+    assert_eq!(got["handoff"]["state"], "accepted", "{got}");
+    assert_eq!(
+        got["handoff"]["accepted_by"], "other",
+        "bob borrowed alice's harness: {got}"
+    );
+}

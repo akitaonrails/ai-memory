@@ -13,6 +13,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A handoff begun with `memory_handoff_begin` from a client that forwards its
+  hook session id (the session-aware bridge, OpenCode 2) now records that
+  session, its harness and its cwd, as `memory_message_send` already did,
+  instead of `from_agent: "other"` and no session. The id counts only for a
+  session the server recorded in the handoff's project for the same operator.
+  The handoff stays a manual one (migration V101 adds a `manual` flag), so it is
+  still delivered ahead of automatic batons and never swept with them.
+  `memory_handoff_accept` now returns the row after the claim (`state:
+  "accepted"`, `accepted_at`, `accepted_by`) rather than the open row it read
+  before claiming it (#2014).
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is

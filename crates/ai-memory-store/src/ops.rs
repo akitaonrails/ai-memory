@@ -3717,7 +3717,7 @@ pub fn end_admitted_session_with_handoff(
     let tx = conn.transaction()?;
     validate_admitted_session(&tx, admitted)?;
     end_session_row(&tx, &admitted.session_id, page, occurred_at)?;
-    let id = insert_handoff_row(&tx, handoff)?;
+    let id = insert_handoff_row(&tx, handoff, false)?;
     tx.commit()?;
     Ok(id)
 }
@@ -5148,7 +5148,20 @@ pub fn prune_consolidated_observations(
 /// Insert a new handoff in state=open.
 pub fn insert_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
     let tx = conn.transaction()?;
-    let id = insert_handoff_row(&tx, h)?;
+    let id = insert_handoff_row(&tx, h, false)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Insert an explicit (`memory_handoff_begin`) handoff in state=open.
+///
+/// It stays manual whatever `from_session_id` it carries: project-wide for cwd
+/// matching, preferred over automatic batons, and never refreshed or swept by
+/// them (#2014). The caller must have checked that a `from_session_id` is the
+/// caller's own session, in this scope.
+pub fn insert_manual_handoff(conn: &mut Connection, h: &NewHandoff) -> StoreResult<HandoffId> {
+    let tx = conn.transaction()?;
+    let id = insert_handoff_row(&tx, h, true)?;
     tx.commit()?;
     Ok(id)
 }
@@ -5196,7 +5209,7 @@ pub fn checkpoint_session_handoff(
         .query_row(
             "SELECT id FROM handoffs \
              WHERE from_session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
-               AND owner_user IS ?4 AND state = 'open' \
+               AND owner_user IS ?4 AND state = 'open' AND manual = 0 \
              ORDER BY created_at DESC LIMIT 1",
             params![
                 session_id.as_bytes(),
@@ -5213,7 +5226,7 @@ pub fn checkpoint_session_handoff(
             refresh_handoff_row(&tx, &id, handoff)?;
             id
         }
-        None => insert_handoff_row(&tx, handoff)?,
+        None => insert_handoff_row(&tx, handoff, false)?,
     };
     tx.commit()?;
     Ok(Some(id))
@@ -5260,7 +5273,7 @@ pub fn end_session_with_handoff(
         ));
     }
     end_session_row(&tx, session_id, summary_page_id, None)?;
-    let id = insert_handoff_row(&tx, handoff)?;
+    let id = insert_handoff_row(&tx, handoff, false)?;
     tx.commit()?;
     Ok(id)
 }
@@ -5343,7 +5356,7 @@ fn expire_same_cwd_auto_handoffs(
     let expired = conn.execute(
         "UPDATE handoffs SET state = 'expired' \
          WHERE workspace_id = ?1 AND project_id = ?2 \
-           AND state = 'open' AND from_session_id IS NOT NULL \
+           AND state = 'open' AND from_session_id IS NOT NULL AND manual = 0 \
            AND (cwd = ?3 OR (cwd IS NULL AND ?3 IS NULL)) \
            AND owner_user IS ?4 AND id IS NOT ?5 \
            AND (from_session_id IS ?6 OR NOT EXISTS ( \
@@ -5403,7 +5416,11 @@ fn refresh_handoff_row(conn: &Transaction<'_>, id: &HandoffId, h: &NewHandoff) -
     Ok(())
 }
 
-fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<HandoffId> {
+fn insert_handoff_row(
+    conn: &Transaction<'_>,
+    h: &NewHandoff,
+    manual: bool,
+) -> StoreResult<HandoffId> {
     validate_identity_storage_key(h.owner_user.as_deref(), "handoff owner")?;
     let id = HandoffId::new();
     let now = Timestamp::now().as_microsecond();
@@ -5417,7 +5434,7 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     let from_session: Option<&[u8]> = h.from_session_id.as_ref().map(|s| &s.as_bytes()[..]);
     let from_agent = h.from_agent.as_str();
     let to_agent = h.to_agent.map(AgentKind::as_str);
-    if from_session.is_some() {
+    if from_session.is_some() && !manual {
         expire_same_cwd_auto_handoffs(conn, h, cwd.as_deref(), None, now)?;
     }
     // Insert + audit atomically. Handoffs are keyed by agent/session, not a DB
@@ -5426,8 +5443,8 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
     conn.execute(
         "INSERT INTO handoffs \
          (id, workspace_id, project_id, from_session_id, from_agent, to_agent, cwd, summary, \
-          open_questions, next_steps, files_touched, state, created_at, owner_user) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13)",
+          open_questions, next_steps, files_touched, state, created_at, owner_user, manual) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12, ?13, ?14)",
         params![
             id.as_bytes(),
             h.workspace_id.as_bytes(),
@@ -5444,6 +5461,7 @@ fn insert_handoff_row(conn: &Transaction<'_>, h: &NewHandoff) -> StoreResult<Han
             // NULL owner = shared with the whole project: what a caller with no
             // actor writes, and what every pre-V39 row already looks like.
             h.owner_user.as_deref(),
+            manual,
         ],
     )?;
     audit(
@@ -5581,8 +5599,8 @@ pub(crate) fn accept_handoff_in_transaction(
     }
     let metadata = tx
         .query_row(
-            "SELECT from_session_id IS NOT NULL, cwd, created_at, owner_user, \
-                    EXISTS (SELECT 1 FROM sessions s \
+            "SELECT from_session_id IS NOT NULL AND manual = 0, cwd, created_at, owner_user, \
+                    manual = 0 AND EXISTS (SELECT 1 FROM sessions s \
                             WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
                               AND EXISTS (SELECT 1 FROM observations o \
                                           WHERE o.session_id = s.id AND o.created_at > ?4)) \
@@ -5744,7 +5762,7 @@ fn expire_superseded_auto_handoffs(
     let mut stmt = tx.prepare(
         "SELECT id, cwd, created_at FROM handoffs \
          WHERE workspace_id = ?1 AND project_id = ?2 \
-           AND state = 'open' AND from_session_id IS NOT NULL \
+           AND state = 'open' AND from_session_id IS NOT NULL AND manual = 0 \
            AND owner_user IS ?3 \
            AND NOT EXISTS (SELECT 1 FROM sessions s \
                            WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
@@ -11696,6 +11714,93 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(summary, "/turn/2 baton");
+    }
+
+    fn session_baton(
+        ws: WorkspaceId,
+        proj: ProjectId,
+        from: Option<SessionId>,
+        cwd: &str,
+        summary: &str,
+    ) -> NewHandoff {
+        NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: from,
+            from_agent: AgentKind::Codex,
+            to_agent: None,
+            cwd: Some(cwd.into()),
+            summary: summary.into(),
+            open_questions: Vec::new(),
+            next_steps: Vec::new(),
+            files_touched: Vec::new(),
+            owner_user: Some("user:alice".into()),
+        }
+    }
+
+    fn handoff_state(conn: &Connection, id: &HandoffId) -> String {
+        conn.query_row(
+            "SELECT state FROM handoffs WHERE id = ?1",
+            params![id.as_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    // #2014: an explicit handoff that records its session stays manual. A
+    // later automatic baton from the same cwd and the sweep after claiming one
+    // both leave it open, which they would do to an automatic baton.
+    #[test]
+    fn an_explicit_handoff_with_a_session_is_never_swept_as_automatic() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let source = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &source).unwrap();
+        end_session(&mut conn, &source.id, None).unwrap();
+        let explicit = insert_manual_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(source.id), "/repo", "explicit"),
+        )
+        .unwrap();
+        let control = insert_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(source.id), "/repo", "automatic"),
+        )
+        .unwrap();
+
+        let later = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &later).unwrap();
+        end_session(&mut conn, &later.id, None).unwrap();
+        let newest = insert_handoff(
+            &mut conn,
+            &session_baton(ws, proj, Some(later.id), "/repo", "newest"),
+        )
+        .unwrap();
+        assert_eq!(
+            handoff_state(&conn, &control),
+            "expired",
+            "control: the same-cwd sweep retires an automatic baton",
+        );
+        assert_eq!(handoff_state(&conn, &explicit), "open");
+
+        let receiver = hook_session(SessionId::new(), ws, proj, Some("user:alice"));
+        begin_session(&mut conn, &receiver).unwrap();
+        assert!(
+            accept_handoff(
+                &mut conn,
+                &HandoffAcceptance {
+                    handoff_id: newest,
+                    workspace_id: ws,
+                    project_id: proj,
+                    accepting_agent: AgentKind::Codex,
+                    accepting_session: Some(receiver.id),
+                    accepting_user: Some("user:alice".into()),
+                    owner_filter: OwnerFilter::User("user:alice".into()),
+                    receiving_cwd: Some("/repo".into()),
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(handoff_state(&conn, &explicit), "open");
     }
 
     fn embed_failure_rows(conn: &Connection) -> i64 {

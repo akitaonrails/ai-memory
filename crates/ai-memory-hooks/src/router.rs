@@ -6379,6 +6379,7 @@ pub(crate) mod tests {
             },
             origin: ai_memory_core::HandoffOrigin {
                 from_session_id: None,
+                manual: false,
                 from_agent: AgentKind::ClaudeCode,
                 to_agent: None,
                 cwd: None,
@@ -9081,6 +9082,7 @@ pub(crate) mod tests {
             },
             origin: ai_memory_core::HandoffOrigin {
                 from_session_id: None,
+                manual: false,
                 from_agent: AgentKind::ClaudeCode,
                 to_agent: None,
                 cwd: None,

@@ -5816,3 +5816,100 @@ async fn a_refused_link_names_the_holder_only_for_the_runs_own_operator_and_harn
     assert_eq!(holder("mine-new").await, None);
     assert_eq!(holder("never-seen").await, None);
 }
+
+/// #2014: an explicit handoff that records its source session is not held back
+/// while that session is still at work, as an automatic baton is: the agent
+/// wrote it on purpose for the next session. It is still claimed exactly once.
+#[tokio::test]
+async fn an_explicit_handoff_from_a_live_session_is_delivered_and_claimed_once() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let source = open_session(&store, ws, proj, AgentKind::ClaudeCode).await;
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                session_id: source,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "still working".into(),
+                importance: 5,
+                occurred_at: None,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+    let baton = |summary: &str| NewHandoff {
+        workspace_id: ws,
+        project_id: proj,
+        from_session_id: Some(source),
+        from_agent: AgentKind::ClaudeCode,
+        to_agent: None,
+        cwd: Some("/repo".into()),
+        summary: summary.into(),
+        open_questions: Vec::new(),
+        next_steps: Vec::new(),
+        files_touched: Vec::new(),
+        owner_user: None,
+    };
+    let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
+    let startup = || {
+        store
+            .reader
+            .startup_handoff(ws, proj, Some("/repo".into()), OwnerFilter::Any, cutoff)
+    };
+
+    // Control: the busy session's automatic baton is not offered.
+    store
+        .writer
+        .checkpoint_session_handoff(baton("checkpoint"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(startup().await.unwrap().is_none());
+
+    let explicit = store
+        .writer
+        .insert_manual_handoff(baton("explicit"))
+        .await
+        .unwrap();
+    let offered = startup().await.unwrap().expect("the explicit handoff");
+    assert_eq!(offered.scope.id, explicit);
+
+    let claim = |receiver| HandoffAcceptance {
+        handoff_id: explicit,
+        workspace_id: ws,
+        project_id: proj,
+        accepting_agent: AgentKind::Codex,
+        accepting_session: Some(receiver),
+        accepting_user: None,
+        owner_filter: OwnerFilter::Any,
+        receiving_cwd: Some("/repo".into()),
+    };
+    let first = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let delivered = store
+        .writer
+        .accept_startup_context(Some(claim(first)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(
+        delivered.handoff_accepted,
+        "a busy source keeps no explicit baton"
+    );
+    let second = open_session(&store, ws, proj, AgentKind::Codex).await;
+    let again = store
+        .writer
+        .accept_startup_context(Some(claim(second)), None, None, cutoff)
+        .await
+        .unwrap();
+    assert!(!again.handoff_accepted, "claimed exactly once");
+}
