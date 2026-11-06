@@ -73,16 +73,39 @@ pub(crate) async fn probe(
     summarize(&response, source)
 }
 
+/// Spawn, retrying briefly while the executable is busy (ETXTBSY): Codex
+/// updates itself in place, and on Linux a write that just finished can still
+/// hold the file open in a process another thread forked, as the OpenCode
+/// version probe also allows for. The 80 ms window stays inside the probe
+/// timeout.
+async fn spawn_retrying_busy(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn list_hooks(program: &Path, cwd: &Path) -> Option<serde_json::Value> {
-    let mut child = tokio::process::Command::new(program)
+    let mut command = tokio::process::Command::new(program);
+    command
         .arg("app-server")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
+        .kill_on_drop(true);
+    let mut child = spawn_retrying_busy(&mut command).await.ok()?;
     let mut stdin = child.stdin.take()?;
     let stdout = child.stdout.take()?;
     let cwd = cwd.to_string_lossy();

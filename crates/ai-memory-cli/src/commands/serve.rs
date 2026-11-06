@@ -5245,12 +5245,9 @@ mod tests {
             );
         }
 
-        // A refused connection, built the same way the LLM suite builds one:
-        // a closed loopback port refuses immediately.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let connect = reqwest::get(format!("http://{addr}/v1"))
+        // A refused connection: a reserved loopback port that never listens.
+        let refusing = ai_memory_test_support::refusing_port();
+        let connect = reqwest::get(format!("{}/v1", refusing.url()))
             .await
             .expect_err("a closed loopback port must refuse the connection");
         assert!(

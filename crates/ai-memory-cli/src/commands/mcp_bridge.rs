@@ -1029,18 +1029,13 @@ mod tests {
         }
     }
 
-    /// A port nothing listens on, reserved by binding and then dropping it.
-    async fn refusing_address() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
-    }
-
     /// #1947: a server that is not listening ends the bridge within the bound,
     /// after retrying, with a diagnosis that names the URL and the server, not
     /// rmcp's initialize error under an unrelated bearer hint.
     #[tokio::test]
     async fn an_unreachable_server_fails_within_the_bound_with_a_named_diagnosis() {
-        let address = refusing_address().await;
+        let refusing = ai_memory_test_support::refusing_port();
+        let address = refusing.addr();
         let url = format!("http://{address}/mcp");
         let started = std::time::Instant::now();
         let error = wait_for_server(&url, Duration::from_millis(400), Duration::from_millis(50))
@@ -1068,7 +1063,8 @@ mod tests {
     /// does not parse.
     #[tokio::test]
     async fn the_unreachable_diagnosis_strips_userinfo_from_the_url() {
-        let address = refusing_address().await;
+        let refusing = ai_memory_test_support::refusing_port();
+        let address = refusing.addr();
         let url = format!("http://alice:hunter2@{address}/mcp");
         let error = wait_for_server(&url, Duration::from_millis(100), Duration::from_millis(50))
             .await
@@ -1093,7 +1089,8 @@ mod tests {
     /// reached, and the bridge completes its upstream handshake.
     #[tokio::test]
     async fn a_server_that_starts_within_the_bound_is_reached() {
-        let address = refusing_address().await;
+        let refusing = ai_memory_test_support::refusing_port();
+        let address = refusing.addr();
         let echo = EchoServer {
             seen_session: Arc::new(Mutex::new(None)),
         };
@@ -1107,7 +1104,8 @@ mod tests {
                         .with_legacy_session_mode(false)
                         .with_json_response(true),
                 );
-            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            // The port stayed reserved while the server was "down".
+            let listener = tokio::net::TcpListener::from_std(refusing.into_listener()).unwrap();
             axum::serve(listener, Router::new().nest_service("/mcp", service))
                 .await
                 .unwrap();

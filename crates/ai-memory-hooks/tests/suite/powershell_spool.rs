@@ -135,10 +135,10 @@ fn spool_files(data_dir: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn powershell_hook_spools_when_server_unreachable() {
-    // A port that nothing listens on: connection refused, immediately.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let server = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    // A reserved port that never listens: connection refused, and no
+    // parallel test can take it (#2030).
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
 
     let home = tempfile::tempdir().unwrap();
     let data_dir = home.path().join("data");
