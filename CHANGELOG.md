@@ -116,7 +116,10 @@ version in [`docs/changelog/`](docs/changelog/):
   with that profile's stored token, the same way hooks route capture. Before,
   they used the configured server and fell back to `127.0.0.1`. A profile
   that does not resolve fails the command with the hook's reason instead of
-  falling back. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
+  falling back. Roots are matched against the directory as the shell names it
+  (`PWD`, when it is the same directory), as the hooks match the harness's
+  cwd, so a checkout under a symlink or macOS's `/var` routes the same for
+  both. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
   profile-routed checkout because the jailed run cannot read the profile's
   token (#2016).
 

@@ -523,8 +523,18 @@ fn point_config_at_a_dead_server(sb: &Sandbox) -> String {
 }
 
 fn in_repo(sb: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Output {
+    in_dir(sb, &sb.repo, args, env)
+}
+
+/// Run a command in `dir` the way a shell does: `PWD` holds the logical
+/// path, while the process's own cwd is the physical one (macOS reports a
+/// tempdir under `/var` as `/private/var`).
+fn in_dir(sb: &Sandbox, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = sb.cmd();
-    cmd.current_dir(&sb.repo).args(args).stdin(Stdio::null());
+    cmd.current_dir(dir)
+        .env("PWD", dir)
+        .args(args)
+        .stdin(Stdio::null());
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -661,4 +671,76 @@ fn checkout_commands_fail_closed_on_a_refused_profile_and_run_probes_the_profile
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains(&profile_server), "{stderr}");
     assert!(!stderr.contains(&dead), "{stderr}");
+}
+
+/// #2016 on any Unix: the profile's root is registered through a symlink, as
+/// a harness reports the checkout, while the command's own cwd is the
+/// physical directory. The command follows the hooks and routes to the
+/// profile; a `PWD` that names another directory is ignored, so the physical
+/// path is matched and refused, as is a missing `PWD`.
+#[cfg(unix)]
+#[test]
+fn checkout_commands_match_profile_roots_through_a_symlinked_checkout() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    let physical = sb.home.join("physical").join("team-b");
+    std::fs::create_dir_all(physical.join("repo")).unwrap();
+    std::fs::write(
+        physical.join("repo").join(".ai-memory.toml"),
+        "server = \"team-b\"\n",
+    )
+    .unwrap();
+    let linked = sb.home.join("work").join("linked");
+    std::os::unix::fs::symlink(&physical, &linked).unwrap();
+    let repo = linked.join("repo");
+    let profile_server = ai_memory_test_support::dead_http_endpoint();
+    let root = linked.to_string_lossy().into_owned();
+    sb.run_ok(
+        &[
+            "server",
+            "add",
+            "team-b",
+            "--url",
+            &profile_server,
+            "--root",
+            &root,
+            "--auth-token-stdin",
+        ],
+        Some("TOKEN-B\n"),
+    );
+
+    // The hook, given the harness's logical cwd, routes to the profile.
+    let check = sb.hook_at(&repo, DEFAULT_SERVER, None, "user-prompt-submit", true);
+    let check: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(check["server_resolution"], "marker");
+
+    // So does the command: it dials the profile's (dead) server, never the
+    // install's, and is not refused.
+    let out = in_dir(&sb, &repo, &["recent"], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&profile_server), "{stderr}");
+    assert!(!stderr.contains("rejected-outside-roots"), "{stderr}");
+    assert!(!stderr.contains(&dead), "{stderr}");
+
+    // A PWD naming another directory, or none, leaves the physical path,
+    // which lies outside the root: refused, nothing sent anywhere.
+    for pwd in [Some(sb.home.as_path()), None] {
+        let mut cmd = sb.cmd();
+        cmd.current_dir(&repo).arg("recent").stdin(Stdio::null());
+        match pwd {
+            Some(pwd) => cmd.env("PWD", pwd),
+            None => cmd.env_remove("PWD"),
+        };
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(
+            stderr.contains("rejected-outside-roots"),
+            "{pwd:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&dead) && !stderr.contains(&profile_server),
+            "{stderr}"
+        );
+    }
 }
