@@ -215,8 +215,15 @@ fn compute_live_calls(
                 })
             }),
         _ => None,
-    };
-    path.and_then(|p| super::session_usage::extract_live_calls(&p, agent, data_dir, routing_key))
+    }?;
+    let batch = super::session_usage::extract_live_calls(&path, agent, data_dir, routing_key)?;
+    // Claude Code subagents write their own transcripts. Their responses ride
+    // only on the main conversation's events: `drop_subagent_captures` drops
+    // a subagent's own event, usage included, after its cursor has moved.
+    if agent == AgentKind::ClaudeCode && !payload_is_subagent(json) {
+        return Some(batch.with_claude_subagents(&path, data_dir, routing_key));
+    }
+    Some(batch)
 }
 
 /// A stale interrupted-session candidate found in the session-start handoff

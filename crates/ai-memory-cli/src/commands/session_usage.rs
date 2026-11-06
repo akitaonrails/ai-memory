@@ -30,6 +30,10 @@ pub struct LiveCallBatch {
     pub calls: Vec<ai_memory_core::TokenCall>,
     cursor_path: PathBuf,
     next: LiveCursor,
+    /// Whether this read moved past any transcript bytes.
+    advanced: bool,
+    /// Cursors of the subagent transcripts whose responses joined `calls`.
+    subagents: Vec<(PathBuf, LiveCursor)>,
 }
 
 impl LiveCallBatch {
@@ -39,6 +43,16 @@ impl LiveCallBatch {
         if let Ok(bytes) = serde_json::to_vec(&self.next) {
             if ai_memory_wiki::write_atomic(&self.cursor_path, &bytes).is_err() {
                 return;
+            }
+            // A subagent cursor that fails to write replays its responses.
+            let mut written = Vec::with_capacity(self.subagents.len());
+            for (path, next) in self.subagents {
+                let Ok(bytes) = serde_json::to_vec(&next) else {
+                    continue;
+                };
+                if ai_memory_wiki::write_atomic(&path, &bytes).is_ok() {
+                    written.push(path);
+                }
             }
             // Eviction only causes idempotent replay on the next hook.
             if let Some(dir) = self.cursor_path.parent()
@@ -50,15 +64,58 @@ impl LiveCallBatch {
                     .filter(|e| {
                         e.path().extension().is_some_and(|s| s == "json")
                             && e.path() != self.cursor_path
+                            && !written.contains(&e.path())
                     })
                     .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
                     .collect::<Vec<_>>();
                 cursors.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-                for (_, stale) in cursors.into_iter().skip(511) {
+                let keep = 511_usize.saturating_sub(written.len());
+                for (_, stale) in cursors.into_iter().skip(keep) {
                     let _ = std::fs::remove_file(stale);
                 }
             }
         }
+    }
+
+    /// Add the responses of the subagents a Claude Code session ran.
+    ///
+    /// The session transcript holds only the main conversation; each
+    /// subagent's responses live in its own transcript beside it (see
+    /// `claude_subagent_transcripts`). Each one keeps its own cursor and
+    /// commits with this batch. They join only a batch that already holds a
+    /// main-conversation response, because the server takes the session's
+    /// model from a batch's first response, and the batch stays within
+    /// `LIVE_BATCH_CALLS`, the most the server reads from one event.
+    #[must_use]
+    pub fn with_claude_subagents(
+        mut self,
+        transcript_path: &Path,
+        data_dir: &Path,
+        routing_key: &str,
+    ) -> Self {
+        if self.calls.is_empty() {
+            return self;
+        }
+        for transcript in claude_subagent_transcripts(transcript_path, LIVE_SUBAGENT_TRANSCRIPTS) {
+            let room = LIVE_BATCH_CALLS.saturating_sub(self.calls.len());
+            if room == 0 {
+                break;
+            }
+            let Some(batch) = read_live_calls(
+                &transcript,
+                ai_memory_core::AgentKind::ClaudeCode,
+                data_dir,
+                routing_key,
+                room,
+            ) else {
+                continue;
+            };
+            if batch.advanced {
+                self.calls.extend(batch.calls);
+                self.subagents.push((batch.cursor_path, batch.next));
+            }
+        }
+        self
     }
 }
 
@@ -76,6 +133,9 @@ struct LiveCursor {
 
 const LIVE_BATCH_CALLS: usize = 256;
 const LIVE_CURSOR_BYTES: u64 = 64 * 1024;
+/// Most subagent transcripts one live hook reads, newest first. One already
+/// read to its end costs a cursor check and no transcript bytes.
+const LIVE_SUBAGENT_TRANSCRIPTS: usize = 64;
 
 fn fingerprint(file: &mut std::fs::File, start: u64, len: u64) -> std::io::Result<String> {
     use sha2::{Digest as _, Sha256};
@@ -93,6 +153,17 @@ pub fn extract_live_calls(
     agent: ai_memory_core::AgentKind,
     data_dir: &Path,
     routing_key: &str,
+) -> Option<LiveCallBatch> {
+    read_live_calls(path, agent, data_dir, routing_key, LIVE_BATCH_CALLS)
+}
+
+/// [`extract_live_calls`], stopping at `max_calls` responses.
+fn read_live_calls(
+    path: &Path,
+    agent: ai_memory_core::AgentKind,
+    data_dir: &Path,
+    routing_key: &str,
+    max_calls: usize,
 ) -> Option<LiveCallBatch> {
     use sha2::{Digest as _, Sha256};
     let key = serde_json::to_vec(&(path, agent.as_str(), routing_key)).ok()?;
@@ -156,7 +227,7 @@ pub fn extract_live_calls(
             cursor.skipping_long_line = false;
             continue;
         }
-        if result.len() >= LIVE_BATCH_CALLS {
+        if result.len() >= max_calls {
             consumed -= line.len();
             break;
         }
@@ -304,6 +375,8 @@ pub fn extract_live_calls(
             .collect(),
         cursor_path,
         next: cursor,
+        advanced: consumed > 0,
+        subagents: Vec::new(),
     })
 }
 
