@@ -495,7 +495,9 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
 4. **Typed 3-tuple identity** `(workspace_id, project_id, path)` on every
    domain row.
 5. **Hooks are fire-and-forget and bounded.** Script hooks hard-timeout
-   at ≤200 ms; the server returns 202 immediately or 429 when saturated.
+   at ≤200 ms; the server returns 202 immediately or 429 when saturated
+   (and 409 for a session it already knows is bound to another agent,
+   decided in memory without a database round trip, #2023).
    No unbounded `tokio::spawn` fan-out or queues on hook paths.
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>` has
    no constructor other than `sanitize()`; the hook router's sanitizer is

@@ -572,7 +572,7 @@ cli-help-root-profile-apply-target-help = { "Arquivo de regras de destino, relat
 cli-help-root-profile-apply-dry-run-help = { "Exibir o bloco e o destino em vez de gravar" }
 cli-help-root-profile-apply-remove-help = { "Remover o bloco gerenciado em vez de gravá-lo" }
 cli-help-root-profile-apply-user-help = { "Operador cujo perfil privado usar quando o perfil é por usuário (`share = \"user\"`)" }
-cli-help-root-server-about = { "Gerenciar perfis locais de servidor, selecionados por `server = \"<name>\"` no `.ai-memory.toml` de um repositório para direcionar a captura de hooks a outro servidor ai-memory" }
+cli-help-root-server-about = { "Gerenciar perfis locais de servidor, selecionados por `server = \"<name>\"` no `.ai-memory.toml` de um repositório para direcionar a captura de hooks, e os comandos de projeto executados nele, a outro servidor ai-memory" }
 cli-help-root-server-add-about = { "Registrar um perfil de servidor ou substituir um de mesmo nome" }
 cli-help-root-server-add-name-help = { "Nome do perfil selecionado pelo marcador: letras minúsculas, dígitos, `-`, `_`" }
 cli-help-root-server-add-url-help = { "URL do servidor, ex.: `https://memory.example.com`" }

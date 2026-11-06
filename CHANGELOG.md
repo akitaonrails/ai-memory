@@ -37,6 +37,15 @@ version in [`docs/changelog/`](docs/changelog/):
   the session under its real agent; persisted mismatches still fail closed.
   ([#2029](https://github.com/akitaonrails/ai-memory/pull/2029))
 
+- The abandoned-session sweep no longer queues an auto-improvement review for
+  every session it closes. Closing a session stamps `ended_at`, which made it a
+  scheduled review candidate, so the first sweep after an upgrade could queue
+  every long-idle session at once. The sweep now parks a claim for each session
+  it closes, in the same transaction. A real `SessionEnd` with new observations,
+  or a handoff that reopens the session, removes the claim. The experience pass
+  no longer counts these sessions, and manual `ai-memory auto-improve
+  --session-id` still reviews them (#2026).
+
 - The built-in `api_key` sanitizer rule no longer starts inside an ordinary
   word. Because nothing anchored its left side, `sk-` matched inside
   identifiers such as `task-release-…`, `disk-usage-…` and
@@ -183,7 +192,8 @@ version in [`docs/changelog/`](docs/changelog/):
   spelling of the same text (migration V100), so the tokenizer stays as it
   was and no stored row changes. The first start after upgrading rebuilds
   both indexes once, which takes longer on a large store, and they grow to
-  roughly twice their previous size (#2013).
+  roughly twice their previous size. A 3.4.2 binary refuses a store this
+  release has upgraded, so keep a backup if you may need to go back (#2013).
 
 - The dashboard's icons no longer show as empty boxes on macOS. The three
   shipped web fonts are Latin subsets, so the geometric and symbol

@@ -553,12 +553,12 @@ shared marker.
   rejected one with the install token, or re-send one addressed to a dead
   loopback port to the server in `config.toml`. Upgrade every install that
   shares a data dir.
-- **MCP and `ai-memory run`.** Profiles route hook capture only. The MCP
-  server entry and `ai-memory run` (its managed-run ledger and heartbeats)
-  still talk to the server they were configured with, so in a routed
-  repository they reach the install default. Point that repository's MCP
-  client at its own server with a per-repository `.mcp.json`, and avoid
-  `ai-memory run` there until it learns profiles.
+- **MCP.** Profiles route hook capture and the checkout commands listed
+  above, `ai-memory run` and its managed-run ledger included. The MCP server
+  entry, including `ai-memory mcp-bridge`, still talks to the server it was
+  configured with, so in a routed repository it reaches the install default.
+  Point that repository's MCP client at its own server with a per-repository
+  `.mcp.json`.
 
 Profiles use static tokens only. OIDC `auth.json` stays with the install
 default and is never presented to a profile's server.
