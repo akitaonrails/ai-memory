@@ -1058,6 +1058,144 @@ mod tests {
         assert!(extract_claude_code_usage(&tmp.path().join("nope.jsonl")).is_none());
     }
 
+    /// A subagent line as Claude Code writes it to
+    /// `<session>/subagents/agent-<id>.jsonl`, on another model.
+    fn subagent_line(msg_id: &str, input: u64, output: u64) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "isSidechain": true,
+            "agentId": "a1",
+            "message": {
+                "id": msg_id,
+                "model": "claude-haiku-5",
+                "usage": {"input_tokens": input, "output_tokens": output}
+            }
+        })
+        .to_string()
+    }
+
+    /// #2031: the session transcript holds none of its subagents' responses,
+    /// so the full-session sum reads `<session>/subagents/agent-*.jsonl` too.
+    #[test]
+    fn claude_code_sums_the_sessions_subagent_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let main_1 = claude_line("main-1", 10, 20, 30, 40);
+        std::fs::write(&path, format!("{main_1}\n")).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let sub_1 = subagent_line("sub-1", 1, 2);
+        // `main-1` again: a response both transcripts recorded counts once.
+        std::fs::write(
+            subagents.join("agent-a1.jsonl"),
+            format!("{sub_1}\n{main_1}\n"),
+        )
+        .unwrap();
+        let sub_2 = subagent_line("sub-2", 3, 4);
+        std::fs::write(subagents.join("agent-a2.jsonl"), format!("{sub_2}\n")).unwrap();
+        // Claude Code's metadata file beside a transcript is not one.
+        let metadata = subagent_line("not-a-transcript", 99, 99);
+        std::fs::write(subagents.join("agent-a1.json"), format!("{metadata}\n")).unwrap();
+        // Another session's subagents stay out.
+        let other = tmp.path().join("other").join("subagents");
+        std::fs::create_dir_all(&other).unwrap();
+        let foreign = subagent_line("foreign", 99, 99);
+        std::fs::write(other.join("agent-b1.jsonl"), format!("{foreign}\n")).unwrap();
+
+        let usage = extract_claude_code_usage(&path).unwrap();
+        assert_eq!(usage.input_tokens, 14);
+        assert_eq!(usage.output_tokens, 26);
+        assert_eq!(usage.cache_write_tokens, 30);
+        assert_eq!(usage.cache_read_tokens, 40);
+        assert_eq!(
+            usage.model.as_deref(),
+            Some("claude-sonnet-5"),
+            "the session keeps the main conversation's model"
+        );
+    }
+
+    /// One live read of a Claude Code session, its subagents included.
+    fn read_claude_session(path: &Path, data_dir: &Path) -> LiveCallBatch {
+        use ai_memory_core::AgentKind;
+        extract_live_calls(path, AgentKind::ClaudeCode, data_dir, "key")
+            .unwrap()
+            .with_claude_subagents(path, data_dir, "key")
+    }
+
+    /// #2031: live batches carry the subagents' responses behind the main
+    /// conversation's, each subagent transcript with its own cursor.
+    #[test]
+    fn live_token_calls_add_subagent_responses_beside_a_main_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let main_1 = claude_line("main-1", 10, 20, 0, 0);
+        std::fs::write(&path, format!("{main_1}\n")).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let subagent = subagents.join("agent-a1.jsonl");
+        let sub_1 = subagent_line("sub-1", 1, 2);
+        let sub_2 = subagent_line("sub-2", 3, 4);
+        std::fs::write(&subagent, format!("{sub_1}\n{sub_2}\n")).unwrap();
+        let read = || read_claude_session(&path, tmp.path());
+        let ids = |batch: &LiveCallBatch| {
+            batch
+                .calls
+                .iter()
+                .map(|call| call.call_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let first = read();
+        assert_eq!(ids(&first), ["main-1", "sub-1", "sub-2"]);
+        assert_eq!(first.calls[1].model.as_deref(), Some("claude-haiku-5"));
+        assert_eq!(ids(&read()), ids(&first), "uncommitted data must replay");
+        first.commit();
+        assert!(read().calls.is_empty());
+
+        // Without a new main response, a subagent response waits for one.
+        let sub_3 = subagent_line("sub-3", 5, 6);
+        std::fs::write(&subagent, format!("{sub_1}\n{sub_2}\n{sub_3}\n")).unwrap();
+        let waiting = read();
+        assert!(waiting.calls.is_empty());
+        waiting.commit();
+        let main_2 = claude_line("main-2", 10, 20, 0, 0);
+        std::fs::write(&path, format!("{main_1}\n{main_2}\n")).unwrap();
+        let next = read();
+        assert_eq!(ids(&next), ["main-2", "sub-3"]);
+        next.commit();
+        assert!(read().calls.is_empty());
+    }
+
+    /// #2031: the server reads at most `LIVE_BATCH_CALLS` responses from one
+    /// event, so subagent responses past that wait for the next one.
+    #[test]
+    fn live_token_calls_keep_subagent_responses_within_one_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let main = |count: u32| {
+            (1..=count)
+                .map(|n| claude_line(&format!("main-{n}"), 1, 1, 0, 0) + "\n")
+                .collect::<String>()
+        };
+        std::fs::write(&path, main(200)).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let sub = (1..=100)
+            .map(|n| subagent_line(&format!("sub-{n}"), 1, 1) + "\n")
+            .collect::<String>();
+        std::fs::write(subagents.join("agent-a1.jsonl"), sub).unwrap();
+
+        let first = read_claude_session(&path, tmp.path());
+        assert_eq!(first.calls.len(), LIVE_BATCH_CALLS);
+        assert_eq!(first.calls[200].call_id, "sub-1");
+        first.commit();
+        std::fs::write(&path, main(201)).unwrap();
+        let rest = read_claude_session(&path, tmp.path());
+        assert_eq!(rest.calls.len(), 45);
+        assert_eq!(rest.calls[0].call_id, "main-201");
+        assert_eq!(rest.calls[1].call_id, "sub-57");
+    }
+
     fn codex_record(input: u64, output: u64, cache_write: u64, cached: u64) -> String {
         serde_json::json!({
             "type": "token_usage_record",

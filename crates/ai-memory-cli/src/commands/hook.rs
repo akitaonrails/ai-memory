@@ -3384,6 +3384,49 @@ mod tests {
         assert!(compute_backfill_usage(AgentKind::ClaudeCode, "some-session", None).is_none());
     }
 
+    /// #2031: Claude Code subagent responses ride only on the main
+    /// conversation's events. `drop_subagent_captures` drops a subagent's own
+    /// event, and the responses it carried with it.
+    #[test]
+    fn live_calls_add_subagent_responses_only_to_main_conversation_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        let line = |id: &str| {
+            let value = serde_json::json!({
+                "type": "assistant",
+                "message": {"id": id, "usage": {"input_tokens": 1, "output_tokens": 2}}
+            });
+            format!("{value}\n")
+        };
+        std::fs::write(&transcript, line("main-1")).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), line("sub-1")).unwrap();
+        let data_dir = tmp.path().join("data");
+        let path = transcript.to_str().unwrap();
+        let calls = |payload: serde_json::Value| {
+            compute_live_calls(
+                AgentKind::ClaudeCode,
+                &payload,
+                Some("session"),
+                &RuntimeEnv::default(),
+                None,
+                &data_dir,
+                "route",
+            )
+            .unwrap()
+            .calls
+            .into_iter()
+            .map(|call| call.call_id)
+            .collect::<Vec<_>>()
+        };
+
+        let subagent_event = serde_json::json!({"transcript_path": path, "agent_id": "a1"});
+        assert_eq!(calls(subagent_event), ["main-1"]);
+        let main_event = serde_json::json!({"transcript_path": path});
+        assert_eq!(calls(main_event), ["main-1", "sub-1"]);
+    }
+
     #[test]
     fn persisted_mode_defaults_to_denylist_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
