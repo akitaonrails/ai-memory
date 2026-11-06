@@ -1671,8 +1671,10 @@ impl WriterHandle {
 
     /// Close every session, in every scope, open with no activity since
     /// before `cutoff_us` (safety net). No usage, no
-    /// consolidation — see [`ops::close_abandoned_sessions`] for why.
-    /// Returns the number of sessions closed.
+    /// consolidation — see [`ops::close_abandoned_sessions`] for why. Each
+    /// closed session also gets a parked auto-improvement claim so the
+    /// sweep never queues an LLM review. Returns the number of sessions
+    /// closed.
     ///
     /// # Errors
     /// Propagates store failures.
@@ -4415,7 +4417,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 send_or_warn(reply, result, "sweep_hollow_projects");
             }
             WriteCmd::CloseAbandonedSessions { cutoff_us, reply } => {
-                let result = ops::close_abandoned_sessions(&conn, cutoff_us);
+                let result = ops::close_abandoned_sessions(&mut conn, cutoff_us);
                 send_or_warn(reply, result, "close_abandoned_sessions");
             }
             WriteCmd::InsertObservation { obs, reply } => {

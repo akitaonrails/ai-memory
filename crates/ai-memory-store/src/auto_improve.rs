@@ -558,6 +558,10 @@ pub fn ensure_scheduler_state(
 /// scope's initialization, so enabling the pass never re-digests
 /// history) and returns the count together with the anchor instant.
 ///
+/// A session whose auto-improve claim is parked by the abandoned-session
+/// sweep is not counted: the sweep closed it, not a real `SessionEnd`, and
+/// the experience pass would digest a session nobody actually finished.
+///
 /// # Errors
 /// Returns an error when the underlying SQLite statements fail.
 pub fn experience_pass_due(
@@ -578,8 +582,20 @@ pub fn experience_pass_due(
         return Ok((0, 0));
     };
     let newer: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sessions          WHERE workspace_id = ?1 AND project_id = ?2            AND ended_at IS NOT NULL AND ended_at > ?3",
-        params![workspace_id.as_bytes(), project_id.as_bytes(), anchor],
+        "SELECT COUNT(*) FROM sessions s \
+         WHERE s.workspace_id = ?1 AND s.project_id = ?2 \
+           AND s.ended_at IS NOT NULL AND s.ended_at > ?3 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM auto_improve_scheduler_claims c \
+               WHERE c.session_id = s.id \
+                 AND c.last_error = ?4 \
+           )",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            anchor,
+            ABANDONED_SWEEP_CLAIM_ERROR,
+        ],
         |row| row.get(0),
     )?;
     Ok((u64::try_from(newer).unwrap_or(0), anchor))
@@ -610,6 +626,17 @@ pub fn mark_experience_pass_run(
 /// deterministic failure — a proposal the reviewer cannot stage, say — stops
 /// costing a review every tick.
 pub const AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS: u32 = 3;
+
+/// The `last_error` a claim parked by the abandoned-session sweep carries, as
+/// opposed to a failed scheduled review.
+///
+/// A sweep-closed session was never reviewed, so its parked claim is not a
+/// review failure and must not look like one: a real `SessionEnd` with new
+/// observations un-parks it (see `end_session_row`), while a `SessionEnd`
+/// without new observations answers `AlreadyEnded` and leaves it parked. Manual
+/// auto-improve stays available for the session either way.
+pub const ABANDONED_SWEEP_CLAIM_ERROR: &str =
+    "parked by the abandoned-session sweep; no scheduled review was run";
 
 /// Atomically claim one ended session for background review. Returns `true`
 /// only for the first claimer: the insert requires the session to be past

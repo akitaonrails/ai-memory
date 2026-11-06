@@ -26,6 +26,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The abandoned-session sweep no longer queues an auto-improvement review for
+  every session it closes. Closing a session stamps `ended_at`, which made it a
+  scheduled review candidate, so the first sweep after an upgrade could queue
+  every long-idle session at once. The sweep now parks a claim for each session
+  it closes, in the same transaction. A real `SessionEnd` with new observations,
+  or a handoff that reopens the session, removes the claim. The experience pass
+  no longer counts these sessions, and manual `ai-memory auto-improve
+  --session-id` still reviews them (#2026).
+
 - The built-in `api_key` sanitizer rule no longer starts inside an ordinary
   word. Because nothing anchored its left side, `sk-` matched inside
   identifiers such as `task-release-…`, `disk-usage-…` and

@@ -2727,7 +2727,10 @@ pub fn end_session(
     session_id: &SessionId,
     summary_page_id: Option<&PageId>,
 ) -> StoreResult<()> {
-    end_session_row(conn, session_id, summary_page_id, None)
+    let tx = conn.transaction()?;
+    end_session_row(&tx, session_id, summary_page_id, None)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Atomically end a lifecycle-only session and return its startup handoff to
@@ -2813,6 +2816,25 @@ fn end_lifecycle_only_session_in_tx(
     })
 }
 
+/// Delete the sweep-parked auto-improvement claim for one session, if the
+/// sweep parked it.
+///
+/// The delete is filtered on the sweep's marker error, so a claim parked by
+/// a genuine review failure (or any other claim state) is left intact. Runs
+/// in the caller's transaction; both un-park sites — the real end and the
+/// handoff reopen — must keep the session row and the claim consistent.
+fn clear_abandoned_sweep_claim(conn: &Connection, session_id: &SessionId) -> StoreResult<()> {
+    conn.execute(
+        "DELETE FROM auto_improve_scheduler_claims \
+         WHERE session_id = ?1 AND last_error = ?2",
+        params![
+            session_id.as_bytes(),
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR
+        ],
+    )?;
+    Ok(())
+}
+
 fn end_session_row(
     conn: &Connection,
     session_id: &SessionId,
@@ -2830,6 +2852,10 @@ fn end_session_row(
          WHERE id = ?3",
         params![now, page_blob, session_id.as_bytes()],
     )?;
+    // A real end un-parks the claim the abandoned-session sweep left behind,
+    // so a session that is resumed and then truly finished returns to the
+    // auto-improvement queue. Only the sweep's marker is deleted.
+    clear_abandoned_sweep_claim(conn, session_id)?;
     Ok(())
 }
 
@@ -2852,10 +2878,43 @@ fn end_session_row(
 /// One batched `UPDATE`, no per-scope iteration (invariant #2). Returns the
 /// number of sessions closed.
 ///
+/// In the same transaction the sweep parks an auto-improvement claim for
+/// every session it closes (exhausted `attempts`, `last_error` marked with
+/// [`crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR`]): closing a session
+/// is what makes it a candidate for the auto-improvement scheduler, and a
+/// blind sweep must not queue an LLM review for a session it only guessed
+/// was over. An existing claim — in flight, retryable or parked by a
+/// genuine failure — is left untouched (`ON CONFLICT(session_id) DO
+/// NOTHING`). A real `SessionEnd` with new observations un-parks the claim
+/// in [`end_session_row`]; manual auto-improve stays available either way.
+///
 /// # Errors
 /// Propagates any SQL error.
-pub fn close_abandoned_sessions(conn: &Connection, cutoff_us: i64) -> StoreResult<u64> {
-    let changed = conn.execute(
+pub fn close_abandoned_sessions(conn: &mut Connection, cutoff_us: i64) -> StoreResult<u64> {
+    let tx = conn.transaction()?;
+    // The claims are inserted BEFORE the UPDATE, with the exact same
+    // selection predicate: once the UPDATE has run the sessions no longer
+    // match (`ended_at IS NULL` is gone), so they would no longer be
+    // identifiable.
+    let now = Timestamp::now().as_microsecond();
+    tx.execute(
+        "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+         SELECT s.workspace_id, s.project_id, s.id, ?2, ?3, ?4, ?2 \
+         FROM sessions s \
+         WHERE s.ended_at IS NULL \
+           AND COALESCE( \
+                 (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = s.id), \
+                 s.started_at) < ?1 \
+         ON CONFLICT(session_id) DO NOTHING",
+        params![
+            cutoff_us,
+            now,
+            crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR,
+        ],
+    )?;
+    let changed = tx.execute(
         "UPDATE sessions \
          SET ended_at = COALESCE( \
                  (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = sessions.id), \
@@ -2869,6 +2928,7 @@ pub fn close_abandoned_sessions(conn: &Connection, cutoff_us: i64) -> StoreResul
                  started_at) < ?1",
         params![cutoff_us],
     )?;
+    tx.commit()?;
     Ok(u64::try_from(changed).unwrap_or(0))
 }
 
@@ -5746,6 +5806,14 @@ pub(crate) fn accept_handoff_in_transaction(
     };
     // Only a real state transition ('open' -> 'accepted') is audited.
     if changed > 0 {
+        // The receiver took a baton, so the generation the sweep closed is
+        // over and its new work must be reviewable when it ends, including
+        // through the idle-end, which never reaches `end_session_row`. This
+        // waits for the transition because a refused accept also commits: a
+        // session that lost the race resumed nothing and stays parked.
+        if let Some(accepting_session) = accepting_session {
+            clear_abandoned_sweep_claim(tx, accepting_session)?;
+        }
         audit(
             tx,
             "accept_handoff",
@@ -6539,6 +6607,18 @@ pub fn reorg_sessions(
             ],
         )?;
         sessions_moved += rows;
+        // A claim is keyed to the session's project: left behind, it would
+        // cascade away with that project once it is empty, and a session the
+        // abandoned-session sweep parked would become reviewable again.
+        tx.execute(
+            "UPDATE auto_improve_scheduler_claims SET project_id = ?1 \
+             WHERE session_id = ?2 AND workspace_id = ?3",
+            params![
+                new_project_id.as_bytes(),
+                session_id.as_bytes(),
+                workspace_id.as_bytes()
+            ],
+        )?;
         // Update observations whose session_id matches, keeping project_id
         // in sync with the session row we just moved.
         let obs_rows = tx.execute(
@@ -20885,7 +20965,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let cutoff_us = now - one_day_us;
-        let closed = close_abandoned_sessions(&conn, cutoff_us).unwrap();
+        let closed = close_abandoned_sessions(&mut conn, cutoff_us).unwrap();
         assert_eq!(closed, 1, "only the stale open session must close");
 
         let (ended_at, summary_page_id): (Option<i64>, Option<Vec<u8>>) = conn
@@ -20923,6 +21003,583 @@ pub(crate) mod tests {
         assert_eq!(
             already_ended_at_after, already_ended_at_before,
             "an already-ended session's ended_at must be left exactly as it was"
+        );
+    }
+
+    /// Whether the sweep parked the session's claim (the sweep's marker
+    /// error, not a review failure).
+    fn sweep_parked(conn: &Connection, session: &NewSession) -> bool {
+        conn.query_row(
+            "SELECT EXISTS( \
+                     SELECT 1 FROM auto_improve_scheduler_claims \
+                     WHERE session_id = ?1 AND last_error = ?2 \
+                 )",
+            params![
+                session.id.as_bytes(),
+                crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    }
+
+    /// Another receiver can take the baton after startup selected it. The
+    /// late accept returns `false` and its transaction still commits, so the
+    /// marker has to survive: nothing was delivered, and removing it would
+    /// let a later idle-end queue the swept generation for review.
+    #[test]
+    fn refused_handoff_accept_keeps_the_sweep_marker() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &session).unwrap();
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "already taken".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        assert!(accept_handoff(&mut conn, &handoff_acceptance(id, ws, proj)).unwrap());
+
+        let mut late = handoff_acceptance(id, ws, proj);
+        late.accepting_agent = AgentKind::Grok;
+        late.accepting_session = Some(session.id);
+        assert!(!accept_handoff(&mut conn, &late).unwrap());
+
+        assert!(
+            sweep_parked(&conn, &session),
+            "a refused accept must keep the sweep's marker"
+        );
+    }
+
+    /// A claim row the way an operator or the scheduler would read it: the
+    /// project it is keyed to, what it last failed with, and how many times
+    /// it was tried.
+    fn claim_row(conn: &Connection, session: SessionId) -> (ProjectId, String, u32) {
+        let (bytes, last_error, attempts): (Vec<u8>, Option<String>, u32) = conn
+            .query_row(
+                "SELECT project_id, last_error, attempts FROM auto_improve_scheduler_claims \
+                 WHERE session_id = ?1",
+                params![session.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the claim row must exist");
+        (
+            ProjectId::from_slice(&bytes).expect("the claim's project id must be a valid id"),
+            last_error.expect("the claim carries its last error"),
+            attempts,
+        )
+    }
+
+    /// A claim is keyed to the session's project. If reorg moved the session
+    /// but left the claim behind, a later hollow-project sweep would delete
+    /// the now-empty source project and the claim would cascade away with it
+    /// — a session the abandoned-session sweep parked would become
+    /// reviewable again. The sweep's parked claim and a genuine failure's
+    /// claim must both move with the session, keeping `attempts` and
+    /// `last_error` intact. A plan that names another workspace must move
+    /// nothing, claim included.
+    #[test]
+    fn reorg_moves_a_parked_claim_with_its_session() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        let dest = get_or_create_project(&mut conn, &ws, "reorg-dest", None).unwrap();
+
+        // One session the abandoned-session sweep just parked.
+        let swept = SessionId::new();
+        let mut swept_session = hook_session(swept, ws, proj, None);
+        swept_session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &swept_session).unwrap();
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        let (swept_project, swept_error, swept_attempts) = claim_row(&conn, swept);
+        assert_eq!(
+            swept_project, proj,
+            "the claim starts on the session's project"
+        );
+        assert_eq!(
+            swept_error,
+            crate::auto_improve::ABANDONED_SWEEP_CLAIM_ERROR
+        );
+        assert_eq!(
+            swept_attempts,
+            crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS
+        );
+
+        // One session whose claim carries a genuine review failure — the
+        // sweep's un-park must never touch it, so reorg has to keep it.
+        let failed = SessionId::new();
+        begin_session(&mut conn, &hook_session(failed, ws, proj, None)).unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+            params![
+                ws.as_bytes(),
+                proj.as_bytes(),
+                failed.as_bytes(),
+                now,
+                2u32,
+                "auto-improve failed: class=provider status=500"
+            ],
+        )
+        .unwrap();
+
+        // The control session: a plan that names another workspace must not
+        // move it, nor the claim keyed to it.
+        let foreign = SessionId::new();
+        begin_session(&mut conn, &hook_session(foreign, ws, proj, None)).unwrap();
+        conn.execute(
+            "INSERT INTO auto_improve_scheduler_claims \
+             (workspace_id, project_id, session_id, claimed_at, attempts, last_error, last_failed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+            params![
+                ws.as_bytes(),
+                proj.as_bytes(),
+                foreign.as_bytes(),
+                now,
+                1u32,
+                "auto-improve failed: class=provider status=429"
+            ],
+        )
+        .unwrap();
+
+        let summary = reorg_sessions(&mut conn, &ws, &[(swept, dest), (failed, dest)]).unwrap();
+        assert_eq!(summary.sessions_moved, 2);
+
+        let (project, error, attempts) = claim_row(&conn, swept);
+        assert_eq!(project, dest, "the parked claim must follow the session");
+        assert_eq!(
+            error, swept_error,
+            "the sweep's marker must survive the move"
+        );
+        assert_eq!(
+            attempts, swept_attempts,
+            "the parked attempts must survive the move"
+        );
+
+        let (project, error, attempts) = claim_row(&conn, failed);
+        assert_eq!(
+            project, dest,
+            "a genuine failure's claim must follow the session"
+        );
+        assert_eq!(error, "auto-improve failed: class=provider status=500");
+        assert_eq!(attempts, 2, "the failure's attempts must survive the move");
+
+        // Adversarial control: a plan naming another workspace must leave
+        // the foreign session and its claim where they were.
+        let other_ws = get_or_create_workspace(&mut conn, "other").unwrap();
+        let other_dest = get_or_create_project(&mut conn, &other_ws, "reorg-dest", None).unwrap();
+        let summary = reorg_sessions(&mut conn, &other_ws, &[(foreign, other_dest)]).unwrap();
+        assert_eq!(
+            summary.sessions_moved, 0,
+            "a plan naming another workspace must not move the session"
+        );
+        let (project, error, attempts) = claim_row(&conn, foreign);
+        assert_eq!(
+            project, proj,
+            "the claim must stay with the session's real project"
+        );
+        assert_eq!(error, "auto-improve failed: class=provider status=429");
+        assert_eq!(attempts, 1);
+    }
+
+    /// A Grok session the sweep closed is reopened by a handoff accept, gains
+    /// new work, and is then ended by a substantive idle-end — a path that
+    /// never goes through `end_session_row`, so only the reopen's delete of
+    /// the sweep's marker keeps the new generation claimable for scheduled
+    /// review. The claim must be accepted and the marker must be gone.
+    #[test]
+    fn grok_reopened_by_handoff_after_sweep_is_claimable_after_idle_end() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        crate::auto_improve::ensure_scheduler_state(&mut conn, ws, proj).unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        // The watermark sits behind the new end, so the claim is past it.
+        conn.execute(
+            "UPDATE auto_improve_scheduler_state SET watermark_ended_at = ?1",
+            params![now - 2 * hour],
+        )
+        .unwrap();
+
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &session).unwrap();
+        let mut obs = hook_observation(&session);
+        obs.occurred_at = session.occurred_at;
+        insert_observation(&mut conn, &obs).unwrap();
+
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        assert!(
+            sweep_parked(&conn, &session),
+            "the sweep must park the claim"
+        );
+
+        // The real reopen path: accept a handoff into the ended Grok session.
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "resume the stale work".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut acceptance = handoff_acceptance(id, ws, proj);
+        acceptance.accepting_agent = AgentKind::Grok;
+        acceptance.accepting_session = Some(session.id);
+        assert!(
+            accept_handoff(&mut conn, &acceptance).unwrap(),
+            "a Grok restart must accept the handoff into the ended session"
+        );
+        assert!(
+            !sweep_parked(&conn, &session),
+            "the reopen must clear the sweep's marker"
+        );
+
+        // New work, then a substantive idle-end (the path that never goes
+        // through `end_session_row`).
+        for i in 0..3 {
+            let mut o = hook_observation(&session);
+            o.occurred_at = Some(now - 3_600_000 + i * 60_000);
+            insert_observation(&mut conn, &o).unwrap();
+        }
+        let page_id = upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                &format!("sessions/{}.md", session.id),
+                "new resumed work",
+            ),
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let results = idle_end_sessions(
+            &mut conn,
+            &[IdleEndCandidate {
+                session_id: session.id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Grok,
+                action: IdleEndAction::Substantive {
+                    expected_page_id: page_id,
+                    observation_count: count,
+                    now_us: now,
+                    last_activity_us: now - hour,
+                },
+            }],
+            true,
+        )
+        .unwrap();
+        assert_eq!(results, vec![IdleEndResult::EndedSubstantive]);
+
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::auto_improve::claim_scheduler_session(&mut conn, ws, proj, session.id, ended)
+                .unwrap(),
+            "the resumed generation must be claimable for scheduled review"
+        );
+        assert!(!sweep_parked(&conn, &session));
+    }
+
+    /// Control for the reopen un-park: the same sequence with no sweep at all
+    /// also accepts the scheduler claim.
+    #[test]
+    fn grok_reopened_by_handoff_without_sweep_is_claimable_after_idle_end() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        crate::auto_improve::ensure_scheduler_state(&mut conn, ws, proj).unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        conn.execute(
+            "UPDATE auto_improve_scheduler_state SET watermark_ended_at = ?1",
+            params![now - 2 * hour],
+        )
+        .unwrap();
+
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        begin_session(&mut conn, &session).unwrap();
+        insert_observation(&mut conn, &hook_observation(&session)).unwrap();
+        end_session(&mut conn, &session.id, None).unwrap();
+        assert!(
+            !sweep_parked(&conn, &session),
+            "no sweep ran; no marker may exist"
+        );
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "resume the stale work".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut acceptance = handoff_acceptance(id, ws, proj);
+        acceptance.accepting_agent = AgentKind::Grok;
+        acceptance.accepting_session = Some(session.id);
+        assert!(accept_handoff(&mut conn, &acceptance).unwrap());
+
+        for i in 0..3 {
+            let mut o = hook_observation(&session);
+            o.occurred_at = Some(now - 3_600_000 + i * 60_000);
+            insert_observation(&mut conn, &o).unwrap();
+        }
+        let page_id = upsert_page(
+            &mut conn,
+            &page(
+                ws,
+                proj,
+                &format!("sessions/{}.md", session.id),
+                "new resumed work",
+            ),
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let results = idle_end_sessions(
+            &mut conn,
+            &[IdleEndCandidate {
+                session_id: session.id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Grok,
+                action: IdleEndAction::Substantive {
+                    expected_page_id: page_id,
+                    observation_count: count,
+                    now_us: now,
+                    last_activity_us: now - hour,
+                },
+            }],
+            true,
+        )
+        .unwrap();
+        assert_eq!(results, vec![IdleEndResult::EndedSubstantive]);
+
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::auto_improve::claim_scheduler_session(&mut conn, ws, proj, session.id, ended)
+                .unwrap(),
+            "the control generation must be claimable too"
+        );
+    }
+
+    /// The reopen must not over-delete: a claim parked by a genuine review
+    /// failure survives the handoff reopen with its `last_error` and its
+    /// attempt count intact.
+    #[test]
+    fn grok_reopened_by_handoff_keeps_a_real_failure_claim() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        crate::auto_improve::ensure_scheduler_state(&mut conn, ws, proj).unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+        conn.execute(
+            "UPDATE auto_improve_scheduler_state SET watermark_ended_at = ?1",
+            params![now - 2 * hour],
+        )
+        .unwrap();
+
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        begin_session(&mut conn, &session).unwrap();
+        insert_observation(&mut conn, &hook_observation(&session)).unwrap();
+        end_session(&mut conn, &session.id, None).unwrap();
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            crate::auto_improve::claim_scheduler_session(&mut conn, ws, proj, session.id, ended)
+                .unwrap()
+        );
+        let error = "auto-improve failed: class=provider status=500";
+        let attempts =
+            crate::auto_improve::record_claim_failure(&conn, ws, proj, session.id, error).unwrap();
+        assert_eq!(attempts, 1);
+        let before: (String, i64) = conn
+            .query_row(
+                "SELECT last_error, attempts FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "resume the stale work".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut acceptance = handoff_acceptance(id, ws, proj);
+        acceptance.accepting_agent = AgentKind::Grok;
+        acceptance.accepting_session = Some(session.id);
+        assert!(accept_handoff(&mut conn, &acceptance).unwrap());
+
+        let after: (String, i64) = conn
+            .query_row(
+                "SELECT last_error, attempts FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+                params![session.id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "a real-failure claim must survive the reopen"
+        );
+    }
+
+    /// A second sweep over a reopened session parks it again: the claim was
+    /// deleted by the reopen, so the sweep's `ON CONFLICT … DO NOTHING` has
+    /// nothing to preserve and the marker comes back — with the session out
+    /// of the scheduler's reach again.
+    #[test]
+    fn grok_reopened_by_handoff_is_reparked_by_a_second_sweep() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        crate::auto_improve::ensure_scheduler_state(&mut conn, ws, proj).unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let hour = 3_600_000_000;
+
+        let mut session = hook_session(SessionId::new(), ws, proj, None);
+        session.agent_kind = AgentKind::Grok;
+        session.occurred_at = Some(now - 49 * hour);
+        begin_session(&mut conn, &session).unwrap();
+        let mut obs = hook_observation(&session);
+        obs.occurred_at = session.occurred_at;
+        insert_observation(&mut conn, &obs).unwrap();
+
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        assert!(sweep_parked(&conn, &session));
+
+        let id = insert_handoff(
+            &mut conn,
+            &NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::Grok,
+                to_agent: None,
+                cwd: None,
+                summary: "resume the stale work".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            },
+        )
+        .unwrap();
+        let mut acceptance = handoff_acceptance(id, ws, proj);
+        acceptance.accepting_agent = AgentKind::Grok;
+        acceptance.accepting_session = Some(session.id);
+        assert!(accept_handoff(&mut conn, &acceptance).unwrap());
+        assert!(
+            !sweep_parked(&conn, &session),
+            "the reopen must clear the marker"
+        );
+
+        // No new work: the session is stale again and the second sweep closes
+        // and re-parks it.
+        assert_eq!(
+            close_abandoned_sessions(&mut conn, now - 48 * hour).unwrap(),
+            1
+        );
+        assert!(
+            sweep_parked(&conn, &session),
+            "the second sweep must park the reopened session again"
+        );
+        let ended: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !crate::auto_improve::claim_scheduler_session(&mut conn, ws, proj, session.id, ended)
+                .unwrap(),
+            "the re-parked session must stay out of the scheduler queue"
         );
     }
 }
