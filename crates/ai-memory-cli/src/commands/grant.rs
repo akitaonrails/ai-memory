@@ -84,11 +84,14 @@ fn write_grants(
     writeln!(
         out,
         "{}",
-        i18n.diagnostic(&format!(
-            "{}  {}  LEVEL",
-            pad_cell("PROJECT", project_w),
-            pad_cell("USERNAME", user_w)
-        ))
+        crate::localization::diagnostic(
+            i18n,
+            format!(
+                "{}  {}  LEVEL",
+                pad_cell("PROJECT", project_w),
+                pad_cell("USERNAME", user_w)
+            )
+        )
     )?;
     for g in grants {
         let project = format!("{}/{}", g.workspace, g.project);

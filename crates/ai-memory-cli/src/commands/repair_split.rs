@@ -105,9 +105,12 @@ pub(crate) async fn adopt(
     if let Err(error) = local {
         eprintln!(
             "{}",
-            config.i18n.diagnostic(&format!(
-                "ai-memory: the projects were joined, but this checkout's local link could not be updated ({error:#}); the next launch resolves it by the repository"
-            ))
+            crate::localization::diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: the projects were joined, but this checkout's local link could not be updated ({error:#}); the next launch resolves it by the repository"
+                )
+            )
         );
     }
     Ok(adopted)

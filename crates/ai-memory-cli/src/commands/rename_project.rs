@@ -67,7 +67,13 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
         config, &endpoint, &workspace, &old_name, &workspace, &args.to,
     ) {
         eprintln!(
-            "{}", i18n.format("cli-rename-project-ai-memory-project-renamed-but-the-client-local-checkout-link-could-not-be-up", &[("value0", format!("{:#}", error))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-rename-project-ai-memory-project-renamed-but-the-client-local-checkout-link-could-not-be-up",
+                &[("value0", format!("{:#}", error))]
+            )
+        );
     }
     println!(
         "{}",

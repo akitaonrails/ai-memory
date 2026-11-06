@@ -958,7 +958,8 @@ fn refresh_generated_integrations(config: &Config) {
             Err(err) => {
                 println!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-upgrade-skipping-generated-name-integration-err",
                         &[
                             ("value0", name.to_string()),
@@ -1001,7 +1002,8 @@ fn refresh_generated_integrations(config: &Config) {
         if let Err(err) = result {
             println!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-apply",
                     &[
                         ("value0", format!("{:#}", err)),
@@ -1106,21 +1108,43 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
         println!(
             "{}", i18n.format("cli-upgrade-no-ai-memory-hooks-in-skipping-the-user-level-re-apply-the-staged-scripts-ar", &[("value0", format!("{}", settings.display())), ("value1", name.to_string())]));
         match install_hooks::restage_claude_code_scripts(&config.i18n, &config.data_dir, None) {
-            Ok(staged) => println!("{}", i18n.format("cli-upgrade-restaged", &[("value0", format!("{}", staged.display()))])),
+            Ok(staged) => println!(
+                "{}",
+                i18n.format(
+                    "cli-upgrade-restaged",
+                    &[("value0", format!("{}", staged.display()))]
+                )
+            ),
             Err(err) => println!(
-                "{}", i18n.format("cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-scope-project-apply-in", &[("value0", format!("{:#}", err)), ("value1", name.to_string())])),
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-scope-project-apply-in",
+                    &[
+                        ("value0", format!("{:#}", err)),
+                        ("value1", name.to_string())
+                    ]
+                )
+            ),
         }
         return;
     }
     println!(
         "{}",
-        i18n.diagnostic(&format!(
-            "    ai-memory install-hooks --agent {name} --apply"
-        ))
+        crate::localization::diagnostic(
+            i18n,
+            format!("    ai-memory install-hooks --agent {name} --apply")
+        )
     );
     if let Err(err) = install_hooks::run(config, apply_hooks_args(agent)) {
         println!(
-            "{}", i18n.format("cli-upgrade-skipped-err-re-run-with-the-same-server-url-auth-token-used-originally", &[("value0", format!("{:#}", err))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-upgrade-skipped-err-re-run-with-the-same-server-url-auth-token-used-originally",
+                &[("value0", format!("{:#}", err))]
+            )
+        );
     }
 }
 

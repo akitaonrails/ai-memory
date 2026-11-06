@@ -95,6 +95,27 @@ version in [`docs/changelog/`](docs/changelog/):
   `rename-project --project-id` command that moves an empty holder out of the
   way. The server also logs such a leftover at startup (#2018).
 
+- A line printed while a command keeps going, such as a recoverable error
+  during `ai-memory run`, `uninstall`, `restore` or the project-split
+  repair, or a lifecycle hook warning, is now neutralized like the final
+  failure report, so a value read back from the server cannot reach the
+  terminal as an escape sequence. That covers the names these lines quote
+  too: workstream, project, workspace and server-profile names, session ids
+  read from harness transcripts, the lines `recover`, `resume`,
+  `continue`, `finalize-session` and `workstreams` print about them, and
+  any other command's line that quotes an error or a reason (`upgrade`,
+  `setup`, `doctor`, `install-hooks` and others). The sanitizer also covers the direction
+  marks (U+061C, U+200E/U+200F) and the zero-width space, word joiner and
+  byte-order mark (U+200B, U+2060–U+2064, U+FEFF) it used to keep. The
+  zero-width joiner and non-joiner still print, since emoji sequences and
+  Persian or Indic text need them (#2000, #2010).
+
+- `ai-memory handoffs --expire-all` now reports the sweep, and explains why
+  it refuses without `--confirm`, in the selected language, and neutralizes
+  terminal controls in the workspace and project it echoes. Those were the
+  last English-only lines in that command while the rest of it already
+  followed the catalogs (#2011).
+
 - Search now matches the parts of a hyphenated or underscored word: `alpha`
   finds a note that writes `foo-bar-alpha`, `memory` finds `ai-memory`, and
   the whole token keeps matching too. A `title:` or `body:` filter reaches

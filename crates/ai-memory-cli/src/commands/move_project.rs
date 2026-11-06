@@ -164,7 +164,13 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         )
     {
         eprintln!(
-            "{}", i18n.format("cli-move-project-ai-memory-project-moved-but-the-client-local-checkout-link-could-not-be-upda", &[("value0", format!("{:#}", error))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-move-project-ai-memory-project-moved-but-the-client-local-checkout-link-could-not-be-upda",
+                &[("value0", format!("{:#}", error))]
+            )
+        );
     }
 
     if moved_via == "true-move" {

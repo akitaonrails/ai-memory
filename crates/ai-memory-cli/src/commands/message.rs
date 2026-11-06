@@ -118,7 +118,8 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
             std::io::stdin().read_to_string(&mut buf).map_err(|e| {
                 anyhow::anyhow!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-message-reading-message-body-from-stdin-e",
                         &[("value0", format!("{}", e))]
                     )

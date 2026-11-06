@@ -335,7 +335,8 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
         if let Some(error) = &journal_error {
             terminal.line(format_args!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-presentation-error-error",
                     &[("value0", error.to_string())]
                 )

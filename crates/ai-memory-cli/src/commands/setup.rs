@@ -592,7 +592,7 @@ fn print_plan(i18n: &ai_memory_core::i18n::Localizer, plan: &SetupPlan) {
             } else {
                 ""
             }).to_string())])),
-        ServicePlan::Skip(reason) => println!("{}", i18n.format("cli-setup-service-reason-2", &[("value0", reason.to_string())])),
+        ServicePlan::Skip(reason) => println!("{}", crate::localization::format(i18n, "cli-setup-service-reason-2", &[("value0", reason.to_string())])),
     }
     if plan.agents.is_empty() {
         println!(
@@ -872,7 +872,8 @@ async fn execute(
     match &plan.service {
         ServicePlan::Skip(reason) => println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-setup-service-reason",
                 &[("value0", reason.to_string())]
             )
@@ -967,7 +968,8 @@ async fn execute(
     for problem in &problems {
         eprintln!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-setup-problem-problem",
                 &[("value0", problem.to_string())]
             )

@@ -199,10 +199,13 @@ async fn restore_data_dir_with_legacy_pepper(
         warn!(path = %staging.display(), error = %e, "could not remove restore staging dir");
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!(
-                "warning: could not remove staging dir {} ({e}); delete it by hand",
-                staging.display()
-            ))
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "warning: could not remove staging dir {} ({e}); delete it by hand",
+                    staging.display()
+                )
+            )
         );
     }
     outcome
@@ -248,10 +251,13 @@ async fn stage_then_swap(
         );
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!(
-                "ai-memory: left out {} file(s) from the backup's wiki git directory that git could run or follow ({listed}); the wiki's git config was rebuilt",
-                left_out.len()
-            ))
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "ai-memory: left out {} file(s) from the backup's wiki git directory that git could run or follow ({listed}); the wiki's git config was rebuilt",
+                    left_out.len()
+                )
+            )
         );
     }
     // tar stops at its zero header, before the gzip decoder necessarily reads
@@ -439,11 +445,14 @@ fn swap_into_place(
         warn!(path = %previous.display(), error = %e, "could not remove pre-restore data");
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!(
-                "warning: restore succeeded but the pre-restore data under {} could not be \
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "warning: restore succeeded but the pre-restore data under {} could not be \
              removed ({e}); delete it by hand",
-                previous.display()
-            ))
+                    previous.display()
+                )
+            )
         );
     }
     Ok(())

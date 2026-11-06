@@ -137,7 +137,13 @@ pub(super) fn project_binding_for_server(
             // discovery. Select no ID and leave the file untouched; the server
             // still refuses ambiguous names and an explicit choice is required.
             eprintln!(
-                "{}", i18n.format("cli-project-registry-ai-memory-could-not-read-the-checkout-binding-error-using-guarded-project-na", &[("value0", format!("{:#}", error))]));
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-project-registry-ai-memory-could-not-read-the-checkout-binding-error-using-guarded-project-na",
+                    &[("value0", format!("{:#}", error))]
+                )
+            );
             return Ok(None);
         }
     };
@@ -215,7 +221,8 @@ pub(super) fn record_prepared_checkout(
     if !canonical.is_dir() {
         bail!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-project-registry-checkout-is-not-a-directory",
                 &[("value0", format!("{}", canonical.display()))]
             )
@@ -381,7 +388,8 @@ fn update_registry(
         if registry.links.len() > MAX_LINKS || registry.bindings.len() > MAX_LINKS {
             bail!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-project-registry-client-project-registry-exceeds-max-links-links",
                     &[("value0", format!("{}", MAX_LINKS))]
                 )
