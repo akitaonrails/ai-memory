@@ -17,7 +17,7 @@
 //! not just documentation.
 
 use std::collections::HashSet;
-use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[path = "session_usage_context.rs"]
