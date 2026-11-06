@@ -13,6 +13,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The built-in `api_key` sanitizer rule no longer starts inside an ordinary
+  word. Because nothing anchored its left side, `sk-` matched inside
+  identifiers such as `task-release-…`, `disk-usage-…` and
+  `background-task-…`, and the captured text or wiki page kept
+  `ta[REDACTED:api_key]` instead of the word. That corruption is
+  irreversible, and it turned page paths, branch names and cross-references
+  into dead links. A match no longer starts right after an ASCII letter, so
+  a key after punctuation, a space, a digit, `_`, a CJK character or a
+  percent escape (`%3D`) is still redacted. The Stripe `sk_live_`/`rk_live_`
+  rule had the same flaw (`task_live_…`, `network_live_…`) and is anchored
+  the same way. The scrub shared by the relay and importer companions now
+  uses the same anchor, so it also redacts a key glued to `_`, a digit, a
+  CJK character or a percent escape (#2025).
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is
@@ -61,6 +75,19 @@ version in [`docs/changelog/`](docs/changelog/):
   was and no stored row changes. The first start after upgrading rebuilds
   both indexes once, which takes longer on a large store, and they grow to
   roughly twice their previous size (#2013).
+
+- The dashboard's icons no longer show as empty boxes on macOS. The three
+  shipped web fonts are Latin subsets, so the geometric and symbol
+  characters the templates use as icons fell through to the platform UI
+  font, which on macOS carries only 4 of the 17. The text font stacks now
+  name the symbol fonts macOS, Windows and Linux ship (Apple Symbols, Segoe
+  UI Symbol, Noto Sans Symbols 2, DejaVu Sans) after `system-ui`, so Latin
+  text keeps its font (#2003).
+
+- The forget sweep's decay cleanup no longer logs a failure when a session
+  is purged after the sweep has listed its decayed page and the purge could
+  not remove the page file. The leftover file is left unindexed, so the
+  purged summary stays deleted, and the cleanup finishes (#1999, #2007).
 
 ### Security
 

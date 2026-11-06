@@ -2505,13 +2505,14 @@ mod tests {
             .unwrap();
         // The key starts 18 bytes before the cap: capping first would keep
         // `sk-` plus 15 characters, one short of the 16 the pattern needs.
-        // The space before the tail matters — without it the greedy key
+        // The key follows a space, since the rule skips an `sk-` glued to a
+        // letter. The space before the tail matters — without it the greedy key
         // pattern would swallow the tail into the same match and the
         // scrubbed text would never reach the cap.
         let credential = format!("sk-{}", "A".repeat(40));
         let content = format!(
-            "{}{credential} {}",
-            "x".repeat(MAX_EVENT_CONTENT_BYTES - 18),
+            "{} {credential} {}",
+            "x".repeat(MAX_EVENT_CONTENT_BYTES - 19),
             "y".repeat(2 * 1024),
         );
         let response = finish_run(
