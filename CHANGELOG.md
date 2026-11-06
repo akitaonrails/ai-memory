@@ -197,6 +197,16 @@ version in [`docs/changelog/`](docs/changelog/):
   not remove the page file. The leftover file is left unindexed, so the
   purged summary stays deleted, and the cleanup finishes (#1999, #2007).
 
+- A Claude Code session's token usage now includes its subagents. Claude
+  Code writes each subagent's turns to its own transcript,
+  `<session>/subagents/agent-<id>.jsonl`, and the native hook read only the
+  session's transcript, so the Token usage ledger and the session totals
+  missed every subagent response. The hook now also reads those transcripts,
+  with a cursor for each, on the main conversation's events and within the
+  256 responses the server takes from one event. The session-end total and
+  the close of an abandoned session add them too, and the session keeps the
+  main conversation's model (#2031).
+
 ### Security
 
 - `ai-memory restore` no longer brings back the parts of the wiki's git
