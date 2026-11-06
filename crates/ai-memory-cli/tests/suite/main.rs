@@ -34,6 +34,7 @@ mod message_e2e;
 mod opencode_dialect;
 mod packaging;
 mod plugins;
+mod portable_hook_paths;
 mod profile_e2e;
 mod removal;
 mod repo_layout;

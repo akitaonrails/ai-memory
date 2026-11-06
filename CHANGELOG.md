@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- `install-hooks` and `setup` now write native POSIX hook commands with
+  the binary and data dir as `"$HOME/..."` when they sit under your home,
+  so a hook file kept in dotfiles works for other users and machines and a
+  re-apply leaves it byte-identical. Pass `--absolute-paths`, or set
+  `AI_MEMORY_HOOK_ABSOLUTE_PATHS=1`, to keep absolute paths. Hermes and
+  Pool, which do not run hooks through a shell, keep absolute paths (#2035)
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed

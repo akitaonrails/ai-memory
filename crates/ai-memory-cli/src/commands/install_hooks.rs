@@ -671,6 +671,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     dialect: Option<ai_memory_workstream::OpenCodeDialect>,
     mcp_config_path: Option<&Path>,
 ) -> Result<()> {
+    crate::commands::render_shared::set_absolute_hook_paths(args.absolute_paths);
     let i18n = &config.i18n;
     let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
     args.agent = match (args.agent, dialect) {
@@ -9283,6 +9284,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::CommandCode,
             config_file: Some(config_path.clone()),
             ..default_hook_args()
@@ -9370,6 +9372,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::CopilotCli,
             config_file: Some(config_path.clone()),
             ..default_hook_args()
@@ -9583,6 +9586,7 @@ mod tests {
 
     fn droid_args(config_file: &Path) -> InstallHooksArgs {
         InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Droid,
             config_file: Some(config_file.to_path_buf()),
             ..default_hook_args()
@@ -9612,6 +9616,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::CodeBuddy,
             config_file: Some(settings.clone()),
             ..default_hook_args()
@@ -9681,6 +9686,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::QwenCode,
             config_file: Some(settings.clone()),
             ..default_hook_args()
@@ -9746,6 +9752,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Qoder,
             config_file: Some(settings.clone()),
             ..default_hook_args()
@@ -9807,6 +9814,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::IbmBob,
             config_file: Some(settings.clone()),
             ..default_hook_args()
@@ -9925,6 +9933,7 @@ mod tests {
 
     fn muse_args(config_file: &Path) -> InstallHooksArgs {
         InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Muse,
             config_file: Some(config_file.to_path_buf()),
             ..default_hook_args()
@@ -10280,6 +10289,7 @@ mod tests {
 
     fn default_hook_args() -> InstallHooksArgs {
         InstallHooksArgs {
+            absolute_paths: false,
             profile: None,
             agent: AgentChoice::OpenCode,
             capture_assistant: false,
@@ -10554,6 +10564,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(cfg),
             project_strategy: None,
@@ -10581,6 +10592,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(cfg),
             project_strategy: Some(ProjectStrategyArg::Basename),
@@ -10597,6 +10609,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
     fn install_project_strategy_none_when_target_absent() {
         let tmp = TempDir::new().unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(tmp.path().join("nope.json")),
             project_strategy: None,
@@ -10616,6 +10629,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Openclaw,
             config_file: Some(tmp.path().to_path_buf()),
             project_strategy: None,
@@ -11353,6 +11367,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zero,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -11511,6 +11526,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zcode,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -11614,6 +11630,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zcode,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -11699,6 +11716,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         let path = tmp.path().join("config.json");
         fs::write(&path, r#"{"hooks": {"enabled": false, "events": {}}}"#).unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zcode,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -11732,6 +11750,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zcode,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -12585,6 +12604,7 @@ model = "gpt-5"
             codex_home.path().to_str().unwrap(),
         )]);
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Codex,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12621,6 +12641,7 @@ model = "gpt-5"
 
         let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12679,6 +12700,7 @@ model = "gpt-5"
         let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
 
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12734,6 +12756,7 @@ model = "gpt-5"
         std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
 
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12780,6 +12803,7 @@ model = "gpt-5"
             config
         };
         let args = || InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12935,6 +12959,7 @@ model = "gpt-5"
         let home = TempDir::new().unwrap();
         let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Codex,
             scope: HookInstallScope::Project,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12966,6 +12991,7 @@ model = "gpt-5"
         std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
         let settings = home.path().join("settings.local.json");
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             scope: HookInstallScope::Project,
             apply: true,
@@ -12989,6 +13015,7 @@ model = "gpt-5"
         capture_assistant: bool,
     ) -> InstallHooksArgs {
         InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             capture_assistant,
@@ -14931,6 +14958,7 @@ model = "gpt-5"
     fn omp_extension_is_directly_discoverable_by_omp() {
         let tmp = TempDir::new().unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Omp,
             capture_assistant: false,
             no_capture_prompts: false,
@@ -14965,6 +14993,7 @@ model = "gpt-5"
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("extensions").join("ai-memory-pi.ts");
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Pi,
             capture_assistant: false,
             no_capture_prompts: false,
@@ -16578,6 +16607,7 @@ process.exit(0);
             config_tmp.path(),
             staging_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::Codex,
                 capture_assistant: false,
@@ -17156,6 +17186,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             staging_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::ClaudeCode,
                 capture_assistant: false,
@@ -17243,6 +17274,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         .unwrap();
 
         let disabled = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(config_path.clone()),
             no_capture_prompts: true,
@@ -17277,6 +17309,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         assert_disabled();
 
         let bare_reapply = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(config_path.clone()),
             ..default_hook_args()
@@ -17294,6 +17327,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         assert_disabled();
 
         let enabled = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(config_path.clone()),
             capture_prompts: true,
@@ -17756,6 +17790,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             config_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
@@ -17825,6 +17860,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             config_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
@@ -17882,6 +17918,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         let hooks_v1_path = config_tmp.path().join("hooks.v1.json");
 
         let args_v1 = InstallHooksArgs {
+            absolute_paths: false,
             profile: None,
             agent: AgentChoice::Devin,
             capture_assistant: false,
@@ -17934,6 +17971,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         fs::write(&config_path, "{}").unwrap();
 
         let args_config = InstallHooksArgs {
+            absolute_paths: false,
             profile: None,
             agent: AgentChoice::Devin,
             capture_assistant: false,
@@ -18012,6 +18050,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             config_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
