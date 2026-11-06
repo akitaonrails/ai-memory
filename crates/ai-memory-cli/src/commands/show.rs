@@ -717,13 +717,16 @@ pub(crate) fn terminal_body(text: &str) -> String {
             // let a value the CLI only quotes reach the terminal as a
             // sequence the operator did not read: C0/C1 controls and DEL
             // (`is_control`), bidi embeddings/overrides/isolates plus the
-            // Arabic letter mark, and the zero-width/word-joiner/BOM family
-            // (#2000).
+            // direction marks, and the zero-width space/word-joiner/BOM
+            // family (#2000). The zero-width joiner and non-joiner (U+200C,
+            // U+200D) stay: emoji sequences and Persian or Indic text need
+            // them, and page bodies and titles print through here.
             if (character.is_control() && !matches!(character, '\n' | '\t'))
                 || matches!(
                     character,
                     '\u{061c}'
-                        | '\u{200b}'..='\u{200f}'
+                        | '\u{200b}'
+                        | '\u{200e}'..='\u{200f}'
                         | '\u{2028}'..='\u{202e}'
                         | '\u{2060}'..='\u{2064}'
                         | '\u{2066}'..='\u{2069}'
@@ -1279,9 +1282,24 @@ mod tests {
     #[test]
     fn terminal_text_neutralizes_mid_direction_marks_and_zero_width_characters() {
         assert_eq!(
-            terminal_text("caf\u{200e}\u{200f}\u{61c}\u{200b}\u{200c}\u{200d}\u{2060}\u{feff}é"),
-            "caf????????é"
+            terminal_text("caf\u{200e}\u{200f}\u{61c}\u{200b}\u{2060}\u{2064}\u{feff}é"),
+            "caf???????é"
         );
+    }
+
+    /// The joiners are part of legitimate text: a ZWJ emoji sequence and a
+    /// Persian word written with a ZWNJ print unchanged, in a quoted value and
+    /// in a page body alike.
+    #[test]
+    fn terminal_text_keeps_the_joiners_that_emoji_and_scripts_need() {
+        for text in [
+            "\u{1f469}\u{200d}\u{1f4bb} notas",
+            "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}",
+            "ação · 日本語 · ~/Projetos/café",
+        ] {
+            assert_eq!(terminal_text(text), text);
+            assert_eq!(terminal_body(text), text);
+        }
     }
 
     #[test]
