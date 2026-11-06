@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The project page's tabs work again when the web UI is shown in a language
+  other than English. Their script looked up the tab bar by its English
+  accessible name, so a Portuguese page left every tab panel hidden. The
+  script now finds the tab bar by a fixed attribute, and a test rejects any
+  web UI script that selects elements by translated text (#2024).
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is
