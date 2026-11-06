@@ -3431,6 +3431,9 @@ mod tests {
         assert_eq!(calls(subagent_event), ["main-1"]);
         let main_event = serde_json::json!({"transcript_path": path});
         assert_eq!(calls(main_event), ["main-1", "sub-1"]);
+        // `claude --agent` sets `agent_type` on the main session's own events.
+        let agent_session = serde_json::json!({"transcript_path": path, "agent_type": "reviewer"});
+        assert_eq!(calls(agent_session), ["main-1", "sub-1"]);
     }
 
     #[test]
