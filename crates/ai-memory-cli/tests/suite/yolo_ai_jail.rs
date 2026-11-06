@@ -13,8 +13,9 @@ use std::path::Path;
 use std::process::Command;
 
 use ai_memory_workstream::{
-    JAIL_TOGGLES, JailToggleChoice, ai_jail_support, build_ai_jail_invocation, parse_jail_toggles,
-    usable_ai_jail_here,
+    JAIL_TOGGLES, JailToggleChoice, ServerReach, ai_jail_contract, ai_jail_support,
+    build_ai_jail_invocation, contract_flags, contract_invocation, contract_status_invocation,
+    parse_jail_toggles, parse_status, status_refusal, usable_ai_jail_here,
 };
 
 fn forwarded() -> Vec<OsString> {
@@ -289,4 +290,83 @@ fn real_ai_jail_rejects_an_unknown_toggle() {
         !output.status.success(),
         "ai-jail accepted an unknown flag; support detection would be moot"
     );
+}
+
+/// The ai-jail 3.0.1+ launch: the real binary accepts the declared harness,
+/// the forwarded port and the command-line grants (`--dry-run`), and its
+/// read-only status of that same launch lists no request waiting for a
+/// prompt. A request file would put each variable behind its own yes/no;
+/// grants on the command line put none. Run in a fresh home and project so
+/// no real policy is read and nothing real is written.
+#[test]
+fn real_ai_jail_3_accepts_the_contract_launch_without_any_pending_request() {
+    let Some(ai_jail) = usable_ai_jail_here() else {
+        eprintln!("skipping: ai-jail is not usable here (absent, no sandbox backend, or Windows)");
+        return;
+    };
+    let support = ai_jail_support(&ai_jail).expect("ai-jail --help");
+    if ai_jail_contract(&ai_jail, &support).is_none() {
+        eprintln!("skipping: installed ai-jail predates the 3.0.1 wrapper contract");
+        return;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
+    let flags = contract_flags(
+        "claude",
+        ServerReach::Loopback { port: 49374 },
+        &["AI_MEMORY_SERVER_URL"],
+        &[],
+        &[],
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (home, project) = (root.join("home"), root.join("project"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let in_fresh_home = |args: &[OsString]| {
+        Command::new(&ai_jail)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("AI_MEMORY_SERVER_URL", "http://127.0.0.1:49374")
+            .current_dir(&project)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run ai-jail")
+    };
+    let dry_run: Vec<OsString> = std::iter::once(OsString::from("--dry-run"))
+        .chain(contract_invocation(&flags, &exe, &forwarded()))
+        .collect();
+    let output = in_fresh_home(&dry_run);
+    assert!(
+        output.status.success(),
+        "ai-jail --dry-run rejected the contract launch:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = in_fresh_home(&contract_status_invocation(&flags, &exe, &forwarded()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let status = parse_status(&stdout).unwrap_or_else(|| panic!("status --json: {stdout}"));
+    assert_eq!(status_refusal(&status), None, "{status:?}");
+    let raw: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        raw["requests"]["pending"],
+        serde_json::json!([]),
+        "{stdout}"
+    );
+    assert!(
+        raw["harnesses"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|item| item["name"] == "claude")),
+        "the declared harness is the one ai-jail reviews: {stdout}"
+    );
+    for dir in [&home, &project] {
+        assert_eq!(
+            std::fs::read_dir(dir).unwrap().count(),
+            0,
+            "{} was written",
+            dir.display()
+        );
+    }
 }
