@@ -26,7 +26,7 @@ pub use admission::{
 pub use atomic::{rename_with_retry, write_atomic};
 pub use confinement::validate_wiki_tree;
 pub use error::{WikiError, WikiResult};
-pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
+pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter, fresh_repository_config};
 pub use ledger::is_rotated_event_ledger;
 pub use markdown::{
     Markdown, decode_markdown_destination_path, delink_wikilinks, derive_title, emit,

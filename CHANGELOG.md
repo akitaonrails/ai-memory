@@ -53,6 +53,26 @@ version in [`docs/changelog/`](docs/changelog/):
   last English-only lines in that command while the rest of it already
   followed the catalogs (#2011).
 
+- Search now matches the parts of a hyphenated or underscored word: `alpha`
+  finds a note that writes `foo-bar-alpha`, `memory` finds `ai-memory`, and
+  the whole token keeps matching too. A `title:` or `body:` filter reaches
+  the parts as well. The page and observation search indexes gained a second
+  spelling of the same text (migration V100), so the tokenizer stays as it
+  was and no stored row changes. The first start after upgrading rebuilds
+  both indexes once, which takes longer on a large store, and they grow to
+  roughly twice their previous size (#2013).
+
+### Security
+
+- `ai-memory restore` no longer brings back the parts of the wiki's git
+  directory that git runs or follows. It restores git's data (objects, refs,
+  logs, HEAD, the index) and writes a fresh git config; hooks, the archived
+  config, worktree and submodule metadata, alternates and any nested
+  repository are left out and named in the output. A backup from someone else
+  could otherwise make a later `git` command in the wiki run a program.
+  Reported by Daniel Pinto (@Cayan).
+  ([GHSA-w734-2f7h-6qcp](https://github.com/akitaonrails/ai-memory/security/advisories/GHSA-w734-2f7h-6qcp))
+
 ## [3.4.2] - 2026-11-05
 
 ### Added
