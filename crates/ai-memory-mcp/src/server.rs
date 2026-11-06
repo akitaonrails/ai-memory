@@ -4398,6 +4398,7 @@ impl AiMemoryServer {
                     }),
                 contradiction_band_min: self.contradiction_band_min,
                 contradiction_band_max: self.contradiction_band_max,
+                keep_llm_findings: false,
             },
         )
         .await
@@ -7857,9 +7858,11 @@ impl AiMemoryServer {
         project state; use `memory_explore` if you want an LLM-composed \
         prose summary on top of the same data. Pass `settled_first: true` \
         to also lead the briefing with the project's settled rule/decision \
-        pages (highest-standing, ordered by evidence then recency). `scope` \
-        names the project briefed — pass it to memory_message_pop when \
-        `pending_message_count` is non-zero."
+        pages (highest-standing, ordered by evidence then recency). `lint`, \
+        when present, counts the warnings in the project's latest \
+        `_lint/report.md`; read that page before relying on the pages it \
+        flags. `scope` names the project briefed — pass it to \
+        memory_message_pop when `pending_message_count` is non-zero."
     )]
     async fn memory_briefing(
         &self,
@@ -19662,6 +19665,70 @@ mod tests {
         assert!(
             !text.contains("\"settled\""),
             "settled must be omitted by default:\n{text}"
+        );
+        assert!(
+            !text.contains("\"lint\""),
+            "a project without a lint report has no lint summary:\n{text}"
+        );
+    }
+
+    /// #2021: `memory_briefing` reports the counts of the project's latest
+    /// lint report and points at it.
+    #[tokio::test]
+    async fn memory_briefing_reports_the_lint_summary() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("_lint/report.md").unwrap(),
+                title: "Lint report".into(),
+                body: "# Lint findings".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({
+                    "kind": "lint-report",
+                    "findings": 3,
+                    "warnings": 2,
+                    "warning_pages": ["foo.md"],
+                }),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let result = server
+            .memory_briefing(
+                Parameters(BriefingArgs {
+                    recent_pages_limit: Some(5),
+                    recent_sessions_limit: None,
+                    project: None,
+                    workspace: None,
+                    settled_first: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let lint = &json["lint"];
+        assert_eq!(lint["report_path"], "_lint/report.md", "{text}");
+        assert_eq!(lint["warnings"], 2, "{text}");
+        assert_eq!(lint["findings"], 3, "{text}");
+        assert_eq!(
+            lint["warning_pages"],
+            serde_json::json!(["foo.md"]),
+            "{text}"
         );
     }
 

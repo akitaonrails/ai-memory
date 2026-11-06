@@ -227,6 +227,15 @@ log_level = "info"
 # requests it for one launch.
 # claude_true_yolo = false
 
+# How the generated Pi extension registers ai-memory's MCP tools. `direct`
+# declares every tool to the model, as before. `codemode` registers them with
+# Pi's `exposure: "codemode"`: Pi's codemode tool lists and calls them, and
+# their schemas are no longer sent to the model on every request. Tool names,
+# session headers and lifecycle capture do not change. Re-run
+# `ai-memory install-hooks --agent pi --apply` and restart Pi after changing
+# it. Env equivalent: `AI_MEMORY_PI_TOOL_EXPOSURE`.
+# pi_tool_exposure = "direct"
+
 # Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
 # contradiction: same topic without being a near-duplicate. Pages at or above
 # the min and below the max are flagged; at or above the max they count as
@@ -714,6 +723,13 @@ mid_session = "follow-cwd"
 # delay. Embedding backfill is off by default because it may call a paid
 # provider.
 #
+# lint_llm_interval_secs adds the LLM contradiction pass to scheduled lint, on
+# its own cadence (604800 is weekly). It makes one `lint` provider call per
+# project that has at least two semantic or procedural pages, with at most 20
+# pages of 400 characters each. Off by default; with no provider configured it
+# is skipped with one warning. While it is on, the daily rule-based run keeps
+# the last LLM findings in `_lint/report.md` instead of dropping them.
+#
 # reconcile_tombstones_deleted_pages (#929, docs/okf.md) lets the watcher's 30s
 # reconcile pass tombstone an OKF-imported content page whose file was missing
 # on two consecutive passes. Session summary pages are excluded. A circuit
@@ -727,6 +743,7 @@ mid_session = "follow-cwd"
 # enabled = true
 # forget_sweep_interval_secs = 86400
 # lint_interval_secs = 86400
+# lint_llm_interval_secs = 0
 # embedding_backfill_interval_secs = 0
 # reconcile_tombstones_deleted_pages = false
 

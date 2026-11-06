@@ -26,6 +26,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `backfill_on_start` | `true` | `AI_MEMORY_BACKFILL_ON_START` | Import a project's existing local harness history once, when SessionStart finds its store empty. |
 | `run_autowire` | `true` | `AI_MEMORY_RUN_AUTOWIRE` | Install a harness's hooks and MCP server on the first `ai-memory run` launch when they are missing. |
 | `claude_true_yolo` | `false` | `AI_MEMORY_CLAUDE_TRUE_YOLO` | Make `ai-memory run --yolo` on Claude force `bypassPermissions` over any settings `defaultMode`. |
+| `pi_tool_exposure` | `"direct"` | `AI_MEMORY_PI_TOOL_EXPOSURE` | How the generated Pi extension registers ai-memory's MCP tools: `direct` (declared to the model) or `codemode` (reached through Pi's codemode tool). |
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
 | `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`. The only value is `llm`, which needs an LLM provider. |
@@ -66,8 +67,9 @@ An array of tables. Each entry is tried in order after the primary provider, onl
 Each optional task profile selects a separate provider chain. The task keys are
 `consolidation`, `bootstrap`, `auto_improve`, `experience`, `dream`, `lint`,
 `profile`, `rerank` and `query_answer`. The last covers both
-`memory_query(answer=true)` and `memory_explore`. Scheduled lint remains
-rule-only.
+`memory_query(answer=true)` and `memory_explore`. Scheduled lint is
+rule-only unless `[maintenance] lint_llm_interval_secs` turns on the LLM pass,
+which uses the `lint` provider.
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
@@ -161,6 +163,7 @@ Per-tier half-lives in days. A tier that sets one decays at `ln(2) / days`. A ti
 | `enabled` | `true` | `AI_MEMORY_MAINTENANCE__ENABLED` | Master switch for scheduled server jobs. |
 | `forget_sweep_interval_secs` | `86400` | `AI_MEMORY_MAINTENANCE__FORGET_SWEEP_INTERVAL_SECS` | Interval of the retention forget sweep. 0 disables the job. |
 | `lint_interval_secs` | `86400` | `AI_MEMORY_MAINTENANCE__LINT_INTERVAL_SECS` | Interval of rule-based wiki lint. 0 disables the job. |
+| `lint_llm_interval_secs` | `0` (off) | `AI_MEMORY_MAINTENANCE__LINT_LLM_INTERVAL_SECS` | Interval of lint with the LLM contradiction pass across every project. Off by default because it calls the `lint` provider; skipped with one warning when no provider is configured. |
 | `embedding_backfill_interval_secs` | `0` (off) | `AI_MEMORY_MAINTENANCE__EMBEDDING_BACKFILL_INTERVAL_SECS` | Interval of embedding backfill. Off by default because it may call a paid provider. |
 | `reconcile_tombstones_deleted_pages` | `false` | `AI_MEMORY_MAINTENANCE__RECONCILE_TOMBSTONES_DELETED_PAGES` | Let the watcher tombstone an OKF-imported page whose file stayed missing on two consecutive passes. |
 

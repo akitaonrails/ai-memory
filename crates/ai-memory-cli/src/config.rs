@@ -280,6 +280,25 @@ pub struct ResolvedTaskLlm {
     pub fallbacks: Vec<ProviderConfig>,
 }
 
+/// The `exposure` the generated Pi extension gives each bridged MCP tool.
+///
+/// Pi documents five values; only the two that keep every tool reachable by
+/// the model are offered. `model-only` would stop codemode scripts calling the
+/// tools, `deferred` hides them from codemode's own listing, and `hidden`
+/// withdraws them. See
+/// <https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure>.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PiToolExposure {
+    /// Pi's default: declared to the model while active. The generated file
+    /// omits the property, so it stays byte-identical to earlier releases.
+    #[default]
+    Direct,
+    /// Callable whenever registered and listed by Pi's `codemode` tool, but
+    /// not declared to the model unless activated explicitly.
+    Codemode,
+}
+
 /// Top-level runtime configuration.
 ///
 /// `deny_unknown_fields` is intentionally NOT set: figment's
@@ -533,6 +552,14 @@ pub struct Config {
     /// `AI_MEMORY_CLAUDE_TRUE_YOLO=true` or `claude_true_yolo = true` in
     /// config.toml; `ai-memory run --true-yolo` requests it per launch.
     pub claude_true_yolo: bool,
+    /// How the generated Pi extension exposes ai-memory's MCP tools to the
+    /// model (#1988). `direct` (the default) declares every tool, as before;
+    /// `codemode` registers them with Pi's `exposure: "codemode"`, so Pi's
+    /// codemode tool lists and calls them without their schemas being sent on
+    /// every request. Read by `install-hooks --agent pi`, preview and
+    /// `--apply` alike, so regenerating the extension keeps the choice. Set
+    /// with `AI_MEMORY_PI_TOOL_EXPOSURE` or `pi_tool_exposure` in config.toml.
+    pub pi_tool_exposure: PiToolExposure,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -1542,6 +1569,7 @@ impl Default for Config {
             run_autowire: true,
             run: RunSettings::default(),
             claude_true_yolo: false,
+            pi_tool_exposure: PiToolExposure::default(),
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -2001,6 +2029,13 @@ pub struct MaintenanceSettings {
     /// persist cadence across restarts; overdue work starts after a bounded
     /// startup delay.
     pub lint_interval_secs: u64,
+    /// Interval for lint with the LLM contradiction pass (#2021). `0` (the
+    /// default) disables this job, because each run makes one `[llm.lint]`
+    /// provider call per project with enough semantic pages. Without a lint
+    /// provider the job is skipped with one startup warning. Cadence persists
+    /// like `lint_interval_secs`, and while it is on the rule-based run keeps
+    /// the last LLM findings in `_lint/report.md`.
+    pub lint_llm_interval_secs: u64,
     /// Interval for embedding backfill. `0` disables this job.
     /// Defaults to off because it may call a paid provider.
     pub embedding_backfill_interval_secs: u64,
@@ -2038,6 +2073,7 @@ impl Default for MaintenanceSettings {
             enabled: true,
             forget_sweep_interval_secs: 86_400,
             lint_interval_secs: 86_400,
+            lint_llm_interval_secs: 0,
             embedding_backfill_interval_secs: 0,
             reconcile_tombstones_deleted_pages: false,
         }
@@ -4549,6 +4585,7 @@ mod tests {
         assert!(cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
+        assert_eq!(cfg.maintenance.lint_llm_interval_secs, 0);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
         assert_eq!(cfg.decay.breadth_weight, 0.0);
         // Observation pruning must stay OFF by default: an install that never
@@ -6099,6 +6136,35 @@ input_token_safety_margin = {margin}
         );
     }
 
+    /// #1988: the Pi extension's tool exposure defaults to Pi's `direct` and
+    /// accepts `codemode`. Pi's other documented values would make the tools
+    /// unreachable from the model or from codemode's listing, so they fail
+    /// config load like any unknown value.
+    #[rstest]
+    #[case::absent("", Ok(PiToolExposure::Direct))]
+    #[case::direct("pi_tool_exposure = \"direct\"\n", Ok(PiToolExposure::Direct))]
+    #[case::codemode("pi_tool_exposure = \"codemode\"\n", Ok(PiToolExposure::Codemode))]
+    #[case::model_only("pi_tool_exposure = \"model-only\"\n", Err(()))]
+    #[case::deferred("pi_tool_exposure = \"deferred\"\n", Err(()))]
+    #[case::hidden("pi_tool_exposure = \"hidden\"\n", Err(()))]
+    #[case::uppercase("pi_tool_exposure = \"Codemode\"\n", Err(()))]
+    fn load_parses_pi_tool_exposure(#[case] toml: &str, #[case] want: Result<PiToolExposure, ()>) {
+        match (load_with_toml(toml), want) {
+            (Ok(cfg), Ok(want)) => assert_eq!(cfg.pi_tool_exposure, want),
+            (Err(error), Err(())) => {
+                let rendered = format!("{error:#}");
+                assert!(
+                    rendered.contains("pi_tool_exposure") && rendered.contains("unknown variant"),
+                    "unexpected error: {rendered}"
+                );
+            }
+            (got, want) => panic!(
+                "{toml:?}: got {:?}, want {want:?}",
+                got.map(|c| c.pi_tool_exposure)
+            ),
+        }
+    }
+
     #[test]
     fn defaults_bound_consolidation_prompts_for_a_large_context_provider() {
         let tmp = TempDir::new().unwrap();
@@ -6238,6 +6304,7 @@ input_token_safety_margin = {margin}
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
+            lint_llm_interval_secs = 604800
 
             [auto_improve]
             mode = "dry_run"
@@ -6293,6 +6360,7 @@ input_token_safety_margin = {margin}
         assert!(!cfg.handoff.create_on_session_end);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
+        assert_eq!(cfg.maintenance.lint_llm_interval_secs, 604_800);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 1_800);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 4);

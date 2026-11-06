@@ -2371,6 +2371,89 @@ pub struct BriefingSnapshot {
     /// shape byte-for-byte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned: Vec<BriefingPage>,
+    /// The project's latest lint report, from `_lint/report.md` (#2021).
+    /// Project-scoped briefings only; omitted when the project has no report
+    /// or the report predates the counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lint: Option<LintSummary>,
+}
+
+/// Counts from a project's `_lint/report.md`, written by every lint run
+/// (scheduled or manual) into the report's frontmatter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LintSummary {
+    /// Always `_lint/report.md`; read it for the findings themselves.
+    pub report_path: String,
+    /// ISO-8601 time the report was written.
+    pub updated_at: String,
+    /// Findings of `warning` severity.
+    pub warnings: u64,
+    /// All findings, `info` included.
+    pub findings: u64,
+    /// The first few distinct pages the warnings name.
+    pub warning_pages: Vec<String>,
+}
+
+/// Path of the per-project lint report; matches `ai-memory-consolidate`'s
+/// `REPORT_PATH`.
+const LINT_REPORT_PATH: &str = "_lint/report.md";
+/// Upper bound on `LintSummary::warning_pages`, whatever the frontmatter
+/// holds: the report is an ordinary page and can be edited by hand.
+const LINT_WARNING_PAGES_MAX: usize = 5;
+
+/// The project's lint summary, or `None` when no current report carries the
+/// counts.
+fn lint_summary_in(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    now_us: i64,
+) -> StoreResult<Option<LintSummary>> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            &format!(
+                "SELECT frontmatter_json, updated_at FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                 AND is_latest = 1{not_expired}",
+                not_expired = not_expired("pages", "?4"),
+            ),
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                LINT_REPORT_PATH,
+                now_us
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((frontmatter, updated_at)) = row else {
+        return Ok(None);
+    };
+    let Ok(frontmatter) = serde_json::from_str::<serde_json::Value>(&frontmatter) else {
+        return Ok(None);
+    };
+    let count = |key: &str| frontmatter.get(key).and_then(serde_json::Value::as_u64);
+    let (Some(warnings), Some(findings)) = (count("warnings"), count("findings")) else {
+        return Ok(None);
+    };
+    let warning_pages = frontmatter
+        .get("warning_pages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .take(LINT_WARNING_PAGES_MAX)
+        .map(str::to_owned)
+        .collect();
+    Ok(Some(LintSummary {
+        report_path: LINT_REPORT_PATH.to_owned(),
+        updated_at: jiff::Timestamp::from_microsecond(updated_at)
+            .map(|ts| ts.to_string())
+            .unwrap_or_default(),
+        warnings,
+        findings,
+        warning_pages,
+    }))
 }
 
 /// Trimmed page view for the briefing — path, title, kind, updated_at
@@ -9614,6 +9697,27 @@ impl ReaderPool {
         .await
     }
 
+    /// The project's lint summary (#2021): counts from the frontmatter of
+    /// its current `_lint/report.md`, or `None` when there is none.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn lint_summary(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<LintSummary>> {
+        self.with_conn(move |conn| {
+            lint_summary_in(
+                conn,
+                workspace_id,
+                project_id,
+                jiff::Timestamp::now().as_microsecond(),
+            )
+        })
+        .await
+    }
+
     /// Count pending messages addressed to a project's inbox (V64). Backs the
     /// on-start inbox notice and `memory_briefing`'s `pending_message_count`.
     ///
@@ -9961,6 +10065,7 @@ impl ReaderPool {
                 // The pinned standing-context list is a project-scoped signal;
                 // an aggregate current/workspace briefing leaves it empty.
                 pinned: Vec::new(),
+                lint: None,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -10222,6 +10327,7 @@ impl ReaderPool {
                 cross_project_dependencies,
                 settled,
                 pinned,
+                lint: lint_summary_in(conn, workspace_id, project_id, now_us)?,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -10681,6 +10787,7 @@ impl ReaderPool {
                 // The pinned standing-context list is a project-scoped signal;
                 // an aggregate current/workspace briefing leaves it empty.
                 pinned: Vec::new(),
+                lint: None,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
