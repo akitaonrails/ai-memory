@@ -66,6 +66,11 @@ version in [`docs/changelog/`](docs/changelog/):
   UI Symbol, Noto Sans Symbols 2, DejaVu Sans) after `system-ui`, so Latin
   text keeps its font (#2003).
 
+- The forget sweep's decay cleanup no longer logs a failure when a session
+  is purged after the sweep has listed its decayed page and the purge could
+  not remove the page file. The leftover file is left unindexed, so the
+  purged summary stays deleted, and the cleanup finishes (#1999, #2007).
+
 ### Security
 
 - `ai-memory restore` no longer brings back the parts of the wiki's git
