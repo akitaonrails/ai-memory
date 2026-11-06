@@ -30,6 +30,7 @@ mod autoscope_multiuser;
 mod dual_key_scope;
 mod handoff_admission;
 mod handoff_identity;
+mod llm_request_subject;
 mod mcp_stateless_http;
 mod query_answer;
 mod query_observation_stream;

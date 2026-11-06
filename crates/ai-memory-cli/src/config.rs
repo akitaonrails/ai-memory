@@ -7716,6 +7716,28 @@ input_token_safety_margin = {margin}
         );
     }
 
+    /// `llm_request_metadata_headers` is server-wide, as `docs/llm-providers.md`
+    /// warns: an `openai-compat` fallback sends the metadata to its own
+    /// endpoint too.
+    #[test]
+    fn an_openai_compat_fallback_inherits_request_metadata_headers() {
+        let cfg = Config {
+            llm_request_metadata_headers: true,
+            ..Config::default()
+        };
+        let profile = FallbackProfile {
+            provider: "openai-compat".into(),
+            model: "qwen3:32b".into(),
+            base_url: Some("http://gateway.internal/v1".into()),
+            api_key_env: Some("COMPAT_FALLBACK_KEY".into()),
+        };
+        let provider_cfg = cfg
+            .fallback_provider_config(0, &profile, Some(SecretString::from("sk-fallback-test")))
+            .unwrap();
+        assert_eq!(provider_cfg.provider, ProviderChoice::OpenAiCompat);
+        assert!(provider_cfg.request_metadata_headers);
+    }
+
     #[test]
     fn native_profile_overrides_use_named_credentials_and_profile_endpoints() {
         let tmp = TempDir::new().unwrap();

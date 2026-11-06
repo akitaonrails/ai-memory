@@ -307,7 +307,10 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > sends these headers (the official providers, `opencode`, and a fallback to
 > another provider never do), and the four names are refused in
 > `AI_MEMORY_LLM_HEADERS` for `openai-compat` whether or not the setting is
-> on.
+> on. The setting is server-wide: an `openai-compat` entry in
+> `llm_fallbacks` sends the headers to its own endpoint too, so turn it on
+> only when every `openai-compat` endpoint you configure may see your
+> workspace, project and user names.
 
 ### Probing the server's own provider
 
