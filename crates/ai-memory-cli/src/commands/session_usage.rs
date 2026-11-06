@@ -332,6 +332,9 @@ pub struct SessionUsage {
 /// pathological file; real sessions are far smaller than this.
 const CLAUDE_MAX_BYTES: u64 = 200 * 1024 * 1024;
 
+/// Most subagent transcripts a full-session Claude Code scan sums.
+const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
+
 /// How far from the end of a Codex rollout file to scan for the most recent
 /// `token_usage_record`. Codex writes one after nearly every turn, so this
 /// window holds one in any session that has had at least one model turn,
@@ -345,52 +348,122 @@ const CODEX_TAIL_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 /// writer emits the same finalized message twice in a row (streaming, then
 /// finalized) with byte-identical usage on every duplicate observed —
 /// summing without the dedup roughly doubled the true total there.
+///
+/// The session's subagent transcripts are summed with it, since the session
+/// transcript holds none of their responses. They share its
+/// `CLAUDE_MAX_BYTES` budget and its `message.id` dedup, and the model stays
+/// the main conversation's.
 #[must_use]
 pub fn extract_claude_code_usage(transcript_path: &Path) -> Option<SessionUsage> {
     let file = std::fs::File::open(transcript_path).ok()?;
-    if file.metadata().ok()?.len() > CLAUDE_MAX_BYTES {
-        return None;
+    let len = file.metadata().ok()?.len();
+    let mut budget = CLAUDE_MAX_BYTES.checked_sub(len)?;
+    let mut totals = ClaudeCodeTotals::default();
+    let model = totals.add(std::io::BufReader::new(file));
+    for transcript in claude_subagent_transcripts(transcript_path, MAX_SUBAGENT_TRANSCRIPTS) {
+        let Ok(file) = std::fs::File::open(&transcript) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        let Some(rest) = budget.checked_sub(metadata.len()) else {
+            continue;
+        };
+        budget = rest;
+        totals.add(std::io::BufReader::new(file));
     }
-    let reader = std::io::BufReader::new(file);
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut totals = SessionUsage::default();
-    let mut any = false;
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.is_empty() {
-            continue;
+    totals.usage.model = model;
+    totals.any.then_some(totals.usage)
+}
+
+/// Responses summed across the transcripts of one Claude Code session.
+#[derive(Default)]
+struct ClaudeCodeTotals {
+    usage: SessionUsage,
+    seen_ids: HashSet<String>,
+    any: bool,
+}
+
+impl ClaudeCodeTotals {
+    /// Add one transcript's responses, skipping ids already counted. Returns
+    /// the last model it names.
+    fn add(&mut self, reader: impl std::io::BufRead) -> Option<String> {
+        let mut model = None;
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if value.get("isMeta").and_then(serde_json::Value::as_bool) == Some(true) {
+                continue;
+            }
+            let Some(message) = value.get("message") else {
+                continue;
+            };
+            let Some(id) = message.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !self.seen_ids.insert(id.to_owned()) {
+                continue;
+            }
+            let Some(usage) = message.get("usage") else {
+                continue;
+            };
+            self.usage.input_tokens += u64_field(usage, "input_tokens");
+            self.usage.output_tokens += u64_field(usage, "output_tokens");
+            self.usage.cache_write_tokens += u64_field(usage, "cache_creation_input_tokens");
+            self.usage.cache_read_tokens += u64_field(usage, "cache_read_input_tokens");
+            if let Some(name) = message.get("model").and_then(serde_json::Value::as_str) {
+                model = Some(name.to_owned());
+            }
+            self.any = true;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if value.get("isMeta").and_then(serde_json::Value::as_bool) == Some(true) {
-            continue;
-        }
-        let Some(message) = value.get("message") else {
-            continue;
-        };
-        let Some(id) = message.get("id").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if !seen_ids.insert(id.to_owned()) {
-            continue;
-        }
-        let Some(usage) = message.get("usage") else {
-            continue;
-        };
-        totals.input_tokens += u64_field(usage, "input_tokens");
-        totals.output_tokens += u64_field(usage, "output_tokens");
-        totals.cache_write_tokens += u64_field(usage, "cache_creation_input_tokens");
-        totals.cache_read_tokens += u64_field(usage, "cache_read_input_tokens");
-        if let Some(model) = message.get("model").and_then(serde_json::Value::as_str) {
-            totals.model = Some(model.to_owned());
-        }
-        any = true;
+        model
     }
-    any.then_some(totals)
+}
+
+/// The subagent transcripts of a Claude Code session, newest first.
+///
+/// Claude Code keeps the main conversation in `<session>.jsonl` and writes
+/// each subagent's to `<session>/subagents/agent-<id>.jsonl`, the
+/// `agent_transcript_path` its `SubagentStop` hook receives
+/// (<https://code.claude.com/docs/en/hooks#subagentstop>). Only regular files
+/// count, at most `limit` of them.
+fn claude_subagent_transcripts(transcript_path: &Path, limit: usize) -> Vec<PathBuf> {
+    let Some(session) = transcript_path.file_stem() else {
+        return Vec::new();
+    };
+    let dir = transcript_path.with_file_name(session).join("subagents");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut transcripts = entries
+        .take(1024)
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("agent-") && name.ends_with(".jsonl")
+        })
+        .filter_map(|entry| {
+            // `DirEntry::metadata` does not follow a symlink.
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            Some((metadata.modified().ok(), entry.path()))
+        })
+        .collect::<Vec<_>>();
+    transcripts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    transcripts.truncate(limit);
+    transcripts.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Read the most recent legacy usage record or modern `token_count` event
