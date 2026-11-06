@@ -55,8 +55,8 @@ LongMemEval-S hit@5 **0.666** zero-LLM and **0.815** with the default local
 embeddings in the published 2.6 line. The observation stream in 3.0
 (on by default) raises zero-LLM to **0.951** and local embeddings
 to **0.945** on all 470 questions, measured on one build with the stream off
-and on. The 3.4.0 release run measures **0.951** zero-LLM and **0.940** local
-at hit@5 ([report](benchmarks/longmemeval-s-3.4.0-release.md)); the local
+and on. The 3.4.3 release run measures **0.951** zero-LLM and **0.943** local
+at hit@5 ([report](benchmarks/longmemeval-s-3.4.3-release.md)); the local
 mode's run-to-run variance is published and tracked in #1854. With capture skipped and
 each raw session indexed whole (component
 mode, ranking only), zero-LLM FTS scores 0.972; the
@@ -448,7 +448,7 @@ ships something ai-memory does not, it is named.
 - **Retrieval through capture, and no local reranker.** Through the shipped
   pipeline, LongMemEval-S hit@5 is 0.815 with local embeddings and 0.666
   zero-LLM (2.6); the 3.0 observation stream raises them to 0.945 and 0.951
-  (3.4.0: 0.940 and 0.951). Ranking
+  (3.4.3: 0.943 and 0.951). Ranking
   the same raw sessions whole scores 0.972 zero-LLM. The
   [decomposition](benchmarks/longmemeval-s-decomposition-2026-10-12.md) traced
   the gap to capture, and within capture not to the 2 KB privacy cap (pages holding exactly the captured text
