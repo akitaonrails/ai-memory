@@ -47,10 +47,11 @@ version in [`docs/changelog/`](docs/changelog/):
   zero-width joiner and non-joiner still print, since emoji sequences and
   Persian or Indic text need them (#2000, #2010).
 
-- `ai-memory handoffs --expire-all` now reports the sweep in the selected
-  language and neutralizes terminal controls in the workspace and project it
-  echoes. The confirmation line was the last English-only output in that
-  command while the rest of it already followed the catalogs (#2011).
+- `ai-memory handoffs --expire-all` now reports the sweep, and explains why
+  it refuses without `--confirm`, in the selected language, and neutralizes
+  terminal controls in the workspace and project it echoes. Those were the
+  last English-only lines in that command while the rest of it already
+  followed the catalogs (#2011).
 
 ## [3.4.2] - 2026-11-05
 

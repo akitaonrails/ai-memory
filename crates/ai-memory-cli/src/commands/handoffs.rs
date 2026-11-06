@@ -121,29 +121,6 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::humanize_age_secs;
-
-    /// Both read-only listings render ages through one helper now; these pin
-    /// the rendering the handoff listing depends on.
-    #[test]
-    fn age_reports_the_coarsest_useful_unit() {
-        assert_eq!(humanize_age_secs(0), "just now");
-        assert_eq!(humanize_age_secs(5 * 60), "5 minutes ago");
-        assert_eq!(humanize_age_secs(3_600), "1 hour ago");
-        assert_eq!(humanize_age_secs(3 * 3_600), "3 hours ago");
-        assert_eq!(humanize_age_secs(9 * 86_400), "9 days ago");
-    }
-
-    /// Server and client clocks can disagree; a future timestamp must not
-    /// render as an enormous age.
-    #[test]
-    fn a_future_timestamp_clamps_to_just_now() {
-        assert_eq!(humanize_age_secs(-5), "just now");
-    }
-}
-
 /// Request body for `POST /admin/handoffs/expire`.
 #[derive(serde::Serialize)]
 struct ExpireRequest<'a> {
@@ -167,13 +144,17 @@ async fn expire(
             .older_than_days
             .map(|d| format!(" --older-than-days {d}"))
             .unwrap_or_default();
+        // The copyable command is one value: it is never translated, and a
+        // catalog template cannot split two adjacent values back apart.
+        let command = format!(
+            "ai-memory handoffs --workspace {workspace} --project {project}{age} \
+             --expire-all --confirm"
+        );
         anyhow::bail!(
             "--expire-all marks every open handoff in {workspace}/{project} expired.\n\
              The rows and their summaries are kept; they just stop being consumable.\n\
              Unlike the automatic sweep this also clears manual handoffs and ones from \
-             another directory.\n\n  \
-             ai-memory handoffs --workspace {workspace} --project {project}{age} \
-             --expire-all --confirm"
+             another directory.\n\n  {command}"
         );
     }
 
@@ -190,20 +171,122 @@ async fn expire(
     .await?;
 
     let expired = report["expired"].as_u64().unwrap_or(0);
+    println!("{}", expire_report(i18n, expired, workspace, project));
+    Ok(())
+}
+
+/// The confirmation `--expire-all` prints. Each shape keeps its English
+/// literal inside the `diagnostic` call so the catalog drift guard sees it;
+/// the singular is its own entry because `diagnostic` matches rendered text.
+fn expire_report(i18n: &Localizer, expired: u64, workspace: &str, project: &str) -> String {
     let (workspace, project) = (terminal_text(workspace), terminal_text(project));
-    let line = if expired == 0 {
-        format!("No open handoffs to expire in {workspace}/{project}.")
-    } else if expired == 1 {
-        format!(
+    match expired {
+        0 => i18n.diagnostic(&format!(
+            "No open handoffs to expire in {workspace}/{project}."
+        )),
+        1 => i18n.diagnostic(&format!(
             "Expired {expired} open handoff in {workspace}/{project}. The rows are kept and \
              remain visible in the audit log; they are no longer offered to an agent."
-        )
-    } else {
-        format!(
+        )),
+        _ => i18n.diagnostic(&format!(
             "Expired {expired} open handoffs in {workspace}/{project}. The rows are kept and \
              remain visible in the audit log; they are no longer offered to an agent."
-        )
-    };
-    println!("{}", i18n.diagnostic(&line));
-    Ok(())
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::humanize_age_secs;
+    use super::{expire, expire_report};
+    use crate::cli::HandoffsArgs;
+    use crate::http_client::ServerEndpoint;
+    use ai_memory_core::i18n::{Language, Localizer};
+
+    /// Both read-only listings render ages through one helper now; these pin
+    /// the rendering the handoff listing depends on.
+    #[test]
+    fn age_reports_the_coarsest_useful_unit() {
+        assert_eq!(humanize_age_secs(0), "just now");
+        assert_eq!(humanize_age_secs(5 * 60), "5 minutes ago");
+        assert_eq!(humanize_age_secs(3_600), "1 hour ago");
+        assert_eq!(humanize_age_secs(3 * 3_600), "3 hours ago");
+        assert_eq!(humanize_age_secs(9 * 86_400), "9 days ago");
+    }
+
+    /// Server and client clocks can disagree; a future timestamp must not
+    /// render as an enormous age.
+    #[test]
+    fn a_future_timestamp_clamps_to_just_now() {
+        assert_eq!(humanize_age_secs(-5), "just now");
+    }
+
+    /// `--expire-all` confirms the sweep with the server's count: each shape,
+    /// the singular included, reaches a Portuguese terminal translated and an
+    /// English one unchanged, and the echoed scope prints inert.
+    #[test]
+    fn expire_report_is_localized_in_every_shape() {
+        let portuguese = Localizer::new(Language::PortugueseBrazil);
+        assert_eq!(
+            expire_report(&portuguese, 0, "default", "x"),
+            "Nenhum handoff aberto para expirar em default/x."
+        );
+        let one = expire_report(&portuguese, 1, "default", "x");
+        assert!(
+            one.starts_with("1 handoff aberto expirou em default/x."),
+            "{one}"
+        );
+        assert!(one.contains("log de auditoria"), "{one}");
+        let many = expire_report(&portuguese, 3, "default", "x");
+        assert!(
+            many.starts_with("3 handoffs abertos expiraram em default/x."),
+            "{many}"
+        );
+
+        let english = Localizer::new(Language::English);
+        assert_eq!(
+            expire_report(&english, 1, "default", "x"),
+            "Expired 1 open handoff in default/x. The rows are kept and remain visible in \
+             the audit log; they are no longer offered to an agent."
+        );
+        assert_eq!(
+            expire_report(&english, 0, "default", "x\u{1b}[2J"),
+            "No open handoffs to expire in default/x?[2J."
+        );
+    }
+
+    /// Without `--confirm` the refusal explains the sweep in the operator's
+    /// language and keeps the copyable command verbatim. No request is sent.
+    #[tokio::test]
+    async fn expire_refusal_is_localized_and_keeps_the_command() {
+        let args = HandoffsArgs {
+            workspace: None,
+            project: None,
+            limit: 50,
+            json: false,
+            expire_all: true,
+            older_than_days: Some(7),
+            confirm: false,
+        };
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:9".to_owned()), None);
+        let portuguese = Localizer::new(Language::PortugueseBrazil);
+        let error = expire(&endpoint, &portuguese, "default", "x", &args)
+            .await
+            .expect_err("--expire-all without --confirm refuses");
+        let report = crate::localization::failure_report(&crate::localization::localize_failure(
+            error,
+            Language::PortugueseBrazil,
+        ));
+        assert!(
+            report.contains("--expire-all marca todos os handoffs abertos em default/x"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "ai-memory handoffs --workspace default --project x --older-than-days 7 \
+                 --expire-all --confirm"
+            ),
+            "{report}"
+        );
+    }
 }
