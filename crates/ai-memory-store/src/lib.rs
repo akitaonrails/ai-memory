@@ -2952,6 +2952,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_column_filter_matches_the_parts_of_a_hyphenated_word() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "proj").await;
+        let mut titled = sample_page(ws, proj, "titled.md", "nothing to see here");
+        titled.title = "my-payment-gateway".into();
+        store.writer.upsert_page(titled).await.unwrap();
+        store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "bodied.md",
+                "the run-managed launcher",
+            ))
+            .await
+            .unwrap();
+
+        // #2013: `title:` and `body:` must reach the `_parts` twin, or a
+        // filter narrows away the very hit the bare word finds. Each filter
+        // keeps its own column: the title word does not match `body:`.
+        for (query, expected) in [
+            ("title:gateway", vec!["titled.md"]),
+            ("body:managed", vec!["bodied.md"]),
+            ("title:my-payment-gateway", vec!["titled.md"]),
+            ("body:gateway", Vec::new()),
+            ("title:managed", Vec::new()),
+        ] {
+            let hits = store
+                .reader
+                .search_pages_for_project(ws, proj, query.into(), 10, None)
+                .await
+                .unwrap();
+            let paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+            assert_eq!(paths, expected, "query {query:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn search_finds_an_observation_naming_a_file_with_its_directory() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
