@@ -2006,6 +2006,13 @@ pub struct MaintenanceSettings {
     /// persist cadence across restarts; overdue work starts after a bounded
     /// startup delay.
     pub lint_interval_secs: u64,
+    /// Interval for lint with the LLM contradiction pass (#2021). `0` (the
+    /// default) disables this job, because each run makes one `[llm.lint]`
+    /// provider call per project with enough semantic pages. Without a lint
+    /// provider the job is skipped with one startup warning. Cadence persists
+    /// like `lint_interval_secs`, and while it is on the rule-based run keeps
+    /// the last LLM findings in `_lint/report.md`.
+    pub lint_llm_interval_secs: u64,
     /// Interval for embedding backfill. `0` disables this job.
     /// Defaults to off because it may call a paid provider.
     pub embedding_backfill_interval_secs: u64,
@@ -2043,6 +2050,7 @@ impl Default for MaintenanceSettings {
             enabled: true,
             forget_sweep_interval_secs: 86_400,
             lint_interval_secs: 86_400,
+            lint_llm_interval_secs: 0,
             embedding_backfill_interval_secs: 0,
             reconcile_tombstones_deleted_pages: false,
         }
@@ -4554,6 +4562,7 @@ mod tests {
         assert!(cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
+        assert_eq!(cfg.maintenance.lint_llm_interval_secs, 0);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
         assert_eq!(cfg.decay.breadth_weight, 0.0);
         // Observation pruning must stay OFF by default: an install that never
@@ -6272,6 +6281,7 @@ input_token_safety_margin = {margin}
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
+            lint_llm_interval_secs = 604800
 
             [auto_improve]
             mode = "dry_run"
@@ -6327,6 +6337,7 @@ input_token_safety_margin = {margin}
         assert!(!cfg.handoff.create_on_session_end);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
+        assert_eq!(cfg.maintenance.lint_llm_interval_secs, 604_800);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 1_800);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 4);

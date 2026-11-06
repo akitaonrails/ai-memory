@@ -4390,6 +4390,7 @@ async fn handle_lint(
                 }),
             contradiction_band_min: state.contradiction_band_min,
             contradiction_band_max: state.contradiction_band_max,
+            keep_llm_findings: false,
         },
     )
     .await

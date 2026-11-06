@@ -148,6 +148,7 @@ fn options_with_band(
         embedding,
         contradiction_band_min: band_min,
         contradiction_band_max: band_max,
+        keep_llm_findings: false,
     }
 }
 

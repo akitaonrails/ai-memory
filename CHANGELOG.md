@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `[maintenance] lint_llm_interval_secs` (default `0`, off) runs the LLM
+  contradiction pass across every project on its own persisted cadence, with
+  one `lint` provider call per project that has enough semantic pages. With no
+  provider it is skipped with one warning. While it is on, the daily rule-based
+  lint keeps the last LLM findings in `_lint/report.md`, and the two scheduled
+  jobs never run at the same time. `memory_briefing` and the `/api/v1` briefing
+  now carry `lint`, the warning and finding counts of the project's latest
+  report, and a session start in a project whose report lists warnings gets one
+  count-only line pointing at it (#2021).
 - `pi_tool_exposure` (`AI_MEMORY_PI_TOOL_EXPOSURE`) chooses how the generated
   Pi extension registers ai-memory's MCP tools. `direct`, the default, keeps
   today's behavior. `codemode` registers each tool with Pi's

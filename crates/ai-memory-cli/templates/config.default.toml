@@ -723,6 +723,13 @@ mid_session = "follow-cwd"
 # delay. Embedding backfill is off by default because it may call a paid
 # provider.
 #
+# lint_llm_interval_secs adds the LLM contradiction pass to scheduled lint, on
+# its own cadence (604800 is weekly). It makes one `lint` provider call per
+# project that has at least two semantic or procedural pages, with at most 20
+# pages of 400 characters each. Off by default; with no provider configured it
+# is skipped with one warning. While it is on, the daily rule-based run keeps
+# the last LLM findings in `_lint/report.md` instead of dropping them.
+#
 # reconcile_tombstones_deleted_pages (#929, docs/okf.md) lets the watcher's 30s
 # reconcile pass tombstone an OKF-imported content page whose file was missing
 # on two consecutive passes. Session summary pages are excluded. A circuit
@@ -736,6 +743,7 @@ mid_session = "follow-cwd"
 # enabled = true
 # forget_sweep_interval_secs = 86400
 # lint_interval_secs = 86400
+# lint_llm_interval_secs = 0
 # embedding_backfill_interval_secs = 0
 # reconcile_tombstones_deleted_pages = false
 
