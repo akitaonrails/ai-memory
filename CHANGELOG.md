@@ -58,6 +58,14 @@ version in [`docs/changelog/`](docs/changelog/):
   both indexes once, which takes longer on a large store, and they grow to
   roughly twice their previous size (#2013).
 
+- The dashboard's icons no longer show as empty boxes on macOS. The three
+  shipped web fonts are Latin subsets, so the geometric and symbol
+  characters the templates use as icons fell through to the platform UI
+  font, which on macOS carries only 4 of the 17. The text font stacks now
+  name the symbol fonts macOS, Windows and Linux ship (Apple Symbols, Segoe
+  UI Symbol, Noto Sans Symbols 2, DejaVu Sans) after `system-ui`, so Latin
+  text keeps its font (#2003).
+
 ### Security
 
 - `ai-memory restore` no longer brings back the parts of the wiki's git

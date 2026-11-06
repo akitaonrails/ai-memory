@@ -6,12 +6,19 @@
 @font-face { font-family: "Management Sans"; src: url("instrument-sans-latin-wdth-normal.woff2") format("woff2"); font-weight: 400 700; font-display: swap; }
 @font-face { font-family: "Management Display"; src: url("bricolage-grotesque-latin-standard-normal.woff2") format("woff2"); font-weight: 200 800; font-display: swap; }
 @font-face { font-family: "Management Mono"; src: url("commit-mono-latin-400-normal.woff2") format("woff2"); font-display: swap; }
+/* The three faces above are Latin subsets, so the geometric and symbol
+   characters the templates use as icons (U+25A0-25FF, U+2600-26FF and
+   neighbours) are absent from them and fall through to the platform UI
+   font. That font carries only a handful: on macOS 4 of the 17 the
+   dashboard uses, so the other 13 render as tofu. The stacks below name
+   the symbol face each platform ships, placed after system-ui so Latin
+   text is unaffected. */
 :root:has(.management) { color-scheme: light; }
 :root[data-theme="dark"]:has(.management) { color-scheme: dark; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]):has(.management) { color-scheme: dark; } }
-.management { --mg-bg: light-dark(#f5f7f5,#141715); --mg-surface: light-dark(#ffffff,#202522); --mg-text: light-dark(#171a18,#f0f4f1); --mg-muted: light-dark(#59625d,#aab5ae); --mg-line: light-dark(#d8ded9,#3d4640); color: var(--mg-text); background: var(--mg-bg); font-family: "Management Sans",system-ui,sans-serif; font-size: 17px; }
+.management { --mg-bg: light-dark(#f5f7f5,#141715); --mg-surface: light-dark(#ffffff,#202522); --mg-text: light-dark(#171a18,#f0f4f1); --mg-muted: light-dark(#59625d,#aab5ae); --mg-line: light-dark(#d8ded9,#3d4640); color: var(--mg-text); background: var(--mg-bg); font-family: "Management Sans",system-ui,"Apple Symbols","Segoe UI Symbol","Noto Sans Symbols 2","DejaVu Sans",sans-serif; font-size: 17px; }
 .management-header { background: var(--mg-surface); border-color: var(--mg-line); }
-.management h1,.management h2,.management-brand strong { font-family: "Management Display",system-ui,sans-serif; font-weight: 650; letter-spacing: 0; }
+.management h1,.management h2,.management-brand strong { font-family: "Management Display",system-ui,"Apple Symbols","Segoe UI Symbol","Noto Sans Symbols 2","DejaVu Sans",sans-serif; font-weight: 650; letter-spacing: 0; }
 .management h1 { font-size: 2rem; margin-bottom: .6rem; } .management h2 { font-size: 1.25rem; }
 .management-brand strong { font-size: 1.5rem; } .management-muted { color: var(--mg-muted); } .management-mono { font-family: "Management Mono",monospace; }
 .management-panel { padding: 1.5rem; border: 1px solid var(--mg-line); border-radius: .5rem; background: var(--mg-surface); box-shadow: 0 8px 24px -16px rgb(24 38 29 / .28); }
@@ -26,8 +33,8 @@
 /* Operational workspace: shared tokens keep both themes readable. */
 :root { --dash-bg:#f5f7fa; --dash-surface:#fff; --dash-soft:#f0f4f8; --dash-line:#dfe6ee; --dash-text:#1c2b3c; --dash-muted:#617186; --dash-accent:#0c786a; --dash-accent-soft:#e8f6f1; --dash-alert:#926015; --dash-alert-bg:#fff5df; --dash-sidebar:#fbfcfe; --dash-shadow:0 4px 24px -16px #173c5730; }
 :root.dark { --dash-bg:#101720; --dash-surface:#182231; --dash-soft:#202d3e; --dash-line:#304054; --dash-text:#edf3fa; --dash-muted:#a6b6ca; --dash-accent:#7be2ca; --dash-accent-soft:#183d3b; --dash-alert:#f7d18b; --dash-alert-bg:#3c301f; --dash-sidebar:#141d29; --dash-shadow:0 4px 24px -16px #0009; }
-body.dashboard-shell { margin:0; min-height:100vh; background:var(--dash-bg); color:var(--dash-text); font-family:"Management Sans",system-ui,sans-serif; font-size:14px; line-height:1.55; -webkit-font-smoothing:antialiased; }
-.dashboard-shell h1,.dashboard-shell h2,.app-brand { font-family:"Management Display",system-ui,sans-serif; letter-spacing:-.035em; }
+body.dashboard-shell { margin:0; min-height:100vh; background:var(--dash-bg); color:var(--dash-text); font-family:"Management Sans",system-ui,"Apple Symbols","Segoe UI Symbol","Noto Sans Symbols 2","DejaVu Sans",sans-serif; font-size:14px; line-height:1.55; -webkit-font-smoothing:antialiased; }
+.dashboard-shell h1,.dashboard-shell h2,.app-brand { font-family:"Management Display",system-ui,"Apple Symbols","Segoe UI Symbol","Noto Sans Symbols 2","DejaVu Sans",sans-serif; letter-spacing:-.035em; }
 .dashboard-shell a,.dashboard-shell button,.dashboard-shell input,.dashboard-shell select,.dashboard-shell textarea { -webkit-tap-highlight-color:transparent; }
 .dashboard-shell :is(a,button,input,select,textarea,summary):focus-visible { outline:3px solid var(--dash-accent); outline-offset:3px; }
 .dashboard-shell .bg-white { background:var(--dash-surface); }.dashboard-shell .bg-slate-50 { background:var(--dash-soft); }
