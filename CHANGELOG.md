@@ -27,6 +27,20 @@ version in [`docs/changelog/`](docs/changelog/):
   uses the same anchor, so it also redacts a key glued to `_`, a digit, a
   CJK character or a percent escape (#2025).
 
+- `ai-memory mcp-bridge`, the stdio entry most clients use on a token-file
+  install, now includes `resultType: "complete"` in the `tools/list` and
+  `tools/call` results it forwards to a client on MCP revision 2026-07-28.
+  That revision requires the field, and a strict client such as
+  `@modelcontextprotocol/client` 2.2 rejected the tool list and reconnected
+  forever with no tools. Clients on an older revision still receive results
+  without it, and the direct HTTP endpoint already sent it (#2022).
+
+- The project page's tabs work again when the web UI is shown in a language
+  other than English. Their script looked up the tab bar by its English
+  accessible name, so a Portuguese page left every tab panel hidden. The
+  script now finds the tab bar by a fixed attribute, and a test rejects any
+  web UI script that selects elements by translated text (#2024).
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is

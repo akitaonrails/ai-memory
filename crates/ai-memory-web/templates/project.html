@@ -8,7 +8,7 @@
 <nav class="breadcrumbs" aria-label="{{ i18n.text("web-breadcrumb") }}"><a href=".">{{ i18n.text("web-projects") }}</a><span>/</span><span>{{ workspace }}</span><span>/</span><span aria-current="page">{{ project }}</span></nav>
 <div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-project-workspace") }}</p><h1>{{ project }}</h1><p>{{ i18n.text("web-understand-your-agents-inspect-their-sessions-and-find-expensive-calls") }}</p></div><a href="{{ inbox_href }}#compose" class="primary-button">{{ i18n.text("web-message-an-agent") }}</a></div>
 <div class="project-navigation">
-  <nav class="project-tabs" role="tablist" aria-label="{{ i18n.text("web-project-sections") }}">
+  <nav class="project-tabs" role="tablist" data-project-tabs aria-label="{{ i18n.text("web-project-sections") }}">
     <a id="project-tab-overview" href="{{ project_href }}?tab=overview" role="tab" aria-controls="project-panel-overview" aria-selected="true" data-project-tab="overview">{{ i18n.text("web-overview") }}</a>
     <a id="project-tab-agents" href="{{ project_href }}?tab=agents" role="tab" aria-controls="project-panel-agents" aria-selected="false" tabindex="-1" data-project-tab="agents">{{ i18n.text("web-agents") }}</a>
     <a id="project-tab-tokens" href="{{ project_href }}?tab=tokens" role="tab" aria-controls="project-panel-tokens" aria-selected="false" tabindex="-1" data-project-tab="tokens">{{ i18n.text("web-token-usage") }}</a>

@@ -112,6 +112,12 @@ and escape HTML script delimiters and Unicode line separators. Only these
 already-encoded values may use askama's `safe` filter. Progressive enhancement
 must use `textContent` for displayed values.
 
+A script finds elements by id, class, role or a `data-*` attribute, never by a
+translated attribute such as `aria-label`, `title` or `placeholder`: the
+translated value changes with the reader's language, so the selector stops
+matching outside English. A test scans every template and script for such
+selectors.
+
 ## Adding a language or message
 
 Copy all five English resources into a new BCP 47 language directory, translate
@@ -139,7 +145,7 @@ cargo test -p ai-memory-web localization --all-features
 
 Tests validate Fluent syntax, duplicate IDs, language parity, parameter parity,
 CLI help drift, CLI diagnostic coverage, language negotiation and isolation,
-script escaping, unchanged API responses, and the administrative gate with
-Portuguese HTML. When changing
+script escaping, selectors that do not depend on translated text, unchanged
+API responses, and the administrative gate with Portuguese HTML. When changing
 browser messages, inspect rendered pages in both languages and check keyboard
 navigation, labels, long text and the small-screen layout.
