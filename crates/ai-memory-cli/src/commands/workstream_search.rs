@@ -11,7 +11,7 @@ use crate::http_client::{ServerEndpoint, get_json};
 /// Search or tail one portable managed-workstream ledger.
 pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
     let i18n = &config.i18n;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let path = format!("/workstream/{}/events", args.workstream_id);
     let limit = args.limit.to_string();
     let mut events: Vec<WorkstreamEvent> = get_json(
@@ -40,7 +40,8 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
         let role = event.display_label();
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-workstream-search-event",
                 &[
                     ("value0", format!("{}", event.sequence)),
@@ -52,7 +53,8 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
         if let Some(source) = &event.source_record_id {
             println!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-workstream-search-source-record",
                     &[("value0", serde_json::to_string(source)?.to_string())]
                 )
@@ -61,7 +63,8 @@ pub async fn run(config: &Config, args: WorkstreamSearchArgs) -> Result<()> {
         if !event.metadata.is_null() {
             println!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-workstream-search-provenance",
                     &[(
                         "value0",

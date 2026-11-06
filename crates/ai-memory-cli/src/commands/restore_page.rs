@@ -53,7 +53,7 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
     super::refuse_empty_explicit(args.page_id.as_deref(), "--page-id")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let resp: RestorePageResponse = post_json(
         &endpoint,
         "/admin/restore-page",

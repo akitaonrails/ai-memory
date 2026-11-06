@@ -958,7 +958,8 @@ fn refresh_generated_integrations(config: &Config) {
             Err(err) => {
                 println!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-upgrade-skipping-generated-name-integration-err",
                         &[
                             ("value0", name.to_string()),
@@ -983,25 +984,11 @@ fn refresh_generated_integrations(config: &Config) {
                 &[("value0", name.to_string())]
             )
         );
-        let mut args = apply_hooks_args(agent);
-        args.config_file = if agent == AgentChoice::Openclaw {
-            path.parent().map(Path::to_path_buf)
-        } else {
-            Some(path.clone())
-        };
-        let result = if agent == AgentChoice::OpenCode {
-            install_hooks::run_with_opencode_dialect(
-                config,
-                args,
-                Some(ai_memory_workstream::OpenCodeDialect::V1),
-            )
-        } else {
-            install_hooks::run(config, args)
-        };
-        if let Err(err) = result {
+        if let Err(err) = refresh_generated_integration(config, agent, &path) {
             println!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-apply",
                     &[
                         ("value0", format!("{:#}", err)),
@@ -1011,6 +998,37 @@ fn refresh_generated_integrations(config: &Config) {
             );
         }
     }
+}
+
+/// Re-render one owned generated integration at `path`.
+///
+/// An OpenCode 1 plugin (`ai-memory.ts`) is refreshed in the dialect of the
+/// OpenCode now installed (#1887). OpenCode 2 loads the same plugin directory
+/// and rejects a v1 function plugin ("must export a default definition with
+/// an id and an effect or setup function"), so after OpenCode itself moved to
+/// 2.x a forced v1 refresh rewrote the very file that broke it. A v2 install
+/// writes `ai-memory-opencode2.ts` beside it and removes the owned v1 file.
+/// When no OpenCode answers the version probe, the v1 file is refreshed as
+/// before rather than guessed into another dialect.
+fn refresh_generated_integration(config: &Config, agent: AgentChoice, path: &Path) -> Result<()> {
+    let mut args = apply_hooks_args(agent);
+    if agent == AgentChoice::Openclaw {
+        args.config_file = path.parent().map(Path::to_path_buf);
+        return install_hooks::run(config, args);
+    }
+    args.config_file = Some(path.to_path_buf());
+    if agent != AgentChoice::OpenCode {
+        return install_hooks::run(config, args);
+    }
+    let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+    let dialect = super::opencode_dialect::resolve_generic(None, &child_env)
+        .map_or(ai_memory_workstream::OpenCodeDialect::V1, |resolved| {
+            resolved.dialect
+        });
+    if dialect == ai_memory_workstream::OpenCodeDialect::V2 {
+        args.config_file = Some(path.with_file_name("ai-memory-opencode2.ts"));
+    }
+    install_hooks::run_with_opencode_dialect(config, args, Some(dialect))
 }
 
 fn default_generated_integration_path(agent: AgentChoice) -> Result<PathBuf> {
@@ -1106,21 +1124,43 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
         println!(
             "{}", i18n.format("cli-upgrade-no-ai-memory-hooks-in-skipping-the-user-level-re-apply-the-staged-scripts-ar", &[("value0", format!("{}", settings.display())), ("value1", name.to_string())]));
         match install_hooks::restage_claude_code_scripts(&config.i18n, &config.data_dir, None) {
-            Ok(staged) => println!("{}", i18n.format("cli-upgrade-restaged", &[("value0", format!("{}", staged.display()))])),
+            Ok(staged) => println!(
+                "{}",
+                i18n.format(
+                    "cli-upgrade-restaged",
+                    &[("value0", format!("{}", staged.display()))]
+                )
+            ),
             Err(err) => println!(
-                "{}", i18n.format("cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-scope-project-apply-in", &[("value0", format!("{:#}", err)), ("value1", name.to_string())])),
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-scope-project-apply-in",
+                    &[
+                        ("value0", format!("{:#}", err)),
+                        ("value1", name.to_string())
+                    ]
+                )
+            ),
         }
         return;
     }
     println!(
         "{}",
-        i18n.diagnostic(&format!(
-            "    ai-memory install-hooks --agent {name} --apply"
-        ))
+        crate::localization::diagnostic(
+            i18n,
+            format!("    ai-memory install-hooks --agent {name} --apply")
+        )
     );
     if let Err(err) = install_hooks::run(config, apply_hooks_args(agent)) {
         println!(
-            "{}", i18n.format("cli-upgrade-skipped-err-re-run-with-the-same-server-url-auth-token-used-originally", &[("value0", format!("{:#}", err))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-upgrade-skipped-err-re-run-with-the-same-server-url-auth-token-used-originally",
+                &[("value0", format!("{:#}", err))]
+            )
+        );
     }
 }
 
@@ -1307,6 +1347,65 @@ mod tests {
     use tar::Header;
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
+
+    /// #1887: an owned OpenCode 1 plugin is refreshed in the dialect of the
+    /// OpenCode installed now. After OpenCode moved to 2.x the refresh writes
+    /// the `{ id, setup }` plugin and removes the v1 file OpenCode 2 rejects;
+    /// with OpenCode 1 (the control) the v1 file is refreshed in place.
+    #[cfg(unix)]
+    #[test]
+    fn an_opencode_plugin_refresh_follows_the_installed_opencode_major() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (version, v2) in [("opencode v2.0.23", true), ("1.18.34", false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            let plugins = temp.path().join("plugins");
+            fs::create_dir_all(&bin).unwrap();
+            fs::create_dir_all(&plugins).unwrap();
+            let opencode = bin.join("opencode");
+            fs::write(
+                &opencode,
+                format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n"),
+            )
+            .unwrap();
+            fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut config = Config {
+                data_dir: temp.path().join("data"),
+                server_url: "http://127.0.0.1:49999".into(),
+                server_url_explicit: true,
+                runtime_env: crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+                    "PATH",
+                    bin.to_str().unwrap(),
+                )]),
+                ..Config::default()
+            };
+            config.auth.bearer_token = Some("t".into());
+            let v1 = plugins.join("ai-memory.ts");
+            let mut args = apply_hooks_args(AgentChoice::OpenCode);
+            args.config_file = Some(v1.clone());
+            install_hooks::run_with_opencode_dialect(
+                &config,
+                args,
+                Some(ai_memory_workstream::OpenCodeDialect::V1),
+            )
+            .unwrap();
+            assert!(v1.is_file());
+
+            refresh_generated_integration(&config, AgentChoice::OpenCode, &v1).unwrap();
+
+            let v2_path = plugins.join("ai-memory-opencode2.ts");
+            if v2 {
+                assert!(!v1.exists(), "the v1 plugin OpenCode 2 rejects is removed");
+                let plugin = fs::read_to_string(&v2_path).unwrap();
+                assert!(plugin.contains("id: \"ai-memory-opencode2\""), "{plugin}");
+                assert!(plugin.contains("export default AiMemoryOpencode2;"));
+            } else {
+                assert!(!v2_path.exists());
+                let plugin = fs::read_to_string(&v1).unwrap();
+                assert!(plugin.contains("export default AiMemoryHooks;"));
+            }
+        }
+    }
 
     #[test]
     fn replacement_binary_refresh_receives_the_loaded_config_coordinates() {

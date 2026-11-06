@@ -121,7 +121,7 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
             "{}", i18n.format("cli-move-project-move-project-moves-to-workspace-if-the-destination-has-no-same-named-project", &[("value0", from_workspace.to_string()), ("value1", target_flag.to_string()), ("value2", args.to_workspace.to_string()), ("value3", confirm_command(&from_workspace, &target_flag, &args).to_string())]));
     }
 
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let report: serde_json::Value = post_json(
         &endpoint,
         "/admin/move-project",
@@ -164,7 +164,13 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         )
     {
         eprintln!(
-            "{}", i18n.format("cli-move-project-ai-memory-project-moved-but-the-client-local-checkout-link-could-not-be-upda", &[("value0", format!("{:#}", error))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-move-project-ai-memory-project-moved-but-the-client-local-checkout-link-could-not-be-upda",
+                &[("value0", format!("{:#}", error))]
+            )
+        );
     }
 
     if moved_via == "true-move" {

@@ -17,8 +17,8 @@ use ai_memory_workstream::{
     JailChecklistItem, JailHostFacts, JailRefusal, JailRisk, JailSupport, JailToggleChoice,
     JailToggleKind, LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate,
     ServerReach, ai_jail_contract, ai_jail_harness_name, ai_jail_support,
-    allows_native_session_adoption, apply_claude_true_yolo, apply_jail_process_isolation,
-    apply_yolo, build_ai_jail_invocation, build_launch_plan, build_launch_plan_with_env_lookup,
+    allows_native_session_adoption, apply_jail_process_isolation, apply_yolo,
+    build_ai_jail_invocation, build_launch_plan, build_launch_plan_with_env_lookup,
     checklist_reason, claude_continued_session, claude_continued_sessions,
     claude_live_background_attach_id, claude_session_ran_in_background, clean_path, contract_flags,
     contract_invocation, contract_status_invocation, crush_global_config_path,
@@ -45,6 +45,7 @@ use crate::http_client::{
     ServerEndpoint, ServerProbe, ServerResponseError, augment_connect_error, get_json, post_empty,
     post_json, post_json_no_content, probe_server,
 };
+use crate::localization::diagnostic;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -211,7 +212,7 @@ impl HeartbeatHealth {
 
     fn notify(&mut self, notice: String) {
         if !self.defer_notices {
-            eprintln!("{notice}");
+            eprintln!("{}", super::show::terminal_text(&notice));
             return;
         }
         self.deferred_count = self.deferred_count.saturating_add(1);
@@ -275,9 +276,10 @@ fn resolve_opencode_for_launch(
         Err(error) if automatic => {
             eprintln!(
                 "{}",
-                i18n.diagnostic(&format!(
-                    "ai-memory: automatic OpenCode scan skipped: {error:#}"
-                ))
+                diagnostic(
+                    i18n,
+                    format!("ai-memory: automatic OpenCode scan skipped: {error:#}")
+                )
             );
             Ok(None)
         }
@@ -427,9 +429,10 @@ async fn run_with_exit_prompt_loop(config: &Config, args: RunArgs, cwd: &Path) -
             Err(error) => {
                 eprintln!(
                     "{}",
-                    config.i18n.diagnostic(&format!(
-                        "ai-memory: could not read the post-run choice ({error}); exiting"
-                    ))
+                    diagnostic(
+                        &config.i18n,
+                        format!("ai-memory: could not read the post-run choice ({error}); exiting")
+                    )
                 );
                 return Ok(outcome.exit_code);
             }
@@ -496,11 +499,14 @@ fn choose_after_run(
         output,
         "{} {}",
         paint.green("✓"),
-        paint.bold(&i18n.diagnostic(&format!(
-            "ai-memory: {} exited successfully in workstream '{}'.",
-            current.as_str(),
-            workstream_name
-        )))
+        paint.bold(&diagnostic(
+            i18n,
+            format!(
+                "ai-memory: {} exited successfully in workstream '{}'.",
+                current.as_str(),
+                workstream_name
+            )
+        ))
     )?;
     writeln!(
         output,
@@ -513,17 +519,20 @@ fn choose_after_run(
         writeln!(
             output,
             "{}",
-            i18n.diagnostic(&format!(
-                "  {}) switch to {}",
-                index + 1,
-                managed_harness(*choice).as_str()
-            ))
+            diagnostic(
+                i18n,
+                format!(
+                    "  {}) switch to {}",
+                    index + 1,
+                    managed_harness(*choice).as_str()
+                )
+            )
         )?;
     }
     writeln!(
         output,
         "{}",
-        i18n.diagnostic(&format!("  r) run {} again", current.as_str()))
+        diagnostic(i18n, format!("  r) run {} again", current.as_str()))
     )?;
     writeln!(output, "{}", i18n.diagnostic("  q) quit (default)"))?;
 
@@ -578,6 +587,8 @@ fn apply_after_run_action(
     args.workstream = Some(outcome.workstream_name.clone());
     args.new_workstream = None;
     args.fresh = false;
+    // The first launch already noted that `--true-yolo` is `--yolo` now.
+    args.yolo |= std::mem::take(&mut args.true_yolo);
     true
 }
 
@@ -617,7 +628,6 @@ async fn run_once_with_wiring(
         .collect();
     let mut next_run = NextRun {
         yolo: false,
-        true_yolo: args.true_yolo,
         no_autowire: args.no_autowire,
         workspace: args.workspace.clone(),
         project: args.project.clone(),
@@ -628,20 +638,14 @@ async fn run_once_with_wiring(
     };
     let mut executable = args.executable.map(PathBuf::into_os_string);
     let mut native_args = args.native_args;
-    let trailing_yolo = remove_wrapper_yolo(&mut native_args);
-    let trailing_true_yolo = remove_wrapper_true_yolo(&mut native_args);
+    let (yolo_requested, true_yolo_typed) =
+        take_wrapper_yolo(args.yolo, args.true_yolo, &mut native_args);
     let trailing_fresh = remove_wrapper_fresh(&mut native_args);
     let trailing_force_unlock = remove_wrapper_force_unlock(&mut native_args);
     let trailing_no_autowire = remove_wrapper_no_autowire(&mut native_args);
     remove_wrapper_no_exit_prompt(&mut native_args);
     let trailing_jail = remove_wrapper_jail(&mut native_args);
     let jail_request = jail_request(args.jail, args.no_jail, trailing_jail)?;
-    let yolo_modes = yolo_modes(
-        args.yolo || trailing_yolo,
-        args.true_yolo || trailing_true_yolo,
-        config.claude_true_yolo,
-    );
-    let yolo_requested = yolo_modes.yolo;
     let force_fresh = args.fresh || trailing_fresh;
     let force_unlock = args.force_unlock || trailing_force_unlock;
     let no_autowire = args.no_autowire || trailing_no_autowire;
@@ -748,6 +752,12 @@ async fn run_once_with_wiring(
     // Inside ai-jail every jail flag is moot (no nesting), so neither the
     // binary lookup nor its errors apply there.
     let jailed = inside_ai_jail_here();
+    // Only the outer process speaks: a jailed re-run gets the same argv.
+    if interactive && !jailed {
+        for note in yolo_deprecation_notes(true_yolo_typed, config.claude_true_yolo) {
+            eprintln!("{}", config.i18n.diagnostic(note));
+        }
+    }
     let ai_jail = if jailed { None } else { usable_ai_jail_here() };
     let jail_facts = JailHostFacts::here(&repository);
     let jail_plan = jail_decision(
@@ -759,7 +769,6 @@ async fn run_once_with_wiring(
         jail_facts.project_config,
     )?;
     next_run.yolo = yolo_requested;
-    next_run.true_yolo |= trailing_true_yolo;
     next_run.no_autowire = no_autowire;
     // Inside the jail the folders are already mounted; the forwarded flags
     // only describe them.
@@ -782,6 +791,7 @@ async fn run_once_with_wiring(
     // cancelled again.
     if let (JailMode::Explicit(spec), Some(ai_jail)) = (&jail_plan.mode, &ai_jail) {
         ensure_jail_does_not_export_config_token(config)?;
+        ensure_jail_does_not_need_a_server_profile(config)?;
         let support = ai_jail_support(ai_jail)
             .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
         // Only a harness named on the command line is known this early; an
@@ -835,7 +845,7 @@ async fn run_once_with_wiring(
         ));
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let project_id = if let Some(id) = args.project_id {
         Some(id)
     } else if args.project.is_none() {
@@ -878,7 +888,7 @@ async fn run_once_with_wiring(
                 workspace: &workspace,
                 project: &project,
                 force_fresh,
-                yolo_modes,
+                yolo: yolo_requested,
                 jail_plan: &jail_plan,
                 ai_jail: ai_jail.as_deref(),
                 jail_facts: &jail_facts,
@@ -970,9 +980,7 @@ async fn run_once_with_wiring(
     if let Some(warning) = prepared.manifest_warning.as_deref() {
         eprintln!(
             "{}",
-            config
-                .i18n
-                .diagnostic(&format!("ai-memory: warning: {warning}"))
+            diagnostic(&config.i18n, format!("ai-memory: warning: {warning}"))
         );
     }
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
@@ -1009,8 +1017,16 @@ async fn run_once_with_wiring(
             },
         )
     {
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not remember the project ID ({error:#}); use --project-id {} next time",
-            scope.project_id)));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not remember the project ID ({error:#}); use --project-id {} next time",
+                    scope.project_id
+                )
+            )
+        );
     }
     let resolved_name = prepared
         .resolved_project
@@ -1023,7 +1039,15 @@ async fn run_once_with_wiring(
         resolved_name,
         &repository.cwd,
     ) {
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run")));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not refresh the client-local project link ({error:#}); continuing the managed run"
+                )
+            )
+        );
     }
     let privacy = acquired_try!(Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from));
     if let Some(id) = prepared.native_session_id.as_deref() {
@@ -1133,17 +1157,25 @@ async fn run_once_with_wiring(
             &orphaned_session,
         )
         .unwrap_or_else(|error| {
-            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted")));
+            eprintln!("{}", diagnostic(&config.i18n, format!("ai-memory: could not read the client-local session store record ({error:#}); treating the linked session as deleted")));
             None
         });
         let current = effective_store(harness, &home, &repository.cwd, plan.session_dir.as_deref());
         if let Some(error) = store_mismatch_error(harness, &orphaned_session, recorded, &current) {
             acquired_try!(Err(error));
         }
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
-            harness.as_str(),
-            display_session_id(&orphaned_session),
-            prepared.workstream_name)));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: linked {} session {} is missing from its native store; starting fresh and repointing workstream '{}' after the new session is established",
+                    harness.as_str(),
+                    display_session_id(&orphaned_session),
+                    prepared.workstream_name
+                )
+            )
+        );
         // The hint tells the user to repeat their own command with a selector
         // right after the harness name, which only works when they typed one
         // and launched an interactive session (`codex exec` and `opencode run`
@@ -1160,17 +1192,20 @@ async fn run_once_with_wiring(
             if let Some(hint) =
                 orphan_resume_hint(harness, &orphaned_session, sessions, SystemTime::now())
             {
-                eprintln!("{hint}");
+                eprintln!("{}", super::show::terminal_text(&hint));
             }
         }
     } else if force_fresh && plan.mode == LaunchMode::Session {
         eprintln!(
             "{}",
-            config.i18n.diagnostic(&format!(
-                "ai-memory: starting a fresh {} session in workstream '{}'",
-                harness.as_str(),
-                prepared.workstream_name
-            ))
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: starting a fresh {} session in workstream '{}'",
+                    harness.as_str(),
+                    prepared.workstream_name
+                )
+            )
         );
     }
     if automatic_harness
@@ -1198,11 +1233,14 @@ async fn run_once_with_wiring(
         ));
         eprintln!(
             "{}",
-            config.i18n.diagnostic(&format!(
-                "ai-memory: continuing newest checkout-local {} session {}",
-                harness.as_str(),
-                display_session_id(&candidate.session.native_session_id)
-            ))
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: continuing newest checkout-local {} session {}",
+                    harness.as_str(),
+                    display_session_id(&candidate.session.native_session_id)
+                )
+            )
         );
     } else if prepared.native_session_id.is_none()
         && prepared.may_adopt_existing_session
@@ -1224,7 +1262,8 @@ async fn run_once_with_wiring(
         {
             Ok(candidates) if !candidates.is_empty() => {
                 let selection = acquired_try!(
-                    choose_native_session_interactive(&config.i18n,
+                    choose_native_session_interactive(
+                        &config.i18n,
                         harness,
                         prepared.workstream_name.clone(),
                         candidates,
@@ -1249,13 +1288,29 @@ async fn run_once_with_wiring(
                         ));
                     }
                     Ok(None) => {}
-                    Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not read the native session choice ({error}); starting a new {} session",
-                        harness.as_str()))),
+                    Err(error) => eprintln!(
+                        "{}",
+                        diagnostic(
+                            &config.i18n,
+                            format!(
+                                "ai-memory: could not read the native session choice ({error}); starting a new {} session",
+                                harness.as_str()
+                            )
+                        )
+                    ),
                 }
             }
             Ok(_) => {}
-            Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not inspect prior {} sessions ({error}); starting a new session",
-                harness.as_str()))),
+            Err(error) => eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not inspect prior {} sessions ({error}); starting a new session",
+                        harness.as_str()
+                    )
+                )
+            ),
         }
     }
     if yolo_requested {
@@ -1275,13 +1330,6 @@ async fn run_once_with_wiring(
             );
         }
         apply_yolo(harness, &mut plan.args);
-    }
-    // Claude's extra "true yolo" bypass (`docs/design-yolo-safety-ai-jail.md`
-    // §4), applied to the same env/args the child command is built from below.
-    // Every other harness already got the plain `--yolo` mapping above, which
-    // is all `--true-yolo` means for them.
-    if yolo_modes.claude_true_yolo && harness == ManagedHarness::Claude {
-        apply_claude_true_yolo(harness, &mut plan.args);
     }
     let planned_native_identity = acquired_try!(
         plan.expected_session_id
@@ -1399,11 +1447,19 @@ async fn run_once_with_wiring(
         None
     };
     if let Some(attach_id) = &attached_background {
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
-            plan.expected_session_id
-                .as_deref()
-                .map(display_session_id)
-                .unwrap_or_default())));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: Claude session {} is still running in the background; attaching to it (`claude attach {attach_id}`). Native arguments and the workstream context packet do not reach an attached session",
+                    plan.expected_session_id
+                        .as_deref()
+                        .map(display_session_id)
+                        .unwrap_or_default()
+                )
+            )
+        );
         plan.args = vec![OsString::from("attach"), OsString::from(attach_id)];
     }
 
@@ -1427,8 +1483,16 @@ async fn run_once_with_wiring(
         {
             Ok(history) => history,
             Err(error) => {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not prepare the previous {} session history ({error:#}); continuing with the portable workstream packet",
-                    previous.agent.as_str())));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not prepare the previous {} session history ({error:#}); continuing with the portable workstream packet",
+                            previous.agent.as_str()
+                        )
+                    )
+                );
                 None
             }
         },
@@ -1565,7 +1629,7 @@ async fn run_once_with_wiring(
         }
     };
     for notice in heartbeat_health.into_deferred() {
-        eprintln!("{notice}");
+        eprintln!("{}", super::show::terminal_text(&notice));
     }
     let status = acquired_try!(waited.context("waiting for managed harness"));
     let exit_code = status.code().unwrap_or(1);
@@ -1593,12 +1657,20 @@ async fn run_once_with_wiring(
                     .as_ref()
                     .and_then(|status| status.native_session_id.as_deref())
             {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
-                    harness.as_str(),
-                    harness.agent_kind().as_str(),
-                    SessionId::from_native(linked),
-                    super::render_shared::shell_quote(&workspace),
-                    super::render_shared::shell_quote(&project))));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: not finalizing the {} session: could not tie it to this run ({error:#}); if it was this run's, run `ai-memory finalize-session --agent {} --reopen --session-id {} --workspace {} --project {}`",
+                            harness.as_str(),
+                            harness.agent_kind().as_str(),
+                            SessionId::from_native(linked),
+                            super::render_shared::shell_quote(&workspace),
+                            super::render_shared::shell_quote(&project)
+                        )
+                    )
+                );
             }
             None
         }
@@ -1636,7 +1708,15 @@ async fn run_once_with_wiring(
         ) {
             Ok(ids) => ids,
             Err(error) => {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported")));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not enumerate Claude sessions left behind by continuation ({error:#}); only the followed session will be imported"
+                        )
+                    )
+                );
                 Vec::new()
             }
         }
@@ -1759,12 +1839,20 @@ async fn run_once_with_wiring(
                 )
             );
             if !left_behind_session_ids.is_empty() {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
-                    left_behind_session_ids
-                        .iter()
-                        .map(|id| display_session_id(id))
-                        .collect::<Vec<_>>()
-                        .join(", "))));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: offline recovery records only the followed session; verify the left-behind Claude session(s) {} after the server returns",
+                            left_behind_session_ids
+                                .iter()
+                                .map(|id| display_session_id(id))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    )
+                );
             }
             journal_finish_failed_run(
                 config,
@@ -1816,10 +1904,13 @@ async fn run_once_with_wiring(
     }
     eprintln!(
         "{}",
-        config.i18n.diagnostic(&format!(
-            "ai-memory: workstream '{}' saved {imported} new event(s)",
-            prepared.workstream_name
-        ))
+        diagnostic(
+            &config.i18n,
+            format!(
+                "ai-memory: workstream '{}' saved {imported} new event(s)",
+                prepared.workstream_name
+            )
+        )
     );
     interrupt_task.abort();
     if let Some((session, finalized)) = finalize_hookless_session(
@@ -1835,15 +1926,29 @@ async fn run_once_with_wiring(
         let session = display_session_id(&session.to_string());
         match finalized {
             Ok(ids) if !ids.is_empty() => {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: finalized the {agent} session {session}")));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!("ai-memory: finalized the {agent} session {session}")
+                    )
+                );
             }
             // No session under that id for this agent and owner in this
             // scope: its hooks are not installed or never fired, or they
             // filed it under another workspace/project.
             Ok(_) => {}
-            Err(error) => eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
-                super::render_shared::shell_quote(&workspace),
-                super::render_shared::shell_quote(&project)))),
+            Err(error) => eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+                        super::render_shared::shell_quote(&workspace),
+                        super::render_shared::shell_quote(&project)
+                    )
+                )
+            ),
         }
     }
     Ok(RunOutcome {
@@ -1871,7 +1976,7 @@ struct DegradedLaunch<'a> {
     workspace: &'a str,
     project: &'a str,
     force_fresh: bool,
-    yolo_modes: YoloModes,
+    yolo: bool,
     jail_plan: &'a JailPlan,
     ai_jail: Option<&'a Path>,
     jail_facts: &'a JailHostFacts,
@@ -1942,7 +2047,7 @@ async fn degraded_launch(
         interrupted,
     )
     .await?;
-    if launch.yolo_modes.yolo {
+    if launch.yolo {
         // Same Kiro caveat as the online path: v3 has no verified dangerous
         // mode, so the wrapper maps nothing there and says so.
         if launch.harness == ManagedHarness::KiroV3
@@ -1957,9 +2062,6 @@ async fn degraded_launch(
             );
         }
         apply_yolo(launch.harness, &mut plan.args);
-    }
-    if launch.yolo_modes.claude_true_yolo && launch.harness == ManagedHarness::Claude {
-        apply_claude_true_yolo(launch.harness, &mut plan.args);
     }
     let launch_env = |name: &str| launch.child_env.get(name).map(OsStr::to_os_string);
     // Auto-wire keeps the hook install (it is local and idempotent, and
@@ -2051,10 +2153,13 @@ async fn degraded_launch(
     let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&config.data_dir));
     eprintln!(
         "{}",
-        config.i18n.diagnostic(&format!(
-            "ai-memory: this run was not recorded on the server; {}",
-            spooled_events_note(&spool)
-        ))
+        diagnostic(
+            &config.i18n,
+            format!(
+                "ai-memory: this run was not recorded on the server; {}",
+                spooled_events_note(&spool)
+            )
+        )
     );
     journal_degraded_run(
         config,
@@ -2107,7 +2212,7 @@ async fn journal_degraded_run(
         .unwrap_or_else(|error| {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
+                diagnostic(&config.i18n, format!(
                     "ai-memory: could not uniquely identify the session this run used ({error:#}); \
                  nothing was journaled; preserve the local transcript and run `ai-memory \
                  backfill --force --session <id>` after identifying it"
@@ -2118,7 +2223,7 @@ async fn journal_degraded_run(
         Err(error) => {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
+                diagnostic(&config.i18n, format!(
                     "ai-memory: could not record this run for recovery (privacy config: {error}); \
                  nothing was journaled"
                 ))
@@ -2139,8 +2244,16 @@ async fn journal_degraded_run(
     let source_cursor = match prelaunch_cursor {
         Some(Ok(cursor)) => Some(cursor),
         Some(Err(error)) => {
-            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
-                display_session_id(&native_session_id))));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record a safe delta baseline for resumed session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                        display_session_id(&native_session_id)
+                    )
+                )
+            );
             return;
         }
         None => None,
@@ -2162,14 +2275,30 @@ async fn journal_degraded_run(
         {
             Ok(export) => export,
             Err(error) => {
-                eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
-                    display_session_id(&native_session_id))));
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not capture an exact post-run transcript bound for session {} ({error:#}); nothing was journaled; retain the native transcript for manual repair",
+                            display_session_id(&native_session_id)
+                        )
+                    )
+                );
                 return;
             }
         };
         let Some(final_cursor) = exact_export.source_cursor.clone() else {
-            eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
-                launch.harness.as_str())));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: the {} transcript adapter produced no post-run cursor; nothing was journaled; retain the native transcript for manual repair",
+                        launch.harness.as_str()
+                    )
+                )
+            );
             return;
         };
         (
@@ -2215,11 +2344,14 @@ async fn journal_degraded_run(
         Err(error) => {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
-                    "ai-memory: could not record this run for recovery ({error:#}); the native \
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record this run for recovery ({error:#}); the native \
                  transcript remains in the harness store and can be imported with `ai-memory \
                  backfill --force --session <id>`"
-                ))
+                    )
+                )
             );
         }
     }
@@ -2464,10 +2596,13 @@ fn journal_finish_failed_run(
         Err(error) => {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
-                    "ai-memory: could not record this run for recovery ({error:#}); retain the \
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record this run for recovery ({error:#}); retain the \
                  native transcript and original run id for manual repair"
-                ))
+                    )
+                )
             );
         }
     }
@@ -2609,9 +2744,12 @@ async fn cancel_managed_run_after_failure(
     {
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!(
-                "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
-            ))
+            diagnostic(
+                i18n,
+                format!(
+                    "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
+                )
+            )
         );
     }
 }
@@ -2999,15 +3137,16 @@ fn render_checklist(
     }
     let mut changes = Vec::new();
     if let Some(saved) = &view.last_saved {
-        changes.push(paint.dim(&i18n.diagnostic(&format!("your choices from {saved}"))));
+        changes.push(paint.dim(&diagnostic(i18n, format!("your choices from {saved}"))));
     }
     if !view.new.is_empty() {
-        changes.push(paint.cyan(&i18n.diagnostic(&format!("new: {}", view.new.join(", ")))));
+        changes.push(paint.cyan(&diagnostic(i18n, format!("new: {}", view.new.join(", ")))));
     }
     if !view.gone.is_empty() {
-        changes.push(
-            paint.yellow(&i18n.diagnostic(&format!("no longer offered: {}", view.gone.join(", ")))),
-        );
+        changes.push(paint.yellow(&diagnostic(
+            i18n,
+            format!("no longer offered: {}", view.gone.join(", ")),
+        )));
     }
     if !changes.is_empty() {
         writeln!(output, "   {}", changes.join(&paint.dim(" · ")))?;
@@ -3201,7 +3340,6 @@ fn jail_summary(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NextRun {
     yolo: bool,
-    true_yolo: bool,
     no_autowire: bool,
     workspace: Option<String>,
     project: Option<String>,
@@ -3287,9 +3425,7 @@ fn next_run_command(
     folders: &[super::jail_folders::ExtraFolder],
 ) -> String {
     let mut words = vec!["ai-memory".to_owned(), "run".to_owned()];
-    if next.true_yolo {
-        words.push("--true-yolo".to_owned());
-    } else if next.yolo {
+    if next.yolo {
         words.push("--yolo".to_owned());
     }
     if next.no_autowire {
@@ -3546,9 +3682,12 @@ async fn confirm_yolo_and_maybe_reexec(
         {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
-                    "ai-memory: could not remember the jail choices ({error:#}); they apply to this run only"
-                ))
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not remember the jail choices ({error:#}); they apply to this run only"
+                    )
+                )
             );
         }
         let choices = marked_choices(&outcome.marked);
@@ -3560,6 +3699,7 @@ async fn confirm_yolo_and_maybe_reexec(
         (choices, outcome.folders, Some(next))
     };
     ensure_jail_does_not_export_config_token(config)?;
+    ensure_jail_does_not_need_a_server_profile(config)?;
     // The re-exec replaces this process (or, off Unix, this process exits
     // once the child does), so its own prepared lease must be released here
     // rather than left to the 90s orphan timeout — the jailed re-run opens
@@ -3681,17 +3821,21 @@ fn jail_refusal_error(
     refusal: JailRefusal,
 ) -> anyhow::Error {
     match refusal {
-        JailRefusal::Backend(message) => anyhow!(i18n.diagnostic(&format!(
-            "ai-jail cannot start its sandbox on this machine: {message}"
-        ))),
+        JailRefusal::Backend(message) => anyhow!(diagnostic(
+            i18n,
+            format!("ai-jail cannot start its sandbox on this machine: {message}")
+        )),
         JailRefusal::Drift(message) => {
             let review = format!(
                 "{} configure {harness}",
                 super::render_shared::shell_quote(&ai_jail.to_string_lossy())
             );
-            anyhow!(i18n.diagnostic(&format!(
-                "ai-jail's saved access for this project no longer matches this machine: {message}. Review it with: {review}"
-            )))
+            anyhow!(diagnostic(
+                i18n,
+                format!(
+                    "ai-jail's saved access for this project no longer matches this machine: {message}. Review it with: {review}"
+                )
+            ))
         }
     }
 }
@@ -3706,15 +3850,18 @@ fn contract_summary(
 ) -> String {
     let server = match reach {
         ServerReach::Loopback { port } => {
-            i18n.diagnostic(&format!("memory server through forwarded port {port}"))
+            diagnostic(i18n, format!("memory server through forwarded port {port}"))
         }
         ServerReach::Network => {
             i18n.diagnostic("full network, because the memory server is not on this machine")
         }
     };
-    i18n.diagnostic(&format!(
-        "ai-memory: ai-jail {version} reviews the rest of the access for {harness} ({server})"
-    ))
+    diagnostic(
+        i18n,
+        format!(
+            "ai-memory: ai-jail {version} reviews the rest of the access for {harness} ({server})"
+        ),
+    )
 }
 
 /// Run `status --json` for the exact launch. `None` when it fails or prints
@@ -3875,6 +4022,25 @@ fn ensure_jail_does_not_export_config_token(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// A checkout whose marker selects a server profile (#2016) talks to that
+/// profile's server with its stored token, which the jailed re-run cannot
+/// read from ai-jail's private home and which must not be copied into the
+/// harness's environment either. Refuse instead of letting the jailed run
+/// fail on the profile or fall back to another server.
+fn ensure_jail_does_not_need_a_server_profile(config: &Config) -> Result<()> {
+    match crate::http_client::checkout_route(config) {
+        crate::server_profiles::Route::InstallDefault => Ok(()),
+        route => Err(anyhow!(
+            "--jail cannot carry this checkout's server profile{} into the managed harness: \
+             the jailed run cannot read its stored token. Set AI_MEMORY_SERVER_URL and a \
+             least-privilege AI_MEMORY_AUTH_TOKEN for this launch, or run without --jail",
+            route
+                .profile_name()
+                .map_or_else(String::new, |name| format!(" `{name}`")),
+        )),
+    }
+}
+
 /// Replace this process with `<ai_jail> <jail_args>` on Unix (never returns
 /// on success); elsewhere, spawn it, wait, and exit with its status (also
 /// never returns). `ai_jail` is the path [`usable_ai_jail_here`] resolved,
@@ -3968,18 +4134,29 @@ fn follow_claude_continued_session(
             };
             eprintln!(
                 "{}",
-                i18n.diagnostic(&format!(
-                    "ai-memory: Claude session {} {how} {}; the workstream now follows it",
-                    display_session_id(&own),
-                    display_session_id(continuation.session_id())
-                ))
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: Claude session {} {how} {}; the workstream now follows it",
+                        display_session_id(&own),
+                        display_session_id(continuation.session_id())
+                    )
+                )
             );
             continuation.session_id().to_owned()
         }
         Ok(None) => own,
         Err(error) => {
-            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
-                display_session_id(&own))));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: could not check whether Claude session {} moved to another session ({error}); keeping it",
+                        display_session_id(&own)
+                    )
+                )
+            );
             own
         }
     }
@@ -4056,7 +4233,15 @@ async fn resolve_native_session_after_run(
         // The session the run was prepared with is no evidence either: this
         // launch may not have touched it while another one did.
         Err(error) if error.is::<AmbiguousNativeSession>() => {
-            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it")));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: {error}, so its transcript was not imported; resume the session with its native selector to link it"
+                    )
+                )
+            );
             return Ok(None);
         }
         Err(error) => return Err(error),
@@ -4121,7 +4306,7 @@ async fn list_auto_sessions(
     for failure in failures {
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!("ai-memory: session scan skipped {failure}"))
+            diagnostic(i18n, format!("ai-memory: session scan skipped {failure}"))
         );
     }
     found.sort_by(|left, right| {
@@ -4296,29 +4481,35 @@ fn remove_wrapper_true_yolo(args: &mut Vec<OsString>) -> bool {
     args.len() != before
 }
 
-/// The effective permission modes for a launch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct YoloModes {
-    /// Map the harness's dangerous-mode option, with the `--yolo` warning and
-    /// ai-jail offer.
-    yolo: bool,
-    /// Additionally apply Claude's `bypassPermissions` + residual-prompt
-    /// silencing (only acted on for the Claude harness).
-    claude_true_yolo: bool,
+/// Whether the launch asked for yolo, and whether it used the retired
+/// `--true-yolo` spelling, from the parsed flags plus either flag left in the
+/// native argv (stripped there, so the harness never sees it). `--true-yolo`
+/// is a deprecated alias: one `--yolo` now does it all.
+fn take_wrapper_yolo(
+    yolo_flag: bool,
+    true_yolo_flag: bool,
+    native_args: &mut Vec<OsString>,
+) -> (bool, bool) {
+    let trailing_yolo = remove_wrapper_yolo(native_args);
+    let true_yolo = true_yolo_flag | remove_wrapper_true_yolo(native_args);
+    (yolo_flag || trailing_yolo || true_yolo, true_yolo)
 }
 
-/// `--true-yolo` is a superset of `--yolo`: it requests yolo on every harness
-/// (where, outside Claude, it is simply interchangeable with `--yolo`) plus the
-/// Claude-only bypass, so passing both is redundant but harmless. The
-/// `claude_true_yolo` config key only upgrades a launch that is already yolo —
-/// it never turns an ordinary run into a permission-bypassing one without the
-/// `--yolo` warning.
-fn yolo_modes(yolo_flag: bool, true_yolo_flag: bool, config_true_yolo: bool) -> YoloModes {
-    let yolo = yolo_flag || true_yolo_flag;
-    YoloModes {
-        yolo,
-        claude_true_yolo: yolo && (true_yolo_flag || config_true_yolo),
+/// Terminal notes for the retired true-yolo spellings. Both still load and
+/// launch: `--true-yolo` is a hidden alias of `--yolo`, and the
+/// `claude_true_yolo` config key is accepted and ignored, because a Claude
+/// `--yolo` now always forces `bypassPermissions`.
+fn yolo_deprecation_notes(true_yolo_flag: bool, config_true_yolo: bool) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if true_yolo_flag {
+        notes.push("ai-memory: --true-yolo is now the same as --yolo; use --yolo");
     }
+    if config_true_yolo {
+        notes.push(
+            "ai-memory: claude_true_yolo is deprecated and ignored: --yolo on Claude always forces bypassPermissions now; remove it from config.toml",
+        );
+    }
+    notes
 }
 
 fn remove_wrapper_fresh(args: &mut Vec<OsString>) -> bool {
@@ -4555,9 +4746,17 @@ fn build_preflighted_launch_plan(
             Some(linked_session_id.to_string()),
         )),
         Err(error) => {
-            eprintln!("{}", i18n.diagnostic(&format!("ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
-                harness.as_str(),
-                display_session_id(linked_session_id))));
+            eprintln!(
+                "{}",
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory: could not verify linked {} session {} ({error}); preserving native resume. Use --fresh to bypass it",
+                        harness.as_str(),
+                        display_session_id(linked_session_id)
+                    )
+                )
+            );
             Ok((plan, None))
         }
     }
@@ -4616,7 +4815,15 @@ fn remember_session_store(
         native_session_id,
         store,
     ) {
-        eprintln!("{}", config.i18n.diagnostic(&format!("ai-memory: could not record the client-local session store ({error:#}); continuing the managed run")));
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!(
+                    "ai-memory: could not record the client-local session store ({error:#}); continuing the managed run"
+                )
+            )
+        );
     }
 }
 
@@ -4672,7 +4879,7 @@ fn default_claude_wrapper(
     let Some(spelling) = spelling else { return };
     match claude_wrapper_executable(spelling, search) {
         Ok(wrapper) => *executable = Some(wrapper),
-        Err(warning) => eprintln!("{warning}"),
+        Err(warning) => eprintln!("{}", super::show::terminal_text(&warning.to_string())),
     }
 }
 
@@ -5256,11 +5463,14 @@ fn choose_native_session(
     writeln!(
         output,
         "{}",
-        i18n.diagnostic(&format!(
-            "ai-memory: no {} session is linked to workstream '{}'.",
-            harness.as_str(),
-            workstream_name
-        ))
+        diagnostic(
+            i18n,
+            format!(
+                "ai-memory: no {} session is linked to workstream '{}'.",
+                harness.as_str(),
+                workstream_name
+            )
+        )
     )?;
     writeln!(
         output,
@@ -5271,18 +5481,24 @@ fn choose_native_session(
         writeln!(
             output,
             "{}",
-            i18n.diagnostic(&format!(
-                "  {}) {} (updated {})",
-                index + 1,
-                display_session_id(&candidate.native_session_id),
-                session_age(candidate.updated_at, now)
-            ))
+            diagnostic(
+                i18n,
+                format!(
+                    "  {}) {} (updated {})",
+                    index + 1,
+                    display_session_id(&candidate.native_session_id),
+                    session_age(candidate.updated_at, now)
+                )
+            )
         )?;
     }
     writeln!(
         output,
         "{}",
-        i18n.diagnostic(&format!("  0) Start a new {} session", harness.as_str()))
+        diagnostic(
+            i18n,
+            format!("  0) Start a new {} session", harness.as_str())
+        )
     )?;
 
     loop {
@@ -5308,7 +5524,7 @@ fn choose_native_session(
         writeln!(
             output,
             "{}",
-            i18n.diagnostic(&format!("Enter 0 through {}.", candidates.len()))
+            diagnostic(i18n, format!("Enter 0 through {}.", candidates.len()))
         )?;
     }
 }
@@ -5317,13 +5533,15 @@ fn choose_native_session(
 /// cannot flood the line. CodeQL's `rust/cleartext-logging` barrier model
 /// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
 /// names this function, so every session id the CLI prints goes through it.
+/// The id comes from a harness transcript or the server, so it is also
+/// neutralized for the terminal (#2000).
 pub(crate) fn display_session_id(value: &str) -> String {
     const MAX_CHARS: usize = 64;
     let mut output = value.chars().take(MAX_CHARS).collect::<String>();
     if value.chars().count() > MAX_CHARS {
         output.push_str("...");
     }
-    output
+    super::show::terminal_text(&output)
 }
 
 /// Age of a native session, rendered the way every other read-only listing
@@ -5460,9 +5678,10 @@ async fn export_after_flush(
     {
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!(
-                "ai-memory: transcript flush check failed: {error}"
-            ))
+            diagnostic(
+                i18n,
+                format!("ai-memory: transcript flush check failed: {error}")
+            )
         );
     }
     match export_transcript(
@@ -5644,7 +5863,7 @@ fn complete_prepare_run(
                 let _ = writeln!(
                     output,
                     "{}",
-                    i18n.diagnostic(&format!("ai-memory: warning: {warning}"))
+                    diagnostic(i18n, format!("ai-memory: warning: {warning}"))
                 );
             }
             Err(error)
@@ -5740,14 +5959,17 @@ async fn wait_out_held_lease(
     };
     eprintln!(
         "{}",
-        i18n.diagnostic(&format!(
-            "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
+        diagnostic(
+            i18n,
+            format!(
+                "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
          without releasing it. Waiting {}s for that lease to lapse (Ctrl-C to abort; \
          `--new <name>` starts a separate workstream).",
-            held.owner,
-            held.expires,
-            wait.as_secs_f64().ceil()
-        ))
+                held.owner,
+                held.expires,
+                wait.as_secs_f64().ceil()
+            )
+        )
     );
     tokio::select! {
         biased;
@@ -6589,8 +6811,9 @@ mod tests {
             "ai-memory run --yolo --workspace team --jail=github,ssh \
              --jail-map /home/u/Projects/ai-jail --jail-rw-map '/home/u/My Projects/tap' claude"
         );
+        // A launch typed with the retired `--true-yolo` repeats as `--yolo`.
         let bare = NextRun {
-            true_yolo: true,
+            yolo: true,
             ..NextRun::default()
         };
         let off = [JailToggleChoice {
@@ -6600,7 +6823,7 @@ mod tests {
         }];
         assert_eq!(
             next_run_command(&bare, Some(&off), &[]),
-            "ai-memory run --true-yolo --jail=none"
+            "ai-memory run --yolo --jail=none"
         );
         let full = NextRun {
             yolo: true,
@@ -6807,6 +7030,50 @@ mod tests {
             gave_up.is_err(),
             "repeated garbage aborts rather than guessing what to mount"
         );
+    }
+
+    /// #2016: a checkout routed to a server profile cannot be jailed, since
+    /// the jailed run cannot read the profile's token; an explicit
+    /// `AI_MEMORY_SERVER_URL` or an unrouted checkout still can.
+    #[test]
+    fn jail_refuses_a_checkout_routed_to_a_server_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = home.join("team-b").join("repo");
+        let data_dir = home.join("data");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::server_profiles::add(
+            &data_dir,
+            &crate::server_profiles::ProfileName::parse("team-b").unwrap(),
+            "https://b.example",
+            &[],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        let config = |server_url: Option<&str>| Config {
+            data_dir: data_dir.clone(),
+            runtime_env: crate::config::RuntimeEnv::for_checkout_tests(
+                repo.to_string_lossy(),
+                home.to_string_lossy(),
+                server_url,
+                false,
+            ),
+            ..Config::default()
+        };
+
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None)).is_ok());
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"team-b\"\n").unwrap();
+        let error = ensure_jail_does_not_need_a_server_profile(&config(None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`team-b`"), "{error}");
+        assert!(!error.contains("PROFILE-TOKEN"), "{error}");
+        assert!(
+            ensure_jail_does_not_need_a_server_profile(&config(Some("https://env.example")))
+                .is_ok()
+        );
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"nobody\"\n").unwrap();
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None)).is_err());
     }
 
     /// A jailed re-run keeps routing but must not turn a server bearer loaded
@@ -7136,6 +7403,78 @@ mod tests {
         assert!(output.contains("q) quit (default)"));
     }
 
+    /// A session id read from a transcript is printed by `backfill`,
+    /// `finalize-session` and `reorg` as well as by `run`, all through this
+    /// helper: it stays bounded and prints inert, and an ordinary id is
+    /// unchanged.
+    #[test]
+    fn display_session_id_is_bounded_and_inert() {
+        let id = "01a16548-23e9-7cf1-b3d6-ab3405055748";
+        assert_eq!(display_session_id(id), id);
+        assert_eq!(
+            display_session_id("abc\u{1b}]52;c;eA==\u{7}\u{202e}def"),
+            "abc?]52;c;eA==??def"
+        );
+        let long = "x".repeat(80);
+        assert_eq!(display_session_id(&long), format!("{}...", "x".repeat(64)));
+    }
+
+    /// #2010: the workstream name comes back from the server and a session
+    /// id from a harness transcript. A hostile value carrying an OSC 52
+    /// clipboard write, a CSI and a bidi override prints inert in both
+    /// prompts, in English and in Portuguese, while the rest of the line is
+    /// still there.
+    #[test]
+    fn server_and_transcript_names_print_inert_in_run_prompts() {
+        use ai_memory_core::i18n::{Language, Localizer};
+        let name = "re\u{1b}]52;c;cHduZWQ=\u{7}search\u{1b}[2J\u{202e}";
+        let id = "new\u{1b}[31mest";
+        let has_control = |text: &str| text.contains(['\u{1b}', '\u{7}', '\u{202e}']);
+        for language in [Language::English, Language::PortugueseBrazil] {
+            let i18n = Localizer::new(language);
+            let mut output = Vec::new();
+            choose_after_run(
+                &i18n,
+                Paint::PLAIN,
+                ManagedHarness::Claude,
+                name,
+                &[RunHarnessChoice::Codex],
+                &mut Cursor::new(b"\n"),
+                &mut output,
+            )
+            .unwrap();
+            let after_run = String::from_utf8(output).unwrap();
+            assert!(!has_control(&after_run), "{after_run:?}");
+            assert!(
+                after_run.contains("re?]52;c;cHduZWQ=?search?[2J?"),
+                "{after_run:?}"
+            );
+
+            let mut output = Vec::new();
+            let candidates = [NativeSessionCandidate {
+                native_session_id: id.into(),
+                updated_at: SystemTime::UNIX_EPOCH,
+            }];
+            choose_native_session(
+                &i18n,
+                ManagedHarness::Codex,
+                name,
+                &candidates,
+                &mut Cursor::new(b"0\n"),
+                &mut output,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            )
+            .unwrap();
+            let adoption = String::from_utf8(output).unwrap();
+            assert!(!has_control(&adoption), "{adoption:?}");
+            assert!(
+                adoption.contains("re?]52;c;cHduZWQ=?search?[2J?"),
+                "{adoption:?}"
+            );
+            assert!(adoption.contains("new?[31mest"), "{adoption:?}");
+        }
+    }
+
     #[test]
     fn post_run_choice_selects_an_installed_harness_by_number() {
         let mut input = Cursor::new(b"1\n");
@@ -7205,7 +7544,10 @@ mod tests {
         assert!(!args.fresh);
         assert!(args.native_args.is_empty());
         assert!(args.yolo);
-        assert!(args.true_yolo);
+        assert!(
+            !args.true_yolo,
+            "a relaunch carries --yolo, not the alias that prints its note again"
+        );
         assert!(args.no_jail);
         assert!(args.no_autowire);
         assert_eq!(args.env, [("MODEL_HOME".into(), "custom".into())]);
@@ -9054,60 +9396,98 @@ mod tests {
         assert_eq!(native, ["--model", "opus"].map(OsString::from));
     }
 
+    /// `--true-yolo` stays a hidden alias so 3.4.x aliases, scripts and
+    /// printed next-run lines keep launching; it parses in `run`, `show`,
+    /// `continue` and `resume`, and is gone from `--help`.
     #[test]
-    fn true_yolo_flag_implies_yolo_on_every_harness() {
+    fn true_yolo_is_a_hidden_alias_on_every_launch_command() {
+        for argv in [
+            &["ai-memory", "run", "--true-yolo", "claude"][..],
+            &["ai-memory", "show", "--true-yolo"],
+            &["ai-memory", "continue", "--true-yolo"],
+            &["ai-memory", "resume", "--true-yolo"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+        let mut command = <Cli as clap::CommandFactory>::command();
+        for name in ["run", "show", "continue", "resume"] {
+            let help = command
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(!help.contains("true-yolo"), "{name} --help: {help}");
+        }
+    }
+
+    /// `--true-yolo` in either position requests exactly what `--yolo` does,
+    /// so a 3.4.x alias still gets the warning, the ai-jail offer and the
+    /// harness's dangerous mode (Claude's `--settings` included).
+    #[test]
+    fn true_yolo_alias_requests_yolo_in_either_position() {
+        let parse = |argv: &[&str]| {
+            let CliCommand::Run(args) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("expected run command");
+            };
+            args
+        };
+        let take = |argv: &[&str]| {
+            let mut args = parse(argv);
+            let taken = take_wrapper_yolo(args.yolo, args.true_yolo, &mut args.native_args);
+            (taken, args.native_args)
+        };
+        let opus = ["--model", "opus"].map(OsString::from).to_vec();
         assert_eq!(
-            yolo_modes(false, true, false),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: true
-            },
-            "--true-yolo alone must still warn/offer ai-jail and map the harness's yolo"
+            take(&[
+                "ai-memory",
+                "run",
+                "--true-yolo",
+                "claude",
+                "--model",
+                "opus"
+            ]),
+            ((true, true), opus.clone())
         );
-        // Both together are redundant, never an error or a different result.
         assert_eq!(
-            yolo_modes(true, true, false),
-            yolo_modes(false, true, false)
+            take(&[
+                "ai-memory",
+                "run",
+                "claude",
+                "--model",
+                "opus",
+                "--true-yolo"
+            ]),
+            ((true, true), opus.clone())
+        );
+        assert_eq!(
+            take(&["ai-memory", "run", "claude", "--model", "opus", "--yolo"]),
+            ((true, false), opus.clone())
+        );
+        assert_eq!(
+            take(&["ai-memory", "run", "claude", "--model", "opus"]),
+            ((false, false), opus)
         );
     }
 
     #[test]
-    fn plain_yolo_does_not_bypass_claude_permissions_by_itself() {
-        assert_eq!(
-            yolo_modes(true, false, false),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: false
-            }
-        );
-        assert_eq!(
-            yolo_modes(false, false, false),
-            YoloModes {
-                yolo: false,
-                claude_true_yolo: false
-            }
-        );
-    }
-
-    /// The config key upgrades a yolo launch, but alone must never turn an
-    /// ordinary managed run into a `bypassPermissions` one with no `--yolo`
-    /// warning (it previously did).
-    #[test]
-    fn claude_true_yolo_config_only_upgrades_a_yolo_launch() {
-        assert_eq!(
-            yolo_modes(false, false, true),
-            YoloModes {
-                yolo: false,
-                claude_true_yolo: false
-            }
-        );
-        assert_eq!(
-            yolo_modes(true, false, true),
-            YoloModes {
-                yolo: true,
-                claude_true_yolo: true
-            }
-        );
+    fn retired_true_yolo_spellings_print_a_note_each() {
+        assert!(yolo_deprecation_notes(false, false).is_empty());
+        let flag = yolo_deprecation_notes(true, false);
+        assert_eq!(flag.len(), 1);
+        assert!(flag[0].contains("--true-yolo is now the same as --yolo"));
+        let key = yolo_deprecation_notes(false, true);
+        assert_eq!(key.len(), 1);
+        assert!(key[0].contains("claude_true_yolo is deprecated and ignored"));
+        assert_eq!(yolo_deprecation_notes(true, true).len(), 2);
+        let catalog =
+            ai_memory_core::i18n::Localizer::new(ai_memory_core::i18n::Language::PortugueseBrazil);
+        for note in yolo_deprecation_notes(true, true) {
+            assert_ne!(
+                catalog.diagnostic(note),
+                note,
+                "pt-BR catalog entry for {note}"
+            );
+        }
     }
 
     #[test]

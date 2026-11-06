@@ -96,9 +96,11 @@ impl Harness {
         // reads can verify they resolved into the right active_project.
         //
         // The FTS5 tokenizer is `unicode61 ... tokenchars '_-'`, so
-        // `_` is part of a token (NOT a separator). A body like
-        // "PROJ_1_BODY" tokenizes as a single token and a `PROJ` query
-        // misses it. Use space-separated words instead: a shared word
+        // `_` is part of a token (NOT a separator) and "PROJ_1_BODY"
+        // tokenizes as a single token. Since V100 the `*_parts` columns index
+        // the same text with `-`/`_` turned into spaces, so a `PROJ` query
+        // would reach it — but these markers still use space-separated words
+        // so the seed does not depend on that: a shared word
         // "markerstream" that every marker carries, plus a per-project
         // unique english-number word so we can both find any marker and
         // tell which project it came from.
@@ -161,6 +163,7 @@ impl Harness {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             ingest_gates: ai_memory_hooks::IngestGates::default(),
+            session_agents: ai_memory_hooks::SessionAgents::default(),
             cwd_probes: ai_memory_hooks::CwdProbes::default(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,

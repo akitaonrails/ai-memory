@@ -14,6 +14,7 @@ pub mod admin_profile;
 pub mod auth;
 pub mod human_auth;
 pub mod identity;
+pub mod launch_scope;
 pub mod metrics;
 mod page_patch;
 pub mod self_service_keys;

@@ -54,7 +54,8 @@ pub async fn run(config: &Config, args: CommitArgs) -> Result<()> {
     } else {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-commit-nothing-to-commit",
                 &[(
                     "value0",

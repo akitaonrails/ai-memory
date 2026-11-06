@@ -516,15 +516,11 @@ pub struct Config {
     /// permission-bypass flags. Configure them under `[run.profiles.<name>.env]`.
     #[serde(default)]
     pub run: RunSettings,
-    /// Off by default. When true, a Claude `ai-memory run --yolo` additionally
-    /// applies [`apply_claude_true_yolo`](ai_memory_workstream::apply_claude_true_yolo),
-    /// injecting `--settings` that forces `bypassPermissions` over any
-    /// settings `defaultMode`. It never turns a launch without `--yolo` into a
-    /// bypassing one, and it cannot silence the user's own `ask` rules, which
-    /// Claude Code enforces in every mode. No-op for every other harness. Best
-    /// paired with ai-jail (see `docs/design-yolo-safety-ai-jail.md`). Set with
-    /// `AI_MEMORY_CLAUDE_TRUE_YOLO=true` or `claude_true_yolo = true` in
-    /// config.toml; `ai-memory run --true-yolo` requests it per launch.
+    /// Deprecated and ignored since 3.4.3: a Claude `ai-memory run --yolo`
+    /// now always forces `bypassPermissions` (what this key used to add), so
+    /// there is nothing left to opt into. Still parsed so a config.toml or
+    /// `AI_MEMORY_CLAUDE_TRUE_YOLO` from an older release keeps loading; when
+    /// true, `ai-memory run` prints a terminal note asking to remove it.
     pub claude_true_yolo: bool,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
@@ -911,6 +907,13 @@ impl RuntimeEnv {
         self.ignore_marker
     }
 
+    /// `AI_MEMORY_SERVER_URL` from the process environment: an explicit
+    /// per-invocation server that outranks a marker's server profile.
+    #[must_use]
+    pub(crate) fn server_url(&self) -> Option<&str> {
+        self.server_url.as_deref()
+    }
+
     /// Install-wide `--project-strategy` default baked into the environment.
     #[must_use]
     pub fn project_strategy(&self) -> Option<&str> {
@@ -985,6 +988,22 @@ impl RuntimeEnv {
         Self {
             host_cwd: Some(host_cwd.into()),
             home_dir: Some(home_dir.into()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_checkout_tests(
+        host_cwd: impl Into<String>,
+        home_dir: impl Into<String>,
+        server_url: Option<&str>,
+        ignore_marker: bool,
+    ) -> Self {
+        Self {
+            host_cwd: Some(host_cwd.into()),
+            home_dir: Some(home_dir.into()),
+            server_url: server_url.map(str::to_owned),
+            ignore_marker,
             ..Self::default()
         }
     }
@@ -4190,6 +4209,15 @@ mod tests {
             ai_memory_core::profile::DEFAULT_MAX_OUTPUT_TOKENS,
             "the template leaves max_output_tokens unset, so the 2k default applies"
         );
+    }
+
+    /// A config written for 3.4.2 or older that still sets the retired
+    /// `claude_true_yolo` key must keep loading, and keep the value, so
+    /// `ai-memory run` can ask the operator to remove it.
+    #[test]
+    fn the_retired_claude_true_yolo_key_still_loads() {
+        let cfg = load_with_toml("claude_true_yolo = true\n").expect("the retired key must load");
+        assert!(cfg.claude_true_yolo);
     }
 
     /// The profile's LLM output budget is operator-settable: providers that

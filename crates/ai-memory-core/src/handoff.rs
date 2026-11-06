@@ -62,7 +62,10 @@ pub struct NewHandoff {
     pub workspace_id: WorkspaceId,
     /// Owning project.
     pub project_id: ProjectId,
-    /// Session this handoff captures (None for manual handoffs).
+    /// Session this handoff captures. An automatic handoff always names its
+    /// session; an explicit `memory_handoff_begin` one names the caller's
+    /// session only when its client forwards a hook session the server
+    /// recorded in the handoff's own scope.
     pub from_session_id: Option<SessionId>,
     /// Agent CLI that produced this handoff.
     pub from_agent: AgentKind,
@@ -126,6 +129,11 @@ pub struct HandoffScope {
 pub struct HandoffOrigin {
     /// Session that produced this handoff, if any.
     pub from_session_id: Option<SessionId>,
+    /// Written explicitly through `memory_handoff_begin` rather than by the
+    /// automatic SessionEnd or turn-checkpoint path. Kept off the wire: the
+    /// row's shape on MCP and `/api/v1` predates it.
+    #[serde(skip)]
+    pub manual: bool,
     /// Agent CLI that produced this handoff.
     pub from_agent: AgentKind,
     /// Optional target hint.
@@ -166,6 +174,16 @@ pub struct HandoffLifecycle {
     /// Operator that accepted it. Unlike [`HandoffLifecycle::accepted_by`]
     /// (the agent CLI), this answers "which teammate took the baton".
     pub accepted_by_user: Option<String>,
+}
+
+impl HandoffOrigin {
+    /// Whether this is a manual handoff: written explicitly, or left without a
+    /// source session. Manual handoffs are project-wide for cwd matching, win
+    /// delivery over automatic ones, and are never swept by them.
+    #[must_use]
+    pub const fn is_manual(&self) -> bool {
+        self.manual || self.from_session_id.is_none()
+    }
 }
 
 /// Materialised view of a handoff row.

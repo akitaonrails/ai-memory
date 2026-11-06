@@ -75,7 +75,7 @@ pub(crate) async fn finalize(
     let agent = args.agent;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let sessions = fetch_open_sessions(
         &endpoint,
         &workspace,
@@ -162,7 +162,16 @@ async fn replay_prompts(
     }
     let Some(home) = super::run::native_home(config) else {
         eprintln!(
-            "{}", i18n.format("cli-finalize-session-ai-memory-no-home-directory-session-is-finalized-without-its-prompts", &[("value0", super::run::display_session_id(session_id).to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-finalize-session-ai-memory-no-home-directory-session-is-finalized-without-its-prompts",
+                &[(
+                    "value0",
+                    super::run::display_session_id(session_id).to_string()
+                )]
+            )
+        );
         return;
     };
     if let Err(error) = super::backfill::replay_session_prompts(
@@ -177,7 +186,19 @@ async fn replay_prompts(
     .await
     {
         eprintln!(
-            "{}", i18n.format("cli-finalize-session-ai-memory-could-not-replay-the-prompts-of-session-error-finalizing-without-t", &[("value0", super::run::display_session_id(session_id).to_string()), ("value1", format!("{:#}", error))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-finalize-session-ai-memory-could-not-replay-the-prompts-of-session-error-finalizing-without-t",
+                &[
+                    (
+                        "value0",
+                        super::run::display_session_id(session_id).to_string()
+                    ),
+                    ("value1", format!("{:#}", error))
+                ]
+            )
+        );
     }
 }
 
@@ -246,7 +267,8 @@ fn print_report(
     } else if report.finalized.is_empty() {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-finalize-session-no-open-sessions-matched",
                 &[
                     ("value0", report.agent.to_string()),
@@ -258,7 +280,8 @@ fn print_report(
     } else {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-finalize-session-finalized-session-s-for",
                 &[
                     ("value0", format!("{}", report.finalized.len())),

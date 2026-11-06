@@ -205,7 +205,8 @@ pub(crate) fn initialize(
         let pepper = generate_token_hex(TOKEN_PEPPER_BYTES).map_err(|e| {
             anyhow::anyhow!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-init-generating-auth-token-pepper-e",
                     &[("value0", format!("{}", e))]
                 )

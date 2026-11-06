@@ -1352,6 +1352,17 @@ fn file_at_rev_fallback(
     Ok(out.stdout)
 }
 
+/// The `.git/config` libgit2 writes for a fresh repository on this
+/// platform. A restore installs this in place of an archived wiki's config,
+/// which git would trust to run commands (`core.hooksPath`, `core.fsmonitor`,
+/// `core.pager`, filters, aliases, `include.path`); generating it rather than
+/// filtering the archived one means nothing from the archive is parsed.
+pub fn fresh_repository_config() -> WikiResult<Vec<u8>> {
+    let scratch = tempfile::tempdir()?;
+    let repo = Repository::init(scratch.path()).map_err(map_git_err)?;
+    Ok(std::fs::read(repo.path().join("config"))?)
+}
+
 fn init_repo(root: &Path) -> WikiResult<()> {
     match Repository::init(root) {
         Ok(_) => Ok(()),

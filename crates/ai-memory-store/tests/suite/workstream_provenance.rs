@@ -560,12 +560,13 @@ async fn workstream_content_is_scrubbed_before_the_store_cap() {
     // The key starts 18 bytes before the truncation cut (the cap minus the
     // ellipsis reserve): capping first would keep `sk-` plus 15 characters,
     // one short of the 16 the pattern needs, leaking the prefix verbatim.
-    // The space before the tail keeps the greedy key pattern from swallowing
+    // The key follows a space, since the rule skips an `sk-` glued to a
+    // letter. The space before the tail keeps the greedy key pattern from swallowing
     // the tail, so the scrubbed text still crosses the cap.
     let mut hostile = event("straddling", "record-1", json!({}));
     hostile.content = format!(
-        "{}sk-{} {}",
-        "x".repeat(CONTENT_CAP - 21),
+        "{} sk-{} {}",
+        "x".repeat(CONTENT_CAP - 22),
         "A".repeat(40),
         "y".repeat(2 * 1024),
     );

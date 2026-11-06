@@ -29,7 +29,7 @@ use ai_memory_llm::OidcToken;
 
 use crate::cli::HookArgs;
 use crate::config::{Config, RuntimeEnv};
-use crate::server_profiles::{self, ProfileName, Rejection, ResolvedServer};
+use crate::server_profiles::{self, ProfileName, Route as HookRoute};
 
 use sha2::{Digest as _, Sha256};
 
@@ -3079,41 +3079,6 @@ impl GlobBudget {
     }
 }
 
-/// Where one event is delivered (#992).
-#[derive(Debug)]
-enum HookRoute {
-    /// No marker selects a server: the install-time `--server-url`, exactly
-    /// as before profiles existed.
-    InstallDefault,
-    /// The marker's profile resolved; its URL and token replace the install's.
-    Profile(ResolvedServer),
-    /// The marker selects a profile that did not resolve. Nothing is emitted.
-    Rejected {
-        /// The selected name, when it is a valid one (safe to print).
-        name: Option<ProfileName>,
-        reason: Rejection,
-    },
-}
-
-impl HookRoute {
-    fn profile_name(&self) -> Option<&ProfileName> {
-        match self {
-            Self::InstallDefault => None,
-            Self::Profile(resolved) => Some(&resolved.name),
-            Self::Rejected { name, .. } => name.as_ref(),
-        }
-    }
-
-    /// Label for `--check-capture`. Never a URL, path, or token.
-    fn resolution(&self) -> &'static str {
-        match self {
-            Self::InstallDefault => "install-default",
-            Self::Profile(_) => "marker",
-            Self::Rejected { reason, .. } => reason.as_str(),
-        }
-    }
-}
-
 /// Resolve the route for one event.
 ///
 /// The payload's cwd decides; when the payload carries none, the hook
@@ -3129,25 +3094,9 @@ fn resolve_hook_route(
     let cwd = policy_cwd
         .map(str::to_owned)
         .or_else(|| process_cwd().map(|dir| dir.to_string_lossy().into_owned()));
-    let Some(selection) = cwd
-        .as_deref()
-        .and_then(|cwd| crate::marker::find_server_selection(cwd, home.as_deref()))
-    else {
-        return HookRoute::InstallDefault;
-    };
-    let Some(raw_name) = selection.name else {
-        return HookRoute::Rejected {
-            name: None,
-            reason: Rejection::UnreadableMarker,
-        };
-    };
-    match server_profiles::resolve(data_dir, &raw_name, &selection.marker_dir, home.as_deref()) {
-        Ok(resolved) => HookRoute::Profile(resolved),
-        Err(reason) => HookRoute::Rejected {
-            name: ProfileName::parse(&raw_name),
-            reason,
-        },
-    }
+    cwd.as_deref().map_or(HookRoute::InstallDefault, |cwd| {
+        server_profiles::route_for_cwd(data_dir, cwd, home.as_deref())
+    })
 }
 
 /// Whether the live hook would deliver events from `destination` to the same

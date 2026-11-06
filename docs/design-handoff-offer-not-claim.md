@@ -53,9 +53,9 @@ has no opt-out, and `to_agent` is stored but never used to target delivery.
   be able to see it").
 - **Selection**: `is_handoff_candidate` / `prefer_handoff` in
   `crates/ai-memory-store/src/reader.rs` (~line 10301, ~10363). A manual
-  handoff (`from_session_id.is_none()`, always true for one created via
-  `memory_handoff_begin`) is project-wide and always wins over an automatic
-  one. An automatic (`SessionEnd`) handoff is scoped by cwd path-boundary.
+  handoff (`HandoffOrigin::is_manual`: created via `memory_handoff_begin`,
+  or left without a source session) is project-wide and always wins over an
+  automatic one. An automatic (`SessionEnd`) handoff is scoped by cwd path-boundary.
   Owner is checked first, before the manual short-circuit, so cross-operator
   mixing is already excluded. This proposal only touches same-operator,
   same-project delivery. `startup_handoff` (`reader.rs`) also already skips a

@@ -132,7 +132,8 @@ fn install_grok_rule_in(i18n: &ai_memory_core::i18n::Localizer, grok_home: &Path
         Err(err) => {
             eprintln!(
                 "{}",
-                i18n.format(
+                crate::localization::format(
+                    i18n,
                     "cli-install-skills-ai-memory-warning-skipped-grok-first-turn-handoff-rule-err",
                     &[("value0", format!("{}", err))]
                 )
@@ -560,14 +561,20 @@ fn render_install_plan(
         let _ = writeln!(
             out,
             "{}",
-            i18n.diagnostic(&format!("# Skill root: {}\n", root.path.display()))
+            i18n.diagnostic(&format!(
+                "# Skill root: {}\n",
+                super::show::terminal_text(&root.path.display().to_string())
+            ))
         );
         for skill in MANAGED_SKILLS {
             let path = root.path.join(skill.relative_path);
             let _ = writeln!(
                 out,
                 "{}",
-                i18n.diagnostic(&format!("# Would write: {}\n", path.display()))
+                i18n.diagnostic(&format!(
+                    "# Would write: {}\n",
+                    super::show::terminal_text(&path.display().to_string())
+                ))
             );
             push_file(&mut out, skill.content);
         }
@@ -578,7 +585,7 @@ fn render_install_plan(
             "{}",
             i18n.diagnostic(&format!(
                 "# Would write Grok first-turn handoff rule: {}\n",
-                path.display()
+                super::show::terminal_text(&path.display().to_string())
             ))
         );
         push_file(&mut out, GROK_HANDOFF_RULE_CONTENT);
