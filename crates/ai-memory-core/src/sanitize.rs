@@ -438,8 +438,9 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     ),
     // Bearer-style tokens.
     (r#"(?i)bearer\s+[A-Za-z0-9._\-+/=]{16,}"#, "bearer_token"),
-    // Vendor-prefixed API keys.
-    (r"sk-[A-Za-z0-9_\-]{16,}", "api_key"),
+    // Vendor-prefixed API keys. The leading \b keeps identifiers such as
+    // `task-…` from matching; a real key starts a token.
+    (r"\bsk-[A-Za-z0-9_\-]{16,}", "api_key"),
     // Stripe secret *and* restricted keys. `rk_live_` is scoped rather than
     // full-access, but the scope is operator-chosen and routinely includes
     // charges/refunds — not meaningfully safer than `sk_live_`.
@@ -1116,6 +1117,33 @@ mod tests {
         let out = s().scrub("key=sk-or-v1-deadbeefcafebabe1234567890abcdef");
         assert!(out.contains("[REDACTED:"));
         assert!(!out.contains("deadbeef"));
+    }
+
+    #[test]
+    fn keeps_identifiers_that_merely_contain_a_sk_fragment() {
+        for keep in [
+            "procedures/triage-llama-server-connection-canceled-log-pair-task-release-lines-and-correlate-client-clock.md",
+            "branch bible-qa-web@task-19-query-expansion",
+            "_rules/organize-dotfiles-docs-by-task-and-strip-trivial-prose.md",
+            "background-task-indexing-after-return",
+            "storage-on-disk-reclaimable-pct",
+            "foo_sk-abcdefghijklmnopqrstuvwxyz",
+        ] {
+            let scrubbed = s().scrub(keep);
+            assert_eq!(scrubbed, keep, "{keep}");
+        }
+    }
+
+    #[test]
+    fn redacts_a_vendor_key_in_a_delimited_context() {
+        for key in [
+            "key=sk-or-v1-deadbeefcafebabe1234567890abcdef",
+            r#"{"stdout":"sk-FAKEfake0123456789abcdef"}"#,
+            "sk-abcdefghijklmnopqrstuvwxyz at line start",
+        ] {
+            let scrubbed = s().scrub(key);
+            assert!(scrubbed.contains("[REDACTED:api_key]"), "{scrubbed}");
+        }
     }
 
     #[test]
