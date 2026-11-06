@@ -593,6 +593,28 @@ take precedence; see
 
 ---
 
+## Homebrew (macOS and Linux)
+
+The `akitaonrails/tap` formula installs the release binary and its hook
+sources for macOS (Apple Silicon and Intel) and Linux (x86_64 and aarch64).
+On Linux it works with Homebrew on Linux, which is how atomic distributions
+such as Bazzite and Fedora Silverblue usually add command-line tools.
+
+```bash
+brew install akitaonrails/tap/ai-memory
+ai-memory setup
+```
+
+`ai-memory setup` creates the data directory and its bearer token, installs
+and starts its own user service (a LaunchAgent on macOS, a systemd user unit
+on Linux), wires the agents it finds and checks the result. The formula also
+defines a `brew services` entry. Use one or the other, not both: with
+`brew services start ai-memory`, run `ai-memory init` first and wire the
+agents with `ai-memory setup --no-service`. `brew upgrade ai-memory` replaces
+the binary under a versioned Cellar path, so a service started by
+`ai-memory setup` should point at the stable `$(brew --prefix)/bin/ai-memory`
+(see the note on versioned package locations above).
+
 ## Fedora (RPM)
 
 Download the `x86_64` or `aarch64` RPM from the
