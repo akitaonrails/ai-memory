@@ -6019,18 +6019,22 @@ $payload = [Console]::In.ReadToEnd()
         );
     }
 
+    #[cfg(unix)]
     fn portable_exe() -> PathBuf {
         PathBuf::from("/h/.local/share/ai-memory/native-runner/ai-memory")
     }
 
+    #[cfg(unix)]
     fn portable_home(agent: &str) -> Option<PathBuf> {
         portable_hook_home_from(agent, Some(std::ffi::OsString::from("/h")), false, None)
     }
 
+    #[cfg(unix)]
     fn portable_ctx<'a>(agent: &'a str, data_dir: Option<&'a Path>) -> HookCommandContext<'a> {
         HookCommandContext::new(HookCommandPlatform::PosixNative, agent, data_dir, None)
     }
 
+    #[cfg(unix)]
     #[test]
     fn portable_claude_native_command_uses_home_exe() {
         let home = portable_home("claude-code");
@@ -6048,6 +6052,7 @@ $payload = [Console]::In.ReadToEnd()
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn portable_data_dir_examples() {
         let cases = [
@@ -6079,6 +6084,7 @@ $payload = [Console]::In.ReadToEnd()
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn portable_unsafe_or_outside_paths_keep_absolute() {
         let home = Path::new("/h");
@@ -6107,6 +6113,7 @@ $payload = [Console]::In.ReadToEnd()
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn portable_unusable_home_keeps_absolute() {
         let homes = [None, Some(""), Some("h"), Some("/")];
@@ -6134,8 +6141,10 @@ $payload = [Console]::In.ReadToEnd()
 
     /// Forces [`portable_hook_home`] to see `home` as `HOME` for this thread.
     /// Restores the real environment on drop.
+    #[cfg(unix)]
     struct HomeOverride;
 
+    #[cfg(unix)]
     impl HomeOverride {
         fn set(home: Option<PathBuf>) -> Self {
             TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(home));
@@ -6143,15 +6152,18 @@ $payload = [Console]::In.ReadToEnd()
         }
     }
 
+    #[cfg(unix)]
     impl Drop for HomeOverride {
         fn drop(&mut self) {
             TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
         }
     }
 
+    #[cfg(unix)]
     const PORTABLE_TEST_URL: &str = "http://127.0.0.1:49374";
 
     /// Every `command` string in a payload, in document order.
+    #[cfg(unix)]
     fn payload_commands(payload: &serde_json::Value) -> Vec<String> {
         fn walk(value: &serde_json::Value, found: &mut Vec<String>) {
             match value {
@@ -6174,8 +6186,10 @@ $payload = [Console]::In.ReadToEnd()
         found
     }
 
+    #[cfg(unix)]
     type PortableBuilder = fn(&Path) -> Vec<String>;
 
+    #[cfg(unix)]
     fn row(agent: &'static str, build: PortableBuilder) -> (&'static str, PortableBuilder) {
         (agent, build)
     }
@@ -6356,6 +6370,7 @@ $payload = [Console]::In.ReadToEnd()
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn portable_opt_out_matches_shell_quote() {
         let env = Some(std::ffi::OsString::from("/h"));
@@ -6378,6 +6393,7 @@ $payload = [Console]::In.ReadToEnd()
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn portable_env_opt_out_values() {
         for value in ["1", "true", "TRUE"] {

@@ -1,5 +1,8 @@
 //! Home-relative hook paths (#2035): `install-hooks` writes `"$HOME/..."` for
 //! the binary and the data dir, and the opt-outs keep absolute paths.
+//! POSIX only: Windows hooks render through the Windows branch, unchanged.
+
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 
