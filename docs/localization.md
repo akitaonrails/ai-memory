@@ -91,6 +91,10 @@ written, so OS, library and provider details are preserved. Each English value
 in `diagnostics.ftl` must equal the source format string. Adding a `bail!`,
 `anyhow!`, `.context` or `diagnostic` message means adding it to both catalogs;
 the `every_cli_diagnostic_has_a_catalog_entry` test lists anything missing.
+A line printed while the command keeps going that quotes an error, a warning
+or another server or OS value goes through `localization::diagnostic(i18n,
+format!(…))` instead, which translates the same way and then neutralizes
+terminal controls; hook warnings get the same from `process_diagnostic`.
 Web templates use `label`, the same lookup, for fixed text that Rust passes to them.
 Hook commands run before configuration loads, so they follow only
 `AI_MEMORY_LANGUAGE`. Commented configuration snippets printed for pasting stay

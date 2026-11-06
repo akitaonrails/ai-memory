@@ -1030,10 +1030,13 @@ fn uninstall_plugins(
             Ok(outcome) if outcome.success => println!("✓ {shown}"),
             Ok(outcome) => eprintln!(
                 "{}",
-                i18n.diagnostic(&format!(
-                    "ai-memory uninstall warning: `{shown}` failed ({}); run it yourself",
-                    outcome.stderr.trim()
-                ))
+                diagnostic(
+                    i18n,
+                    format!(
+                        "ai-memory uninstall warning: `{shown}` failed ({}); run it yourself",
+                        outcome.stderr.trim()
+                    )
+                )
             ),
             Err(error) => eprintln!(
                 "{}",

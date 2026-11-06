@@ -37,12 +37,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `rename-project --project-id` command that moves an empty holder out of the
   way. The server also logs such a leftover at startup (#2018).
 
-- A recoverable error printed while `ai-memory run` or `ai-memory uninstall`
-  keeps going is now neutralized like the final failure report, so a value
-  read back from the server cannot reach the terminal as an escape sequence.
-  The sanitizer also covers the direction marks (U+061C, U+200E/U+200F) and
-  the zero-width characters (U+200B–U+200D, U+2060, U+FEFF) it used to keep
-  (#2000).
+- A warning printed while a command keeps going, such as a recoverable
+  error during `ai-memory run`, `uninstall`, `restore` or the project-split
+  repair, or a lifecycle hook warning, is now neutralized like the final
+  failure report, so a value read back from the server cannot reach the
+  terminal as an escape sequence. The sanitizer also covers the direction
+  marks (U+061C, U+200E/U+200F) and the zero-width space, word joiner and
+  byte-order mark (U+200B, U+2060–U+2064, U+FEFF) it used to keep. The
+  zero-width joiner and non-joiner still print, since emoji sequences and
+  Persian or Indic text need them (#2000, #2010).
 
 ## [3.4.2] - 2026-11-05
 

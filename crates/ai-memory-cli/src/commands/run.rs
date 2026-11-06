@@ -276,9 +276,10 @@ fn resolve_opencode_for_launch(
         Err(error) if automatic => {
             eprintln!(
                 "{}",
-                i18n.diagnostic(&format!(
-                    "ai-memory: automatic OpenCode scan skipped: {error:#}"
-                ))
+                diagnostic(
+                    i18n,
+                    format!("ai-memory: automatic OpenCode scan skipped: {error:#}")
+                )
             );
             Ok(None)
         }
@@ -428,9 +429,10 @@ async fn run_with_exit_prompt_loop(config: &Config, args: RunArgs, cwd: &Path) -
             Err(error) => {
                 eprintln!(
                     "{}",
-                    config.i18n.diagnostic(&format!(
-                        "ai-memory: could not read the post-run choice ({error}); exiting"
-                    ))
+                    diagnostic(
+                        &config.i18n,
+                        format!("ai-memory: could not read the post-run choice ({error}); exiting")
+                    )
                 );
                 return Ok(outcome.exit_code);
             }
@@ -971,9 +973,7 @@ async fn run_once_with_wiring(
     if let Some(warning) = prepared.manifest_warning.as_deref() {
         eprintln!(
             "{}",
-            config
-                .i18n
-                .diagnostic(&format!("ai-memory: warning: {warning}"))
+            diagnostic(&config.i18n, format!("ai-memory: warning: {warning}"))
         );
     }
     let run_path = format!("/workstream/runs/{}", prepared.run_id);
@@ -2178,7 +2178,7 @@ async fn journal_degraded_run(
         .unwrap_or_else(|error| {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
+                diagnostic(&config.i18n, format!(
                     "ai-memory: could not uniquely identify the session this run used ({error:#}); \
                  nothing was journaled; preserve the local transcript and run `ai-memory \
                  backfill --force --session <id>` after identifying it"
@@ -2189,7 +2189,7 @@ async fn journal_degraded_run(
         Err(error) => {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
+                diagnostic(&config.i18n, format!(
                     "ai-memory: could not record this run for recovery (privacy config: {error}); \
                  nothing was journaled"
                 ))
@@ -2302,11 +2302,14 @@ async fn journal_degraded_run(
         Err(error) => {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
-                    "ai-memory: could not record this run for recovery ({error:#}); the native \
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record this run for recovery ({error:#}); the native \
                  transcript remains in the harness store and can be imported with `ai-memory \
                  backfill --force --session <id>`"
-                ))
+                    )
+                )
             );
         }
     }
@@ -2551,10 +2554,13 @@ fn journal_finish_failed_run(
         Err(error) => {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
-                    "ai-memory: could not record this run for recovery ({error:#}); retain the \
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not record this run for recovery ({error:#}); retain the \
                  native transcript and original run id for manual repair"
-                ))
+                    )
+                )
             );
         }
     }
@@ -2696,9 +2702,12 @@ async fn cancel_managed_run_after_failure(
     {
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!(
-                "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
-            ))
+            diagnostic(
+                i18n,
+                format!(
+                    "ai-memory: {error}; the orphaned lease will expire automatically within 90 seconds"
+                )
+            )
         );
     }
 }
@@ -3633,9 +3642,12 @@ async fn confirm_yolo_and_maybe_reexec(
         {
             eprintln!(
                 "{}",
-                config.i18n.diagnostic(&format!(
-                    "ai-memory: could not remember the jail choices ({error:#}); they apply to this run only"
-                ))
+                diagnostic(
+                    &config.i18n,
+                    format!(
+                        "ai-memory: could not remember the jail choices ({error:#}); they apply to this run only"
+                    )
+                )
             );
         }
         let choices = marked_choices(&outcome.marked);
@@ -4224,7 +4236,7 @@ async fn list_auto_sessions(
     for failure in failures {
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!("ai-memory: session scan skipped {failure}"))
+            diagnostic(i18n, format!("ai-memory: session scan skipped {failure}"))
         );
     }
     found.sort_by(|left, right| {
@@ -5579,9 +5591,10 @@ async fn export_after_flush(
     {
         eprintln!(
             "{}",
-            i18n.diagnostic(&format!(
-                "ai-memory: transcript flush check failed: {error}"
-            ))
+            diagnostic(
+                i18n,
+                format!("ai-memory: transcript flush check failed: {error}")
+            )
         );
     }
     match export_transcript(
@@ -5763,7 +5776,7 @@ fn complete_prepare_run(
                 let _ = writeln!(
                     output,
                     "{}",
-                    i18n.diagnostic(&format!("ai-memory: warning: {warning}"))
+                    diagnostic(i18n, format!("ai-memory: warning: {warning}"))
                 );
             }
             Err(error)
@@ -5859,14 +5872,17 @@ async fn wait_out_held_lease(
     };
     eprintln!(
         "{}",
-        i18n.diagnostic(&format!(
-            "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
+        diagnostic(
+            i18n,
+            format!(
+                "ai-memory: the workstream is held by {} until {} — usually a launcher that exited \
          without releasing it. Waiting {}s for that lease to lapse (Ctrl-C to abort; \
          `--new <name>` starts a separate workstream).",
-            held.owner,
-            held.expires,
-            wait.as_secs_f64().ceil()
-        ))
+                held.owner,
+                held.expires,
+                wait.as_secs_f64().ceil()
+            )
+        )
     );
     tokio::select! {
         biased;
