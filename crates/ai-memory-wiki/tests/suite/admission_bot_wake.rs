@@ -402,6 +402,16 @@ async fn a_planted_secret_never_reaches_logs_debug_or_errors() {
         .with_ansi(false)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Under plain `cargo test` (the Windows CI job) every test in this binary
+    // shares one process, and tracing-core caches each callsite's interest
+    // process-wide. With this the only registered dispatcher, a callsite first
+    // reached on another test's thread is judged against that thread's
+    // default (none) and pinned to `never`, so this capture stays empty. As in
+    // `ai-memory-llm`'s `capture_info_logs`, a second live `Dispatch` makes
+    // every registration consult all dispatchers, and
+    // `rebuild_interest_cache()` heals a callsite already pinned.
+    let _companion = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::callsite::rebuild_interest_cache();
 
     // A port that refuses connections: bound, then released.
     let refused = {
