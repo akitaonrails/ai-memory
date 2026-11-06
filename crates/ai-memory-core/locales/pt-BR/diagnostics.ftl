@@ -1020,3 +1020,5 @@ diag-jail-contract-drift = o acesso salvo do ai-jail para este projeto não corr
 diag-jail-contract-summary = ai-memory: o ai-jail { $version } revisa o resto do acesso para { $harness } ({ $server })
 diag-jail-contract-forwarded-port = servidor de memória pela porta encaminhada { $port }
 diag-jail-contract-full-network = rede completa, porque o servidor de memória não está nesta máquina
+diag-restore-left-out-git = ai-memory: { $value0 } arquivo(s) do diretório git da wiki no backup ficaram de fora porque o git poderia executá-los ou segui-los ({ $listed }); a configuração git da wiki foi recriada
+diag-restore-generating-git-config = gerando uma configuração git para a wiki restaurada
