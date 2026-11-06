@@ -361,7 +361,7 @@ async fn run_once_repairing_split(
     if !accepted {
         return Err(error);
     }
-    super::run_project_split::apply_repair(config, &split).await?;
+    super::run_project_split::apply_repair(config, &split, cwd).await?;
     run_once_with_wiring(config, args, cwd, wire_overrides).await
 }
 
@@ -791,7 +791,7 @@ async fn run_once_with_wiring(
     // cancelled again.
     if let (JailMode::Explicit(spec), Some(ai_jail)) = (&jail_plan.mode, &ai_jail) {
         ensure_jail_does_not_export_config_token(config)?;
-        ensure_jail_does_not_need_a_server_profile(config)?;
+        ensure_jail_does_not_need_a_server_profile(config, &repository.cwd)?;
         let support = ai_jail_support(ai_jail)
             .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
         // Only a harness named on the command line is known this early; an
@@ -845,7 +845,7 @@ async fn run_once_with_wiring(
         ));
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
-    let endpoint = ServerEndpoint::for_checkout(config).await?;
+    let endpoint = ServerEndpoint::for_checkout_at(config, &repository.cwd).await?;
     let project_id = if let Some(id) = args.project_id {
         Some(id)
     } else if args.project.is_none() {
@@ -3699,7 +3699,7 @@ async fn confirm_yolo_and_maybe_reexec(
         (choices, outcome.folders, Some(next))
     };
     ensure_jail_does_not_export_config_token(config)?;
-    ensure_jail_does_not_need_a_server_profile(config)?;
+    ensure_jail_does_not_need_a_server_profile(config, &inputs.checkout_root)?;
     // The re-exec replaces this process (or, off Unix, this process exits
     // once the child does), so its own prepared lease must be released here
     // rather than left to the 90s orphan timeout — the jailed re-run opens
@@ -4027,8 +4027,8 @@ fn ensure_jail_does_not_export_config_token(config: &Config) -> Result<()> {
 /// read from ai-jail's private home and which must not be copied into the
 /// harness's environment either. Refuse instead of letting the jailed run
 /// fail on the profile or fall back to another server.
-fn ensure_jail_does_not_need_a_server_profile(config: &Config) -> Result<()> {
-    match crate::http_client::checkout_route(config) {
+fn ensure_jail_does_not_need_a_server_profile(config: &Config, cwd: &Path) -> Result<()> {
+    match crate::http_client::checkout_route_at(config, cwd) {
         crate::server_profiles::Route::InstallDefault => Ok(()),
         route => Err(anyhow!(
             "--jail cannot carry this checkout's server profile{} into the managed harness: \
@@ -7053,7 +7053,7 @@ mod tests {
         let config = |server_url: Option<&str>| Config {
             data_dir: data_dir.clone(),
             runtime_env: crate::config::RuntimeEnv::for_checkout_tests(
-                repo.to_string_lossy(),
+                home.to_string_lossy(),
                 home.to_string_lossy(),
                 server_url,
                 false,
@@ -7061,19 +7061,19 @@ mod tests {
             ..Config::default()
         };
 
-        assert!(ensure_jail_does_not_need_a_server_profile(&config(None)).is_ok());
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None), &repo).is_ok());
         std::fs::write(repo.join(".ai-memory.toml"), "server = \"team-b\"\n").unwrap();
-        let error = ensure_jail_does_not_need_a_server_profile(&config(None))
+        let error = ensure_jail_does_not_need_a_server_profile(&config(None), &repo)
             .unwrap_err()
             .to_string();
         assert!(error.contains("`team-b`"), "{error}");
         assert!(!error.contains("PROFILE-TOKEN"), "{error}");
         assert!(
-            ensure_jail_does_not_need_a_server_profile(&config(Some("https://env.example")))
+            ensure_jail_does_not_need_a_server_profile(&config(Some("https://env.example")), &repo)
                 .is_ok()
         );
         std::fs::write(repo.join(".ai-memory.toml"), "server = \"nobody\"\n").unwrap();
-        assert!(ensure_jail_does_not_need_a_server_profile(&config(None)).is_err());
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None), &repo).is_err());
     }
 
     /// A jailed re-run keeps routing but must not turn a server bearer loaded
@@ -10294,6 +10294,97 @@ mod tests {
                 .unwrap_or(0)
                 == 0,
             "an offline half-wiring must not gate the next online launch"
+        );
+    }
+
+    /// A picker can launch a checkout other than the command's cwd. Its
+    /// managed prepare must reach the same server, with the same bearer, as
+    /// that checkout's hooks; the install's endpoint is a hostile control.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_checkout_routes_managed_prepare_to_its_profile() {
+        let (temp, mut config, mut args) = offline_run_fixture(0).await;
+        let repo = temp.path().join("repo").canonicalize().unwrap();
+        let home = temp.path().join("home");
+        config.runtime_env = crate::config::RuntimeEnv::for_checkout_tests(
+            home.to_string_lossy(),
+            home.to_string_lossy(),
+            None,
+            false,
+        );
+        config.auth.bearer_token = Some("INSTALL-TOKEN".into());
+        args.require_server = true;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().unwrap().push((
+                    request.method().clone(),
+                    request.uri().path().to_owned(),
+                    request.headers().get("authorization").cloned(),
+                ));
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "selected-profile-prepare",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/memory", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        crate::server_profiles::add(
+            &config.data_dir,
+            &crate::server_profiles::ProfileName::parse("selected").unwrap(),
+            &url,
+            &[repo.to_string_lossy().into_owned()],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"selected\"\n").unwrap();
+
+        let error = run_from_with_wiring(&config, args, &repo, &WireOverrides::default())
+            .await
+            .unwrap_err();
+        server.abort();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("selected-profile-prepare"), "{detail}");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                (reqwest::Method::GET, "/memory/healthz".into(), None),
+                (
+                    reqwest::Method::POST,
+                    "/memory/workstream/runs".into(),
+                    Some("Bearer PROFILE-TOKEN".parse().unwrap())
+                ),
+            ],
+            "the probe is anonymous and the managed write uses only the selected profile's token"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_checkout_refuses_its_invalid_profile_before_any_server_request() {
+        let (temp, mut config, mut args) = offline_run_fixture(0).await;
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        config.runtime_env = crate::config::RuntimeEnv::for_checkout_tests(
+            home.to_string_lossy(),
+            home.to_string_lossy(),
+            None,
+            false,
+        );
+        args.require_server = true;
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"missing\"\n").unwrap();
+        let error = run_from_with_wiring(&config, args, &repo, &WireOverrides::default())
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("rejected-unknown-profile"), "{detail}");
+        assert!(
+            !detail.contains(&config.server_url),
+            "no fallback: {detail}"
         );
     }
 
