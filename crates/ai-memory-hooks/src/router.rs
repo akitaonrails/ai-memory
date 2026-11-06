@@ -8679,6 +8679,8 @@ pub(crate) mod tests {
             failure_policy: ai_memory_wiki::FailurePolicy::Reject,
             events: vec![AdmissionOp::Consolidate],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let mut state = make_state_with_admission(&tmp, chain).await;
@@ -19553,6 +19555,8 @@ pub(crate) mod tests {
             failure_policy: ai_memory_wiki::FailurePolicy::Reject,
             events,
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap()
     }
@@ -19599,6 +19603,8 @@ pub(crate) mod tests {
                     failure_policy: ai_memory_wiki::FailurePolicy::Reject,
                     events: vec![ai_memory_wiki::AdmissionOp::HandoffBegin],
                     blocking: true,
+                    projects: Vec::new(),
+                    headers: Vec::new(),
                 }])
                 .unwrap(),
             )
@@ -19826,6 +19832,8 @@ pub(crate) mod tests {
                         ai_memory_wiki::AdmissionOp::HandoffAccept,
                     ],
                     blocking: false,
+                    projects: Vec::new(),
+                    headers: Vec::new(),
                 }])
                 .unwrap(),
             )
@@ -20525,6 +20533,8 @@ pub(crate) mod tests {
             failure_policy: ai_memory_wiki::FailurePolicy::default(),
             events: vec![ai_memory_wiki::AdmissionOp::HandoffAccept],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let state = state_with_pending_handoff(&tmp, chain).await;
@@ -20563,6 +20573,8 @@ pub(crate) mod tests {
             failure_policy: ai_memory_wiki::FailurePolicy::Reject,
             events: vec![ai_memory_wiki::AdmissionOp::HandoffAccept],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let state = state_with_pending_handoff(&tmp, chain).await;
@@ -20637,6 +20649,8 @@ pub(crate) mod tests {
             failure_policy: ai_memory_wiki::FailurePolicy::default(),
             events: vec![ai_memory_wiki::AdmissionOp::HandoffAccept],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         };
         let guard = ai_memory_wiki::WebhookConfig {
             name: "scope-guard".into(),
@@ -20646,6 +20660,8 @@ pub(crate) mod tests {
             failure_policy: ai_memory_wiki::FailurePolicy::Reject,
             events: vec![ai_memory_wiki::AdmissionOp::HandoffAccept],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         };
 
         let refused_tmp = TempDir::new().unwrap();

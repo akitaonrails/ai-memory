@@ -148,6 +148,15 @@ log_level = "info"
 # tiers). Env equivalent: `AI_MEMORY_LLM_TIMEOUT_SECS`.
 # llm_timeout_secs = 300
 
+# openai-compat only: add request metadata headers to every chat attempt, so a
+# gateway can attribute and limit traffic. `x-ai-memory-workload` names the
+# workload (consolidation, profile, dream, lint, ...); `x-ai-memory-workspace`
+# and `x-ai-memory-project` name the scope, and `x-ai-memory-user` the
+# username, only when the operation has exactly one. Values are names, never
+# page content. Other providers never send them. Off by default. Env
+# equivalent: `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`.
+# llm_request_metadata_headers = false
+
 # How many live `bootstrap` runs may call the LLM at once, across projects. A
 # second run for the same project always waits for the first. The default runs
 # one at a time; raise it when the provider batches concurrent requests (a local
@@ -165,7 +174,9 @@ log_level = "info"
 # `Name=Value` entries. Empty by default. Use it for a gateway that wants a
 # caller-identifying header; OpenCode asks for `x-opencode-session` and a
 # specific `User-Agent`. Headers ai-memory sets itself (`authorization`,
-# `content-type`, `x-api-key`, ...) are refused at startup. Values are never
+# `content-type`, `x-api-key`, ...) are refused at startup, and so are
+# `x-request-id` and the `x-ai-memory-*` metadata names for openai-compat,
+# which sends them itself. Values are never
 # logged. Env equivalent: `AI_MEMORY_LLM_HEADERS`, set as an array such as
 # `["name=value","name2=value2"]`. A plain comma separated string is rejected.
 # llm_headers = []
@@ -849,8 +860,15 @@ mid_session = "follow-cwd"
 # webhook inside the write path, where it can change the page and a rejection
 # aborts the write. With blocking = false the webhook is called after the page
 # lands, its response is ignored, and a slow or down mirror adds no latency to
-# writes. `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` takes a JSON array of the same
-# fields and replaces the list from this file.
+# writes. projects (default: every project) limits the webhook to the listed
+# "workspace/project" entries; a workspace-wide event matches by workspace.
+# headers adds request headers whose values are read from files, once, when the
+# server starts: a relative value_file resolves against the data dir, a missing
+# or empty file stops the server, and the value never reaches a log. Together
+# they let a bot's endpoint be woken on message_send with no relay in between;
+# the message_send context names the message id, the addressed harness and the
+# sending project, never the message text. `AI_MEMORY_ADMISSION_WEBHOOKS_JSON`
+# takes a JSON array of the same fields and replaces the list from this file.
 #   [[admission_webhooks]]
 #   name           = "contributors"
 #   url            = "http://contributors-webhook.memory.svc.cluster.local/enrich"
@@ -858,6 +876,14 @@ mid_session = "follow-cwd"
 #   failure_policy = "ignore"
 #   blocking       = true
 #   events         = ["write_page", "consolidate"]
+#
+#   [[admission_webhooks]]
+#   name     = "bot-wake"
+#   url      = "https://bot.example.test/wake"
+#   blocking = false
+#   events   = ["message_send"]
+#   projects = ["default/ops-bot"]
+#   headers  = [{ name = "Authorization", value_file = "secrets/bot-wake" }]
 
 # NOTE: `[auth]` must remain the LAST section in this template.
 # `ai-memory init` appends further `[auth]` keys (token_pepper, root_username,

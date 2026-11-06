@@ -23,6 +23,24 @@ version in [`docs/changelog/`](docs/changelog/):
   including copied fork history. Per-response Pi ledger records remain
   unsupported; update the server and reinstall the Pi extension to enable
   session reporting (#1984, #1985).
+- `llm_request_metadata_headers` (`AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`),
+  off by default, makes the `openai-compat` provider tell a gateway what each
+  call is for: every chat attempt carries `x-ai-memory-workload`
+  (`consolidation`, `profile`, `dream`, `lint`, ...), and
+  `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when
+  the operation reads one scope or acts for one user, such as the session
+  owner in consolidation or the operator of a private profile. A value that is
+  not known as one name is left out, never guessed, and page content is never
+  sent. Other providers never send these headers, and `AI_MEMORY_LLM_HEADERS`
+  now refuses the four names for `openai-compat` at startup (#2001, #2004).
+- Added `projects` and `headers` to `[[admission_webhooks]]`, so a bot can be
+  woken straight from an observer webhook with no relay. `projects` limits a
+  webhook to `workspace/project` entries; `headers` sends request headers whose
+  values the server reads once from files at startup and never logs. A
+  `message_send` webhook now also receives the message id, the addressed
+  harness and the sending project (never the subject or body), on the MCP,
+  admin, `/web` composer and `/web` edit paths, so the bot can pop exactly the
+  message that woke it. Configs without the new keys behave as before (#2008, #2009).
 
 ### Changed
 
@@ -36,6 +54,31 @@ version in [`docs/changelog/`](docs/changelog/):
   only `user-prompt` observations, and skips a refusal with no reason or a
   one-off rename. Proposals still follow the approval policy. (#1992)
 
+### Fixed
+
+- `ai-memory run --jail` no longer shows two access checklists with ai-jail
+  3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
+  flags such as `--jail-map` no longer hide it, and ai-jail's own review is
+  the only one. What the session needs is passed as grants that ai-jail
+  applies without a prompt: the harness's login state, the `AI_MEMORY_*`
+  variables, and only that harness's own API key, so a Claude jail no longer
+  receives OpenAI or Gemini keys. A memory server on the same machine is
+  reached through one forwarded port instead of the full network. Before
+  launching, ai-memory asks ai-jail whether the sandbox can start and stops
+  with ai-jail's reason when it cannot or when saved access no longer matches
+  the machine. ai-memory's own screen keeps only the extra folders. Older
+  ai-jail releases, and Copilot and Command Code, keep the previous launch
+  (#2020).
+
+- A project name no longer turns ambiguous because an empty leftover project
+  holds it literally. When a remote-derived name such as `acme-api` matches
+  both the project that owns that repository and an empty project created
+  under the literal name, reads, writes and `memory_message_send` now reach
+  the repository owner. A leftover that holds data, or any restricted
+  candidate, still refuses, and the error now says which holder owns which
+  repository, which project name to pass instead, and the
+  `rename-project --project-id` command that moves an empty holder out of the
+  way. The server also logs such a leftover at startup (#2018).
 
 ## [3.4.2] - 2026-11-05
 
