@@ -572,7 +572,7 @@ cli-help-root-profile-apply-target-help = { "Rules file to write, relative to th
 cli-help-root-profile-apply-dry-run-help = { "Print the block and the target instead of writing" }
 cli-help-root-profile-apply-remove-help = { "Remove the managed block instead of writing it" }
 cli-help-root-profile-apply-user-help = { "Operator whose private profile to use when the profile is per user (`share = \"user\"`)" }
-cli-help-root-server-about = { "Manage local server profiles, which a repository's `.ai-memory.toml` selects with `server = \"<name>\"` to route its hook capture to a different ai-memory server" }
+cli-help-root-server-about = { "Manage local server profiles, which a repository's `.ai-memory.toml` selects with `server = \"<name>\"` to route its hook capture, and the project-scoped commands run there, to a different ai-memory server" }
 cli-help-root-server-add-about = { "Register a server profile, or replace one with the same name" }
 cli-help-root-server-add-name-help = { "Profile name a marker selects: lowercase letters, digits, `-`, `_`" }
 cli-help-root-server-add-url-help = { "Server URL, e.g. `https://memory.example.com`" }
