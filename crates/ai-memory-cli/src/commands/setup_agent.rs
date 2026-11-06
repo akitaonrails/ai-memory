@@ -592,6 +592,7 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
         install_hooks::run_with_opencode_dialect(
             config,
             InstallHooksArgs {
+                absolute_paths: false,
                 agent: AgentChoice::OpenCode,
                 hooks_dir: None,
                 server_url: Some(args.server_url.clone()),

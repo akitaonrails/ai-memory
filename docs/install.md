@@ -501,6 +501,17 @@ Docker wrapper forwards the variable for config roots under its existing
 `$HOME` bind mount; use the native binary when the relocated root is outside
 `$HOME`.
 
+On macOS and Linux the native hook commands name the binary and the data dir
+relative to your home when they sit under it, as
+`"$HOME/.local/share/ai-memory/native-runner/ai-memory" --data-dir "$HOME/..."`,
+so a settings file kept in a dotfiles repo works for another user or machine
+with the same layout, and re-applying leaves it unchanged. A path outside
+`$HOME`, or one with `"`, `$`, `` ` `` or `\` in it, stays absolute. Pass
+`--absolute-paths` to `install-hooks` or `setup`, or set
+`AI_MEMORY_HOOK_ABSOLUTE_PATHS=1` (which `upgrade` also honours), to keep
+absolute paths everywhere. Hermes and Pool always get absolute paths, because
+they do not run the command through a shell.
+
 The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,
 `curator`, `pending-writes`, etc.) inherit the two env vars automatically. So do
 `install-mcp`, `install-hooks`, and

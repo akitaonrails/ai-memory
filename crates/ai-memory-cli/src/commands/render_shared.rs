@@ -2489,29 +2489,129 @@ fn hook_command(
             // gets the local spool + OIDC fallback, instead of the `.sh` script
             // that POSTs via curl. Mirrors `WindowsNative` but with POSIX
             // single-quote quoting. The event name is the script stem.
-            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
-            let event = script
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let mut cmd = format!(
-                "{}{} hook --event {event} --agent {agent} --server-url {}",
-                shell_quote(&exe),
-                native_data_dir_arg(context.data_dir, NativeQuote::Posix),
-                shell_quote(server_url),
-                agent = context.agent,
-            );
-            if let Some(t) = auth_token {
-                cmd.push_str(&format!(" --auth-token {}", shell_quote(t)));
-            }
-            cmd.push_str(&native_project_strategy_arg(
-                context.project_strategy,
-                NativeQuote::Posix,
-            ));
-            cmd.push_str(native_capture_assistant_arg(context, event));
-            cmd
+            let exe = hook_embedded_exe_path();
+            let home = portable_hook_home(context.agent);
+            posix_native_hook_command_with(
+                &exe,
+                home.as_deref(),
+                script,
+                server_url,
+                auth_token,
+                context,
+            )
         }
     }
+}
+
+/// The POSIX native command with the exe and home injected. `home` is the
+/// directory written as `"$HOME"`; `None` keeps every path absolute.
+fn posix_native_hook_command_with(
+    exe: &Path,
+    home: Option<&Path>,
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> String {
+    let event = script
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let mut cmd = format!(
+        "{}{} hook --event {event} --agent {agent} --server-url {}",
+        posix_path_arg(exe, home),
+        native_data_dir_posix_arg(context.data_dir, home),
+        shell_quote(server_url),
+        agent = context.agent,
+    );
+    if let Some(t) = auth_token {
+        cmd.push_str(&format!(" --auth-token {}", shell_quote(t)));
+    }
+    cmd.push_str(&native_project_strategy_arg(
+        context.project_strategy,
+        NativeQuote::Posix,
+    ));
+    cmd.push_str(native_capture_assistant_arg(context, event));
+    cmd
+}
+
+/// Process-wide opt-out set by `install-hooks --absolute-paths` for this run.
+static ABSOLUTE_HOOK_PATHS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether this process renders absolute hook paths (`--absolute-paths`).
+pub(crate) fn set_absolute_hook_paths(absolute: bool) {
+    ABSOLUTE_HOOK_PATHS.store(absolute, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The home that native POSIX hook commands write as `"$HOME"`, read from the
+/// environment and the process opt-out. See [`portable_hook_home_from`].
+fn portable_hook_home(agent: &str) -> Option<PathBuf> {
+    portable_hook_home_from(
+        agent,
+        std::env::var_os("HOME"),
+        ABSOLUTE_HOOK_PATHS.load(std::sync::atomic::Ordering::Relaxed),
+        std::env::var_os("AI_MEMORY_HOOK_ABSOLUTE_PATHS"),
+    )
+}
+
+/// The home to substitute as `"$HOME"`, or `None` for absolute paths.
+///
+/// `None` when the user opted out (`--absolute-paths` or the env var `1` or
+/// `true`), when the agent runs its hook command as argv with no shell
+/// (`hermes`, `pool`), or when `HOME` is unset, empty, relative or `/`.
+fn portable_hook_home_from(
+    agent: &str,
+    home_env: Option<std::ffi::OsString>,
+    absolute_requested: bool,
+    env_opt_out: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if absolute_requested || env_opt_out.as_deref().is_some_and(absolute_env_opt_out) {
+        return None;
+    }
+    if matches!(agent, "hermes" | "pool") {
+        return None;
+    }
+    let home = PathBuf::from(home_env?);
+    let usable = home.is_absolute() && home.parent().is_some();
+    usable.then_some(home)
+}
+
+fn absolute_env_opt_out(value: &std::ffi::OsStr) -> bool {
+    value
+        .to_str()
+        .map(str::trim)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Render a path for a POSIX shell. Under `home` it becomes `"$HOME/<rest>"`
+/// (exactly `"$HOME"` for `home` itself), so the shell expands the home of the
+/// machine that runs the hook. Anything outside `home`, or whose remainder
+/// holds a character that is special inside double quotes, keeps the
+/// [`shell_quote`] form.
+fn posix_path_arg(path: &Path, home: Option<&Path>) -> String {
+    if let Some(rest) = home.and_then(|home| path.strip_prefix(home).ok()) {
+        let rest = rest.to_string_lossy();
+        if rest.is_empty() {
+            return "\"$HOME\"".to_string();
+        }
+        if rest
+            .chars()
+            .all(|c| !matches!(c, '"' | '$' | '`' | '\\') && !c.is_control())
+        {
+            return format!("\"$HOME/{rest}\"");
+        }
+    }
+    shell_quote(&path.to_string_lossy())
+}
+
+fn native_data_dir_posix_arg(data_dir: Option<&Path>, home: Option<&Path>) -> String {
+    let Some(data_dir) = data_dir else {
+        return String::new();
+    };
+    let lossy = data_dir.to_string_lossy();
+    let path = strip_windows_verbatim_prefix(&lossy);
+    format!(" --data-dir {}", posix_path_arg(Path::new(&*path), home))
 }
 
 fn powershell_encoded_command(program: &str) -> String {
@@ -5899,6 +5999,209 @@ $payload = [Console]::In.ReadToEnd()
         assert!(
             cmd.contains("AI_MEMORY_AUTH_TOKEN=tok123"),
             "must inline token: {cmd}"
+        );
+    }
+
+    fn portable_exe() -> PathBuf {
+        PathBuf::from("/h/.local/share/ai-memory/native-runner/ai-memory")
+    }
+
+    fn portable_home(agent: &str) -> Option<PathBuf> {
+        portable_hook_home_from(agent, Some(std::ffi::OsString::from("/h")), false, None)
+    }
+
+    fn portable_ctx<'a>(agent: &'a str, data_dir: Option<&'a Path>) -> HookCommandContext<'a> {
+        HookCommandContext::new(HookCommandPlatform::PosixNative, agent, data_dir, None)
+    }
+
+    #[test]
+    fn portable_claude_native_command_uses_home_exe() {
+        let home = portable_home("claude-code");
+        let cmd = posix_native_hook_command_with(
+            &portable_exe(),
+            home.as_deref(),
+            Path::new("stop.sh"),
+            "http://127.0.0.1:49374",
+            None,
+            portable_ctx("claude-code", None),
+        );
+        assert!(
+            cmd.starts_with("\"$HOME/.local/share/ai-memory/native-runner/ai-memory\" "),
+            "{cmd}"
+        );
+    }
+
+    #[test]
+    fn portable_data_dir_examples() {
+        let cases = [
+            (
+                "/h/Library/Application Support/ai-memory",
+                "--data-dir \"$HOME/Library/Application Support/ai-memory\"",
+            ),
+            (
+                "/h/.local/share/ai-memory",
+                "--data-dir \"$HOME/.local/share/ai-memory\"",
+            ),
+            ("/h", "--data-dir \"$HOME\""),
+            ("/elsewhere/data", "--data-dir /elsewhere/data"),
+        ];
+        for (data_dir, expected) in cases {
+            let home = portable_home("claude-code");
+            let cmd = posix_native_hook_command_with(
+                &portable_exe(),
+                home.as_deref(),
+                Path::new("stop.sh"),
+                "http://127.0.0.1:49374",
+                None,
+                portable_ctx("claude-code", Some(Path::new(data_dir))),
+            );
+            assert!(
+                cmd.contains(&format!("{expected} hook --event stop")),
+                "{data_dir}: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_unsafe_or_outside_paths_keep_absolute() {
+        let home = Path::new("/h");
+        let cases = [
+            ("/elsewhere/ai-memory", "/elsewhere/ai-memory"),
+            ("/h/it's dir/ai-memory", "\"$HOME/it's dir/ai-memory\""),
+            ("/h/a$b/ai-memory", "'/h/a$b/ai-memory'"),
+            ("/h/a\"b/ai-memory", "'/h/a\"b/ai-memory'"),
+            ("/h/a`b/ai-memory", "'/h/a`b/ai-memory'"),
+            ("/h/a\\b/ai-memory", "'/h/a\\b/ai-memory'"),
+            ("/h/a\u{7}b/ai-memory", "'/h/a\u{7}b/ai-memory'"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                posix_path_arg(Path::new(path), Some(home)),
+                expected,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            posix_path_arg(
+                Path::new("/home/hx/bin/ai-memory"),
+                Some(Path::new("/home/h"))
+            ),
+            "/home/hx/bin/ai-memory"
+        );
+    }
+
+    #[test]
+    fn portable_unusable_home_keeps_absolute() {
+        let homes = [None, Some(""), Some("h"), Some("/")];
+        for home in homes {
+            let env = home.map(std::ffi::OsString::from);
+            assert_eq!(
+                portable_hook_home_from("claude-code", env, false, None),
+                None,
+                "{home:?}"
+            );
+        }
+        let cmd = posix_native_hook_command_with(
+            &portable_exe(),
+            None,
+            Path::new("stop.sh"),
+            "http://127.0.0.1:49374",
+            None,
+            portable_ctx("claude-code", None),
+        );
+        assert_eq!(
+            cmd,
+            "/h/.local/share/ai-memory/native-runner/ai-memory hook --event stop --agent claude-code --server-url http://127.0.0.1:49374"
+        );
+    }
+
+    #[test]
+    fn portable_shell_agents_get_home_form() {
+        let agents = [
+            "claude-code",
+            "grok",
+            "devin",
+            "dsh",
+            "antigravity-cli",
+            "kimi-code",
+            "kiro-cli",
+            "droid",
+            "muse",
+            "codebuddy",
+            "qoder",
+            "ibm-bob",
+            "qwen-code",
+        ];
+        for agent in agents {
+            let home = portable_home(agent);
+            let cmd = posix_native_hook_command_with(
+                &portable_exe(),
+                home.as_deref(),
+                Path::new("stop.sh"),
+                "http://127.0.0.1:49374",
+                None,
+                portable_ctx(agent, None),
+            );
+            let prefix = format!(
+                "\"$HOME/.local/share/ai-memory/native-runner/ai-memory\" hook --event stop --agent {agent} "
+            );
+            assert!(cmd.starts_with(&prefix), "{agent}: {cmd}");
+        }
+    }
+
+    #[test]
+    fn portable_argv_agents_keep_absolute() {
+        for agent in ["hermes", "pool"] {
+            assert_eq!(portable_home(agent), None, "{agent}");
+        }
+    }
+
+    #[test]
+    fn portable_opt_out_matches_shell_quote() {
+        let env = Some(std::ffi::OsString::from("/h"));
+        assert_eq!(
+            portable_hook_home_from("claude-code", env, true, None),
+            None
+        );
+        let data_dir = PathBuf::from("/h/Library/Application Support/ai-memory");
+        let cmd = posix_native_hook_command_with(
+            &portable_exe(),
+            None,
+            Path::new("stop.sh"),
+            "http://127.0.0.1:49374",
+            None,
+            portable_ctx("claude-code", Some(&data_dir)),
+        );
+        assert_eq!(
+            cmd,
+            "/h/.local/share/ai-memory/native-runner/ai-memory --data-dir '/h/Library/Application Support/ai-memory' hook --event stop --agent claude-code --server-url http://127.0.0.1:49374"
+        );
+    }
+
+    #[test]
+    fn portable_env_opt_out_values() {
+        for value in ["1", "true", "TRUE"] {
+            let env = Some(std::ffi::OsString::from(value));
+            let home = std::ffi::OsString::from("/h");
+            assert_eq!(
+                portable_hook_home_from("claude-code", Some(home), false, env),
+                None,
+                "{value}"
+            );
+        }
+        for value in ["0", "false", ""] {
+            let env = Some(std::ffi::OsString::from(value));
+            let home = std::ffi::OsString::from("/h");
+            assert_eq!(
+                portable_hook_home_from("claude-code", Some(home), false, env),
+                Some(PathBuf::from("/h")),
+                "{value:?}"
+            );
+        }
+        let home = std::ffi::OsString::from("/h");
+        assert_eq!(
+            portable_hook_home_from("claude-code", Some(home), false, None),
+            Some(PathBuf::from("/h")),
         );
     }
 }
