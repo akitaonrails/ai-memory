@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A section that `memory_patch_page` adds now gets a blank line before and
+  after its heading, so the page no longer reads as one run-on block and
+  passes Markdown linters (MD022). The docs now say that an `end_of_page`
+  append means the end of the page that was read, so it lands before a
+  section the same batch adds (#2015).
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is
