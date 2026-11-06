@@ -593,6 +593,28 @@ ainda tem precedência; consulte
 
 ---
 
+## Homebrew (macOS e Linux)
+
+A fórmula `akitaonrails/tap` instala o binário da release e as fontes de hook dele
+para macOS (Apple Silicon e Intel) e Linux (x86_64 e aarch64).
+No Linux ela funciona com o Homebrew no Linux, que é como distribuições atômicas
+como Bazzite e Fedora Silverblue costumam adicionar ferramentas de linha de comando.
+
+```bash
+brew install akitaonrails/tap/ai-memory
+ai-memory setup
+```
+
+O `ai-memory setup` cria o diretório de dados e seu bearer token, instala
+e inicia seu próprio serviço de usuário (um LaunchAgent no macOS, uma unidade de usuário do systemd
+no Linux), configura os agentes que encontra e verifica o resultado. A fórmula também
+define uma entrada de `brew services`. Use uma ou outra, não ambas: com
+`brew services start ai-memory`, execute `ai-memory init` primeiro e configure os
+agentes com `ai-memory setup --no-service`. O `brew upgrade ai-memory` substitui
+o binário em um caminho versionado do Cellar, de modo que um serviço iniciado por
+`ai-memory setup` deve apontar para o caminho estável `$(brew --prefix)/bin/ai-memory`
+(veja a nota sobre locais versionados de pacotes acima).
+
 ## Fedora (RPM)
 
 Baixe o RPM `x86_64` ou `aarch64` do
@@ -2275,7 +2297,23 @@ e a inicialização compartilham o mesmo ambiente capturado mais as substituiç�
 Uma saída malformada, um tempo limite ou uma versão principal futura incompatível falha com
 um erro acionável em vez de adivinhar.
 
-### OpenCode V2 compatibility
+O OpenCode 1 e o 2 carregam plugins do mesmo diretório `~/.config/opencode/plugins/`,
+e o OpenCode 2 recusa o plugin V1 com "Plugin must export a
+default definition with an id and an effect or setup function". Depois de atualizar
+o próprio OpenCode para a 2.x, execute `ai-memory install-hooks --agent opencode --apply`
+de novo (ou `ai-memory upgrade`, que sonda a versão principal instalada do mesmo modo):
+ele grava `ai-memory-opencode2.ts` e remove o `ai-memory.ts` V1 que ele possui.
+
+Uma camada de compatibilidade com o Claude Code dentro do OpenCode (como o
+`claude_code.hooks` do oh-my-opencode) também pode executar os hooks de `~/.claude/settings.json`. No
+Windows nativo, essas entradas usam a forma exec do Claude Code: `command` é o caminho simples
+para `ai-memory.exe` e os argumentos ficam em `args`, que o Claude Code
+inicia sem shell, de modo que um caminho com espaços está correto ali. Uma camada que
+executa `command` por meio de um shell e descarta `args` divide esse caminho no primeiro
+espaço e falha com `unrecognized subcommand`. Desative os hooks do Claude dela; o
+plugin do OpenCode já captura esses eventos.
+
+### Compatibilidade com o OpenCode V2
 
 O plugin gerado tem como alvo a API de eventos do OpenCode 2.0.10+ (verificado com
 2.0.14). O OpenCode V2 executa um serviço de longa duração por trás de cada CLI, portanto fechar um
@@ -2443,6 +2481,30 @@ ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
 
 Reinicie o Pi após instalar ou alterar a extensão. OMP / Oh My Pi permanece
 separado e continua usando os caminhos de `.omp`.
+
+#### Pi codemode
+
+Por padrão, a extensão declara todas as ferramentas do ai-memory ao modelo, com o esquema
+incluído. Para alcançá-las pela ferramenta `codemode` do Pi, defina isto
+no `config.toml` do ai-memory (ou `AI_MEMORY_PI_TOOL_EXPOSURE=codemode`) e
+regenere a extensão:
+
+```toml
+pi_tool_exposure = "codemode"
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Cada ferramenta passa então a ser registrada com o
+[`exposure: "codemode"`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure) do Pi:
+scripts de codemode podem listá-la e chamá-la, e o modelo deixa de receber o esquema
+dela, a menos que você ative a ferramenta por conta própria. Os nomes das ferramentas, os cabeçalhos de sessão
+que roteiam cada chamada para o projeto atual e a captura de ciclo de vida
+permanecem os mesmos. A saída de pré-visualização e todo `--apply` posterior (inclusive a atualização que o
+`ai-memory upgrade` executa) leem a mesma configuração, de modo que regenerar mantém a sua
+escolha. Volte para `direct`, ou remova-a, para retornar ao padrão.
 
 ### Montagens bind vs docker cp
 

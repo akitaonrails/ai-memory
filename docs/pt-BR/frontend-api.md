@@ -390,7 +390,8 @@ GET /api/v1/workspaces/{workspace}/projects/{project}/briefing?limit=10
 
 Mesmo payload que `memory_briefing` retorna: contagens + janelas de atividade +
 última observação + handoffs abertos + `_rules/` + `_slots/` + N páginas mais
-recentes. Sem LLM, determinístico.
+recentes, mais `lint` (as contagens de `_lint/report.md`) quando o projeto tem um
+relatório. Sem LLM, determinístico.
 
 **Resposta:** `BriefingSnapshot`
 

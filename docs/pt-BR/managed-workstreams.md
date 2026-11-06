@@ -189,7 +189,7 @@ foi uma sessão e `--executable` não foi usado; comandos utilitários, saídas 
 interrompidas e inicializações não interativas não exibem o prompt. Uma troca ou
 reexecução não repete os argumentos nativos do harness anterior, que podem ser
 específicos daquela CLI; configurações de wrapper como `--workspace`, `--project`,
-`--yolo` / `--true-yolo`, controles do ai-jail, `--no-autowire`, `--no-exit-prompt`,
+`--yolo`, controles do ai-jail, `--no-autowire`, `--no-exit-prompt`,
 `--env` e `--env-file` permanecem em vigor. A escolha inicial de `--fresh` aplica-se
 apenas à primeira inicialização.
 

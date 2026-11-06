@@ -467,6 +467,30 @@ handoff é buscado e um aviso de uma linha vai para o stderr do hook. Ele nunca
 recorre ao padrão da instalação, porque isso entregaria a captura
 de uma equipe ao servidor de outra equipe.
 
+Os comandos que trabalham no checkout em que você os executa seguem a mesma rota,
+de modo que alcançam o servidor para o qual seus hooks fazem a captura: `run`, `resume`, `continue`,
+`show`, `workstreams`, `workstream-search`, `rename-workstream`, `doctor`,
+`search`, `recent`, `read-page`, `write-page`, `delete-page`,
+`restore-page`, `handoffs`, `message`, `pending-writes`, `profile`, `lint`,
+`forget-sweep`, `curator`, `auto-improve`, `auto-improve-report`, `embed`,
+`bootstrap`, `backfill`, `repair-backfill-timestamps`, `repair-split`,
+`finalize-session`, `rename-project`, `move-project`, `move-session`,
+`purge-project` e `purge-session`. Eles usam a URL
+e o token armazenado do perfil, nunca o bearer da sua configuração, e falham
+de forma fechada com o mesmo motivo que o hook relata quando o perfil não
+resolve. Eles comparam as raízes do perfil com o diretório como o seu
+shell o nomeia (`PWD`, quando é o mesmo diretório que o diretório de trabalho do processo),
+do modo como um harness o informa aos hooks, de modo que um checkout alcançado
+por um link simbólico, ou o `/var` do macOS (na verdade `/private/var`), roteia igual
+para ambos. `AI_MEMORY_SERVER_URL` no ambiente ainda vence para uma
+invocação, e `AI_MEMORY_IGNORE_MARKER=1` ignora o marcador, como faz para o
+escopo. Os comandos de toda a instalação (`status`, `list-projects`, `backup`, `user`,
+`api-key`, `project access`, `setup` e os demais comandos de administração) continuam usando
+o servidor configurado. `run --jail` recusa um checkout roteado por perfil,
+porque a execução na jail não consegue ler o token do perfil; defina
+`AI_MEMORY_SERVER_URL` e um `AI_MEMORY_AUTH_TOKEN` de menor privilégio para essa
+inicialização.
+
 O roteamento é herdado pela árvore abaixo, diferentemente das outras chaves. O marcador mais próximo
 que declare `server` decide, de modo que um marcador aninhado que defina apenas `workspace`,
 ou apenas `[capture]`, mantenha o perfil de seu ancestral. Um marcador aninhado pode selecionar

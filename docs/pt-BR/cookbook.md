@@ -346,6 +346,12 @@ compactado ou mesclado permanece no git e na cadeia de substituição, recuperá
 - **Manter memória usada por mais tempo:** nada a configurar. Uma página que você abre, pesquisa
   ou alcança através de navegação por páginas relacionadas é reforçada automaticamente e resiste
   ao decaimento.
+- **Verificar contradições em um agendamento:** defina `[maintenance]
+  lint_llm_interval_secs = 604800` para executar a passagem de contradições com LLM
+  semanalmente em todos os projetos, com o provedor de `lint` (`[llm.lint]` ou o
+  padrão). O `memory_briefing` então informa a contagem de alertas do `_lint/report.md` de
+  cada projeto, e o início de sessão em um projeto com alertas recebe uma
+  linha apontando para o relatório.
 - **Revisar conhecimento similar:** execute `memory_lint` (através do seu agente ou da
   CLI); com embeddings configurados, ele emite alertas de `similarity_candidate`
   para pares de páginas do mesmo tópico, apenas em caráter consultivo. A similaridade identifica tanto vocabulário compartilhado
@@ -472,8 +478,8 @@ Consulte [`managed-workstreams.md`](managed-workstreams.md).
 ## Receita: executar um agente não supervisionado com segurança (`--yolo` + ai-jail)
 
 `--yolo` mapeia-se para a flag de modo perigoso de cada harness (Claude Code →
-`--dangerously-skip-permissions`), que executa cada chamada de ferramenta sem
-nenhuma confirmação. `ai-memory run --yolo` adiciona barreiras de proteção ao redor disso, condicionadas
+`--dangerously-skip-permissions`, mais `--settings` impondo
+`bypassPermissions`), que executa cada chamada de ferramenta sem nenhuma confirmação. `ai-memory run --yolo` adiciona barreiras de proteção ao redor disso, condicionadas
 inteiramente a um terminal interativo real (stdin e stderr ambos TTYs), de modo que
 scripts, hooks e CI nunca são interrompidos com perguntas:
 
@@ -554,18 +560,26 @@ ai-memory run --yolo claude
   automaticamente lá, habilite-as em seu `~/.ai-jail` global ou passe
   `--jail=github,…`. O ai-memory sempre passa `--no-save-config`, de modo que uma execução
   na jail nunca grava suas próprias flags no `.ai-jail` do seu repositório.
+- **Com ai-jail 3.0.1 ou mais recente.** O ai-jail revisa o acesso por conta própria, uma vez
+  por projeto, então a tela do ai-memory mantém apenas as pastas extras (`f`).
+  O ai-memory nomeia o harness para o ai-jail e passa o que a sessão precisa
+  como concessões simples, sem prompts extras: o estado de login do harness, as
+  variáveis `AI_MEMORY_*` e apenas a chave de API desse harness (uma jail do Claude
+  nunca recebe a sua chave da OpenAI). Um servidor de memória nesta máquina é alcançado
+  por uma única porta encaminhada, de modo que a rede continua filtrada a menos que você a abra
+  na revisão do ai-jail; um servidor em outra máquina mantém rede completa,
+  que o ai-jail rotula como OPEN. Copilot e Command Code, para os quais o ai-jail não tem
+  predefinição, mantêm a lista de verificação acima.
 - **Já dentro do ai-jail.** Ambos os prompts são ignorados e a execução prossegue
   diretamente, portanto `ai-jail ai-memory run … --yolo` não encontra atrito adicional.
   A detecção ocorre no Linux (hostname `ai-sandbox`) / macOS (`PS1` iniciando com
   `(jail) `); opera em modo fail-open (exibe o aviso) quando indetectável, nunca
   abrindo brecha para pular silenciosamente.
-- **Claude "true yolo".** `--true-yolo` inclui tudo o que o `--yolo` faz
-  (`ai-memory run claude --true-yolo` é suficiente; adicionar `--yolo` também não causa
-  problemas) e, para o Claude, também impõe `bypassPermissions` sobre qualquer
-  `defaultMode` em suas configurações. Para outros harnesses, equivale a
-  `--yolo`. `claude_true_yolo = true` em `config.toml` /
-  `AI_MEMORY_CLAUDE_TRUE_YOLO=true` aplica o extra do Claude a cada inicialização com
-  `--yolo`, nunca a uma execução sem ele.
+- **Configurações de permissão do próprio Claude.** Para o Claude, `--yolo` também impõe
+  `bypassPermissions` sobre qualquer `defaultMode` em suas configurações, de modo que um padrão
+  `auto` ou `acceptEdits` não possa restringir a execução. Até a 3.4.2 isso exigia um
+  `--true-yolo` separado; agora ele é um alias oculto de `--yolo` (imprime uma nota de
+  uma linha), e `claude_true_yolo` em `config.toml` é ignorado (remova-o).
   **Ele não pode remover suas próprias regras `ask`**: o Claude Code respeita regras explícitas
   de `permissions.ask` (e suas checagens embutidas de segurança de comandos) em todos os modos,
   portanto uma regra como `Bash(docker run *)` em `~/.claude/settings.json` ainda
@@ -619,7 +633,9 @@ server = "team-b"
 
 Repositórios sem a chave `server` continuam usando o servidor configurado por
 `install-hooks`. O marcador sempre nomeia apenas um perfil; um perfil que não
-resolve descarta o evento em vez de enviá-lo para qualquer outro lugar. Detalhes, as
+resolve descarta o evento em vez de enviá-lo para qualquer outro lugar. Os comandos que você executa
+dentro do repositório (`run`, `workstreams`, `doctor`, `search`, ...) usam o mesmo
+perfil. Detalhes, as
 regras de fail-closed e quais integrações oferecem suporte a isso:
 [`marker-file.md`](marker-file.md#roteamento-de-captura-para-outro-servidor-server).
 

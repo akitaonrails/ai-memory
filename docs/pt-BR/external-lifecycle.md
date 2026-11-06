@@ -191,6 +191,12 @@ filhos; o orquestrador deve relatar essas transições de ciclo de vida.
 
 `POST /hook` permanece disponível, mas sua resposta `202` antecede a persistência.
 Prefira `/hook/batch` quando o produtor precisar de um reconhecimento de processamento em linha.
+Uma sessão pertence ao agente sob o qual foi capturada pela primeira vez. Um evento que a nomeia
+sob outro agente é descartado (`dropped_collision` em um lote). Depois que o servidor
+vê isso, ele responde aos eventos posteriores de `POST /hook` do mesmo chamador para a
+sessão com `409` e `{"error":"agent_mismatch","bound_agent":"<agent>"}`.
+Trate um 409 como terminal: reenviar o evento com o mesmo rótulo não pode
+ter sucesso.
 
 ## Limites
 

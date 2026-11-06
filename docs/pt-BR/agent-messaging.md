@@ -484,3 +484,15 @@ Ambos os clientes de aviso precisam de um servidor com esta versão. Um servidor
 `inbox_only` e ainda retorna apenas o aviso (os clientes também enviam
 `handoff=0&recovery=0&profile_digest=0`), mas republica o projeto
 ativo a cada busca.
+
+### Despertando um bot de longa duração
+
+Um bot ou outro agente de longa duração que não seja uma sessão do Claude Code pode ser
+despertado por um webhook observador em `message_send` ([webhooks de
+admissão](admission-webhooks.md)). Limite o webhook ao projeto do bot com
+`projects` e dê ao endpoint do bot a sua credencial com `headers`, cujo
+valor o servidor lê de um arquivo na inicialização. O contexto do webhook nomeia a
+mensagem na fila (`message_id`), o harness destinatário e o projeto remetente,
+nunca o texto, de modo que o bot retira exatamente essa mensagem com
+`memory_message_pop` e `message_id`. A entrega é feita no melhor esforço: mantenha um
+`memory_message_list` periódico como alternativa para um evento perdido.

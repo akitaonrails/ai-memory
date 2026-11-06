@@ -284,6 +284,34 @@ não redireciona os embeddings; defina `AI_MEMORY_EMBEDDING_BASE_URL` também.
 > inicialização para esse provedor; o valor dinâmico não deve ser mascarado ou
 > duplicado.
 
+> [!TIP]
+> **O `openai-compat` também pode informar o que cada operação é.** Com
+> `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS=true` (`llm_request_metadata_headers
+> = true`), cada tentativa de chat carrega, junto ao `X-Request-Id`:
+>
+> | Cabeçalho | Valor | Enviado quando |
+> | --- | --- | --- |
+> | `x-ai-memory-workload` | `consolidation`, `profile`, `dream`, `lint`, `auto-improve`, `experience`, `bootstrap`, `query-answer`, `rerank` ou `unspecified` | sempre |
+> | `x-ai-memory-workspace` | nome do espaço de trabalho | a operação lê um espaço de trabalho |
+> | `x-ai-memory-project` | nome do projeto | a operação lê um projeto |
+> | `x-ai-memory-user` | nome de usuário | a operação age em nome de um usuário |
+>
+> Um gateway pode usá-los para atribuir custo ou aplicar um limite por carga de trabalho,
+> projeto ou usuário. Um cabeçalho que a operação não consegue nomear com um único valor é omitido,
+> nunca adivinhado: um lote de classificação de perfil que mistura frases de vários
+> operadores não envia usuário, uma resposta de `memory_query` (cujas
+> evidências abrangem projetos) não envia escopo, e a chamada de rerank envia apenas a
+> carga de trabalho. Um valor que não é um valor de cabeçalho HTTP válido (um nome de
+> projeto não ASCII, por exemplo) também é omitido. Os valores são identificadores,
+> nunca conteúdo de página. A configuração vem desativada por padrão, apenas o `openai-compat`
+> envia esses cabeçalhos (os provedores oficiais, o `opencode` e uma contingência para
+> outro provedor nunca enviam), e os quatro nomes são recusados em
+> `AI_MEMORY_LLM_HEADERS` para o `openai-compat`, com a configuração ativada ou não.
+> A configuração vale para todo o servidor: uma entrada `openai-compat` em
+> `llm_fallbacks` também envia os cabeçalhos ao próprio endpoint, portanto ative-a
+> apenas quando todo endpoint `openai-compat` que você configurar puder ver os nomes do seu
+> espaço de trabalho, projeto e usuário.
+
 ### Sondando o próprio provedor do servidor
 
 `ai-memory llm-test` compila um provedor a partir da shell em que é executado. Esse é o

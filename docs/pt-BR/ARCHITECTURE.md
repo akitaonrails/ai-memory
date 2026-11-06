@@ -281,7 +281,8 @@ a partir dos caminhos de hooks.
    o armazenamento é somente lido, e uma linha legada de `pages` para um registro contábil excluído é deixada
    para `reclaim-ledger-versions`. Uma execução de teste relata os arquivos e bytes que seriam
    excluídos (`ledgers_prunable`, `ledger_bytes_prunable`) e não exclui nada.
-   Ciclos agendados de varredura, lint baseado em regras e preenchimento retroativo opcional de embeddings
+   Ciclos agendados de varredura, lint baseado em regras, lint com LLM opcional e preenchimento
+   retroativo opcional de embeddings
    enumeram todo escopo existente de espaço de trabalho/projeto antes de executar o trabalho por projeto,
    correspondendo ao modelo de escopo abrangente de todo o armazenamento do agendador de autoaperfeiçoamento. Uma
    limpeza diária separada remove linhas de projetos com mais de uma semana apenas quando eles não contêm
@@ -422,6 +423,12 @@ mesma transação expira handoffs automáticos elegíveis mais antigos enquanto 
 manuais e de diretórios irmãos. A inserção também expira handoffs automáticos abertos anteriores
 do diretório de trabalho exato, limitando SessionEnds repetidos antes que qualquer receptor
 seja iniciado.
+Uma sessão que ainda tem um handoff aberto próprio de `memory_handoff_begin`
+termina sem baton automático, e seus checkpoints de turno não gravam nenhum;
+gravar esse handoff explícito também expira os batons automáticos abertos da própria sessão
+(#2012). O bloco de inicialização de um handoff com sessão de origem nomeia a página
+`sessions/<id>.md` dela, que a consolidação opcional em SessionEnd reescreve
+depois que o baton foi gravado.
 `GET /recap?session_id=` responde a um prompt que começa com `reload context`
 (Claude Code e Codex no envelope `UserPromptSubmit`, Grok no próximo
 `PostToolUse`, OpenCode através de seus hooks de sistema/contexto). Ele é somente leitura e
@@ -641,16 +648,16 @@ no local.
 |---|---|
 | `workspaces`, `projects` | Topo da coordenada de identidade de 3 tuplas. `projects.identity` / `identity_source` (V70, #708) mantêm a identidade de repositório pela qual um projeto é roteado (um `identity` de marcador explícito ou um remoto git normalizado, resolvido no lado do cliente), exclusivo por espaço de trabalho quando definido; vazio até que uma captura reivindique o projeto. Clientes da Fase 5 enviam explicitamente `IdentityStyle::Path` (#1033) para projetos com suporte remoto, nomeando-os a partir do caminho completo do repositório sem o host (`acme-api`), e enviam `host_path` explícito para a opção anterior à v3. A omissão no lado do servidor permanece `HostPath` porque clientes antigos omitiam esse padrão histórico; nenhum novo campo de transmissão é necessário. A criação ou promoção autorizada de captura usa esse nome canônico apenas quando nenhuma identidade com host diferente o reivindicar; caso contrário, a resolução recorre ao nome com host/compatível legado existente. V76 armazena chaves canônicas e v2-basename indexadas derivadas dessa identidade completa: leituras não criam/não renomeiam, enquanto uma escrita explícita autorizada através do nome canônico promove apenas `projects.name` na mesma transação de gravador de resolver-ou-criar e preserva o UUID. O `_meta.md` do projeto carrega a identidade/fonte completa opcional mais chaves derivadas; um reíndice limpo as valida e reconstrói a mesma pesquisa de UUID/nome/coordenada, enquanto manifestos mais antigos sem identidade permanecem válidos. Chaves ambíguas entre forges ou de múltiplos candidatos falham fechadas. Um marcador local pode, adicionalmente, enviar até 16 nomes anteriores validados como um valor de consulta de array JSON temporário `aliases`: a pesquisa permanece dentro do espaço de trabalho selecionado, exige que a identidade remota git completa com host do checkout seja igual à linha armazenada, retorna leituras sem renomeação e permite que a captura execute apenas a mesma promoção canônica autorizada que preserva o UUID. Apelidos não são armazenados e permanecem distintos no cache de roteamento de hooks. O marcador exato no home do operador pode, adicionalmente, definir blocos limitados `[routes.identity."host/path"]` e `[routes.path."absolute-or-tilde-path"]`: uma correspondência remota exata com host vence a correspondência de caminho lexical mais longa por componentes, qualquer marcador de configurações locais alcançável fora do home vence ambos, mapas de rota malformados ou ambíguos falham fechados, e campos selecionados reutilizam a transmissão de marcador existente sem alteração de servidor/esquema. `AI_MEMORY_HOME` é autoritativo para chamadores nativos; clientes portáteis usam `HOME`/`USERPROFILE`, e o Docker compara seu diretório de trabalho do host encaminhado. Consulte `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; padrão `open` / `restricted`) decide se qualquer usuário autenticado ou apenas o root, o criador (`projects.created_by`, V69) e detentores de concessões (`project_grants`, V68) o acessam, decidido por `ai_memory_store::authorize_project` (consulte `docs/users.md#per-project-access`). `projects.profile_contribute` / `profile_consume` (V74) registram as opções de exclusão de `[profile]` do marcador, encaminhadas no início da sessão; `profile_candidates`, `profile_harvest_marks` e `profile_entry_ledger` (V75) mantêm as evidências da passagem de perfil, a posição de leitura por projeto e as entradas que ele escreveu. Projetos reservados: `scratch`, `_global` (preferências compartilhadas; mantém o perfil de usuário único sob `profile/`), `_profile` (um perfil de espaço de trabalho) e `_profile.<user id>` (um perfil privado, sempre `restricted`); a captura nunca é atribuída a nenhum deles (consulte `docs/cross-project-profile.md`). |
 | `pages` | Páginas versionadas da wiki com cadeia de `is_latest` + `supersedes`. Colunas M8: `last_accessed_at`, `access_count` e marcador de lápide exclusivo de decaimento `superseded_at`. Colunas M9: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (TTL do frontmatter). V37: `salience` (NULL = `salience_default`; derivado de `page_feedback`). |
-| `pages_fts` | Tabela virtual FTS5 sobre `(title, body)`, sincronizada automaticamente por gatilhos. |
+| `pages_fts` | Tabela virtual FTS5 sobre `(title, body, path_search)` mais as grafias `title_parts` / `body_parts`, que transformam `-`/`_` em espaços (V100, #2013), de modo que um token com hífen e cada uma de suas palavras correspondam; sincronizada automaticamente por gatilhos. |
 | `pages_cjk_fts` | Índice FTS5 derivado de unigrama/bigrama sobre sequências CJK no título, corpo e caminho da página. O gravador o atualiza na transação da página; a inicialização repara linhas ausentes após um upgrade. Consultado apenas quando a consulta limitada contém Han, Kana ou Hangul. |
 | `sessions`, `observations` | Projeções sanitizadas e limitadas de hooks de ciclo de vida. `sessions.ended_observation_count` é a marca d'água de geração estável para elegibilidade de reencerramento de sessão retomada; relógios de parede não são usados para essa decisão. São uma trilha de auditoria operacional, não uma transcrição nativa completa. |
 | `session_consolidation_jobs` | Fila durável e idempotente por geração de observações para consolidação automática por LLM. Trabalhos de checkpoint PreCompact / PostCompaction são enfileirados independentemente de a sessão ter terminado (uma sessão retomada mantém `ended_at`); trabalhos opcionais de SessionEnd necessitam de uma sessão *encerrada*, e as gerações de observação ordenam os dois. Um worker de servidor limitado arrola trabalhos, repete falhas do provedor com backoff e recupera concessões expiradas após reinicialização. O worker inicia sempre que um consolidador estiver configurado; o enfileiramento de SessionEnd permanece atrás de `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`. Um `memory_consolidate` manual grava sua página fora de banda e depois reconcilia esta tabela (mudando uma linha `failed`/`pending`/`superseded` da sessão para `completed`, nunca tocando em uma concessão `running` ativa), para que o operador não veja um trabalho `failed` para uma sessão que está, de fato, consolidada. |
-| `observations_fts` | Tabela virtual FTS5 sobre `(title, body)` de observações brutas. Alimenta a contingência limitada de `raw_hits` e, através de `[retrieval] observation_stream` (ativo por padrão), o fluxo RRF de evidências de observação que vota em páginas de sessão. |
+| `observations_fts` | Tabela virtual FTS5 sobre `(title, body)` de observações brutas, com as mesmas grafias `title_parts` / `body_parts` (V100, #2013). Alimenta a contingência limitada de `raw_hits` e, através de `[retrieval] observation_stream` (ativo por padrão), o fluxo RRF de evidências de observação que vota em páginas de sessão. |
 | `observations_cjk_fts` | Complemento derivado de unigrama/bigrama para texto de observação CJK sem espaços. Segue os mesmos limites de escrita transacional, escopo, visibilidade de proprietário, contingência bruta, linha do tempo e votos de sessão que `observations_fts`. |
 | `workstreams`, `managed_runs`, `workstream_native_sessions` | Estado opcional de concessões mais cursores de entrega e origem nativa por harness para `ai-memory run`. |
 | `workstream_events`, `workstream_events_fts` | Eventos de transcrição visíveis normalizados somente de anexo e busca textual completa; lotes de origem sanitizados e imutáveis também residem sob `raw/workstreams/`. |
 | `links` | Referências cruzadas de wikilinks / markdown. `to_page_id` (um PageId global) é anulável para links diretos não resolvidos. `to_workspace` / `to_project` carregam escopo entre projetos (NULL = o próprio projeto da página de origem). |
-| `handoffs` | Registros tipados de handoff entre agentes (aberto / aceito / expirado). |
+| `handoffs` | Registros tipados de handoff entre agentes (aberto / aceito / expirado). O `manual` da V101 marca um handoff de `memory_handoff_begin`, que agora pode carregar a própria sessão do chamador (#2014); uma linha com `manual = 1` ou sem `from_session_id` é manual: abrange o projeto inteiro na correspondência de cwd, tem preferência na entrega e nunca é renovada nem varrida como baton automático. |
 | `page_embeddings` | Linhas de vetores opcionais para páginas mais recentes, com `(provider, model, dim)` desnormalizados para que a busca híbrida possa ignorar vetores obsoletos após uma mudança de configuração de embedding e relatar diagnósticos de embeddings ausentes. |
 | `page_feedback` | Sinais de `memory_feedback` somente de anexo (`helpful` / `not_helpful` / `stale` / `wrong`) indexados pela *versão* da página, com um motivo sanitizado opcional e `salience_after`. Fonte da verdade para o `pages.salience` derivado; a passagem de lint lê linhas pendentes de stale/wrong combinadas com `is_latest = 1`, de modo que uma reescrita encerra a constatação. |
 | `query_page_signals` | Associações opcionais de classificação com escopo de consulta (`[retrieval] query_signal_weight > 0`) (V98): uma linha por `(workspace, project, normalized-query hash, page version)` com o texto sanitizado da consulta (≤256 caracteres), um `signal_count` de sessões distintas e a última sessão de escrita. Gravado apenas para chamadores cientes de sessão e com autorização de escrita após leitura ou `helpful` do resultado da consulta anterior; `not_helpful` exclui a linha, `purge_session` exclui linhas que a sessão gravou por último e as FKs de projeto e página executam cascata. |
@@ -834,7 +841,7 @@ não precisa pegar carona na alteração do protocolo público.
 | `memory_patch_page` | destrutiva | Anexa atomicamente dentro de uma seção Markdown analisada ou no EOF, adiciona uma seção única de nível 2-6 ou substitui uma seção. Exige o id da página atual; a substituição também exige o hash exato da seção retornado na leitura. Todas as edições são resolvidas contra um único corpo capturado, ambiguidades/conflitos falham antes da escrita, e a página completa resultante passa por `Wiki::write_page_if`, preservando o frontmatter e os limites normais de sanitizador, admissão, atribuição, substituição, índice, reversão e checkpoint do git. A autorização de escrita em escopo existente falha fechada e não pode criar um alvo. |
 | `memory_read_session_observations` | somente leitura | Pagina através das observações brutas de hook de UMA sessão (`ObservationRecord` com corpo sanitizado completo, limitado por linha por `body_max_chars`), restrito às linhas que caíram no escopo resolvido e a sessões que o chamador pode ver; `total` e `elided_other_scope` relatam a contagem no escopo e as linhas que a sessão deixou em outro projeto. A omissão de `session_id` lê a sessão visível com o trabalho capturado mais recente além do próprio chamador, finalizada ou interrompida (`ReaderPool::recent_session_activity` ao longo de 30 dias, preferindo o diretório atual da sessão chamadora), senão a sessão visível concluída mais recente. `session_id: "current"` resolve para a própria sessão de hook do chamador quando o cliente a encaminha (`X-Memory-Actor-Session-Id`) e é recusada caso contrário (#1983). |
 | `memory_status` | somente leitura | Contagens, caminhos, versão, mais o `scope` que respondeu: `workspace`, `project` e `resolved_by` (`explicit`, `session`, `shared_slot`, `startup_seed`, `default`, `default_after_mismatch`). Leituras sem escopo resolvidas por `startup_seed` ou `default_after_mismatch` também registram um aviso no servidor. |
-| `memory_briefing` | somente leitura | Snapshot estruturado de contagens/atividade/regras/slots/recentes. Snapshots com escopo de projeto também carregam uma lista limitada `pinned` (até 10) das páginas mais recentes fixadas do projeto (`pinned = 1`, mais recente primeiro) como contexto quente permanente no SessionStart, distinto de `slots`, que é indexado pelo prefixo de caminho `_slots/`; vazio e omitido do JSON quando o projeto não possui itens fixados, de modo que o formato padrão permanece inalterado. `settled_first: true` opcional inicia com até 8 das páginas de `rule`/`decision` de maior destaque do projeto, ordenadas por contagem de evidências e depois por recência; desativado por padrão. `scope` nomeia o espaço de trabalho/projeto resumido e `resolved_by` como ele foi escolhido. `recent_sessions_limit` (1-50) define quantas sessões recentes ele lista. |
+| `memory_briefing` | somente leitura | Snapshot estruturado de contagens/atividade/regras/slots/recentes. Snapshots com escopo de projeto também carregam uma lista limitada `pinned` (até 10) das páginas mais recentes fixadas do projeto (`pinned = 1`, mais recente primeiro) como contexto quente permanente no SessionStart, distinto de `slots`, que é indexado pelo prefixo de caminho `_slots/`; vazio e omitido do JSON quando o projeto não possui itens fixados, de modo que o formato padrão permanece inalterado. `settled_first: true` opcional inicia com até 8 das páginas de `rule`/`decision` de maior destaque do projeto, ordenadas por contagem de evidências e depois por recência; desativado por padrão. `scope` nomeia o espaço de trabalho/projeto resumido e `resolved_by` como ele foi escolhido. `recent_sessions_limit` (1-50) define quantas sessões recentes ele lista. `lint`, presente depois que uma execução de lint grava `_lint/report.md` com suas contagens, informa os `warnings`, `findings`, `updated_at` do relatório e até cinco `warning_pages`; o contexto de início de sessão acrescenta uma linha apenas com a contagem quando `warnings` é diferente de zero. |
 | `memory_explore` | somente leitura | Resumo em prosa por LLM sobre o snapshot de briefing, degradando para JSON sem um provedor. Um nível `reasoning` opcional (`minimal` (padrão) / `low` / `medium` / `high` / `max`) dimensiona o orçamento de tokens máximos do resumo a partir de sua base (16.000; mesmo mapeamento de 1x/1.5x/2x/3x/4x de `memory_query`); inerte no caminho somente de briefing sem provedor, e `minimal` é idêntico byte a byte. |
 | `memory_handoff_begin` | destrutiva | Abre um handoff com escopo de proprietário para o próximo agente; `shared=true` deliberadamente o publica para o projeto. `workspace` + `project` opcional tem como alvo um espaço de trabalho/projeto irmão nomeado. |
 | `memory_handoff_list` | somente leitura | Lista handoffs abertos próprios/compartilhados com campos de corpo e identidade inspecionáveis; não reivindica nem expira. `any_owner=true` exclusivo de root recupera entre operadores. `workspace` + `project` opcional tem como alvo um espaço de trabalho/projeto irmão nomeado. |
@@ -908,7 +915,10 @@ delega chamadas de ferramentas ao servidor HTTP configurado através do transpor
 Ele usa o bearer que o `Config::load` resolveu, ou a chave de hook armazenada da instalação antes
 de uma chave root descoberta, a qual envia apenas para um servidor de loopback.
 O servidor mantém, portanto, a mesma autenticação, resolvedor de escopo e manipuladores de ferramentas que clientes
-HTTP diretos. Ele possui dois modos, escolhidos pela entrada que o inicializa:
+HTTP diretos. Sua perna a montante roda em uma revisão mais antiga do MCP, então a ponte
+restaura o campo `resultType: "complete"` que a revisão 2026-07-28 exige nos resultados de
+`tools/list` e `tools/call` que ela encaminha; o rmcp o descarta de novo para um cliente
+stdio em uma revisão mais antiga. Ele possui dois modos, escolhidos pela entrada que o inicializa:
 
 - ciente de sessão (Claude Code, `install-mcp --client claude-code
   --session-aware`, e toda entrada do Claude Code em uma instalação com arquivo de token; e
@@ -1153,6 +1163,9 @@ que toquem na área relevante.
    em toda linha de domínio desde o primeiro dia. (basic-memory #783 / #834.)
 5. **Hooks são de disparo sem espera.** Scripts de hook têm timeout rígido em
    ≤200 ms; o servidor retorna 202 imediatamente ou 429 quando saturado.
+   A única exceção é um 409 para uma sessão que o servidor já sabe estar
+   vinculada a outro agente para aquele chamador, decidido a partir de uma visão
+   em memória (`SessionAgents`) sem ida ao banco de dados (#2023).
    (agentmemory #221 / #143.) As sondagens do sistema de arquivos do roteador do diretório de trabalho de um evento
    (descoberta git, canonização) nunca rodam em um worker assíncrono: elas
    passam por `CwdProbes`, um caminho de pool bloqueante com quatro permissões e um
@@ -1238,7 +1251,7 @@ contradiction_band_max = 0.75      # (lower/upper cosine-similarity edge). The b
 
 # Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
 # override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
-# AI_MEMORY_RUN_AUTOWIRE / AI_MEMORY_CLAUDE_TRUE_YOLO).
+# AI_MEMORY_RUN_AUTOWIRE).
 capture_assistant = false          # server-side opt-in: honor a Claude Code / Codex
                                    # client's sanitized assistant-final-message marker
                                    # on Stop (#196). Client half is baked separately by
@@ -1252,13 +1265,9 @@ run_autowire = true                # `ai-memory run <harness>` auto-installs tha
                                    # hooks + MCP on first launch if missing (idempotent,
                                    # one-time per harness+version+install location).
                                    # Also `--no-autowire`.
-claude_true_yolo = false           # opt-in: on a Claude `ai-memory run --yolo`, also
-                                   # silence the residual `--dangerously-skip-permissions`
-                                   # prompts (rm timeout/confirmation, PowerShell rm deny)
-                                   # and force `bypassPermissions` via `--settings`.
-                                   # Claude-only, no-op for every other harness. Also
-                                   # `--true-yolo`. See
-                                   # docs/design-yolo-safety-ai-jail.md.
+pi_tool_exposure = "direct"        # how the generated Pi extension registers the MCP
+                                   # tools: "direct" (declared to the model) or
+                                   # "codemode" (reached through Pi's codemode tool).
 release_base_url = ""              # override the GitHub releases base URL that `ai-memory
                                    # upgrade` checks and downloads from (#801). Empty =
                                    # https://github.com/akitaonrails/ai-memory/releases.
@@ -1287,6 +1296,9 @@ enabled = true                     # master switch for the scheduled jobs below
 forget_sweep_interval_secs = 86400 # retention forget sweep; 0 disables. Cadence persists
                                    # across restarts; overdue work starts after a bounded delay
 lint_interval_secs = 86400         # rule-based wiki lint; 0 disables (same persistence)
+lint_llm_interval_secs = 0         # lint with the LLM contradiction pass; 0 = off (calls
+                                   # the lint provider; skipped with one warning without
+                                   # one). While on, the rule run keeps its findings.
 embedding_backfill_interval_secs = 0  # embedding backfill; 0 = off (may call a paid provider)
 reconcile_tombstones_deleted_pages = false
                                    # opt-in (#929/#964): the 30s reconcile pass soft-tombstones
@@ -1645,6 +1657,12 @@ AI_MEMORY_LLM_COMPAT_DISABLE_THINKING  openai-compat only, false by default; tru
 AI_MEMORY_LLM_COMPAT_STREAM optional false to request non-streaming openai-compat JSON;
                            omitted by default; true is rejected because SSE is unsupported
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
+AI_MEMORY_LLM_REQUEST_METADATA_HEADERS  openai-compat only, false by default; true adds
+                           x-ai-memory-workload to every chat attempt, plus
+                           x-ai-memory-workspace / x-ai-memory-project when the
+                           operation reads one scope and x-ai-memory-user when it
+                           acts for one username. Unknown values are omitted,
+                           never guessed; values are names, never page content
 AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT  bootstrap runs in flight at once
                            (`bootstrap_max_concurrent`); 1 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
@@ -1663,9 +1681,10 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            content-type, x-api-key, x-goog-api-key,
                            anthropic-version, anthropic-beta, openai-beta,
                            host, content-length) are refused at startup.
-                           `x-request-id` is additionally refused at
+                           `x-request-id` and the `x-ai-memory-*` request
+                           metadata names are additionally refused at
                            initialization for the `openai-compat` provider,
-                           which sends the operation's request id itself.
+                           which sends them itself.
                            Values are never logged. A header value cannot
                            contain a comma through the env var — use
                            `llm_headers = [...]` in config.toml for that.

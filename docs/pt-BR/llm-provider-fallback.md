@@ -10,8 +10,9 @@ também podem selecionar seu próprio provedor e cadeia de fallback.
 Configure uma tabela opcional `[llm.<task>]` para qualquer uma destas tarefas:
 `consolidation`, `bootstrap`, `auto_improve`, `experience`, `dream`, `lint`,
 `profile`, `rerank` e `query_answer`. O provedor de `query_answer` lida
-tanto com `memory_query(answer=true)` quanto com `memory_explore`. O lint agendado permanece
-apenas por regras.
+tanto com `memory_query(answer=true)` quanto com `memory_explore`. O lint agendado é
+apenas por regras, a menos que `[maintenance] lint_llm_interval_secs` ative a passagem com LLM,
+que usa o provedor de `lint`.
 
 ```toml
 [llm.bootstrap]

@@ -532,7 +532,10 @@ requer um título ATX de nível 2-6 como `## Decisions` e rejeita um título
 que já exista após a normalização de espaços/caixa. Edições que chegam ao
 mesmo local mantêm onde foram resolvidas na página que você leu, qualquer que seja sua ordem
 em `edits`: uma anexação à última seção permanece nessa seção, uma
-anexação em `end_of_page` a segue e novas seções vêm por último. Substituir uma
+anexação em `end_of_page` a segue e novas seções vêm por último. Assim,
+`end_of_page` é o fim da página que você leu, antes de qualquer seção que o mesmo
+lote adicione; o texto que deve vir depois de um novo título vai no `content` desse
+`add_section`. Um novo título recebe uma linha em branco antes e depois. Substituir uma
 seção também substitui as seções aninhadas nela, portanto, outra edição em uma
 delas é um destino sobreposto. Títulos duplicados, tokens de página ou seção
 desatualizados, destinos sobrepostos, falha na admissão ou um gravador simultâneo rejeitam
