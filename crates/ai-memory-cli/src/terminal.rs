@@ -7,6 +7,12 @@ use crossterm::style::{Color, Stylize as _};
 
 use crate::config::RuntimeEnv;
 
+/// Whether output to a stream should be colored: it is a terminal, `NO_COLOR`
+/// is unset, and `TERM` is not `dumb`.
+pub(crate) fn color_enabled(tty: bool, env: &RuntimeEnv) -> bool {
+    tty && env.var_os("NO_COLOR").is_none() && env.var_os("TERM").is_none_or(|term| term != "dumb")
+}
+
 pub(crate) struct Terminal {
     pub(crate) i18n: ai_memory_core::i18n::Localizer,
     color: bool,
@@ -26,9 +32,7 @@ impl Terminal {
         Self {
             i18n: ai_memory_core::i18n::Localizer::default(),
             columns: 80,
-            color: tty
-                && env.var_os("NO_COLOR").is_none()
-                && env.var_os("TERM").is_none_or(|term| term != "dumb"),
+            color: color_enabled(tty, env),
         }
     }
 

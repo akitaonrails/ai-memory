@@ -47,7 +47,7 @@ None of the competitors below has more than one or two of these; none has all.
   #16), self-hosted, with no paid tier.
 - **Reproducible retrieval benchmarks**: LongMemEval-S hit@5 0.815 local and
   0.666 zero-LLM through the shipped 2.6 pipeline, 0.951 zero-LLM and 0.945 local with the 3.0
-  observation stream (3.3.3: 0.951 and 0.943; the local mode's run-to-run
+  observation stream (3.4.0: 0.951 and 0.940; the local mode's run-to-run
   variance is tracked in #1854), and a published pipeline-vs-component decomposition
   ([`benchmarks/`](benchmarks/README.md)). Others publish numbers too (Mem0,
   Zep, Hindsight, EverOS, MemPalace, agentmemory), mostly end-to-end QA with
@@ -223,7 +223,7 @@ schedules them.
    belief-strength confidence, and the LLM dream pass), audited row-by-row in
    the borrowed-ideas table above; the design of record is
    [`design-memory-aging.md`](design-memory-aging.md).
-   MCP tool behavior hints now ship across the 25-tool surface (title plus
+   MCP tool behavior hints now ship across the 27-tool surface (title plus
    read-only/destructive/idempotent/open-world), with the runtime auth and
    scope checks remaining authoritative because annotations are untrusted
    metadata. **Still unshipped:** typed-edge **rank** weighting and a
@@ -294,7 +294,7 @@ invariants), **ALREADY** (we have it and should say so).
 | Auth on by default | SHIPPED (3.0) for new installs; requiring auth on existing loopback installs DECLINED for 2.x | Flipping existing installs would break every env-less hook and MCP config, a major change under our semver. Existing installs opt in with `ai-memory auth enable` |
 | One-command installer / onboarding | SHIPPED (3.0 Linux/macOS, 3.1 Windows) for three platforms (`install.sh`/`install.ps1` + `ai-memory setup`); the agent-driven install doc is folded in | No npm package |
 | Many-language README | DECLINE | Translations go stale on every release, and stale docs are defects under our quality bar |
-| Large speculative tool surfaces (leases, task graphs, routines, sentinels, sketches, crystals, facets; 50+ tools visible by default) | DECLINE | No evidence of real use; each tool adds prompt-surface cost; we keep 25 tools and have run leases where needed |
+| Large speculative tool surfaces (leases, task graphs, routines, sentinels, sketches, crystals, facets; 50+ tools visible by default) | DECLINE | No evidence of real use; each tool adds prompt-surface cost; we keep 27 tools and have run leases where needed |
 | Signals between agents | ALREADY | Typed cross-project messaging with exactly-once pop |
 | Mesh / P2P sync | ALREADY (3.0) via `ai-memory-wikisync` | Two-way, conflict-aware git sync over the file truth using `expected_page_id` compare-and-swap |
 | Durable capture inbox / offline spool | ALREADY | Hook spool, `ai-memory-relay`, `ai-memory recover`, 202/429 backpressure |

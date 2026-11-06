@@ -22,5 +22,5 @@ SESSION_QS=""
 
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=session-start&agent=gemini-cli${QS}" >/dev/null 2>&1 || true
-ai_memory_get_handoff "$SERVER/handoff?agent=gemini-cli${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true
+ai_memory_get_start_handoff "$PAYLOAD" "$SERVER/handoff?agent=gemini-cli${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true
 exit 0

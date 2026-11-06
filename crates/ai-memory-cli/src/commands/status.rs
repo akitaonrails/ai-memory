@@ -12,6 +12,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::hook_spool::{SpoolHealth, spool_dir, spool_health};
+use super::show::terminal_text;
 use crate::cli::StatusArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -398,7 +399,11 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
 /// completed call, and its most notable state (an open circuit takes
 /// priority over a stale last-error status).
 fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String {
-    let mut line = format!("{}/{}", candidate.provider, candidate.model);
+    let mut line = format!(
+        "{}/{}",
+        terminal_text(&candidate.provider),
+        terminal_text(&candidate.model)
+    );
     if candidate.last_selected {
         line.push_str(" (last selected)");
     }
@@ -407,7 +412,7 @@ fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String
     } else if let Some(status) = candidate.last_error_status {
         line.push_str(&format!(" — last error: status {status}"));
     } else if let Some(class) = &candidate.last_error_class {
-        line.push_str(&format!(" — last error: {class}"));
+        line.push_str(&format!(" — last error: {}", terminal_text(class)));
     }
     line
 }
@@ -548,9 +553,15 @@ fn provider_health_line(
 
 fn provider_label(role: &ProviderRoleHealthSnapshot) -> String {
     match (&role.provider, &role.model, role.dim) {
-        (Some(provider), Some(model), Some(dim)) => format!("{provider}/{model} ({dim}d)"),
-        (Some(provider), Some(model), None) => format!("{provider}/{model}"),
-        (Some(provider), None, _) => provider.clone(),
+        (Some(provider), Some(model), Some(dim)) => format!(
+            "{}/{} ({dim}d)",
+            terminal_text(provider),
+            terminal_text(model)
+        ),
+        (Some(provider), Some(model), None) => {
+            format!("{}/{}", terminal_text(provider), terminal_text(model))
+        }
+        (Some(provider), None, _) => terminal_text(provider),
         _ => "provider".to_string(),
     }
 }
@@ -566,7 +577,7 @@ fn error_detail(
     if let Some(message) = &role.last_error_message
         && !message.is_empty()
     {
-        parts.push(message.clone());
+        parts.push(terminal_text(message));
     }
     if let Some(when) = &role.last_error_at {
         parts.push(i18n.one("cli-status-last-error", when));

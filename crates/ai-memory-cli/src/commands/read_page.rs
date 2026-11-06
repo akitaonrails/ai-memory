@@ -13,6 +13,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::ReadPageArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
@@ -114,14 +115,17 @@ pub async fn run(config: &Config, args: ReadPageArgs) -> Result<()> {
 fn render_text(i18n: &ai_memory_core::i18n::Localizer, page: &PageContent) -> String {
     let mut out = String::new();
     if let Some(title) = &page.title {
-        out.push_str(&format!("# {title}\n"));
+        out.push_str(&format!("# {}\n", terminal_text(title)));
     }
-    out.push_str(&i18n.format("cli-read-page-path", &[("value0", page.path.to_string())]));
+    out.push_str(&i18n.format(
+        "cli-read-page-path",
+        &[("value0", terminal_text(&page.path))],
+    ));
     if page.expired {
         out.push_str(&i18n.text("cli-read-page-expired-true"));
     }
     out.push('\n');
-    out.push_str(&page.body);
+    out.push_str(&terminal_body(&page.body));
     if !page.body.ends_with('\n') {
         out.push('\n');
     }

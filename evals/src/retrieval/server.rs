@@ -49,6 +49,9 @@ pub struct LaunchConfig<'a> {
     pub embeddings: EvalEmbeddings,
     /// When `embeddings == Local`, the models root to seed the server from.
     pub models_root: Option<&'a std::path::Path>,
+    /// Document-embedding cache root (`AI_MEMORY_EVAL_EMBEDDING_CACHE_DIR`),
+    /// `None` for a cold run.
+    pub embedding_cache: Option<&'a std::path::Path>,
     /// Turn the post-RRF reranker on (`AI_MEMORY_RERANKER=llm`). Requires
     /// an LLM provider to be supplied through `env` — the harness does not
     /// configure one, so a bare `reranker=true` with no provider is a no-op
@@ -126,6 +129,12 @@ impl EvalServer {
                 cmd.env("AI_MEMORY_EMBEDDING_PROVIDER", "local");
             }
         }
+        // Eval-only server hook: reuse haystack document vectors across runs.
+        // An inherited value would silently warm a run meant to be cold.
+        match config.embedding_cache {
+            Some(root) => cmd.env("AI_MEMORY_EVAL_EMBEDDING_CACHE_DIR", root),
+            None => cmd.env_remove("AI_MEMORY_EVAL_EMBEDDING_CACHE_DIR"),
+        };
         if config.reranker {
             // Only `llm` is a supported reranker; it needs a provider,
             // which the config must supply via `env`.

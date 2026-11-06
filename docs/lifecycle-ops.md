@@ -12,6 +12,7 @@ on a homelab box where mistakes are harder to undo.
 | `purge-session --session-id --confirm` | ✅ yes | the one session's data, **plus** any observation stamped into a different project by this session (cascades regardless of the observation's own `project_id`), and it nulls (does not delete) the session reference on any handoff in a different project that this session authored or accepted | no | Deletes one session by UUID: its row, its observations, the handoffs it **authored**, its `sessions/<id>.md` page and every superseded version, their embeddings, and its auto-improve runs. Strictly scoped: a session that does not belong to the named workspace/project is a `404` and nothing is deleted. Handoffs the session only *accepted* are kept: that text belongs to the session that wrote it. Logical delete by default; `--compact` additionally rebuilds the FTS indexes and `VACUUM`s (see below). Without `--confirm` it previews the same counts, including the cross-project ones, before refusing (see below). |
 | `handoffs --expire-all --confirm` | ✅ yes | no (state change only) | no (but nothing is destroyed) | Marks every **open** handoff in the scope `expired` so it stops being offered to an agent. Rows, summaries and provenance are kept and stay visible in the audit log. Unlike the automatic sweep it does **not** spare manual handoffs or ones from another directory. A leftover backlog is made of exactly those, so honouring the exemptions would clear nothing. `--older-than-days N` keeps recent batons. Owner-scoped: never touches another user's baton. |
 | `rename-project --from --to` | ✅ yes | no | yes (rename back) | Column-only update on `projects.name`. The on-disk dir is keyed by `project_id` (UUID), so the rename never moves a file. |
+| `repair-split --project-id --from-project-id` | ✅ yes | no | partly (rename back; the identity stays moved) | Moves an empty project's repository identity onto the project holding the checkout's sessions and archives the empty one (#1993). Refuses when the empty one has sessions, pages or a live run. |
 | `/admin/rename-workspace` | ✅ yes | no | yes (rename back) | Column-only update on `workspaces.name`; refreshes `_meta.md` scope manifests and checkpoints the wiki tree. |
 | `/admin/delete-workspace` | ✅ yes | the workspace and every child project, **plus** any observation stamped into a different workspace by one of this workspace's sessions (cascades regardless of the observation's own `workspace_id`), and it nulls (does not delete) the session reference on any handoff in a different workspace that this workspace's sessions authored or accepted | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. Logical delete by default; `"compact": true` additionally rebuilds the FTS indexes and `VACUUM`s (see below). `"dry_run": true` previews the same counts, including the cross-workspace ones, without deleting anything (see below). |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate.  An existing same-named destination project makes this a **copy+purge merge**, which deletes the source's sessions, observations, handoffs and older page versions: it now needs `--allow-lossy-merge` as well, and without it the server answers `409` naming the counts it would discard (#1713). |
@@ -1087,6 +1088,14 @@ Failure modes:
   pre-restore checkpoint remains as an audit breadcrumb.
 - **Page-version UUID is malformed** → 400 before a checkpoint or mutation.
 - **Page version is absent or belongs to another project/path** → 404.
+- **Session summary belongs to a purged session** → 409 for either source;
+  no page row is added and any newly installed file is removed. Legacy
+  summaries without `session_id` are also refused unless a live manual
+  replacement survives at that path. A live current manual page remains
+  restorable. An older retained manual version alone does not authorize a
+  restore: without a live replacement, it cannot be distinguished from a
+  legacy summary without `session_id` (#701). MCP `memory_restore_page`
+  applies the same guard to its checkpoint restores.
 - **Historical markdown is malformed or non-UTF-8** → 500, live file is not
   replaced.
 - **SQLite rejects the restored version** (for example, the historical path
@@ -1118,10 +1127,19 @@ before anything is written. Other frontmatter keys are not carried over.
 Scope is resolved once, without creating anything, and the listing, the read
 and the write all use that one project.
 
+Before writing, `memory_restore_page` checks the checkpoint's original
+frontmatter, including `session_id`, against the session-purge tombstone.
+A purged session summary is refused with an invalid-parameters error,
+leaving disk, index and git unchanged. A live current manual page at the
+same path remains restorable; an older retained manual version without a
+live replacement is refused because it is indistinguishable from a legacy
+summary without `session_id`. Listing checkpoints and reading history stay
+available to admins.
+
 Who may call it: an admin, the same authority as `/admin/restore-page`. Git
 history keeps every version the live wiki dropped, including pages a root
 deleted, pages a session purge removed and expired pages the forget sweep
-hard-deleted, so listing names them and restoring brings their text back. A DB
+hard-deleted, so listing can name text that a restore must refuse. A DB
 user or proxied operator is refused for both, even on a project they can write
 and even for their own per-user slot. On a server that tells no operators
 apart (anonymous loopback, or a root bearer with no users) the caller is root

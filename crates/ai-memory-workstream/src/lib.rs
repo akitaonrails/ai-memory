@@ -2,6 +2,7 @@
 
 mod harness;
 mod jail;
+mod jail_contract;
 mod repository;
 mod transcript;
 
@@ -15,11 +16,16 @@ pub use harness::{
     omp_profile_flag, omp_profile_flag_env, store_override_vars,
 };
 pub use jail::{
-    FORWARDED_ENV_NAMES, JAIL_TOGGLES, JailChecklistItem, JailEnv, JailHostFacts, JailOs,
+    FORWARDED_ENV_NAMES, JAIL_TOGGLES, JailChecklistItem, JailEnv, JailHostFacts, JailOs, JailRisk,
     JailSupport, JailToggle, JailToggleChoice, JailToggleError, JailToggleKind, ai_jail_support,
-    build_ai_jail_invocation, checked_choices, current_jail_os, inside_ai_jail,
-    inside_ai_jail_here, jail_checklist, jail_toggle, marked_choices, parse_jail_toggles,
-    usable_ai_jail, usable_ai_jail_here,
+    build_ai_jail_invocation, checked_choices, checklist_reason, current_jail_os, inside_ai_jail,
+    inside_ai_jail_here, jail_checklist, jail_spec, jail_toggle, marked_choices,
+    parse_jail_toggles, usable_ai_jail, usable_ai_jail_here,
+};
+pub use jail_contract::{
+    JailContract, JailRefusal, JailStatus, ServerReach, ai_jail_contract, ai_jail_harness_name,
+    contract_flags, contract_invocation, contract_status_invocation, harness_env_names,
+    parse_capabilities, parse_status, server_reach, status_refusal,
 };
 pub use repository::{
     RepositoryFingerprints, RepositoryIdentity, inspect_repository, inspect_repository_fingerprints,

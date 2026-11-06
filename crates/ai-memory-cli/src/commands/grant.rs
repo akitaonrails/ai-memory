@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::{ProjectGrantsArgs, UserGrantArgs, UserGrantsArgs, UserRevokeArgs};
 use crate::commands::user::url_encode;
 use crate::http_client::{ServerEndpoint, get_json, post_json};
@@ -67,14 +68,16 @@ fn write_grants(
     let project_w = grants
         .iter()
         .map(|g| {
-            unicode_width::UnicodeWidthStr::width(format!("{}/{}", g.workspace, g.project).as_str())
+            unicode_width::UnicodeWidthStr::width(
+                terminal_text(&format!("{}/{}", g.workspace, g.project)).as_str(),
+            )
         })
         .max()
         .unwrap_or(7)
         .max(7);
     let user_w = grants
         .iter()
-        .map(|g| unicode_width::UnicodeWidthStr::width(g.username.as_str()))
+        .map(|g| unicode_width::UnicodeWidthStr::width(terminal_text(&g.username).as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
@@ -92,9 +95,9 @@ fn write_grants(
         writeln!(
             out,
             "{}  {}  {}",
-            pad_cell(&project, project_w),
-            pad_cell(&g.username, user_w),
-            g.level
+            pad_cell(&terminal_text(&project), project_w),
+            pad_cell(&terminal_text(&g.username), user_w),
+            terminal_text(&g.level)
         )?;
     }
     Ok(())
@@ -189,7 +192,7 @@ pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
                 "cli-grant-who-already-holds-on-project-nothing-changed",
                 &[
                     ("value0", who.to_string()),
-                    ("value1", resp.level.to_string()),
+                    ("value1", terminal_text(&resp.level)),
                     ("value2", project.to_string())
                 ]
             )
@@ -200,8 +203,8 @@ pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
                 "cli-grant-who-previous-on-project",
                 &[
                     ("value0", who.to_string()),
-                    ("value1", previous.to_string()),
-                    ("value2", resp.level.to_string()),
+                    ("value1", terminal_text(&previous)),
+                    ("value2", terminal_text(&resp.level)),
                     ("value3", project.to_string())
                 ]
             )
@@ -212,7 +215,7 @@ pub async fn grant(ep: &ServerEndpoint, args: &UserGrantArgs) -> Result<()> {
                 "cli-grant-who-now-holds-on-project",
                 &[
                     ("value0", who.to_string()),
-                    ("value1", resp.level.to_string()),
+                    ("value1", terminal_text(&resp.level)),
                     ("value2", project.to_string())
                 ]
             )

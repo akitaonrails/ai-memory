@@ -9,6 +9,7 @@ use ai_memory_core::{ListManagedWorkstreamsRequest, ManagedWorkstreamSummary};
 use ai_memory_workstream::inspect_repository_fingerprints;
 use anyhow::{Context as _, Result};
 
+use super::show::terminal_text;
 use crate::cli::WorkstreamsArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -234,7 +235,7 @@ fn render_human(
         let _ = writeln!(
             output,
             "{marker} {}  {}  [{}]",
-            summary.name,
+            terminal_text(&summary.name),
             humanize_age(i18n, &summary.last_active_at),
             harnesses,
         );

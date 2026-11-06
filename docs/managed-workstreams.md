@@ -1431,6 +1431,41 @@ to seed the new managed workstream. Keep the old checkout path available until
 recovery is verified. Automatic discovery intentionally requires the recorded
 checkout to match exactly.
 
+### A repository that gained its remote after capture began
+
+A project's name comes from the git remote, or from the folder name when the
+checkout has no remote. Sessions captured before the remote was added stay in
+the folder-named project, while `ai-memory run` resolves the remote-derived
+one, so resuming one of those sessions cannot link it to the run. The server
+refuses the link with the `native_session_in_other_project` conflict, which
+names both projects (only for the operator and harness that recorded the
+session).
+
+When the folder-named project is the remote-derived project's old name and
+the remote-derived project has no sessions or pages yet, the repair loses
+nothing. The server moves the repository identity from the empty project onto
+the folder-named one, gives it the remote-derived name, and keeps the empty
+project as `<name>-split-<date>`. The project id stays, so sessions,
+observations and pages follow, and identity-based capture and later launches
+reach them. This client's checkout links and saved project binding are
+re-pointed too.
+
+On a terminal, `ai-memory run` explains this and offers the repair (default
+yes), then starts the session again. Closing the prompt's input without an
+answer cancels it; pressing Enter accepts the default. Off a terminal it stops
+before the agent starts and prints the command:
+
+```
+ai-memory repair-split --workspace <ws> --project-id <folder project id> \
+  --from-project-id <remote project id>
+```
+
+The same command repairs a pair that was renamed by hand, where renaming
+alone left the identity on the archived project. It refuses when the
+remote-derived project holds its own sessions or pages, or a managed run is
+still active in it, because joining them would hide data. Compare the two
+projects first ([lifecycle operations](lifecycle-ops.md)).
+
 ## Manual acceptance
 
 The opt-in acceptance runner exercises launcher edge cases and then orchestrates

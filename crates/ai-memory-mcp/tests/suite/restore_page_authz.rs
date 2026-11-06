@@ -2,11 +2,11 @@
 //!
 //! Git keeps every version the live wiki dropped: a page a root deleted, a
 //! session purge removed, an expired page the forget sweep hard-deleted. The
-//! tool's listing names those versions and a restore brings their text back,
-//! so both carry the authority of root-only `/admin/restore-page`. These tests
-//! drive the real `require_bearer` middleware with real `aim_` DB-user tokens
-//! and the trusted-proxy rung, attempt each bypass, and keep a root control
-//! beside every refusal so a blanket deny cannot pass for the guard.
+//! tool's listing names those versions; restoring refuses purged session
+//! summaries. Both carry the authority of root-only `/admin/restore-page`.
+//! These tests drive the real `require_bearer` middleware with real `aim_`
+//! DB-user tokens and the trusted-proxy rung, attempt each bypass, and keep a
+//! root control beside every refusal so a blanket deny cannot pass for the guard.
 
 use ai_memory_core::{ActorContext, ApiCredentialId, NewUser, ProjectId, UserRole};
 use ai_memory_mcp::AiMemoryServer;

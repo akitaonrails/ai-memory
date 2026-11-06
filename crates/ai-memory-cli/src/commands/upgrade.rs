@@ -327,6 +327,15 @@ fn container_refusal() -> Option<String> {
 }
 
 fn package_managed_refusal(exe: &Path) -> Option<String> {
+    // Scoop's bucket manifest owns the version under `apps\ai-memory\`; a
+    // self-replace there would be undone or orphaned by the next
+    // `scoop update`, and `scoop cleanup` deletes old version directories.
+    if crate::install_layout::is_scoop_app_path(exe, crate::install_layout::SCOOP_APP_NAME) {
+        return Some(format!(
+            "refusing to self-upgrade a Scoop install at {}; run `scoop update ai-memory` instead",
+            exe.display()
+        ));
+    }
     let path_str = exe.to_string_lossy();
     for prefix in package_managed_prefixes() {
         if path_str.starts_with(prefix) {
@@ -1469,6 +1478,26 @@ mod tests {
     fn homebrew_is_package_managed() {
         let exe = Path::new("/opt/homebrew/bin/ai-memory");
         assert!(package_managed_refusal(exe).is_some());
+    }
+
+    #[test]
+    fn scoop_install_is_package_managed_with_the_scoop_command() {
+        for exe in [
+            "/Users/me/scoop/apps/ai-memory/3.4.0/ai-memory.exe",
+            "/Users/me/scoop/apps/ai-memory/current/ai-memory.exe",
+            "/ProgramData/scoop/apps/ai-memory/3.4.0/ai-memory.exe",
+        ] {
+            let reason = package_managed_refusal(Path::new(exe)).expect(exe);
+            assert!(reason.contains("scoop update ai-memory"), "{reason}");
+        }
+        // Control: a user-owned install and another Scoop app's directory are
+        // not refused as Scoop installs.
+        for exe in [
+            "/Users/me/.local/bin/ai-memory",
+            "/Users/me/scoop/apps/other-tool/1.0/ai-memory.exe",
+        ] {
+            assert!(package_managed_refusal(Path::new(exe)).is_none(), "{exe}");
+        }
     }
 
     #[test]

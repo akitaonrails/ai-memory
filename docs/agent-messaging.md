@@ -75,7 +75,8 @@ may claim the message; the recipient project must have a session recorded for
 it. Omit `to_agent` for shared project mail. The MCP tool accepts the sender's
 own project as the recipient too. Static MCP clients can set `from_agent` when
 the caller's session does not record its harness; a recorded session takes
-precedence.
+precedence, but only one that belongs to the sending project (and, on a
+multi-user server, to the calling operator). Any other session id is ignored.
 
 **In Claude (project B), receiving:**
 

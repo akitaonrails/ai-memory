@@ -915,6 +915,7 @@ impl CapturePolicy {
                     Some(paths)
                         if paths
                             .iter()
+                            .chain(&extracted.readings)
                             .any(|path| normalize_candidate(path, cwd).is_none()) =>
                     {
                         (
@@ -923,17 +924,26 @@ impl CapturePolicy {
                         )
                     }
                     Some(paths) => {
+                        // An OMP path's other readings are candidates too.
+                        let with_readings;
+                        let candidates: &[String] = if extracted.readings.is_empty() {
+                            paths
+                        } else {
+                            with_readings =
+                                [paths.as_slice(), extracted.readings.as_slice()].concat();
+                            &with_readings
+                        };
                         let matched = if extracted.globs {
                             self.match_globs(paths, cwd)
                         } else {
-                            self.match_paths(paths, cwd)
+                            self.match_paths(candidates, cwd)
                         };
                         // A harness's saved copy of an earlier tool's output
                         // is read back like `BashOutput`; past the budget
                         // that check proves nothing either.
                         let spooled = || -> Result<bool, ()> {
                             let mut work = 0_usize;
-                            for path in paths {
+                            for path in candidates {
                                 let readings = if extracted.globs {
                                     normalize_readings(path, cwd).ok().flatten()
                                 } else {
@@ -1284,6 +1294,10 @@ fn hook_tool_call(agent: AgentKind, name: &str, args: Value) -> (&str, Value) {
 struct Extracted<'a> {
     family: ToolFamily,
     paths: Option<Vec<String>>,
+    /// The other files an OMP path can name ([`omp_path_readings`]). The
+    /// call's own decision reads them beside `paths`; the call still names
+    /// only its `paths`.
+    readings: Vec<String>,
     /// A shell tool's command, not yet split into words.
     command: Option<ShellCommand<'a>>,
     /// A command-running tool, even when its command is unreadable.
@@ -1399,6 +1413,25 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
             })
         })
         .flatten();
+    // An OMP or Pi path that has more readings than the bound proves
+    // nothing, like an unreadable candidate.
+    let readings = match (&paths, agent) {
+        (Some(paths), AgentKind::Omp) => omp_path_readings(
+            paths,
+            OMP_PATH_TOOL_NAMES.contains(&name.to_ascii_lowercase().as_str()),
+        ),
+        (Some(paths), AgentKind::Pi) => Some(
+            paths
+                .iter()
+                .filter_map(|path| pi_expand_path(path))
+                .collect(),
+        ),
+        _ => Some(Vec::new()),
+    };
+    let (paths, readings) = match readings {
+        Some(readings) => (paths, readings),
+        None => (None, Vec::new()),
+    };
     let command = (family == ToolFamily::NonFile)
         .then(|| {
             args.and_then(|value| {
@@ -1469,6 +1502,7 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
     Extracted {
         family,
         paths,
+        readings,
         command,
         shell,
         workdir,
@@ -1800,6 +1834,16 @@ pub const OUTPUT_READER_TOOL_NAMES: &[&str] = &[
     "write_powershell",
 ];
 
+/// OMP tools whose `path` can name a file through a suffix, per the tool
+/// prompts OMP gives the model: a `read` line selector (`notes.txt:450-455`,
+/// `:-5`, `:raw`, `:conflicts`), executable view (`bin:main`), video time or
+/// JSON/SQLite query (`data.json?q=.x`), and a `read` or `write` archive
+/// member (`archive.zip:dir/file`) or SQLite table or row (`app.db:users:42`)
+/// (OMP v18.16.0,
+/// <https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/prompts/tools/read.md>
+/// and `write.md` beside it). [`omp_path_readings`] reads them.
+pub const OMP_PATH_TOOL_NAMES: &[&str] = &["read", "write"];
+
 fn family(name: &str) -> ToolFamily {
     let name = name.to_ascii_lowercase();
     let name = name.as_str();
@@ -2001,23 +2045,30 @@ pub fn capture_lookup_locations(
     raw: &Value,
     cwd: &str,
     home: Option<&str>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<LookupLocation>> {
     let extracted = extract(agent, raw);
-    let mut seen = std::collections::HashSet::new();
-    let mut locations = Vec::new();
-    let mut push = |candidate: Option<Normalized>| -> Option<()> {
+    let mut seen = std::collections::HashMap::new();
+    let mut locations: Vec<LookupLocation> = Vec::new();
+    let mut push = |candidate: Option<Normalized>, literal: LiteralGroups| -> Option<()> {
         let Some(candidate) = candidate else {
             return Some(());
         };
-        let location = native_path(candidate);
-        if seen.insert(location.clone()) {
-            if locations.len() == MAX_LOOKUP_LOCATIONS {
-                return None;
-            }
-            locations.push(location);
+        let path = native_path(candidate);
+        if let Some(&index) = seen.get(&path) {
+            // Spelled twice, the location reads as syntax wherever either
+            // spelling does.
+            let location: &mut LookupLocation = &mut locations[index];
+            location.literal = location.literal.and(literal);
+            return Some(());
         }
+        if locations.len() == MAX_LOOKUP_LOCATIONS {
+            return None;
+        }
+        seen.insert(path.clone(), locations.len());
+        locations.push(LookupLocation { path, literal });
         Some(())
     };
+    let syntax = LiteralGroups::default();
     // Every reading of a glob whose `..` follows a `**` ([`normalize_readings`]).
     let readings = |path: &str, base: &str| normalize_readings(path, base).ok();
     match (extracted.family, extracted.command.as_ref()) {
@@ -2028,7 +2079,7 @@ pub fn capture_lookup_locations(
                 .or(extracted.patch_paths.as_ref())?;
             for path in paths {
                 for candidate in readings(path, cwd)?? {
-                    push(Some(candidate))?;
+                    push(Some(candidate), syntax)?;
                 }
             }
         }
@@ -2038,7 +2089,7 @@ pub fn capture_lookup_locations(
             for root in &scope.roots {
                 for root in readings(root, cwd)?? {
                     roots.push(native_path(root.clone()));
-                    push(Some(root))?;
+                    push(Some(root), syntax)?;
                 }
             }
             if roots.is_empty() {
@@ -2049,7 +2100,7 @@ pub fn capture_lookup_locations(
             for pattern in scope.patterns.iter().filter(|p| p.contains(['/', '\\'])) {
                 for root in &roots {
                     for candidate in readings(pattern, root)?? {
-                        push(Some(candidate))?;
+                        push(Some(candidate), syntax)?;
                     }
                 }
             }
@@ -2059,15 +2110,25 @@ pub fn capture_lookup_locations(
                 return None;
             }
             let base = command_base(extracted.workdir.as_deref(), cwd);
-            push(normalize_candidate(&base, &base))?;
+            push(normalize_candidate(&base, &base), syntax)?;
             let home = home.and_then(|dir| normalize_root(dir).ok());
             let split = command.split(extracted.powershell || flavor_of(cwd) == Flavor::Windows);
-            for (word, tilde) in split.words.iter().chain(&split.expanded) {
+            let words = split.words.iter().map(|(word, tilde)| {
+                let literal = split.literal.get(word).copied().unwrap_or_default();
+                (word, *tilde, literal)
+            });
+            let expanded = split
+                .expanded
+                .iter()
+                .map(|(word, tilde)| (word, *tilde, syntax));
+            for (word, tilde, literal) in words.chain(expanded) {
                 for (argument, _) in shell_arguments(word) {
-                    let expanded = expand_tilde(argument, *tilde, home.as_deref(), &base);
-                    if expanded.contains(['/', '\\']) {
-                        for candidate in readings(&expanded, &base)?.into_iter().flatten() {
-                            push(Some(candidate))?;
+                    let expanded = expand_tilde(argument, tilde, home.as_deref(), &base);
+                    for (text, literal) in quoted_brace_readings(expanded, literal) {
+                        if text.contains(['/', '\\']) {
+                            for candidate in readings(&text, &base)?.into_iter().flatten() {
+                                push(Some(candidate), literal)?;
+                            }
                         }
                     }
                 }
@@ -2076,6 +2137,67 @@ pub fn capture_lookup_locations(
         _ => {}
     }
     Some(locations)
+}
+
+/// A location [`capture_lookup_locations`] names, and which of its glob
+/// syntax is text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupLocation {
+    /// The absolute location, in its own separator style.
+    pub path: String,
+    literal: LiteralGroups,
+}
+
+impl LookupLocation {
+    /// How to follow the location ([`glob_walk`]), reading a group or brace
+    /// its shell word quoted as text.
+    #[must_use]
+    pub fn walk(&self) -> GlobWalk {
+        glob_walk_with(&self.path, self.literal)
+    }
+}
+
+/// Which groups (`(`…`)`) and braces (`{`…`}`) of a location are text rather
+/// than glob syntax: those a shell word quoted. A shell expands neither
+/// inside quotes, so an unbalanced one there cannot span a separator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiteralGroups {
+    parens: bool,
+    braces: bool,
+}
+
+impl LiteralGroups {
+    /// Text only where both readings say so.
+    fn and(self, other: Self) -> Self {
+        Self {
+            parens: self.parens && other.parens,
+            braces: self.braces && other.braces,
+        }
+    }
+}
+
+/// `text`, and when its braces are quoted text that still lists
+/// alternatives (`'{a/x,b}'`), each alternative too: a program that globs
+/// its argument itself (`rg -g`, `fd`) expands them, so the lookup follows
+/// each one. Past [`MAX_BRACE_ALTERNATIVES`] the braces read as syntax again.
+fn quoted_brace_readings(text: String, literal: LiteralGroups) -> Vec<(String, LiteralGroups)> {
+    if !literal.braces || !text.contains('{') {
+        return vec![(text, literal)];
+    }
+    match brace_alternatives(&text) {
+        Some(alternatives) if alternatives.len() > 1 => std::iter::once(text)
+            .chain(alternatives)
+            .map(|reading| (reading, literal))
+            .collect(),
+        Some(_) => vec![(text, literal)],
+        None => vec![(
+            text,
+            LiteralGroups {
+                braces: false,
+                ..literal
+            },
+        )],
+    }
 }
 
 /// Where a search/list tool reads: see [`Extracted::search_scope`].
@@ -2255,9 +2377,18 @@ pub fn glob_segment_matches(segment: &str, name: &str) -> bool {
 /// only ever adds directories.
 #[must_use]
 pub fn glob_walk(location: &str) -> GlobWalk {
+    glob_walk_with(location, LiteralGroups::default())
+}
+
+/// [`glob_walk`], reading the groups and braces `literal` names as text.
+fn glob_walk_with(location: &str, literal: LiteralGroups) -> GlobWalk {
     // A parameter expansion's braces are not a brace expansion; the shell
     // split also reads the word with each default in its place.
-    let syntax = |segment: &str| segment.contains(['*', '?', '[', '{', '(']);
+    let syntax = |segment: &str| {
+        segment.contains(['*', '?', '['])
+            || (!literal.braces && segment.contains('{'))
+            || (!literal.parens && segment.contains('('))
+    };
     if location.contains("${") || !syntax(location) {
         return GlobWalk::Literal;
     }
@@ -2303,7 +2434,8 @@ pub fn glob_walk(location: &str) -> GlobWalk {
                 .any(|piece| piece == ".." || piece.starts_with('~'))
         };
         let leaves = leaves_at(segment)
-            || (segment.contains('{')
+            || (!literal.braces
+                && segment.contains('{')
                 && match brace_alternatives(segment) {
                     Some(alternatives) => alternatives.iter().any(|alternative| {
                         alternative.contains(['/', '\\'])
@@ -2312,7 +2444,10 @@ pub fn glob_walk(location: &str) -> GlobWalk {
                     }),
                     None => brace_overflow_could_leave(segment),
                 });
-        if leaves || !balanced('{', '}') || !balanced('(', ')') {
+        if leaves
+            || (!literal.braces && !balanced('{', '}'))
+            || (!literal.parens && !balanced('(', ')'))
+        {
             return GlobWalk::Unprovable;
         }
         if segment.contains("**") {
@@ -2614,6 +2749,121 @@ fn direct_paths(object: &Map<String, Value>) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
+/// The other files an [`OMP_PATH_TOOL_NAMES`] path can name: every part of it
+/// before a `:` or `?`. OMP reads a literal file of the full name when one
+/// exists and otherwise the part before the selector, archive member, table
+/// or query, so each part is a candidate and the stricter decision wins:
+/// `secrets.env:1-20` reads `secrets.env`. A Windows root prefix's `?` and
+/// `:` end no part ([`windows_prefix_len`]). Each part, and the path itself,
+/// is also read as OMP's `expandPath` opens it ([`omp_expand_path`]), so
+/// `:/repo/secrets.env:1-20` reads `/repo/secrets.env`; any other OMP file
+/// tool (`edit`) resolves its path the same way but takes no suffix, so
+/// without `suffixes` only the path itself is expanded. `None` past
+/// [`MAX_CAPTURE_CANDIDATES`] readings, which proves nothing.
+fn omp_path_readings(paths: &[String], suffixes: bool) -> Option<Vec<String>> {
+    let mut readings = Vec::new();
+    let mut add = |reading: String| {
+        if readings.len() == MAX_CAPTURE_CANDIDATES {
+            return None;
+        }
+        readings.push(reading);
+        Some(())
+    };
+    for path in paths {
+        let root = windows_prefix_len(path).max(1);
+        for (index, c) in path.char_indices() {
+            if !suffixes || index < root || !matches!(c, ':' | '?') {
+                continue;
+            }
+            let part = &path[..index];
+            add(part.to_owned())?;
+            if let Some(expanded) = omp_expand_path(part) {
+                add(expanded)?;
+            }
+        }
+        // Last, so the file index tries the whole expanded name first.
+        if let Some(expanded) = omp_expand_path(path) {
+            add(expanded)?;
+        }
+    }
+    Some(readings)
+}
+
+/// The path OMP opens for `path` when `expandPath` rewrites it (OMP v18.16.0,
+/// <https://github.com/can1357/oh-my-pi/blob/v18.16.0/packages/coding-agent/src/tools/path-utils.ts>):
+/// a stray leading `:` before a path shape (`:/x`, `:./x`, `:../x`, `:~`,
+/// `:C:`) is dropped, then a leading `@` before an absolute path or `~`
+/// (`@/x`, `@C:\x`, `@~/x`), then a `file://` URL is read as its path. `~`
+/// itself is not expanded, a residual docs/marker-file.md lists. `None` when
+/// nothing changes.
+fn omp_expand_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let colon_shape = |rest: &str| {
+        let rest = rest.as_bytes();
+        matches!(rest.first(), Some(b'/' | b'\\' | b'~'))
+            || matches!(
+                rest,
+                [b'.', b'/' | b'\\', ..] | [b'.', b'.', b'/' | b'\\', ..]
+            )
+            || matches!(rest, [drive, b':', ..] if drive.is_ascii_alphabetic())
+    };
+    let mut expanded = if bytes.first() == Some(&b':') && colon_shape(&path[1..]) {
+        &path[1..]
+    } else {
+        path
+    };
+    if let Some(rest) = expanded.strip_prefix('@')
+        && (matches!(rest.as_bytes().first(), Some(b'/' | b'\\'))
+            || rest == "~"
+            || rest.starts_with("~/")
+            || is_absolute(rest))
+    {
+        expanded = rest;
+    }
+    let expanded = file_url_reading(expanded);
+    (expanded != path).then_some(expanded)
+}
+
+/// The path Pi opens for a `read`, `write` or `edit` path when its
+/// `normalizePath` rewrites it (pi-mono v1.5.0,
+/// <https://github.com/badlogic/pi-mono/blob/v1.5.0/packages/coding-agent/src/utils/paths.ts>):
+/// any leading `@` is dropped, then a `file://` URL is read as its path. `~`
+/// is not expanded, as for OMP. `None` when nothing changes.
+fn pi_expand_path(path: &str) -> Option<String> {
+    let expanded = file_url_reading(path.strip_prefix('@').unwrap_or(path));
+    (expanded != path).then_some(expanded)
+}
+
+/// A `file://` URL's path ([`file_url_path`]), else `path` itself.
+fn file_url_reading(path: &str) -> String {
+    if path
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file://"))
+    {
+        file_url_path(path).unwrap_or_else(|| path.to_owned())
+    } else {
+        path.to_owned()
+    }
+}
+
+/// How many leading bytes of `path` are a Windows root prefix: a device
+/// prefix (`\\?\`, `\\.\`), a drive (`C:`), or both (`\\?\C:`). A path whose
+/// second character is a colon is drive-relative to the matcher on every host
+/// ([`is_drive_relative`]), which fails closed, so a POSIX `x:1-5` loses no
+/// reading either.
+fn windows_prefix_len(path: &str) -> usize {
+    let bytes = path.as_bytes();
+    let device = bytes.len() >= 4
+        && matches!(bytes[0], b'\\' | b'/')
+        && matches!(bytes[1], b'\\' | b'/')
+        && matches!(bytes[2], b'?' | b'.')
+        && matches!(bytes[3], b'\\' | b'/');
+    let start = if device { 4 } else { 0 };
+    let drive = bytes.get(start).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(start + 1) == Some(&b':');
+    if drive { start + 2 } else { start }
+}
+
 /// Meta Muse Code's memory tools (Muse Code 1.4.7).
 const MUSE_MEMORY_TOOL_NAMES: [&str; 3] = ["read_memory", "add_memory", "edit_memory"];
 
@@ -2716,6 +2966,9 @@ enum ShellCommand<'a> {
 #[derive(Default)]
 struct ShellWords {
     words: Vec<(String, bool)>,
+    /// Which of the groups and braces in each of `words` are text: every
+    /// reading of that word agreed ([`LiteralGroups::and`]).
+    literal: std::collections::HashMap<String, LiteralGroups>,
     opaque: bool,
     /// The words of each script that holds such syntax, read as the shell
     /// expands them where that can change which directory a path names: a
@@ -2797,7 +3050,7 @@ impl ShellCommand<'_> {
             Self::Line(command) => {
                 split.opaque = has_unevaluated_expansion(command);
                 if split.opaque {
-                    split.expanded.extend(shell_tokens(command, true));
+                    split.expanded.extend(expanded_words(command));
                 }
                 for (text, literal) in readings(command) {
                     push_nested_words(
@@ -2814,7 +3067,7 @@ impl ShellCommand<'_> {
                 split.opaque = items.iter().any(|item| has_unevaluated_expansion(item))
                     || runs_inline_code(items);
                 for item in items.iter().filter(|item| has_unevaluated_expansion(item)) {
-                    split.expanded.extend(shell_tokens(item, true));
+                    split.expanded.extend(expanded_words(item));
                 }
                 for (index, item) in items.iter().enumerate() {
                     // An element reaches the program as is, so only a script
@@ -2847,32 +3100,51 @@ impl ShellCommand<'_> {
 fn push_argv_item(item: &str, script: bool, literal: bool, split: &mut ShellWords) {
     let tokens = split_words(item, literal);
     if tokens.len() == 1 && tokens[0].0 == item {
-        push_word(item, false, split);
+        let marks = Marks {
+            tilde: false,
+            bare_brace: script && tokens[0].1.bare_brace,
+        };
+        push_word(item, marks, split);
         return;
     }
     // Kept whole, a long script would exhaust the match budget.
     if item.chars().count() <= MAX_ARGV_PATH_CHARS {
-        split.words.push((item.to_owned(), false));
+        // An element reaches the program as is; a script's groups and braces
+        // are the shell's, read through its words below.
+        let literal = LiteralGroups {
+            parens: !script,
+            braces: !script,
+        };
+        add_word(item.to_owned(), false, literal, split);
     }
     push_nested_words(
-        &literal_tildes(tokens, script),
+        &literal_marks(tokens, script),
         MAX_SHELL_NESTING - 1,
         literal,
         split,
     );
 }
 
-/// `tokens` re-split from one word, whose unquoted tildes count only when a
-/// shell runs that word as a script; in a quoted message or pattern
-/// (`-m "fix ~approx"`, `grep '~[a-z]+'`) a tilde is literal.
-fn literal_tildes(tokens: Vec<(String, bool)>, script: bool) -> Vec<(String, bool)> {
+/// `tokens` re-split from one word, whose unquoted tildes and braces count
+/// only when a shell runs that word as a script; in a quoted message or
+/// pattern (`-m "fix ~approx"`, `grep '~[a-z]+'`, `awk '{print $1/2}'`) they
+/// are text.
+fn literal_marks(tokens: Vec<(String, Marks)>, script: bool) -> Vec<(String, Marks)> {
     if script {
         return tokens;
     }
     tokens
         .into_iter()
-        .map(|(token, _)| (token, false))
+        .map(|(token, _)| (token, Marks::default()))
         .collect()
+}
+
+/// The words of a script with syntax the matcher does not evaluate, read as
+/// the shell expands them ([`ShellWords::expanded`]).
+fn expanded_words(script: &str) -> impl Iterator<Item = (String, bool)> {
+    shell_tokens(script, true)
+        .into_iter()
+        .map(|(word, marks)| (word, marks.tilde))
 }
 
 /// `command` without PowerShell's backquote and cmd's caret escapes, each of
@@ -2931,7 +3203,7 @@ const MAX_SHELL_NESTING: usize = 4;
 /// `literal` re-splits each word with its backslashes kept
 /// ([`split_words`]).
 fn push_nested_words(
-    words: &[(String, bool)],
+    words: &[(String, Marks)],
     depth: usize,
     literal: bool,
     split: &mut ShellWords,
@@ -2940,8 +3212,8 @@ fn push_nested_words(
     if runs_inline_code(&texts) {
         split.opaque = true;
     }
-    for (index, (word, tilde)) in words.iter().enumerate() {
-        push_word(word, *tilde, split);
+    for (index, (word, marks)) in words.iter().enumerate() {
+        push_word(word, *marks, split);
         let tokens = split_words(word, literal);
         if tokens.len() == 1 && tokens[0].0 == *word {
             continue;
@@ -2956,9 +3228,9 @@ fn push_nested_words(
         let script = word.contains("$(") || word.contains('`') || is_shell_script(&texts, index);
         if script && has_unevaluated_expansion(word) {
             split.opaque = true;
-            split.expanded.extend(shell_tokens(word, true));
+            split.expanded.extend(expanded_words(word));
         }
-        push_nested_words(&literal_tildes(tokens, script), depth, literal, split);
+        push_nested_words(&literal_marks(tokens, script), depth, literal, split);
     }
 }
 
@@ -2967,15 +3239,24 @@ fn push_nested_words(
 /// Windows path keeps its separators. A word with a parameter default
 /// (`${X:-docs/x.md}`) also adds the reading with the operand in its place,
 /// of the word as written and of its POSIX reading (`${X:-d\ocs/x.md}`).
-/// `tilde` says whether a `~` in the word was outside quotes.
-fn push_word(word: &str, tilde: bool, split: &mut ShellWords) {
-    push_word_reading(word, tilde, split);
+/// `marks` says how the word was quoted.
+fn push_word(word: &str, marks: Marks, split: &mut ShellWords) {
+    push_word_reading(word, marks, split);
     if word.contains('\\') {
         let plain = without_backslash_escapes(word);
         if plain != word {
-            push_word_reading(&plain, tilde, split);
+            push_word_reading(&plain, marks, split);
         }
     }
+}
+
+fn add_word(word: String, tilde: bool, literal: LiteralGroups, split: &mut ShellWords) {
+    split
+        .literal
+        .entry(word.clone())
+        .and_modify(|seen| *seen = seen.and(literal))
+        .or_insert(literal);
+    split.words.push((word, tilde));
 }
 
 /// `word` as a POSIX shell reads its unquoted backslashes: each escapes the
@@ -2993,10 +3274,16 @@ fn without_backslash_escapes(word: &str) -> String {
     plain
 }
 
-fn push_word_reading(word: &str, tilde: bool, split: &mut ShellWords) {
-    split.words.push((word.to_owned(), tilde));
+fn push_word_reading(word: &str, marks: Marks, split: &mut ShellWords) {
+    // An unquoted `(` ends a word, so one inside a word is quoted or
+    // escaped: text, never a group.
+    let literal = LiteralGroups {
+        parens: true,
+        braces: !marks.bare_brace,
+    };
+    add_word(word.to_owned(), marks.tilde, literal, split);
     if let Some((operands, exhausted)) = parameter_operands(word) {
-        split.words.push((operands, tilde));
+        add_word(operands, marks.tilde, literal, split);
         // A default nested deeper than the matcher reads is unprovable.
         split.opaque |= exhausted;
     }
@@ -3354,29 +3641,39 @@ fn shell_words(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// [`shell_words`], each word with whether it holds a `~` outside quotes and
-/// not after a backslash, the only tilde a shell expands.
-fn marked_shell_words(command: &str) -> Vec<(String, bool)> {
+/// How a shell word was quoted, for the readings that depend on it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Marks {
+    /// A `~` outside quotes and not after a backslash, the only tilde a
+    /// shell expands.
+    tilde: bool,
+    /// A `{` or `}` outside quotes, which a brace expansion may read. A
+    /// quoted one is text to the shell.
+    bare_brace: bool,
+}
+
+/// [`shell_words`], each word with how it was quoted ([`Marks`]).
+fn marked_shell_words(command: &str) -> Vec<(String, Marks)> {
     shell_tokens(command, false)
 }
 
 /// [`marked_shell_words`]; with `expand`, a zsh glob group stays inside its
 /// word (`docs/(a|b)/x`, `(a|b)/x`) instead of splitting it as a subshell, and
 /// the numeric and control escapes of an ANSI-C string are decoded.
-fn shell_tokens(command: &str, expand: bool) -> Vec<(String, bool)> {
+fn shell_tokens(command: &str, expand: bool) -> Vec<(String, Marks)> {
     tokenize(command, expand, false)
 }
 
 /// [`marked_shell_words`] with every backslash an ordinary character, as
 /// PowerShell and cmd read it: `\\srv\share\x`, bare or double-quoted, keeps
 /// both leading backslashes.
-fn literal_shell_words(command: &str) -> Vec<(String, bool)> {
+fn literal_shell_words(command: &str) -> Vec<(String, Marks)> {
     tokenize(command, false, true)
 }
 
 /// The words of `command` read with POSIX quoting ([`shell_tokens`]), or,
 /// with `literal`, with backslashes kept as written ([`literal_shell_words`]).
-fn split_words(command: &str, literal: bool) -> Vec<(String, bool)> {
+fn split_words(command: &str, literal: bool) -> Vec<(String, Marks)> {
     if literal {
         literal_shell_words(command)
     } else {
@@ -3385,11 +3682,11 @@ fn split_words(command: &str, literal: bool) -> Vec<(String, bool)> {
 }
 
 /// [`shell_tokens`]; `literal` reads every backslash as an ordinary character.
-fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, bool)> {
+fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, Marks)> {
     let is_operator = |c: char| matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '`');
     let mut words = Vec::new();
     let mut word = String::new();
-    let mut tilde = false;
+    let mut marks = Marks::default();
     let mut in_word = false;
     let mut quote = None;
     let mut chars = command.chars().peekable();
@@ -3457,19 +3754,20 @@ fn tokenize(command: &str, expand: bool, literal: bool) -> Vec<(String, bool)> {
             }
             (None, c) if c.is_whitespace() || is_operator(c) => {
                 if in_word {
-                    words.push((std::mem::take(&mut word), tilde));
-                    (in_word, tilde) = (false, false);
+                    words.push((std::mem::take(&mut word), std::mem::take(&mut marks)));
+                    in_word = false;
                 }
             }
             (None, c) => {
-                tilde |= c == '~' && !word.ends_with('\\');
+                marks.tilde |= c == '~' && !word.ends_with('\\');
+                marks.bare_brace |= matches!(c, '{' | '}');
                 word.push(c);
                 in_word = true;
             }
         }
     }
     if in_word {
-        words.push((word, tilde));
+        words.push((word, marks));
     }
     words
 }
@@ -4564,6 +4862,16 @@ fn char_equal(left: char, right: char, insensitive: bool) -> bool {
 mod tests {
     use super::*;
 
+    /// The paths [`capture_lookup_locations`] names, without how each reads.
+    fn location_paths(found: Option<Vec<LookupLocation>>) -> Option<Vec<String>> {
+        found.map(|locations| {
+            locations
+                .into_iter()
+                .map(|location| location.path)
+                .collect()
+        })
+    }
+
     /// The routed `cwd` is built from these paths, so a Windows target keeps
     /// backslashes (as the harness reports every other cwd) while `..` is
     /// still collapsed; a POSIX target is unchanged. Windows CI caught the
@@ -5432,7 +5740,12 @@ mod tests {
             CaptureDisposition::Keep
         );
         assert_eq!(
-            capture_lookup_locations(AgentKind::Droid, &patch("../other/x.rs"), "/repo", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Droid,
+                &patch("../other/x.rs"),
+                "/repo",
+                None
+            )),
             Some(vec!["/other/x.rs".to_owned()])
         );
         assert_eq!(
@@ -5464,7 +5777,12 @@ mod tests {
         // Droid's directory and glob arguments locate the call in another
         // checkout.
         let elsewhere = |name: &str, input: Value| {
-            capture_lookup_locations(AgentKind::Droid, &call(name, input), "/repo", None)
+            location_paths(capture_lookup_locations(
+                AgentKind::Droid,
+                &call(name, input),
+                "/repo",
+                None,
+            ))
         };
         assert_eq!(
             elsewhere("LS", json!({"directory_path": "/other/docs"})),
@@ -5983,7 +6301,12 @@ mod tests {
         assert_eq!(excluded.tool_family(), ToolFamily::File);
         assert_eq!(excluded.disposition(), CaptureDisposition::MetadataOnly);
         assert_eq!(
-            capture_lookup_locations(AgentKind::Muse, &patch("../other/x.rs"), "/repo", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Muse,
+                &patch("../other/x.rs"),
+                "/repo",
+                None
+            )),
             Some(vec!["/other/x.rs".to_owned()])
         );
 
@@ -5993,7 +6316,7 @@ mod tests {
         assert_eq!(decision.tool_family(), ToolFamily::SearchList);
         assert_eq!(decision.disposition(), CaptureDisposition::Drop);
         assert_eq!(
-            capture_lookup_locations(
+            location_paths(capture_lookup_locations(
                 AgentKind::Muse,
                 &call(
                     "search",
@@ -6001,7 +6324,7 @@ mod tests {
                 ),
                 "/repo",
                 None
-            ),
+            )),
             Some(vec!["/other".to_owned(), "/other/a/*.env".to_owned()])
         );
 
@@ -6885,11 +7208,22 @@ mod tests {
             CaptureDisposition::Keep
         );
         assert!(
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(&over), "/repo", None).is_none()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(&over),
+                "/repo",
+                None
+            ))
+            .is_none()
         );
         assert!(
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(&at_limit), "/repo", None)
-                .is_some()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(&at_limit),
+                "/repo",
+                None
+            ))
+            .is_some()
         );
     }
 
@@ -7345,6 +7679,115 @@ mod tests {
         assert!(glob_matches_below("C:/Docs/**", "c:/docs", true));
     }
 
+    /// OMP's `read` and `write` name a file through a suffix of `path`, so a
+    /// ranged read of an ignored file (`secrets.env:1-20`), an archive member,
+    /// a SQLite row or a query would otherwise miss every exact-file pattern.
+    /// OMP's `expandPath` and Pi's `normalizePath` also drop a leading `:` or
+    /// `@` and read a `file://` URL, in `edit` too. The shared vectors attempt
+    /// each documented form; `src/app.ts:5-9`, a literal `@secrets.env` for
+    /// OMP and a ranged path for Pi, which takes no suffix, are the controls.
+    #[test]
+    fn omp_path_suffixes_cannot_reach_ignored_paths() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/capture-policy.json")).unwrap();
+        let section = &fixture["omp_path_grammar"];
+        for vector in section["readings"].as_array().unwrap() {
+            let path = vector["path"].as_str().unwrap().to_owned();
+            let expected: Vec<String> = serde_json::from_value(vector["readings"].clone()).unwrap();
+            assert_eq!(omp_path_readings(&[path], true), Some(expected), "{vector}");
+        }
+        for vector in section["pi_readings"].as_array().unwrap() {
+            let path = vector["path"].as_str().unwrap();
+            let expected: Vec<String> = serde_json::from_value(vector["readings"].clone()).unwrap();
+            assert_eq!(
+                pi_expand_path(path).into_iter().collect::<Vec<_>>(),
+                expected,
+                "{vector}"
+            );
+        }
+        let ignore_paths = section["ignore_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pattern| pattern.as_str().unwrap().to_owned())
+            .collect();
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig { ignore_paths }),
+            "/repo",
+            None,
+        );
+        for vector in section["vectors"].as_array().unwrap() {
+            let agent = AgentKind::from_wire(vector["agent"].as_str().unwrap());
+            let path = vector["path"].as_str().unwrap().replace("{root}", "/repo");
+            let raw = json!({"tool": vector["tool"], "args": {"path": path}});
+            let protocol = policy.inspect(agent, &raw, "/repo").protocol().clone();
+            assert_eq!(
+                serde_json::to_value(protocol.disposition()).unwrap(),
+                vector["disposition"],
+                "{raw}"
+            );
+            assert_eq!(protocol.tool_family(), ToolFamily::File, "{raw}");
+            assert_eq!(
+                serde_json::to_value(protocol.extraction_state()).unwrap(),
+                vector
+                    .get("extraction_state")
+                    .cloned()
+                    .unwrap_or(json!("extracted")),
+                "{raw}"
+            );
+            assert_eq!(
+                u64::from(protocol.path_count()),
+                vector["path_count"].as_u64().unwrap_or(1),
+                "{raw}"
+            );
+        }
+    }
+
+    /// OMP drops a stray leading `:` before a path shape (`expandPath`), so
+    /// `:/repo/secrets.env:1-20` reads `/repo/secrets.env`. The generated
+    /// TypeScript policy is metadata-only on any leading `:`, so this native
+    /// row lives here rather than in the shared vectors; `:src/app.ts` (no
+    /// path shape, opened as spelled) and Pi, which keeps a leading `:`, are
+    /// the controls.
+    #[test]
+    fn omp_stray_leading_colon_cannot_reach_ignored_paths() {
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["secrets.env".into(), "*.pem".into()],
+            }),
+            "/repo",
+            None,
+        );
+        for (agent, path, expected) in [
+            (
+                AgentKind::Omp,
+                ":/repo/secrets.env:1-20",
+                CaptureDisposition::Drop,
+            ),
+            (
+                AgentKind::Omp,
+                ":/repo/secrets.env",
+                CaptureDisposition::Drop,
+            ),
+            (AgentKind::Omp, ":./key.pem:1-40", CaptureDisposition::Drop),
+            (
+                AgentKind::Omp,
+                ":../repo/secrets.env",
+                CaptureDisposition::Drop,
+            ),
+            (AgentKind::Omp, ":src/app.ts:5-9", CaptureDisposition::Keep),
+            (
+                AgentKind::Pi,
+                ":/repo/secrets.env",
+                CaptureDisposition::Keep,
+            ),
+        ] {
+            let raw = json!({"tool": "read", "args": {"path": path}});
+            let protocol = policy.inspect(agent, &raw, "/repo").protocol().clone();
+            assert_eq!(protocol.disposition(), expected, "{agent:?} {path}");
+        }
+    }
+
     /// Tools that read back an earlier command's output are stripped to
     /// metadata under an active or invalid policy, since the command they
     /// read may have been dropped; with no policy they are untouched.
@@ -7468,8 +7911,14 @@ mod tests {
     #[test]
     fn windows_lookup_locations_keep_glob_segments_whole() {
         let cwd = r"C:\work\b";
-        let locations =
-            |raw: &Value| capture_lookup_locations(AgentKind::ClaudeCode, raw, cwd, None);
+        let locations = |raw: &Value| {
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                cwd,
+                None,
+            ))
+        };
         assert_eq!(
             locations(&bash("cat {.,}./a/secrets.env")),
             Some(vec![
@@ -7492,7 +7941,12 @@ mod tests {
     #[test]
     fn capture_lookup_locations_name_every_path_a_call_spells() {
         let locations = |raw: &Value| {
-            capture_lookup_locations(AgentKind::ClaudeCode, raw, "/work/b", Some("/home/me"))
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                "/work/b",
+                Some("/home/me"),
+            ))
         };
         assert_eq!(
             locations(
@@ -7521,12 +7975,12 @@ mod tests {
             Some(vec!["/work/a".to_owned()])
         );
         assert_eq!(
-            capture_lookup_locations(
+            location_paths(capture_lookup_locations(
                 AgentKind::ClaudeCode,
                 &json!({"tool_name": "Read", "tool_input": {"file_path": "C:\\a\\x.md"}}),
                 "C:\\b",
                 None,
-            ),
+            )),
             Some(vec!["C:\\a\\x.md".to_owned()])
         );
         // A search/list tool names its root and the path-like globs below it;
@@ -7808,7 +8262,13 @@ mod tests {
             CaptureDisposition::Keep
         );
         let locations = |raw: &Value| {
-            capture_lookup_locations(AgentKind::ClaudeCode, raw, "/work/b", None).unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                raw,
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for raw in [
             bash("cat ./**/../a/secrets.env"),
@@ -7896,8 +8356,13 @@ mod tests {
             Err(())
         );
         let locations = |command: &str| {
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
-                .unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(command),
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for command in [
             "cat .*/a/secrets.env",
@@ -7935,8 +8400,13 @@ mod tests {
     #[test]
     fn glob_groups_and_ansi_c_escapes_reach_the_marker_lookup() {
         let locations = |command: &str| {
-            capture_lookup_locations(AgentKind::ClaudeCode, &bash(command), "/work/b", None)
-                .unwrap()
+            location_paths(capture_lookup_locations(
+                AgentKind::ClaudeCode,
+                &bash(command),
+                "/work/b",
+                None,
+            ))
+            .unwrap()
         };
         for (command, location) in [
             ("cat ../(a)/secrets.env", "/work/(a)/secrets.env"),
@@ -8028,7 +8498,12 @@ mod tests {
             "tool_input": {"command": "*** Begin Patch\n*** Add File: x.rs\n+x\n  \t*** Update File: ../a/secrets.env\n+KEY\n*** End Patch"},
         });
         assert_eq!(
-            capture_lookup_locations(AgentKind::Codex, &patch, "/work/b", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Codex,
+                &patch,
+                "/work/b",
+                None
+            )),
             Some(vec![
                 "/work/b/x.rs".to_owned(),
                 "/work/a/secrets.env".to_owned()
@@ -8039,7 +8514,12 @@ mod tests {
             "tool_input": {"pattern": "KEY", "path": "/work", "file_glob": "a/*.env"},
         });
         assert_eq!(
-            capture_lookup_locations(AgentKind::Hermes, &search, "/work/b", None),
+            location_paths(capture_lookup_locations(
+                AgentKind::Hermes,
+                &search,
+                "/work/b",
+                None
+            )),
             Some(vec!["/work".to_owned(), "/work/a/*.env".to_owned()])
         );
     }

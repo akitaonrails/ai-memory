@@ -3,8 +3,8 @@
 #
 #   sh tests/hooks/test_lib.sh
 #
-# Exits non-zero on any failure. POSIX shell + sed/awk only, so no extra
-# CI setup needed.
+# Exits non-zero on any failure. POSIX shell; the loopback HTTP fixture uses
+# Python's standard library.
 set -eu
 
 # shellcheck source=../../hooks/_lib.sh
@@ -24,7 +24,8 @@ CALLER_SPOOL="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$ORIG_HOME/.local/share}/ai
 unset AI_MEMORY_DATA_DIR XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME
 unset AI_MEMORY_RUN_ID AI_MEMORY_MANAGED_WORKSTREAM_ID AI_MEMORY_MANAGED_WORKSTREAM_NAME
 unset AI_MEMORY_AUTO_HANDOFF
-trap 'rm -rf "$TMP"; HOME=$ORIG_HOME' EXIT
+HTTP_PID=""
+trap '[ -z "$HTTP_PID" ] || { kill "$HTTP_PID" 2>/dev/null || true; wait "$HTTP_PID" 2>/dev/null || true; }; rm -rf "$TMP"; HOME=$ORIG_HOME' EXIT
 
 assert_eq() {
     desc="$1"; want="$2"; got="$3"
@@ -48,6 +49,102 @@ host_path() {
         printf '%s' "$1"
     fi
 }
+
+# --- only successful HTTP replies become context ----------------------
+# Exercise real curl, including all three auth branches. Without the status
+# guard, a redirect or error page is printed as the agent's handoff or brief.
+# Windows runners ship `python` but not always a working `python3` (Git Bash
+# may find only the Store alias), so take the first that runs Python 3.
+HTTP_PYTHON=""
+for HTTP_CANDIDATE in python3 python; do
+    if "$HTTP_CANDIDATE" -c 'import sys; sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then
+        HTTP_PYTHON=$HTTP_CANDIDATE
+        break
+    fi
+done
+[ -n "$HTTP_PYTHON" ] || { printf 'the HTTP fixture needs Python 3 (python3 or python)\n' >&2; exit 1; }
+"$HTTP_PYTHON" - "$TMP/http-port" <<'PY' &
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        url = urlsplit(self.path)
+        status = int(url.path.split('/')[1])
+        auth = parse_qs(url.query)['auth'][0]
+        expected = {'none': None, 'env': 'Bearer env-fixture', 'file': 'Bearer file-fixture'}
+        if (self.headers.get('Authorization') != expected[auth]
+                or self.headers.get('X-AI-Memory-Client') != 'hook-sh'):
+            status = 401
+        bodies = {200: b'context line one\ncontext line two',
+                  201: b'context with final newlines\n\n',
+                  204: b'', 299: b'context ending in digits\n500'}
+        body = bodies.get(status, b'HTTP error body must not become context')
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        if 300 <= status < 400:
+            self.send_header('Location', '/200/handoff?' + url.query)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+server = HTTPServer(('127.0.0.1', 0), Handler)
+with open(sys.argv[1], 'w') as ready:
+    ready.write(str(server.server_port))
+server.serve_forever()
+PY
+HTTP_PID=$!
+HTTP_WAIT=0
+while [ ! -s "$TMP/http-port" ]; do
+    kill -0 "$HTTP_PID" 2>/dev/null || { printf 'HTTP fixture exited\n' >&2; exit 1; }
+    HTTP_WAIT=$((HTTP_WAIT + 1))
+    [ "$HTTP_WAIT" -lt 100 ] || { printf 'HTTP fixture did not start\n' >&2; exit 1; }
+    sleep 0.05
+done
+HTTP_SERVER="http://127.0.0.1:$(cat "$TMP/http-port")"
+for HTTP_AUTH in none env file; do
+    AI_MEMORY_DATA_DIR="$TMP/http-$HTTP_AUTH"
+    export AI_MEMORY_DATA_DIR
+    mkdir -p "$AI_MEMORY_DATA_DIR"
+    unset AI_MEMORY_AUTH_TOKEN
+    case "$HTTP_AUTH" in
+        env) AI_MEMORY_AUTH_TOKEN=env-fixture; export AI_MEMORY_AUTH_TOKEN ;;
+        file) printf 'Authorization: Bearer file-fixture\n' >"$AI_MEMORY_DATA_DIR/auth-header" ;;
+    esac
+    for HTTP_HELPER in ai_memory_get_handoff ai_memory_get_brief; do
+        for HTTP_STATUS in 200 201 204 299 302 307 308 401 404 500; do
+            case "$HTTP_STATUS" in
+                200) HTTP_WANT='context line one
+context line two|' ;;
+                201) HTTP_WANT='context with final newlines
+
+|' ;;
+                299) HTTP_WANT='context ending in digits
+500|' ;;
+                *) HTTP_WANT='|' ;;
+            esac
+            # The sentinel preserves final newlines across command substitution.
+            HTTP_GOT=$(set +e
+                "$HTTP_HELPER" "$HTTP_SERVER/$HTTP_STATUS/context?auth=$HTTP_AUTH&cwd=%2Ffixture"
+                printf '|')
+            assert_eq "$HTTP_HELPER: $HTTP_STATUS context ($HTTP_AUTH auth)" "$HTTP_WANT" "$HTTP_GOT"
+        done
+    done
+done
+kill "$HTTP_PID"
+wait "$HTTP_PID" 2>/dev/null || true
+HTTP_PID=""
+unset AI_MEMORY_AUTH_TOKEN AI_MEMORY_DATA_DIR
+for HTTP_HELPER in ai_memory_get_handoff ai_memory_get_brief; do
+    assert_eq "$HTTP_HELPER: connection failure stays empty with curl's exit code" '|7' \
+        "$(set +e; "$HTTP_HELPER" "$HTTP_SERVER/200/context?auth=none&cwd=%2Ffixture" 2>/dev/null; printf '|%s' "$?")"
+done
 
 # --- parse_toml_key ---------------------------------------------------
 cat >"$TMP/sample.toml" <<EOF
@@ -219,6 +316,7 @@ printf '%s\n' "$*" >>"$AI_MEMORY_CURL_LOG"
 case "$*" in
     *'/handoff?'*) printf 'next-session-context' ;;
 esac
+case "$*" in *'\n%{http_code}'*) printf '\n200' ;; esac
 EOF
 chmod +x "$FAKE_CURL_BIN/curl"
 
@@ -989,6 +1087,8 @@ curl() {
     _tm=GET
     _tu=""
     _tdata=""
+    _twrite=no
+    case "$*" in *'\n%{http_code}'*) _twrite=yes ;; esac
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -X) shift; [ "$#" -gt 0 ] || break; _tm="$1" ;;
@@ -1007,6 +1107,7 @@ curl() {
     else
         printf 'GET %s\n' "$_tu" >>"$CURL_LOG"
         printf 'HANDOFF BODY'
+        case "$_twrite" in yes) printf '\n200' ;; esac
     fi
     return 0
 }
@@ -1094,6 +1195,8 @@ cat >"$TMP/bin/curl" <<'EOF'
 # Fake curl: log "METHOD URL"; answer 200 to a POST, HANDOFF BODY to a GET.
 _gm=GET
 _gu=""
+_gw=no
+case "$*" in *'\n%{http_code}'*) _gw=yes ;; esac
 while [ $# -gt 0 ]; do
     case "$1" in
         -X) shift; [ $# -gt 0 ] || break; _gm=$1 ;;
@@ -1103,6 +1206,7 @@ while [ $# -gt 0 ]; do
 done
 printf '%s %s\n' "$_gm" "$_gu" >>"$GROK_LOG"
 if [ "$_gm" = POST ]; then printf '200'; else printf 'HANDOFF BODY'; fi
+if [ "$_gm" = GET ] && [ "$_gw" = yes ]; then printf '\n200'; fi
 EOF
 chmod +x "$TMP/bin/curl"
 PATH="$TMP/bin:$PATH"
@@ -1325,7 +1429,7 @@ briefing_handoff_get() {
 
 BRIEF_SCRIPTS=0
 for script in "$(dirname "$0")"/../../hooks/*/*.sh; do
-    grep -q 'ai_memory_get_handoff "' "$script" || continue
+    grep -Eq 'ai_memory_get_(start_)?handoff "' "$script" || continue
     name="$(basename "$(dirname "$script")")/$(basename "$script")"
     BRIEF_SCRIPTS=$((BRIEF_SCRIPTS + 1))
     GET=$(briefing_handoff_get "$script" "$BRIEF_REPO")
@@ -1362,6 +1466,7 @@ case "$*" in
     *'/brief?'*) printf 'subagent-brief-context' ;;
     *'/handoff?'*) printf 'parent-handoff' ;;
 esac
+case "$*" in *'\n%{http_code}'*) printf '\n200' ;; esac
 EOF
 chmod +x "$SUB_CURL_BIN/curl"
 SUB_REPO="$TMP/subagent-brief-on"
@@ -1433,7 +1538,7 @@ scope_handoff_gets() {
 }
 SCOPE_SCRIPTS=0
 for script in "$HOOKS_ABS"/*/*.sh; do
-    grep -q 'ai_memory_get_handoff "' "$script" || continue
+    grep -Eq 'ai_memory_get_(start_)?handoff "' "$script" || continue
     name="$(basename "$(dirname "$script")")/$(basename "$script")"
     SCOPE_SCRIPTS=$((SCOPE_SCRIPTS + 1))
     SCOPE_RUN=$((SCOPE_RUN + 1))
@@ -1681,7 +1786,41 @@ assert_eq "antigravity later turn of the same conversation prints an empty reply
     "$(printf '%s' "$AGY_TURN" | AI_MEMORY_DATA_DIR="$AGY_DATA" AI_MEMORY_HOOK_URL="http://127.0.0.1:9" \
         sh -x hooks/antigravity-cli/session-start.sh 2>"$TMP/agy-trace")"
 assert_eq "antigravity later turn sends no request" "" \
-    "$(grep -E 'ai_memory_(post_hook|get_handoff)' "$TMP/agy-trace" | head -n 1)"
+    "$(grep -E 'ai_memory_(post_hook|get_(start_)?handoff)' "$TMP/agy-trace" | head -n 1)"
+
+# --- a compaction's SessionStart claims nothing (#1983) ----------------
+# `"source": "compact"` is mid-session: every session-start script that
+# fetches a handoff must skip the claim, like the native hook. Control: the
+# same payload with `"source": "startup"` still claims.
+COMPACT_SCRIPTS=0
+for script in "$(dirname "$0")"/../../hooks/*/session-start.sh; do
+    grep -q 'ai_memory_get_start_handoff "' "$script" || continue
+    name="$(basename "$(dirname "$script")")/$(basename "$script")"
+    COMPACT_SCRIPTS=$((COMPACT_SCRIPTS + 1))
+    for source in compact startup; do
+        rm -f "$FAKE_CURL_LOG"
+        printf '{"session_id":"compact-s","cwd":"%s","source":"%s"}' "$TMP" "$source" \
+            | PATH="$FAKE_CURL_BIN:$PATH" AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG" \
+                AI_MEMORY_DATA_DIR="$TMP/compact-data-$source" AI_MEMORY_HOOK_URL='http://memory.test' \
+                sh "$script" >/dev/null 2>&1 || true
+        GETS=$(grep -c '/handoff?' "$FAKE_CURL_LOG" 2>/dev/null || true)
+        case "$source" in
+            compact) assert_eq "$name: a compaction start claims no handoff" "0" "${GETS:-0}" ;;
+            *) assert_eq "$name: a $source start claims the handoff" "1" "${GETS:-0}" ;;
+        esac
+    done
+done
+assert_eq "every handoff-fetching session-start script was checked for compaction" "10" "$COMPACT_SCRIPTS"
+# PowerShell parity, pinned statically (no pwsh needed).
+assert_eq "powershell: a compaction start claims no handoff" "yes" \
+    "$(grep -Fq '$Event -eq "session-start" -and $ParsedPayload -and [string]$ParsedPayload.source -eq "compact"' \
+        "$(dirname "$0")/../../hooks/lib/ai-memory-hook.ps1" && printf yes || printf no)"
+assert_eq "a compact source is a compaction start" "yes" \
+    "$(ai_memory_is_compaction_start '{"source": "compact"}' && printf yes || printf no)"
+assert_eq "a resume source is not a compaction start" "no" \
+    "$(ai_memory_is_compaction_start '{"source":"resume","x":"compact"}' && printf yes || printf no)"
+assert_eq "a payload without a source is not a compaction start" "no" \
+    "$(ai_memory_is_compaction_start '{"session_id":"s"}' && printf yes || printf no)"
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

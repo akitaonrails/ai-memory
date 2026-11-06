@@ -50,12 +50,20 @@ const HELP_2_5_0_EXTRA: &str = "\
     --no-toolchains / --toolchains Disable/enable dev-toolchain cache
 ";
 
+/// What ai-jail 2.15 adds that these tests use: folder mounts.
+const HELP_MAPS: &str = "\
+    --map <PATH|SOURCE:DEST>       Mount read-only, optionally at DEST
+    --rw-map <PATH|SOURCE:DEST>    Mount read-write, optionally at DEST
+";
+
 struct Fixture {
     _temp: tempfile::TempDir,
     repo: PathBuf,
     home: PathBuf,
     bin: PathBuf,
     jail_argv: PathBuf,
+    /// `AI_MEMORY_JAIL_NEXT_RUN` as the fake ai-jail received it.
+    next_run: PathBuf,
     claude_ran: PathBuf,
 }
 
@@ -102,7 +110,12 @@ impl Fixture {
         let help_file = root.join("ai-jail-help.txt");
         fs::write(&help_file, help).unwrap();
         let jail_argv = root.join("ai-jail-argv.txt");
+        let next_run = root.join("ai-jail-next-run.txt");
         let claude_ran = root.join("claude-ran.txt");
+        // Sibling projects to mount, next to the repository.
+        for sibling in ["ai-jail", "tap"] {
+            fs::create_dir_all(root.join(sibling)).unwrap();
+        }
         // `--help` feeds toggle support; `--dry-run` is the usable-ai-jail
         // preflight (`usable_ai_jail_here`). Neither is a real re-exec, so
         // neither may touch `jail_argv` — tests assert its absence when the
@@ -112,9 +125,11 @@ impl Fixture {
             &format!(
                 "if [ \"$1\" = --help ]; then cat '{}'; exit 0; fi\n\
                  if [ \"$1\" = --dry-run ]; then exit 0; fi\n\
-                 printf '%s\\n' \"$@\" > '{}'\n",
+                 printf '%s\\n' \"$@\" > '{}'\n\
+                 printf '%s' \"$AI_MEMORY_JAIL_NEXT_RUN\" > '{}'\n",
                 help_file.display(),
-                jail_argv.display()
+                jail_argv.display(),
+                next_run.display()
             ),
         );
         if with_backend {
@@ -162,8 +177,25 @@ impl Fixture {
             home,
             bin,
             jail_argv,
+            next_run,
             claude_ran,
         }
+    }
+
+    /// A sibling of the repository, created by [`Fixture::new`].
+    fn sibling(&self, name: &str) -> PathBuf {
+        self.repo.parent().unwrap().join(name)
+    }
+
+    /// The `(flag, path)` folder mounts before the `--`.
+    fn mounts(&self) -> Vec<(String, PathBuf)> {
+        let argv = self.jail_argv().expect("ai-jail exec'd");
+        let (flags, _) = split_at_separator(&argv);
+        flags
+            .windows(2)
+            .filter(|pair| pair[0] == "--map" || pair[0] == "--rw-map")
+            .map(|pair| (pair[0].clone(), PathBuf::from(&pair[1])))
+            .collect()
     }
 
     fn jail_argv(&self) -> Option<Vec<String>> {
@@ -640,7 +672,10 @@ async fn yolo_offer_then_checklist_execs_ai_jail_on_a_terminal() {
     )
     .await;
     assert!(output.contains("ai-jail is installed"), "{output}");
-    assert!(output.contains("Enable in the jail"), "{output}");
+    assert!(
+        output.contains("ai-jail: what the agent can reach"),
+        "{output}"
+    );
     let argv = fixture
         .jail_argv()
         .unwrap_or_else(|| panic!("ai-jail exec'd:\n{output}"));
@@ -696,7 +731,7 @@ async fn yolo_offer_skips_the_checklist_for_a_project_ai_jail() {
     .await;
     assert!(output.contains("ai-jail is installed"), "{output}");
     assert!(
-        !output.contains("Enable in the jail"),
+        !output.contains("ai-jail: what the agent can reach"),
         "no checklist with a project .ai-jail:\n{output}"
     );
     let argv = fixture
@@ -925,4 +960,479 @@ async fn terminal_run_program(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn help_with_maps() -> String {
+    format!("{HELP_2_4_1}{HELP_2_5_0_EXTRA}{HELP_MAPS}")
+}
+
+/// `--jail-map` / `--jail-rw-map` reach ai-jail as `--map` / `--rw-map`
+/// before the `--`, resolved against the checkout, and the summary names them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn jail_maps_named_folders_read_only_and_read_write() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new(&help_with_maps(), true, None);
+    let (server, _requests, handle) = mock_server().await;
+    let tap = fixture.sibling("tap");
+    let output = run(
+        &fixture,
+        &server,
+        &[
+            "run",
+            "--no-autowire",
+            "--jail=none",
+            "--jail-map",
+            "../ai-jail",
+            "--jail-rw-map",
+            tap.to_str().unwrap(),
+            "claude",
+        ],
+    )
+    .await;
+    let text = stderr(&output);
+    assert!(
+        fixture.jail_argv().is_some(),
+        "ai-jail was not exec'd (status {:?}):\n{text}",
+        output.status
+    );
+    assert_eq!(
+        fixture.mounts(),
+        [
+            ("--map".to_owned(), fixture.sibling("ai-jail")),
+            ("--rw-map".to_owned(), tap),
+        ],
+        "{text}"
+    );
+    assert!(text.contains("folders: ai-jail (ro), tap (rw)"), "{text}");
+    assert!(!fixture.claude_ran.exists());
+    handle.abort();
+}
+
+/// Each refusal stops the launch before the sandbox or the harness starts,
+/// and its message says what is wrong and what to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_jail_folders_stop_the_launch_with_a_way_forward() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let (server, _requests, handle) = mock_server().await;
+    let fixture = Fixture::new(&help_with_maps(), true, None);
+    fs::create_dir_all(fixture.home.join(".ssh")).unwrap();
+    for (args, expected) in [
+        (
+            vec![
+                "run",
+                "--no-autowire",
+                "--jail",
+                "--jail-map",
+                "~/.ssh",
+                "claude",
+            ],
+            "cannot mount ~/.ssh in the jail: it would expose",
+        ),
+        (
+            vec![
+                "run",
+                "--no-autowire",
+                "--jail",
+                "--jail-map",
+                "../nope",
+                "claude",
+            ],
+            "cannot mount ../nope in the jail: the folder does not exist",
+        ),
+        (
+            vec![
+                "run",
+                "--no-autowire",
+                "--jail",
+                "--jail-rw-map",
+                ".",
+                "claude",
+            ],
+            "the checkout is already mounted",
+        ),
+        (
+            vec!["run", "--no-autowire", "--jail-map", "../ai-jail", "claude"],
+            "need a jailed run: add --jail, or --yolo and accept the ai-jail offer",
+        ),
+    ] {
+        let output = run(&fixture, &server, &args).await;
+        let text = stderr(&output);
+        assert!(!output.status.success(), "{args:?}: {text}");
+        assert!(text.contains(expected), "{args:?}: {text}");
+        assert!(
+            fixture.jail_argv().is_none(),
+            "{args:?}: the sandbox must not start"
+        );
+        assert!(
+            !fixture.claude_ran.exists(),
+            "{args:?}: the harness must not start"
+        );
+    }
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ai_jail_without_folder_mounts_says_to_update_it() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new(HELP_2_4_1, true, None);
+    let (server, _requests, handle) = mock_server().await;
+    let output = run(
+        &fixture,
+        &server,
+        &[
+            "run",
+            "--no-autowire",
+            "--jail",
+            "--jail-map",
+            "../ai-jail",
+            "claude",
+        ],
+    )
+    .await;
+    let text = stderr(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("update ai-jail or drop --jail-map"), "{text}");
+    assert!(fixture.jail_argv().is_none());
+    handle.abort();
+}
+
+/// The checklist is remembered per checkout outside the repository: the next
+/// launch shows the earlier answers, Enter keeps them, and the jailed run is
+/// handed the command line that repeats them.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_checklist_remembers_answers_and_hands_in_the_next_run_command() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new(HELP_2_4_1, true, None);
+    let (server, _requests, handle) = mock_server().await;
+    let flipped = visible_capability_rows()[1];
+    let first = terminal_run(
+        &fixture,
+        &server,
+        "run --no-autowire --yolo claude",
+        "y\ny\n2\n\n",
+    )
+    .await;
+    let first_argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail exec'd:\n{first}"));
+    assert!(first_argv.contains(&format!("--{flipped}")), "{first}");
+    assert!(fixture.home.join("data/jail-choices.json").is_file());
+    assert!(
+        !fixture.repo.join(".ai-jail").exists(),
+        "nothing is written into the repository"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.next_run).unwrap(),
+        format!("ai-memory run --yolo --no-autowire --jail={flipped} claude")
+    );
+    assert!(
+        first_argv
+            .windows(2)
+            .any(|pair| pair == ["--env", "AI_MEMORY_JAIL_NEXT_RUN"]),
+        "{first_argv:?}"
+    );
+
+    fs::remove_file(&fixture.jail_argv).unwrap();
+    let second = terminal_run(
+        &fixture,
+        &server,
+        "run --no-autowire --yolo claude",
+        "y\ny\n\n",
+    )
+    .await;
+    assert!(second.contains("your choices from"), "{second}");
+    let second_argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail exec'd:\n{second}"));
+    let (first_flags, _) = split_at_separator(&first_argv);
+    let (second_flags, _) = split_at_separator(&second_argv);
+    assert_eq!(
+        toggles(first_flags),
+        toggles(second_flags),
+        "Enter keeps the remembered answers"
+    );
+
+    fs::remove_file(&fixture.jail_argv).unwrap();
+    let reset = terminal_run(
+        &fixture,
+        &server,
+        "run --no-autowire --yolo claude",
+        "y\ny\nreset\n\n",
+    )
+    .await;
+    let reset_argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail exec'd:\n{reset}"));
+    assert!(reset_argv.contains(&format!("--no-{flipped}")), "{reset}");
+    handle.abort();
+}
+
+/// `--help` of an ai-jail that speaks the wrapper contract (3.0.1).
+fn help_with_contract() -> String {
+    format!(
+        "{HELP_2_4_1}{HELP_2_5_0_EXTRA}{HELP_MAPS}\
+    --harness <NAME>               Declare the effective harness explicitly
+    --request-file <PATH>          Load a versioned wrapper request manifest
+    --forward-port <PORT>          Expose the host's 127.0.0.1:PORT on the sandbox's own
+"
+    )
+}
+
+/// `capabilities --json` of ai-jail 3.0.1.
+const CAPABILITIES: &str = r#"{"version":"3.0.1","schema_version":1,
+"flags":["--harness","--request-file","--request","--json"],
+"request_kinds":["private_host","host","env","secret","agent_state","map"],
+"features":{"harness_flag":true,"request_file":true,"status_json":true,
+"secret_private_http":true,"configure_requests":true,"inside_marker":false},
+"exit_codes":{"cancelled":130,"required_grant":3,"blocked":4,"backend_unavailable":5}}"#;
+
+/// `status --json` for a project whose review is done and approves everything.
+const STATUS_REVIEWED: &str = r#"{"version":"3.0.1","schema_version":1,
+"project":{"canonical_path":"/p","profile_present":true},
+"harnesses":[{"name":"claude","onboarding_complete":true}],
+"grants":{"restricted":[],"allowed":[],"open":[]},
+"requests":{"approved":[],"pending":[]},"blockers":[]}"#;
+
+/// `status --json` for a project ai-jail has not reviewed yet.
+const STATUS_FIRST_RUN: &str = r#"{"version":"3.0.1","schema_version":1,
+"project":{"canonical_path":"/p","profile_present":false},
+"harnesses":[{"name":"claude","onboarding_complete":false}],
+"grants":{"restricted":["unrestricted_network"],"allowed":[],"open":[]},
+"requests":{"approved":[],"pending":[]},
+"blockers":[{"code":"onboarding_required","message":"Interactive onboarding is required before launch"}]}"#;
+
+impl Fixture {
+    /// Turn the fake into ai-jail 3.0.1: it answers `capabilities --json` and,
+    /// for `status --json`, prints `status` and records that argv too.
+    fn with_contract(self, status: &str) -> Self {
+        let root = self.repo.parent().unwrap().to_path_buf();
+        let help = root.join("ai-jail-help.txt");
+        fs::write(&help, help_with_contract()).unwrap();
+        let capabilities = root.join("ai-jail-capabilities.json");
+        fs::write(&capabilities, CAPABILITIES).unwrap();
+        let status_file = root.join("ai-jail-status.json");
+        fs::write(&status_file, status).unwrap();
+        write_script(
+            &self.bin.join("ai-jail"),
+            &format!(
+                "if [ \"$1\" = --help ]; then cat '{help}'; exit 0; fi\n\
+                 if [ \"$1\" = --dry-run ]; then exit 0; fi\n\
+                 if [ \"$1\" = capabilities ]; then cat '{caps}'; exit 0; fi\n\
+                 for arg in \"$@\"; do\n\
+                 [ \"$arg\" = -- ] && break\n\
+                 if [ \"$arg\" = status ]; then printf '%s\\n' \"$@\" > '{status_argv}'; cat '{status}'; exit 0; fi\n\
+                 done\n\
+                 printf '%s\\n' \"$@\" > '{argv}'\n\
+                 printf '%s' \"$AI_MEMORY_JAIL_NEXT_RUN\" > '{next}'\n",
+                help = help.display(),
+                caps = capabilities.display(),
+                status_argv = root.join("ai-jail-status-argv.txt").display(),
+                status = status_file.display(),
+                argv = self.jail_argv.display(),
+                next = self.next_run.display(),
+            ),
+        );
+        self
+    }
+
+    fn recorded(&self, name: &str) -> Option<Vec<String>> {
+        fs::read_to_string(self.repo.parent().unwrap().join(name))
+            .ok()
+            .map(|text| text.lines().map(str::to_owned).collect())
+    }
+}
+
+/// With ai-jail 3.0.1 the launch declares the harness and passes what the
+/// session needs as command-line grants, which ai-jail applies without a
+/// prompt: no request file, whose every entry would be its own yes/no. A
+/// loopback server gets only its port forwarded, never the whole network,
+/// and only this harness's own provider key is passed. The read-only status
+/// call previews exactly that launch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ai_jail_3_gets_the_harness_and_grants_without_prompts() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new("", true, None).with_contract(STATUS_REVIEWED);
+    let (server, requests, handle) = mock_server().await;
+    let port = server.rsplit(':').next().unwrap().to_owned();
+    let mut command = command(
+        &fixture,
+        &server,
+        &["run", "--no-autowire", "claude", "--jail=github"],
+    );
+    command
+        .env("ANTHROPIC_API_KEY", "sk-ant-fixture")
+        .env("OPENAI_API_KEY", "sk-openai-fixture")
+        .env("GEMINI_API_KEY", "gemini-fixture");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .expect("ai-memory run finished")
+        .expect("spawn ai-memory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail was never exec'd:\n{}", stderr(&output)));
+    let (flags, wrapped) = split_at_separator(&argv);
+    assert_eq!(
+        flags[..6],
+        [
+            "--harness",
+            "claude",
+            "--forward-port",
+            port.as_str(),
+            "--agent-state",
+            "--no-save-config"
+        ],
+        "a loopback server gets its port forwarded, never the whole network: {flags:?}"
+    );
+    let env: Vec<&str> = flags
+        .windows(2)
+        .filter(|pair| pair[0] == "--env")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert!(env.contains(&"AI_MEMORY_SERVER_URL"), "{env:?}");
+    assert!(env.contains(&"ANTHROPIC_API_KEY"), "{env:?}");
+    for other in ["OPENAI_API_KEY", "GEMINI_API_KEY"] {
+        assert!(!env.contains(&other), "a Claude jail got {other}: {env:?}");
+    }
+    assert_eq!(flags.last().map(String::as_str), Some("--github"));
+    for absent in ["--network", "--request-file", "--request"] {
+        assert!(
+            !flags.iter().any(|flag| flag == absent),
+            "{absent}: {flags:?}"
+        );
+    }
+    assert_eq!(
+        wrapped,
+        [
+            exe().as_str(),
+            "run",
+            "--no-autowire",
+            "claude",
+            "--jail=github"
+        ]
+    );
+    let status = fixture
+        .recorded("ai-jail-status-argv.txt")
+        .expect("status ran");
+    let (status_flags, status_wrapped) = split_at_separator(&status);
+    assert_eq!(status_flags[..status_flags.len() - 2], *flags);
+    assert_eq!(status_flags[status_flags.len() - 2..], ["status", "--json"]);
+    assert_eq!(status_wrapped, wrapped);
+    assert!(
+        !fixture.home.join("data").join("jail-requests").exists(),
+        "no request file is written"
+    );
+    assert!(
+        stderr(&output).contains("ai-jail 3.0.1 reviews the rest of the access for claude"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    handle.abort();
+}
+
+/// A first run with no terminal is not refused by ai-memory: ai-jail runs it
+/// once with restricted defaults plus the command-line grants, which is what
+/// its own guide asks of automation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_run_without_a_terminal_still_launches_with_the_grants() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new("", true, None).with_contract(STATUS_FIRST_RUN);
+    let (server, _requests, handle) = mock_server().await;
+    let output = run(
+        &fixture,
+        &server,
+        &["run", "--no-autowire", "claude", "--jail"],
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    let argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail was never exec'd:\n{}", stderr(&output)));
+    let (flags, _) = split_at_separator(&argv);
+    assert_eq!(flags[..2], ["--harness", "claude"]);
+    handle.abort();
+}
+
+/// A harness ai-jail has no preset for cannot be declared (ai-jail refuses
+/// an unknown `--harness`), so it keeps the flag-based launch, and no status
+/// call is made for a contract it is not using.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_harness_without_an_ai_jail_preset_keeps_the_flag_launch() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let fixture = Fixture::new("", true, None).with_contract(STATUS_REVIEWED);
+    write_script(&fixture.bin.join("copilot"), "exit 0\n");
+    let (server, _requests, handle) = mock_server().await;
+    let output = run(
+        &fixture,
+        &server,
+        &["run", "--no-autowire", "copilot", "--jail"],
+    )
+    .await;
+    let argv = fixture
+        .jail_argv()
+        .unwrap_or_else(|| panic!("ai-jail was never exec'd:\n{}", stderr(&output)));
+    let (flags, _) = split_at_separator(&argv);
+    assert!(
+        !flags
+            .iter()
+            .any(|flag| flag == "--harness" || flag == "--request-file"),
+        "{flags:?}"
+    );
+    assert_eq!(
+        flags[..3],
+        ["--network", "--agent-state", "--no-save-config"]
+    );
+    assert!(fixture.recorded("ai-jail-status-argv.txt").is_none());
+    handle.abort();
+}
+
+/// A saved approval that no longer matches the host (here an approved
+/// variable that is not set any more) stops the launch before exec, quoting
+/// ai-jail's reason and the review command, instead of letting ai-jail fail
+/// inside the re-exec with exit 4.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drifted_ai_jail_access_stops_before_the_launch_with_the_reason() {
+    if skip_inside_ai_jail() {
+        return;
+    }
+    let status = STATUS_REVIEWED.replace(
+        r#""blockers":[]"#,
+        r#""blockers":[{"code":"missing_approved_env","message":"approved variable OPENAI_API_KEY is not set"}]"#,
+    );
+    assert_ne!(status, STATUS_REVIEWED);
+    let fixture = Fixture::new("", true, None).with_contract(&status);
+    let (server, _requests, handle) = mock_server().await;
+    let output = run(
+        &fixture,
+        &server,
+        &["run", "--no-autowire", "claude", "--jail"],
+    )
+    .await;
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(
+        text.contains(
+            "no longer matches this machine: approved variable OPENAI_API_KEY is not set"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("ai-jail configure claude"), "{text}");
+    assert!(fixture.jail_argv().is_none(), "nothing was launched");
+    handle.abort();
 }

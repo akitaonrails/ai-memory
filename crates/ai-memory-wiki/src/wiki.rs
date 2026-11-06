@@ -1347,6 +1347,7 @@ impl Wiki {
     /// git still stores the exact markdown file. The restored file is parsed
     /// before it is written so a malformed checkpoint cannot replace the live
     /// disk copy and then fail during indexing.
+    /// Session-purge tombstones also apply to historical restores.
     ///
     /// # Errors
     /// Returns [`WikiError`] when the revision/path does not exist, the stored
@@ -1468,7 +1469,7 @@ impl Wiki {
             let installed = replace_file_with_rollback_snapshot(&self.git, &abs, raw.as_bytes())?;
             let id = match self
                 .writer
-                .upsert_page(NewPage {
+                .upsert_page_from_disk(NewPage {
                     workspace_id,
                     project_id,
                     path,

@@ -268,6 +268,16 @@ sign in, with no console window, and restarts if it fails. Details and the
 other Windows setups (WSL2, Docker Desktop, a real Windows service) are in
 [`docs/windows.md`](docs/windows.md).
 
+With [Scoop](https://scoop.sh) (ai-memory 3.4.0 or later):
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Update it with `scoop update ai-memory`.
+
 ### Arch Linux (AUR)
 
 For native Arch installs, use the AUR packages. They install
@@ -629,6 +639,7 @@ readable wiki pages; the next session starts with a handoff.
   [Investigate token usage](docs/usage.md#investigate-token-usage-in-the-dashboard)
   for capture coverage, cache accounting and the investigation flags. You can
   drill down from a project to an agent, its sessions and individual responses.
+  The updated Pi extension reports session totals only, not response-ledger rows.
   The web [agent inbox](docs/agent-messaging.md#in-the-web-ui) lets an operator
   queue requests for registered agents and read the received and sent history.
   Token filters run on the full authorized ledger, with native turn and tool

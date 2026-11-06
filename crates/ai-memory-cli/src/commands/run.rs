@@ -14,19 +14,22 @@ use ai_memory_core::{
 };
 use ai_memory_workstream::{
     AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, FORWARDED_ENV_NAMES,
-    JailChecklistItem, JailHostFacts, JailSupport, JailToggleChoice, JailToggleKind, LaunchMode,
-    LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate, ai_jail_support,
+    JailChecklistItem, JailHostFacts, JailRefusal, JailRisk, JailSupport, JailToggleChoice,
+    JailToggleKind, LaunchMode, LaunchPlan, LaunchRoots, ManagedHarness, NativeSessionCandidate,
+    ServerReach, ai_jail_contract, ai_jail_harness_name, ai_jail_support,
     allows_native_session_adoption, apply_claude_true_yolo, apply_jail_process_isolation,
     apply_yolo, build_ai_jail_invocation, build_launch_plan, build_launch_plan_with_env_lookup,
-    claude_continued_session, claude_continued_sessions, claude_live_background_attach_id,
-    claude_session_ran_in_background, clean_path, crush_global_config_path,
-    discover_native_session, export_transcript, has_native_session_selector, inside_ai_jail_here,
-    inspect_repository, is_interactive_session_invocation, jail_checklist, jail_toggle,
-    kiro_explicit_session_id, kiro_harness_from_source_cursor, kiro_selects_non_default_engine,
-    kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_v3_resume_uses_default_store,
-    list_native_sessions, marked_choices, native_session_exists, native_session_in_checkout,
-    native_store_root, omp_profile_flag, omp_profile_flag_env, parse_jail_toggles,
-    store_override_vars, transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
+    checklist_reason, claude_continued_session, claude_continued_sessions,
+    claude_live_background_attach_id, claude_session_ran_in_background, clean_path, contract_flags,
+    contract_invocation, contract_status_invocation, crush_global_config_path,
+    discover_native_session, export_transcript, harness_env_names, has_native_session_selector,
+    inside_ai_jail_here, inspect_repository, is_interactive_session_invocation, jail_checklist,
+    jail_spec, jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
+    kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
+    kiro_v3_resume_uses_default_store, list_native_sessions, marked_choices, native_session_exists,
+    native_session_in_checkout, native_store_root, omp_profile_flag, omp_profile_flag_env,
+    parse_jail_toggles, parse_status, server_reach, status_refusal, store_override_vars,
+    transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
     wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
@@ -314,9 +317,50 @@ pub(super) async fn run_from_with_wiring(
     cwd: &Path,
     wire_overrides: &super::run_autowire::WireOverrides,
 ) -> Result<i32> {
-    run_once_with_wiring(config, args, cwd, wire_overrides)
+    run_once_repairing_split(config, args, cwd, wire_overrides)
         .await
         .map(|outcome| outcome.exit_code)
+}
+
+/// [`run_once_with_wiring`], offering once on a terminal to join a project
+/// split by the git remote's arrival and then launching again (#1993).
+async fn run_once_repairing_split(
+    config: &Config,
+    args: RunArgs,
+    cwd: &Path,
+    wire_overrides: &super::run_autowire::WireOverrides,
+) -> Result<RunOutcome> {
+    let error = match run_once_with_wiring(config, args.clone(), cwd, wire_overrides).await {
+        Ok(outcome) => return Ok(outcome),
+        Err(error) => error,
+    };
+    let Some(split) = error
+        .downcast_ref::<super::run_project_split::ProjectSplit>()
+        .cloned()
+    else {
+        return Err(error);
+    };
+    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+        return Err(error);
+    }
+    let i18n = config.i18n.clone();
+    let prompt_split = split.clone();
+    let accepted = tokio::task::spawn_blocking(move || {
+        super::run_project_split::confirm_repair(
+            &i18n,
+            &prompt_split,
+            &mut io::stdin().lock(),
+            &mut io::stderr(),
+        )
+    })
+    .await
+    .context("waiting for the project rename confirmation")?
+    .context("reading the project rename confirmation from stdin")?;
+    if !accepted {
+        return Err(error);
+    }
+    super::run_project_split::apply_repair(config, &split).await?;
+    run_once_with_wiring(config, args, cwd, wire_overrides).await
 }
 
 #[derive(Debug)]
@@ -340,13 +384,19 @@ enum AfterRunAction {
 }
 
 async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
+    let result = run_with_exit_prompt_loop(config, args, cwd).await;
+    print_next_run_hint(config);
+    result
+}
+
+async fn run_with_exit_prompt_loop(config: &Config, args: RunArgs, cwd: &Path) -> Result<i32> {
     let interactive_terminal =
         io::stdin().is_terminal() && io::stdout().is_terminal() && io::stderr().is_terminal();
     let mut next_args = args;
     preserve_trailing_run_options(&mut next_args);
 
     loop {
-        let outcome = run_once_with_wiring(
+        let outcome = run_once_repairing_split(
             config,
             next_args.clone(),
             cwd,
@@ -364,6 +414,7 @@ async fn run_with_exit_prompt(config: &Config, args: RunArgs, cwd: &Path) -> Res
             let stderr = io::stderr();
             choose_after_run(
                 &config.i18n,
+                Paint::for_stderr(config),
                 outcome.harness,
                 &outcome.workstream_name,
                 &available,
@@ -434,6 +485,7 @@ fn available_switch_harnesses(
 
 fn choose_after_run(
     i18n: &ai_memory_core::i18n::Localizer,
+    paint: Paint,
     current: ManagedHarness,
     workstream_name: &str,
     available: &[RunHarnessChoice],
@@ -442,12 +494,20 @@ fn choose_after_run(
 ) -> io::Result<AfterRunAction> {
     writeln!(
         output,
-        "{}",
-        i18n.diagnostic(&format!(
+        "{} {}",
+        paint.green("✓"),
+        paint.bold(&i18n.diagnostic(&format!(
             "ai-memory: {} exited successfully in workstream '{}'.",
             current.as_str(),
             workstream_name
-        ))
+        )))
+    )?;
+    writeln!(
+        output,
+        "  {}",
+        paint.dim(
+            &i18n.diagnostic("A switch keeps this workstream, its options and the same jail.")
+        )
     )?;
     for (index, choice) in available.iter().enumerate() {
         writeln!(
@@ -549,6 +609,23 @@ async fn run_once_with_wiring(
     let home = native_home(config).context("locating native harness session storage")?;
     let automatic_harness = args.harness.is_none();
     let requested_harness = args.harness;
+    let jail_folder_flags: Vec<(PathBuf, bool)> = args
+        .jail_map
+        .iter()
+        .map(|path| (path.clone(), false))
+        .chain(args.jail_rw_map.iter().map(|path| (path.clone(), true)))
+        .collect();
+    let mut next_run = NextRun {
+        yolo: false,
+        true_yolo: args.true_yolo,
+        no_autowire: args.no_autowire,
+        workspace: args.workspace.clone(),
+        project: args.project.clone(),
+        profile: args.profile.clone(),
+        env_file: args.env_file.clone(),
+        had_env: !args.env.is_empty(),
+        harness: requested_harness.map(super::show::harness_name),
+    };
     let mut executable = args.executable.map(PathBuf::into_os_string);
     let mut native_args = args.native_args;
     let trailing_yolo = remove_wrapper_yolo(&mut native_args);
@@ -681,6 +758,25 @@ async fn run_once_with_wiring(
         ai_jail.is_some(),
         jail_facts.project_config,
     )?;
+    next_run.yolo = yolo_requested;
+    next_run.true_yolo |= trailing_true_yolo;
+    next_run.no_autowire = no_autowire;
+    // Inside the jail the folders are already mounted; the forwarded flags
+    // only describe them.
+    let jail_inputs = JailInputs {
+        checkout_key: repository.worktree_fingerprint.clone(),
+        checkout_root: repository.cwd.clone(),
+        home: home.clone(),
+        flag_folders: if jailed {
+            Vec::new()
+        } else {
+            validate_flag_folders(config, &repository.cwd, &home, &jail_folder_flags)?
+        },
+        next_run,
+    };
+    if jail_plan.mode == JailMode::Stay {
+        folders_need_a_jail(&jail_inputs)?;
+    }
     // An explicit `--jail` re-runs before any managed run is prepared: the
     // jailed process opens its own, so preparing one out here would only be
     // cancelled again.
@@ -688,14 +784,31 @@ async fn run_once_with_wiring(
         ensure_jail_does_not_export_config_token(config)?;
         let support = ai_jail_support(ai_jail)
             .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
-        // With a project `.ai-jail` nothing is pre-checked, so a bare
-        // `--jail` defers to that file while a listed toggle still overrides it.
-        let toggles = parse_jail_toggles(spec, &jail_checklist(&jail_facts, &support), &support)?;
+        // Only a harness named on the command line is known this early; an
+        // automatic one is chosen by the server later, so it keeps the
+        // flag-based launch rather than declare a guess.
+        let contract = jail_contract_for(
+            ai_jail,
+            &support,
+            requested_harness.is_some().then_some(provisional_harness),
+        );
+        // With ai-jail's contract its own review owns the toggles, so a bare
+        // `--jail` adds none. Otherwise, with a project `.ai-jail` nothing is
+        // pre-checked, so a bare `--jail` defers to that file while a listed
+        // toggle still overrides it.
+        let checklist = if contract.is_some() {
+            Vec::new()
+        } else {
+            jail_checklist(&jail_facts, &support)
+        };
+        let toggles = parse_jail_toggles(spec, &checklist, &support)?;
         if jail_plan.warn {
             let confirmation_i18n = config.i18n.clone();
+            let confirmation_paint = Paint::for_stderr(config);
             let confirmation = tokio::task::spawn_blocking(move || {
                 read_yolo_confirmation(
                     &confirmation_i18n,
+                    confirmation_paint,
                     false,
                     &mut io::stdin().lock(),
                     &mut io::stderr(),
@@ -711,9 +824,14 @@ async fn run_once_with_wiring(
         return Err(exec_under_ai_jail(
             ai_jail,
             config,
-            &support,
+            JailLaunch {
+                support: &support,
+                contract: contract.as_ref(),
+            },
             &toggles,
             jail_facts.project_config,
+            &jail_inputs.flag_folders,
+            None,
         ));
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
@@ -764,6 +882,7 @@ async fn run_once_with_wiring(
                 jail_plan: &jail_plan,
                 ai_jail: ai_jail.as_deref(),
                 jail_facts: &jail_facts,
+                jail_inputs: &jail_inputs,
                 no_autowire,
                 child_env: &child_env,
                 run_env: &run_env,
@@ -977,8 +1096,12 @@ async fn run_once_with_wiring(
         confirm_yolo_and_maybe_reexec(
             config,
             &jail_plan,
-            ai_jail.as_deref(),
+            JailOffer {
+                ai_jail: ai_jail.as_deref(),
+                harness,
+            },
             &jail_facts,
+            &jail_inputs,
             Some((&endpoint, &run_path)),
             &interrupted_before_spawn,
         )
@@ -1236,7 +1359,15 @@ async fn run_once_with_wiring(
                 },
             )
             .await
-            .context("linking the managed native session; the agent was not started")
+            .map_err(|error| {
+                // A session recorded under this checkout's old project name
+                // gets the repair offer instead of a bare conflict (#1993).
+                match super::run_project_split::ProjectSplit::from_error(&error) {
+                    Some(split) => anyhow::Error::new(split),
+                    None => error
+                        .context("linking the managed native session; the agent was not started"),
+                }
+            })
         );
         remember_session_store(
             config,
@@ -1744,6 +1875,7 @@ struct DegradedLaunch<'a> {
     jail_plan: &'a JailPlan,
     ai_jail: Option<&'a Path>,
     jail_facts: &'a JailHostFacts,
+    jail_inputs: &'a JailInputs,
     no_autowire: bool,
     child_env: &'a EffectiveChildEnv,
     run_env: &'a [(String, String)],
@@ -1800,8 +1932,12 @@ async fn degraded_launch(
     confirm_yolo_and_maybe_reexec(
         config,
         launch.jail_plan,
-        launch.ai_jail,
+        JailOffer {
+            ai_jail: launch.ai_jail,
+            harness: launch.harness,
+        },
         launch.jail_facts,
+        launch.jail_inputs,
         None,
         interrupted,
     )
@@ -2631,6 +2767,7 @@ struct YoloConfirmation {
 /// are unit-tested without a real terminal.
 fn read_yolo_confirmation(
     i18n: &ai_memory_core::i18n::Localizer,
+    paint: Paint,
     ai_jail_available: bool,
     input: &mut impl io::BufRead,
     output: &mut impl io::Write,
@@ -2638,14 +2775,22 @@ fn read_yolo_confirmation(
     writeln!(
         output,
         "{}",
-        i18n.diagnostic("⚠  --yolo runs every tool call with no confirmation. An agent can delete")
+        paint.yellow(&i18n.diagnostic(
+            "⚠  --yolo runs every tool call with no confirmation. An agent can delete"
+        ))
     )?;
     writeln!(
         output,
         "{}",
-        i18n.diagnostic("   files, run any command, and reach the network unsupervised.")
+        paint.dim(
+            &i18n.diagnostic("   files, run any command, and reach the network unsupervised.")
+        )
     )?;
-    write!(output, "{}", i18n.diagnostic("   Proceed? [Y/n] "))?;
+    write!(
+        output,
+        "{}",
+        paint.bold(&i18n.diagnostic("   Proceed? [Y/n] "))
+    )?;
     output.flush()?;
     let mut line = String::new();
     input.read_line(&mut line)?;
@@ -2663,8 +2808,8 @@ fn read_yolo_confirmation(
     }
     write!(
         output,
-        "{}",
-        i18n.diagnostic("ai-jail is installed. Re-run this session inside it? [Y/n] ")
+        "🔒 {}",
+        paint.bold(&i18n.diagnostic("ai-jail is installed. Re-run this session inside it? [Y/n] "))
     )?;
     output.flush()?;
     let mut jail_line = String::new();
@@ -2686,17 +2831,24 @@ enum ChecklistAnswer {
     Accept,
     /// Marks changed; show the list again.
     Changed,
+    /// `f`: open the extra-folder picker.
+    Folders,
+    /// `reset`: back to the recommended marks and no extra folders.
+    Reset,
     /// Not understood; nothing changed.
     Invalid(String),
 }
 
-/// Apply one checklist line: empty accepts, `all`/`none` set every mark, and
-/// row numbers (separated by spaces or commas) flip those rows. A line with
-/// any bad number changes nothing.
+/// Apply one checklist line: empty accepts, `all`/`none` set every mark, `f`
+/// asks for the folder picker, `reset` restores the recommendation, and row
+/// numbers (separated by spaces or commas) flip those rows. A line with any
+/// bad number changes nothing.
 fn apply_checklist_answer(line: &str, checked: &mut [bool]) -> ChecklistAnswer {
     let answer = line.trim().to_ascii_lowercase();
     match answer.as_str() {
         "" => return ChecklistAnswer::Accept,
+        "f" | "folders" => return ChecklistAnswer::Folders,
+        "reset" => return ChecklistAnswer::Reset,
         "all" | "none" => {
             checked.fill(answer == "all");
             return ChecklistAnswer::Changed;
@@ -2724,27 +2876,197 @@ fn apply_checklist_answer(line: &str, checked: &mut [bool]) -> ChecklistAnswer {
     ChecklistAnswer::Changed
 }
 
+/// Terminal emphasis for the jail prompts. Off the terminal, with
+/// `NO_COLOR`, or on a dumb terminal it is plain text, and the marks and
+/// icons still carry the meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Paint {
+    color: bool,
+}
+
+impl Paint {
+    #[cfg(test)]
+    const PLAIN: Self = Self { color: false };
+
+    fn for_stderr(config: &Config) -> Self {
+        Self {
+            color: crate::terminal::color_enabled(io::stderr().is_terminal(), &config.runtime_env),
+        }
+    }
+
+    fn with(
+        self,
+        text: &str,
+        style: fn(String) -> crossterm::style::StyledContent<String>,
+    ) -> String {
+        if self.color {
+            style(text.to_owned()).to_string()
+        } else {
+            text.to_owned()
+        }
+    }
+
+    fn bold(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::bold)
+    }
+
+    fn green(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::green)
+    }
+
+    fn yellow(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::yellow)
+    }
+
+    fn red(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::red)
+    }
+
+    fn cyan(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::cyan)
+    }
+
+    fn dim(self, text: &str) -> String {
+        self.with(text, crossterm::style::Stylize::dark_grey)
+    }
+}
+
+/// What the checklist shows besides the rows: why each row is recommended,
+/// what changed since the remembered answers, and the extra folders.
+struct ChecklistView {
+    i18n: ai_memory_core::i18n::Localizer,
+    paint: Paint,
+    /// Per row, why its recommendation checks it ([`checklist_reason`]).
+    reasons: Vec<Option<&'static str>>,
+    /// The marks before any remembered answers: what `reset` restores.
+    recommended: Vec<bool>,
+    /// When the remembered answers were saved, if there are any.
+    last_saved: Option<String>,
+    /// Rows the remembered answers never covered.
+    new: Vec<&'static str>,
+    /// Remembered toggles no longer offered here.
+    gone: Vec<String>,
+    /// Whether the installed ai-jail can mount extra folders.
+    folders_supported: bool,
+}
+
+/// Opens the extra-folder picker on the current folders; `None` keeps them.
+type FolderPicker<'a> = dyn FnMut(
+        &[super::jail_folders::ExtraFolder],
+    ) -> io::Result<Option<Vec<super::jail_folders::ExtraFolder>>>
+    + 'a;
+
+/// The rows, the extra folders and the accepted marks of one checklist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChecklistOutcome {
+    marked: Vec<JailChecklistItem>,
+    folders: Vec<super::jail_folders::ExtraFolder>,
+}
+
+fn folder_names(folders: &[super::jail_folders::ExtraFolder]) -> String {
+    folders
+        .iter()
+        .map(super::jail_folders::ExtraFolder::label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_checklist(
-    i18n: &ai_memory_core::i18n::Localizer,
+    view: &ChecklistView,
     items: &[JailChecklistItem],
     checked: &[bool],
+    folders: &[super::jail_folders::ExtraFolder],
     output: &mut impl io::Write,
 ) -> io::Result<()> {
-    writeln!(
-        output, "{}", i18n.diagnostic("Enable in the jail (Enter = as marked; numbers flip, e.g. \"2 4\"; \"all\" / \"none\"):"))?;
+    let i18n = &view.i18n;
+    let paint = view.paint;
+    if items.is_empty() {
+        // ai-jail 3.0.1+ reviews credentials and network itself; this screen
+        // keeps only the extra folders.
+        writeln!(
+            output,
+            "{} {}",
+            paint.bold(&i18n.diagnostic("🔒 ai-jail: extra folders for the agent")),
+            paint.dim(&i18n.diagnostic("(ai-jail reviews the rest next)"))
+        )?;
+    } else {
+        writeln!(
+            output,
+            "{} {}",
+            paint.bold(&i18n.diagnostic("🔒 ai-jail: what the agent can reach")),
+            paint.dim(&i18n.diagnostic("(Enter keeps the marks)"))
+        )?;
+    }
+    let mut changes = Vec::new();
+    if let Some(saved) = &view.last_saved {
+        changes.push(paint.dim(&i18n.diagnostic(&format!("your choices from {saved}"))));
+    }
+    if !view.new.is_empty() {
+        changes.push(paint.cyan(&i18n.diagnostic(&format!("new: {}", view.new.join(", ")))));
+    }
+    if !view.gone.is_empty() {
+        changes.push(
+            paint.yellow(&i18n.diagnostic(&format!("no longer offered: {}", view.gone.join(", ")))),
+        );
+    }
+    if !changes.is_empty() {
+        writeln!(output, "   {}", changes.join(&paint.dim(" · ")))?;
+    }
     let width = items
         .iter()
         .map(|item| item.toggle.label.chars().count())
         .max()
         .unwrap_or(0);
     for (index, (item, on)) in items.iter().zip(checked).enumerate() {
-        let mark = if *on { 'x' } else { ' ' };
+        let mark = if *on {
+            paint.green("[x]")
+        } else {
+            paint.dim("[ ]")
+        };
+        let note = match item.toggle.risk() {
+            JailRisk::HostRoot => paint.red(item.toggle.note),
+            JailRisk::Secret => format!("🔑 {}", paint.dim(item.toggle.note)),
+            JailRisk::Normal => paint.dim(item.toggle.note),
+        };
+        let mut extra = String::new();
+        if let Some(reason) = view.reasons.get(index).copied().flatten() {
+            extra.push_str(&paint.green(&format!(" · {}", i18n.diagnostic(reason))));
+        }
+        if view.new.contains(&item.toggle.stem) {
+            extra.push_str(&paint.cyan(&format!(" {}", i18n.diagnostic("new"))));
+        }
         writeln!(
             output,
-            "  [{mark}] {}) {:<width$}   {}",
+            "  {mark} {}) {:<width$}   {note}{extra}",
             index + 1,
             item.toggle.label,
-            item.toggle.note
+        )?;
+    }
+    if view.folders_supported {
+        let listed = if folders.is_empty() {
+            paint.dim(&i18n.diagnostic("none"))
+        } else {
+            paint.yellow(&folder_names(folders))
+        };
+        writeln!(
+            output,
+            "  📁 {} {listed}",
+            i18n.diagnostic("Extra folders:")
+        )?;
+        writeln!(
+            output,
+            "  {}",
+            paint.dim(&i18n.diagnostic(if items.is_empty() {
+                "f folders · reset · Enter go"
+            } else {
+                "numbers flip · f folders · all · none · reset · Enter go"
+            }))
+        )?;
+    } else {
+        writeln!(
+            output,
+            "  {}",
+            paint.dim(&i18n.diagnostic("numbers flip · all · none · reset · Enter go"))
         )?;
     }
     write!(output, "> ")?;
@@ -2752,20 +3074,25 @@ fn render_checklist(
 }
 
 /// The interactive toggle checklist (docs/design-yolo-safety-ai-jail.md §5),
-/// line-based with injected `input`/`output` like [`read_yolo_confirmation`].
-/// Enter or EOF accepts the marks. The result is every row as the user saw
-/// it ([`marked_choices`]): checked rows `--X`, unchecked rows `--no-X`, so an
-/// unchecked row stays off even if the user's own ai-jail config enables it.
+/// line-based with injected `input`/`output` like [`read_yolo_confirmation`],
+/// and `pick_folders` for the `f` answer. Enter or EOF accepts the marks. The
+/// result's choices are every row as the user saw it ([`marked_choices`]):
+/// checked rows `--X`, unchecked rows `--no-X`, so an unchecked row stays off
+/// even if the user's own ai-jail config enables it.
 fn read_jail_checklist(
-    i18n: &ai_memory_core::i18n::Localizer,
+    view: &ChecklistView,
     items: &[JailChecklistItem],
+    folders: Vec<super::jail_folders::ExtraFolder>,
     input: &mut impl io::BufRead,
     output: &mut impl io::Write,
-) -> io::Result<Vec<JailToggleChoice>> {
+    pick_folders: &mut FolderPicker<'_>,
+) -> io::Result<ChecklistOutcome> {
+    let i18n = &view.i18n;
     let mut checked: Vec<bool> = items.iter().map(|item| item.checked).collect();
+    let mut folders = folders;
     let mut invalid = 0;
     loop {
-        render_checklist(i18n, items, &checked, output)?;
+        render_checklist(view, items, &checked, &folders, output)?;
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
             writeln!(output)?;
@@ -2774,6 +3101,24 @@ fn read_jail_checklist(
         match apply_checklist_answer(&line, &mut checked) {
             ChecklistAnswer::Accept => break,
             ChecklistAnswer::Changed => {}
+            ChecklistAnswer::Folders if view.folders_supported => {
+                if let Some(picked) = pick_folders(&folders)? {
+                    folders = picked;
+                }
+            }
+            ChecklistAnswer::Reset => {
+                checked.clone_from(&view.recommended);
+                folders.clear();
+            }
+            ChecklistAnswer::Folders => {
+                writeln!(
+                    output,
+                    "{}",
+                    i18n.diagnostic(
+                        "this ai-jail cannot mount extra folders; update it to use `f`"
+                    )
+                )?;
+            }
             ChecklistAnswer::Invalid(message) => {
                 invalid += 1;
                 writeln!(output, "{}", i18n.diagnostic(&message))?;
@@ -2793,7 +3138,7 @@ fn read_jail_checklist(
             checked,
         })
         .collect();
-    Ok(marked_choices(&marked))
+    Ok(ChecklistOutcome { marked, folders })
 }
 
 /// The one-line account of what the jailed re-run enables, grouped the way
@@ -2801,7 +3146,11 @@ fn read_jail_checklist(
 /// user's own `no-X` entries, and — for an explicit selection — the visible
 /// rows it left out (forced off, summarized rather than spelled out) — and
 /// whether the project `.ai-jail` supplies the rest.
-fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
+fn jail_summary(
+    toggles: &[JailToggleChoice],
+    project_config: bool,
+    folders: &[super::jail_folders::ExtraFolder],
+) -> String {
     let labels = |kind: JailToggleKind| -> Vec<&'static str> {
         toggles
             .iter()
@@ -2832,6 +3181,9 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
     if toggles.iter().any(|choice| choice.implied) {
         parts.push("everything else in the checklist off".to_owned());
     }
+    if !folders.is_empty() {
+        parts.push(format!("folders: {}", folder_names(folders)));
+    }
     if project_config {
         parts.push("plus the project .ai-jail".to_owned());
     }
@@ -2845,6 +3197,215 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
     }
 }
 
+/// The launch's own options, kept to print the command that repeats it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NextRun {
+    yolo: bool,
+    true_yolo: bool,
+    no_autowire: bool,
+    workspace: Option<String>,
+    project: Option<String>,
+    profile: Option<String>,
+    env_file: Option<PathBuf>,
+    /// Whether `--env` was given: its values may be secrets, so the line
+    /// leaves them out and says so.
+    had_env: bool,
+    harness: Option<String>,
+}
+
+/// What the jail offer needs beyond the host facts: whose answers to recall,
+/// the folders named on the command line, and the launch to repeat.
+#[derive(Debug, Clone)]
+struct JailInputs {
+    /// The worktree fingerprint the checklist answers are remembered under.
+    checkout_key: String,
+    checkout_root: PathBuf,
+    home: PathBuf,
+    /// `--jail-map` / `--jail-rw-map`, already validated.
+    flag_folders: Vec<super::jail_folders::ExtraFolder>,
+    next_run: NextRun,
+}
+
+/// The environment variable that carries [`next_run_command`] into the jail,
+/// where the jailed `ai-memory run` prints it on quit.
+const NEXT_RUN_ENV: &str = "AI_MEMORY_JAIL_NEXT_RUN";
+
+fn folder_rules<'a>(
+    data_dir: &'a Path,
+    home: &'a Path,
+    checkout_root: &'a Path,
+) -> super::jail_folders::FolderRules<'a> {
+    super::jail_folders::FolderRules {
+        home: Some(home),
+        data_dir,
+        checkout_root,
+    }
+}
+
+/// Folder flags on a run that is not going into ai-jail would be silently
+/// ignored, so the launch stops and says how to get a jail.
+fn folders_need_a_jail(inputs: &JailInputs) -> Result<()> {
+    if inputs.flag_folders.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "--jail-map and --jail-rw-map need a jailed run: add --jail, or --yolo and accept the ai-jail offer"
+        ))
+    }
+}
+
+/// Validate `--jail-map` / `--jail-rw-map`; a refused folder stops the launch.
+fn validate_flag_folders(
+    config: &Config,
+    cwd: &Path,
+    home: &Path,
+    flags: &[(PathBuf, bool)],
+) -> Result<Vec<super::jail_folders::ExtraFolder>> {
+    let rules = folder_rules(&config.data_dir, home, cwd);
+    let mut folders: Vec<super::jail_folders::ExtraFolder> = Vec::new();
+    for (raw, writable) in flags {
+        let path = super::jail_folders::validate_extra_folder(raw, cwd, &rules)
+            .map_err(|refusal| anyhow!("cannot mount {} in the jail: {refusal}", raw.display()))?;
+        super::jail_folders::upsert(
+            &mut folders,
+            super::jail_folders::ExtraFolder {
+                path,
+                writable: *writable,
+            },
+        );
+    }
+    Ok(folders)
+}
+
+/// The `ai-memory run` line that repeats this launch's jail choices exactly:
+/// the wrapper options, the enabled toggles, the extra folders and the
+/// harness. One-off parts (a resume selector, native arguments that may hold a
+/// prompt, `--env` values that may hold secrets) are left out.
+fn next_run_command(
+    next: &NextRun,
+    choices: Option<&[JailToggleChoice]>,
+    folders: &[super::jail_folders::ExtraFolder],
+) -> String {
+    let mut words = vec!["ai-memory".to_owned(), "run".to_owned()];
+    if next.true_yolo {
+        words.push("--true-yolo".to_owned());
+    } else if next.yolo {
+        words.push("--yolo".to_owned());
+    }
+    if next.no_autowire {
+        words.push("--no-autowire".to_owned());
+    }
+    let env_file = next
+        .env_file
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    for (flag, value) in [
+        ("--workspace", next.workspace.as_ref()),
+        ("--project", next.project.as_ref()),
+        ("--profile", next.profile.as_ref()),
+        ("--env-file", env_file.as_ref()),
+    ] {
+        if let Some(value) = value {
+            words.push(flag.to_owned());
+            words.push(super::render_shared::shell_quote(value));
+        }
+    }
+    // `None`: ai-jail's own review holds the access, so a bare `--jail`.
+    words.push(match choices {
+        Some(choices) => format!("--jail={}", jail_spec(choices)),
+        None => "--jail".to_owned(),
+    });
+    for folder in folders {
+        words.push(
+            if folder.writable {
+                "--jail-rw-map"
+            } else {
+                "--jail-map"
+            }
+            .to_owned(),
+        );
+        words.push(super::render_shared::shell_quote(
+            &folder.path.to_string_lossy(),
+        ));
+    }
+    if let Some(harness) = &next.harness {
+        words.push(harness.clone());
+    }
+    let mut line = words.join(" ");
+    if next.had_env {
+        line.push_str("   # add your --env values again");
+    }
+    line
+}
+
+/// Print the line that repeats the jail choices, when the launcher outside
+/// the jail handed one in. Only the jailed run prints it, on its way out.
+fn print_next_run_hint(config: &Config) {
+    if !inside_ai_jail_here() || !io::stderr().is_terminal() {
+        return;
+    }
+    let Some(command) = config.runtime_env.var_os(NEXT_RUN_ENV) else {
+        return;
+    };
+    eprint!(
+        "{}",
+        next_run_hint(
+            &config.i18n,
+            Paint::for_stderr(config),
+            &command.to_string_lossy()
+        )
+    );
+}
+
+/// The quit-time lines that offer [`next_run_command`].
+fn next_run_hint(i18n: &ai_memory_core::i18n::Localizer, paint: Paint, command: &str) -> String {
+    format!(
+        "\n{}\n  {}\n",
+        paint.dim(&i18n.diagnostic("Next time, start with the same jail choices:")),
+        paint.bold(command)
+    )
+}
+
+/// Recall this checkout's answers onto `items`, keeping only folders that
+/// still pass validation, then add the command-line folders on top.
+fn recall_jail_answers(
+    config: &Config,
+    inputs: &JailInputs,
+    items: &mut [JailChecklistItem],
+) -> (
+    Option<String>,
+    super::jail_choices::Applied,
+    Vec<super::jail_folders::ExtraFolder>,
+) {
+    let remembered =
+        super::jail_choices::load(&config.data_dir, &inputs.checkout_key).unwrap_or_default();
+    let mut applied = if remembered == super::jail_choices::Remembered::default() {
+        super::jail_choices::Applied::default()
+    } else {
+        super::jail_choices::apply(items, &remembered)
+    };
+    let rules = folder_rules(&config.data_dir, &inputs.home, &inputs.checkout_root);
+    let mut folders = Vec::new();
+    for folder in remembered.folders {
+        match super::jail_folders::validate_extra_folder(
+            &folder.path,
+            &inputs.checkout_root,
+            &rules,
+        ) {
+            Ok(path) => folders.push(super::jail_folders::ExtraFolder {
+                path,
+                writable: folder.writable,
+            }),
+            Err(_) => applied.gone.push(format!("📁 {}", folder.path.display())),
+        }
+    }
+    for flag in &inputs.flag_folders {
+        super::jail_folders::upsert(&mut folders, flag.clone());
+    }
+    let saved = remembered.saved_at.get(..10).map(str::to_owned);
+    (saved, applied, folders)
+}
+
 /// The post-prepare `--yolo` gate (docs/design-yolo-safety-ai-jail.md). A
 /// no-op unless `plan.warn`. On confirmation it either returns (unjailed, or
 /// the user declined the ai-jail offer) or, on accepting the offer and the
@@ -2852,11 +3413,20 @@ fn jail_summary(toggles: &[JailToggleChoice], project_config: bool) -> String {
 /// the original invocation under `ai-jail` — which never returns on success.
 /// `lease` is the prepared run to release before that re-exec; a degraded
 /// offline launch passes `None` (it holds no lease).
+/// The ai-jail binary a `--yolo` offer re-execs under, and the harness the
+/// jailed run will launch.
+#[derive(Clone, Copy)]
+struct JailOffer<'a> {
+    ai_jail: Option<&'a Path>,
+    harness: ManagedHarness,
+}
+
 async fn confirm_yolo_and_maybe_reexec(
     config: &Config,
     plan: &JailPlan,
-    ai_jail: Option<&Path>,
+    offer: JailOffer<'_>,
     facts: &JailHostFacts,
+    inputs: &JailInputs,
     lease: Option<(&ServerEndpoint, &str)>,
     interrupted: &CancellationToken,
 ) -> Result<()> {
@@ -2870,14 +3440,16 @@ async fn confirm_yolo_and_maybe_reexec(
     // exact binary the re-exec runs. An explicit `--jail` re-exec'd earlier
     // and never reaches here.
     let (ai_jail, show_checklist) = match plan.mode {
-        JailMode::Offer { checklist } => (ai_jail, checklist),
+        JailMode::Offer { checklist } => (offer.ai_jail, checklist),
         JailMode::Stay | JailMode::Explicit(_) => (None, false),
     };
     let ai_jail_available = ai_jail.is_some();
     let confirmation_i18n = config.i18n.clone();
+    let confirmation_paint = Paint::for_stderr(config);
     let confirmation = tokio::task::spawn_blocking(move || {
         read_yolo_confirmation(
             &confirmation_i18n,
+            confirmation_paint,
             ai_jail_available,
             &mut io::stdin().lock(),
             &mut io::stderr(),
@@ -2890,28 +3462,102 @@ async fn confirm_yolo_and_maybe_reexec(
         return Err(anyhow!("aborted: --yolo not confirmed"));
     }
     let (true, Some(ai_jail)) = (confirmation.jail, ai_jail) else {
+        folders_need_a_jail(inputs)?;
         return Ok(());
     };
     let support = ai_jail_support(ai_jail)
         .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
-    let items = jail_checklist(facts, &support);
-    // A project `.ai-jail` owns the toggles: ai-jail loads it itself, so no
-    // checklist and no flags of ours.
-    let toggles = if !show_checklist || items.is_empty() {
+    let contract = jail_contract_for(ai_jail, &support, Some(offer.harness));
+    // With ai-jail's contract its own review owns credentials and network, so
+    // ai-memory's screen keeps only the extra folders. Otherwise a project
+    // `.ai-jail` owns the toggles: ai-jail loads it itself, so no checklist
+    // and no flags of ours.
+    let mut items = if contract.is_some() {
         Vec::new()
     } else {
-        let checklist_i18n = config.i18n.clone();
-        tokio::task::spawn_blocking(move || {
+        jail_checklist(facts, &support)
+    };
+    let show = if contract.is_some() {
+        support.mounts_folders()
+    } else {
+        show_checklist && !items.is_empty()
+    };
+    let (toggles, folders, next_run) = if !show {
+        (Vec::new(), inputs.flag_folders.clone(), None)
+    } else {
+        let reasons = items
+            .iter()
+            .map(|item| checklist_reason(facts, item.toggle))
+            .collect();
+        let recommended = items.iter().map(|item| item.checked).collect();
+        let (last_saved, mut applied, folders) = recall_jail_answers(config, inputs, &mut items);
+        if contract.is_some() {
+            // Remembered toggles are ai-jail's to review now, not gone.
+            applied.gone.retain(|gone| gone.starts_with("📁"));
+        }
+        let view = ChecklistView {
+            i18n: config.i18n.clone(),
+            paint: Paint::for_stderr(config),
+            reasons,
+            recommended,
+            last_saved,
+            new: applied.new,
+            gone: applied.gone,
+            folders_supported: support.mounts_folders(),
+        };
+        let picker_i18n = config.i18n.clone();
+        let color = view.paint.color;
+        let data_dir = config.data_dir.clone();
+        let home = inputs.home.clone();
+        let checkout_root = inputs.checkout_root.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut pick = |current: &[super::jail_folders::ExtraFolder]| {
+                let rules = folder_rules(&data_dir, &home, &checkout_root);
+                let start = checkout_root.parent().unwrap_or(&checkout_root);
+                super::jail_folders::pick_folders(&picker_i18n, start, current, &rules, color)
+                    .map_err(io::Error::other)
+            };
             read_jail_checklist(
-                &checklist_i18n,
+                &view,
                 &items,
+                folders,
                 &mut io::stdin().lock(),
                 &mut io::stderr(),
+                &mut pick,
             )
         })
         .await
         .context("waiting for the ai-jail checklist")?
-        .context("reading the ai-jail checklist from stdin")?
+        .context("reading the ai-jail checklist from stdin")?;
+        let saved_at = jiff::Timestamp::now().to_string();
+        let remembered = if contract.is_some() {
+            // Keep the toggle answers for a launch that falls back to flags
+            // (an older ai-jail, a harness ai-jail has no preset for).
+            let mut prior = super::jail_choices::load(&config.data_dir, &inputs.checkout_key)
+                .unwrap_or_default();
+            prior.folders.clone_from(&outcome.folders);
+            prior.saved_at = saved_at;
+            prior
+        } else {
+            super::jail_choices::remember(&outcome.marked, outcome.folders.clone(), saved_at)
+        };
+        if let Err(error) =
+            super::jail_choices::save(&config.data_dir, &inputs.checkout_key, remembered)
+        {
+            eprintln!(
+                "{}",
+                config.i18n.diagnostic(&format!(
+                    "ai-memory: could not remember the jail choices ({error:#}); they apply to this run only"
+                ))
+            );
+        }
+        let choices = marked_choices(&outcome.marked);
+        let next = next_run_command(
+            &inputs.next_run,
+            contract.is_none().then_some(choices.as_slice()),
+            &outcome.folders,
+        );
+        (choices, outcome.folders, Some(next))
     };
     ensure_jail_does_not_export_config_token(config)?;
     // The re-exec replaces this process (or, off Unix, this process exits
@@ -2924,10 +3570,169 @@ async fn confirm_yolo_and_maybe_reexec(
     Err(exec_under_ai_jail(
         ai_jail,
         config,
-        &support,
+        JailLaunch {
+            support: &support,
+            contract: contract.as_ref(),
+        },
         &toggles,
         facts.project_config,
+        &folders,
+        next_run,
     ))
+}
+
+/// The installed ai-jail speaks the wrapper contract for this harness.
+#[derive(Debug, Clone)]
+struct ContractTarget {
+    /// The harness launched.
+    managed: ManagedHarness,
+    /// The `--harness` name.
+    harness: &'static str,
+    /// ai-jail's version, for the summary line.
+    version: String,
+}
+
+/// The contract target for `harness`, or `None` to keep the flag-based
+/// launch: no harness known yet, one ai-jail has no preset for, or an
+/// ai-jail older than 3.0.1.
+fn jail_contract_for(
+    ai_jail: &Path,
+    support: &JailSupport,
+    harness: Option<ManagedHarness>,
+) -> Option<ContractTarget> {
+    let managed = harness?;
+    let name = ai_jail_harness_name(managed)?;
+    let contract = ai_jail_contract(ai_jail, support)?;
+    Some(ContractTarget {
+        managed,
+        harness: name,
+        version: contract.version,
+    })
+}
+
+/// How the jailed re-run is launched.
+#[derive(Clone, Copy)]
+struct JailLaunch<'a> {
+    support: &'a JailSupport,
+    contract: Option<&'a ContractTarget>,
+}
+
+/// What a contract launch needs from [`exec_under_ai_jail`].
+#[derive(Clone, Copy)]
+struct ContractExec<'a> {
+    contract: &'a ContractTarget,
+    exe: &'a Path,
+    forwarded: &'a [OsString],
+    present: &'a [&'static str],
+    resolved: &'a [(&'static str, String)],
+}
+
+/// Re-exec under ai-jail 3.0.1+ (docs/design-yolo-safety-ai-jail.md §6):
+/// declare the harness, pass what it needs as command-line grants, ask the
+/// read-only `status --json` whether the launch can start, and launch.
+/// Returns only on failure.
+fn exec_under_ai_jail_contract(
+    ai_jail: &Path,
+    config: &Config,
+    exec: ContractExec<'_>,
+    toggles: &[JailToggleChoice],
+    folders: &[super::jail_folders::ExtraFolder],
+) -> anyhow::Error {
+    let i18n = &config.i18n;
+    let reach = server_reach(&config.server_url);
+    let folder_pairs: Vec<(&Path, bool)> = folders
+        .iter()
+        .map(|folder| (folder.path.as_path(), folder.writable))
+        .collect();
+    let env_names = harness_env_names(exec.contract.managed, exec.present);
+    let flags = contract_flags(
+        exec.contract.harness,
+        reach,
+        &env_names,
+        toggles,
+        &folder_pairs,
+    );
+    let status = jail_status(
+        ai_jail,
+        &contract_status_invocation(&flags, exec.exe, exec.forwarded),
+        exec.resolved,
+    );
+    if let Some(refusal) = status.as_ref().and_then(status_refusal) {
+        return jail_refusal_error(i18n, ai_jail, exec.contract.harness, refusal);
+    }
+    eprintln!("{}", jail_summary(toggles, false, folders));
+    eprintln!(
+        "{}",
+        contract_summary(i18n, &exec.contract.version, exec.contract.harness, reach)
+    );
+    reexec_under_ai_jail(
+        ai_jail,
+        &contract_invocation(&flags, exec.exe, exec.forwarded),
+        exec.resolved,
+    )
+}
+
+/// The error for a launch `status --json` says cannot start, quoting
+/// ai-jail's reason. Drifted access names the command that reviews it again.
+fn jail_refusal_error(
+    i18n: &ai_memory_core::i18n::Localizer,
+    ai_jail: &Path,
+    harness: &str,
+    refusal: JailRefusal,
+) -> anyhow::Error {
+    match refusal {
+        JailRefusal::Backend(message) => anyhow!(i18n.diagnostic(&format!(
+            "ai-jail cannot start its sandbox on this machine: {message}"
+        ))),
+        JailRefusal::Drift(message) => {
+            let review = format!(
+                "{} configure {harness}",
+                super::render_shared::shell_quote(&ai_jail.to_string_lossy())
+            );
+            anyhow!(i18n.diagnostic(&format!(
+                "ai-jail's saved access for this project no longer matches this machine: {message}. Review it with: {review}"
+            )))
+        }
+    }
+}
+
+/// The second summary line of a contract launch: who reviews the rest of the
+/// access and how the memory server is reached.
+fn contract_summary(
+    i18n: &ai_memory_core::i18n::Localizer,
+    version: &str,
+    harness: &str,
+    reach: ServerReach,
+) -> String {
+    let server = match reach {
+        ServerReach::Loopback { port } => {
+            i18n.diagnostic(&format!("memory server through forwarded port {port}"))
+        }
+        ServerReach::Network => {
+            i18n.diagnostic("full network, because the memory server is not on this machine")
+        }
+    };
+    i18n.diagnostic(&format!(
+        "ai-memory: ai-jail {version} reviews the rest of the access for {harness} ({server})"
+    ))
+}
+
+/// Run `status --json` for the exact launch. `None` when it fails or prints
+/// something else: the launch then goes ahead and ai-jail explains any
+/// refusal itself.
+fn jail_status(
+    ai_jail: &Path,
+    args: &[OsString],
+    env: &[(&'static str, String)],
+) -> Option<ai_memory_workstream::JailStatus> {
+    let output = std::process::Command::new(ai_jail)
+        .args(args)
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_status(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Re-exec the original invocation under `ai_jail` with `toggles`, after the
@@ -2935,10 +3740,17 @@ async fn confirm_yolo_and_maybe_reexec(
 fn exec_under_ai_jail(
     ai_jail: &Path,
     config: &Config,
-    support: &JailSupport,
+    launch: JailLaunch<'_>,
     toggles: &[JailToggleChoice],
     project_config: bool,
+    folders: &[super::jail_folders::ExtraFolder],
+    next_run: Option<String>,
 ) -> anyhow::Error {
+    if !folders.is_empty() && !launch.support.mounts_folders() {
+        return anyhow!(
+            "this ai-jail cannot mount extra folders (--map / --rw-map); update ai-jail or drop --jail-map"
+        );
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -2947,8 +3759,26 @@ fn exec_under_ai_jail(
         }
     };
     let forwarded = jail_forwarded_args(config, std::env::args_os().skip(1));
-    let resolved = jail_resolved_env(config);
+    let mut resolved = jail_resolved_env(config);
+    if let Some(command) = next_run {
+        resolved.push((NEXT_RUN_ENV, command));
+    }
     let present = jail_forwarded_names(config, &resolved);
+    if let Some(contract) = launch.contract {
+        return exec_under_ai_jail_contract(
+            ai_jail,
+            config,
+            ContractExec {
+                contract,
+                exe: &exe,
+                forwarded: &forwarded,
+                present: &present,
+                resolved: &resolved,
+            },
+            toggles,
+            folders,
+        );
+    }
     // `--agent-state` is a bare toggle: enable it so the harness's own login
     // state survives ai-jail's ephemeral private home (ai-jail derives the
     // per-harness state location from the wrapped `run <harness>` it parses).
@@ -2959,10 +3789,14 @@ fn exec_under_ai_jail(
         &forwarded,
         &present,
         true,
-        support.supports("no-save-config"),
+        launch.support.supports("no-save-config"),
         toggles,
+        &folders
+            .iter()
+            .map(|folder| (folder.path.as_path(), folder.writable))
+            .collect::<Vec<_>>(),
     );
-    eprintln!("{}", jail_summary(toggles, project_config));
+    eprintln!("{}", jail_summary(toggles, project_config, folders));
     reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
 }
 
@@ -5516,16 +6350,388 @@ mod tests {
             .collect()
     }
 
-    fn run_checklist(input: &str) -> (io::Result<Vec<String>>, String) {
+    fn checklist_view(items: &[JailChecklistItem]) -> ChecklistView {
+        ChecklistView {
+            i18n: ai_memory_core::i18n::Localizer::default(),
+            paint: Paint::PLAIN,
+            reasons: vec![None; items.len()],
+            recommended: items.iter().map(|item| item.checked).collect(),
+            last_saved: None,
+            new: Vec::new(),
+            gone: Vec::new(),
+            folders_supported: true,
+        }
+    }
+
+    fn folder(path: &str, writable: bool) -> super::super::jail_folders::ExtraFolder {
+        super::super::jail_folders::ExtraFolder {
+            path: path.into(),
+            writable,
+        }
+    }
+
+    fn run_checklist_with(
+        view: &ChecklistView,
+        items: &[JailChecklistItem],
+        input: &str,
+        picked: Option<Vec<super::super::jail_folders::ExtraFolder>>,
+    ) -> (io::Result<ChecklistOutcome>, String, usize) {
         let mut output = Vec::new();
+        let mut opened = 0;
+        let mut pick = |_: &[super::super::jail_folders::ExtraFolder]| {
+            opened += 1;
+            Ok(picked.clone())
+        };
         let result = read_jail_checklist(
-            &ai_memory_core::i18n::Localizer::default(),
-            &checklist_items(),
+            view,
+            items,
+            Vec::new(),
             &mut Cursor::new(input.as_bytes().to_vec()),
             &mut output,
+            &mut pick,
+        );
+        (result, String::from_utf8(output).unwrap(), opened)
+    }
+
+    /// The folder-only screen ai-jail 3.0.1+ gets: no toggle rows, `f`
+    /// still opens the picker, and a number is refused instead of flipping a
+    /// row that is not there.
+    #[test]
+    fn the_folder_only_screen_offers_folders_and_refuses_row_numbers() {
+        let items: Vec<JailChecklistItem> = Vec::new();
+        let view = checklist_view(&items);
+        let (result, printed, opened) = run_checklist_with(
+            &view,
+            &items,
+            "1\nf\n\n",
+            Some(vec![folder("/src/sibling", false)]),
+        );
+        let outcome = result.unwrap();
+        assert_eq!(opened, 1);
+        assert!(outcome.marked.is_empty());
+        assert_eq!(outcome.folders, [folder("/src/sibling", false)]);
+        assert!(
+            printed.contains("ai-jail: extra folders for the agent"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("f folders · reset · Enter go"),
+            "{printed}"
+        );
+        assert!(!printed.contains("numbers flip"), "{printed}");
+        assert!(!printed.contains("what the agent can reach"), "{printed}");
+    }
+
+    #[test]
+    fn the_next_run_under_ai_jail_3_is_a_bare_jail_with_the_folders() {
+        let next = NextRun {
+            harness: Some("claude".into()),
+            ..NextRun::default()
+        };
+        assert_eq!(
+            next_run_command(&next, None, &[folder("/src/sibling", true)]),
+            "ai-memory run --jail --jail-rw-map /src/sibling claude"
+        );
+    }
+
+    #[test]
+    fn the_contract_summary_names_how_the_server_is_reached() {
+        let i18n = ai_memory_core::i18n::Localizer::default();
+        assert_eq!(
+            contract_summary(
+                &i18n,
+                "3.0.1",
+                "claude",
+                ServerReach::Loopback { port: 49374 }
+            ),
+            "ai-memory: ai-jail 3.0.1 reviews the rest of the access for claude (memory server through forwarded port 49374)"
+        );
+        assert!(
+            contract_summary(&i18n, "3.0.1", "codex", ServerReach::Network)
+                .contains("full network, because the memory server is not on this machine")
+        );
+    }
+
+    fn run_checklist(input: &str) -> (io::Result<Vec<String>>, String) {
+        let items = checklist_items();
+        let (result, printed, _) = run_checklist_with(&checklist_view(&items), &items, input, None);
+        let flags = result.map(|outcome| {
+            marked_choices(&outcome.marked)
+                .iter()
+                .map(JailToggleChoice::flag)
+                .collect()
+        });
+        (flags, printed)
+    }
+
+    /// `f` opens the picker and keeps what it returns; Esc there (None)
+    /// keeps the previous folders. `reset` restores the recommended marks
+    /// and clears the folders.
+    #[test]
+    fn checklist_f_opens_the_folder_picker_and_reset_restores_the_recommendation() {
+        let items = checklist_items();
+        let view = checklist_view(&items);
+        let picked = vec![folder("/home/u/Projects/ai-jail", false)];
+        let (outcome, printed, opened) =
+            run_checklist_with(&view, &items, "f\n\n", Some(picked.clone()));
+        let outcome = outcome.unwrap();
+        assert_eq!(opened, 1);
+        assert_eq!(outcome.folders, picked);
+        assert!(
+            printed.contains("📁 Extra folders: ai-jail (ro)"),
+            "{printed}"
+        );
+
+        let (outcome, _, _) = run_checklist_with(&view, &items, "f\n\n", None);
+        assert!(
+            outcome.unwrap().folders.is_empty(),
+            "a cancelled picker changes nothing"
+        );
+
+        let (outcome, _, _) = run_checklist_with(&view, &items, "1 3\nf\nreset\n\n", Some(picked));
+        let outcome = outcome.unwrap();
+        assert!(outcome.folders.is_empty());
+        assert_eq!(
+            marked_choices(&outcome.marked)
+                .iter()
+                .map(JailToggleChoice::flag)
+                .collect::<Vec<_>>(),
+            ["--github", "--aws", "--no-ssh", "--no-docker"]
+        );
+    }
+
+    #[test]
+    fn checklist_without_folder_support_hides_f_and_refuses_it() {
+        let items = checklist_items();
+        let mut view = checklist_view(&items);
+        view.folders_supported = false;
+        let (outcome, printed, opened) = run_checklist_with(&view, &items, "f\n\n", None);
+        assert!(outcome.is_ok());
+        assert_eq!(opened, 0);
+        assert!(!printed.contains("f folders"), "{printed}");
+        assert!(printed.contains("cannot mount extra folders"), "{printed}");
+    }
+
+    /// Each row says why it is recommended, the header names the remembered
+    /// answers and what changed since, and the risk shows on the row.
+    #[test]
+    fn checklist_explains_recommendations_and_changes_tersely() {
+        let items = checklist_items();
+        let mut view = checklist_view(&items);
+        view.reasons = vec![
+            Some("found on this machine"),
+            None,
+            Some("origin pushes over SSH"),
+            None,
+        ];
+        view.last_saved = Some("2026-11-05".into());
+        view.new = vec!["ssh"];
+        view.gone = vec!["kube".into()];
+        let (_, printed, _) = run_checklist_with(&view, &items, "\n", None);
+        assert!(
+            printed.contains("🔒 ai-jail: what the agent can reach"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("your choices from 2026-11-05"),
+            "{printed}"
+        );
+        assert!(printed.contains("new: ssh"), "{printed}");
+        assert!(printed.contains("no longer offered: kube"), "{printed}");
+        assert!(
+            printed.contains("GitHub CLI credentials   🔑 "),
+            "{printed}"
+        );
+        assert!(printed.contains("· found on this machine"), "{printed}");
+        assert!(
+            printed.contains("· origin pushes over SSH new"),
+            "{printed}"
+        );
+        assert!(printed.contains("⚠ grants host root"), "{printed}");
+        assert!(printed.contains("numbers flip · f folders · all · none · reset · Enter go"));
+        assert!(
+            !printed.contains('\u{1b}'),
+            "plain output carries no escape codes"
+        );
+    }
+
+    #[test]
+    fn next_run_command_repeats_the_choices_without_one_off_parts() {
+        let next = NextRun {
+            yolo: true,
+            workspace: Some("team".into()),
+            harness: Some("claude".into()),
+            ..NextRun::default()
+        };
+        let choices = [
+            JailToggleChoice {
+                stem: "github",
+                enable: true,
+                implied: false,
+            },
+            JailToggleChoice {
+                stem: "docker",
+                enable: false,
+                implied: true,
+            },
+            JailToggleChoice {
+                stem: "ssh",
+                enable: true,
+                implied: false,
+            },
+        ];
+        let folders = [
+            folder("/home/u/Projects/ai-jail", false),
+            folder("/home/u/My Projects/tap", true),
+        ];
+        assert_eq!(
+            next_run_command(&next, Some(&choices), &folders),
+            "ai-memory run --yolo --workspace team --jail=github,ssh \
+             --jail-map /home/u/Projects/ai-jail --jail-rw-map '/home/u/My Projects/tap' claude"
+        );
+        let bare = NextRun {
+            true_yolo: true,
+            ..NextRun::default()
+        };
+        let off = [JailToggleChoice {
+            stem: "github",
+            enable: false,
+            implied: false,
+        }];
+        assert_eq!(
+            next_run_command(&bare, Some(&off), &[]),
+            "ai-memory run --true-yolo --jail=none"
+        );
+        let full = NextRun {
+            yolo: true,
+            no_autowire: true,
+            profile: Some("work".into()),
+            env_file: Some("/home/u/.env.ai".into()),
+            had_env: true,
+            harness: Some("codex".into()),
+            ..NextRun::default()
+        };
+        assert_eq!(
+            next_run_command(&full, Some(&off), &[]),
+            "ai-memory run --yolo --no-autowire --profile work --env-file /home/u/.env.ai \
+             --jail=none codex   # add your --env values again"
+        );
+    }
+
+    /// Remembered answers come back for the same checkout only; a folder
+    /// that no longer exists (or no longer passes the rules) is dropped and
+    /// reported, and a command-line folder is added on top.
+    #[test]
+    fn recalled_answers_drop_folders_that_no_longer_qualify() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let checkout = home.join("Projects/api");
+        let sibling = home.join("Projects/ai-jail");
+        let tap = home.join("Projects/tap");
+        for dir in [&checkout, &sibling, &tap] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let config = Config {
+            data_dir: root.path().join("data"),
+            ..Config::default()
+        };
+        let gone = home.join("Projects/deleted");
+        super::super::jail_choices::save(
+            &config.data_dir,
+            "worktree-a",
+            super::super::jail_choices::Remembered {
+                enabled: vec!["ssh".into()],
+                disabled: vec!["github".into(), "aws".into(), "docker".into()],
+                folders: vec![
+                    folder(&sibling.to_string_lossy(), false),
+                    folder(&gone.to_string_lossy(), true),
+                ],
+                saved_at: "2026-11-05T12:00:00Z".into(),
+            },
         )
-        .map(|choices| choices.iter().map(JailToggleChoice::flag).collect());
-        (result, String::from_utf8(output).unwrap())
+        .unwrap();
+        let inputs = JailInputs {
+            checkout_key: "worktree-a".into(),
+            checkout_root: checkout.clone(),
+            home: home.clone(),
+            flag_folders: vec![folder(&tap.to_string_lossy(), true)],
+            next_run: NextRun::default(),
+        };
+        let mut items = checklist_items();
+        let (saved, applied, folders) = recall_jail_answers(&config, &inputs, &mut items);
+        assert_eq!(saved.as_deref(), Some("2026-11-05"));
+        assert_eq!(
+            items.iter().map(|item| item.checked).collect::<Vec<_>>(),
+            [false, false, true, false]
+        );
+        assert_eq!(
+            folders,
+            [
+                folder(&sibling.to_string_lossy(), false),
+                folder(&tap.to_string_lossy(), true)
+            ]
+        );
+        assert_eq!(applied.gone, [format!("📁 {}", gone.display())]);
+
+        let other = JailInputs {
+            checkout_key: "worktree-b".into(),
+            flag_folders: Vec::new(),
+            ..inputs
+        };
+        let mut items = checklist_items();
+        let (saved, applied, folders) = recall_jail_answers(&config, &other, &mut items);
+        assert_eq!(saved, None, "another checkout has its own answers");
+        assert_eq!(applied, super::super::jail_choices::Applied::default());
+        assert!(folders.is_empty());
+        assert_eq!(
+            items.iter().map(|item| item.checked).collect::<Vec<_>>(),
+            [true, true, false, false],
+            "the smart defaults stay"
+        );
+    }
+
+    #[test]
+    fn the_next_run_hint_is_two_terse_lines_and_plain_without_color() {
+        let hint = next_run_hint(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
+            "ai-memory run --yolo --jail=github claude",
+        );
+        assert_eq!(
+            hint,
+            "\nNext time, start with the same jail choices:\n  ai-memory run --yolo --jail=github claude\n"
+        );
+    }
+
+    #[test]
+    fn flag_folders_are_validated_and_deduplicated() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let checkout = home.join("Projects/api");
+        let sibling = home.join("Projects/ai-jail");
+        for dir in [&checkout, &sibling, &home.join(".ssh")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let config = Config {
+            data_dir: root.path().join("data"),
+            ..Config::default()
+        };
+        let folders = validate_flag_folders(
+            &config,
+            &checkout,
+            &home,
+            &[
+                (PathBuf::from("../ai-jail"), false),
+                (sibling.clone(), true),
+            ],
+        )
+        .unwrap();
+        assert_eq!(folders, [folder(&sibling.to_string_lossy(), true)]);
+        let refused =
+            validate_flag_folders(&config, &checkout, &home, &[(home.join(".ssh"), false)])
+                .unwrap_err()
+                .to_string();
+        assert!(refused.contains("cannot mount"), "{refused}");
     }
 
     #[test]
@@ -5536,7 +6742,7 @@ mod tests {
             ["--github", "--aws", "--no-ssh", "--no-docker"],
             "every row as seen: unchecked rows are forced off"
         );
-        assert!(printed.contains("Enable in the jail (Enter = as marked"));
+        assert!(printed.contains("🔒 ai-jail: what the agent can reach (Enter keeps the marks)"));
         assert!(printed.contains("[x] 1) GitHub CLI credentials"));
         assert!(printed.contains("[x] 2) AWS credentials"));
         assert!(printed.contains("[ ] 3) SSH keys + agent"));
@@ -5728,21 +6934,22 @@ mod tests {
                     choice("ssh", true),
                     choice("mise", false),
                 ],
-                false
+                false,
+                &[]
             ),
             "ai-memory: re-running inside ai-jail (credentials: GitHub CLI credentials, \
              SSH keys + agent; capabilities: GPU devices; forced off: --no-mise)"
         );
         assert_eq!(
-            jail_summary(&[], false),
+            jail_summary(&[], false, &[]),
             "ai-memory: re-running inside ai-jail with no extra mounts"
         );
         assert_eq!(
-            jail_summary(&[], true),
+            jail_summary(&[], true, &[]),
             "ai-memory: re-running inside ai-jail (plus the project .ai-jail)"
         );
         assert_eq!(
-            jail_summary(&[choice("gpu", true)], true),
+            jail_summary(&[choice("gpu", true)], true, &[]),
             "ai-memory: re-running inside ai-jail (capabilities: GPU devices; plus the \
              project .ai-jail)"
         );
@@ -5756,13 +6963,26 @@ mod tests {
                     implied_off("docker"),
                     implied_off("gpu"),
                 ],
-                false
+                false,
+                &[]
             ),
             "ai-memory: re-running inside ai-jail (credentials: GitHub CLI credentials; \
              forced off: --no-mise; everything else in the checklist off)"
         );
         assert_eq!(
-            jail_summary(&[implied_off("docker")], false),
+            jail_summary(
+                &[choice("github", true)],
+                false,
+                &[super::super::jail_folders::ExtraFolder {
+                    path: "/home/u/Projects/ai-jail".into(),
+                    writable: false,
+                }]
+            ),
+            "ai-memory: re-running inside ai-jail (credentials: GitHub CLI credentials; \
+             folders: ai-jail (ro))"
+        );
+        assert_eq!(
+            jail_summary(&[implied_off("docker")], false, &[]),
             "ai-memory: re-running inside ai-jail (everything else in the checklist off)"
         );
     }
@@ -5798,6 +7018,7 @@ mod tests {
         let mut output = Vec::new();
         let confirmation = read_yolo_confirmation(
             &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
             false,
             &mut input,
             &mut output,
@@ -5821,6 +7042,7 @@ mod tests {
         let mut output = Vec::new();
         let confirmation = read_yolo_confirmation(
             &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
             true,
             &mut input,
             &mut output,
@@ -5846,6 +7068,7 @@ mod tests {
         let mut output = Vec::new();
         let confirmation = read_yolo_confirmation(
             &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
             true,
             &mut input,
             &mut output,
@@ -5874,6 +7097,8 @@ mod tests {
             true_yolo: true,
             jail: None,
             no_jail: true,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: true,
             force_unlock: false,
             no_autowire: true,
@@ -5894,6 +7119,7 @@ mod tests {
         let mut output = Vec::new();
         let action = choose_after_run(
             &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
             ManagedHarness::Claude,
             "research",
             &[RunHarnessChoice::Codex],
@@ -5917,6 +7143,7 @@ mod tests {
         assert_eq!(
             choose_after_run(
                 &ai_memory_core::i18n::Localizer::default(),
+                Paint::PLAIN,
                 ManagedHarness::Claude,
                 "research",
                 &[RunHarnessChoice::Codex],
@@ -8060,6 +9287,8 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: true,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: true,
@@ -8410,6 +9639,8 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: true,
@@ -8519,6 +9750,8 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: true,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: true,
@@ -9016,6 +10249,8 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: true,
@@ -9897,6 +11132,8 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: false,
@@ -10029,6 +11266,8 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: false,
@@ -10445,6 +11684,8 @@ mod tests {
             true_yolo: false,
             jail: None,
             no_jail: false,
+            jail_map: Vec::new(),
+            jail_rw_map: Vec::new(),
             fresh: false,
             force_unlock: false,
             no_autowire: false,

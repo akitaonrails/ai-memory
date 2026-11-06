@@ -204,30 +204,46 @@ pub fn upsert_page(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId>
     Ok(result_id)
 }
 
-/// Reindex a disk page without reviving a purged session's summary.
+/// Reindex or restore a page without reviving a purged session's summary.
 /// The tombstone and any surviving manual version are checked in the upsert
 /// transaction, so a directory walk's earlier snapshot cannot authorize a
-/// write after a session purge. Explicit page writes/restores use `upsert_page`.
+/// write after a session purge. Explicit new page writes use `upsert_page`.
 pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResult<PageId> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
-    let session = page
-        .path
+    check_page_restore_allowed(
+        &tx,
+        page.workspace_id,
+        page.project_id,
+        &page.path,
+        &page.frontmatter_json,
+    )?;
+    let id = upsert_page_in_tx(&tx, page, now)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Check the original page metadata against session-purge tombstones.
+pub(crate) fn check_page_restore_allowed(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> StoreResult<()> {
+    let session = path
         .as_str()
         .strip_prefix("sessions/")
         .and_then(|rest| rest.strip_suffix(".md"))
         .and_then(|id| id.parse::<SessionId>().ok());
     if let Some(session) = session {
         let session_text = session.to_string();
-        let owns_file = page
-            .frontmatter_json
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            == Some(session_text.as_str());
+        let owns_file =
+            frontmatter.get("session_id").and_then(|v| v.as_str()) == Some(session_text.as_str());
         // #866 keeps manual versions at this path. They may keep changing,
         // but absence of `session_id` alone is not permission to recreate a
         // deleted page: legacy summaries can lack that field too (#701).
-        let blocked: bool = tx.query_row(
+        let blocked: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM purged_sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3) \
                AND (?6 OR NOT EXISTS(SELECT 1 FROM pages \
@@ -235,10 +251,10 @@ pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResu
                    AND is_latest = 1 \
                    AND json_extract(frontmatter_json, '$.session_id') IS NOT ?5))",
             params![
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
                 session.as_bytes(),
-                page.path.as_str(),
+                path.as_str(),
                 session_text,
                 owns_file
             ],
@@ -248,9 +264,7 @@ pub fn upsert_page_from_disk(conn: &mut Connection, page: &NewPage) -> StoreResu
             return Err(StoreError::SessionPurged(session_text));
         }
     }
-    let id = upsert_page_in_tx(&tx, page, now)?;
-    tx.commit()?;
-    Ok(id)
+    Ok(())
 }
 
 /// What a conditional page write requires of the current latest version.
@@ -602,6 +616,20 @@ pub struct ProjectAliasWriteResolution {
     pub promoted_from: Option<String>,
 }
 
+/// Whether a project other than `except` is named `name` in the workspace.
+fn name_held_by_another_project(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &ai_memory_core::WorkspaceId,
+    name: &str,
+    except: ai_memory_core::ProjectId,
+) -> StoreResult<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE workspace_id = ?1 AND name = ?2 AND id <> ?3)",
+        params![workspace_id.as_bytes(), name, except.as_bytes()],
+        |row| row.get(0),
+    )?)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_project_name_for_write(
     conn: &mut Connection,
@@ -630,6 +658,16 @@ pub(crate) fn resolve_project_name_for_write(
             .then(|| crate::project_coordinates::promotion_target(&matched, requested))
             .flatten()
             .map(str::to_owned);
+        // A leftover row may still hold the canonical name (#2018); the owner
+        // keeps its current name rather than failing the write.
+        let promote_to = match promote_to {
+            Some(canonical)
+                if name_held_by_another_project(&tx, workspace_id, &canonical, matched.id)? =>
+            {
+                None
+            }
+            other => other,
+        };
         let promoted_from = if let Some(canonical) = promote_to {
             rename_project_in_tx(
                 &tx,
@@ -6584,6 +6622,192 @@ pub fn rename_project(
     Ok(())
 }
 
+/// What [`adopt_project_identity`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedProjectIdentity {
+    /// The project that now carries the repository identity, under its
+    /// final name.
+    pub project: String,
+    /// That project's name before the move.
+    pub previous: String,
+    /// The emptied project's name afterwards.
+    pub archived: String,
+    /// The repository identity that moved.
+    pub identity: String,
+}
+
+/// Move the repository identity of the empty project `from` onto `into`, the
+/// project that holds the checkout's sessions (#1993).
+///
+/// A checkout captured before it had a git remote keeps its sessions in a
+/// project named after the folder, while the remote, once added, gets its own
+/// project. Renaming alone leaves the identity on the remote project, so
+/// identity-based resolution keeps routing new work there. This moves the
+/// identity and its derived name keys, gives `into` the remote-derived name,
+/// and renames `from` to `archive_name` (default `<name>-split-<YYYYMMDD>`)
+/// when it held that name. Nothing is deleted. It is idempotent once applied.
+///
+/// # Errors
+/// - [`StoreError::NotFound`] when either project is missing from the
+///   workspace.
+/// - [`StoreError::InvalidState`] when the two are the same project, `from`
+///   carries no identity, `into` already carries a different one, `from`
+///   holds sessions or pages, or a managed run is live in `from`.
+/// - [`StoreError::ProjectNameTaken`] / [`StoreError::InvalidProjectName`]
+///   from the renames.
+pub fn adopt_project_identity(
+    conn: &mut Connection,
+    workspace_id: &WorkspaceId,
+    into: &ProjectId,
+    from: &ProjectId,
+    archive_name: Option<&str>,
+    author_id: Option<ai_memory_core::UserId>,
+) -> StoreResult<AdoptedProjectIdentity> {
+    if into == from {
+        return Err(StoreError::InvalidState(
+            "a project cannot adopt its own identity".into(),
+        ));
+    }
+    let tx = conn.transaction()?;
+    let load = |id: &ProjectId| -> StoreResult<[String; 5]> {
+        tx.query_row(
+            "SELECT name, identity, identity_source, canonical_name, legacy_name \
+             FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![id.as_bytes(), workspace_id.as_bytes()],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ])
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::NotFound(format!(
+                "project id {id} is not in workspace {workspace_id}"
+            ))
+        })
+    };
+    let [into_name, into_identity, ..] = load(into)?;
+    let [from_name, identity, source, canonical, legacy] = load(from)?;
+    let count = |sql: &str| -> StoreResult<i64> {
+        Ok(tx.query_row(sql, [from.as_bytes()], |row| row.get(0))?)
+    };
+    if count("SELECT COUNT(*) FROM sessions WHERE project_id = ?1")? > 0
+        || count("SELECT COUNT(*) FROM pages WHERE project_id = ?1")? > 0
+    {
+        return Err(StoreError::InvalidState(format!(
+            "project '{from_name}' holds its own sessions or pages; compare the two projects \
+             before merging them"
+        )));
+    }
+    if identity.is_empty() {
+        if into_identity.is_empty() {
+            return Err(StoreError::InvalidState(format!(
+                "project '{from_name}' has no repository identity to move"
+            )));
+        }
+        // Already applied: the empty project gave its identity away earlier.
+        return Ok(AdoptedProjectIdentity {
+            previous: into_name.clone(),
+            project: into_name,
+            archived: from_name,
+            identity: into_identity,
+        });
+    }
+    if !into_identity.is_empty() && into_identity != identity {
+        return Err(StoreError::InvalidState(format!(
+            "project '{into_name}' already belongs to repository {into_identity}"
+        )));
+    }
+    if count(
+        "SELECT COUNT(*) FROM managed_runs r JOIN workstreams w ON w.id = r.workstream_id \
+         WHERE w.project_id = ?1 AND r.state = 'active'",
+    )? > 0
+    {
+        return Err(StoreError::InvalidState(format!(
+            "a managed run is still active in project '{from_name}'; let it finish first"
+        )));
+    }
+    let target = if canonical.is_empty() {
+        from_name.clone()
+    } else {
+        canonical.clone()
+    };
+    // The identity index is unique per workspace: clear it on `from` before
+    // `into` takes it.
+    tx.execute(
+        "UPDATE projects SET identity = '', identity_source = '', canonical_name = '', \
+         legacy_name = '' WHERE id = ?1",
+        [from.as_bytes()],
+    )?;
+    let archived = if from_name == target {
+        let archive = archive_name.map_or_else(
+            || {
+                format!(
+                    "{from_name}-split-{}",
+                    jiff::Zoned::now().strftime("%Y%m%d")
+                )
+            },
+            |name| name.trim().to_owned(),
+        );
+        rename_project_in_tx(
+            &tx,
+            workspace_id,
+            from,
+            Some(&from_name),
+            &archive,
+            author_id,
+            "adopt_project_identity",
+        )?;
+        archive
+    } else {
+        from_name
+    };
+    if into_name != target {
+        rename_project_in_tx(
+            &tx,
+            workspace_id,
+            into,
+            Some(&into_name),
+            &target,
+            author_id,
+            "adopt_project_identity",
+        )?;
+    }
+    tx.execute(
+        "UPDATE projects SET identity = ?1, identity_source = ?2, canonical_name = ?3, \
+         legacy_name = ?4 WHERE id = ?5",
+        params![identity, source, canonical, legacy, into.as_bytes()],
+    )?;
+    let detail = serde_json::json!({
+        "identity": identity,
+        "into": target,
+        "from": archived,
+    })
+    .to_string();
+    audit_with_detail(
+        &tx,
+        "adopt_project_identity",
+        Some(workspace_id.as_bytes()),
+        Some(into.as_bytes()),
+        None,
+        author_id.as_ref().map(ai_memory_core::UserId::as_bytes),
+        Timestamp::now().as_microsecond(),
+        &detail,
+    )?;
+    tx.commit()?;
+    Ok(AdoptedProjectIdentity {
+        project: target,
+        previous: into_name,
+        archived,
+        identity,
+    })
+}
+
 /// Record a successfully-applied wiki-structure migration.
 ///
 /// Uses `INSERT OR IGNORE` so re-running the same name is a no-op
@@ -7446,11 +7670,14 @@ pub(crate) fn purge_session_with_owner(
     // Query-signal associations (#1941) this session wrote last carry its
     // query text. The row goes with the session, even when earlier sessions
     // also confirmed it: the text is the user's, and the boost is a
-    // convenience that the next confirming session rebuilds.
+    // convenience that the next confirming session rebuilds. Not scoped to
+    // this project: a row is filed under the QUERIED project, so a session
+    // that searched a sibling scope left its text there. No index covers
+    // `last_session`; this rare path scans the opt-in table rather than make
+    // every signal upsert maintain one.
     tx.execute(
-        "DELETE FROM query_page_signals \
-          WHERE workspace_id = ?1 AND project_id = ?2 AND last_session = ?3",
-        rusqlite::params![&wid[..], &pid[..], session_id.to_string()],
+        "DELETE FROM query_page_signals WHERE last_session = ?1",
+        rusqlite::params![session_id.to_string()],
     )?;
 
     // Tombstone before the row goes, in the same transaction: a purge that
@@ -7845,6 +8072,11 @@ pub fn purge_project(
         });
     }
 
+    // Query signals this project's sessions filed under OTHER projects carry
+    // their query text; the cascade below only reaches this project's rows.
+    // Must run before the cascade removes the sessions it matches against.
+    delete_query_signals_of_sessions(&tx, "project_id = ?1", &pid[..])?;
+
     // Cascade handles pages / sessions / observations / handoffs /
     // page_embeddings. The workspace row is intentionally left intact —
     // other projects may still live there.
@@ -7899,6 +8131,30 @@ pub fn purge_project(
         workstream_ids,
         compacted,
     })
+}
+
+/// Delete the query-signal rows (#1941) whose `last_session` is one of the
+/// sessions `sessions_where` selects, in any project.
+///
+/// A signal row is filed under the project that was queried, not the one the
+/// session belongs to, so a purge's own cascade misses the rows its sessions
+/// left in sibling scopes — and each still holds the session's query text.
+/// `last_session` is the session id's hyphenated text form (see
+/// [`record_query_page_signal`]), rebuilt here from the blob key so the delete
+/// is one statement rather than a per-session loop.
+fn delete_query_signals_of_sessions(
+    tx: &rusqlite::Transaction<'_>,
+    sessions_where: &str,
+    id: &[u8],
+) -> StoreResult<u64> {
+    let sql = format!(
+        "DELETE FROM query_page_signals WHERE last_session IN ( \
+           SELECT lower(substr(hex(id), 1, 8) || '-' || substr(hex(id), 9, 4) || '-' \
+                     || substr(hex(id), 13, 4) || '-' || substr(hex(id), 17, 4) || '-' \
+                     || substr(hex(id), 21, 12)) \
+             FROM sessions WHERE {sessions_where})"
+    );
+    Ok(tx.execute(&sql, rusqlite::params![id])? as u64)
 }
 
 /// Summary returned by [`delete_workspace`].
@@ -8072,6 +8328,9 @@ pub fn delete_workspace(
         });
     }
 
+    // Same cross-scope query-signal cleanup as `purge_project`, before the
+    // cascade removes the sessions it matches against.
+    delete_query_signals_of_sessions(&tx, "workspace_id = ?1", &wid[..])?;
     let removed = tx.execute(
         "DELETE FROM workspaces WHERE id = ?1",
         rusqlite::params![&wid[..]],
@@ -18436,6 +18695,155 @@ pub(crate) mod tests {
     /// `404 Not Found`. Pins both the writer-side semantic and a
     /// concrete recipe for the failure shape so a future refactor
     /// can't quietly downgrade the error back to a silent Ok.
+    /// A folder-named project holding the sessions (`api`) and the empty
+    /// remote-named project that owns the repository identity (`acme-api`):
+    /// the state #1993 left behind.
+    fn split_projects(conn: &mut Connection, ws: &WorkspaceId) -> (ProjectId, ProjectId) {
+        let folder = get_or_create_project(conn, ws, "api", None).unwrap();
+        begin_session(conn, &hook_session(SessionId::new(), *ws, folder, None)).unwrap();
+        let (remote, _) = resolve_project_by_identity(
+            conn,
+            ws,
+            &acme_api_identity(),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
+            false,
+            "acme-api",
+            None,
+            None,
+            None,
+            crate::AccessMode::Open,
+        )
+        .unwrap();
+        assert_ne!(folder, remote, "the fixture must reproduce the split");
+        (folder, remote)
+    }
+
+    fn acme_api_identity() -> ai_memory_core::repository_identity::RepositoryIdentity {
+        ai_memory_core::repository_identity::RepositoryIdentity {
+            identity: "github.com/acme/api".into(),
+            source: ai_memory_core::repository_identity::IdentitySource::GitRemote,
+        }
+    }
+
+    fn name_and_identity(conn: &Connection, id: &ProjectId) -> (String, String) {
+        conn.query_row(
+            "SELECT name, identity FROM projects WHERE id = ?1",
+            [id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Identity-based resolution reaches the session-holding project after the
+    /// move, for a fresh split and for one already renamed by hand (the
+    /// half-repaired state 3.4.1's two renames left), and a second call
+    /// changes nothing.
+    #[test]
+    fn adopt_project_identity_routes_the_remote_to_the_session_project() {
+        for renamed_by_hand in [false, true] {
+            let (_tmp, mut conn, ws, _) = fresh_db();
+            let (folder, remote) = split_projects(&mut conn, &ws);
+            if renamed_by_hand {
+                rename_project(&mut conn, &ws, &remote, "acme-api-split-20261105", None).unwrap();
+                rename_project(&mut conn, &ws, &folder, "acme-api", None).unwrap();
+            }
+            let adopted = adopt_project_identity(
+                &mut conn,
+                &ws,
+                &folder,
+                &remote,
+                Some("acme-api-split-20261105"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                adopted,
+                AdoptedProjectIdentity {
+                    project: "acme-api".into(),
+                    previous: String::from(if renamed_by_hand { "acme-api" } else { "api" }),
+                    archived: "acme-api-split-20261105".into(),
+                    identity: "github.com/acme/api".into(),
+                },
+                "renamed_by_hand={renamed_by_hand}"
+            );
+            assert_eq!(
+                name_and_identity(&conn, &folder),
+                ("acme-api".into(), "github.com/acme/api".into())
+            );
+            assert_eq!(
+                name_and_identity(&conn, &remote),
+                ("acme-api-split-20261105".into(), String::new())
+            );
+            let (resolved, _) = resolve_project_by_identity(
+                &mut conn,
+                &ws,
+                &acme_api_identity(),
+                ai_memory_core::repository_identity::IdentityStyle::Path,
+                false,
+                "acme-api",
+                None,
+                None,
+                None,
+                crate::AccessMode::Open,
+            )
+            .unwrap();
+            assert_eq!(resolved, folder, "renamed_by_hand={renamed_by_hand}");
+            let again =
+                adopt_project_identity(&mut conn, &ws, &folder, &remote, None, None).unwrap();
+            assert_eq!(
+                again,
+                AdoptedProjectIdentity {
+                    previous: "acme-api".into(),
+                    ..adopted
+                },
+                "applying it twice changes nothing"
+            );
+        }
+    }
+
+    /// Each refusal leaves both projects exactly as they were.
+    #[test]
+    fn adopt_project_identity_refuses_anything_that_could_hide_data() {
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        let before = (
+            name_and_identity(&conn, &folder),
+            name_and_identity(&conn, &remote),
+        );
+        let refused = |conn: &mut Connection, into: &ProjectId, from: &ProjectId| {
+            let error = adopt_project_identity(conn, &ws, into, from, None, None).unwrap_err();
+            assert!(matches!(error, StoreError::InvalidState(_)), "{error:?}");
+        };
+        // The session project cannot give away the identity it lacks, and a
+        // project cannot adopt itself.
+        refused(&mut conn, &remote, &folder);
+        refused(&mut conn, &folder, &folder);
+        // The remote project holds a session of its own.
+        let session = SessionId::new();
+        begin_session(&mut conn, &hook_session(session, ws, remote, None)).unwrap();
+        refused(&mut conn, &folder, &remote);
+        assert_eq!(
+            (
+                name_and_identity(&conn, &folder),
+                name_and_identity(&conn, &remote)
+            ),
+            before
+        );
+        // The session project already belongs to another repository.
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        conn.execute(
+            "UPDATE projects SET identity = 'github.com/acme/other', identity_source = 'git_remote' \
+             WHERE id = ?1",
+            [folder.as_bytes()],
+        )
+        .unwrap();
+        let error =
+            adopt_project_identity(&mut conn, &ws, &folder, &remote, None, None).unwrap_err();
+        assert!(matches!(error, StoreError::InvalidState(_)), "{error:?}");
+        assert_eq!(name_and_identity(&conn, &remote).1, "github.com/acme/api");
+    }
+
     #[test]
     fn rename_project_after_purge_returns_not_found() {
         let (_tmp, mut conn, ws, proj) = fresh_db();

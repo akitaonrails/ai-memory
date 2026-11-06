@@ -1095,16 +1095,59 @@ async fn link_run(
     if status.state != "active" {
         return error(StatusCode::CONFLICT, "managed run is not active");
     }
+    let native_session_id = native_identity.into_string();
     match state
         .writer
-        .link_managed_run_session(run_id, status.agent, native_identity.into_string())
+        .link_managed_run_session(run_id, status.agent, native_session_id.clone())
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => error(StatusCode::CONFLICT, "managed run is not active"),
+        Ok(false) => link_refusal(&state, run_id, native_session_id).await,
         Err(failure) => store_error_response(failure),
     }
 }
+
+/// Why a link of an active run was refused. A session the same operator
+/// captured under another project, which a project rename splits off (#1993),
+/// gets its own code naming both projects so `ai-memory run` can offer the
+/// repair; everything else keeps the generic conflict.
+async fn link_refusal(
+    state: &WorkstreamState,
+    run_id: ManagedRunId,
+    native_session_id: String,
+) -> Response {
+    match state
+        .reader
+        .managed_run_native_session_holder(run_id, native_session_id)
+        .await
+    {
+        Ok(Some(holder)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "native session belongs to project {}/{}, not {}/{}",
+                    holder.workspace, holder.project, holder.run_workspace, holder.run_project
+                ),
+                "code": NATIVE_SESSION_IN_OTHER_PROJECT,
+                "workspace": holder.workspace,
+                "session_project": holder.project,
+                "session_project_id": holder.project_id.to_string(),
+                "run_project": holder.run_project,
+                "run_project_id": holder.run_project_id.to_string(),
+                "run_workspace": holder.run_workspace,
+                "run_legacy_name": holder.run_legacy_name,
+                "run_sessions": holder.run_sessions,
+                "run_pages": holder.run_pages,
+            })),
+        )
+            .into_response(),
+        Ok(None) => error(StatusCode::CONFLICT, "managed run is not active"),
+        Err(failure) => store_error_response(failure),
+    }
+}
+
+/// `code` of the link conflict for a session held by another project.
+pub const NATIVE_SESSION_IN_OTHER_PROJECT: &str = "native_session_in_other_project";
 
 async fn recover_finish_run(
     State(state): State<WorkstreamState>,
@@ -1592,6 +1635,93 @@ mod tests {
             trusted_proxy_identity: false,
             finish_barrier: None,
         }
+    }
+
+    /// The link route turns a split session into a coded 409 the CLI can act
+    /// on (#1993); an unrelated refusal keeps the generic conflict.
+    #[tokio::test]
+    async fn a_link_refused_by_a_split_project_names_both_projects() {
+        use tower::ServiceExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let old = store
+            .writer
+            .get_or_create_project(ws, "api".to_string(), None)
+            .await
+            .unwrap();
+        let new = store
+            .writer
+            .get_or_create_project(ws, "acme-api".to_string(), None)
+            .await
+            .unwrap();
+        let run = store
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                ..prepare_input(ws, new, AgentKind::ClaudeCode, "launcher")
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: ai_memory_core::SessionId::from_native("split-native"),
+                workspace_id: ws,
+                project_id: old,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/repo".into()),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        let link = async |native: &str| {
+            let response = workstream_router(test_state(&store, temp.path()))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/workstream/runs/{}/link", run.run_id))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({ "native_session_id": native }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1 << 16).await.unwrap())
+                    .unwrap_or_default();
+            (status, body)
+        };
+
+        let (status, body) = link("split-native").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], NATIVE_SESSION_IN_OTHER_PROJECT);
+        assert_eq!(body["session_project"], "api");
+        assert_eq!(body["session_project_id"], old.to_string());
+        assert_eq!(body["run_project"], "acme-api");
+        assert_eq!(body["run_project_id"], new.to_string());
+        assert_eq!(body["run_workspace"], "default");
+        assert_eq!(
+            (body["run_sessions"].as_u64(), body["run_pages"].as_u64()),
+            (Some(0), Some(0))
+        );
+
+        // Control: a fresh session links, and then a different one is refused
+        // without any project named.
+        let (status, _) = link("fresh-native").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = link("another-native").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.get("code").is_none(), "{body}");
     }
 
     fn prepare_input(
@@ -5043,16 +5173,29 @@ mod tests {
         // The twin an earlier name-only run created under the derived name,
         // inserted directly: the capture path under test no longer mints it, so
         // this has to stand in for the row an older release left behind.
+        let twin = ai_memory_core::ProjectId::new();
         rusqlite::Connection::open(store.db_path())
             .unwrap()
             .execute(
                 "INSERT INTO projects (id, workspace_id, name, created_at) \
                  VALUES (?1, ?2, 'victorcesc-unknown-system', 0)",
-                rusqlite::params![
-                    ai_memory_core::ProjectId::new().as_bytes().to_vec(),
-                    workspace_id.as_bytes().to_vec()
-                ],
+                rusqlite::params![twin.as_bytes().to_vec(), workspace_id.as_bytes().to_vec()],
             )
+            .unwrap();
+        // The twin holds a session, so the name stays ambiguous: an empty twin
+        // would resolve to the identity owner by name alone (#2018).
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                occurred_at: None,
+                id: ai_memory_core::SessionId::new(),
+                workspace_id,
+                project_id: twin,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
             .unwrap();
 
         // By name alone the derived name names both projects.

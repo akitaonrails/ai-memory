@@ -161,9 +161,70 @@ infer an agent.
 
 ### Reload context after a compaction
 
-A compaction keeps a model-written summary of the conversation, and the
-summary can drop or soften what you asked. Start a prompt with
-`reload context` to put the stretch it dropped back in front of the agent:
+A compaction replaces the conversation with a model-written summary, and the
+summary can drop or soften what you asked. The start of the session goes
+first: the original task, its constraints, the early decisions. On a long
+session, or a local model with a context window around 200k tokens, this
+happens again and again. Every instruction surface ai-memory installs (the
+`AGENTS.md`/`CLAUDE.md` block, the MCP handshake and the handoff skill) tells
+the agent to re-ground on ai-memory after a compaction before it continues,
+and to trust your recorded prompts over the summary. Some harnesses also get
+the evidence injected automatically.
+
+#### Automatic: the post-compaction anchor
+
+Where the harness has a hook that runs after a compaction, ai-memory injects a
+**post-compaction anchor** for the session, built by
+`GET /recap?session_id=<id>&mode=anchor`:
+
+- a header naming the session id, and a line telling the agent that the
+  summary may have lost detail and that your prompts below are the source of
+  truth for the task and its constraints;
+- the session's first prompts, verbatim and oldest first, which hold the
+  original task, then its latest prompts, newest last. Harness markup is left
+  out as in the recap. The first prompts get up to about 45% of the budget;
+  anything cut or dropped carries a visible note;
+- a footer pointing at the full record (`memory_read_session_observations`
+  with the session id and `kinds: ["user-prompt","stop"]`) and at
+  `memory_query` for decisions.
+
+The default budget is 2,000 characters (clamped to 800 to 4,000), small enough
+for a tight context. The anchor covers the whole session, so it still works
+after the fifth compaction. It is read-only: a compaction claims no handoff
+and does not re-send the session-start packet, digest or brief. When the
+server is slow or unreachable the hook prints nothing and the harness carries
+on without it.
+
+The anchor comes from the native `ai-memory hook` only. Any `SessionStart`
+with source `compact`, from any harness, claims nothing: the native hook and
+the shell and PowerShell fallback hooks in `hooks/` all skip the handoff
+fetch and print their usual empty reply. The fallback hooks never inject an
+anchor, so a Claude Code, Codex or Droid install running them relies on the
+installed instructions, like the harnesses in the last row below.
+
+| Harness | Post-compaction path |
+|---|---|
+| Claude Code | Automatic (native hook): `SessionStart` with source `compact`, through `hookSpecificOutput.additionalContext` |
+| Codex | Automatic (native hook): `SessionStart` with source `compact`, as developer context before the next model request |
+| Factory Droid | Automatic (native hook): `SessionStart` with source `compact`, appended to the new session context |
+| OpenCode V1 | Automatic: the `experimental.session.compacting` hook adds one line to `output.context` asking the summary to keep the session id and point at ai-memory, and `session.compacted` arms the anchor for the system transform until the next compaction |
+| OpenCode V2 | Automatic: the `compaction` hook adds the same line as a `system` part, and `session.compaction.ended` arms the anchor for the `context` hook until the next compaction |
+| Gemini CLI, Cursor, GitHub Copilot CLI, Kimi Code, Grok Build, Kiro CLI, Cline, Muse Code and the rest | Instructions only: these harnesses have no hook that can add context after a compaction (Muse reports a `compact` source, but its output contract is unpublished, so its compaction start only skips the handoff claim), so the agent follows the installed instructions and reads its own session's prompts |
+
+When no anchor arrives, the agent calls `memory_read_session_observations`
+with `session_id: "current"` and `kinds: ["user-prompt","stop"]`. The server
+resolves `"current"` only for a session-aware client (the session-aware bridge
+header or OpenCode 2's native session id). A static client is refused and
+passes the session id shown in the post-compaction anchor. With no anchor, it
+omits `session_id` and confirms that the returned session's prompts match its
+own conversation before trusting them. The session-start notice names a
+different session, so its id is never the fallback here.
+
+#### Manual: `reload context`
+
+Start a prompt with `reload context` to put the stretch the last compaction
+dropped back in front of the agent, on any harness whose hooks can answer a
+prompt:
 
 ```
 reload context after last compaction, then finish the screenshots for guide 12
@@ -202,9 +263,10 @@ agent, which then runs it without a recap. Prompts that do not start with
 | OpenCode V1 / V2 | With that prompt and later model calls, until the next compaction |
 | Grok Build | After the first tool result of that turn: Grok discards `UserPromptSubmit` output. The recap shares that field with a handoff delivered at the same time and is sized to fit; when the handoff leaves too little room, it comes with the next tool result. A request with no tool call expires after 30 minutes or at session end |
 
-A session that has not been compacted yet answers with a one-line notice. The
-full record stays available through `memory_read_session_observations` with
-the session id and `kinds: ["user-prompt", "stop"]`.
+A session that has not been compacted yet answers the manual recap with a
+one-line notice. The full record stays available through
+`memory_read_session_observations` with the session id and
+`kinds: ["user-prompt", "stop"]`.
 
 ## Proactive memory queries
 
@@ -234,7 +296,7 @@ at the managed ai-memory Agent Skills that carry detailed tool routing.
 | "Search only Rust release runbooks" | `memory_query` with `path_prefix: "procedures/"`, `tag: "rust"`, and optionally `kind` / `tier` | Narrows every page retrieval stream before ranking. Filters also constrain global, time-travel, profile, and `pin_first` results. A filtered miss has no raw-observation fallback because observations have no page metadata. |
 | "Why did this page rank here?" | `memory_query` with `explain: true` | Adds bounded per-stream ranks, matched entities, scores, RRF contributions, graph provenance, and authority factors to project/scopes hits, plus a top-level `timings` object with each stream's wall time in milliseconds (`fts_ms`, `entity_ms`, `vector_ms`, `graph_ms`, `observation_ms`, `rerank_ms`; streams that did not run are left out). A global query reports only its distinct FTS stream and `fts_ms`. |
 | Improve top project/scopes search relevance | Set `AI_MEMORY_RERANKER=llm` on a server with an LLM provider | Sends the bounded query plus up to 30 bounded titles/snippets to the provider for at most one final relevance pass. Invalid, partial, failed, timed-out, or concurrency-saturated requests preserve the normal order; `global=true` and supplemental global-preference hits are unchanged. |
-| "Undo that change" / "bring back the page I deleted" | `memory_restore_page` | Call it without `rev` to list the page's checkpoints, then with the chosen `rev` to write that version back as the current one. The replaced version stays reachable. Admin only on a multi-user server; see [lifecycle-ops](lifecycle-ops.md#mcp-memory_restore_page). |
+| "Undo that change" / "bring back the page I deleted" | `memory_restore_page` | Call it without `rev` to list the page's checkpoints, then with the chosen `rev` to write that version back as the current one. The replaced version stays reachable. Purged session summaries are refused. Admin only on a multi-user server; see [lifecycle-ops](lifecycle-ops.md#mcp-memory_restore_page). |
 | "Delete this page" / "remove the note about X" | `memory_delete_page` | Removes a page by exact path. Pass `workspace` + `project` together when the page lives in a sibling workspace, so a project name shared between workspaces never silently routes the delete to the wrong slot. |
 | "That recalled page helped" / "this page is stale" | `memory_feedback` | Records `helpful`, `not_helpful`, `stale`, or `wrong` for the exact path. Retention weight affects sweep-eligible episodic pages; stale/wrong also flag any current page for lint review. Retrieved content never authorizes feedback by itself. |
 | "Audit the wiki" / "any contradictions?" | `memory_lint` | Runs stale-page, contradiction, and rule-suggestion checks. |
@@ -990,6 +1052,21 @@ Codex hooks send measured response usage on `post-tool-use`, `stop`,
 session is open. The panel and session totals refresh every ten seconds. To
 enable capture, update the native client on each agent machine as well as the
 server.
+
+Pi sends cumulative session totals at `agent_end` and `session_shutdown`.
+Update both the server and client binary, run
+`ai-memory install-hooks --agent pi --apply`, then `/reload` in an existing Pi
+session. The extension reads saved entries, so reloads, resumes and repeated
+reports do not reset or double-count the totals. Fresh input, output, cache
+reads and cache writes stay separate; missing usage stays unknown. Saved
+compaction, branch-summary, cache-warming and nested-tool usage also count when
+Pi records them.
+
+These totals follow Pi's `/session` accounting: all entries in the session,
+including abandoned branches and history copied into a fork. A fork's total
+therefore includes inherited usage, not only work billed after the fork.
+Pi does **not** yet send individual response records to the Token usage ledger;
+session totals and coverage can be present while its response table is empty.
 
 The metric cards are navigation controls. Workspace cards sort the project
 list by the selected count, and Open sessions also selects projects that have

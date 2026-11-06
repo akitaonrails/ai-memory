@@ -7,6 +7,7 @@ use std::io::{self, BufRead, Write};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::terminal_text;
 use crate::cli::{
     ApiKeyAddArgs, ApiKeyArgs, ApiKeyCommand, ApiKeyListArgs, ApiKeyRevokeArgs, ApiKeyRotateArgs,
 };
@@ -108,13 +109,13 @@ fn write_credentials(
 ) -> Result<()> {
     let id_w = credentials
         .iter()
-        .map(|c| unicode_width::UnicodeWidthStr::width(c.id.as_str()))
+        .map(|c| unicode_width::UnicodeWidthStr::width(terminal_text(&c.id).as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
     let label_w = credentials
         .iter()
-        .map(|c| unicode_width::UnicodeWidthStr::width(c.label.as_str()))
+        .map(|c| unicode_width::UnicodeWidthStr::width(terminal_text(&c.label).as_str()))
         .max()
         .unwrap_or(5)
         .max(5);
@@ -132,10 +133,10 @@ fn write_credentials(
         writeln!(
             out,
             "{}  {}  {:<8}  {}",
-            pad_cell(&c.id, id_w),
-            pad_cell(&c.label, label_w),
+            pad_cell(&terminal_text(&c.id), id_w),
+            pad_cell(&terminal_text(&c.label), label_w),
             c.status(),
-            c.preview.as_deref().unwrap_or("-")
+            terminal_text(c.preview.as_deref().unwrap_or("-"))
         )?;
     }
     Ok(())
@@ -200,12 +201,12 @@ fn print_token(
                 "cli-api-key-verb-api-key-store-this-token-now-it-will-not-be-shown-again",
                 &[
                     ("value0", verb.to_string()),
-                    ("value1", resp.credential.id.to_string()),
-                    ("value2", resp.credential.label.to_string())
+                    ("value1", terminal_text(&resp.credential.id)),
+                    ("value2", terminal_text(&resp.credential.label))
                 ]
             )
         );
-        println!("{}", resp.token);
+        println!("{}", terminal_text(&resp.token));
     }
     Ok(())
 }

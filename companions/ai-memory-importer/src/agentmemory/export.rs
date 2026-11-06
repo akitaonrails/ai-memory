@@ -657,6 +657,7 @@ fn single_version(
         tier,
         tags: tags_from(tags.iter().map(String::as_str)),
         expires_at: None,
+        previous_bodies: Vec::new(),
     }
 }
 
@@ -1012,6 +1013,7 @@ pub(crate) fn plan(
                 tier,
                 tags: tags_from(memory.concepts.iter().map(String::as_str)),
                 expires_at: memory.forget_after.clone().filter(|t| !t.is_empty()),
+                previous_bodies: Vec::new(),
             });
         }
         builder.pages.push(PlannedPage {

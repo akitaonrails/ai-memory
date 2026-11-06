@@ -225,7 +225,7 @@ collision.
 
 | Toggle | Kind | Checklist | Smart default (Enter / bare `--jail`) |
 |---|---|---|---|
-| `github` (`~/.config/gh`) | credential | when that directory exists | on when present |
+| `github` (`~/.config/gh`, and from ai-jail 2.15 the active `gh` token, keyring included) | credential | when that directory exists | on when present |
 | `aws` (`~/.aws`) | credential | when present | on when present |
 | `kube` (`~/.kube`) | credential | when present | on when present |
 | `gcloud` (`~/.config/gcloud`) | credential | when present | on when present |
@@ -306,26 +306,101 @@ baseline sandbox. `--no-save-config` sits in the baseline next to `--network`
 
 **Checklist.** Without either flag and without a project `.ai-jail`, after the
 user accepts the §2 offer, the rows visible on this host are listed with their
-smart defaults:
+marks:
 
 ```
-Enable in the jail (Enter = as marked; numbers flip, e.g. "2 4"; "all" / "none"):
-  [x] 1) GitHub CLI credentials        ~/.config/gh, read-only
-  [x] 2) AWS credentials               ~/.aws, read-only
-  [ ] 3) SSH keys + agent              ~/.ssh read-only + SSH_AUTH_SOCK; needed for git over SSH
-  [ ] 4) Docker socket                 ⚠ grants host root
+🔒 ai-jail: what the agent can reach (Enter keeps the marks)
+   your choices from 2026-11-05 · new: worktree
+  [x] 1) GitHub CLI credentials     🔑 gh config and its token, read-only · found on this machine
+  [x] 2) SSH keys + agent           🔑 ~/.ssh read-only + SSH_AUTH_SOCK; needed for git over SSH · origin pushes over SSH
+  [x] 3) Linked worktree metadata   writable, so the agent can commit here · needed to commit here new
+  [ ] 4) Docker socket              ⚠ grants host root
+  📁 Extra folders: ai-jail (ro)
+  numbers flip · f folders · all · none · reset · Enter go
 >
 ```
 
+Each row says why it is recommended when its smart default checks it
+(`checklist_reason`). On a terminal the marks and risks are colored: a checked
+box green, a credential's note marked 🔑, the Docker socket red. Without a
+terminal, with `NO_COLOR`, or with `TERM=dumb` the text is plain, and the marks
+and icons still carry the meaning.
+
 Enter (or EOF) accepts as marked; row numbers (spaces or commas) flip rows and
-redraw the list; `all` / `none` set every row. An unrecognized answer changes
-nothing and re-prompts; the third one aborts the launch rather than guessing
-what to mount. One summary line then names what the jail gets, grouped into
-credentials, capabilities, and the user's own `no-X` entries, then "everything
-else in the checklist off" for the rows an explicit selection left out (rather
-than spelling out each `--no-X`). With no visible row the
-checklist is skipped. The reader takes injected `BufRead`/`Write`, like the §1
-prompt, so its grammar is unit-tested without a TTY.
+redraw the list; `all` / `none` set every row; `reset` restores the
+recommended marks and clears the extra folders; `f` opens the folder picker
+below. An unrecognized answer changes nothing and re-prompts; the third one
+aborts the launch rather than guessing what to mount. One summary line then
+names what the jail gets, grouped into credentials, capabilities, the user's
+own `no-X` entries and the extra folders, then "everything else in the
+checklist off" for the rows an explicit selection left out. With no visible
+row the checklist is skipped. The reader takes injected `BufRead`/`Write` and a
+picker callback, so its grammar is unit-tested without a TTY.
+
+**Remembered answers.** The accepted checklist is saved per checkout in
+`<data_dir>/jail-choices.json`, keyed by the worktree fingerprint, and the next
+offer starts from it: Enter keeps last time's answers, and the header says when
+they were saved. A row the saved answers never covered (a newer ai-jail, a
+credential that appeared since) keeps its recommendation and is marked `new`.
+A saved toggle that is no longer offered, or a saved folder that is gone or no
+longer passes the folder rules, is named under "no longer offered" instead of
+being dropped silently. The file lives in ai-memory's data directory, never in
+the repository, for the same reason ai-memory passes `--no-save-config`: a
+project `.ai-jail` may only close what ai-jail opens, so answers saved there
+would be ignored or skip the checklist, and a repository must not be able to
+grant itself a credential or a mount. A failed save is reported and the
+answers apply to that run only. Explicit `--jail=…` runs and project
+`.ai-jail` runs neither read nor write it.
+
+**Extra folders.** `--jail-map DIR` and `--jail-rw-map DIR` (repeatable) mount
+a folder read-only or read-write, for example a sibling project the agent
+should study. They become ai-jail's `--map` / `--rw-map` (2.15), placed before
+the `--` like every other sandbox flag. In the checklist, `f` opens a picker
+that starts in the checkout's parent: typing filters by fuzzy match, git
+repositories come first, Space selects (read-only), Ctrl+W switches the
+selected folder between read-only and read-write, Tab or → opens a folder, ←
+goes up, and a query starting with `/` or `~` is a path with Tab completion.
+Selected folders are remembered with the other answers.
+
+Every folder, from a flag, the picker or the saved answers, passes
+`validate_extra_folder` first. A relative path resolves against the checkout,
+and `~/` against the home. Refused, with the reason shown:
+
+- a missing path or a file;
+- the checkout itself or a folder inside it (already mounted);
+- `/` and the home;
+- any folder that is, sits inside, or contains `~/.ssh`, `~/.gnupg`, `~/.aws`,
+  `~/.kube`, `~/.config/gh`, `~/.config/gcloud`, `~/.docker`,
+  `~/.local/share/ai-memory`, or the configured data directory, where a
+  jailed agent could rewrite its own memory and tokens.
+
+The rules are checked on the lexical path and again on the resolved one, so a
+symlink into `~/.ssh` is refused too, while the lexical path is what ai-jail
+mounts. A refused flag folder stops the launch before anything starts. Folder
+flags on a run that ends up unjailed (no `--jail`, the offer declined, or a
+non-interactive run without `--jail`) are an error that says how to get a
+jail, rather than being ignored. An ai-jail without `--map` / `--rw-map` hides
+`f` and refuses the flags with "update ai-jail or drop --jail-map". Inside
+ai-jail the flags are ignored like `--jail`: the forwarded argv still carries
+them, and the folders are already mounted.
+
+**The next-run line.** After an interactive checklist, the launcher hands the
+jailed run (`AI_MEMORY_JAIL_NEXT_RUN`, forwarded with `--env`) the
+`ai-memory run` line that repeats its choices exactly, and the jailed run
+prints it when it quits:
+
+```
+Next time, start with the same jail choices:
+  ai-memory run --yolo --jail=github,ssh --jail-map /home/u/Projects/ai-jail claude
+```
+
+It names `--yolo`/`--true-yolo`, `--no-autowire`, `--workspace`, `--project`,
+`--profile`, `--env-file`, the enabled toggles as an exact `--jail=` list (or
+`--jail=none`), the folders and the harness. One-off parts stay out: a resume
+selector, native arguments (they may hold a prompt), and `--env` values (they
+may hold secrets; the line adds a reminder comment instead). The post-run
+switch menu (§2 of `managed-workstreams.md`) keeps all of these for the next
+harness: it runs inside the same jail.
 
 **Decision table** (`jail_decision` in `run.rs`):
 
@@ -364,6 +439,78 @@ directly.
 - The re-exec forwards only environment names already set plus resolved
   routing values (§2). It never turns a config-file bearer into an environment
   variable, and the toggle flags carry no values or secrets.
+
+### 6. ai-jail 3.0.1+: the wrapper contract
+
+ai-jail 3.0.0 moved its policy out of the checkout (`~/.config/ai-jail`), runs
+its own first-run review for known harnesses, and treats unrestricted network
+as OPEN. ai-memory's flag-based launch still works there, but the user saw two
+checklists, ai-memory opened the full network, and ai-jail had to guess the
+harness from ai-memory's argv (a wrapper flag it did not know, such as
+`--jail-map`, made it give up). ai-jail 3.0.1 added a wrapper contract
+([WRAPPER_INTEGRATION.md](https://github.com/akitaonrails/ai-jail/blob/v3.0.1/docs/WRAPPER_INTEGRATION.md)),
+and ai-memory uses part of it (#2020).
+
+**When.** The installed ai-jail's `--help` lists `--harness`,
+`ai-jail capabilities --json` reports schema 1 with `harness_flag` and
+`status_json`, and the harness has an ai-jail preset (`ai_jail_harness_name`:
+Copilot and Command Code do not). `capabilities` is never asked of an older
+ai-jail, which would sandbox a command by that name. An explicit `--jail`
+with an automatic harness keeps the flag launch, because the server picks the
+harness after the re-exec decision. Otherwise the launch is the §2/§5 one.
+
+**Launch.** `ai-jail --harness H <reach> --agent-state --no-save-config
+--env NAME… <toggles> <folders> -- ai-memory run …`. Every part is a
+command-line grant, which ai-jail applies without a prompt:
+
+- *No request file.* The contract's `--request-file` was tried first and
+  dropped: ai-jail asks a separate yes/no for every request, so eight
+  forwarded variables meant eight prompts before the agent started. The same
+  names passed as `--env NAME` need none. ai-jail's own first-run review
+  (network, credentials, SSH) stays the one place the user decides.
+- *Only the harness's own keys.* `harness_env_names` passes every ai-memory
+  routing name that is set, `CLAUDE_CONFIG_DIR` for Claude only, and the
+  provider keys that harness reads: Claude gets the Anthropic ones, Codex the
+  OpenAI one, Antigravity the Gemini/Google ones. Grok and Kimi get none from
+  ai-memory, because ai-jail forwards `XAI_API_KEY` and `MOONSHOT_API_KEY` itself
+  with `--agent-state`. Multi-provider harnesses (OpenCode, Pi, Crush, Omp,
+  Kiro) keep every key that is set. A test fails when a new provider key is
+  added to `FORWARDED_ENV_NAMES` without being classified.
+- *Reaching the server.* A server on `localhost` or `127.0.0.0/8` gets
+  `--forward-port PORT`: that one host port on the jail's loopback, and the
+  network stays filtered. Any other server keeps `--network`, labelled OPEN
+  in ai-jail's review: ai-jail's filter reaches LAN and remote services only
+  through its HTTP proxy, and ai-memory's hook clients bypass proxies on
+  purpose (§2). `[::1]` is not bridged by `--forward-port`, so it also keeps
+  `--network`.
+- *`--no-save-config` stays.* Without it ai-jail saves the launch's
+  restrictive flags (an unchecked `--no-ssh`) as permanent project
+  constraints, which a later approval in its review cannot lift. The review's
+  own approvals are saved either way.
+
+**Preflight.** `status --json` for the exact launch argv. A
+`backend_unavailable` blocker stops the launch quoting ai-jail;
+`missing_approved_env`, `directory_drift` and `changed_ssh_key` stop it
+quoting ai-jail plus `ai-jail configure H`. Anything else, including a first
+run, launches: ai-jail holds its own review in a terminal and, without one,
+runs once with restricted defaults plus the command-line grants, which is what
+its guide asks of automation. An unreadable status also launches and leaves
+any refusal to ai-jail.
+
+**Checklist.** ai-jail's review owns credentials, SSH and network, so
+ai-memory's screen shows only the extra folders (`f`, `reset`, Enter). The
+remembered toggle answers are kept for a later launch that falls back to
+flags, and the next-run line is a bare `--jail` plus the folders.
+
+**Tests.** `jail_contract.rs` covers capability parsing (every missing piece
+falls back), harness names against ai-jail's accepted list, per-harness
+variable names, server reach, argv assembly and the refusal codes.
+`yolo_ai_jail.rs` runs the real installed ai-jail (3.0.1+ on `PATH`): it
+accepts the launch with `--dry-run`, and its status of that launch has no
+pending request and writes nothing. `jail_toggles_e2e.rs` drives the built
+binary against a fake ai-jail 3.0.1 for the launch argv (no other provider's
+key in a Claude jail), the first run without a terminal, the drift stop and
+the preset fallback.
 
 ## OS support matrix
 

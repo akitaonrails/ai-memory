@@ -1,0 +1,31 @@
+{
+  "##": "Template. The release workflow's scoop job pins version, url and hash from the tag's published .sha256 sidecar before pushing it to akitaonrails/scoop-bucket.",
+  "version": "3.3.3",
+  "description": "Long-term, cross-session memory for AI coding agents over MCP and lifecycle hooks",
+  "homepage": "https://aimemory.sh",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/akitaonrails/ai-memory/releases/download/v3.3.3/ai-memory-windows-x86_64.zip",
+      "hash": "7febf22e0b8c0c5cf546e8597c2218598bdececc98fd375bbcd1e13e376cf87c"
+    }
+  },
+  "bin": "ai-memory.exe",
+  "notes": [
+    "Run 'ai-memory setup' to configure the server, its logon service and your agents.",
+    "Update with 'scoop update ai-memory'; 'ai-memory upgrade' refuses a Scoop install."
+  ],
+  "checkver": {
+    "github": "https://github.com/akitaonrails/ai-memory"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/akitaonrails/ai-memory/releases/download/v$version/ai-memory-windows-x86_64.zip"
+      }
+    },
+    "hash": {
+      "url": "$url.sha256"
+    }
+  }
+}

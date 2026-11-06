@@ -66,16 +66,16 @@ pub use error::{
 pub use grants::{GrantFilter, GrantListing, GrantOutcome, ProjectGrant};
 pub use maintenance::MaintenanceJob;
 pub use ops::{
-    AdmittedSession, BootstrapChunkRecord, CompactSummary, Compaction, ConditionalBatchUpsert,
-    ConditionalUpsert, DateOnlyTtlPage, DeleteWorkspaceSummary, EmbedOutcome, EmbeddingWrite,
-    EntityBackfillSummary, HookSessionAdmission, IdentityResolution, IdleEndAction,
-    IdleEndCandidate, IdleEndResult, IngestObservationOutcome, LifecycleOnlyEndOutcome,
-    MAX_PENDING_INBOX_MESSAGES, MergeProjectPage, MergeProjectSummary, MoveSessionSummary,
-    MoveSummary, ObservationPruneOutcome, OkfMigratedPage, PAGE_WINDOW_BACKFILL_BATCH,
-    PagePrecondition, PageWindowBackfillSummary, PagesMode, ProjectAliasWriteResolution, PurgeMode,
-    PurgeSessionSummary, PurgeSummary, ReorgSummary, RepairSessionTimesSummary,
-    RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason, SkippedSessionTimes,
-    StaleAfterRepair, backfill_entity_index, backfill_page_windows,
+    AdmittedSession, AdoptedProjectIdentity, BootstrapChunkRecord, CompactSummary, Compaction,
+    ConditionalBatchUpsert, ConditionalUpsert, DateOnlyTtlPage, DeleteWorkspaceSummary,
+    EmbedOutcome, EmbeddingWrite, EntityBackfillSummary, HookSessionAdmission, IdentityResolution,
+    IdleEndAction, IdleEndCandidate, IdleEndResult, IngestObservationOutcome,
+    LifecycleOnlyEndOutcome, MAX_PENDING_INBOX_MESSAGES, MergeProjectPage, MergeProjectSummary,
+    MoveSessionSummary, MoveSummary, ObservationPruneOutcome, OkfMigratedPage,
+    PAGE_WINDOW_BACKFILL_BATCH, PagePrecondition, PageWindowBackfillSummary, PagesMode,
+    ProjectAliasWriteResolution, PurgeMode, PurgeSessionSummary, PurgeSummary, ReorgSummary,
+    RepairSessionTimesSummary, RepairedSessionTimes, SessionTimesCandidate, SessionTimesSkipReason,
+    SkippedSessionTimes, StaleAfterRepair, backfill_entity_index, backfill_page_windows,
     backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use profile::{
@@ -133,10 +133,10 @@ pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
     LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, OperationalWorkstreamSummary,
-    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
-    StoredManagedRunStatus, StoredWorkstreamSummary, WorkstreamOperationalStatus,
-    WorkstreamSelection, WorkstreamSelector,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
+    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
+    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
 
@@ -280,6 +280,21 @@ impl Store {
             tracing::info!(
                 projects = coordinate_keys,
                 "project coordinate keys backfilled"
+            );
+        }
+        for twin in project_coordinates::shadowing_empty_twins(&conn, 20)? {
+            tracing::warn!(
+                workspace = %twin.workspace,
+                project = %twin.name,
+                owner = %twin.owner,
+                "empty project '{}' holds the canonical name of '{}'; it is skipped when \
+                 resolving that name, and can be renamed out of the way with \
+                 `ai-memory rename-project --workspace {} --project-id {} --to {}-empty`",
+                twin.name,
+                twin.owner,
+                twin.workspace,
+                twin.id,
+                twin.name
             );
         }
         let cjk_backfill = ops::backfill_cjk_indexes(&mut conn)?;

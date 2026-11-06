@@ -695,7 +695,7 @@ fn read_observations(
         let files_read: Option<String> = bounded(row.get(10)?, "observation files_read")?;
         let files_modified: Option<String> = bounded(row.get(11)?, "observation files_modified")?;
         let source_id = id.to_string();
-        let body = observation_body(
+        let (body, earlier_body) = observation_bodies(
             &created_at,
             text.as_deref(),
             subtitle.as_deref(),
@@ -714,6 +714,7 @@ fn read_observations(
             format!("{prefix}/{}/{id}.md", observation_type.path_segment()),
             title,
             body,
+            earlier_body,
             observation_type.kind(),
             &["claude-mem-import", "observation"],
         );
@@ -776,26 +777,34 @@ fn read_summaries(
         };
         let created_at = bounded_metadata(row.get(3)?, "summary created_at", MAX_TIMESTAMP_BYTES)?;
         let labels = [
-            "Request",
-            "Investigated",
-            "Learned",
-            "Completed",
-            "Next steps",
-            "Files read",
-            "Files edited",
-            "Notes",
+            ("Request", Field::Text),
+            ("Investigated", Field::Text),
+            ("Learned", Field::Text),
+            ("Completed", Field::Text),
+            ("Next steps", Field::Text),
+            ("Files read", Field::Files),
+            ("Files edited", Field::Files),
+            ("Notes", Field::Text),
         ];
+        // The 3.4.0 importer read every summary column as text.
         let mut sections = Vec::new();
-        for (offset, label) in labels.iter().enumerate() {
+        let mut earlier_sections = Vec::new();
+        for (offset, (label, field)) in labels.into_iter().enumerate() {
             let value: Option<String> = bounded(row.get(4 + offset)?, "summary field")?;
-            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-                sections.push(format!("## {label}\n\n{}", value.trim()));
+            let Some(value) = value else { continue };
+            if let Some(text) = section_text(&value, field) {
+                sections.push(format!("## {label}\n\n{text}"));
+            }
+            if let Some(text) = section_text(&value, Field::Text) {
+                earlier_sections.push(format!("## {label}\n\n{text}"));
             }
         }
-        let body = format!(
-            "Imported at source timestamp: `{created_at}`\n\n{}",
-            sections.join("\n\n")
-        );
+        let summary_body = |sections: Vec<String>| {
+            format!(
+                "Imported at source timestamp: `{created_at}`\n\n{}",
+                sections.join("\n\n")
+            )
+        };
         let source_id = id.to_string();
         let planned = page(
             "claude_mem_summary",
@@ -803,7 +812,8 @@ fn read_summaries(
             destination,
             format!("{prefix}/session-summary/{id}.md"),
             format!("Session summary {id}"),
-            body,
+            summary_body(sections),
+            summary_body(earlier_sections),
             "session-summary",
             &["claude-mem-import", "session-summary"],
         );
@@ -866,8 +876,10 @@ fn optional_bounded_metadata(
         .transpose()
 }
 
+/// An observation's page body, and the body the 3.4.0 importer planned for
+/// the same row, which read every column as text.
 #[allow(clippy::too_many_arguments)]
-fn observation_body(
+fn observation_bodies(
     created_at: &str,
     text: Option<&str>,
     subtitle: Option<&str>,
@@ -875,21 +887,68 @@ fn observation_body(
     narrative: Option<&str>,
     files_read: Option<&str>,
     files_modified: Option<&str>,
-) -> String {
+) -> (String, String) {
     let mut body = format!("Imported at source timestamp: `{created_at}`");
-    for (heading, value) in [
-        ("Observation", text),
-        ("Subtitle", subtitle),
-        ("Facts", facts),
-        ("Narrative", narrative),
-        ("Files read", files_read),
-        ("Files modified", files_modified),
+    let mut earlier = body.clone();
+    for (heading, field, value) in [
+        ("Observation", Field::Text, text),
+        ("Subtitle", Field::Text, subtitle),
+        ("Facts", Field::List, facts),
+        ("Narrative", Field::Text, narrative),
+        ("Files read", Field::Files, files_read),
+        ("Files modified", Field::Files, files_modified),
     ] {
-        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-            body.push_str(&format!("\n\n## {heading}\n\n{}", value.trim()));
+        let Some(value) = value else { continue };
+        if let Some(text) = section_text(value, field) {
+            body.push_str(&format!("\n\n## {heading}\n\n{text}"));
+        }
+        if let Some(text) = section_text(value, Field::Text) {
+            earlier.push_str(&format!("\n\n## {heading}\n\n{text}"));
         }
     }
-    body
+    (body, earlier)
+}
+
+/// How [`section_text`] reads a claude-mem column.
+#[derive(Clone, Copy)]
+enum Field {
+    /// Prose, kept as written.
+    Text,
+    /// A list of strings.
+    List,
+    /// A list of file paths.
+    Files,
+}
+
+/// A claude-mem column as section text, or `None` when it holds nothing.
+/// claude-mem stores an observation's `facts`, `files_read` and
+/// `files_modified`, and a summary's `files_read` and `files_edited`, as
+/// `JSON.stringify` arrays of strings (`SessionStore.ts` `storeObservations`
+/// and `storeSummary`), so such an array becomes one bullet per entry, a file
+/// path in a code span as the agentmemory export writes it, and an empty
+/// array or `null` adds no section. Any other text is kept as written.
+fn section_text(value: &str, field: Field) -> Option<String> {
+    let value = value.trim();
+    if !matches!(field, Field::Text) {
+        match serde_json::from_str::<serde_json::Value>(value) {
+            Ok(serde_json::Value::Null) => return None,
+            Ok(serde_json::Value::Array(items)) if items.iter().all(|item| item.is_string()) => {
+                let lines: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(|item| match field {
+                        Field::Files => format!("- `{item}`"),
+                        _ => format!("- {item}"),
+                    })
+                    .collect();
+                return (!lines.is_empty()).then(|| lines.join("\n"));
+            }
+            _ => {}
+        }
+    }
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,6 +959,7 @@ fn page(
     path: String,
     title: String,
     body: String,
+    earlier_body: String,
     kind: &str,
     tags: &[&str],
 ) -> PlannedPage {
@@ -909,9 +969,17 @@ fn page(
             .as_bytes(),
     )
     .to_string();
-    let sanitized = ai_memory_client::sanitize_external_text(&body);
     let footer =
         format!("*Imported from claude-mem ({record} `{source_id}`). Import key: `{key}`.*");
+    let finish =
+        |body: &str| bounded_page_body(&ai_memory_client::sanitize_external_text(body), &footer);
+    let body = finish(&body);
+    // What an earlier importer release wrote for this row, so a rerun
+    // replaces its own older layout instead of refusing it.
+    let previous_bodies = Some(finish(&earlier_body))
+        .filter(|earlier| *earlier != body)
+        .into_iter()
+        .collect();
     PlannedPage {
         record,
         destination,
@@ -921,11 +989,12 @@ fn page(
             source_id: source_id.to_owned(),
             version: None,
             title: one_line(&ai_memory_client::sanitize_external_text(&title), 80),
-            body: bounded_page_body(&sanitized, &footer),
+            body,
             kind: kind.to_owned(),
             tier: "episodic",
             tags: tags_from(tags.iter().copied()),
             expires_at: None,
+            previous_bodies,
         }],
     }
 }
@@ -1110,6 +1179,131 @@ mod tests {
     }
 
     #[test]
+    fn list_columns_read_as_bullets_and_other_text_stays_as_written() {
+        for (value, field, expected) in [
+            (
+                r#"["The cache lives in SQLite","WAL mode is on"]"#,
+                Field::List,
+                Some("- The cache lives in SQLite\n- WAL mode is on"),
+            ),
+            (
+                r#"["src/cache.rs","src/db.rs"]"#,
+                Field::Files,
+                Some("- `src/cache.rs`\n- `src/db.rs`"),
+            ),
+            (
+                r#" [" src/a.rs ", ""] "#,
+                Field::Files,
+                Some("- `src/a.rs`"),
+            ),
+            ("[]", Field::Files, None),
+            ("null", Field::List, None),
+            (r#"["", "  "]"#, Field::List, None),
+            ("   ", Field::Files, None),
+            (
+                "src/a.rs, src/b.rs",
+                Field::Files,
+                Some("src/a.rs, src/b.rs"),
+            ),
+            ("[1, 2]", Field::List, Some("[1, 2]")),
+            (
+                r#"["kept as written"]"#,
+                Field::Text,
+                Some(r#"["kept as written"]"#),
+            ),
+        ] {
+            assert_eq!(section_text(value, field).as_deref(), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn structured_observation_lists_become_bullets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-mem.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_versions(id INTEGER PRIMARY KEY, version INTEGER UNIQUE NOT NULL, applied_at TEXT NOT NULL);\
+                 INSERT INTO schema_versions(version,applied_at) VALUES(53,'now');\
+                 CREATE TABLE sdk_sessions(memory_session_id TEXT UNIQUE, project TEXT NOT NULL, cwd TEXT);\
+                 INSERT INTO sdk_sessions VALUES('m1','api','/repo/api');\
+                 CREATE TABLE session_summaries(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, request TEXT, learned TEXT, created_at TEXT NOT NULL);\
+                 CREATE TABLE observations(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, text TEXT, type TEXT NOT NULL, title TEXT, subtitle TEXT, facts TEXT, narrative TEXT, files_read TEXT, files_modified TEXT, created_at TEXT NOT NULL);\
+                 INSERT INTO observations VALUES(1,'m1','api',NULL,'decision','Use SQLite',NULL,'[\"The cache lives in SQLite\",\"WAL mode is on\"]','We chose SQLite.','[\"src/cache.rs\",\"src/db.rs\"]','[]','2026-01-01');\
+                 INSERT INTO observations VALUES(2,'m1','api',NULL,'bugfix','Fix the lock',NULL,'null','Retry the write.','src/lock.rs, src/retry.rs','[\"\"]','2026-01-01');",
+            )
+            .unwrap();
+        drop(connection);
+        let snapshot = snapshot_database(&path).unwrap();
+        let plan = plan_snapshot(&snapshot, &mapping(), DEFAULT_DEST_PREFIX).unwrap();
+        let body = |suffix: &str| {
+            plan.pages
+                .iter()
+                .find(|page| page.path.ends_with(suffix))
+                .unwrap()
+                .versions[0]
+                .body
+                .clone()
+        };
+        let decision = body("decision/1.md");
+        assert!(
+            decision.contains("## Facts\n\n- The cache lives in SQLite\n- WAL mode is on\n"),
+            "{decision}"
+        );
+        assert!(
+            decision.contains("## Files read\n\n- `src/cache.rs`\n- `src/db.rs`"),
+            "{decision}"
+        );
+        assert!(!decision.contains("## Files modified"), "{decision}");
+        assert!(!decision.contains("[\""), "{decision}");
+        let bugfix = body("bugfix/2.md");
+        assert!(!bugfix.contains("## Facts"), "{bugfix}");
+        assert!(
+            bugfix.contains("## Files read\n\nsrc/lock.rs, src/retry.rs"),
+            "{bugfix}"
+        );
+        assert!(!bugfix.contains("## Files modified"), "{bugfix}");
+    }
+
+    #[test]
+    fn summary_file_lists_become_bullets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude-mem.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_versions(id INTEGER PRIMARY KEY, version INTEGER UNIQUE NOT NULL, applied_at TEXT NOT NULL);\
+                 INSERT INTO schema_versions(version,applied_at) VALUES(53,'now');\
+                 CREATE TABLE sdk_sessions(memory_session_id TEXT UNIQUE, project TEXT NOT NULL, cwd TEXT);\
+                 INSERT INTO sdk_sessions VALUES('m1','api','/repo/api');\
+                 CREATE TABLE observations(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, text TEXT, type TEXT NOT NULL, title TEXT, subtitle TEXT, facts TEXT, narrative TEXT, files_read TEXT, files_modified TEXT, created_at TEXT NOT NULL);\
+                 CREATE TABLE session_summaries(id INTEGER PRIMARY KEY, memory_session_id TEXT, project TEXT NOT NULL, request TEXT, investigated TEXT, learned TEXT, completed TEXT, next_steps TEXT, files_read TEXT, files_edited TEXT, notes TEXT, created_at TEXT NOT NULL);\
+                 INSERT INTO session_summaries VALUES(7,'m1','api','Speed up the cache',NULL,'SQLite is enough',NULL,'Benchmark the hot path','[\"src/cache.rs\",\"src/db.rs\"]','[]',NULL,'2026-01-01');",
+            )
+            .unwrap();
+        drop(connection);
+        let snapshot = snapshot_database(&path).unwrap();
+        let plan = plan_snapshot(&snapshot, &mapping(), DEFAULT_DEST_PREFIX).unwrap();
+        let summary = &plan
+            .pages
+            .iter()
+            .find(|page| page.path.ends_with("session-summary/7.md"))
+            .unwrap()
+            .versions[0]
+            .body;
+        assert!(
+            summary.contains("## Files read\n\n- `src/cache.rs`\n- `src/db.rs`"),
+            "{summary}"
+        );
+        assert!(!summary.contains("## Files edited"), "{summary}");
+        assert!(!summary.contains("[\""), "{summary}");
+        assert!(
+            summary.contains("## Next steps\n\nBenchmark the hot path"),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn rejects_unknown_schema_and_source_symlinks() {
         let (_dir, path) = fixture(false);
         let connection = Connection::open(&path).unwrap();
@@ -1224,6 +1418,81 @@ mod tests {
         );
     }
 
+    /// A page the 3.4.0 importer wrote, with claude-mem's JSON lists copied
+    /// as text, is this import's own output: a rerun writes the new layout
+    /// over it and keeps it in the chain. The same body with one edit is
+    /// still refused and left as it was.
+    #[tokio::test]
+    async fn rerun_replaces_the_earlier_list_layout_but_never_an_edited_page() {
+        let (_dir, database) = fixture(true);
+        let snapshot = snapshot_database(&database).unwrap();
+        let plan = plan_snapshot(&snapshot, &mapping(), DEFAULT_DEST_PREFIX).unwrap();
+        let path = "imported/claude-mem/decision/1.md";
+        let planned = plan
+            .pages
+            .iter()
+            .find(|page| page.path == path)
+            .unwrap()
+            .versions[0]
+            .clone();
+        let [earlier] = planned.previous_bodies.as_slice() else {
+            panic!("no earlier body: {planned:?}");
+        };
+        assert!(earlier.contains("## Facts\n\n[]"), "{earlier}");
+        assert!(!planned.body.contains("## Facts"), "{}", planned.body);
+        for edited in [false, true] {
+            let stored = if edited {
+                earlier.replace("Chosen", "Chosen, then edited")
+            } else {
+                earlier.clone()
+            };
+            let files = tempfile::tempdir().unwrap();
+            let mapping_file = files.path().join("mapping.json");
+            fs::write(
+                &mapping_file,
+                r#"{"projects":{"api":{"workspace":"acme","project":"api"}}}"#,
+            )
+            .unwrap();
+            let server = MockServer::start(&[("acme", "api")]);
+            server.state().pages.insert(
+                ("acme".into(), "api".into(), path.into()),
+                vec![crate::agentmemory::mock::StoredVersion {
+                    page_id: "page-from-3.4.0".into(),
+                    body: stored.clone(),
+                    arguments: serde_json::json!({}),
+                }],
+            );
+            let args = ClaudeMemArgs {
+                database: Some(database.clone()),
+                mapping: mapping_file,
+                dest_prefix: DEFAULT_DEST_PREFIX.into(),
+                server_url: server.url.clone(),
+                apply: true,
+                manifest_out: Some(files.path().join("manifest.json")),
+                show_body: false,
+            };
+            let result = run(args.clone()).await;
+            let chain = server.state().chain("acme", "api", path);
+            if edited {
+                let error = result.unwrap_err();
+                assert!(format!("{error:#}").contains("did not write"), "{error:#}");
+                assert_eq!(chain.len(), 1);
+                assert_eq!(chain[0].body, stored);
+            } else {
+                result.unwrap();
+                assert_eq!(chain.len(), 2);
+                assert_eq!(chain[0].body, *earlier);
+                assert_eq!(chain[1].body, planned.body);
+                assert_eq!(server.state().stored_versions(), 4);
+                // Once upgraded, a further rerun finds its own current body
+                // and writes nothing.
+                run(args).await.unwrap();
+                assert_eq!(server.state().chain("acme", "api", path).len(), 2);
+                assert_eq!(server.state().stored_versions(), 4);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn all_destinations_are_preflighted_before_the_first_batch() {
         let (_dir, database) = fixture(false);
@@ -1316,6 +1585,7 @@ mod tests {
             },
             "imported/claude-mem/decision/1.md".into(),
             "Decision".into(),
+            "body".into(),
             "body".into(),
             "decision",
             &["claude-mem-import"],

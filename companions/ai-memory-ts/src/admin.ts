@@ -233,7 +233,8 @@ export class AdminClient {
 
   /**
    * Write a page's content at `rev` back as its latest version. There is no
-   * dry run: this always writes a new version (the server checkpoints first).
+   * dry run: a successful restore writes a new version (the server checkpoints
+   * first). A purged session summary is refused with HTTP 409.
    * `POST /admin/restore-page`.
    */
   async restorePage(args: RestorePageArgs, options?: CallOptions): Promise<RestorePageResult> {

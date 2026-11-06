@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 use serde::Serialize;
 
+use super::show::terminal_text;
 use crate::cli::MergeProjectArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -63,7 +64,7 @@ pub async fn run(config: &Config, args: MergeProjectArgs) -> Result<()> {
         "Merged"
     };
     println!(
-        "{}", i18n.format("cli-merge-project-verb-page-versions-sessions-observations-handoffs-workstreams-page-conflicts", &[("value0", verb.to_string()), ("value1", report["from"].as_str().unwrap_or("source").to_string()), ("value2", report["into"].as_str().unwrap_or("target").to_string()), ("value3", format!("{}", report["page_versions"].as_u64().unwrap_or(0))), ("value4", format!("{}", report["sessions"].as_u64().unwrap_or(0))), ("value5", format!("{}", report["observations"].as_u64().unwrap_or(0))), ("value6", format!("{}", report["handoffs"].as_u64().unwrap_or(0))), ("value7", format!("{}", report["workstreams"].as_u64().unwrap_or(0))), ("value8", format!("{}", report["page_conflicts"].as_u64().unwrap_or(0)))]));
+        "{}", i18n.format("cli-merge-project-verb-page-versions-sessions-observations-handoffs-workstreams-page-conflicts", &[("value0", verb.to_string()), ("value1", terminal_text(report["from"].as_str().unwrap_or("source"))), ("value2", terminal_text(report["into"].as_str().unwrap_or("target"))), ("value3", format!("{}", report["page_versions"].as_u64().unwrap_or(0))), ("value4", format!("{}", report["sessions"].as_u64().unwrap_or(0))), ("value5", format!("{}", report["observations"].as_u64().unwrap_or(0))), ("value6", format!("{}", report["handoffs"].as_u64().unwrap_or(0))), ("value7", format!("{}", report["workstreams"].as_u64().unwrap_or(0))), ("value8", format!("{}", report["page_conflicts"].as_u64().unwrap_or(0)))]));
     if !args.confirm {
         println!(
             "{}",
@@ -71,7 +72,7 @@ pub async fn run(config: &Config, args: MergeProjectArgs) -> Result<()> {
         );
     }
     if let Some(warning) = report["manifest_warning"].as_str() {
-        eprintln!("{}", i18n.format("cli-merge-project-warning-merge-committed-but-scope-manifest-refresh-failed-warning", &[("value0", warning.to_string())]));
+        eprintln!("{}", i18n.format("cli-merge-project-warning-merge-committed-but-scope-manifest-refresh-failed-warning", &[("value0", terminal_text(warning))]));
     }
     Ok(())
 }

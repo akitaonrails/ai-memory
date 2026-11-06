@@ -18,7 +18,7 @@ SESSION_QS=""
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=session-start&agent=command-code${QS}" >/dev/null 2>&1 || true
 
-HANDOFF=$(ai_memory_get_handoff "$SERVER/handoff?agent=command-code${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
+HANDOFF=$(ai_memory_get_start_handoff "$PAYLOAD" "$SERVER/handoff?agent=command-code${QS}${SESSION_QS}${BRIEF_QS}" 2>/dev/null || true)
 if [ -n "$HANDOFF" ]; then
     printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":%s}}\n' \
         "$(printf '%s' "$HANDOFF" | ai_memory_json_string)"

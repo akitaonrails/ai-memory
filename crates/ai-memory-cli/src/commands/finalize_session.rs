@@ -7,6 +7,7 @@ use ai_memory_workstream::ManagedHarness;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::show::{terminal_body, terminal_text};
 use crate::cli::FinalizeSessionArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, ServerResponseError, get_json, http_client};
@@ -268,7 +269,7 @@ fn print_report(
             )
         );
         for session_id in &report.finalized {
-            println!("  - {session_id}");
+            println!("  - {}", terminal_text(session_id));
         }
     }
     Ok(())
@@ -304,7 +305,7 @@ async fn post_session_end_batch(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        bail!("server returned {status}: {body}");
+        bail!("server returned {status}: {}", terminal_body(&body));
     }
     let ack: HookBatchAck = response
         .json()

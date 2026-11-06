@@ -369,7 +369,21 @@ mod slow {
         call: Option<Value>,
         check: impl FnOnce(u32),
     ) -> (Value, Option<Value>) {
+        bridge_exchange_in(install, &install.home, mode, base, call, check)
+    }
+
+    /// [`bridge_exchange`] with the bridge launched from `dir`, as a client
+    /// starts it from the repository it works in.
+    fn bridge_exchange_in(
+        install: &Install,
+        dir: &Path,
+        mode: BridgeMode,
+        base: &str,
+        call: Option<Value>,
+        check: impl FnOnce(u32),
+    ) -> (Value, Option<Value>) {
         let mut cmd = install.cmd();
+        cmd.current_dir(dir);
         match mode {
             BridgeMode::SessionAware => {
                 cmd.args(["mcp-bridge", "--server-url", base])
@@ -664,6 +678,106 @@ mod slow {
             String::from_utf8_lossy(&out.stderr).contains("MUSE_SESSION_ID is missing"),
             "the Muse bridge fails closed without its own id: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The text of a `tools/call` reply, failing on an error reply.
+    fn tool_text(reply: &Value) -> String {
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert_ne!(reply["result"]["isError"], json!(true), "{reply}");
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// #1979, the reporter's case against the shipped `serve`: the hooks make
+    /// one repository the active project, and a session-less bridge launched
+    /// in another marked repository sends its unscoped calls to that other
+    /// repository, a write included. Its explicit calls keep their scope, a
+    /// bridge launched in the first repository cannot read the second's page
+    /// without naming it, and the session-aware bridge keeps the server's
+    /// routing.
+    #[tokio::test]
+    async fn a_session_less_bridge_scopes_unscoped_calls_to_its_launch_repository() {
+        const NOTES: &str = "authdef-notes";
+        let install = Install::new();
+        install.run_ok(&["init"], None);
+        let token = install.root_token().unwrap();
+        let notes = install.home.join("work").join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(
+            notes.join(".ai-memory.toml"),
+            format!("workspace = \"{WORKSPACE}\"\nproject = \"{NOTES}\"\n"),
+        )
+        .unwrap();
+        let client = reqwest::Client::new();
+        let (_server, base) = install.serve(&client, "serve-launch-scope.log").await;
+        install.hook_prompt(&base, "authdef-launch-scope-hook");
+        assert_eq!(settled_sessions(&client, &base, &token, 1).await, 1);
+
+        let session_less = |dir: &Path, call: Value| {
+            let (_, reply) = bridge_exchange_in(
+                &install,
+                dir,
+                BridgeMode::SessionLess,
+                &base,
+                Some(call),
+                |_| {},
+            );
+            tool_text(&reply.expect("tools/call reply"))
+        };
+        let write = json!({
+            "name": "memory_write_page",
+            "arguments": {
+                "path": "notes/launch-scope.md",
+                "title": "Launch scope",
+                "body": "The zircon ledger is recorded only in the notes repository.",
+            },
+        });
+        session_less(&notes, write);
+        let unscoped_query = json!({"name": "memory_query", "arguments": {"q": "zircon ledger"}});
+        let scoped_query = |project: &str| {
+            json!({
+                "name": "memory_query",
+                "arguments": {"q": "zircon ledger", "workspace": WORKSPACE, "project": project},
+            })
+        };
+
+        // The unscoped write landed in the launch repository's project.
+        assert!(
+            session_less(&install.home, scoped_query(NOTES)).contains("launch-scope"),
+            "the page is in {NOTES}"
+        );
+        assert!(
+            !session_less(&install.home, scoped_query(PROJECT)).contains("launch-scope"),
+            "and not in the hook's active project"
+        );
+        assert!(
+            session_less(&notes, unscoped_query.clone()).contains("launch-scope"),
+            "an unscoped query from the notes checkout answers from notes"
+        );
+        // Adversarial: launched elsewhere, an unscoped call does not reach it,
+        // and an explicit scope from the notes checkout is not replaced.
+        assert!(
+            !session_less(&install.repo, unscoped_query.clone()).contains("launch-scope"),
+            "a bridge in the other repository stays in that repository"
+        );
+        assert!(
+            !session_less(&notes, scoped_query(PROJECT)).contains("launch-scope"),
+            "an explicit scope wins over the launch directory"
+        );
+        let (_, aware) = bridge_exchange_in(
+            &install,
+            &notes,
+            BridgeMode::SessionAware,
+            &base,
+            Some(unscoped_query),
+            |_| {},
+        );
+        assert!(
+            !tool_text(&aware.expect("tools/call reply")).contains("launch-scope"),
+            "the session-aware bridge fills in no scope"
         );
     }
 

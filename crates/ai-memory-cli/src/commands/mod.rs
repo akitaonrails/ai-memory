@@ -50,6 +50,7 @@ pub mod data_purge;
 pub mod delete_page;
 pub mod doctor;
 pub mod embed;
+mod eval_embedding_cache;
 pub mod export_okf;
 pub mod finalize_session;
 pub mod forget_sweep;
@@ -65,6 +66,8 @@ pub mod install_hooks;
 pub mod install_instructions;
 pub mod install_mcp;
 pub mod install_skills;
+pub(crate) mod jail_choices;
+pub(crate) mod jail_folders;
 pub mod lint;
 pub mod list_projects;
 pub mod llm_test;
@@ -97,6 +100,7 @@ pub mod render_plugins;
 pub mod render_shared;
 pub mod reorg;
 pub mod repair_backfill_timestamps;
+pub mod repair_split;
 pub mod reset;
 pub mod restore;
 pub mod restore_agents;
@@ -104,6 +108,7 @@ pub mod restore_page;
 pub mod resume;
 pub mod run;
 pub mod run_autowire;
+pub(crate) mod run_project_split;
 pub mod search;
 pub mod serve;
 pub mod server;
@@ -564,11 +569,13 @@ pub(crate) fn skipped_proposal_lines(skipped: &[ai_memory_store::SkippedProposal
     }
     let mut lines = Vec::with_capacity(skipped.len() + 1);
     lines.push(format!("Skipped {} proposal(s):", skipped.len()));
-    lines.extend(
-        skipped
-            .iter()
-            .map(|s| format!("  - {}: {}", s.target_path, s.reason)),
-    );
+    lines.extend(skipped.iter().map(|s| {
+        format!(
+            "  - {}: {}",
+            show::terminal_text(&s.target_path),
+            show::terminal_text(&s.reason)
+        )
+    }));
     lines
 }
 

@@ -43,6 +43,7 @@ secrecy.workspace = true
 sha2.workspace = true
 base64.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 # Sets SO_KEEPALIVE on accepted `serve` sockets (#792); not a workspace dep,
 # `ai-memory-cli` is the only crate that needs it.

@@ -61,6 +61,22 @@ always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
 
+## Recipe: stop the agent repeating something you rejected
+
+> "No, don't mock the database in this integration test. Last month a mock hid
+> a broken migration; use the shared test Postgres."
+
+With an LLM provider configured you don't have to ask for this to be
+remembered. After the session completes, the auto-improvement reviewer picks
+up a correction that comes with a reason, whatever language you wrote it in.
+It proposes a `_rules/` page, or a patch to the one already on that topic,
+saying what to avoid, why, and what to do instead, and it quotes your words as
+evidence. The proposal goes through your `[auto_improve]` approval policy. A
+plain "no" or a one-off rename does not become a rule. Details and limits are
+in [`auto-improvement-loop.md`](auto-improvement-loop.md#user-corrections).
+If the agent still repeats the mistake with the rule in place, turn the rule
+into a hook or a test.
+
 ## Recipe: notice when a page's code has changed
 
 > "Remember this deploy gotcha; it is about `bin/deploy.sh`."
@@ -346,6 +362,34 @@ compacted or merged stays in git and the supersession chain, recoverable with
   moment you return. It is off by default, never deletes a source, and is gated on
   an internal recall eval before it could ever become default behavior.
 
+## Recipe: long sessions on a small context window
+
+A local model with a context window around 200k tokens, or any long-horizon
+session, compacts again and again. Each compaction keeps a lossy summary, and
+the first thing it loses is the start of the session: the task you gave, its
+constraints, the early decisions. ai-memory has the prompts you actually
+typed, so the agent can re-ground on them.
+
+- On Claude Code, Codex, Factory Droid and OpenCode V1/V2, after each
+  compaction the hooks inject a small post-compaction anchor (about 2,000
+  characters by default) with the session's first and latest prompts, and the
+  installed instructions tell the agent to trust it over the summary.
+- On Gemini CLI, Cursor, Copilot CLI, Kimi Code, Grok, Kiro, Cline, Muse and
+  the rest, nothing is injected: the routing block and the handoff skill tell
+  the agent to read its own session's prompts with
+  `memory_read_session_observations` after a compaction. Install the managed
+  routing (`ai-memory install-instructions`, or ask "install ai-memory
+  routing") so every session gets that rule.
+- Anywhere the hooks answer a prompt, you can start one with
+  `reload context` to get the stretch the last compaction dropped, for example
+  `reload context, then finish the migration`.
+
+Codex's `compact_prompt` setting replaces Codex's whole compaction prompt and
+applies only to local providers, so it cannot add one line the way the OpenCode
+hook does. Change it only if you mean to rewrite how Codex summarizes. See
+[`usage.md`](usage.md#reload-context-after-a-compaction) for the per-harness
+details.
+
 ## Recipe: two agents / two repos working together
 
 - **Continuity across agents in the same project** (quit Claude Code, open Codex
@@ -462,6 +506,28 @@ ai-memory run --yolo claude
   A mounted credential is usable by the unsupervised agent, so uncheck what it
   should not touch. What you see is what you get: unchecked rows are passed
   as `--no-X`, so they stay off even if your global `~/.ai-jail` enables them.
+- **Your answers come back next time.** The checklist remembers what you
+  chose for each checkout, so the next launch shows the same marks and Enter
+  is enough. Each pre-checked row says why it is recommended (`found on this
+  machine`, `origin pushes over SSH`), and the header says when your answers
+  were saved and what changed since (`new: …`, `no longer offered: …`). Type
+  `reset` to go back to the recommended marks. The answers are stored in
+  ai-memory's data directory, never in your repository.
+- **Letting the agent read a sibling project.** Press `f` in the checklist to
+  pick extra folders. The picker starts in the folder above your checkout:
+  type to filter, Space to select (read-only), Ctrl+W to make the selected one
+  read-write, Tab or → to open a folder, ← to go up, Enter when done. From the
+  command line, `ai-memory run --jail --jail-map ../ai-jail claude` mounts a
+  folder read-only and `--jail-rw-map DIR` read-write; both repeat. Your home,
+  `/`, credential folders (`~/.ssh`, `~/.aws`, `~/.config/gh`, …) and
+  ai-memory's own data directory are refused, and the error says why. Edits
+  the agent makes in a read-write sibling are captured under the current
+  project, because capture follows the session. This needs ai-jail 2.15.
+- **The same choices next time.** When the jailed session ends, ai-memory
+  prints the `ai-memory run …` line that repeats your choices, `--jail=…`
+  list, folders and harness included. Paste it, or keep it as an alias, to
+  skip the questions. Switching harness from the post-run menu keeps the same
+  jail and options.
 - **Skipping the questions.** `ai-memory run --jail claude` re-runs inside
   ai-jail straight away, turning on those pre-marked defaults and leaving
   everything else to your own ai-jail config. This works with or without
@@ -488,6 +554,16 @@ ai-memory run --yolo claude
   automatically there, enable them in your global `~/.ai-jail` or pass
   `--jail=github,…`. ai-memory always passes `--no-save-config`, so a jailed
   run never writes its own flags into your repository's `.ai-jail`.
+- **With ai-jail 3.0.1 or newer.** ai-jail reviews the access itself, once
+  per project, so ai-memory's screen keeps only the extra folders (`f`).
+  ai-memory names the harness for ai-jail and passes what the session needs
+  as plain grants, with no extra prompts: the harness's login state, the
+  `AI_MEMORY_*` variables, and only that harness's own API key (a Claude jail
+  never gets your OpenAI key). A memory server on this machine is reached
+  through one forwarded port, so the network stays filtered unless you open
+  it in ai-jail's review; a server on another machine keeps full network,
+  which ai-jail labels OPEN. Copilot and Command Code, which ai-jail has no
+  preset for, keep the checklist above.
 - **Already inside ai-jail.** Both prompts are skipped and the run proceeds
   directly, so `ai-jail ai-memory run … --yolo` sees no extra friction.
   Detection is Linux (`ai-sandbox` hostname) / macOS (`PS1` starting with

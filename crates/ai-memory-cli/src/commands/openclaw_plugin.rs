@@ -392,7 +392,7 @@ function postPreCompact(event: any, ctx: any): void {{
   url.searchParams.set("event", eventName);
   url.searchParams.set("agent", AGENT);
   if (!applyMarkerParams(url, typeof body.cwd === "string" ? body.cwd : undefined)) return;
-  const policy = capturePolicy(body, typeof body.cwd === "string" ? body.cwd : undefined);
+  const policy = capturePolicy(body, typeof body.cwd === "string" ? body.cwd : undefined, eventName);
   if (policy.disposition === "drop") return;
   try {{
     // Fire-and-forget, but never silent loss: an unreachable server, a
@@ -642,6 +642,8 @@ mod tests {
         assert!(plugin.contains("fetchHandoff"));
         assert!(plugin.contains("// capture-policy-v1 (generated; do not fork between adapters)"));
         assert!(plugin.contains("const policy = capturePolicy(body"));
+        // #1843: the event name gates the `_ai_memory_file` field.
+        assert!(plugin.contains("body.cwd : undefined, eventName);"));
         assert!(plugin.contains("body: JSON.stringify(policy.payload)"));
         assert!(plugin.contains("prependContext: handoff"));
         assert!(plugin.contains("Bearer ${token}"));

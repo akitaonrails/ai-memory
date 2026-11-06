@@ -28,6 +28,10 @@ pub struct Report {
     /// Human-readable knob summary for this config (e.g.
     /// `embeddings=local reranker=off`).
     pub config: String,
+    /// Haystack document vectors came from the eval embedding cache when
+    /// present (query embeddings are always live).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub embedding_cache: bool,
     pub questions_scored: usize,
     pub abstention_excluded: usize,
     pub ks: Vec<usize>,
@@ -291,7 +295,11 @@ pub fn to_markdown(r: &Report) -> String {
         r.dataset, r.generated_at
     ));
     md.push_str(&provenance_md(r));
-    md.push_str(&format!("- mode: {}\n- config: {}\n\n", r.mode, r.config));
+    md.push_str(&format!("- mode: {}\n- config: {}\n", r.mode, r.config));
+    if r.embedding_cache {
+        md.push_str("- document embeddings: eval cache (`evals/.cache/embeddings`)\n");
+    }
+    md.push('\n');
     md.push_str(&slices_table_md(r));
     md.push_str(&qa_table_md(r));
     md.push_str(&extras_md(r));
@@ -498,6 +506,7 @@ mod tests {
             dataset_sha256: crate::retrieval::dataset::LONGMEMEVAL_S_SHA256,
             mode: "zero-llm",
             config: config.into(),
+            embedding_cache: false,
             questions_scored: 2,
             abstention_excluded: 1,
             ks: vec![5],

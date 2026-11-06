@@ -21,9 +21,9 @@ use ai_memory_core::{AgentKind, ManagedRunId, SessionId};
 use ai_memory_hooks::capture_policy::metadata_only_body;
 use ai_memory_hooks::{
     CaptureDecision, CaptureDisposition, CaptureMode, CapturePolicy, CaptureSource, FILE_FIELD_KEY,
-    FileSkip, FileTarget, GlobStep, GlobWalk, HookEvent, PolicyState, absolute_tool_location_paths,
-    capture_lookup_locations, file_field, file_target, glob_segment_matches, glob_walk,
-    repository_admits_capture,
+    FileSkip, FileTarget, GlobStep, GlobWalk, HookEvent, LookupLocation, PolicyState,
+    absolute_tool_location_paths, capture_lookup_locations, file_field, file_target,
+    glob_segment_matches, repository_admits_capture,
 };
 use ai_memory_llm::OidcToken;
 
@@ -35,9 +35,10 @@ use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
     HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
-    hook_scope, marker_capture_policy, marker_query_suffix, marker_query_suffix_for_subagent_brief,
-    marker_query_suffix_without_briefing, marker_requests_briefing, marker_requests_inbox_notice,
-    marker_requests_subagent_briefing, resolve_cwd_with_fallbacks, url_encode,
+    hook_scope, inbox_notice_query_suffix, marker_capture_policy, marker_query_suffix,
+    marker_query_suffix_for_subagent_brief, marker_query_suffix_without_briefing,
+    marker_requests_briefing, marker_requests_inbox_notice, marker_requests_subagent_briefing,
+    resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -1298,6 +1299,55 @@ fn recap_url(base: &str, agent: &str, session_id: &str, budget: Option<usize>) -
     )
 }
 
+/// The post-compaction anchor's size. A compaction already left the context
+/// tight, so it asks for the server's default rather than a recap's room. One
+/// budget serves every agent because it already fits Codex's limit.
+const ANCHOR_BUDGET: usize = 2_000;
+const _: () = assert!(ANCHOR_BUDGET <= CODEX_RECAP_BUDGET);
+/// The first line of a real anchor. A server that predates `mode=anchor`
+/// ignores it and answers with the full recap (up to 8,000 chars), and an
+/// unknown or refused session gets a "no session is recorded" notice; neither
+/// starts with this, so neither is injected automatically. A session with no
+/// prompts yet still gets its short anchor, which names where the record is.
+pub(crate) const ANCHOR_HEADER: &str = ai_memory_core::compaction_recap::ANCHOR_HEADER_PREFIX;
+
+/// Whether a `SessionStart` is the one an agent fires right after a context
+/// compaction (`source: "compact"`). Any agent that says so is mid-session,
+/// so none of them claims the startup packet; only
+/// [`injects_compaction_anchor`] agents get the anchor in its place.
+fn is_compaction_session_start(raw: &serde_json::Value) -> bool {
+    raw.get("source").and_then(serde_json::Value::as_str) == Some("compact")
+}
+
+/// Whether a compaction `SessionStart` should carry the session anchor: the
+/// agents documented to add its `additionalContext` to the compacted context:
+/// - Claude Code: <https://code.claude.com/docs/en/hooks> ("Re-inject
+///   context after compaction", `source: "compact"`);
+/// - Codex: <https://learn.chatgpt.com/docs/hooks> (`source: "compact"`,
+///   queued after a compaction and run before the next model request);
+/// - Factory Droid: <https://docs.factory.com/reference/hooks-reference>
+///   (`source: "compact"`, appended to the new session context).
+///
+/// Muse reports a `compact` source but publishes no output contract for it,
+/// and Cursor runs Claude Code's settings with unverified handling of the
+/// envelope, so neither gets an anchor.
+fn injects_compaction_anchor(agent: AgentKind, raw: &serde_json::Value) -> bool {
+    matches!(
+        agent,
+        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid
+    ) && is_compaction_session_start(raw)
+        && ai_memory_hooks::agent_from_payload(raw) != Some(AgentKind::Cursor)
+}
+
+/// `GET /recap?mode=anchor`: the session's first and latest operator prompts,
+/// re-grounding the agent after the summary dropped them.
+fn anchor_url(base: &str, agent: &str, session_id: &str) -> String {
+    format!(
+        "{}&mode=anchor",
+        recap_url(base, agent, session_id, Some(ANCHOR_BUDGET))
+    )
+}
+
 /// A `UserPromptSubmit` hook's `hookSpecificOutput.additionalContext`:
 /// Claude Code places it alongside the submitted prompt (used for both the
 /// compaction recap and the mid-session inbox notice, #1942).
@@ -2149,7 +2199,30 @@ where
         // consume the handoff server-side (the GET is destructive) and then
         // discard the result — silently losing it. Those agents recover the
         // handoff on demand via the MCP `memory_handoff_accept` tool.
-        if agent_kind.session_start_injects_handoff() && !handoff_scoped {
+        // A compaction's SessionStart is not a new session: claiming a
+        // handoff, a recovery snapshot or the brief again would spend the
+        // tight room the compaction left on the startup packet, and would
+        // consume a baton mid-session. A verified agent gets the session
+        // anchor instead; every other one, and an unavailable anchor, gets
+        // the normal empty reply.
+        if is_compaction_session_start(&json) {
+            if injects_compaction_anchor(agent_kind, &json)
+                && let Some(session_id) = canonical_session_id.as_deref()
+            {
+                let client = build_client();
+                let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+                let url = anchor_url(base, &args.agent, session_id);
+                if let Some(anchor) =
+                    get_handoff(&client, &url, bearer.as_deref(), handoff_timeout())
+                        .await
+                        .filter(|body| body.starts_with(ANCHOR_HEADER))
+                {
+                    let envelope = session_start_handoff_envelope(agent_kind, anchor);
+                    writeln!(stdout, "{envelope}")?;
+                    return Ok(());
+                }
+            }
+        } else if agent_kind.session_start_injects_handoff() && !handoff_scoped {
             eprintln!(
                 "{}",
                 crate::localization::process_diagnostic(
@@ -2157,8 +2230,7 @@ where
                  was fetched; recover a pending one with memory_handoff_accept"
                 )
             );
-        }
-        if agent_kind.session_start_injects_handoff() && handoff_scoped {
+        } else if agent_kind.session_start_injects_handoff() && handoff_scoped {
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
@@ -2372,7 +2444,8 @@ where
     // inbox notice a session start appends, on every prompt, deduplicated on
     // count change. `inbox_only=1` makes the server return only that notice
     // and skip every claim, write and active-project publish; `handoff=0`,
-    // `recovery=0`, `profile_digest=0` and no `briefing` keep an older server
+    // `recovery=0`, `profile_digest=0` (each sent once: a repeated key is a
+    // 400, see `inbox_notice_query_suffix`) and no `briefing` keep an older server
     // that ignores the flag to the same body (the baton stays unclaimed,
     // unlike the kimi path above, which is Claude's baton-delivery
     // substitute). The response is a count and the inbox's own names, never
@@ -2393,12 +2466,9 @@ where
                 format!("&session_id={}", url_encode(session_id))
             });
         let notice_url = format!(
-            "{base}/handoff?agent={}{qs}&inbox_only=1&handoff=0&recovery=0&profile_digest=0{native_session_qs}",
+            "{base}/handoff?agent={}{qs}{native_session_qs}",
             args.agent,
-            qs = marker_query_suffix_without_briefing(
-                cwd,
-                args.project_strategy.and_then(|s| s.baked()),
-            ),
+            qs = inbox_notice_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
         );
         let notice = get_handoff(&client, &notice_url, bearer.as_deref(), handoff_timeout()).await;
         let shown = inbox_notice_state_path(
@@ -2784,13 +2854,13 @@ fn foreign_decision_within(
     // long list inside the checkout must not spend it first. Inside it the
     // own policy governs, as for a glob rooted there; a marker nested in it
     // is found while the budget lasts, the shallowest locations first.
-    let (outside, mut inside): (Vec<String>, Vec<String>) =
+    let (outside, mut inside): (Vec<LookupLocation>, Vec<LookupLocation>) =
         locations.into_iter().partition(|location| {
             checkout
                 .as_deref()
-                .is_none_or(|checkout| !Path::new(location).starts_with(checkout))
+                .is_none_or(|checkout| !Path::new(&location.path).starts_with(checkout))
         });
-    inside.sort_by_key(|location| Path::new(location).components().count());
+    inside.sort_by_key(|location| Path::new(&location.path).components().count());
     let inside_from = outside.len();
     for (index, location) in outside.into_iter().chain(inside).enumerate() {
         // Past a bound, a location inside the own checkout ends the lookup;
@@ -2802,8 +2872,8 @@ fn foreign_decision_within(
                 Some(unprovable())
             }
         };
-        let (lookup, steps) = match glob_walk(&location) {
-            GlobWalk::Literal => (location, None),
+        let (lookup, steps) = match location.walk() {
+            GlobWalk::Literal => (location.path, None),
             GlobWalk::Unprovable => return unprovable(),
             GlobWalk::Walk { root, steps } => (root, Some(steps)),
         };
@@ -5749,6 +5819,62 @@ mod tests {
             budget,
         )
         .map(|decision| decision.protocol().disposition())
+    }
+
+    /// Regression (#1977): a shell does not expand a `(` or `{` inside
+    /// quotes, so a quoted one next to a `/` (an awk block, a jq group) is
+    /// text and the call keeps its output with no marker anywhere.
+    /// Adversarial: an unquoted brace expansion or zsh group that spans a
+    /// separator still proves nothing, and quoted braces that list
+    /// alternatives, which a program that globs its own argument expands,
+    /// are followed into the sibling checkout they name.
+    #[test]
+    fn a_quoted_group_or_brace_next_to_a_separator_is_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let plain = work.join("plain");
+        let a = work.join("a");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(a.join(".git")).unwrap();
+        std::fs::write(
+            a.join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"secrets.env\"]\n",
+        )
+        .unwrap();
+        let fast = || GlobBudget::with_clock(MAX_GLOB_TIME, Box::new(|| Duration::ZERO));
+        for command in [
+            "echo '(a/b)'",
+            "echo 'a/(b'",
+            "echo 'a/{b'",
+            "echo \"(a/b)\"",
+            "echo a/\\(b",
+            "awk '{print $1/2}' f.txt",
+            "jq '(.a // \"x\")' f.json",
+            "jq '{a: .x, b: (.y/2)}' f.json",
+            "bash -c \"awk '{print \\$1/2}' f.txt\"",
+        ] {
+            assert_eq!(
+                foreign_disposition(&plain, command, None, None, fast),
+                None,
+                "{command}"
+            );
+        }
+        for command in ["cat {x/y,z}", "cat x/{y", "bash -c 'cat {x/y,z}'"] {
+            assert_eq!(
+                foreign_disposition(&plain, command, None, None, fast),
+                Some(CaptureDisposition::MetadataOnly),
+                "{command}"
+            );
+        }
+        assert!(
+            foreign_disposition(&plain, "rg -g '{../a/secrets.env,x}' key", None, None, fast)
+                .is_some(),
+            "the sibling checkout's marker governs a quoted alternative naming it"
+        );
+        assert_eq!(
+            foreign_disposition(&plain, "rg -g '{../plain/x,y}' key", None, None, fast),
+            None
+        );
     }
 
     /// Regression (the docs promised it; v2.6.3 kept the call): a `**` that
@@ -9551,6 +9677,48 @@ mod tests {
         assert!(request.starts_with("GET /handoff?"), "{request}");
     }
 
+    /// A repository that turned handoff and recovery delivery off still gets
+    /// the prompt inbox notice: the request carries each suppression flag
+    /// once, so the server's `HandoffQuery` extractor accepts it instead of
+    /// answering 400 (which the hook swallows as "no notice").
+    #[tokio::test]
+    async fn claude_user_prompt_inbox_notice_survives_delivery_opt_outs() {
+        use ai_memory_hooks::router::HandoffQuery;
+        use axum::extract::Query;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[messaging]\ninbox_notice_on_prompt = true\n\
+             [handoff]\ndeliver_on_session_start = false\n\
+             [recovery]\ndeliver_on_session_start = false\n",
+        )
+        .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", "1 message waiting").await;
+        let mut args = kimi_hook_args("user-prompt-submit", &base);
+        args.agent = "claude-code".into();
+        let mut stdout = Vec::new();
+        run_with_payload(
+            Some(data.path().to_path_buf()),
+            args,
+            serde_json::json!({"session_id": "claude-session", "cwd": repo.path()}).to_string(),
+            &mut stdout,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        let request = first_request(&mut requests).await.unwrap();
+        let target = request.split_whitespace().nth(1).unwrap();
+        let uri: axum::http::Uri = target.parse().unwrap();
+        let Query(query) = Query::<HandoffQuery>::try_from_uri(&uri)
+            .unwrap_or_else(|e| panic!("the server would reject {target}: {e}"));
+        assert_eq!(query.inbox_only.as_deref(), Some("1"), "{target}");
+        assert_eq!(query.handoff.as_deref(), Some("0"), "{target}");
+        assert_eq!(query.recovery.as_deref(), Some("0"), "{target}");
+    }
+
     fn hermes_args(event: &str, server_url: &str) -> HookArgs {
         let mut args = kimi_hook_args(event, server_url);
         args.agent = "hermes".into();
@@ -11134,5 +11302,210 @@ mod tests {
         )
         .await;
         assert!(!data_dir.join("recap-pending").join("grok-session").exists());
+    }
+
+    fn droid_args(event: &str, server_url: &str) -> HookArgs {
+        let mut args = claude_args(event, server_url);
+        args.agent = "droid".into();
+        args
+    }
+
+    fn session_start_payload(cwd: &Path, session_id: &str, source: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": session_id,
+            "cwd": cwd,
+            "source": source,
+        })
+    }
+
+    #[tokio::test]
+    async fn compact_session_start_injects_the_anchor_and_never_claims_a_handoff() {
+        type Args = fn(&str, &str) -> HookArgs;
+        let agents: [(&str, Args); 3] = [
+            ("claude-code", claude_args),
+            ("codex", codex_args),
+            ("droid", droid_args),
+        ];
+        for (agent, args) in agents {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
+            let stdout = run_hook(
+                &tmp.path().join("data"),
+                args("session-start", &base),
+                session_start_payload(tmp.path(), "compacted-session", "compact"),
+            )
+            .await;
+            let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+            assert_eq!(
+                envelope,
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": ANCHOR_SAMPLE,
+                    }
+                }),
+                "{agent}"
+            );
+            let seen = all_requests(&mut requests).await;
+            assert!(
+                !seen.iter().any(|r| r.starts_with("GET /handoff")),
+                "{agent}: a compaction must not claim a handoff: {seen:?}"
+            );
+            let recap = recap_requests(&seen);
+            assert_eq!(recap.len(), 1, "{agent}: {seen:?}");
+            for part in [
+                "mode=anchor",
+                "budget=2000",
+                "session_id=compacted-session",
+                &format!("agent={agent}"),
+            ] {
+                assert!(recap[0].contains(part), "{agent}: {part}: {}", recap[0]);
+            }
+            // The session-start drain still runs first, so the compaction's
+            // own boundary reaches the server before the anchor reads it.
+            let drain = seen.iter().position(|r| r.starts_with("POST /hook"));
+            let anchor = seen.iter().position(|r| r.starts_with("GET /recap"));
+            assert!(drain.is_some() && drain < anchor, "{agent}: {seen:?}");
+        }
+    }
+
+    const ANCHOR_SAMPLE: &str = "> 🧭 ai-memory: post-compaction anchor for this session (compacted-session)\n> The summary may have lost detail.";
+
+    /// An older server ignores `mode=anchor` and answers with the full recap
+    /// or its "no compaction" notice; an unknown or refused session gets the
+    /// anchor's own notice. None of them is injected.
+    #[tokio::test]
+    async fn compact_session_start_injects_only_a_real_anchor() {
+        for body in [
+            "> 🧭 ai-memory: compaction recap for this session\n<!-- ai-memory:untrusted-history:start -->\nold recap",
+            "> 🧭 ai-memory: no compaction is recorded for this session yet.",
+            ai_memory_core::compaction_recap::NO_ANCHOR_SESSION_NOTICE,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", body).await;
+            let stdout = run_hook(
+                &tmp.path().join("data"),
+                claude_args("session-start", &base),
+                session_start_payload(tmp.path(), "compacted-session", "compact"),
+            )
+            .await;
+            assert_eq!(stdout, b"{}\n", "{body}");
+            let seen = all_requests(&mut requests).await;
+            assert_eq!(recap_requests(&seen).len(), 1, "{seen:?}");
+            assert!(
+                !seen.iter().any(|r| r.starts_with("GET /handoff")),
+                "{seen:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_session_start_with_the_server_down_prints_the_empty_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("session-start", &dead_server_url()),
+            session_start_payload(tmp.path(), "compacted-session", "compact"),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+    }
+
+    #[tokio::test]
+    async fn compact_session_start_with_no_anchor_never_falls_back_to_a_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("404 Not Found", "").await;
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            codex_args("session-start", &base),
+            session_start_payload(tmp.path(), "compacted-session", "compact"),
+        )
+        .await;
+        assert_eq!(stdout, b"{}\n");
+        let seen = all_requests(&mut requests).await;
+        assert_eq!(recap_requests(&seen).len(), 1, "{seen:?}");
+        assert!(
+            !seen.iter().any(|r| r.starts_with("GET /handoff")),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_session_start_sources_still_fetch_the_handoff() {
+        for source in ["startup", "resume", "clear"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", "HANDOFF-BODY").await;
+            let stdout = run_hook(
+                &tmp.path().join("data"),
+                claude_args("session-start", &base),
+                session_start_payload(tmp.path(), "fresh-session", source),
+            )
+            .await;
+            let envelope: serde_json::Value = serde_json::from_slice(stdout.trim_ascii()).unwrap();
+            assert_eq!(
+                envelope["hookSpecificOutput"]["additionalContext"], "HANDOFF-BODY",
+                "{source}"
+            );
+            let seen = all_requests(&mut requests).await;
+            assert!(
+                seen.iter().any(|r| r.starts_with("GET /handoff?")),
+                "{source}: {seen:?}"
+            );
+            assert!(recap_requests(&seen).is_empty(), "{source}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_documented_agents_inject_a_compaction_anchor() {
+        let compact = serde_json::json!({ "source": "compact" });
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Droid] {
+            assert!(injects_compaction_anchor(agent, &compact), "{agent:?}");
+            assert!(!injects_compaction_anchor(
+                agent,
+                &serde_json::json!({ "source": "resume" })
+            ));
+        }
+        // Muse reports a `compact` source but publishes no output contract
+        // for it; Cursor running Claude Code's settings is unverified. Both
+        // still count as a compaction, so neither claims the startup packet.
+        let cursor = serde_json::json!({ "source": "compact", "cursor_version": "2.0.0" });
+        assert!(!injects_compaction_anchor(AgentKind::Muse, &compact));
+        assert!(!injects_compaction_anchor(AgentKind::ClaudeCode, &cursor));
+        assert!(is_compaction_session_start(&compact));
+        assert!(is_compaction_session_start(&cursor));
+        assert!(!is_compaction_session_start(
+            &serde_json::json!({ "source": "startup" })
+        ));
+    }
+
+    /// A compaction `SessionStart` from an agent without a verified anchor
+    /// contract (Muse, or Cursor running Claude Code's settings) is still
+    /// mid-session: it must not claim a pending handoff, recovery snapshot or
+    /// brief, and gets no anchor either.
+    #[tokio::test]
+    async fn unverified_compact_session_start_claims_nothing_and_gets_no_anchor() {
+        for (name, agent, cursor) in [("muse", "muse", false), ("cursor", "claude-code", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
+            let mut args = claude_args("session-start", &base);
+            args.agent = agent.into();
+            let mut payload = session_start_payload(tmp.path(), "compacted-session", "compact");
+            if cursor {
+                payload["cursor_version"] = "2.0.0".into();
+            }
+            let stdout = run_hook(&tmp.path().join("data"), args, payload).await;
+            let stdout = String::from_utf8_lossy(&stdout);
+            assert!(
+                !stdout.contains("post-compaction anchor"),
+                "{name}: {stdout}"
+            );
+            let seen = all_requests(&mut requests).await;
+            assert!(
+                !seen.iter().any(|r| r.starts_with("GET /handoff")),
+                "{name}: a compaction must not claim a handoff: {seen:?}"
+            );
+            assert!(recap_requests(&seen).is_empty(), "{name}: {seen:?}");
+        }
     }
 }

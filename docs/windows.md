@@ -251,6 +251,27 @@ registers the server to start at logon (see
 wires the agents it finds, and checks the result. Inside WSL2 the Linux
 `install.sh` and `setup` path works unchanged.
 
+### With Scoop
+
+Releases from 3.4.0 on are also published to the maintainer's
+[Scoop](https://scoop.sh) bucket:
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Scoop checks the zip against the release's published SHA-256, unpacks it to
+`<scoop>\apps\ai-memory\<version>` and points the
+`<scoop>\apps\ai-memory\current` junction at it. The `ai-memory` shim on
+`PATH` runs the binary through `current`. `ai-memory setup` records that
+`current` path in the logon entry, the hook commands and the MCP entries,
+never the version directory, so they keep working after
+`scoop update ai-memory` installs the next version and `scoop cleanup` deletes
+the old one. Update with `scoop update ai-memory`: `ai-memory upgrade` refuses
+a Scoop install, because the bucket owns the version.
+
 To do the same by hand:
 
 ```powershell
@@ -283,7 +304,8 @@ $EnvKey.Dispose()
     --server-url "https://memory.example.com" --auth-token "<token>"
 ```
 
-Later updates for this install use the same command as Linux/macOS release
+Later updates for this install (not a Scoop one, which updates with
+`scoop update ai-memory`) use the same command as Linux/macOS release
 binaries. From a writable prefix (for example `%LOCALAPPDATA%\ai-memory`),
 run:
 

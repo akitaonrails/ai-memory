@@ -14,6 +14,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use super::show::terminal_text;
 use crate::cli::ListProjectsArgs;
 use crate::commands::show::ProjectRow;
 use crate::config::Config;
@@ -119,7 +120,9 @@ fn render_human(i18n: &ai_memory_core::i18n::Localizer, rows: &[ProjectRow]) -> 
     // while scalar counts under-count double-width CJK characters.
     let workspace_width = rows
         .iter()
-        .map(|row| unicode_width::UnicodeWidthStr::width(row.workspace_name.as_str()))
+        .map(|row| {
+            unicode_width::UnicodeWidthStr::width(terminal_text(&row.workspace_name).as_str())
+        })
         .max()
         .unwrap_or(0)
         .max(unicode_width::UnicodeWidthStr::width(
@@ -127,7 +130,7 @@ fn render_human(i18n: &ai_memory_core::i18n::Localizer, rows: &[ProjectRow]) -> 
         ));
     let project_width = rows
         .iter()
-        .map(|row| unicode_width::UnicodeWidthStr::width(row.project_name.as_str()))
+        .map(|row| unicode_width::UnicodeWidthStr::width(terminal_text(&row.project_name).as_str()))
         .max()
         .unwrap_or(0)
         .max(unicode_width::UnicodeWidthStr::width(
@@ -138,7 +141,11 @@ fn render_human(i18n: &ai_memory_core::i18n::Localizer, rows: &[ProjectRow]) -> 
     // header stays stable across server versions. (#1208)
     let id_width = rows
         .iter()
-        .map(|row| unicode_width::UnicodeWidthStr::width(row.project_id.as_deref().unwrap_or("-")))
+        .map(|row| {
+            unicode_width::UnicodeWidthStr::width(
+                terminal_text(row.project_id.as_deref().unwrap_or("-")).as_str(),
+            )
+        })
         .max()
         .unwrap_or(0)
         .max(unicode_width::UnicodeWidthStr::width(id_header.as_str()));
@@ -171,11 +178,14 @@ fn render_human(i18n: &ai_memory_core::i18n::Localizer, rows: &[ProjectRow]) -> 
     for row in rows {
         out += &format!(
             "{}  {}  {}  {:>pages_width$}  {}\n",
-            display_cell(&row.workspace_name, workspace_width),
-            display_cell(&row.project_name, project_width),
-            display_cell(row.project_id.as_deref().unwrap_or("-"), id_width),
+            display_cell(&terminal_text(&row.workspace_name), workspace_width),
+            display_cell(&terminal_text(&row.project_name), project_width),
+            display_cell(
+                &terminal_text(row.project_id.as_deref().unwrap_or("-")),
+                id_width
+            ),
             row.page_count,
-            row.last_updated.as_deref().unwrap_or("-")
+            terminal_text(row.last_updated.as_deref().unwrap_or("-"))
         );
     }
     out

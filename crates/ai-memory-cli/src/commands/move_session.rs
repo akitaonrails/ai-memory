@@ -4,6 +4,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
+use super::show::terminal_text;
 use crate::cli::MoveSessionArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -77,7 +78,7 @@ pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
             "{}",
             i18n.format(
                 "cli-move-project-ai-memory-warning-warning",
-                &[("value0", warning.to_string())]
+                &[("value0", terminal_text(warning))]
             )
         );
     }
@@ -102,8 +103,8 @@ pub async fn run(config: &Config, args: MoveSessionArgs) -> Result<()> {
 fn scope(label: &serde_json::Value) -> String {
     format!(
         "{}/{}",
-        label["workspace"].as_str().unwrap_or("?"),
-        label["project"].as_str().unwrap_or("?")
+        terminal_text(label["workspace"].as_str().unwrap_or("?")),
+        terminal_text(label["project"].as_str().unwrap_or("?"))
     )
 }
 
@@ -131,7 +132,7 @@ fn print_session_report(
                 ("value0", verb.to_string()),
                 (
                     "value1",
-                    report["session_id"].as_str().unwrap_or("?").to_string()
+                    terminal_text(report["session_id"].as_str().unwrap_or("?"))
                 ),
                 ("value2", scope(&report["from"]).to_string()),
                 ("value3", scope(&report["to"]).to_string())
@@ -157,7 +158,7 @@ fn print_session_report(
             "{}",
             i18n.format(
                 "cli-move-session-warning-warning",
-                &[("value0", warning.to_string())]
+                &[("value0", terminal_text(warning))]
             )
         );
     }
@@ -186,7 +187,7 @@ fn print_checkpoints(i18n: &ai_memory_core::i18n::Localizer, report: &serde_json
             "{}",
             i18n.format(
                 "cli-move-session-pre-move-checkpoint-oid",
-                &[("value0", oid.to_string())]
+                &[("value0", terminal_text(oid))]
             )
         );
     }
@@ -195,7 +196,7 @@ fn print_checkpoints(i18n: &ai_memory_core::i18n::Localizer, report: &serde_json
             "{}",
             i18n.format(
                 "cli-move-session-checkpoint-oid",
-                &[("value0", oid.to_string())]
+                &[("value0", terminal_text(oid))]
             )
         );
     }
@@ -242,7 +243,7 @@ fn print_batch_report(
         for s in sessions {
             println!(
                 "{:<38} {:<8} {:>6} {:>8} {:>5} {:<22} {}",
-                s["session_id"].as_str().unwrap_or("?"),
+                terminal_text(s["session_id"].as_str().unwrap_or("?")),
                 if s["session_moved"].as_bool().unwrap_or(false) {
                     "moved"
                 } else {
@@ -251,8 +252,8 @@ fn print_batch_report(
                 s["summary"]["observations"].as_u64().unwrap_or(0),
                 s["summary"]["handoffs"].as_u64().unwrap_or(0),
                 s["summary"]["consolidation_jobs"].as_u64().unwrap_or(0),
-                s["page"].as_str().unwrap_or("none"),
-                s["cwd"].as_str().unwrap_or(""),
+                terminal_text(s["page"].as_str().unwrap_or("none")),
+                terminal_text(s["cwd"].as_str().unwrap_or("")),
             );
         }
         let rehomed = sessions
@@ -313,8 +314,14 @@ fn print_source_scopes(
             i18n.format(
                 "cli-move-session-observation-s",
                 &[
-                    ("value0", s["workspace"].as_str().unwrap_or("?").to_string()),
-                    ("value1", s["project"].as_str().unwrap_or("?").to_string()),
+                    (
+                        "value0",
+                        terminal_text(s["workspace"].as_str().unwrap_or("?"))
+                    ),
+                    (
+                        "value1",
+                        terminal_text(s["project"].as_str().unwrap_or("?"))
+                    ),
                     (
                         "value2",
                         format!("{}", s["observations"].as_u64().unwrap_or(0))
@@ -369,7 +376,7 @@ fn print_counts(i18n: &ai_memory_core::i18n::Localizer, summary: &serde_json::Va
         i18n.format(
             "cli-move-session-page-page-version-s-moved-retired",
             &[
-                ("value0", page.to_string()),
+                ("value0", terminal_text(page)),
                 ("value1", format!("{}", n("page_versions_moved"))),
                 ("value2", format!("{}", n("pages_regenerated")))
             ]

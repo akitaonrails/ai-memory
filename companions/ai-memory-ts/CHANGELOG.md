@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `observations` documents the server's new `session_id: "current"`: the
+  server resolves it only for a request carrying the caller's hook session
+  id, which this client does not send, so SDK callers pass the id. (#1983)
 - `pages.write`, `pages.writeBatch` and `pages.update` accept `sourceFiles`
   (sent as `source_files`), the repository files a page describes with the
   commit it was checked against; `pages.update` carries it over. (#1957)

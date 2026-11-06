@@ -30,7 +30,10 @@ project-scoped tool call because they cannot attach the real lifecycle-hook
 session id. Without a marker override, static clients derive the project from normalized
 `upstream`, then `origin`, joining the full hostless path with the standard safe
 name mapping; only no-valid-remote checkouts use their folder basename.
-Session-aware bridges keep automatic current-project routing.
+Session-aware bridges keep automatic current-project routing. The session-less
+`ai-memory mcp-bridge --no-session-id` applies this derivation itself, from its
+launch directory, to a call that names no scope
+([`auto-scope.md`](auto-scope.md#the-session-less-bridges-launch-scope)).
 
 ## Where to put it
 
@@ -650,6 +653,25 @@ subtracts an ignored path. An entry using glob
 syntax the matcher cannot evaluate (`[…]`, `{…}`, `(…)`, `!`) makes the call
 **metadata-only**.
 
+OMP's `read` and `write` can name a file through a suffix of `path`: a line
+selector (`notes.txt:450-455`, `:-5`, `:raw`), an archive member
+(`vault.zip:notes/a.md`), a SQLite table or row (`app.db:users:42`), an
+executable view (`bin:main`), a video time or a query (`data.json?q=.items`).
+OMP reads the file of the full name when one exists and otherwise the part
+before the suffix, so ai-memory also matches every part of the path before a
+`:` or `?`: `secrets.env:1-20` and `key.pem:1-40` drop under `secrets.env` and
+`*.pem` like the bare names, and `vault.zip:notes/a.md` drops under
+`vault.zip`. A Windows drive or device prefix (`C:`, `\\?\`) ends no part, and
+a path with more than 32 parts is **metadata-only**.
+
+Both harnesses also rewrite a file-tool path before opening it, and ai-memory
+matches the rewritten path as well. OMP's `read`, `write` and `edit` drop a
+stray leading `:` before a path (`:/repo/secrets.env`, `:./key.pem`) and a
+leading `@` before an absolute path or `~` (`@/repo/secrets.env`). Pi's drop
+any leading `@` (`@secrets.env`). Both read a `file://` URL as the path it
+names. In the generated extension a path that starts with `:` is
+**metadata-only**, since the extension cannot place it.
+
 Recognized shell tools (`Bash`, `PowerShell`, `shell`, `exec`, `execute_bash`,
 `terminal`, Gemini CLI's `run_shell_command`, …) have no path field, so the command line is split into words lexically, the way
 a POSIX shell quotes and separates them, without expanding or running anything.
@@ -813,7 +835,12 @@ most 256 directories and runs at most 50 ms per call; past any bound the call
 is metadata-only, and so is glob syntax that can leave its leading directories:
 a brace or group spanning a separator, a `..` or `~` alternative, a brace
 expansion that builds one, or a brace-built directory name that older bash
-expands to `..` (`.{*,x}/`). A brace expansion too large to list (more than 64
+expands to `..` (`.{*,x}/`). In a shell argument, a `(` or `{` the shell does
+not expand is text, not glob syntax: one inside quotes or escaped
+(`awk '{print $1/2}'`, `jq '(.a // "x")'`, `echo 'a/{b'`), or in an element of
+an argument vector that no shell runs. Quoted braces that still list
+alternatives (`rg -g '{a/x,b}'`) are looked up once per alternative as well,
+since a program that globs its own argument expands them. A brace expansion too large to list (more than 64
 words) counts as leaving only when its pieces could build such a word; integer
 and letter sequences cannot, so `touch test/file{1..200}.txt` and `cat
 data/{a..h}{1..9}.csv` are walked like any other glob. A `..` after a `**`,
@@ -881,6 +908,12 @@ can be mentioned.
 - a value glued to a short flag is read after the flag's first letter only,
   not after a cluster (`-rf…`), and a `file:` URL's non-ASCII percent-escapes
   are not decoded;
+- OMP and Pi resolve a file-tool path in ways the matcher does not follow:
+  both expand `~` and normalize Unicode spaces before opening it, Pi on
+  Windows reads a Git Bash `/c/x` as `C:\x`, and OMP splits a `read` path
+  that names no file at commas, semicolons or whitespace into several files,
+  so `ignore_paths` sees only the path as spelled, its parts before a `:` or
+  `?`, and the `:`, `@` and `file://` rewrites above;
 - in a Windows session a shell tool's `workdir` spelled `/c/x` is read only
   as Git Bash reads it (`C:\x`), so arguments resolved from it miss a native
   tool's reading (`D:\c\x` from a `cwd` on `D:`); a file-tool path or shell

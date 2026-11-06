@@ -68,6 +68,10 @@ The dashboard shows usage for individual model responses and totals per session
 and agent type. Update the native Claude Code or Codex client and reinstall its
 hooks as above to enable capture. There is no separate dashboard token switch.
 The server records reports as they arrive; the session need not end.
+Pi also reports cumulative session totals through its updated generated
+extension, but not individual response records. See
+[Pi capture and accounting limits](usage.md#investigate-token-usage-in-the-dashboard)
+for setup, included history and fork behavior.
 
 The Token usage form filters the complete authorized response ledger on the
 server before selecting a 50-row page. From is inclusive and Until is exclusive,

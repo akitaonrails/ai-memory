@@ -240,6 +240,7 @@ async fn dispatch(
         Command::PurgeProject(args) => commands::purge_project::run(&config, args).await,
         Command::PurgeSession(args) => commands::purge_session::run(&config, args).await,
         Command::RenameProject(args) => commands::rename_project::run(&config, args).await,
+        Command::RepairSplit(args) => commands::repair_split::run(&config, args).await,
         Command::MoveProject(args) => commands::move_project::run(&config, args).await,
         Command::MergeProject(args) => commands::merge_project::run(&config, args).await,
         Command::MoveSession(args) => commands::move_session::run(&config, args).await,

@@ -3256,6 +3256,19 @@ impl ReaderPool {
             .await
     }
 
+    /// The other project already holding a native session this run could not
+    /// link (#1993).
+    pub async fn managed_run_native_session_holder(
+        &self,
+        run_id: ManagedRunId,
+        native_session_id: String,
+    ) -> StoreResult<Option<crate::NativeSessionHolder>> {
+        self.with_conn(move |conn| {
+            crate::workstream::native_session_holder(conn, run_id, &native_session_id)
+        })
+        .await
+    }
+
     /// Return the unseen portable range assigned to a managed SessionStart.
     pub async fn managed_run_context(
         &self,
@@ -12284,6 +12297,31 @@ impl ReaderPool {
                 )
                 .optional()?;
             Ok(row)
+        })
+        .await
+    }
+
+    /// Check whether restoring the original frontmatter would revive a purged
+    /// session summary. This precheck does not reserve a later write.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::SessionPurged`] for a refused summary, or any SQL
+    /// or pool error.
+    pub async fn check_page_restore_allowed(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+        frontmatter: serde_json::Value,
+    ) -> StoreResult<()> {
+        self.with_conn(move |conn| {
+            crate::ops::check_page_restore_allowed(
+                conn,
+                workspace_id,
+                project_id,
+                &path,
+                &frontmatter,
+            )
         })
         .await
     }

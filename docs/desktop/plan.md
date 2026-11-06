@@ -109,7 +109,7 @@ payload. What shipped, under the existing `antigravity-cli` agent kind:
 
 ## Phase 3 — explicit capture for hookless surfaces (RFC Phase 1, adjusted)
 
-- Tool-surface change (current 25-tool count, MEMORY_INSTRUCTIONS/SNIPPET_BODY,
+- Tool-surface change (current 27-tool count, MEMORY_INSTRUCTIONS/SNIPPET_BODY,
   prompt-surface regression tests, adversarial boundary test) for an
   explicit capture tool the model calls on apps without hooks (Claude Chat
   tab, Grok Bot, hosted ChatGPT chat). Scoping per RFC: fixed

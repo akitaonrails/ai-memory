@@ -784,6 +784,8 @@ fn required_qualified_attribute(
 
 fn xlsx_shared_strings(xml: &str) -> Result<Vec<String>> {
     let mut reader = XmlReader::from_str(xml);
+    // An empty <si/> still occupies an index in the shared string table.
+    reader.config_mut().expand_empty_elements = true;
     let mut strings = Vec::new();
     let mut current = None::<String>;
     let mut in_text = false;
@@ -1661,6 +1663,41 @@ mod tests {
         let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
         assert!(plan.body.contains("## Sheet: Totals"), "{}", plan.body);
         assert!(plan.body.contains("Item\t42"), "{}", plan.body);
+    }
+
+    #[test]
+    fn xlsx_empty_shared_strings_preserve_cell_indexes() {
+        for empty in ["<si/>", "<si></si>", "<si><t/></si>"] {
+            let shared_xml = format!("<sst>{empty}<si><t>Label</t></si><si><t>Last</t></si></sst>");
+            let shared = xlsx_shared_strings(&shared_xml).unwrap();
+            let sheet = r#"<worksheet><sheetData><row><c t="s"><v>0</v></c><c t="s"><v>1</v></c><c t="s"><v>2</v></c></row></sheetData></worksheet>"#;
+            let mut output = String::new();
+            let mut cells = 0;
+            extract_xlsx_sheet(sheet, &shared, &mut cells, &mut output).unwrap();
+            assert_eq!(output, "    \tLabel\tLast\n", "{empty}");
+            assert_eq!(cells, 3);
+        }
+    }
+
+    #[test]
+    fn xlsx_empty_shared_strings_keep_the_entry_limit_and_nesting_guard() {
+        let entries = "<si/>".repeat(MAX_SHARED_STRINGS);
+        let at_limit = format!("<sst>{entries}</sst>");
+        assert_eq!(
+            xlsx_shared_strings(&at_limit).unwrap().len(),
+            MAX_SHARED_STRINGS
+        );
+        let over_limit = format!("<sst>{entries}<si/></sst>");
+        let error = xlsx_shared_strings(&over_limit).unwrap_err();
+        assert!(error.to_string().contains("shared-string limit"), "{error}");
+
+        let error = xlsx_shared_strings("<sst><si><si/></si></sst>").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("nested XLSX shared string entry"),
+            "{error}"
+        );
     }
 
     #[test]

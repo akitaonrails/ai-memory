@@ -117,6 +117,20 @@ Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
 failure under `iex` leaves your PowerShell window open. Details are in
 [`docs/windows.md`](windows.md).
 
+With [Scoop](https://scoop.sh), add the maintainer's bucket and install from it
+instead (ai-memory 3.4.0 or later):
+
+```powershell
+scoop bucket add akitaonrails https://github.com/akitaonrails/scoop-bucket
+scoop install ai-memory
+ai-memory setup
+```
+
+Scoop verifies the zip against the SHA-256 published with the release and puts
+an `ai-memory` shim on `PATH`. Update with `scoop update ai-memory`;
+`ai-memory upgrade` refuses a Scoop install, because the bucket owns the
+version.
+
 `ai-memory setup [--yes] [--agent <name>]... [--no-service] [--plan [--json]] [--web [--no-open]]`
 runs, in order, the commands a native install otherwise needs one by one:
 
@@ -132,11 +146,13 @@ runs, in order, the commands a native install otherwise needs one by one:
    `~/Library/LaunchAgents/com.github.akitaonrails.ai-memory.plist` on macOS,
    rendered from the packaged LaunchAgent. The unit runs the binary `setup` ran
    from. When that binary sits in a versioned package location (Homebrew's
-   `Cellar/ai-memory/<version>` or a `/nix/store` path, both gone after an
-   upgrade and `brew cleanup` or garbage collection), the unit names a stable
-   link that resolves to the same file instead: the path as invoked, an
-   `ai-memory` on `PATH` such as `~/.nix-profile/bin/ai-memory`, or Homebrew's
-   `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`. With no such link it names
+   `Cellar/ai-memory/<version>`, a `/nix/store` path, or Scoop's
+   `apps\ai-memory\<version>`, all gone after an upgrade and `brew cleanup`,
+   garbage collection or `scoop cleanup`), the unit names a stable link that
+   resolves to the same file instead: the path as invoked, an `ai-memory` on
+   `PATH` such as `~/.nix-profile/bin/ai-memory`, Homebrew's
+   `opt/ai-memory/bin/ai-memory` or `bin/ai-memory`, or Scoop's
+   `apps\ai-memory\current\ai-memory.exe`. With no such link it names
    the versioned path, and you re-run `setup` after upgrading.
    On Windows there is no per-user service manager, so `setup` writes an
    `ai-memory` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
@@ -3928,7 +3944,7 @@ are checked against the release workflow's exact layout but are not extracted
 during self-upgrade. Archives are capped at 4,096 entries and 512 MiB expanded,
 in addition to the 128 MiB response-body cap. Windows uses rename-aside
 (`.exe` → `.old`, then promote `.new`) because
-a running image cannot be overwritten in place. It refuses Homebrew/AUR/`/usr`
+a running image cannot be overwritten in place. It refuses Homebrew/AUR/Scoop/`/usr`
 installs (use the package manager), unwritable prefixes (for example Program
 Files; download the zip manually), and in-container binaries (upgrade the
 host wrapper/image instead). Windows aarch64 has no release asset yet. For

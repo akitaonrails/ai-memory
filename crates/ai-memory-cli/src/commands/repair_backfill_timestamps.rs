@@ -28,6 +28,7 @@ use ai_memory_workstream::{ManagedHarness, build_launch_plan, export_transcript}
 
 use super::backfill::{SessionRef, collect_local_sessions};
 use super::run;
+use super::show::terminal_text;
 use crate::cli::RepairBackfillTimestampsArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, post_json};
@@ -242,7 +243,7 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
             i18n.format(
                 "cli-repair-backfill-timestamps-skipped-reason-count",
                 &[
-                    ("value0", reason.to_string()),
+                    ("value0", terminal_text(reason)),
                     ("value1", format!("{}", count))
                 ]
             )
@@ -254,7 +255,7 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
         for repaired in &response.repaired {
             println!(
                 "  {}: {} .. {} -> {} .. {}{}",
-                repaired.session_id,
+                terminal_text(&repaired.session_id),
                 format_us(repaired.old_started_at_us),
                 repaired
                     .old_ended_at_us

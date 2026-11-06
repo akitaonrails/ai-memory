@@ -33,6 +33,8 @@
 //!   computes them from local transcripts; see `ai-memory
 //!   repair-backfill-timestamps`).
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
+//! - `POST /admin/adopt-project-identity` — move an empty project's repository
+//!   identity onto the project holding the checkout's sessions (#1993).
 //! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
 //! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
 //! - `POST /admin/reclaim-ledger-versions` — drop the superseded ledger
@@ -812,6 +814,10 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/purge-project", post(handle_purge_project))
         .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
+        .route(
+            "/admin/adopt-project-identity",
+            post(handle_adopt_project_identity),
+        )
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/merge-project", post(handle_merge_project))
         .route("/admin/move-session", post(handle_move_session))
@@ -4806,7 +4812,13 @@ async fn handle_restore_page(
             .wiki
             .restore_page_from_checkpoint(ws, proj, path.clone(), rev)
             .await
-            .map_err(|e| internal_err(e.to_string()))?
+            .map_err(|error| match error {
+                WikiError::Store(StoreError::SessionPurged(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
+                _ => internal_err(error.to_string()),
+            })?
     } else {
         let version = version_id
             .ok_or_else(|| internal_err("validated page-version restore lost its version id"))?;
@@ -4815,6 +4827,10 @@ async fn handle_restore_page(
             .restore_page_from_version(ws, proj, path.clone(), version)
             .await
             .map_err(|error| match error {
+                WikiError::Store(StoreError::SessionPurged(_)) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
                 WikiError::Store(StoreError::NotFound(_)) => (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({"error": error.to_string()})),
@@ -6512,6 +6528,105 @@ async fn handle_rename_project(
         to: req.to.clone(),
         pages,
         checkpoint,
+        manifest_warning,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&summary).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+#[derive(Deserialize)]
+struct AdoptProjectIdentityRequest {
+    workspace: String,
+    /// The project that holds the checkout's sessions.
+    project_id: String,
+    /// The empty project that holds the repository identity.
+    from_project_id: String,
+    /// The emptied project's name when it held the remote-derived name;
+    /// defaults to `<name>-split-<YYYYMMDD>`.
+    #[serde(default)]
+    archive_name: Option<String>,
+}
+
+/// Wire-format summary returned by `POST /admin/adopt-project-identity`.
+#[derive(Debug, Serialize)]
+pub struct AdoptProjectIdentitySummary {
+    /// Workspace name.
+    pub workspace: String,
+    /// The project that now carries the identity, under its final name.
+    pub project: String,
+    /// That project's name before the move.
+    pub previous: String,
+    /// The emptied project's name afterwards.
+    pub archived: String,
+    /// The repository identity that moved.
+    pub identity: String,
+    /// Non-fatal manifest/checkpoint failure after the database change committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
+}
+
+async fn handle_adopt_project_identity(
+    State(state): State<Arc<AdminState>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<AdoptProjectIdentityRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    let (ws_id, into) =
+        match resolve_target_ids_for_admin(&state, &req.workspace, None, Some(&req.project_id))
+            .await
+        {
+            Ok(target) => target,
+            Err(e) => return e,
+        };
+    let (_, from) = match resolve_target_ids_for_admin(
+        &state,
+        &req.workspace,
+        None,
+        Some(&req.from_project_id),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
+    let adopted = match state
+        .writer
+        .adopt_project_identity(ws_id, into, from, req.archive_name.clone(), author_id)
+        .await
+    {
+        Ok(adopted) => adopted,
+        Err(e) => {
+            let status = match &e {
+                StoreError::InvalidState(_) => StatusCode::CONFLICT,
+                StoreError::ProjectNameTaken(_) | StoreError::InvalidProjectName(_) => {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+                StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return (status, Json(serde_json::json!({ "error": e.to_string() })));
+        }
+    };
+    let mut manifest_warning = None;
+    for project_id in [into, from] {
+        if let Err(error) = state.wiki.refresh_renamed_scope(ws_id, project_id).await {
+            warn!(
+                error = %error,
+                workspace_id = %ws_id,
+                project_id = %project_id,
+                "adopt-project-identity committed; manifest refresh/checkpoint failed; startup backfill can repair"
+            );
+            manifest_warning = Some(error.to_string());
+        }
+    }
+    let summary = AdoptProjectIdentitySummary {
+        workspace: req.workspace,
+        project: adopted.project,
+        previous: adopted.previous,
+        archived: adopted.archived,
+        identity: adopted.identity,
         manifest_warning,
     };
     (
@@ -10331,6 +10446,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["llm_workloads"], serde_json::json!([]));
+        assert!(json["providers"]["llm_workloads_started_ms"].is_null());
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
         // 2.0 item 7: the report carries the wedged-writer gauge and the
         // wiki-format state — a fresh store is natively conformant (no
@@ -10403,6 +10519,13 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let workloads = json["providers"]["llm_workloads"].as_array().unwrap();
         assert_eq!(workloads.len(), LlmWorkload::ALL.len());
+        // #1981: the counters say since when they count.
+        assert!(
+            json["providers"]["llm_workloads_started_ms"]
+                .as_u64()
+                .is_some_and(|started| started > 0),
+            "{json}"
+        );
         let query_answer = workloads
             .iter()
             .find(|entry| entry["workload"] == "query-answer")
@@ -15230,6 +15353,15 @@ mod tests {
                 "POST",
                 "/admin/rename-project",
                 serde_json::json!({"workspace": "default", "from": "scratch", "to": "renamed"}),
+            ),
+            (
+                "POST",
+                "/admin/adopt-project-identity",
+                serde_json::json!({
+                    "workspace": "default",
+                    "project_id": "01a19c51-63d5-7dc2-8dc1-90201095ba96",
+                    "from_project_id": "01a19da2-094f-7830-9807-1d32f2fdb464"
+                }),
             ),
             (
                 "POST",
