@@ -402,6 +402,114 @@ async fn another_operator_cannot_claim_the_handoff() {
     assert_eq!(row.lifecycle.accepted_by_user, Some(operator("alice")));
 }
 
+/// The sweep parks a claim for every session it closes, and only a claim
+/// that *takes effect* clears the receiver's marker. Bob claiming Alice's
+/// baton into his sweep-closed Grok session is refused by the ownership
+/// guard — zero rows change — so the marker must survive the refusal; the
+/// owner's accepted claim into the same session clears it.
+#[tokio::test]
+async fn another_operators_refused_claim_keeps_the_receivers_sweep_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+
+    let id = store
+        .writer
+        .insert_handoff(handoff(ws, proj, "alice's baton", Some("alice")))
+        .await
+        .unwrap();
+
+    // A Grok session in the same scope that the abandoned-session sweep just
+    // closed: Grok reuses the session id after a restart, so the sweep-closed
+    // session is still a live handoff candidate.
+    let receiver = ai_memory_core::SessionId::new();
+    store
+        .writer
+        .begin_session(ai_memory_core::NewSession {
+            occurred_at: None,
+            id: receiver,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::Grok,
+            cwd: None,
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    let now = jiff::Timestamp::now().as_microsecond();
+    let hour = 3_600 * 1_000_000;
+    assert_eq!(
+        store
+            .writer
+            .close_abandoned_sessions(now + hour)
+            .await
+            .unwrap(),
+        1,
+        "the sweep must close the open Grok session"
+    );
+
+    /// Whether the receiver's claim still carries the sweep's marker.
+    fn sweep_parked(store: &Store, receiver: ai_memory_core::SessionId) -> bool {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.query_row(
+            "SELECT EXISTS( \
+                     SELECT 1 FROM auto_improve_scheduler_claims \
+                     WHERE session_id = ?1 AND last_error = ?2 \
+                 )",
+            rusqlite::params![
+                receiver.as_bytes(),
+                ai_memory_store::ABANDONED_SWEEP_CLAIM_ERROR
+            ],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    assert!(
+        sweep_parked(&store, receiver),
+        "fixture: the sweep parked the receiver's claim"
+    );
+
+    // Bob claims into the sweep-closed session: the ownership guard changes
+    // zero rows, and the refusal must keep the marker parked.
+    let bob_claim = HandoffAcceptance {
+        accepting_agent: AgentKind::Grok,
+        accepting_session: Some(receiver),
+        ..acceptance(id, ws, proj, Some(operator("bob")), filter_for("bob"), None)
+    };
+    assert!(
+        !store.writer.accept_handoff(bob_claim).await.unwrap(),
+        "Bob must not be able to claim Alice's handoff"
+    );
+    assert!(
+        sweep_parked(&store, receiver),
+        "a refused claim must keep the receiver's sweep marker"
+    );
+
+    // Control: the owner claims the same session — the claim takes effect,
+    // and the marker goes with it.
+    let alice_claim = HandoffAcceptance {
+        accepting_agent: AgentKind::Grok,
+        accepting_session: Some(receiver),
+        ..acceptance(
+            id,
+            ws,
+            proj,
+            Some(operator("alice")),
+            filter_for("alice"),
+            None,
+        )
+    };
+    assert!(
+        store.writer.accept_handoff(alice_claim).await.unwrap(),
+        "the owner claims her own handoff"
+    );
+    assert!(
+        !sweep_parked(&store, receiver),
+        "a claim that takes effect must clear the receiver's sweep marker"
+    );
+}
+
 /// An unattributed reader — the read-only `/api/v1` surface a browser reaches —
 /// must not see a baton that belongs to somebody, because rendering it leaks the
 /// raw prompt text it was built from.

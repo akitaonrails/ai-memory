@@ -45,13 +45,13 @@ pub use fts_query::{FtsStopwords, prepare_fts5_query};
 
 pub use api_credentials::{AuthenticatedApiUser, generate_api_key, preview_for as api_key_preview};
 pub use auto_improve::{
-    AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS, ApproveAutoImproveProposal, ApproveAutoImproveProposalResult,
-    AutoImproveProposalDetail, AutoImproveProposalEvent, AutoImproveProposalOperation,
-    AutoImproveProposalStatus, AutoImproveProposalSummary, AutoImproveRejectionSummary,
-    AutoImproveTelemetryAggregate, AutoImproveTelemetryCount, FailAutoImproveProposal,
-    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, PendingAutoImproveReview,
-    PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun,
-    StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    ABANDONED_SWEEP_CLAIM_ERROR, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS, ApproveAutoImproveProposal,
+    ApproveAutoImproveProposalResult, AutoImproveProposalDetail, AutoImproveProposalEvent,
+    AutoImproveProposalOperation, AutoImproveProposalStatus, AutoImproveProposalSummary,
+    AutoImproveRejectionSummary, AutoImproveTelemetryAggregate, AutoImproveTelemetryCount,
+    FailAutoImproveProposal, NewAutoImproveProposal, OwnedAutoImproveProposalDetail,
+    PendingAutoImproveReview, PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal,
+    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use dashboard::{AgentUsage, RegisteredAgent};
@@ -4930,6 +4930,558 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].session_id, candidates[0].session_id);
         assert_eq!(remaining[0].ended_at, same_ended_at);
+    }
+
+    /// Begin a session whose whole activity is in the past (`occurred_at`
+    /// stamps `started_at` and every observation's `created_at`), so a later
+    /// `close_abandoned_sessions` cutoff can reach it without touching any
+    /// row directly.
+    async fn aged_open_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        last_activity_us: i64,
+        observations: usize,
+    ) -> SessionId {
+        let session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(last_activity_us),
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..observations {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(last_activity_us + i as i64),
+                        session_id: session,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "durable work".into(),
+                        importance: 5,
+                        file_path: None,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        session
+    }
+
+    /// Read a session's persisted auto-improvement claim
+    /// `(last_error, attempts, last_failed_at)`, or `None` when no claim row
+    /// exists.
+    fn auto_improve_claim_row(
+        store: &Store,
+        session: SessionId,
+    ) -> Option<(Option<String>, u32, Option<i64>)> {
+        let conn = Connection::open(store.db_path()).unwrap();
+        match conn.query_row(
+            "SELECT last_error, attempts, last_failed_at \
+             FROM auto_improve_scheduler_claims WHERE session_id = ?1",
+            params![session.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => panic!("claim read failed: {e}"),
+        }
+    }
+
+    /// The abandoned-session sweep must not queue an LLM review: a session it
+    /// closes gets a parked claim in the same transaction and stays out of
+    /// `auto_improve_candidate_sessions`. The control — a session ended by a
+    /// real `SessionEnd` in the same project — stays a candidate.
+    #[tokio::test]
+    async fn abandoned_sweep_closed_session_is_not_an_auto_improve_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "abandoned-sweep", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_microsecond();
+        let one_hour_us = 3_600 * 1_000_000;
+        let swept = aged_open_session(&store, ws, proj, now - 49 * one_hour_us, 4).await;
+
+        let control = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: control,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(control, None).await.unwrap();
+
+        let closed = store
+            .writer
+            .close_abandoned_sessions(now - 48 * one_hour_us)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1, "only the stale open session must close");
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the sweep-closed session must not be a candidate"
+        );
+        assert_eq!(candidates[0].session_id, control);
+
+        let (last_error, attempts, last_failed_at) = auto_improve_claim_row(&store, swept)
+            .expect("the sweep must park a claim for the closed session");
+        assert_eq!(last_error.as_deref(), Some(ABANDONED_SWEEP_CLAIM_ERROR));
+        assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert!(
+            last_failed_at.is_some(),
+            "a parked claim must carry its park time"
+        );
+    }
+
+    /// A session closed by the sweep returns to the auto-improvement queue
+    /// when a real `SessionEnd` with new observations re-ends it: the end
+    /// stamp deletes the sweep's parked claim in the same transaction.
+    #[tokio::test]
+    async fn abandoned_sweep_closed_session_returns_to_candidates_after_real_reend() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "abandoned-sweep", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_microsecond();
+        let one_hour_us = 3_600 * 1_000_000;
+        let swept = aged_open_session(&store, ws, proj, now - 49 * one_hour_us, 4).await;
+        let closed = store
+            .writer
+            .close_abandoned_sessions(now - 48 * one_hour_us)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert!(
+            candidates.iter().all(|c| c.session_id != swept),
+            "the parked claim must exclude the sweep-closed session"
+        );
+
+        // New work, then the real end stamp.
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id: swept,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "resumed work".into(),
+                    body: "more durable work".into(),
+                    importance: 5,
+                    file_path: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(swept, None).await.unwrap();
+
+        assert!(
+            auto_improve_claim_row(&store, swept).is_none(),
+            "the real end must delete the sweep's parked claim"
+        );
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, swept);
+    }
+
+    /// A `SessionEnd` with no new observation answers `AlreadyEnded` before
+    /// `end_session_row` runs, so a sweep-closed session stays parked: the
+    /// claim keeps its marker and the session stays out of the queue. That is
+    /// the accepted limit — the work the sweep closed was never reviewed.
+    #[tokio::test]
+    async fn abandoned_sweep_closed_session_stays_parked_without_new_work() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "abandoned-sweep", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_microsecond();
+        let one_hour_us = 3_600 * 1_000_000;
+        let swept = aged_open_session(&store, ws, proj, now - 49 * one_hour_us, 2).await;
+        let closed = store
+            .writer
+            .close_abandoned_sessions(now - 48 * one_hour_us)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+
+        let disposition = store
+            .reader
+            .session_end_disposition(swept, ws, proj, AgentKind::OpenCode)
+            .await
+            .unwrap();
+        assert_eq!(
+            disposition,
+            SessionEndDisposition::AlreadyEnded,
+            "without new observations the real end never reaches the end stamp"
+        );
+
+        let (last_error, attempts, last_failed_at) =
+            auto_improve_claim_row(&store, swept).expect("the claim must stay parked");
+        assert_eq!(last_error.as_deref(), Some(ABANDONED_SWEEP_CLAIM_ERROR));
+        assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert!(last_failed_at.is_some());
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert!(candidates.iter().all(|c| c.session_id != swept));
+    }
+
+    /// A claim parked by a genuine review failure survives a real
+    /// `SessionEnd` with its `last_error` and `attempts` intact: only the
+    /// sweep's marker error un-parks a claim.
+    #[tokio::test]
+    async fn real_session_end_keeps_a_parked_claim_from_a_real_failure() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "abandoned-sweep", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        let session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session, None).await.unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let ended_at: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let error = "auto-improve failed: class=provider status=400";
+        let mut attempts = 0;
+        for _ in 0..AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(ws, proj, session, ended_at)
+                    .await
+                    .unwrap(),
+                "the claim must succeed for a real end past the watermark"
+            );
+            attempts = store
+                .writer
+                .record_auto_improve_claim_failure(ws, proj, session, error)
+                .await
+                .unwrap();
+        }
+        assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+
+        // A real end of the resumed session.
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: None,
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "resumed work".into(),
+                    body: "more durable work".into(),
+                    importance: 5,
+                    file_path: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session, None).await.unwrap();
+
+        let (last_error, attempts, last_failed_at) =
+            auto_improve_claim_row(&store, session).expect("the claim must survive");
+        assert_eq!(last_error.as_deref(), Some(error));
+        assert_eq!(attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert!(last_failed_at.is_some());
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert!(
+            candidates.is_empty(),
+            "a parked claim still excludes the session"
+        );
+    }
+
+    /// The sweep never overwrites an existing claim: `ON CONFLICT(session_id)
+    /// DO NOTHING` leaves a claim the scheduler wrote exactly as it is.
+    #[tokio::test]
+    async fn abandoned_sweep_keeps_an_existing_claim_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "abandoned-sweep", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_microsecond();
+        let one_hour_us = 3_600 * 1_000_000;
+        let session = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(session, None).await.unwrap();
+        let conn = Connection::open(store.db_path()).unwrap();
+        let ended_at: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE id = ?1",
+                params![session.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, session, ended_at)
+                .await
+                .unwrap()
+        );
+        let attempts = store
+            .writer
+            .record_auto_improve_claim_failure(
+                ws,
+                proj,
+                session,
+                "auto-improve failed: class=provider status=500",
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempts, 1);
+        let before = auto_improve_claim_row(&store, session).expect("the claim must exist");
+
+        // A resuming harness (Grok/Kimi reuse the session id after an end)
+        // reopens the session, which then goes stale again.
+        conn.execute(
+            "UPDATE sessions SET ended_at = NULL, started_at = ?1 WHERE id = ?2",
+            params![now - 49 * one_hour_us, session.as_bytes()],
+        )
+        .unwrap();
+
+        let closed = store
+            .writer
+            .close_abandoned_sessions(now - 48 * one_hour_us)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+
+        assert_eq!(
+            auto_improve_claim_row(&store, session),
+            Some(before),
+            "the sweep must not touch an existing claim"
+        );
+    }
+
+    /// `experience_pass_due` does not count a session the sweep parked — the
+    /// sweep closed it, not a real `SessionEnd` — while a session ended by a
+    /// real `SessionEnd` still counts.
+    #[tokio::test]
+    async fn experience_pass_excludes_sessions_parked_by_the_sweep() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "abandoned-sweep", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        let now = jiff::Timestamp::now().as_microsecond();
+        let one_hour_us = 3_600 * 1_000_000;
+        // Move the experience anchor 50h back: only then can a session whose
+        // last activity is 49h ago be "newer than the last pass" at all.
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE auto_improve_scheduler_state \
+             SET last_experience_run_at = ?1 \
+             WHERE workspace_id = ?2 AND project_id = ?3",
+            params![now - 50 * one_hour_us, ws.as_bytes(), proj.as_bytes()],
+        )
+        .unwrap();
+
+        let swept = aged_open_session(&store, ws, proj, now - 49 * one_hour_us, 2).await;
+        let control = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: control,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(control, None).await.unwrap();
+
+        let closed = store
+            .writer
+            .close_abandoned_sessions(now - 48 * one_hour_us)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1);
+        assert!(
+            auto_improve_claim_row(&store, swept).is_some(),
+            "the sweep must park a claim for the closed session"
+        );
+
+        let (count, anchor) = store.reader.experience_pass_due(ws, proj).await.unwrap();
+        assert_eq!(anchor, now - 50 * one_hour_us);
+        assert_eq!(
+            count, 1,
+            "only the real-SessionEnd session counts; the sweep-parked one is excluded"
+        );
     }
 
     // #833: a claim is the scheduler's in-flight marker, but the only writer was

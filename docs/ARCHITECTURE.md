@@ -295,6 +295,9 @@ from hook paths.
    activity, with no summary page and no usage. This keeps
    `open_session_count` from growing on sessions nobody continues, and it is
    narrower than a real end (see the session-usage row below).
+   Each session the sweep closes also gets a parked auto-improvement claim, so
+   the sweep never queues an LLM review. A real `SessionEnd` with new
+   observations, or a handoff that reopens the session, removes that claim.
    A session that is continued, meaning a new session starts in the same
    scope while the old one has been quiet for 15 minutes or more, is closed
    sooner on the client, including usage recovery. After that threshold the
