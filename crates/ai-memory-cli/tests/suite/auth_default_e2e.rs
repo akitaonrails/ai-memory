@@ -696,8 +696,8 @@ mod slow {
     /// in another marked repository sends its unscoped calls to that other
     /// repository, a write included. Its explicit calls keep their scope, a
     /// bridge launched in the first repository cannot read the second's page
-    /// without naming it, and the session-aware bridge keeps the server's
-    /// routing.
+    /// without naming it, and the session-aware bridge uses the launch
+    /// repository only until its session's pointer is published (#2005).
     #[tokio::test]
     async fn a_session_less_bridge_scopes_unscoped_calls_to_its_launch_repository() {
         const NOTES: &str = "authdef-notes";
@@ -767,17 +767,30 @@ mod slow {
             !session_less(&notes, scoped_query(PROJECT)).contains("launch-scope"),
             "an explicit scope wins over the launch directory"
         );
-        let (_, aware) = bridge_exchange_in(
-            &install,
-            &notes,
-            BridgeMode::SessionAware,
-            &base,
-            Some(unscoped_query),
-            |_| {},
-        );
+        // #2005: the session-aware bridge's session has no pointer yet (as
+        // after `/resume`), so the server falls back to its launch scope...
+        let aware = |call: Value| {
+            let (_, reply) = bridge_exchange_in(
+                &install,
+                &notes,
+                BridgeMode::SessionAware,
+                &base,
+                Some(call),
+                |_| {},
+            );
+            tool_text(&reply.expect("tools/call reply"))
+        };
         assert!(
-            !tool_text(&aware.expect("tools/call reply")).contains("launch-scope"),
-            "the session-aware bridge fills in no scope"
+            aware(unscoped_query.clone()).contains("launch-scope"),
+            "a session-aware call whose pointer misses answers from the launch repository"
+        );
+        // ...but once the hooks publish that session's project, the pointer
+        // routes it and the launch scope is not used.
+        install.hook_prompt(&base, "authdef-bridge-session");
+        assert_eq!(settled_sessions(&client, &base, &token, 2).await, 2);
+        assert!(
+            !aware(unscoped_query).contains("launch-scope"),
+            "the session's own pointer wins over the launch directory"
         );
     }
 

@@ -78,7 +78,7 @@ fn initialize(
     writeln!(
         output,
         "{}",
-        i18n.diagnostic(&format!("Created {}.", marker.display()))
+        crate::localization::diagnostic(i18n, format!("Created {}.", marker.display()))
     )
     .context("reporting created marker")?;
     if repo_root.is_some() {

@@ -91,6 +91,13 @@ written, so OS, library and provider details are preserved. Each English value
 in `diagnostics.ftl` must equal the source format string. Adding a `bail!`,
 `anyhow!`, `.context` or `diagnostic` message means adding it to both catalogs;
 the `every_cli_diagnostic_has_a_catalog_entry` test lists anything missing.
+A line printed while the command keeps going that interpolates any value (an
+error, a warning, a workstream, project or profile name) goes through
+`localization::diagnostic(i18n, format!(…))` instead, which translates the same
+way and then neutralizes terminal controls; hook warnings get the same from
+`process_diagnostic`, and the catalog lines of `run` and the commands that
+recover, resume or report its workstreams use `localization::format`, as does
+any other catalog line that quotes an error or a reason.
 Web templates use `label`, the same lookup, for fixed text that Rust passes to them.
 Hook commands run before configuration loads, so they follow only
 `AI_MEMORY_LANGUAGE`. Commented configuration snippets printed for pasting stay
@@ -111,6 +118,12 @@ Inside a script, use `js`, `js_one`, `js_two`, or `errors_js`: they produce JSON
 and escape HTML script delimiters and Unicode line separators. Only these
 already-encoded values may use askama's `safe` filter. Progressive enhancement
 must use `textContent` for displayed values.
+
+A script finds elements by id, class, role or a `data-*` attribute, never by a
+translated attribute such as `aria-label`, `title` or `placeholder`: the
+translated value changes with the reader's language, so the selector stops
+matching outside English. A test scans every template and script for such
+selectors.
 
 ## Adding a language or message
 
@@ -139,7 +152,7 @@ cargo test -p ai-memory-web localization --all-features
 
 Tests validate Fluent syntax, duplicate IDs, language parity, parameter parity,
 CLI help drift, CLI diagnostic coverage, language negotiation and isolation,
-script escaping, unchanged API responses, and the administrative gate with
-Portuguese HTML. When changing
+script escaping, selectors that do not depend on translated text, unchanged
+API responses, and the administrative gate with Portuguese HTML. When changing
 browser messages, inspect rendered pages in both languages and check keyboard
 navigation, labels, long text and the small-screen layout.

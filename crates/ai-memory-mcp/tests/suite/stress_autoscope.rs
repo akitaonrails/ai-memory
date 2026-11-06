@@ -163,6 +163,7 @@ impl Harness {
                 DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
             )),
             ingest_gates: ai_memory_hooks::IngestGates::default(),
+            session_agents: ai_memory_hooks::SessionAgents::default(),
             cwd_probes: ai_memory_hooks::CwdProbes::default(),
             consolidate_on_session_end: false,
             session_consolidation_notify: None,

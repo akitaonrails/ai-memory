@@ -19,7 +19,7 @@ pub async fn run(config: &Config, args: WorkstreamsArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("getting managed workstream checkout")?;
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let fingerprints = inspect_repository_fingerprints(&cwd)?;
     let project_id = if args.project_id.is_some() || args.project.is_some() {
         args.project_id
@@ -188,7 +188,13 @@ pub(super) async fn list_all_for_checkout(
         // the CLI and server may be upgraded on different machines.
         if summaries.len() == before {
             eprintln!(
-                "{}", i18n.format("cli-workstreams-warning-the-ai-memory-server-ignored-workstream-pagination-showing-its-first", &[("value0", format!("{}", summaries.len()))]));
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-workstreams-warning-the-ai-memory-server-ignored-workstream-pagination-showing-its-first",
+                    &[("value0", format!("{}", summaries.len()))]
+                )
+            );
             break;
         }
         // Pages are ordered by recency, so a workstream that becomes active
@@ -209,7 +215,8 @@ fn render_human(
     workspace: &str,
     project: &str,
 ) -> String {
-    let mut output = i18n.format(
+    let mut output = crate::localization::format(
+        i18n,
         "cli-workstreams-managed-workstreams-for-workspace-project",
         &[
             ("value0", workspace.to_string()),
@@ -242,7 +249,8 @@ fn render_human(
         let _ = writeln!(
             output,
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-message-id",
                 &[("value0", format!("{}", summary.workstream_id))]
             )

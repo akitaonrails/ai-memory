@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use axum::Router;
 use rmcp::model::{
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -47,6 +48,14 @@ impl ServerHandler for OneTool {
             )],
             ..Default::default()
         })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        Ok(CallToolResult::success(vec![ContentBlock::text(request.name)]).into())
     }
 }
 
@@ -229,6 +238,110 @@ async fn a_server_discover_probe_is_answered_and_initialize_still_works() {
         .expect("the legacy bridge exits when stdin closes")
         .unwrap();
     assert!(status.success(), "{status}");
+    server.abort();
+}
+
+/// Every result a server sends at the 2026-07-28 revision carries
+/// `resultType`; only results from servers on an earlier revision may omit
+/// it, and a client treats the absent field as `"complete"`
+/// (<https://modelcontextprotocol.io/specification/2026-07-28/basic#resulttype>).
+/// The bridge reaches its upstream on an older revision, so the upstream's
+/// `tools/list` and `tools/call` answers arrive without the field, and a
+/// strict 2026-07-28 client rejected the forwarded result (#2022). A legacy
+/// downstream client still receives the older shape, without the field.
+#[tokio::test]
+async fn forwarded_results_carry_result_type_only_at_the_2026_revision() {
+    let (url, server) = upstream().await;
+    let home = tempfile::tempdir().unwrap();
+    let modern_meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "strict-e2e", "version": "0"}
+    });
+
+    let mut child = spawn_bridge(&url, home.path(), &[]);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+               "params": {"_meta": modern_meta}}),
+    )
+    .await;
+    let list = reply(&mut stdout, json!(1)).await;
+    assert_eq!(list["result"]["resultType"], json!("complete"), "{list}");
+    assert_eq!(list["result"]["ttlMs"], json!(0), "{list}");
+    assert_eq!(list["result"]["cacheScope"], json!("private"), "{list}");
+    assert_eq!(
+        list["result"]["tools"][0]["name"],
+        json!("probe_tool"),
+        "{list}"
+    );
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "probe_tool", "arguments": {}, "_meta": modern_meta}}),
+    )
+    .await;
+    let call = reply(&mut stdout, json!(2)).await;
+    assert_eq!(call["result"]["resultType"], json!("complete"), "{call}");
+    assert_eq!(
+        call["result"]["content"][0]["text"],
+        json!("probe_tool"),
+        "{call}"
+    );
+    drop(stdin);
+    tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("the modern bridge exits when stdin closes")
+        .unwrap();
+
+    let mut legacy_child = spawn_bridge(&url, home.path(), &[]);
+    let mut legacy_stdin = legacy_child.stdin.take().unwrap();
+    let mut legacy_stdout = BufReader::new(legacy_child.stdout.take().unwrap()).lines();
+    send(
+        &mut legacy_stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "legacy-e2e", "version": "0"}}}),
+    )
+    .await;
+    reply(&mut legacy_stdout, json!(1)).await;
+    send(
+        &mut legacy_stdin,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    send(
+        &mut legacy_stdin,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    let list = reply(&mut legacy_stdout, json!(2)).await;
+    assert_eq!(
+        list["result"]["tools"][0]["name"],
+        json!("probe_tool"),
+        "{list}"
+    );
+    assert!(list["result"].get("resultType").is_none(), "{list}");
+    send(
+        &mut legacy_stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+               "params": {"name": "probe_tool", "arguments": {}}}),
+    )
+    .await;
+    let call = reply(&mut legacy_stdout, json!(3)).await;
+    assert_eq!(
+        call["result"]["content"][0]["text"],
+        json!("probe_tool"),
+        "{call}"
+    );
+    assert!(call["result"].get("resultType").is_none(), "{call}");
+    drop(legacy_stdin);
+    tokio::time::timeout(Duration::from_secs(20), legacy_child.wait())
+        .await
+        .expect("the legacy bridge exits when stdin closes")
+        .unwrap();
     server.abort();
 }
 

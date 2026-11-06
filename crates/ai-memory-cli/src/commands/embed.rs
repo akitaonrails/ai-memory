@@ -48,7 +48,7 @@ fn check_report(report: &serde_json::Value) -> Result<()> {
 /// to embed — the full report is still printed to stdout first.
 pub async fn run(config: &Config, args: EmbedArgs) -> Result<()> {
     let i18n = &config.i18n;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     // Model migrations must reach stale rows in every project namespace.
     // Without an explicit `--project`, `--force` / `--reembed` fans out
     // across the whole workspace instead of the CWD-derived project only.

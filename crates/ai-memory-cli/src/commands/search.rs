@@ -35,7 +35,7 @@ struct Hit {
 /// # Errors
 /// Returns an error if the server is unreachable or returns non-2xx.
 pub async fn run(config: &Config, args: SearchArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
+    let ep = ServerEndpoint::for_checkout(config).await?;
     let limit_str = args.limit.to_string();
     let mut query = vec![("q", args.query.clone()), ("limit", limit_str)];
     if !args.global {

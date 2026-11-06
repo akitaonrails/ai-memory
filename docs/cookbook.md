@@ -629,7 +629,9 @@ server = "team-b"
 
 Repositories without a `server` key keep using the server `install-hooks`
 configured. The marker only ever names a profile; a profile that does not
-resolve drops the event rather than sending it anywhere else. Details, the
+resolve drops the event rather than sending it anywhere else. Commands you run
+inside the repository (`run`, `workstreams`, `doctor`, `search`, ...) use the
+same profile. Details, the
 fail-closed rules, and which integrations support it:
 [`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 

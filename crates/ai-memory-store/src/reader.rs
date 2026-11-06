@@ -9359,10 +9359,9 @@ impl ReaderPool {
 
     /// Return the open handoff the next session should pick up.
     ///
-    /// A manual handoff (`memory_handoff_begin`, which always sets
-    /// `from_session_id = None`) is project-wide and always a candidate,
-    /// whatever cwd it carries. An auto SessionEnd handoff
-    /// (`from_session_id = Some`) is a candidate only when its cwd is an
+    /// A manual handoff (`memory_handoff_begin`, or a row left without a
+    /// source session) is project-wide and always a candidate, whatever cwd
+    /// it carries. An auto SessionEnd handoff is a candidate only when its cwd is an
     /// ancestor-or-equal of `cwd_filter` (path-boundary, the prior art's
     /// check rather than exact equality: a handoff left in `/repo` reaches a
     /// session in `/repo/api`, but never `/repo-other`). Among candidates a
@@ -9435,10 +9434,10 @@ impl ReaderPool {
             let busy_index = if owner_param.is_some() { 4 } else { 3 };
             let busy_clause = if busy_since.is_some() {
                 format!(
-                    " AND NOT EXISTS (SELECT 1 FROM sessions s \
+                    " AND (manual = 1 OR NOT EXISTS (SELECT 1 FROM sessions s \
                          WHERE s.id = handoffs.from_session_id AND s.ended_at IS NULL \
                            AND EXISTS (SELECT 1 FROM observations o \
-                                       WHERE o.session_id = s.id AND o.created_at > ?{busy_index}))"
+                                       WHERE o.session_id = s.id AND o.created_at > ?{busy_index})))"
                 )
             } else {
                 String::new()
@@ -9447,7 +9446,7 @@ impl ReaderPool {
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
                         created_at, accepted_by, accepted_at, accepted_by_session, \
-                        owner_user, accepted_by_user \
+                        owner_user, accepted_by_user, manual \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND state = 'open'{owner_clause}{busy_clause} \
                  ORDER BY created_at DESC"
@@ -9692,7 +9691,7 @@ impl ReaderPool {
                     "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                             cwd, summary, open_questions, next_steps, files_touched, state, \
                             created_at, accepted_by, accepted_at, accepted_by_session, \
-                            owner_user, accepted_by_user \
+                            owner_user, accepted_by_user, manual \
                      FROM handoffs WHERE id = ?1",
                     params![handoff_id.as_bytes()],
                     row_to_handoff,
@@ -9725,7 +9724,7 @@ impl ReaderPool {
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
                         created_at, accepted_by, accepted_at, accepted_by_session, \
-                        owner_user, accepted_by_user \
+                        owner_user, accepted_by_user, manual \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND id = ?3{owner_clause}"
             );
@@ -10416,7 +10415,7 @@ impl ReaderPool {
                 "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                         cwd, summary, open_questions, next_steps, files_touched, state, \
                         created_at, accepted_by, accepted_at, accepted_by_session, \
-                        owner_user, accepted_by_user \
+                        owner_user, accepted_by_user, manual \
                  FROM handoffs \
                  WHERE workspace_id = ?1 AND state = 'open'{owner_clause}{visible} \
                  ORDER BY created_at DESC LIMIT 1"
@@ -14919,7 +14918,7 @@ fn handoff_listing_sql(
     const SELECT: &str = "SELECT id, workspace_id, project_id, from_session_id, from_agent, to_agent, \
                 cwd, summary, open_questions, next_steps, files_touched, state, \
                 created_at, accepted_by, accepted_at, accepted_by_session, \
-                owner_user, accepted_by_user \
+                owner_user, accepted_by_user, manual \
          FROM handoffs";
     let state_clause = if has_state { " AND state = ?3" } else { "" };
     let owner_index = if has_state { 4 } else { 3 };
@@ -16106,12 +16105,13 @@ fn is_handoff_candidate(h: &Handoff, cwd_filter: Option<&str>, owner_filter: &Ow
     if !owner_filter.admits(h.origin.owner_user.as_deref()) {
         return false;
     }
-    // Manual handoffs (memory_handoff_begin always sets from_session_id = None)
-    // are project-wide and always candidates, whatever cwd they carry. Only auto
-    // SessionEnd handoffs are cwd-path-boundary scoped. This makes "a manual
-    // handoff always beats the auto one" deterministic on from_session_id,
-    // instead of relying on a manual handoff happening to have a NULL cwd.
-    if h.origin.from_session_id.is_none() {
+    // Manual handoffs (memory_handoff_begin, whether or not it recorded the
+    // caller's session) are project-wide and always candidates, whatever cwd
+    // they carry. Only auto SessionEnd handoffs are cwd-path-boundary scoped.
+    // This makes "a manual handoff always beats the auto one" deterministic on
+    // the row's origin, instead of relying on a manual handoff happening to
+    // have a NULL cwd.
+    if h.origin.is_manual() {
         return true;
     }
     auto_handoff_matches_cwd(h.origin.cwd.as_deref(), cwd_filter)
@@ -16159,13 +16159,13 @@ pub(crate) fn handoff_selection_key(
 
 fn prefer_handoff(a: &Handoff, b: &Handoff) -> std::cmp::Ordering {
     handoff_selection_key(
-        a.origin.from_session_id.is_none(),
+        a.origin.is_manual(),
         a.lifecycle.created_at.as_microsecond(),
         a.origin.cwd.as_deref(),
         a.scope.id,
     )
     .cmp(&handoff_selection_key(
-        b.origin.from_session_id.is_none(),
+        b.origin.is_manual(),
         b.lifecycle.created_at.as_microsecond(),
         b.origin.cwd.as_deref(),
         b.scope.id,
@@ -16186,7 +16186,7 @@ fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Op
         .max_by(prefer_handoff)
 }
 
-/// Build a [`Handoff`] from a row selected with the 18-column handoff SELECT
+/// Build a [`Handoff`] from a row selected with the 19-column handoff SELECT
 /// every handoff query in this file shares.
 ///
 /// Reading the row here (instead of destructuring it into a long positional
@@ -16211,6 +16211,7 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
     let accepted_by_session_bytes: Option<Vec<u8>> = row.get(15)?;
     let owner_user: Option<String> = row.get(16)?;
     let accepted_by_user: Option<String> = row.get(17)?;
+    let manual: bool = row.get(18)?;
 
     Ok((|| {
         for (label, value) in [
@@ -16242,6 +16243,7 @@ fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Hando
             },
             origin: HandoffOrigin {
                 from_session_id: from_session,
+                manual,
                 from_agent: parse_agent(&from_agent),
                 to_agent: to_agent.as_deref().map(parse_agent),
                 cwd,
@@ -17218,6 +17220,7 @@ mod tests {
             },
             origin: HandoffOrigin {
                 from_session_id: if manual { None } else { Some(SessionId::new()) },
+                manual: false,
                 from_agent: AgentKind::ClaudeCode,
                 to_agent: None,
                 cwd: cwd.map(str::to_string),
@@ -17361,6 +17364,16 @@ mod tests {
             handoff("auto", Some("/repo"), false, 2),
         ];
         assert_eq!(pick(c, Some("/repo")), "MAN");
+    }
+
+    #[test]
+    fn explicit_handoff_with_a_source_session_stays_project_wide_and_wins() {
+        // #2014: memory_handoff_begin now records the caller's session, so the
+        // explicit flag, not a NULL from_session_id, is what keeps it manual.
+        let mut explicit = handoff("explicit", Some("/some/other/place"), false, 1);
+        explicit.origin.manual = true;
+        let c = vec![explicit, handoff("auto", Some("/repo"), false, 2)];
+        assert_eq!(pick(c, Some("/repo")), "explicit");
     }
 
     #[test]

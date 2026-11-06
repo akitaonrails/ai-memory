@@ -31,7 +31,7 @@ use tower::ServiceExt;
 use crate::idle_end::{IDLE_END_BATCH, IdleEndTickInput, run_idle_end_tick};
 use crate::router::{
     CwdProbes, DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, IngestGates, IngestRateLimiter,
-    ProjectCacheStore, SubagentSessionSet, hook_router,
+    ProjectCacheStore, SessionAgents, SubagentSessionSet, hook_router,
 };
 
 const WORKSPACE: &str = "default";
@@ -80,6 +80,7 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
             DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
         )),
         ingest_gates: IngestGates::default(),
+        session_agents: SessionAgents::default(),
         cwd_probes: CwdProbes::default(),
         per_user_slots: false,
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),

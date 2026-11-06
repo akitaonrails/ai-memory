@@ -312,7 +312,16 @@ fn store_bridge_key(
         }
         Err(e) => {
             eprintln!(
-                "{}", i18n.format("cli-install-mcp-ai-memory-warning-could-not-store-the-key-under-e-keeping-it-in-the-mcp-entr", &[("value0", format!("{}", data_dir.display())), ("value1", format!("{:#}", e))]));
+                "{}",
+                crate::localization::format(
+                    i18n,
+                    "cli-install-mcp-ai-memory-warning-could-not-store-the-key-under-e-keeping-it-in-the-mcp-entr",
+                    &[
+                        ("value0", format!("{}", data_dir.display())),
+                        ("value1", format!("{:#}", e))
+                    ]
+                )
+            );
             None
         }
     }
@@ -1221,7 +1230,15 @@ fn apply_to_config_file(
     }
     if matches!(args.client, McpClient::Droid) && (args.auth_token.is_some() || args.token_env_var)
     {
-        println!("{}", i18n.diagnostic(&format!("  Droid expands ${{{PRIME_AGENT_TOKEN_ENV}}} in the Authorization header; export it where you launch droid, or the server fails to connect.")));
+        println!(
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!(
+                    "  Droid expands ${{{PRIME_AGENT_TOKEN_ENV}}} in the Authorization header; export it where you launch droid, or the server fails to connect."
+                )
+            )
+        );
     }
     if matches!(args.client, McpClient::Codex) && args.token_env_var {
         println!(

@@ -67,6 +67,7 @@ async fn harness() -> Harness {
         active_project: ai_memory_core::ActiveProject::new(),
         ingest_semaphore: ingest_semaphore.clone(),
         ingest_gates: ai_memory_hooks::IngestGates::default(),
+        session_agents: ai_memory_hooks::SessionAgents::default(),
         cwd_probes: ai_memory_hooks::CwdProbes::default(),
         ingest_drop_list: ai_memory_hooks::IngestDropList::default(),
         record_tool_names: false,

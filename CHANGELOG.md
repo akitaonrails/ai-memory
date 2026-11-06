@@ -70,6 +70,83 @@ version in [`docs/changelog/`](docs/changelog/):
   uses the same anchor, so it also redacts a key glued to `_`, a digit, a
   CJK character or a percent escape (#2025).
 
+- `ai-memory mcp-bridge`, the stdio entry most clients use on a token-file
+  install, now includes `resultType: "complete"` in the `tools/list` and
+  `tools/call` results it forwards to a client on MCP revision 2026-07-28.
+  That revision requires the field, and a strict client such as
+  `@modelcontextprotocol/client` 2.2 rejected the tool list and reconnected
+  forever with no tools. Clients on an older revision still receive results
+  without it, and the direct HTTP endpoint already sent it (#2022).
+
+- The project page's tabs work again when the web UI is shown in a language
+  other than English. Their script looked up the tab bar by its English
+  accessible name, so a Portuguese page left every tab panel hidden. The
+  script now finds the tab bar by a fixed attribute, and a test rejects any
+  web UI script that selects elements by translated text (#2024).
+
+- A hook event whose session was first captured under another agent label is
+  no longer accepted with `202` and then dropped without a trace on every
+  delivery. The server logs the drop once per session, naming the agent that
+  holds the session, and answers that caller's later `POST /hook` events for
+  the session with `409` and `{"error":"agent_mismatch","bound_agent":"…"}`,
+  so a client can tell what happened. Only the session's own operator learns
+  the bound agent; another operator's events for the same id get the same
+  opaque drop as before. Every first-party hook client treats the 409 as
+  final, and the native client no longer spends retry attempts on it. Drops
+  still count under `dropped_collision` in `ai-memory status` (#2023).
+
+- A handoff begun with `memory_handoff_begin` from a client that forwards its
+  hook session id (the session-aware bridge, OpenCode 2) now records that
+  session, its harness and its cwd, as `memory_message_send` already did,
+  instead of `from_agent: "other"` and no session. The id counts only for a
+  session the server recorded in the handoff's project for the same operator.
+  The handoff stays a manual one (migration V101 adds a `manual` flag), so it is
+  still delivered ahead of automatic batons and never swept with them.
+  `memory_handoff_accept` now returns the row after the claim (`state:
+  "accepted"`, `accepted_at`, `accepted_by`) rather than the open row it read
+  before claiming it (#2014).
+
+- A session that ends, or finishes a turn checkpoint, while its own
+  `memory_handoff_begin` handoff is still open no longer leaves an automatic
+  template handoff beside it, and writing the explicit handoff expires that
+  session's earlier automatic one, so no stale pending handoff is left behind.
+  The startup handoff block now names the source session's
+  `sessions/<id>.md` page, where opt-in SessionEnd LLM consolidation writes the
+  session's open items after the template handoff was created (#2012).
+
+- `ai-memory upgrade` no longer rewrites the OpenCode 1 plugin after OpenCode
+  itself moved to 2.x. It probes the installed OpenCode first, so on 2.x it
+  writes `ai-memory-opencode2.ts` and removes the old `ai-memory.ts` that
+  OpenCode 2 refuses to load ("Plugin must export a default definition with an
+  id and an effect or setup function") (#1887).
+
+- After `/resume` or `/clear` in Claude Code, unscoped `memory_*` calls
+  through the session-aware `mcp-bridge` no longer fall back to
+  `default/scratch` (reads) or refuse with "the active-project pointer does
+  not match this caller" (writes). The bridge keeps its launch-time session
+  id, so its pointer lookup missed. It now sends its launch directory's
+  project in two headers, and the server uses that project only when the
+  session's own pointer does not resolve. A pointer the hooks published still
+  wins, the project is authorized like an explicit scope, and a directory
+  that resolves to no project keeps the old behaviour (#2005).
+
+- Commands that work on the checkout they run in (`run`, `resume`,
+  `continue`, `workstreams`, `doctor`, `search`, `read-page`, `write-page`,
+  `handoffs`, `message` and the other project-scoped commands) now reach the
+  server that the nearest `.ai-memory.toml` selects with `server = "<name>"`,
+  with that profile's stored token, the same way hooks route capture. Before,
+  they used the configured server and fell back to `127.0.0.1`. A profile
+  that does not resolve fails the command with the hook's reason instead of
+  falling back. `AI_MEMORY_SERVER_URL` still wins, and `run --jail` refuses a
+  profile-routed checkout because the jailed run cannot read the profile's
+  token (#2016).
+
+- A section that `memory_patch_page` adds now gets a blank line before and
+  after its heading, so the page no longer reads as one run-on block and
+  passes Markdown linters (MD022). The docs now say that an `end_of_page`
+  append means the end of the page that was read, so it lands before a
+  section the same batch adds (#2015).
+
 - `ai-memory run --jail` no longer shows two access checklists with ai-jail
   3.0.1 or newer. It names the harness for ai-jail (`--harness`), so wrapper
   flags such as `--jail-map` no longer hide it, and ai-jail's own review is
@@ -93,6 +170,27 @@ version in [`docs/changelog/`](docs/changelog/):
   repository, which project name to pass instead, and the
   `rename-project --project-id` command that moves an empty holder out of the
   way. The server also logs such a leftover at startup (#2018).
+
+- A line printed while a command keeps going, such as a recoverable error
+  during `ai-memory run`, `uninstall`, `restore` or the project-split
+  repair, or a lifecycle hook warning, is now neutralized like the final
+  failure report, so a value read back from the server cannot reach the
+  terminal as an escape sequence. That covers the names these lines quote
+  too: workstream, project, workspace and server-profile names, session ids
+  read from harness transcripts, the lines `recover`, `resume`,
+  `continue`, `finalize-session` and `workstreams` print about them, and
+  any other command's line that quotes an error or a reason (`upgrade`,
+  `setup`, `doctor`, `install-hooks` and others). The sanitizer also covers the direction
+  marks (U+061C, U+200E/U+200F) and the zero-width space, word joiner and
+  byte-order mark (U+200B, U+2060–U+2064, U+FEFF) it used to keep. The
+  zero-width joiner and non-joiner still print, since emoji sequences and
+  Persian or Indic text need them (#2000, #2010).
+
+- `ai-memory handoffs --expire-all` now reports the sweep, and explains why
+  it refuses without `--confirm`, in the selected language, and neutralizes
+  terminal controls in the workspace and project it echoes. Those were the
+  last English-only lines in that command while the rest of it already
+  followed the catalogs (#2011).
 
 - Search now matches the parts of a hyphenated or underscored word: `alpha`
   finds a note that writes `foo-bar-alpha`, `memory` finds `ai-memory`, and

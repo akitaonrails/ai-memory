@@ -180,7 +180,8 @@ stay on the static HTTP transport unless this flag is used.
 Claude Code's stdio MCP subprocess keeps the id it received at startup across
 `/clear`, even though subsequent hooks receive the new id. On
 `--continue`/`--resume` without an explicit id, Claude may also give the MCP
-subprocess the startup id rather than the resumed id. Restart Claude Code after
+subprocess the startup id rather than the resumed id. Unscoped calls then fall
+back to the bridge's launch directory (see below); restart Claude Code after
 `/clear` when exact session-key continuity matters, and prefer
 `--resume <session-id>` for explicit resumes. The bridge deliberately fails
 when no `CLAUDE_CODE_SESSION_ID` is available instead of silently degrading to
@@ -222,8 +223,20 @@ project lives on another server), or when the upstream tool list cannot be
 read. The filled scope is an explicit scope like any other: the server
 authorizes it for the caller, it never reads or moves an active-project
 pointer, and it names the same project the hooks capture that checkout into.
-The session-aware bridge fills in nothing, since the server routes its calls
-by the forwarded session id.
+
+The session-aware bridge fills in nothing itself, since the server routes its
+calls by the forwarded session id. That id can miss: Claude Code's `/resume`
+and `/clear` keep the bridge's launch-time id while the hooks publish under the
+new one, a restarted server has not seen the session's hooks yet, and a
+session's first call can come before its first hook event. So the bridge sends
+the same launch scope in the `X-Memory-Actor-Fallback-Workspace` and
+`X-Memory-Actor-Fallback-Project` headers (percent-encoded), and the server
+fills it into a call that names no scope only when the caller's own keyed
+pointer did not resolve (#2005). A pointer the hooks published for the session
+wins, and so does the shared slot of a `single`-mode or hook-less install, so a
+call that routes correctly today is never re-routed. The filled scope is
+authorized like an explicit one and never moves the pointer. A directory that
+resolves to no project sends no headers, and the call keeps today's fallback.
 
 Use `per_session` only when your client or bridge can send the same
 opaque session id from the hook payload on each MCP request as

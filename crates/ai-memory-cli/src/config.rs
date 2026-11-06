@@ -918,6 +918,13 @@ impl RuntimeEnv {
         self.ignore_marker
     }
 
+    /// `AI_MEMORY_SERVER_URL` from the process environment: an explicit
+    /// per-invocation server that outranks a marker's server profile.
+    #[must_use]
+    pub(crate) fn server_url(&self) -> Option<&str> {
+        self.server_url.as_deref()
+    }
+
     /// Install-wide `--project-strategy` default baked into the environment.
     #[must_use]
     pub fn project_strategy(&self) -> Option<&str> {
@@ -992,6 +999,22 @@ impl RuntimeEnv {
         Self {
             host_cwd: Some(host_cwd.into()),
             home_dir: Some(home_dir.into()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_checkout_tests(
+        host_cwd: impl Into<String>,
+        home_dir: impl Into<String>,
+        server_url: Option<&str>,
+        ignore_marker: bool,
+    ) -> Self {
+        Self {
+            host_cwd: Some(host_cwd.into()),
+            home_dir: Some(home_dir.into()),
+            server_url: server_url.map(str::to_owned),
+            ignore_marker,
             ..Self::default()
         }
     }

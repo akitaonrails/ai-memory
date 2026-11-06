@@ -123,7 +123,8 @@ pub(crate) fn confirm_repair(
     writeln!(
         output,
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-run-project-split-explain",
             &[
                 ("workspace", super::show::terminal_text(&split.workspace)),
@@ -151,7 +152,7 @@ pub(crate) fn confirm_repair(
 /// Join the projects on the server and point this checkout at the result
 /// ([`super::repair_split::adopt`]).
 pub(crate) async fn apply_repair(config: &Config, split: &ProjectSplit) -> Result<()> {
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let adopted = super::repair_split::adopt(
         config,
         &endpoint,
@@ -163,7 +164,8 @@ pub(crate) async fn apply_repair(config: &Config, split: &ProjectSplit) -> Resul
     .await?;
     eprintln!(
         "{}",
-        config.i18n.format(
+        crate::localization::format(
+            &config.i18n,
             "cli-run-project-split-repaired",
             &[
                 ("workspace", split.run_workspace.clone()),
