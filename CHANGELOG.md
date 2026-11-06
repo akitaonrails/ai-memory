@@ -181,7 +181,8 @@ version in [`docs/changelog/`](docs/changelog/):
   spelling of the same text (migration V100), so the tokenizer stays as it
   was and no stored row changes. The first start after upgrading rebuilds
   both indexes once, which takes longer on a large store, and they grow to
-  roughly twice their previous size (#2013).
+  roughly twice their previous size. A 3.4.2 binary refuses a store this
+  release has upgraded, so keep a backup if you may need to go back (#2013).
 
 - The dashboard's icons no longer show as empty boxes on macOS. The three
   shipped web fonts are Latin subsets, so the geometric and symbol
