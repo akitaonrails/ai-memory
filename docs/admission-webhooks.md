@@ -440,6 +440,9 @@ file, an invalid header name or value, and the reserved names `Content-Type`,
 names the webhook and the file, never the value. The value is marked sensitive
 and never appears in logs, errors or `Debug` output, and a redirect is still
 followed only on the same origin, so the header never reaches another host.
+The server does not encrypt the header itself: over an `http://` URL it
+travels in clear text, so give a webhook with `headers` an `https://` URL
+unless the endpoint is on loopback or a network you trust.
 
 ## 9. Worked examples
 
