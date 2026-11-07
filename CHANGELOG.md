@@ -73,7 +73,7 @@ version in [`docs/changelog/`](docs/changelog/):
   every preflight got a 401 and the browser blocked the real request. The CORS layer now answers the preflight
   ahead of authentication, still only for `/api/v1` and the configured origins;
   every real request is authenticated as before, and its 401/403 now carries
-  the CORS headers so the page can read it. (#PR)
+  the CORS headers so the page can read it. (#2105)
 
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
