@@ -2774,7 +2774,10 @@ mod slow {
             stdout.contains("wrapper checksum mismatch; refusing update"),
             "stdout={stdout} stderr={stderr}"
         );
-        assert!(!stderr.contains("hostile payload executed"), "stderr={stderr}");
+        assert!(
+            !stderr.contains("hostile payload executed"),
+            "stderr={stderr}"
+        );
         assert_eq!(std::fs::read_to_string(&wrapper).unwrap(), original);
         // The native host-launch client, whose checksum the same fake curl also
         // fails, then fails closed instead of installing an unverified binary,
