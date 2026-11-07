@@ -3181,12 +3181,15 @@ async function drainHookSpool(): Promise<void> {
   names.sort();
   for (const name of names.slice(0, 500)) {
     const file = join(hookSpoolDir(), name);
-    let entry: { url?: string; body?: string; token?: string };
+    let entry: { url?: string; body?: string; token?: string; auth_mode?: string };
     try {
       entry = JSON.parse(readMarkerText(file, "utf8"));
     } catch (_e) {
       continue; // torn or foreign file; leave it for the CLI drain
     }
+    // Native OIDC entries carry no inline bearer. The native drain resolves
+    // their credentials from auth.json, so leave these entries untouched.
+    if (entry.auth_mode === "oidc") continue;
     if (!entry.url || typeof entry.body !== "string") continue;
     try {
       const headers: Record<string, string> = {
@@ -3373,6 +3376,83 @@ mod tests {
     use std::process::Command;
     #[cfg(windows)]
     use std::process::Stdio;
+
+    #[test]
+    fn generated_ts_spool_leaves_native_oidc_entries_for_the_native_drain() {
+        let Some(()) = node_strip_types_available() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let module = temp.path().join("spool-oidc.mts");
+        const HARNESS: &str = r#"
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, readFileSync as readMarkerText, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import type { AddressInfo } from "node:net";
+
+const AGENT = "open-code";
+function resolveToken(): string | undefined { return undefined; }
+
+const requests: [string | undefined, string | undefined][] = [];
+const server = createServer((request, response) => {
+  requests.push([request.url, request.headers.authorization]);
+  request.resume();
+  response.writeHead(request.url === "/oidc" ? 401 : 202).end();
+});
+await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+try {
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const dir = hookSpoolDir();
+  mkdirSync(dir, { recursive: true });
+  const oidc = JSON.stringify({
+    url: `${base}/oidc`, body: "{}", created_ms: 1, auth_mode: "oidc", attempts: 0,
+  });
+  const oidcFile = join(dir, "0000000000001-1-0000000000000000.json");
+  writeFileSync(oidcFile, oidc);
+  for (const [index, path, auth] of [
+    [2, "static", { auth_mode: "static", token: "static-fixture" }],
+    [3, "anonymous", { auth_mode: "none" }],
+    [4, "legacy", { token: "legacy-fixture" }],
+  ] as const) {
+    const name = `${String(index).padStart(13, "0")}-1-0000000000000000.json`;
+    const body = JSON.stringify({ session_id: path, auth_mode: "oidc" });
+    writeFileSync(join(dir, name), JSON.stringify({
+      url: `${base}/${path}`, body, created_ms: index, attempts: 0, ...auth,
+    }));
+  }
+  await drainHookSpool();
+  assert.deepEqual({
+    requests,
+    oidc: existsSync(oidcFile) ? readMarkerText(oidcFile, "utf8") : undefined,
+    files: readdirSync(dir),
+  }, {
+    requests: [["/static", "Bearer static-fixture"], ["/anonymous", undefined], ["/legacy", "Bearer legacy-fixture"]],
+    oidc,
+    files: ["0000000000001-1-0000000000000000.json"],
+  });
+} finally {
+  server.close();
+}
+"#;
+        fs::write(
+            &module,
+            format!("{}{}\n{HARNESS}", ts_spool_runtime(), ts_timeout_signal()),
+        )
+        .unwrap();
+        let output = Command::new("node")
+            .arg("--experimental-strip-types")
+            .arg(&module)
+            .env("AI_MEMORY_DATA_DIR", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "spool runtime evidence failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn strip_deleted_suffix_removes_only_the_trailing_kernel_marker() {

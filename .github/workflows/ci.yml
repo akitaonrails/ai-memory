@@ -154,10 +154,8 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: uv run --no-project python -m unittest discover -s docs/examples/auto-improve-eval -p 'test_*.py' -v
-      # The capture policy every generated OpenCode/OMP/Pi/OpenClaw plugin
-      # embeds is TypeScript; only Node can execute it against the shared
-      # capture-policy fixture. The test is ignored locally, where Node is not
-      # a build requirement.
+      # Node executes the capture policy and spool drain emitted by the
+      # generated integrations. Node is not a build requirement.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: matrix.os == 'ubuntu-latest'
         with:
@@ -172,11 +170,13 @@ jobs:
         env:
           AI_MEMORY_BIN: ${{ github.workspace }}/target/debug/ai-memory
         run: node tests/e2e/web_dashboard_mutations.mjs
-      - name: Generated capture-policy TypeScript runtime evidence
+      - name: Generated TypeScript runtime evidence
         if: matrix.os == 'ubuntu-latest'
         # `--workspace` reuses the test binaries built above instead of
         # re-resolving features for one package.
-        run: cargo test --workspace --lib -- --ignored --exact commands::render_shared::tests::generated_capture_policy_v1_node_runtime_evidence
+        run: |
+          cargo test --workspace --lib -- --ignored --exact commands::render_shared::tests::generated_capture_policy_v1_node_runtime_evidence
+          cargo test --workspace --lib -- --exact commands::render_shared::tests::generated_ts_spool_leaves_native_oidc_entries_for_the_native_drain
       # The optional TypeScript SDK (companions/ai-memory-ts) against the server
       # built above: integration tests, the MCP schema drift test and every
       # example. A pull request that changes an MCP tool schema fails here
