@@ -54,6 +54,7 @@ case "${1:-}" in
         fi
         ;;
       *RestartPolicy*) printf '%s\n' '--restart unless-stopped' ;;
+      *NetworkMode*) printf '%s\n' '--network host' ;;
       '{{json .Config.Cmd}}') printf '[]\n' ;;
       *'.Config.Env'*)
         if [ "${2:-}" = "ai-memory" ]; then
@@ -100,6 +101,7 @@ assert_contains "${TMP_ROOT}/standalone/output.log" "does not manage the running
 assert_not_contains "${TMP_ROOT}/standalone/docker.log" "compose up -d"
 assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "-v ai-memory-data:/data:Z"
 assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "-e CUSTOM_VAR=custom_val"
+assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "--restart unless-stopped --network host"
 assert_not_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "HOSTNAME="
 assert_not_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "container=podman"
 assert_contains "${TMP_ROOT}/standalone/cache/ai-memory/recreate-ai-memory.sh" "${FAKE_DOCKER} stop ai-memory"

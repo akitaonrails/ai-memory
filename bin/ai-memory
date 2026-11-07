@@ -262,17 +262,22 @@ self_upgrade_script() {
 # the kind of leak this project exists to prevent.
 #
 # Reconstructs the flags that matter for an ai-memory container: name,
-# restart policy, published ports, mounts, operator-supplied environment,
-# and an overridden command. It does NOT reproduce every possible container
-# run` flag (networks, capabilities, resource limits, devices); the script
-# says so in its own header so a reader can add anything exotic back.
+# restart policy, network mode, published ports, mounts, operator-supplied
+# environment, and an overridden command. It does NOT reproduce every possible
+# `run` flag (extra networks, capabilities, resource limits, devices); the
+# script says so in its own header so a reader can add anything exotic back.
 emit_docker_run_script() {
   local container="$1" out="$2" image engine
   printf -v engine '%q' "${DOCKER}"
   image="$("${DOCKER}" inspect "${container}" --format '{{.Config.Image}}' 2>/dev/null)" || return 1
   [ -n "${image}" ] || return 1
 
-  local ports volumes restart cmd
+  local network ports volumes restart cmd
+  # A host-network install binds 127.0.0.1 inside the container and reaches
+  # host services (a local LLM) on loopback; recreating it on the default
+  # bridge leaves the server unreachable. Carry any non-default mode.
+  network="$("${DOCKER}" inspect "${container}" --format \
+    '{{with .HostConfig.NetworkMode}}{{if and (ne . "default") (ne . "bridge")}}--network {{.}}{{end}}{{end}}' 2>/dev/null)"
   ports="$("${DOCKER}" inspect "${container}" --format \
     '{{range $p, $bindings := .HostConfig.PortBindings}}{{range $bindings}}-p {{if .HostIp}}{{.HostIp}}:{{end}}{{.HostPort}}:{{$p}} {{end}}{{end}}' 2>/dev/null)"
   volumes="$("${DOCKER}" inspect "${container}" --format \
@@ -320,15 +325,16 @@ ENVEOF
     echo "# Contains this install's environment (API keys, auth token) — it is"
     echo "# mode 0600 for that reason. Delete it once the container is back up."
     echo "#"
-    echo "# Covers name, restart policy, ports, mounts, operator-set environment"
-    echo "# and an overridden command. If your original command used anything"
-    echo "# else (custom network, capabilities, resource limits), re-add it."
+    echo "# Covers name, restart policy, network mode, ports, mounts, operator-set"
+    echo "# environment and an overridden command. If your original command used"
+    echo "# anything else (capabilities, resource limits), re-add it."
     echo "set -euo pipefail"
     echo
     printf '%s stop %q\n' "${engine}" "${container}"
     printf '%s rm %q\n' "${engine}" "${container}"
     printf '%s run -d --name %q' "${engine}" "${container}"
     [ -n "${restart}" ] && printf ' %s' "${restart}"
+    [ -n "${network}" ] && printf ' %s' "${network}"
     [ -n "${ports}" ] && printf ' %s' "${ports% }"
     [ -n "${volumes}" ] && printf ' %s' "${volumes% }"
     [ -n "${env_flags}" ] && printf '%s' "${env_flags}"
