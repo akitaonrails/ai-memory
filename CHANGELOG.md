@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `merge_project` now preserves all recovery and session attributes on migrated
+  `ingest_keys` rows (`session_id`, `agent_kind`, `observation_kind`,
+  `event_identity`, and `recovery_retained`). Previously, only the original
+  four columns from schema V33 were copied, clearing those five fields to `NULL`
+  or `0` on the target project, causing premature TTL deletion of recovery keys
+  and false `StoreError::SessionCollision` errors on replay (#2061).
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed
