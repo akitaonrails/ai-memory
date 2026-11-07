@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- A Claude Code subagent's tool event no longer reads the main conversation's
+  token usage. It read the main session's transcript, took the response that
+  started the subagent and moved the transcript cursor past it. With
+  `drop_subagent_captures = true` the router then dropped the event, so that
+  response never reached the token-usage ledger. The main conversation's
+  next event now reports it (#2034).
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed
