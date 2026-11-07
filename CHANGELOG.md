@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   downloading, copies the release into a new sibling staging directory and
   publishes it only while the destination is still absent; a failed copy or
   publication leaves the destination untouched and names the staging
-  directory to inspect.
+  directory to inspect (#2060).
 
 ## [3.4.3] - 2026-11-06
 
