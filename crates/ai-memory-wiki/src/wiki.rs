@@ -1562,6 +1562,9 @@ impl Wiki {
     ) -> WikiResult<()> {
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.read().await;
+        // Same-path writers hold this from file rename through upsert; without
+        // it a delete could land between the two (invariant #16).
+        let _page_guard = self.lock_page(workspace_id, project_id, path).await;
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
@@ -3542,9 +3545,9 @@ impl Wiki {
     ///
     /// Checked twice under the page lock: before the file is replaced, so a
     /// normal mismatch never touches disk, and again in the store transaction
-    /// that writes the version, which is the authority (a plain delete takes
-    /// only the shared mutation lock and can land between the two); a
-    /// mismatch there restores the file.
+    /// that writes the version, which is the authority (a write from another
+    /// process or an independently constructed handle shares no lock with
+    /// this one); a mismatch there restores the file.
     ///
     /// # Errors
     /// As [`Self::write_page`].
@@ -6052,6 +6055,75 @@ mod tests {
         assert_ne!(
             ai_memory_core::okf::generated_at(&disk.frontmatter),
             Some("2020-01-01T00:00:00Z")
+        );
+    }
+
+    // A plain delete used to take only the shared mutation guard, so it could
+    // quarantine the file and tombstone the row between a same-path writer's
+    // rename and its upsert: a committed version lost its file, or a deleted
+    // page came back on the next reindex (invariant #16).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_page_lock_waits_before_removing_and_allows_another_path() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/held-delete.md").unwrap();
+        let other = PagePath::new("notes/independent-delete.md").unwrap();
+        let original = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "original",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        wiki.write_page(req(
+            ws,
+            proj,
+            other.as_str(),
+            "control",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+
+        let global = wiki.mutation_lock.read().await;
+        let page = wiki.lock_page(ws, proj, &path).await;
+        let delete = wiki.delete_page(ws, proj, &path, None, None);
+        tokio::pin!(delete);
+        wait_for_page_waiter(&wiki, &(ws, proj, path.clone()), delete.as_mut()).await;
+        assert!(
+            abs.exists(),
+            "the delete removed the file under a held page lock"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().into())
+                .await
+                .unwrap(),
+            Some(original),
+            "the delete tombstoned the row under a held page lock"
+        );
+
+        finish_lock_test(wiki.delete_page(ws, proj, &other, None, None))
+            .await
+            .unwrap();
+        assert!(!wiki.abs_path(ws, proj, &other).exists());
+
+        drop(page);
+        drop(global);
+        finish_lock_test(delete).await.unwrap();
+        assert!(!abs.exists());
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().into())
+                .await
+                .unwrap(),
+            None
         );
     }
 

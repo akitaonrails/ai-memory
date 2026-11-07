@@ -11,15 +11,6 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
-### Fixed
-
-- Approving an auto-improvement proposal that conflicts with a newer version of
-  its page no longer notifies non-blocking observer webhooks. The approval rolls
-  the file back and records nothing, but the observers were still sent the
-  proposal's content as if it had been written, so a mirror could copy a page
-  that never landed. Observers are now notified only when the approval writes
-  the page, as `docs/admission-webhooks.md` already described. (#2068)
-
 ### Security
 
 - `ai-memory upgrade` (and any managed launch that refreshes the native host
@@ -56,6 +47,20 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Approving an auto-improvement proposal that conflicts with a newer version of
+  its page no longer notifies non-blocking observer webhooks. The approval rolls
+  the file back and records nothing, but the observers were still sent the
+  proposal's content as if it had been written, so a mirror could copy a page
+  that never landed. Observers are now notified only when the approval writes
+  the page, as `docs/admission-webhooks.md` already described. (#2068)
+- Deleting a page no longer races a concurrent write to the same path. A plain
+  delete (`memory_delete_page`, `ai-memory delete-page`, lint cleanup) took only
+  the shared wiki lock, not the per-page lock that writes, restores and
+  reindexes hold from the file rename to the index update. A delete landing in
+  between could remove the file of a version the write had just recorded, or
+  tombstone the page while the new file stayed on disk and came back on the next
+  reindex. A delete now waits for that page's lock; other pages are not held up.
+  (#2067)
 - Fixed the native installer link when `AI_MEMORY_LIB_DIR` is relative (#2052).
 - Corrected the 2.6.6 note that frontmatter reads exactly as before the
   switch to `serde-saphyr`. A few YAML 1.1 shapes read otherwise, and a page
