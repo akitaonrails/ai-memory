@@ -138,7 +138,7 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
             compact: args.compact,
             dry_run: true,
         };
-        let outcome = run_preview(config, "/admin/purge-session", &request).await;
+        let outcome = run_preview(config, "/admin/purge-session", &request).await?;
         if let Some(line) = preview_message(&outcome, &label) {
             println!("{line}");
         }
@@ -380,7 +380,9 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-session", &preview_request())
+            .await
+            .unwrap();
         assert!(matches!(outcome, PreviewOutcome::OlderServer));
         assert!(preview_message(&outcome, "default/scratch").is_none());
     }
@@ -396,7 +398,9 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-session", &preview_request())
+            .await
+            .unwrap();
         match &outcome {
             PreviewOutcome::Refused { status, body } => {
                 assert_eq!(*status, 404);
@@ -426,7 +430,9 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-session", &preview_request())
+            .await
+            .unwrap();
         let msg = preview_message(&outcome, "default/scratch").expect("must print a line");
         assert!(msg.starts_with("Would purge session from default/scratch: 1063 observations"));
     }
@@ -449,7 +455,9 @@ mod tests {
             // Close after receiving the request, without an HTTP response.
         });
         let config = config_for(&tmp, format!("http://{addr}"));
-        let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-session", &preview_request())
+            .await
+            .unwrap();
         assert!(matches!(outcome, PreviewOutcome::Unreachable));
         assert!(preview_message(&outcome, "default/scratch").is_none());
         tokio::time::timeout(std::time::Duration::from_secs(1), server)

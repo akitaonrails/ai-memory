@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::config::Config;
@@ -53,25 +54,35 @@ pub enum PreviewOutcome {
 }
 
 /// Run the preview request under [`PREVIEW_TIMEOUT`] and classify the
-/// result. Auth resolution (`ServerEndpoint::from_config_resolving_auth`,
-/// which can itself refresh an OIDC token over the network) runs inside the
-/// same timeout so a hung refresh cannot silently make a `--confirm`-less
-/// purge command block far longer than the rest of it ever has.
+/// result.
+///
+/// The preview goes to the server the confirmed purge would reach:
+/// [`ServerEndpoint::for_checkout`] picks the server profile this checkout's
+/// marker selects, with that profile's own token, and the install's server
+/// otherwise (#2016). Auth resolution (which can itself refresh an OIDC token
+/// over the network) runs inside the same timeout so a hung refresh cannot
+/// silently make a `--confirm`-less purge command block far longer than the
+/// rest of it ever has.
+///
+/// # Errors
+/// A marker that selects a server profile which does not resolve. The
+/// confirmed purge fails closed on it, and so does the preview: it is sent
+/// nowhere rather than to the install's server with this checkout's names.
 pub async fn run_preview<Req: Serialize>(
     config: &Config,
     path: &str,
     request: &Req,
-) -> PreviewOutcome {
+) -> Result<PreviewOutcome> {
     let attempt = tokio::time::timeout(PREVIEW_TIMEOUT, async {
-        let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-        post_json::<_, serde_json::Value>(&endpoint, path, request).await
+        let endpoint = ServerEndpoint::for_checkout(config).await?;
+        Ok::<_, anyhow::Error>(post_json::<_, serde_json::Value>(&endpoint, path, request).await)
     })
     .await;
 
-    let Ok(result) = attempt else {
-        return PreviewOutcome::Unreachable;
+    let Ok(routed) = attempt else {
+        return Ok(PreviewOutcome::Unreachable);
     };
-    match result {
+    Ok(match routed? {
         Ok(report) if report["dry_run"].as_bool().unwrap_or(false) => {
             PreviewOutcome::Previewed(report)
         }
@@ -87,7 +98,7 @@ pub async fn run_preview<Req: Serialize>(
             // deserialize as JSON.
             None => PreviewOutcome::Unreachable,
         },
-    }
+    })
 }
 
 /// Format a `PreviewOutcome::Refused` body as the one line every caller
