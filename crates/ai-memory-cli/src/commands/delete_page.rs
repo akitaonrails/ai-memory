@@ -67,7 +67,8 @@ pub async fn run(config: &Config, args: DeletePageArgs) -> Result<()> {
     let status = if resp.deleted { "✓ deleted" } else { "no-op" };
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-delete-page-under",
             &[
                 ("value0", status.to_string()),

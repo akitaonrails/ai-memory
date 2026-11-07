@@ -75,7 +75,8 @@ pub async fn run(config: &Config, args: RestorePageArgs) -> Result<()> {
 
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-restore-page-restored-under-from-page-id",
             &[
                 ("value0", terminal_text(&resp.path)),
