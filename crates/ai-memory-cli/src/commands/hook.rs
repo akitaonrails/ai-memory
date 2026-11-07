@@ -215,8 +215,21 @@ fn compute_live_calls(
                 })
             }),
         _ => None,
-    };
-    path.and_then(|p| super::session_usage::extract_live_calls(&p, agent, data_dir, routing_key))
+    }?;
+    let batch = super::session_usage::extract_live_calls(&path, agent, data_dir, routing_key)?;
+    // Claude Code subagents write their own transcripts. Their responses ride
+    // only on the main conversation's events: `drop_subagent_captures` drops
+    // an event that carries `agent_id` (the router's `body_is_subagent`),
+    // usage included, after its cursor has moved. `agent_type` alone is a
+    // `claude --agent` main session, whose events keep them.
+    let subagent_event = json
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty());
+    if agent == AgentKind::ClaudeCode && !subagent_event {
+        return Some(batch.with_claude_subagents(&path, data_dir, routing_key));
+    }
+    Some(batch)
 }
 
 /// A stale interrupted-session candidate found in the session-start handoff
@@ -3387,6 +3400,52 @@ mod tests {
     #[test]
     fn compute_backfill_usage_claude_code_without_cwd_is_none() {
         assert!(compute_backfill_usage(AgentKind::ClaudeCode, "some-session", None).is_none());
+    }
+
+    /// #2031: Claude Code subagent responses ride only on the main
+    /// conversation's events. `drop_subagent_captures` drops a subagent's own
+    /// event, and the responses it carried with it.
+    #[test]
+    fn live_calls_add_subagent_responses_only_to_main_conversation_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        let line = |id: &str| {
+            let value = serde_json::json!({
+                "type": "assistant",
+                "message": {"id": id, "usage": {"input_tokens": 1, "output_tokens": 2}}
+            });
+            format!("{value}\n")
+        };
+        std::fs::write(&transcript, line("main-1")).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), line("sub-1")).unwrap();
+        let data_dir = tmp.path().join("data");
+        let path = transcript.to_str().unwrap();
+        let calls = |payload: serde_json::Value| {
+            compute_live_calls(
+                AgentKind::ClaudeCode,
+                &payload,
+                Some("session"),
+                &RuntimeEnv::default(),
+                None,
+                &data_dir,
+                "route",
+            )
+            .unwrap()
+            .calls
+            .into_iter()
+            .map(|call| call.call_id)
+            .collect::<Vec<_>>()
+        };
+
+        let subagent_event = serde_json::json!({"transcript_path": path, "agent_id": "a1"});
+        assert_eq!(calls(subagent_event), ["main-1"]);
+        let main_event = serde_json::json!({"transcript_path": path});
+        assert_eq!(calls(main_event), ["main-1", "sub-1"]);
+        // `claude --agent` sets `agent_type` on the main session's own events.
+        let agent_session = serde_json::json!({"transcript_path": path, "agent_type": "reviewer"});
+        assert_eq!(calls(agent_session), ["main-1", "sub-1"]);
     }
 
     #[test]
