@@ -3495,12 +3495,14 @@ fn print_next_run_hint(config: &Config) {
     );
 }
 
-/// The quit-time lines that offer [`next_run_command`].
+/// The quit-time lines that offer [`next_run_command`]. The command repeats
+/// the extra folders' paths, directory entries that can come from a cloned
+/// repository, so it is neutralized like the jail summary's folder names.
 fn next_run_hint(i18n: &ai_memory_core::i18n::Localizer, paint: Paint, command: &str) -> String {
     format!(
         "\n{}\n  {}\n",
         paint.dim(&i18n.diagnostic("Next time, start with the same jail choices:")),
-        paint.bold(command)
+        paint.bold(&super::show::terminal_text(command))
     )
 }
 
