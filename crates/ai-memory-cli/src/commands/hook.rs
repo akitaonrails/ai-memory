@@ -1928,10 +1928,22 @@ where
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
     let mut live_batch = None;
+    // Claude Code runs hooks inside subagents too, tagging their events with
+    // `agent_id` while `transcript_path` still names the main session's
+    // transcript (<https://code.claude.com/docs/en/hooks>, "Hooks in
+    // subagents"). The router may drop such an event, so it must not move the
+    // main transcript's cursor: the main conversation's next event reads the
+    // same lines (#2034).
+    let claude_subagent_event = agent_kind == AgentKind::ClaudeCode
+        && json
+            .get("agent_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|id| !id.trim().is_empty());
     if matches!(
         args.event.as_str(),
         "post-tool-use" | "stop" | "pre-compact" | "session-end"
-    ) {
+    ) && !claude_subagent_event
+    {
         live_batch = compute_live_calls(
             agent_kind,
             &json,
