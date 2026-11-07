@@ -1305,13 +1305,13 @@ Order of operations:
    configured pepper must match the one the keys were hashed with, or the
    restore stops here too. This also applies when the archive has no
    `config.toml`, even with `--with-config`.
-4. Swap: rename the live `wiki/` and `db/` aside, rename the staged copies
-   into place, then delete the previous data. Each move is a same-filesystem
-   rename; if one fails, the moves already made are reversed. The archive's
-   `config.toml`, when it carries one, replaces the live config only with
+4. Swap: rename the live `wiki/` and `db/` aside and move the staged copies
+   into place. The archive's `config.toml` replaces the live config only with
    `--with-config` or when the data dir has none. Otherwise the live config
    stays and the archived one is saved as `<data_dir>/config.toml.from-backup`
-   (`0600` on Unix), replacing an earlier copy there.
+   (`0600` on Unix), replacing an earlier copy there. If any rename fails,
+   including saving this copy, the earlier moves are reversed. The previous
+   data is deleted only after the swap and config placement succeed.
 5. Print a summary, including where the backup's config went.
 
 A backup's `config.toml` can run commands and redirect data. Restore it, with
