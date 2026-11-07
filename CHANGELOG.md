@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - The legacy JSON recent-pages endpoint now orders and limits results in
   SQLite using the project's existing recency index. Requests for a short
-  list no longer load and sort the whole project.
+  list no longer load and sort the whole project (#2051).
 
 ## [3.4.3] - 2026-11-06
 
