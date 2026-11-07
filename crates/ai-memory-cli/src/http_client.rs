@@ -184,7 +184,17 @@ impl ServerEndpoint {
     /// like the hook drops the event: falling back to config would send this
     /// checkout's requests to another team's server.
     pub(crate) async fn for_checkout(config: &Config) -> Result<Self> {
-        match checkout_route(config) {
+        Self::from_checkout_route(config, checkout_route(config)).await
+    }
+
+    /// Resolve a selected checkout without borrowing the process cwd or its
+    /// Docker scope overrides. Managed pickers launch native host paths.
+    pub(crate) async fn for_checkout_at(config: &Config, cwd: &Path) -> Result<Self> {
+        Self::from_checkout_route(config, checkout_route_at(config, cwd)).await
+    }
+
+    async fn from_checkout_route(config: &Config, route: Route) -> Result<Self> {
+        match route {
             Route::InstallDefault => Ok(Self::from_config_resolving_auth(config).await),
             Route::Profile(profile) => {
                 let mut endpoint = Self::build(Some(profile.url), Some(profile.token), true, None);
@@ -304,19 +314,21 @@ impl ServerEndpoint {
 /// The server route for the directory this command runs in; see
 /// [`ServerEndpoint::for_checkout`].
 pub(crate) fn checkout_route(config: &Config) -> Route {
+    let Some((_, lookup_cwd)) = crate::commands::scope_directories(config) else {
+        return Route::InstallDefault;
+    };
+    checkout_route_at(config, Path::new(&lookup_cwd))
+}
+
+/// The same routing policy for an explicitly selected native checkout.
+pub(crate) fn checkout_route_at(config: &Config, cwd: &Path) -> Route {
     let env = &config.runtime_env;
     if env.server_url().is_some() || env.ignore_marker() {
         return Route::InstallDefault;
     }
-    let Some((_, lookup_cwd)) = crate::commands::scope_directories(config) else {
-        return Route::InstallDefault;
-    };
     // The hooks route the harness's logical cwd, so match a profile's roots
     // against the same spelling of this directory (#2016).
-    let lookup_cwd = crate::commands::path_util::logical_dir(
-        Path::new(&lookup_cwd),
-        env.var_os("PWD").as_deref(),
-    );
+    let lookup_cwd = crate::commands::path_util::logical_dir(cwd, env.var_os("PWD").as_deref());
     crate::server_profiles::route_for_cwd(
         &config.data_dir,
         &lookup_cwd.to_string_lossy(),
@@ -1464,6 +1476,50 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("rejected-no-token"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn explicit_target_keeps_profile_refusals_and_explicit_overrides() {
+        let checkout = ProfiledCheckout::new("server = \"team-b\"\n");
+        // The ambient directory and Docker identity point elsewhere. They
+        // still govern ordinary checkout commands, never an explicit target.
+        let config = checkout.config_in(&checkout.home, None, false);
+        let ambient = ServerEndpoint::for_checkout(&config).await.unwrap();
+        assert_eq!(ambient.url, "https://install.example");
+        let selected = ServerEndpoint::for_checkout_at(&config, &checkout.repo)
+            .await
+            .unwrap();
+        assert_eq!(selected.url, "https://b.example");
+        assert_eq!(selected.base_path, "/memory");
+        assert_eq!(selected.auth_token.as_deref(), Some("PROFILE-TOKEN"));
+
+        let outside = checkout.home.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(".ai-memory.toml"), "server = \"team-b\"\n").unwrap();
+        let refused = ServerEndpoint::for_checkout_at(&config, &outside)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("rejected-outside-roots"));
+        for (url, ignore_marker, expected) in [
+            (
+                Some("https://override.example"),
+                false,
+                "https://override.example",
+            ),
+            (None, true, "https://install.example"),
+        ] {
+            let config = checkout.config_in(&checkout.home, url, ignore_marker);
+            let endpoint = ServerEndpoint::for_checkout_at(&config, &outside)
+                .await
+                .unwrap();
+            assert_eq!(endpoint.url, expected);
+            assert_eq!(endpoint.auth_token.as_deref(), Some("INSTALL-TOKEN"));
+        }
+        std::fs::remove_file(checkout.data_dir.join("auth-tokens/team-b")).unwrap();
+        let refused = ServerEndpoint::for_checkout_at(&config, &checkout.repo)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("rejected-no-token"));
     }
 
     #[tokio::test]

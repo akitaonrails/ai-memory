@@ -7,6 +7,14 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
+When `show` selects another checkout, the launch resolves that checkout's
+server profile before probing or opening a workstream. Local state and
+transcript writes use the same endpoint and profile token as its hooks.
+`AI_MEMORY_SERVER_URL` still takes precedence, and an invalid profile fails
+closed. `resume` and `continue` also check that a saved link still belongs to
+the checkout's selected server, including its mount path. If the route has
+changed, run `ai-memory run` in that checkout to establish the new link.
+
 On Linux, a jailed OpenCode session uses a private `--standalone` server by
 default. This keeps its server and tool processes inside ai-jail's PID
 namespace so they cannot survive the jail. An explicit native `--server`
