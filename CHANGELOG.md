@@ -179,6 +179,13 @@ version in [`docs/changelog/`](docs/changelog/):
   ai-jail releases, and Copilot and Command Code, keep the previous launch
   (#2020).
 
+- `ai-memory backup-agents` now collects GitHub Copilot CLI skills, from
+  `$COPILOT_HOME/skills` (default `~/.copilot/skills`) and the repository's
+  `.github/skills`, the roots `install-skills --agent copilot-cli` writes.
+  `restore-agents` puts them back in the same places, following
+  `COPILOT_HOME` on the restoring machine, and accepts no other Copilot or
+  `.github` destination (#2037).
+
 - A project name no longer turns ambiguous because an empty leftover project
   holds it literally. When a remote-derived name such as `acme-api` matches
   both the project that owns that repository and an empty project created
