@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   redirected to the change-password form. The browser redirect sent every 403
   there except the root-only pages, so the user was told their password was the
   problem. Only the 403 for an account that must change its password redirects
-  now. (#PR)
+  now. (#2104)
 
 ### Security
 
