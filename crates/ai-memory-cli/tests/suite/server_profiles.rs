@@ -827,3 +827,34 @@ async fn purge_previews_reach_the_marker_profile_server() {
     let read = in_repo(&sb, &["read-page", "--path", "notes/kept.md"], &[]);
     assert!(String::from_utf8_lossy(&read.stdout).contains("only on server B"));
 }
+
+/// A marker selecting a profile that does not resolve fails both previews
+/// closed with the hook's reason, as it fails the confirmed purge: the
+/// checkout's names are never sent to the install's server instead.
+#[test]
+fn purge_previews_fail_closed_on_a_refused_profile() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    sb.write_marker("workspace = \"team-b\"\nproject = \"repo\"\nserver = \"nobody\"\n");
+    for args in [
+        &["purge-project"][..],
+        &[
+            "purge-session",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000000",
+        ],
+    ] {
+        let out = in_repo(&sb, args, &[]);
+        assert!(!out.status.success(), "`{}`", args.join(" "));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("rejected-unknown-profile"),
+            "`{}`: {stderr}",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains(&dead),
+            "nothing dialed the install's server: {stderr}"
+        );
+    }
+}
