@@ -48,7 +48,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 
 - Fixed `restore-agents` accepting backups with missing or invalid gzip
-  trailers. It verifies the gzip stream before restoring any assets.
+  trailers. It verifies the gzip stream before restoring any assets (#2065).
 
 ## [3.4.3] - 2026-11-06
 
