@@ -16853,6 +16853,120 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn merge_project_preserves_ingest_keys_recovery_attributes_and_resolves_conflicts() {
+        let (_tmp, mut conn, ws, source) = fresh_db();
+        let target = get_or_create_project(&mut conn, &ws, "target", None).unwrap();
+        let sid_src = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid_src, ws, source, None)).unwrap();
+        end_session(&mut conn, &sid_src, None).unwrap();
+        let sid_dst = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid_dst, ws, target, None)).unwrap();
+        end_session(&mut conn, &sid_dst, None).unwrap();
+
+        conn.execute(
+            "INSERT INTO ingest_keys ( \
+                 project_id, key, seen_at, completed_at, session_id, \
+                 agent_kind, observation_kind, event_identity, recovery_retained \
+             ) VALUES (?1, 'key-src-unique', 100, 200, ?2, 'test-agent', 'user-prompt', 'ident-src', 1)",
+            params![source.as_bytes(), sid_src.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys ( \
+                 project_id, key, seen_at, completed_at, session_id, \
+                 agent_kind, observation_kind, event_identity, recovery_retained \
+             ) VALUES (?1, 'key-conflict', 150, NULL, ?2, 'test-agent', 'user-prompt', 'ident-src', 1)",
+            params![source.as_bytes(), sid_src.as_bytes()],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO ingest_keys ( \
+                 project_id, key, seen_at, completed_at, session_id, \
+                 agent_kind, observation_kind, event_identity, recovery_retained \
+             ) VALUES (?1, 'key-conflict', 120, 180, NULL, NULL, NULL, NULL, 0)",
+            params![target.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys ( \
+                 project_id, key, seen_at, completed_at, session_id, \
+                 agent_kind, observation_kind, event_identity, recovery_retained \
+             ) VALUES (?1, 'key-dst-unique', 90, 110, ?2, 'test-agent', 'tool-call', 'ident-dst', 0)",
+            params![target.as_bytes(), sid_dst.as_bytes()],
+        )
+        .unwrap();
+
+        merge_project(&mut conn, ws, source, target, &[], true).unwrap();
+
+        let src_keys: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1",
+                params![source.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(src_keys, 0);
+
+        type IngestKeyTuple = (
+            i64,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
+        let query_key = |key: &str| -> IngestKeyTuple {
+            conn.query_row(
+                "SELECT seen_at, completed_at, session_id, agent_kind, observation_kind, \
+                        event_identity, recovery_retained \
+                 FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
+                params![target.as_bytes(), key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+
+        let unique = query_key("key-src-unique");
+        assert_eq!(unique.0, 100);
+        assert_eq!(unique.1, Some(200));
+        assert_eq!(unique.2.as_deref(), Some(sid_src.as_bytes()));
+        assert_eq!(unique.3.as_deref(), Some("test-agent"));
+        assert_eq!(unique.4.as_deref(), Some("user-prompt"));
+        assert_eq!(unique.5.as_deref(), Some("ident-src"));
+        assert_eq!(unique.6, 1);
+
+        let conflict = query_key("key-conflict");
+        assert_eq!(conflict.0, 150);
+        assert_eq!(conflict.1, Some(180));
+        assert_eq!(conflict.2.as_deref(), Some(sid_src.as_bytes()));
+        assert_eq!(conflict.3.as_deref(), Some("test-agent"));
+        assert_eq!(conflict.4.as_deref(), Some("user-prompt"));
+        assert_eq!(conflict.5.as_deref(), Some("ident-src"));
+        assert_eq!(conflict.6, 1);
+
+        let dst_unique = query_key("key-dst-unique");
+        assert_eq!(dst_unique.0, 90);
+        assert_eq!(dst_unique.1, Some(110));
+        assert_eq!(dst_unique.2.as_deref(), Some(sid_dst.as_bytes()));
+        assert_eq!(dst_unique.3.as_deref(), Some("test-agent"));
+        assert_eq!(dst_unique.4.as_deref(), Some("tool-call"));
+        assert_eq!(dst_unique.5.as_deref(), Some("ident-dst"));
+        assert_eq!(dst_unique.6, 0);
+    }
+
     /// Seed one session in `(ws, proj)` with everything `move_session`
     /// re-stamps: two observations, one handoff it produced, one completed
     /// consolidation job, one auto-improve run, one scheduler claim, and two
