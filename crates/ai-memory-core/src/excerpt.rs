@@ -77,15 +77,24 @@ pub fn leading_prose(body: &str) -> Option<String> {
         end -= 1;
     }
     let mut prose = String::new();
-    for block in body[..end]
+    // A fenced block can hold blank lines, so its state carries across the
+    // paragraph split.
+    let mut fence: Option<(char, usize)> = None;
+    for raw_block in body[..end]
         .split("\n\n")
         .flat_map(|block| block.split("\n\r\n"))
     {
-        let block = block.trim();
-        if block.starts_with(COMPACTION_FOOTER_PREFIX) {
+        let block = raw_block.trim();
+        if fence.is_none() && block.starts_with(COMPACTION_FOOTER_PREFIX) {
             continue;
         }
-        for line in block.lines().map(str::trim) {
+        for raw_line in raw_block.lines() {
+            let (next, in_code) = fence_step(fence, raw_line);
+            fence = next;
+            if in_code {
+                continue;
+            }
+            let line = raw_line.trim();
             if line.is_empty()
                 || line.starts_with('#')
                 || line == "---"
@@ -113,6 +122,38 @@ pub fn leading_prose(body: &str) -> Option<String> {
         }
     }
     (!prose.is_empty()).then_some(prose)
+}
+
+/// The open code fence's glyph and run length after `line`, and whether
+/// `line` is a fence line or code inside one (CommonMark §4.5, as the wiki's
+/// title and link scanners track it). Code is not prose: a page that opens
+/// with a command block would otherwise lead its excerpt with the command.
+fn fence_step(current: Option<(char, usize)>, line: &str) -> (Option<(char, usize)>, bool) {
+    let in_fence = current.is_some();
+    let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if leading_spaces > 3 {
+        return (current, in_fence);
+    }
+    let trimmed = &line[leading_spaces..];
+    let glyph = match trimmed.chars().next() {
+        Some(c @ ('`' | '~')) => c,
+        _ => return (current, in_fence),
+    };
+    let count = trimmed.chars().take_while(|&c| c == glyph).count();
+    if count < 3 {
+        return (current, in_fence);
+    }
+    let info = &trimmed[count..];
+    match current {
+        // A backtick fence's info string cannot contain a backtick, so
+        // ```` ```code``` text ```` is a paragraph with an inline span.
+        None if glyph == '`' && info.contains('`') => (None, false),
+        None => (Some((glyph, count)), true),
+        Some((open, len)) if open == glyph && count >= len && info.trim().is_empty() => {
+            (None, true)
+        }
+        Some(open) => (Some(open), true),
+    }
 }
 
 /// The start of a line, long enough for any metadata label: whether a line
@@ -339,6 +380,17 @@ mod tests {
         let prose = leading_prose(&format!("Lead.\n\n{long_word}")).unwrap();
         assert!(prose.len() <= BRIEF_L1_MAX_BYTES + 4, "{}", prose.len());
         assert!(prose.starts_with("Lead. zzz"));
+    }
+
+    #[test]
+    fn fenced_code_is_not_prose() {
+        // Agent-written pages often open with a command block. Its lines are
+        // code, and a `# comment` inside it is not a heading either.
+        let body = "```bash\n# run the suite\ncargo test --workspace\n```\n\n\
+                    Run the suite before every push.\n\n~~~\nmake lint\n\n```\nstill code\n~~~\n";
+        let e = excerpt(json!({}), body);
+        assert_eq!(e.l0.as_deref(), Some("Run the suite before every push."));
+        assert_eq!(e.l1.as_deref(), Some("Run the suite before every push."));
     }
 
     #[test]
