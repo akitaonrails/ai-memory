@@ -71,6 +71,12 @@ fn join_root(web_root: &str, leaf: &str) -> String {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AdminRequired;
 
+/// Response marker for a 403 that refuses a project the viewer is not
+/// authorized for (#708). Like [`AdminRequired`], it is an answer to show,
+/// not a reason to send the viewer to the change-password form.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProjectRefused;
+
 /// Allow only same-origin relative paths under `web_root`.
 ///
 /// Rejects protocol-relative `//`, absolute URLs (`http:` / `https:`),
@@ -157,7 +163,10 @@ pub async fn html_auth_redirect_mw(
                 urlencoding_encode(&sanitize_next(Some(&full_path_and_query), &cfg.web_root));
             Redirect::to(&format!("{}?next={next_q}", cfg.login_path)).into_response()
         }
-        StatusCode::FORBIDDEN if resp.extensions().get::<AdminRequired>().is_none() => {
+        StatusCode::FORBIDDEN
+            if resp.extensions().get::<AdminRequired>().is_none()
+                && resp.extensions().get::<ProjectRefused>().is_none() =>
+        {
             Redirect::to(&cfg.change_password_path).into_response()
         }
         _ => resp,
