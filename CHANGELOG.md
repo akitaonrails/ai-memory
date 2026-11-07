@@ -48,7 +48,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 
 - Fixed `restore` replacing the live wiki and database even when it failed
-  to save the archived configuration as `config.toml.from-backup`.
+  to save the archived configuration as `config.toml.from-backup` (#2064).
 
 ## [3.4.3] - 2026-11-06
 
