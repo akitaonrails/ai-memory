@@ -2647,15 +2647,16 @@ impl Wiki {
             let abstract_text = frontmatter_abstract(&markdown.frontmatter);
             self.embed_page_version(*page_id, &markdown.body, abstract_text)
                 .await?;
-        }
-
-        if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
-            chain.dispatch_async(
-                Some(path.as_str()),
-                &markdown.frontmatter,
-                &markdown.body,
-                ctx,
-            );
+            // Observers hear only about a version that landed: a conflict
+            // rolled the file back and recorded nothing.
+            if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+                chain.dispatch_async(
+                    Some(path.as_str()),
+                    &markdown.frontmatter,
+                    &markdown.body,
+                    ctx,
+                );
+            }
         }
         Ok(result)
     }
@@ -6548,6 +6549,119 @@ mod tests {
                 .unwrap()
                 .body,
             "external body"
+        );
+    }
+
+    // A conflicting approval rolls the file back and records no version, so
+    // a non-blocking observer must not hear about it: a mirror would copy
+    // content that never landed. An approved control is still delivered.
+    #[tokio::test]
+    async fn auto_improve_approval_conflict_dispatches_no_observer_webhook() {
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::net::TcpListener;
+
+        type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+        let seen: Seen = Arc::default();
+        let app = Router::new()
+            .route(
+                "/observe",
+                post(
+                    |State(seen): State<Seen>, Json(payload): Json<serde_json::Value>| async move {
+                        seen.lock().unwrap().push(payload.to_string());
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let conflicted = stage_one(
+            &store,
+            ws,
+            proj,
+            "notes/observed-conflict.md",
+            "conflicting proposal body",
+        )
+        .await;
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/observed-conflict.md",
+            "external body",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let approved = stage_one(
+            &store,
+            ws,
+            proj,
+            "notes/observed-approved.md",
+            "approved proposal body",
+        )
+        .await;
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "mirror-observer".into(),
+                url: format!("http://{addr}/observe"),
+                timeout_ms: 1_000,
+                failure_policy: FailurePolicy::Ignore,
+                events: vec![AdmissionOp::WritePage],
+                blocking: false,
+            }])
+            .unwrap(),
+        );
+
+        assert_eq!(
+            wiki.approve_auto_improve_proposal(
+                ws,
+                proj,
+                conflicted,
+                ActorContext::default(),
+                None,
+                None
+            )
+            .await
+            .unwrap(),
+            ApproveAutoImproveProposalResult::Conflict
+        );
+        assert!(matches!(
+            wiki.approve_auto_improve_proposal(
+                ws,
+                proj,
+                approved,
+                ActorContext::default(),
+                None,
+                None
+            )
+            .await
+            .unwrap(),
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+
+        let delivered = |needle: &str| seen.lock().unwrap().iter().any(|p| p.contains(needle));
+        for _ in 0..50 {
+            if delivered("approved proposal body") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // The conflicting dispatch, if any, was spawned before the control's.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            delivered("approved proposal body"),
+            "the approved control must reach the observer"
+        );
+        assert!(
+            !delivered("conflicting proposal body"),
+            "the observer was told about a conflicting approval that wrote nothing"
         );
     }
 
