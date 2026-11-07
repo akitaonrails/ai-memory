@@ -49,7 +49,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Fixed an unreadable recovery journal blocking the hook spool drain in
   `ai-memory recover`. The command now reports both the drain result and
-  the journal error while preserving the journal for repair.
+  the journal error while preserving the journal for repair (#2066).
 
 ## [3.4.3] - 2026-11-06
 
