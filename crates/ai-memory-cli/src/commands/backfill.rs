@@ -1398,18 +1398,37 @@ fn finish(
     }
     if report.skipped_not_admitted {
         println!(
-            "{}", i18n.format("cli-backfill-ai-memory-capture-mode-is-allowlist-and-this-checkout-has-no-ai-memory-toml", &[("value0", report.workspace.to_string()), ("value1", report.project.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-backfill-ai-memory-capture-mode-is-allowlist-and-this-checkout-has-no-ai-memory-toml",
+                &[
+                    ("value0", report.workspace.to_string()),
+                    ("value1", report.project.to_string())
+                ]
+            )
+        );
         return Ok(());
     }
     if report.skipped_non_empty {
         println!(
-            "{}", i18n.format("cli-backfill-ai-memory-already-has-captured-sessions-nothing-to-backfill-use-force-to-imp", &[("value0", report.workspace.to_string()), ("value1", report.project.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-backfill-ai-memory-already-has-captured-sessions-nothing-to-backfill-use-force-to-imp",
+                &[
+                    ("value0", report.workspace.to_string()),
+                    ("value1", report.project.to_string())
+                ]
+            )
+        );
         return Ok(());
     }
     if report.dry_run {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-backfill-ai-memory-would-import-local-session-s-into-dry-run",
                 &[
                     ("value0", format!("{}", report.selected)),
@@ -1423,7 +1442,8 @@ fn finish(
     if report.imported_sessions == 0 && report.failed_sessions == 0 {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-backfill-ai-memory-no-local-session-history-found-to-backfill-for",
                 &[
                     ("value0", report.workspace.to_string()),
