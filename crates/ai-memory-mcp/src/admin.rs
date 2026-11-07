@@ -4073,6 +4073,12 @@ async fn handle_pending_write_reject(
             StatusCode::OK,
             Json(serde_json::json!({ "status": "rejected" })),
         ),
+        // The proposal exists in scope (checked above) but is no longer
+        // pending: it was decided already, a conflict rather than a fault.
+        Err(StoreError::InvalidState(msg)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        ),
         Err(e) => internal_err(e.to_string()),
     }
 }
@@ -13856,6 +13862,42 @@ mod tests {
             "reject of an unknown id must be 404, not 500 (regression for #1205): {}",
             resp.status(),
         );
+    }
+
+    /// Rejecting a proposal that was already decided (a double click on
+    /// `/web/pending`, two reviewers) is a conflict with its state, the
+    /// 409 the store's `InvalidState` maps to elsewhere, not a server error.
+    #[tokio::test]
+    async fn pending_write_reject_of_a_decided_proposal_returns_409() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (_ws, _proj, proposal_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/twice.md", "# Twice\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let reject = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"
+                ))
+                .header("content-type", "application/json")
+                .extension(ai_memory_core::ActorContext {
+                    user: Some("reviewer".into()),
+                    ..ai_memory_core::ActorContext::default()
+                })
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                ))
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(reject()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router.oneshot(reject()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
     }
 
     /// #1205: an id that exists in another workspace must still be 404
