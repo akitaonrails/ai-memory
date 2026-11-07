@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   the file back and records nothing, but the observers were still sent the
   proposal's content as if it had been written, so a mirror could copy a page
   that never landed. Observers are now notified only when the approval writes
-  the page, as `docs/admission-webhooks.md` already described. (#PR)
+  the page, as `docs/admission-webhooks.md` already described. (#2068)
 
 ### Security
 
