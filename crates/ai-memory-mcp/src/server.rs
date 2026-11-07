@@ -7068,7 +7068,9 @@ impl AiMemoryServer {
                 None => ai_memory_core::OwnerFilter::Unattributed,
             }
         };
-        let receiving_cwd = args.cwd;
+        // Blank means omitted, as for `handoff_id`: an empty path has no
+        // directory inside it, so it would hide every automatic handoff.
+        let receiving_cwd = args.cwd.filter(|cwd| !cwd.trim().is_empty());
         let requested_id = args
             .handoff_id
             .as_deref()
@@ -25449,6 +25451,67 @@ mod tests {
         assert!(again_text.contains("\"handoff\": null"));
         // Taken by this server's own MCP call, not by a SessionStart hook.
         assert!(again_text.contains("\"status\": \"none_pending\""));
+    }
+
+    /// A blank `cwd` is an omitted one, as for `handoff_id`: clients that
+    /// fill every optional field send `""`, and no stored directory lies
+    /// within an empty path, so it used to hide every automatic handoff.
+    #[tokio::test]
+    async fn memory_handoff_accept_reads_a_blank_cwd_as_omitted() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/tmp/aim".into()),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(session_id),
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: Some("/tmp/aim".into()),
+                summary: "automatic baton".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        let accept = server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: Some("  ".into()),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                    handoff_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = accept
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(text.contains("automatic baton"), "{text}");
+        assert!(text.contains("\"status\": \"claimed\""), "{text}");
     }
 
     /// `Handoff` is grouped internally into `HandoffScope`/`HandoffOrigin`/
