@@ -489,10 +489,18 @@ mod tests {
     // above.
     // -----------------------------------------------------------------
 
+    /// The preview follows this checkout's marker (#2016), so the config pins
+    /// the directory and home to the temp dir: a marker above the developer's
+    /// checkout must not decide where these previews go.
     fn config_for(tmp: &tempfile::TempDir, server_url: String) -> Config {
+        let dir = tmp.path().to_string_lossy().into_owned();
         Config {
             data_dir: tmp.path().to_path_buf(),
             server_url,
+            runtime_env: crate::config::RuntimeEnv::with_host_cwd_and_home_for_tests(
+                dir.clone(),
+                dir,
+            ),
             ..Config::default()
         }
     }
