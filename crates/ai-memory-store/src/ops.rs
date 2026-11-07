@@ -9108,14 +9108,24 @@ pub fn merge_project(
         params![src],
     )?;
     tx.execute(
-        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) \
-         SELECT ?1, key, seen_at, completed_at FROM ingest_keys WHERE project_id = ?2 \
+        "INSERT INTO ingest_keys ( \
+             project_id, key, seen_at, completed_at, session_id, \
+             agent_kind, observation_kind, event_identity, recovery_retained \
+         ) \
+         SELECT ?1, key, seen_at, completed_at, session_id, \
+                agent_kind, observation_kind, event_identity, recovery_retained \
+         FROM ingest_keys WHERE project_id = ?2 \
          ON CONFLICT(project_id, key) DO UPDATE SET \
            seen_at = max(seen_at, excluded.seen_at), \
            completed_at = CASE \
              WHEN completed_at IS NULL THEN excluded.completed_at \
              WHEN excluded.completed_at IS NULL THEN completed_at \
-             ELSE max(completed_at, excluded.completed_at) END",
+             ELSE max(completed_at, excluded.completed_at) END, \
+           session_id = COALESCE(session_id, excluded.session_id), \
+           agent_kind = COALESCE(agent_kind, excluded.agent_kind), \
+           observation_kind = COALESCE(observation_kind, excluded.observation_kind), \
+           event_identity = COALESCE(event_identity, excluded.event_identity), \
+           recovery_retained = max(recovery_retained, excluded.recovery_retained)",
         params![dst, src],
     )?;
     tx.execute(
