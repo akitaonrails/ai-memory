@@ -225,4 +225,33 @@ mod tests {
             "the install's server must not be asked about this checkout"
         );
     }
+
+    /// A marker whose profile does not resolve stops the preview before
+    /// anything is sent, as it stops the confirmed purge; falling back to the
+    /// install's server would preview, and name this checkout to, a server
+    /// the purge never touches.
+    #[tokio::test]
+    async fn a_refused_profile_fails_the_preview_without_sending_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (profile_url, profile_seen) = recording_server("/admin/purge-session", PREVIEW).await;
+        let (install_url, install_seen) =
+            recording_server("/admin/purge-session", WRONG_SERVER).await;
+        let config = profiled_checkout(&tmp, "server = \"nobody\"\n", &profile_url, &install_url);
+
+        let Err(error) = run_preview(
+            &config,
+            "/admin/purge-session",
+            &serde_json::json!({"workspace": "team-b", "project": "repo", "dry_run": true}),
+        )
+        .await
+        else {
+            panic!("a refused profile must fail the preview");
+        };
+        let error = error.to_string();
+
+        assert!(error.contains("rejected-unknown-profile"), "{error}");
+        assert!(!error.contains("TOKEN"), "{error}");
+        assert!(profile_seen.lock().unwrap().is_empty());
+        assert!(install_seen.lock().unwrap().is_empty());
+    }
 }
