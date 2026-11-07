@@ -11,6 +11,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The workspace and project names a repository's `.ai-memory.toml` declares
+  no longer reach the terminal with their control characters. The scope note
+  every marker-scoped command prints, the workspace-only note, and 34 more CLI
+  lines that quote a workspace or project name (from the marker, a flag or the
+  server) printed them as written, so a cloned repository could retitle the
+  terminal or reorder a line with an OSC sequence or a bidi control. They now
+  go through the same neutralizing helper as the lines around `ai-memory run`,
+  and so do the folder paths in the "Next time" line a jailed run prints when
+  it quits (#2058).
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed
