@@ -20,7 +20,7 @@ version in [`docs/changelog/`](docs/changelog/):
   between could remove the file of a version the write had just recorded, or
   tombstone the page while the new file stayed on disk and came back on the next
   reindex. A delete now waits for that page's lock; other pages are not held up.
-  (#PR)
+  (#2067)
 
 ### Security
 
