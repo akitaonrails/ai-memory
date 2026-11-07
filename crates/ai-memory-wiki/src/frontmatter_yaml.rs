@@ -1,13 +1,15 @@
 //! Frontmatter YAML to JSON, resolved the way `serde_yaml` 0.9 resolved it.
 //!
-//! This exists for parity with existing hand-edited pages: every page that
-//! indexed under `serde_yaml` 0.9 must index to the same JSON now. The typed
-//! `serde-saphyr` deserializer reads some plain scalars differently (`007`
-//! and `1_000` as numbers, `.inf` as an error) and fails a page that uses
-//! `!!timestamp`, so this walks the parser events of `serde-saphyr`'s own
-//! YAML parser and ports `serde_yaml` 0.9's scalar rules. Frontmatter is
-//! untrusted, so nesting stays capped at `serde_yaml`'s 128 containers and
-//! alias expansion at a fixed node count.
+//! This exists for parity with existing hand-edited pages: a page that
+//! indexed under `serde_yaml` 0.9 indexes to the same JSON now, except for
+//! the YAML 1.1 shapes YAML 1.2 reads otherwise (a `#` glued to a token,
+//! U+0085/U+2028/U+2029 as line breaks), pinned in `markdown.rs`'s tests.
+//! The typed `serde-saphyr` deserializer reads some plain scalars
+//! differently (`007` and `1_000` as numbers, `.inf` as an error) and fails
+//! a page that uses `!!timestamp`, so this walks the parser events of
+//! `serde-saphyr`'s own YAML parser and ports `serde_yaml` 0.9's scalar
+//! rules. Frontmatter is untrusted, so nesting stays capped at
+//! `serde_yaml`'s 128 containers and alias expansion at a fixed node count.
 
 use std::collections::{HashMap, HashSet};
 use std::num::ParseIntError;

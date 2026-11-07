@@ -276,6 +276,7 @@ diag-would-write = # Seria gravado: { $value0 }{ "\u000A" }
 diag-would-write-grok-first-turn-handoff-rule = # Seria gravada a regra de handoff do primeiro turno do Grok: { $value0 }{ "\u000A" }
 diag-the-server-did-not-confirm-project-id = o servidor não confirmou a seleção por ID de projeto; atualize o servidor antes de iniciar
 diag-the-server-returned-a-different-managed-project = o servidor retornou um escopo de projeto gerenciado diferente; recusando iniciar
+diag-checkout-server-changed-before-resume = este checkout agora seleciona outro servidor; execute `ai-memory run` nele para vinculá-lo antes de retomar
 diag-listing-authorized-project-candidates-upgrade-the-server = listando os projetos candidatos autorizados; atualize o servidor se este endpoint não estiver disponível
 diag-no-writable-project-candidates-are-available-ask = não há projetos candidatos com permissão de escrita; peça ao operador um ID de projeto autorizado e use --project-id <id>
 diag-project-name-is-ambiguous-rerun-with-project = o nome do projeto é ambíguo; execute novamente com --project-id <id>. Opções autorizadas: { $choices }

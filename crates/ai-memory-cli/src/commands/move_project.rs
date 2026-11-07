@@ -118,7 +118,21 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
 
     if !args.confirm {
         bail!(
-            "{}", i18n.format("cli-move-project-move-project-moves-to-workspace-if-the-destination-has-no-same-named-project", &[("value0", from_workspace.to_string()), ("value1", target_flag.to_string()), ("value2", args.to_workspace.to_string()), ("value3", confirm_command(&from_workspace, &target_flag, &args).to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-move-project-move-project-moves-to-workspace-if-the-destination-has-no-same-named-project",
+                &[
+                    ("value0", from_workspace.to_string()),
+                    ("value1", target_flag.to_string()),
+                    ("value2", args.to_workspace.to_string()),
+                    (
+                        "value3",
+                        confirm_command(&from_workspace, &target_flag, &args).to_string()
+                    )
+                ]
+            )
+        );
     }
 
     let endpoint = ServerEndpoint::for_checkout(config).await?;
@@ -176,7 +190,19 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
     if moved_via == "true-move" {
         // Lossless: re-stamped in place, nothing copied or purged.
         println!(
-            "{}", i18n.format("cli-move-project-moved-pages-pages-re-stamped-true-move-sessions-observations-and-history-pre", &[("value0", from_workspace.to_string()), ("value1", terminal_text(&target_label)), ("value2", args.to_workspace.to_string()), ("value3", terminal_text(&target_label)), ("value4", format!("{}", pages))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-move-project-moved-pages-pages-re-stamped-true-move-sessions-observations-and-history-pre",
+                &[
+                    ("value0", from_workspace.to_string()),
+                    ("value1", terminal_text(&target_label)),
+                    ("value2", args.to_workspace.to_string()),
+                    ("value3", terminal_text(&target_label)),
+                    ("value4", format!("{}", pages))
+                ]
+            )
+        );
     } else {
         // copy-purge (merge into an existing same-named project).
         let tail = if skipped_count > 0 {
@@ -188,7 +214,8 @@ pub async fn run(config: &Config, args: MoveProjectArgs) -> Result<()> {
         };
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-move-project-moved-pages-pages-copied-merged-into-existing-project-tail",
                 &[
                     ("value0", from_workspace.to_string()),

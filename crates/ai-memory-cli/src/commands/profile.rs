@@ -600,12 +600,22 @@ async fn apply(ep: &ServerEndpoint, config: &Config, args: &ProfileApplyArgs) ->
         .context(i18n.text("cli-profile-reading-the-profile-entries-for-this-project"))?;
     if !resp.consume {
         bail!(
-            "{}", i18n.format("cli-profile-workspace-project-sets-profile-consume-false-so-it-does-not-take-the-profile", &[("value0", workspace.to_string()), ("value1", project.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-profile-workspace-project-sets-profile-consume-false-so-it-does-not-take-the-profile",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string())
+                ]
+            )
+        );
     }
     if resp.lines.is_empty() {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-profile-no-profile-entries-apply-to-workspace-project-nothing-written",
                 &[
                     ("value0", workspace.to_string()),
