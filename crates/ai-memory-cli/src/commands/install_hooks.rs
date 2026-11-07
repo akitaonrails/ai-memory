@@ -8964,6 +8964,15 @@ fn write_private_dsh_config(path: &Path, content: &[u8]) -> Result<()> {
 /// and `setup-agent`.
 pub(crate) fn dsh_bridge_patch_fragment(command_dir: &Path) -> String {
     let config_path = command_dir.join("hooks.json");
+    // The bridge is a Node plugin that reads this path with
+    // `fs.readFileSync`, which cannot resolve a Windows `\\?\` verbatim
+    // prefix and fails ENOENT (it treats the path as relative, #2032).
+    // `command_dir` descends from the canonical data dir, which carries that
+    // prefix on Windows, so strip it the way `service_host` does for command
+    // lines. A plain `C:\...` drive path reads fine in Node.
+    let config_path =
+        super::path_util::strip_windows_verbatim_prefix(&config_path.to_string_lossy())
+            .into_owned();
     let mut out = String::new();
     out.push_str("# DeepSeek Harness (DSH) - merge the entry below into the DSH\n");
     out.push_str("# profile patch at $DSH_HOME/profiles/<profile>/cordis.patch.yml,\n");
@@ -8977,7 +8986,7 @@ pub(crate) fn dsh_bridge_patch_fragment(command_dir: &Path) -> String {
     out.push_str("      config:\n");
     out.push_str(&format!(
         "        configPath: {}\n",
-        yaml_single_quote(&config_path.to_string_lossy())
+        yaml_single_quote(&config_path)
     ));
     out
 }
@@ -11055,6 +11064,26 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(
             out.contains(&format!("configPath: '{expected}'")),
             "expected quoted configPath in: {out}"
+        );
+    }
+
+    #[test]
+    fn dsh_bridge_patch_fragment_strips_windows_verbatim_prefix() {
+        // `command_dir` descends from the canonical data dir, which carries a
+        // `\\?\` verbatim prefix on Windows. The Node bridge reads configPath
+        // with `fs.readFileSync`, which fails ENOENT on that prefix (#2032),
+        // so the emitted path must be a plain drive path. The strip is
+        // lexical, so this bites on any host.
+        let out = dsh_bridge_patch_fragment(Path::new(
+            r"\\?\C:\Users\me\AppData\Local\ai-memory\hooks\dsh",
+        ));
+        assert!(
+            !out.contains(r"\\?\"),
+            "verbatim prefix must not reach configPath: {out}"
+        );
+        assert!(
+            out.contains(r"configPath: 'C:\Users\me\AppData\Local\ai-memory\hooks\dsh"),
+            "expected a plain drive path in: {out}"
         );
     }
 
