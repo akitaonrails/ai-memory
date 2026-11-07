@@ -90,7 +90,16 @@ async fn access(ep: &ServerEndpoint, args: ProjectAccessArgs) -> Result<()> {
             println!("  {}", terminal_text(name));
         }
         println!(
-            "{}", i18n.format("cli-project-grant-the-ones-who-should-keep-access-ai-memory-user-grant-user-name-workspa", &[("value0", args.workspace.to_string()), ("value1", args.project.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-project-grant-the-ones-who-should-keep-access-ai-memory-user-grant-user-name-workspa",
+                &[
+                    ("value0", args.workspace.to_string()),
+                    ("value1", args.project.to_string())
+                ]
+            )
+        );
     }
     Ok(())
 }

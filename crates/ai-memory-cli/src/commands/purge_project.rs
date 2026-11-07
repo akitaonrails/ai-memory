@@ -231,7 +231,16 @@ pub async fn run(config: &Config, args: PurgeProjectArgs) -> Result<()> {
             println!("{line}");
         }
         bail!(
-            "{}", i18n.format("cli-purge-project-purge-project-is-destructive-and-irreversible-re-run-with-confirm-to-proceed", &[("value0", confirm_command(&workspace, &target_flag, &args).to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-purge-project-purge-project-is-destructive-and-irreversible-re-run-with-confirm-to-proceed",
+                &[(
+                    "value0",
+                    confirm_command(&workspace, &target_flag, &args).to_string()
+                )]
+            )
+        );
     }
 
     let endpoint = ServerEndpoint::for_checkout(config).await?;
