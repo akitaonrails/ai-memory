@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Generated TypeScript hooks now leave native OIDC spool entries queued for
   `ai-memory hook-drain` to deliver with the right credentials. Their drain
   previously posted those entries without a bearer and removed them after
-  a 401 from the gateway (follow-up to #1801).
+  a 401 from the gateway (#2050).
 
 ## [3.4.3] - 2026-11-06
 
