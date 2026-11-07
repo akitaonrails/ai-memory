@@ -2549,7 +2549,7 @@ mod tests {
         for prefix in ["aim_", "ams_", "amk_"] {
             let key = format!("{prefix}{tail}");
             for glued in [
-                format!("title\u{7}{key}"),     // a removed BEL
+                format!("title\u{7}{key}"),      // a removed BEL
                 format!("title\u{1b}[32m{key}"), // a removed ANSI colour code
                 format!("word%20{key}"),         // a percent-encoded byte
                 format!("prefixword{key}"),      // a letter directly before it
@@ -2564,7 +2564,10 @@ mod tests {
         // AWS: the percent-encoded byte is newly covered; a boundary case still
         // works. (A letter removed from directly before `AKIA` stays unmatched
         // on purpose — redacting it mid-word would destroy uppercase text.)
-        for aws in ["url?k=%20AKIAFAKEFAKEFAKEFAKE", "set AKIAFAKEFAKEFAKEFAKE here"] {
+        for aws in [
+            "url?k=%20AKIAFAKEFAKEFAKEFAKE",
+            "set AKIAFAKEFAKEFAKEFAKE here",
+        ] {
             let out = s.scrub(aws);
             assert!(
                 out.contains("[REDACTED:aws_key]") && !out.contains("FAKEFAKE"),

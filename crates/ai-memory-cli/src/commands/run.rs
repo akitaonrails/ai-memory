@@ -13216,7 +13216,10 @@ mod tests {
                 read("src/lib.rs", "pub"),
                 output("ADRSENTINEL private decision", "adr"),
                 // FAKE token shape, never a live value.
-                output("PUBLICCONTROL token ghp_FAKEfakeFAKEfakeFAKEfake012345678", "pub"),
+                output(
+                    "PUBLICCONTROL token ghp_FAKEfakeFAKEfakeFAKEfake012345678",
+                    "pub",
+                ),
             ],
             losses: Vec::new(),
         };
@@ -13226,9 +13229,15 @@ mod tests {
             &Sanitizer::builtin(),
         );
         let dossier = render_previous_session_history(ManagedHarness::Claude, &filtered);
-        assert!(dossier.contains("PUBLICCONTROL"), "public control: {dossier}");
+        assert!(
+            dossier.contains("PUBLICCONTROL"),
+            "public control: {dossier}"
+        );
         assert!(dossier.contains("src/lib.rs"), "public call: {dossier}");
-        assert!(!dossier.contains("ADRSENTINEL"), "excluded output: {dossier}");
+        assert!(
+            !dossier.contains("ADRSENTINEL"),
+            "excluded output: {dossier}"
+        );
         assert!(!dossier.contains("docs/adr"), "excluded call: {dossier}");
         assert!(
             !dossier.contains("ghp_FAKEfakeFAKEfakeFAKEfake012345678"),
