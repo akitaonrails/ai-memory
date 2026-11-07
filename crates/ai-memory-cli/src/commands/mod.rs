@@ -291,10 +291,13 @@ pub(crate) fn resolve_scope_with_marker(
 
     if announce && let Some((scope, _, _)) = marker.as_ref().filter(|_| !decided.is_empty()) {
         // Name only the halves the marker actually decided: an explicit flag
-        // that was honoured must not read as if the file overrode it.
+        // that was honoured must not read as if the file overrode it. The
+        // names come from a marker the repository may have shipped, so they
+        // are neutralized like server text.
         eprintln!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-mod-ai-memory-scope-workspace-project-from",
                 &[
                     ("value0", workspace.to_string()),
@@ -415,7 +418,8 @@ pub(crate) fn resolve_workspace(config: &Config, explicit_ws: Option<&str>) -> R
             Some(declared) => {
                 eprintln!(
                     "{}",
-                    i18n.format(
+                    crate::localization::format(
+                        i18n,
                         "cli-mod-ai-memory-workspace-declared-workspace-from",
                         &[
                             ("value0", declared.to_string()),
