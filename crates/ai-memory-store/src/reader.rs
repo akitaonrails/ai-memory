@@ -2659,6 +2659,21 @@ pub struct PageSummary {
     pub updated_at: String,
 }
 
+impl PageSummary {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let updated_us: i64 = row.get(4)?;
+        Ok(Self {
+            path: row.get(0)?,
+            title: row.get(1)?,
+            kind: row.get(2)?,
+            tier: row.get(3)?,
+            updated_at: jiff::Timestamp::from_microsecond(updated_us)
+                .map(|ts| ts.to_string())
+                .unwrap_or_default(),
+        })
+    }
+}
+
 /// Page author surfaced alongside read responses (P1.7).
 /// JOINed from the `users` table when `pages.author_id IS NOT NULL`;
 /// `None` for anonymous + root writes (where attribution lives only in
@@ -12133,29 +12148,72 @@ impl ReaderPool {
             if hide_expired {
                 bound.push(&now);
             }
-            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
-                let path: String = row.get(0)?;
-                let title: String = row.get(1)?;
-                let kind: String = row.get(2)?;
-                let tier: String = row.get(3)?;
-                let updated_us: i64 = row.get(4)?;
-                Ok((path, title, kind, tier, updated_us))
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                let (path, title, kind, tier, updated_us) = r?;
-                let updated_at = jiff::Timestamp::from_microsecond(updated_us)
-                    .map(|ts| ts.to_string())
-                    .unwrap_or_default();
-                out.push(PageSummary {
-                    path,
-                    title,
-                    kind,
-                    tier,
-                    updated_at,
+            let rows = stmt.query_map(params_from_iter(bound.iter()), PageSummary::from_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Latest unexpired page summaries for the legacy JSON recent route.
+    ///
+    /// The caller authorizes the scope IDs. Requiring the exact URL names
+    /// keeps the same name matching as [`Self::list_unexpired_pages`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn recent_unexpired_page_summaries(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        workspace: &str,
+        project: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<PageSummary>> {
+        let workspace = workspace.to_owned();
+        let project = project.to_owned();
+        let limit = limit.clamp(1, 100);
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let ttl = not_expired("pg", "?5");
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT pg.path, pg.title, {kind_expr}, pg.tier, pg.updated_at
+                 FROM pages pg
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1{ttl}
+                   AND EXISTS (
+                       SELECT 1 FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+                       WHERE w.id = ?1 AND p.id = ?2 AND w.name = ?3 AND p.name = ?4
+                   )
+                 ORDER BY pg.updated_at DESC, pg.path ASC LIMIT ?6"
+            ))?;
+            let now = now_us();
+            let mut fetch = |sql_limit| -> StoreResult<Vec<PageSummary>> {
+                let rows = stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        workspace,
+                        project,
+                        now,
+                        sql_limit,
+                    ],
+                    PageSummary::from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            };
+            let mut pages = fetch(limit as i64)?;
+            // An unrepresentable timestamp sorts last, regardless of the
+            // stored number. Re-sort only if one reached the SQL top N.
+            if pages.iter().any(|page| page.updated_at.is_empty()) {
+                pages = fetch(-1)?;
+                pages.sort_by_cached_key(|page| {
+                    (
+                        std::cmp::Reverse(page.updated_at.parse::<jiff::Timestamp>().ok()),
+                        page.path.clone(),
+                    )
                 });
+                pages.truncate(limit);
             }
-            Ok(out)
+            Ok(pages)
         })
         .await
     }
@@ -12195,18 +12253,7 @@ impl ReaderPool {
                     jiff::Timestamp::now().as_microsecond(),
                     limit.clamp(1, 100) as i64 + 1
                 ],
-                |row| {
-                    let updated_us: i64 = row.get(4)?;
-                    Ok(PageSummary {
-                        path: row.get(0)?,
-                        title: row.get(1)?,
-                        kind: row.get(2)?,
-                        tier: row.get(3)?,
-                        updated_at: jiff::Timestamp::from_microsecond(updated_us)
-                            .map(|ts| ts.to_string())
-                            .unwrap_or_default(),
-                    })
-                },
+                PageSummary::from_row,
             )?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
