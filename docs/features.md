@@ -67,7 +67,10 @@ registered sessions and captured-event counts should grow. If they do not, use
 The dashboard shows usage for individual model responses and totals per session
 and agent type. Update the native Claude Code or Codex client and reinstall its
 hooks as above to enable capture. There is no separate dashboard token switch.
-The server records reports as they arrive; the session need not end.
+The server records reports as they arrive; the session need not end. A Claude
+Code session's responses include its subagents', which Claude Code keeps in
+their own transcripts beside the session's; they arrive with the main
+conversation's next response.
 
 The Token usage form filters the complete authorized response ledger on the
 server before selecting a 50-row page. From is inclusive and Until is exclusive,
