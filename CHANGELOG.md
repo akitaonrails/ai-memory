@@ -67,6 +67,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory run --yolo kiro` now launches with a `--trust-all-tools` that
+  kiro-cli accepts, on both engines. kiro-cli takes the flag only as a `chat`
+  option, but the wrapper appended it to the end of the arguments, so a launch
+  without `chat` (a bare `kiro`, or a managed resume) put it at the root, where
+  kiro-cli 3.1.0 exits with `unexpected argument`. On the v3 engine `--yolo`
+  added nothing, on the belief that v3 had replaced the flag with
+  `permissions.yaml`; Kiro documents `--trust-all-tools` as v3's session-wide
+  trust, and v3 still applies `permissions.yaml` denies under it. The flag now
+  goes right after `chat`, and a launch without a subcommand starts with
+  `chat --trust-all-tools`. Other subcommands and help or version requests get
+  no trust flag, an explicit `--trust-tools` choice is still never widened, and
+  an `--agent-engine` other than v2 or v3 keeps the notice and no flag. (#2044)
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
   the file back and records nothing, but the observers were still sent the

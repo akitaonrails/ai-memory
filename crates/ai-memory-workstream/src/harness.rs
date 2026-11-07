@@ -614,14 +614,7 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         ManagedHarness::Omp => None,
         ManagedHarness::Kimi => Some("--yolo"),
         ManagedHarness::CommandCode => Some("--yolo"),
-        ManagedHarness::Kiro => {
-            if kiro_selects_non_default_engine(args) {
-                None
-            } else {
-                Some("--trust-all-tools")
-            }
-        }
-        ManagedHarness::KiroV3 => None,
+        ManagedHarness::Kiro | ManagedHarness::KiroV3 => return apply_kiro_yolo(harness, args),
         ManagedHarness::Grok => Some("--yolo"),
         ManagedHarness::Antigravity => Some("--dangerously-skip-permissions"),
         ManagedHarness::Copilot => Some("--yolo"),
@@ -635,9 +628,6 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         let present: &[&str] = match harness {
             ManagedHarness::Kimi => &["--yolo", "-y", "--yes", "--auto-approve", "--auto"],
             ManagedHarness::CommandCode => &["--yolo", "--dangerously-skip-permissions"],
-            // A narrower native trust set is an explicit user choice and must
-            // never be widened by the wrapper.
-            ManagedHarness::Kiro => &["--trust-all-tools", "-a", "--trust-tools"],
             ManagedHarness::Grok => &["--yolo", "--always-approve"],
             // Copilot documents `--allow-all` as the same permission set.
             ManagedHarness::Copilot => &["--yolo", "--allow-all"],
@@ -651,6 +641,50 @@ pub fn apply_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
         args.push(OsString::from("--settings"));
         args.push(OsString::from(CLAUDE_BYPASS_SETTINGS));
     }
+}
+
+/// Kiro's `--yolo`: `--trust-all-tools`, which kiro-cli accepts only as a
+/// `chat` option. The root command rejects it, and a bare `kiro-cli` is
+/// `kiro-cli chat`, whose options include every global one, so a launch
+/// without `chat` gets both words up front. The v2 and v3 engines both honor
+/// it, and v3 still applies its `permissions.yaml` denies. Other subcommands
+/// (`mcp`, `login`) take no trust flag, and neither does a help or version
+/// request, which starts no session: `chat` rejects the root's `--version`
+/// and `--help-all`. A narrower native trust set is an explicit user choice
+/// and is never widened. Checked against kiro-cli 3.1.0:
+/// <https://kiro.dev/docs/reference/cli-commands/>,
+/// <https://kiro.dev/docs/cli/v3/>.
+fn apply_kiro_yolo(harness: ManagedHarness, args: &mut Vec<OsString>) {
+    if kiro_yolo_engine_is_unverified(harness, args)
+        || has_flag(args, &["--trust-all-tools", "-a", "--trust-tools"])
+        || has_flag(args, KIRO_INFO_FLAGS)
+    {
+        return;
+    }
+    let trust = OsString::from("--trust-all-tools");
+    match kiro_root_positional(args) {
+        Some(index) if args[index] == OsStr::new("chat") => args.insert(index + 1, trust),
+        Some(_) => {}
+        None => {
+            let mut chat = vec![OsString::from("chat"), trust];
+            chat.append(args);
+            *args = chat;
+        }
+    }
+}
+
+/// Whether `--yolo` has no verified Kiro flag for this launch: an
+/// `--agent-engine` other than v2 or v3, which no adapter models. kiro-cli
+/// accepts it next to `--v3`, which selects the v3 harness (and is what the
+/// v3 plan prepends), so the engine value decides, not `--v3`.
+#[must_use]
+pub fn kiro_yolo_engine_is_unverified(harness: ManagedHarness, args: &[OsString]) -> bool {
+    matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3)
+        && has_flag(args, &["--agent-engine"])
+        && !matches!(
+            flag_value(args, &["--agent-engine"]).as_deref(),
+            Some("v2" | "v3")
+        )
 }
 
 /// The `--settings` value Claude's `--yolo` adds on top of
@@ -738,13 +772,16 @@ fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool
     }
 }
 
+/// Kiro's help and version flags. `-v` is verbose there (the version short
+/// flag is `-V`).
+const KIRO_INFO_FLAGS: &[&str] = &["--help", "-h", "--version", "-V", "--help-all"];
+
 fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
-    // Kiro's `-v` is verbose (its version short flag is `-V`), so the
-    // generic version-flag check must not send `kiro-cli -v` through
-    // unmanaged.
+    // Kiro's `-v` is verbose, so the generic version-flag check must not send
+    // `kiro-cli -v` through unmanaged.
     let version_flags: &[&str] = if matches!(harness, ManagedHarness::Kiro | ManagedHarness::KiroV3)
     {
-        &["--help", "-h", "--version", "-V", "--help-all"]
+        KIRO_INFO_FLAGS
     } else {
         &["--help", "-h", "--version", "-v"]
     };
@@ -1161,14 +1198,26 @@ fn first_arg_is(args: &[OsString], expected: &str) -> bool {
 }
 
 fn kiro_root_subcommand(args: &[OsString]) -> Option<&str> {
+    args.get(kiro_root_positional(args)?)?.to_str()
+}
+
+/// Index of the first root positional (the subcommand), skipping global flags
+/// and the values of the ones that take a value. An argument that is not UTF-8
+/// counts as the positional, so nothing is placed before or after it.
+fn kiro_root_positional(args: &[OsString]) -> Option<usize> {
     let mut index = 0;
     while index < args.len() {
-        let value = args.get(index)?.to_str()?;
-        if matches!(value, "--agent" | "--resume-id") {
+        let Some(value) = args[index].to_str() else {
+            return Some(index);
+        };
+        if matches!(value, "--agent" | "--resume-id" | "--repo") {
             index += 2;
             continue;
         }
-        if value.starts_with("--agent=") || value.starts_with("--resume-id=") {
+        if ["--agent=", "--resume-id=", "--repo="]
+            .iter()
+            .any(|prefix| value.starts_with(prefix))
+        {
             index += 1;
             continue;
         }
@@ -1176,7 +1225,7 @@ fn kiro_root_subcommand(args: &[OsString]) -> Option<&str> {
             index += 1;
             continue;
         }
-        return Some(value);
+        return Some(index);
     }
     None
 }
@@ -3655,25 +3704,151 @@ mod tests {
         );
     }
 
+    fn kiro_yolo(harness: ManagedHarness, native: &[&str]) -> Vec<String> {
+        let mut args: Vec<OsString> = native.iter().map(OsString::from).collect();
+        apply_yolo(harness, &mut args);
+        strings(&args)
+    }
+
     #[test]
-    fn kiro_yolo_maps_only_to_the_v2_permission_flag() {
-        let mut args = Vec::new();
-        apply_yolo(ManagedHarness::Kiro, &mut args);
-        assert_eq!(strings(&args), ["--trust-all-tools"]);
-
-        for already in ["--trust-all-tools", "-a", "--trust-tools=fs_read"] {
-            let mut args = vec![OsString::from(already)];
-            apply_yolo(ManagedHarness::Kiro, &mut args);
-            assert_eq!(strings(&args), [already]);
+    fn kiro_yolo_places_trust_all_tools_right_after_chat_on_both_engines() {
+        for harness in [ManagedHarness::Kiro, ManagedHarness::KiroV3] {
+            assert_eq!(kiro_yolo(harness, &[]), ["chat", "--trust-all-tools"]);
+            assert_eq!(
+                kiro_yolo(harness, &["--v3"]),
+                ["chat", "--trust-all-tools", "--v3"]
+            );
+            assert_eq!(
+                kiro_yolo(harness, &["chat", "hi"]),
+                ["chat", "--trust-all-tools", "hi"]
+            );
+            assert_eq!(
+                kiro_yolo(harness, &["-v", "chat", "--no-interactive", "hi"]),
+                ["-v", "chat", "--trust-all-tools", "--no-interactive", "hi"]
+            );
+            // An agent named `chat` is the value of `--agent`, not the subcommand.
+            assert_eq!(
+                kiro_yolo(harness, &["--agent", "chat"]),
+                ["chat", "--trust-all-tools", "--agent", "chat"]
+            );
+            assert_eq!(
+                kiro_yolo(harness, &["--resume-id=abc", "chat"]),
+                ["--resume-id=abc", "chat", "--trust-all-tools"]
+            );
+            // The root's value-taking flags: their values are never the subcommand.
+            assert_eq!(
+                kiro_yolo(harness, &["--cloud", "--repo", "owner/name"]),
+                [
+                    "chat",
+                    "--trust-all-tools",
+                    "--cloud",
+                    "--repo",
+                    "owner/name"
+                ]
+            );
+            assert_eq!(
+                kiro_yolo(harness, &["--repo=owner/name", "chat"]),
+                ["--repo=owner/name", "chat", "--trust-all-tools"]
+            );
         }
+        assert_eq!(
+            kiro_yolo(ManagedHarness::Kiro, &["chat", "--agent-engine", "v2"]),
+            ["chat", "--trust-all-tools", "--agent-engine", "v2"]
+        );
+    }
 
-        let mut v3 = vec![OsString::from("--v3")];
-        apply_yolo(ManagedHarness::Kiro, &mut v3);
-        assert_eq!(strings(&v3), ["--v3"]);
+    #[test]
+    fn kiro_yolo_never_widens_a_native_trust_choice_and_is_idempotent() {
+        for already in ["--trust-all-tools", "-a", "--trust-tools=fs_read"] {
+            for harness in [ManagedHarness::Kiro, ManagedHarness::KiroV3] {
+                assert_eq!(kiro_yolo(harness, &["chat", already]), ["chat", already]);
+            }
+        }
+        let mut args = Vec::new();
+        apply_yolo(ManagedHarness::KiroV3, &mut args);
+        apply_yolo(ManagedHarness::KiroV3, &mut args);
+        assert_eq!(strings(&args), ["chat", "--trust-all-tools"]);
+    }
 
-        let mut managed_v3 = vec![OsString::from("--v3")];
-        apply_yolo(ManagedHarness::KiroV3, &mut managed_v3);
-        assert_eq!(strings(&managed_v3), ["--v3"]);
+    #[test]
+    fn kiro_yolo_leaves_other_subcommands_and_unmodeled_engines_alone() {
+        for native in [
+            &["login"][..],
+            &["--agent", "reviewer", "mcp"],
+            &["-vv", "doctor"],
+            &["--version"],
+            &["-V"],
+            &["--help-all"],
+            &["chat", "--help"],
+        ] {
+            assert_eq!(kiro_yolo(ManagedHarness::Kiro, native), native);
+        }
+        let v1 = ["chat", "--agent-engine", "v1"].map(OsString::from);
+        let v3_plan = build_launch_plan(ManagedHarness::KiroV3, None, v1.to_vec(), None).unwrap();
+        assert_eq!(strings(&v3_plan.args)[0], "--v3");
+        assert!(kiro_yolo_engine_is_unverified(
+            ManagedHarness::KiroV3,
+            &v3_plan.args
+        ));
+        let mut args = v3_plan.args.clone();
+        apply_yolo(ManagedHarness::KiroV3, &mut args);
+        assert_eq!(args, v3_plan.args);
+        for harness in [ManagedHarness::Kiro, ManagedHarness::KiroV3] {
+            assert!(kiro_yolo_engine_is_unverified(harness, &v1), "{harness:?}");
+            assert_eq!(
+                kiro_yolo(harness, &["chat", "--agent-engine", "v1"]),
+                ["chat", "--agent-engine", "v1"],
+                "{harness:?}"
+            );
+        }
+        for verified in [
+            &["--v3"][..],
+            &["--mode", "vibe"],
+            &["--agent-engine", "v2"],
+            &[],
+        ] {
+            let args: Vec<OsString> = verified.iter().map(OsString::from).collect();
+            assert!(
+                !kiro_yolo_engine_is_unverified(ManagedHarness::Kiro, &args),
+                "{verified:?}"
+            );
+            assert!(
+                !kiro_yolo_engine_is_unverified(ManagedHarness::KiroV3, &args),
+                "{verified:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kiro_yolo_on_a_managed_v3_resume_keeps_the_planned_selectors() {
+        let mut plan = build_launch_plan(
+            ManagedHarness::KiroV3,
+            None,
+            Vec::new(),
+            Some("sess_3f6d1c2a-0000-4000-8000-000000000aaa"),
+        )
+        .unwrap();
+        apply_yolo(ManagedHarness::KiroV3, &mut plan.args);
+        assert_eq!(
+            strings(&plan.args),
+            [
+                "chat",
+                "--trust-all-tools",
+                "--v3",
+                "--resume-id",
+                "sess_3f6d1c2a-0000-4000-8000-000000000aaa"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kiro_yolo_treats_a_non_utf8_root_argument_as_the_subcommand() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let bad = OsString::from_vec(vec![0xff]);
+        let mut args = vec![OsString::from("-v"), bad.clone()];
+        apply_yolo(ManagedHarness::Kiro, &mut args);
+        assert_eq!(args, [OsString::from("-v"), bad]);
     }
 
     #[test]

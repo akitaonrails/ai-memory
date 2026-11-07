@@ -26,11 +26,11 @@ use ai_memory_workstream::{
     inside_ai_jail_here, inspect_repository, is_interactive_session_invocation, jail_checklist,
     jail_spec, jail_toggle, kiro_explicit_session_id, kiro_harness_from_source_cursor,
     kiro_selects_non_default_engine, kiro_selects_v2_engine, kiro_selects_v3_engine,
-    kiro_v3_resume_uses_default_store, list_native_sessions, marked_choices, native_session_exists,
-    native_session_in_checkout, native_store_root, omp_profile_flag, omp_profile_flag_env,
-    parse_jail_toggles, parse_status, server_reach, status_refusal, store_override_vars,
-    transcript_baseline, transcript_interval_digests, usable_ai_jail_here,
-    wait_for_transcript_flush,
+    kiro_v3_resume_uses_default_store, kiro_yolo_engine_is_unverified, list_native_sessions,
+    marked_choices, native_session_exists, native_session_in_checkout, native_store_root,
+    omp_profile_flag, omp_profile_flag_env, parse_jail_toggles, parse_status, server_reach,
+    status_refusal, store_override_vars, transcript_baseline, transcript_interval_digests,
+    usable_ai_jail_here, wait_for_transcript_flush,
 };
 use anyhow::{Context as _, Result, anyhow};
 use clap::ValueEnum as _;
@@ -1314,18 +1314,15 @@ async fn run_once_with_wiring(
         }
     }
     if yolo_requested {
-        // Kiro's official dangerous mode exists on the v2 engine only
-        // (`--trust-all-tools`); the v3 engine replaced it with
-        // permissions.yaml and documents no CLI equivalent, so the wrapper
-        // maps nothing there and says so instead of failing silently.
-        if harness == ManagedHarness::KiroV3
-            || harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
-        {
+        // Kiro's v2 and v3 engines take `--trust-all-tools`; an engine no
+        // adapter models gets nothing, and the wrapper says so instead of
+        // failing silently.
+        if kiro_yolo_engine_is_unverified(harness, &plan.args) {
             eprintln!(
                 "{}",
                 config.i18n.diagnostic(
                     "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
-                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+                 (only v2 and v3 take --trust-all-tools); launching without it"
                 )
             );
         }
@@ -2048,16 +2045,14 @@ async fn degraded_launch(
     )
     .await?;
     if launch.yolo {
-        // Same Kiro caveat as the online path: v3 has no verified dangerous
-        // mode, so the wrapper maps nothing there and says so.
-        if launch.harness == ManagedHarness::KiroV3
-            || launch.harness == ManagedHarness::Kiro && kiro_selects_non_default_engine(&plan.args)
-        {
+        // Same Kiro caveat as the online path: an engine no adapter models
+        // gets no trust flag, and the wrapper says so.
+        if kiro_yolo_engine_is_unverified(launch.harness, &plan.args) {
             eprintln!(
                 "{}",
                 config.i18n.diagnostic(
                     "ai-memory: --yolo maps to no verified flag on the selected Kiro engine \
-                 (v3 replaced --trust-all-tools with permissions.yaml); launching without it"
+                 (only v2 and v3 take --trust-all-tools); launching without it"
                 )
             );
         }
