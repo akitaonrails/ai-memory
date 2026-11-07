@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::config::Config;
@@ -53,25 +54,35 @@ pub enum PreviewOutcome {
 }
 
 /// Run the preview request under [`PREVIEW_TIMEOUT`] and classify the
-/// result. Auth resolution (`ServerEndpoint::from_config_resolving_auth`,
-/// which can itself refresh an OIDC token over the network) runs inside the
-/// same timeout so a hung refresh cannot silently make a `--confirm`-less
-/// purge command block far longer than the rest of it ever has.
+/// result.
+///
+/// The preview goes to the server the confirmed purge would reach:
+/// [`ServerEndpoint::for_checkout`] picks the server profile this checkout's
+/// marker selects, with that profile's own token, and the install's server
+/// otherwise (#2016). Auth resolution (which can itself refresh an OIDC token
+/// over the network) runs inside the same timeout so a hung refresh cannot
+/// silently make a `--confirm`-less purge command block far longer than the
+/// rest of it ever has.
+///
+/// # Errors
+/// A marker that selects a server profile which does not resolve. The
+/// confirmed purge fails closed on it, and so does the preview: it is sent
+/// nowhere rather than to the install's server with this checkout's names.
 pub async fn run_preview<Req: Serialize>(
     config: &Config,
     path: &str,
     request: &Req,
-) -> PreviewOutcome {
+) -> Result<PreviewOutcome> {
     let attempt = tokio::time::timeout(PREVIEW_TIMEOUT, async {
-        let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
-        post_json::<_, serde_json::Value>(&endpoint, path, request).await
+        let endpoint = ServerEndpoint::for_checkout(config).await?;
+        Ok::<_, anyhow::Error>(post_json::<_, serde_json::Value>(&endpoint, path, request).await)
     })
     .await;
 
-    let Ok(result) = attempt else {
-        return PreviewOutcome::Unreachable;
+    let Ok(routed) = attempt else {
+        return Ok(PreviewOutcome::Unreachable);
     };
-    match result {
+    Ok(match routed? {
         Ok(report) if report["dry_run"].as_bool().unwrap_or(false) => {
             PreviewOutcome::Previewed(report)
         }
@@ -87,7 +98,7 @@ pub async fn run_preview<Req: Serialize>(
             // deserialize as JSON.
             None => PreviewOutcome::Unreachable,
         },
-    }
+    })
 }
 
 /// Format a `PreviewOutcome::Refused` body as the one line every caller
@@ -103,4 +114,144 @@ pub fn refused_message(status: u16, body: &str) -> String {
         "Preview refused ({status}): {}",
         super::show::terminal_text(&message)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// One fixture server: answers `path` with `body` and records the
+    /// `Authorization` header of every request it receives.
+    async fn recording_server(
+        path: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let record = record.clone();
+                async move {
+                    let auth = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    record.lock().unwrap().push(auth);
+                    axum::Json(serde_json::from_str::<serde_json::Value>(body).unwrap())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A checkout under `<home>/work/team-b` whose marker is `marker`, a
+    /// `team-b` profile pointing at `profile_url`, and a config whose own
+    /// server is `install_url` with its own bearer.
+    fn profiled_checkout(
+        tmp: &tempfile::TempDir,
+        marker: &str,
+        profile_url: &str,
+        install_url: &str,
+    ) -> Config {
+        let home = tmp.path().join("home");
+        let root = home.join("work").join("team-b");
+        let repo = root.join("repo");
+        let data_dir = home.join("data");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(repo.join(".ai-memory.toml"), marker).unwrap();
+        let name = crate::server_profiles::ProfileName::parse("team-b").unwrap();
+        crate::server_profiles::add(
+            &data_dir,
+            &name,
+            profile_url,
+            &[root.to_string_lossy().into_owned()],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        let mut config = Config {
+            data_dir,
+            server_url: install_url.to_owned(),
+            runtime_env: crate::config::RuntimeEnv::for_checkout_tests(
+                repo.to_string_lossy(),
+                home.to_string_lossy(),
+                None,
+                false,
+            ),
+            ..Config::default()
+        };
+        config.auth.bearer_token = Some("INSTALL-TOKEN".to_owned());
+        config
+    }
+
+    const PREVIEW: &str = r#"{"label": "team-b/repo", "pages_deleted": 1, "dry_run": true}"#;
+    const WRONG_SERVER: &str = r#"{"label": "team-b/repo", "pages_deleted": 3, "dry_run": true}"#;
+
+    /// #2016 routes the confirmed purge to the server profile the checkout's
+    /// marker selects; the preview must ask that same server, with that
+    /// profile's token, and never show the install's counts instead.
+    #[tokio::test]
+    async fn a_profiled_checkout_previews_on_the_profile_server() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (profile_url, profile_seen) = recording_server("/admin/purge-project", PREVIEW).await;
+        let (install_url, install_seen) =
+            recording_server("/admin/purge-project", WRONG_SERVER).await;
+        let config = profiled_checkout(&tmp, "server = \"team-b\"\n", &profile_url, &install_url);
+
+        let outcome = run_preview(
+            &config,
+            "/admin/purge-project",
+            &serde_json::json!({"workspace": "team-b", "project": "repo", "dry_run": true}),
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            PreviewOutcome::Previewed(report) => assert_eq!(report["pages_deleted"], 1),
+            _ => panic!("expected the profile server's preview"),
+        }
+        assert_eq!(*profile_seen.lock().unwrap(), ["Bearer PROFILE-TOKEN"]);
+        assert!(
+            install_seen.lock().unwrap().is_empty(),
+            "the install's server must not be asked about this checkout"
+        );
+    }
+
+    /// A marker whose profile does not resolve stops the preview before
+    /// anything is sent, as it stops the confirmed purge; falling back to the
+    /// install's server would preview, and name this checkout to, a server
+    /// the purge never touches.
+    #[tokio::test]
+    async fn a_refused_profile_fails_the_preview_without_sending_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (profile_url, profile_seen) = recording_server("/admin/purge-session", PREVIEW).await;
+        let (install_url, install_seen) =
+            recording_server("/admin/purge-session", WRONG_SERVER).await;
+        let config = profiled_checkout(&tmp, "server = \"nobody\"\n", &profile_url, &install_url);
+
+        let Err(error) = run_preview(
+            &config,
+            "/admin/purge-session",
+            &serde_json::json!({"workspace": "team-b", "project": "repo", "dry_run": true}),
+        )
+        .await
+        else {
+            panic!("a refused profile must fail the preview");
+        };
+        let error = error.to_string();
+
+        assert!(error.contains("rejected-unknown-profile"), "{error}");
+        assert!(!error.contains("TOKEN"), "{error}");
+        assert!(profile_seen.lock().unwrap().is_empty());
+        assert!(install_seen.lock().unwrap().is_empty());
+    }
 }
