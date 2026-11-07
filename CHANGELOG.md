@@ -13,7 +13,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- Fixed the native installer link when `AI_MEMORY_LIB_DIR` is relative.
+- Fixed the native installer link when `AI_MEMORY_LIB_DIR` is relative (#2052).
 
 ## [3.4.3] - 2026-11-06
 
