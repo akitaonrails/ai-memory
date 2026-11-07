@@ -51,6 +51,11 @@ await memory.pages.update("notes/retries.md", (current) => ({
 over, and writes with the version it read as `expectedPageId`. Set a field to
 `null` in the change to clear it.
 
+If the first read is truncated and the reported size is at most 64,000
+characters, `update` reads the page once more with that cap and uses the
+version from the second read. If the body cannot be read in full, `update`
+raises `ProtocolError` before calling your change function.
+
 ### Conditional writes
 
 Two programs can write the same page. To change a page only if nobody else

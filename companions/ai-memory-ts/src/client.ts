@@ -115,6 +115,8 @@ export interface CallToolOptions extends CallOptions {
 
 const TIERS: readonly string[] = ["working", "episodic", "semantic", "procedural"];
 const RELATIONS: readonly RelationName[] = ["causes", "fixes", "contradicts"];
+// The maximum memory_read_page accepts for max_chars.
+const MAX_PAGE_UPDATE_READ_CHARS = 64_000;
 
 function scopeWire(scope: Scope): { workspace: string; project: string } {
   return { workspace: scope.workspace, project: scope.project };
@@ -518,6 +520,10 @@ export class PagesNamespace {
    * re-run it. The page must exist; create new pages with
    * `write({ createOnly: true })`.
    *
+   * If the first body is truncated and fits within 64,000 characters, read
+   * it once more with that cap. A body that still cannot be read in full
+   * causes {@link ProtocolError} before `change` is called.
+   *
    * Calls `memory_read_page`, then `memory_write_page`.
    */
   async update(
@@ -533,7 +539,17 @@ export class PagesNamespace {
     const callOptions: CallOptions = {};
     if (signal !== undefined) callOptions.signal = signal;
     if (timeoutMs !== undefined) callOptions.timeoutMs = timeoutMs;
-    const current = await this.read({ path, scope }, callOptions);
+    let current = await this.read({ path, scope }, callOptions);
+    if (current.truncated === true) {
+      if (current.totalChars !== undefined && current.totalChars <= MAX_PAGE_UPDATE_READ_CHARS) {
+        current = await this.read({ path, scope, maxChars: MAX_PAGE_UPDATE_READ_CHARS }, callOptions);
+      }
+      if (current.truncated !== false) {
+        throw new ProtocolError(
+          "pages.update requires a complete page body. memory_read_page can return at most 64,000 characters.",
+        );
+      }
+    }
     const delta = await change(current);
     if (delta === null || typeof delta !== "object" || Array.isArray(delta)) {
       throw new ArgumentError(`${where}: change must return an object`);

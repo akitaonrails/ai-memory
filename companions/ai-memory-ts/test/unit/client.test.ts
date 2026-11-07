@@ -270,6 +270,9 @@ describe("pages", () => {
 
   it("update carries metadata over, applies the change and guards on the read version", async () => {
     const { server, memory } = setup();
+    const readSchema = server.schemas["memory_read_page"];
+    assert.ok(readSchema !== undefined);
+    delete readSchema.properties["max_chars"];
     server.tools.set("memory_read_page", () => payloads.read);
     server.tools.set("memory_write_page", () => payloads.write);
     await memory.pages.update("notes/retries.md", (current) => ({
@@ -294,6 +297,72 @@ describe("pages", () => {
       expected_page_id: payloads.PAGE_ID,
     });
   });
+
+  it("update rereads a truncated page and guards on the complete version", async () => {
+    const { server, memory } = setup();
+    const complete = "x".repeat(12_344) + "!";
+    server.tools.set("memory_read_page", (args) =>
+      args["max_chars"] === undefined
+        ? {
+            ...payloads.read,
+            body: complete.slice(0, 12_000) + "\n[body truncated]",
+            truncated: true,
+            total_chars: complete.length,
+          }
+        : {
+            ...payloads.read,
+            page_id: payloads.NEXT_PAGE_ID,
+            body: complete,
+            truncated: false,
+            total_chars: complete.length,
+          },
+    );
+    server.tools.set("memory_write_page", () => payloads.write);
+
+    let callbacks = 0;
+    await memory.pages.update("notes/retries.md", (current) => {
+      callbacks += 1;
+      assert.equal(current.body, complete);
+      assert.equal(current.pageId, payloads.NEXT_PAGE_ID);
+      return { tags: ["retagged"] };
+    });
+    assert.equal(callbacks, 1);
+    const calls = server.toolCalls();
+    assert.deepEqual(calls.map((call) => call.name), [
+      "memory_read_page", "memory_read_page", "memory_write_page",
+    ]);
+    assert.equal(calls[0]?.args["max_chars"], undefined);
+    assert.equal(calls[1]?.args["max_chars"], 64_000);
+    assert.equal(calls[2]?.args["body"], complete);
+    assert.equal(calls[2]?.args["expected_page_id"], payloads.NEXT_PAGE_ID);
+  });
+
+  for (const [initialSize, expectedReads] of [[64_001, 1], [12_345, 2]] as const) {
+    it(`update refuses an incomplete page after ${expectedReads} read(s)`, async () => {
+      const { server, memory } = setup();
+      server.tools.set("memory_read_page", (args) => ({
+        ...payloads.read,
+        body: "partial body",
+        truncated: true,
+        total_chars: args["max_chars"] === undefined ? initialSize : 64_001,
+      }));
+      server.tools.set("memory_write_page", () => payloads.write);
+      let callbacks = 0;
+      await assert.rejects(
+        memory.pages.update("notes/retries.md", () => {
+          callbacks += 1;
+          return { tags: ["retagged"] };
+        }),
+        (error: unknown) =>
+          error instanceof ProtocolError && error.message.includes("complete page body"),
+      );
+      assert.equal(callbacks, 0);
+      assert.deepEqual(
+        server.toolCalls().map((call) => call.name),
+        Array.from({ length: expectedReads }, () => "memory_read_page"),
+      );
+    });
+  }
 
   it("update writes nothing when the change function throws", async () => {
     const { server, memory } = setup();

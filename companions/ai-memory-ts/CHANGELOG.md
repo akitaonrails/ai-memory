@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `pages.update` rereads a truncated page once when its body fits the server's
+  64,000-character read cap. It refuses an incomplete body before invoking
+  the change callback, preventing metadata edits from discarding page text.
+
 - Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
   GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
   Node 22 and 24.
