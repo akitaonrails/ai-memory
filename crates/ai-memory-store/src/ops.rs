@@ -16942,7 +16942,7 @@ pub(crate) mod tests {
         let unique = query_key("key-src-unique");
         assert_eq!(unique.0, 100);
         assert_eq!(unique.1, Some(200));
-        assert_eq!(unique.2.as_deref(), Some(sid_src.as_bytes()));
+        assert_eq!(unique.2.as_deref(), Some(&sid_src.as_bytes()[..]));
         assert_eq!(unique.3.as_deref(), Some("test-agent"));
         assert_eq!(unique.4.as_deref(), Some("user-prompt"));
         assert_eq!(unique.5.as_deref(), Some("ident-src"));
@@ -16951,7 +16951,7 @@ pub(crate) mod tests {
         let conflict = query_key("key-conflict");
         assert_eq!(conflict.0, 150);
         assert_eq!(conflict.1, Some(180));
-        assert_eq!(conflict.2.as_deref(), Some(sid_src.as_bytes()));
+        assert_eq!(conflict.2.as_deref(), Some(&sid_src.as_bytes()[..]));
         assert_eq!(conflict.3.as_deref(), Some("test-agent"));
         assert_eq!(conflict.4.as_deref(), Some("user-prompt"));
         assert_eq!(conflict.5.as_deref(), Some("ident-src"));
@@ -16960,7 +16960,7 @@ pub(crate) mod tests {
         let dst_unique = query_key("key-dst-unique");
         assert_eq!(dst_unique.0, 90);
         assert_eq!(dst_unique.1, Some(110));
-        assert_eq!(dst_unique.2.as_deref(), Some(sid_dst.as_bytes()));
+        assert_eq!(dst_unique.2.as_deref(), Some(&sid_dst.as_bytes()[..]));
         assert_eq!(dst_unique.3.as_deref(), Some("test-agent"));
         assert_eq!(dst_unique.4.as_deref(), Some("tool-call"));
         assert_eq!(dst_unique.5.as_deref(), Some("ident-dst"));
