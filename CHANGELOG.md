@@ -62,6 +62,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed managed launches using the ambient directory's server instead of the
+  selected checkout's profile for workstreams, local state and transcripts,
+  including jail preflight and project-split repair. `resume` and `continue`
+  refuse a saved link whose checkout now selects another server.
+  ([#2029](https://github.com/akitaonrails/ai-memory/pull/2029))
+
+- Fixed ignored hook session-end events binding an agent in the mismatch
+  cache when the session does not exist. A later valid start can establish
+  the session under its real agent; persisted mismatches still fail closed.
+  ([#2029](https://github.com/akitaonrails/ai-memory/pull/2029))
+
 - The abandoned-session sweep no longer queues an auto-improvement review for
   every session it closes. Closing a session stamps `ended_at`, which made it a
   scheduled review candidate, so the first sweep after an upgrade could queue
