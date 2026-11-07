@@ -1108,10 +1108,10 @@ failure: they POST first and write the event to the same
 `<data_dir>/hook-spool/` contract when the server is unreachable, answers
 5xx, or answers 408, 425 or 429 (a saturated server asks for a retry), then
 flush the backlog behind the next delivery that succeeds. Any other 4xx
-is a permanent rejection and is not retried. Script drains leave native OIDC
-entries untouched for `ai-memory hook-drain`, which resolves or refreshes their
-credentials from `auth.json`; they continue with other eligible entries within
-the same bounded scan. Session start
+is a permanent rejection and is not retried. POSIX, PowerShell, and generated
+TypeScript drains leave native OIDC entries untouched for `ai-memory hook-drain`
+to resolve or refresh credentials from `auth.json`. They continue with other
+eligible entries within the same bounded scan. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
