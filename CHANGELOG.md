@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - The TypeScript SDK's `pages.update` loads the complete body before applying
   a change. It refuses an incomplete body when the read cap prevents this,
-  so a metadata-only edit cannot replace page text with a truncated preview.
+  so a metadata-only edit cannot replace page text with a truncated preview (#2054).
 
 ## [3.4.3] - 2026-11-06
 
