@@ -1095,9 +1095,13 @@ async fn recover_degraded_run(
     }
 }
 
-/// Apply clears and failure annotations in one locked rewrite; returns the
-/// remaining entry count.
+/// Persist spool-delivery evidence for entries from this pass.
 fn update_journal_evidence(data_dir: &Path, current: &[JournalEntry]) -> Result<()> {
+    // An unreadable journal supplied no entries to update. Leave it intact
+    // so its error can be reported after the independent spool drain.
+    if current.is_empty() {
+        return Ok(());
+    }
     mutate_journal(data_dir, |entries| {
         for entry in entries {
             if let Some(updated) = current.iter().find(|candidate| candidate.id == entry.id) {
@@ -1110,6 +1114,8 @@ fn update_journal_evidence(data_dir: &Path, current: &[JournalEntry]) -> Result<
     })
 }
 
+/// Apply clears and failure annotations in one locked rewrite and return the
+/// remaining entry count.
 fn finish_journal(
     data_dir: &Path,
     sanitizer: &Sanitizer,
@@ -1641,6 +1647,60 @@ mod tests {
             remaining: 0,
             dropped: 0,
         }));
+    }
+
+    #[tokio::test]
+    async fn corrupt_journal_does_not_block_the_spool_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = journal_path(temp.path());
+        let malformed = b"{\"version\":1,\"entries\":[";
+        fs::write(&journal, malformed).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/healthz",
+                axum::routing::get(|| async { axum::http::StatusCode::OK }),
+            )
+            .route(
+                "/hook/batch",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "accepted": 1,
+                        "results": [{"index": 0, "outcome": "stored"}]
+                    }))
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let spool = hook_spool::spool_dir(temp.path());
+        hook_spool::enqueue(
+            &spool,
+            &hook_spool::SpoolEntry {
+                url: format!("http://{address}/hook?event=user-prompt-submit&agent=claude-code"),
+                body: r#"{"session_id":"sess-1","cwd":"/tmp/repo","prompt":"queued"}"#.into(),
+                created_ms: u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap(),
+                auth_mode: hook_spool::AuthMode::Anonymous,
+                token: None,
+                attempts: 0,
+                profile: None,
+            },
+        )
+        .unwrap();
+        let config = Config {
+            data_dir: temp.path().to_path_buf(),
+            server_url: format!("http://{address}"),
+            ..Config::default()
+        };
+        let result = recover(&config, &RecoverBudgets::default()).await;
+        server.abort();
+        let report = result.unwrap();
+
+        assert_eq!(report.spool.sent, 1);
+        assert!(!report.spool_incomplete);
+        assert_eq!(hook_spool::spool_len(&spool), 0);
+        assert!(report.journal_error.is_some());
+        assert!(report.sessions.is_empty());
+        assert_eq!(fs::read(&journal).unwrap(), malformed);
     }
 
     #[tokio::test]

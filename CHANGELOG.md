@@ -45,6 +45,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `auth enable`'s manual-wiring fallback) redacts any `token`/`password`/`secret`
   assignment or URL userinfo it echoes back. (GHSA-6pmr-q79m-87vp)
 
+### Fixed
+
+- Fixed an unreadable recovery journal blocking the hook spool drain in
+  `ai-memory recover`. The command now reports both the drain result and
+  the journal error while preserving the journal for repair.
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed
