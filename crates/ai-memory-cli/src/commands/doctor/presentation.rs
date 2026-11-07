@@ -9,7 +9,8 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
     terminal.section(&i18n.text("cli-presentation-connection"));
     terminal.line(format_args!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-presentation-capture-coverage-for-server",
             &[
                 ("value0", report.workspace.to_string()),
