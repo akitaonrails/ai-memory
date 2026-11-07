@@ -4491,6 +4491,39 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
             "{uri} with no viewer: {body}"
         );
     }
+
+    // In a browser the refusal must stay a refusal. The HTML auth layer used
+    // to turn every 403 it did not recognize into a redirect to the
+    // change-password form, telling bob his password was the problem.
+    let browser = web.layer(axum::middleware::from_fn_with_state(
+        std::sync::Arc::new(ai_memory_web::HtmlAuthRedirectConfig::from_mount(
+            "", "/web",
+        )),
+        ai_memory_web::html_auth_redirect_mw,
+    ));
+    let navigate = |viewer: UserId| {
+        Request::builder()
+            .uri("/w/default/alice-client-work/p/secrets/rates.md")
+            .header(header::ACCEPT, "text/html")
+            .header("sec-fetch-dest", "document")
+            .extension(AuthorizedViewer(viewer))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let resp = browser.clone().oneshot(navigate(bob)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get(header::LOCATION), None);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("not authorized for alice-client-work"),
+        "{body}"
+    );
+    assert!(!body.contains("confidential"), "leaked the body: {body}");
+    let resp = browser.oneshot(navigate(alice)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 /// A project name that two projects answer to is the caller's ambiguity, not

@@ -107,7 +107,9 @@ and actor-proxy bearer without logging the values. Operator runbook:
 Custom SPA HTML at `/web` is public static; the builtin wiki browser stays
 behind auth. With human auth active and no session, a browser GET to the
 builtin wiki redirects to `{web_slug}/login` (HTML form → `POST /auth/login`);
-`must_change_password` redirects to `{web_slug}/change-password`. JSON clients
+`must_change_password` redirects to `{web_slug}/change-password`. Any other 403,
+such as a root-only page or a restricted project the user holds no grant in, is
+shown as the refusal itself. JSON clients
 and `/api/v1` still receive JSON 401/403. Once human auth becomes active, the
 engine expires the deprecated `ai_memory_auth` compatibility cookie.
 

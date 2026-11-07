@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- A signed-in user who opens a restricted project they hold no grant in now sees
+  the refusal ("not authorized for …") in the web UI, instead of being
+  redirected to the change-password form. The browser redirect sent every 403
+  there except the root-only pages, so the user was told their password was the
+  problem. Only the 403 for an account that must change its password redirects
+  now. (#PR)
+
 ### Security
 
 - `ai-memory upgrade` (and any managed launch that refreshes the native host
