@@ -989,6 +989,12 @@ accepting wildcard. The layer allows `GET / POST / OPTIONS`,
 `Authorization` + `Content-Type` headers, and credentials, with a
 10-minute preflight cache.
 
+The CORS layer sits outside authentication. A browser sends its preflight
+(`OPTIONS` with `Access-Control-Request-*`) without credentials, so the
+preflight is answered by the allow-list alone. Every real request still needs a
+bearer or session, and its `401`/`403` carries the CORS headers so the calling
+page can read the refusal.
+
 ## 10. Known gaps and deliberate non-goals
 
 - **No write surface, by design.** This is not a pending iteration: browsers
