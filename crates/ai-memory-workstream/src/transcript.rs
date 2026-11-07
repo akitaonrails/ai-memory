@@ -1,7 +1,7 @@
 //! Incremental, read-only extraction from native harness session stores.
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -1282,6 +1282,13 @@ fn export_jsonl_range(
             "native transcript final cursor is past the current transcript end"
         ));
     }
+    // `occurrences` tracks how many times each content-hashed record identity
+    // has been seen so far in document order, so a rewrite-in-place harness's
+    // byte-identical records get distinct ids (#2053). It is seeded from the
+    // validated prefix so an incremental export numbers a repeated record the
+    // same way a full export does. Non-rewrite harnesses key records by their
+    // own source ids and never consult it.
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
     let (start, mut prefix_hasher) = if journal_rewrites_in_place(harness) {
         let validated = if let Some(cursor) = cursor.as_ref().filter(|cursor| cursor.offset <= len)
             && let Some(expected) = cursor.prefix_sha256.as_deref()
@@ -1292,7 +1299,13 @@ fn export_jsonl_range(
         } else {
             None
         };
-        validated.unwrap_or_else(|| (0, Sha256::new()))
+        match validated {
+            Some((offset, hasher)) => {
+                occurrences = count_prefix_record_occurrences(&mut file, offset)?;
+                (offset, hasher)
+            }
+            None => (0, Sha256::new()),
+        }
     } else {
         (
             cursor.map_or(0, |cursor| cursor.offset.min(len)),
@@ -1454,7 +1467,23 @@ fn export_jsonl_range(
             // exchange's Prompt/AssistantMessage/ToolResults records, so
             // the line hash is its unique record id as well.
             let raw = line.strip_suffix(b"\n").unwrap_or(&line);
-            format!("{:x}", Sha256::digest(raw))
+            let base = format!("{:x}", Sha256::digest(raw));
+            // The first occurrence keeps the bare content hash, so every unique
+            // record (and the first of any repeated set) stays byte-stable
+            // across a rewrite exactly as before; only a later byte-identical
+            // record gains a deterministic occurrence suffix so it no longer
+            // collides on one ingest key (#2053). A rewrite that drops an
+            // earlier identical record shifts later suffixes, which can
+            // re-import a retained duplicate but never drops a distinct turn —
+            // the same duplicate-over-loss trade the content-hash identity
+            // already makes.
+            let seen = occurrences.entry(base.clone()).or_insert(0);
+            *seen += 1;
+            if *seen == 1 {
+                base
+            } else {
+                format!("{base}#{seen}")
+            }
         } else {
             source_id(&value).unwrap_or_else(|| format!("byte-{}", offset - read as u64))
         };
@@ -1594,6 +1623,40 @@ fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
             metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
         }
     }
+}
+
+/// Count how many times each rewrite-in-place record identity (the SHA-256 of
+/// a raw JSONL line) occurs in the first `len` committed bytes. Seeds the
+/// occurrence tally so an incremental export after the cursor numbers a
+/// repeated record exactly as a full export does, keeping both byte-identical
+/// records distinct instead of colliding on one id (#2053).
+fn count_prefix_record_occurrences(file: &mut File, len: u64) -> Result<HashMap<String, usize>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(file);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut remaining = len;
+    let mut line = Vec::new();
+    while remaining > 0 {
+        line.clear();
+        let read = reader
+            .by_ref()
+            .take(remaining)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        remaining -= read as u64;
+        // Only a complete, newline-terminated record has a stable identity,
+        // matching the main scan's own record boundary.
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+        *counts
+            .entry(format!("{:x}", Sha256::digest(raw)))
+            .or_insert(0) += 1;
+    }
+    Ok(counts)
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -6885,6 +6948,60 @@ mod tests {
         .unwrap();
         assert_eq!(rewritten.events.len(), 4);
         assert_eq!(rewritten.events[2].event_id, initial.events[1].event_id);
+    }
+
+    #[test]
+    fn grok_backfill_keeps_byte_identical_records_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let chat = temp.path().join("sessions/bucket/sess/chat_history.jsonl");
+        fs::create_dir_all(chat.parent().unwrap()).unwrap();
+        let user = r#"{"type":"user","content":"continue"}"#;
+        let assistant = r#"{"type":"assistant","content":"I completed the next step"}"#;
+        let journal = format!("{user}\n{assistant}\n{user}\n");
+        fs::write(&chat, &journal).unwrap();
+
+        let continues = |export: &ExportedTranscript| -> Vec<String> {
+            export
+                .events
+                .iter()
+                .filter(|event| event.content == "continue")
+                .map(|event| event.event_id.clone())
+                .collect()
+        };
+
+        // A full backfill keeps BOTH byte-identical user turns, with distinct
+        // ids (before the fix they shared one id and the server dropped one).
+        let full = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        let full_ids = continues(&full);
+        assert_eq!(full_ids.len(), 2, "both identical user turns are kept");
+        assert_ne!(full_ids[0], full_ids[1], "and they get distinct event ids");
+
+        // Re-backfilling the same file is idempotent.
+        let again = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        assert_eq!(continues(&again), full_ids);
+
+        // Incremental: export the first two records, then append the identical
+        // third. Its occurrence number agrees with the full export, so it lands
+        // as the distinct second turn instead of colliding with the first and
+        // being dropped on ingest.
+        fs::write(&chat, format!("{user}\n{assistant}\n")).unwrap();
+        let initial = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        assert_eq!(continues(&initial), vec![full_ids[0].clone()]);
+        fs::write(&chat, &journal).unwrap();
+        let delta = export_jsonl(
+            ManagedHarness::Grok,
+            &chat,
+            "sess",
+            initial.source_cursor.as_deref(),
+        )
+        .unwrap();
+        let delta_ids = continues(&delta);
+        assert_eq!(delta_ids.len(), 1);
+        assert_eq!(
+            delta_ids[0], full_ids[1],
+            "the appended duplicate matches the full export's second id"
+        );
+        assert_ne!(delta_ids[0], full_ids[0]);
     }
 
     /// For a journal validated by its prefix hash, the baseline hashes a

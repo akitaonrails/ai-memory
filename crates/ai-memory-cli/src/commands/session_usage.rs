@@ -17,7 +17,7 @@
 //! not just documentation.
 
 use std::collections::HashSet;
-use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[path = "session_usage_context.rs"]
@@ -30,6 +30,10 @@ pub struct LiveCallBatch {
     pub calls: Vec<ai_memory_core::TokenCall>,
     cursor_path: PathBuf,
     next: LiveCursor,
+    /// Whether this read moved past any transcript bytes.
+    advanced: bool,
+    /// Cursors of the subagent transcripts whose responses joined `calls`.
+    subagents: Vec<(PathBuf, LiveCursor)>,
 }
 
 impl LiveCallBatch {
@@ -39,6 +43,16 @@ impl LiveCallBatch {
         if let Ok(bytes) = serde_json::to_vec(&self.next) {
             if ai_memory_wiki::write_atomic(&self.cursor_path, &bytes).is_err() {
                 return;
+            }
+            // A subagent cursor that fails to write replays its responses.
+            let mut written = Vec::with_capacity(self.subagents.len());
+            for (path, next) in self.subagents {
+                let Ok(bytes) = serde_json::to_vec(&next) else {
+                    continue;
+                };
+                if ai_memory_wiki::write_atomic(&path, &bytes).is_ok() {
+                    written.push(path);
+                }
             }
             // Eviction only causes idempotent replay on the next hook.
             if let Some(dir) = self.cursor_path.parent()
@@ -50,15 +64,58 @@ impl LiveCallBatch {
                     .filter(|e| {
                         e.path().extension().is_some_and(|s| s == "json")
                             && e.path() != self.cursor_path
+                            && !written.contains(&e.path())
                     })
                     .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
                     .collect::<Vec<_>>();
                 cursors.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-                for (_, stale) in cursors.into_iter().skip(511) {
+                let keep = 511_usize.saturating_sub(written.len());
+                for (_, stale) in cursors.into_iter().skip(keep) {
                     let _ = std::fs::remove_file(stale);
                 }
             }
         }
+    }
+
+    /// Add the responses of the subagents a Claude Code session ran.
+    ///
+    /// The session transcript holds only the main conversation; each
+    /// subagent's responses live in its own transcript beside it (see
+    /// `claude_subagent_transcripts`). Each one keeps its own cursor and
+    /// commits with this batch. They join only a batch that already holds a
+    /// main-conversation response, because the server takes the session's
+    /// model from a batch's first response, and the batch stays within
+    /// `LIVE_BATCH_CALLS`, the most the server reads from one event.
+    #[must_use]
+    pub fn with_claude_subagents(
+        mut self,
+        transcript_path: &Path,
+        data_dir: &Path,
+        routing_key: &str,
+    ) -> Self {
+        if self.calls.is_empty() {
+            return self;
+        }
+        for transcript in claude_subagent_transcripts(transcript_path, LIVE_SUBAGENT_TRANSCRIPTS) {
+            let room = LIVE_BATCH_CALLS.saturating_sub(self.calls.len());
+            if room == 0 {
+                break;
+            }
+            let Some(batch) = read_live_calls(
+                &transcript,
+                ai_memory_core::AgentKind::ClaudeCode,
+                data_dir,
+                routing_key,
+                room,
+            ) else {
+                continue;
+            };
+            if batch.advanced {
+                self.calls.extend(batch.calls);
+                self.subagents.push((batch.cursor_path, batch.next));
+            }
+        }
+        self
     }
 }
 
@@ -76,6 +133,9 @@ struct LiveCursor {
 
 const LIVE_BATCH_CALLS: usize = 256;
 const LIVE_CURSOR_BYTES: u64 = 64 * 1024;
+/// Most subagent transcripts one live hook reads, newest first. One already
+/// read to its end costs a cursor check and no transcript bytes.
+const LIVE_SUBAGENT_TRANSCRIPTS: usize = 64;
 
 fn fingerprint(file: &mut std::fs::File, start: u64, len: u64) -> std::io::Result<String> {
     use sha2::{Digest as _, Sha256};
@@ -93,6 +153,17 @@ pub fn extract_live_calls(
     agent: ai_memory_core::AgentKind,
     data_dir: &Path,
     routing_key: &str,
+) -> Option<LiveCallBatch> {
+    read_live_calls(path, agent, data_dir, routing_key, LIVE_BATCH_CALLS)
+}
+
+/// [`extract_live_calls`], stopping at `max_calls` responses.
+fn read_live_calls(
+    path: &Path,
+    agent: ai_memory_core::AgentKind,
+    data_dir: &Path,
+    routing_key: &str,
+    max_calls: usize,
 ) -> Option<LiveCallBatch> {
     use sha2::{Digest as _, Sha256};
     let key = serde_json::to_vec(&(path, agent.as_str(), routing_key)).ok()?;
@@ -156,7 +227,7 @@ pub fn extract_live_calls(
             cursor.skipping_long_line = false;
             continue;
         }
-        if result.len() >= LIVE_BATCH_CALLS {
+        if result.len() >= max_calls {
             consumed -= line.len();
             break;
         }
@@ -304,6 +375,8 @@ pub fn extract_live_calls(
             .collect(),
         cursor_path,
         next: cursor,
+        advanced: consumed > 0,
+        subagents: Vec::new(),
     })
 }
 
@@ -332,6 +405,9 @@ pub struct SessionUsage {
 /// pathological file; real sessions are far smaller than this.
 const CLAUDE_MAX_BYTES: u64 = 200 * 1024 * 1024;
 
+/// Most subagent transcripts a full-session Claude Code scan sums.
+const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
+
 /// How far from the end of a Codex rollout file to scan for the most recent
 /// `token_usage_record`. Codex writes one after nearly every turn, so this
 /// window holds one in any session that has had at least one model turn,
@@ -345,52 +421,122 @@ const CODEX_TAIL_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 /// writer emits the same finalized message twice in a row (streaming, then
 /// finalized) with byte-identical usage on every duplicate observed —
 /// summing without the dedup roughly doubled the true total there.
+///
+/// The session's subagent transcripts are summed with it, since the session
+/// transcript holds none of their responses. They share its
+/// `CLAUDE_MAX_BYTES` budget and its `message.id` dedup, and the model stays
+/// the main conversation's.
 #[must_use]
 pub fn extract_claude_code_usage(transcript_path: &Path) -> Option<SessionUsage> {
     let file = std::fs::File::open(transcript_path).ok()?;
-    if file.metadata().ok()?.len() > CLAUDE_MAX_BYTES {
-        return None;
+    let len = file.metadata().ok()?.len();
+    let mut budget = CLAUDE_MAX_BYTES.checked_sub(len)?;
+    let mut totals = ClaudeCodeTotals::default();
+    let model = totals.add(std::io::BufReader::new(file));
+    for transcript in claude_subagent_transcripts(transcript_path, MAX_SUBAGENT_TRANSCRIPTS) {
+        let Ok(file) = std::fs::File::open(&transcript) else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata() else {
+            continue;
+        };
+        let Some(rest) = budget.checked_sub(metadata.len()) else {
+            continue;
+        };
+        budget = rest;
+        totals.add(std::io::BufReader::new(file));
     }
-    let reader = std::io::BufReader::new(file);
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut totals = SessionUsage::default();
-    let mut any = false;
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if line.is_empty() {
-            continue;
+    totals.usage.model = model;
+    totals.any.then_some(totals.usage)
+}
+
+/// Responses summed across the transcripts of one Claude Code session.
+#[derive(Default)]
+struct ClaudeCodeTotals {
+    usage: SessionUsage,
+    seen_ids: HashSet<String>,
+    any: bool,
+}
+
+impl ClaudeCodeTotals {
+    /// Add one transcript's responses, skipping ids already counted. Returns
+    /// the last model it names.
+    fn add(&mut self, reader: impl std::io::BufRead) -> Option<String> {
+        let mut model = None;
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if value.get("isMeta").and_then(serde_json::Value::as_bool) == Some(true) {
+                continue;
+            }
+            let Some(message) = value.get("message") else {
+                continue;
+            };
+            let Some(id) = message.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !self.seen_ids.insert(id.to_owned()) {
+                continue;
+            }
+            let Some(usage) = message.get("usage") else {
+                continue;
+            };
+            self.usage.input_tokens += u64_field(usage, "input_tokens");
+            self.usage.output_tokens += u64_field(usage, "output_tokens");
+            self.usage.cache_write_tokens += u64_field(usage, "cache_creation_input_tokens");
+            self.usage.cache_read_tokens += u64_field(usage, "cache_read_input_tokens");
+            if let Some(name) = message.get("model").and_then(serde_json::Value::as_str) {
+                model = Some(name.to_owned());
+            }
+            self.any = true;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if value.get("isMeta").and_then(serde_json::Value::as_bool) == Some(true) {
-            continue;
-        }
-        let Some(message) = value.get("message") else {
-            continue;
-        };
-        let Some(id) = message.get("id").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        if !seen_ids.insert(id.to_owned()) {
-            continue;
-        }
-        let Some(usage) = message.get("usage") else {
-            continue;
-        };
-        totals.input_tokens += u64_field(usage, "input_tokens");
-        totals.output_tokens += u64_field(usage, "output_tokens");
-        totals.cache_write_tokens += u64_field(usage, "cache_creation_input_tokens");
-        totals.cache_read_tokens += u64_field(usage, "cache_read_input_tokens");
-        if let Some(model) = message.get("model").and_then(serde_json::Value::as_str) {
-            totals.model = Some(model.to_owned());
-        }
-        any = true;
+        model
     }
-    any.then_some(totals)
+}
+
+/// The subagent transcripts of a Claude Code session, newest first.
+///
+/// Claude Code keeps the main conversation in `<session>.jsonl` and writes
+/// each subagent's to `<session>/subagents/agent-<id>.jsonl`, the
+/// `agent_transcript_path` its `SubagentStop` hook receives
+/// (<https://code.claude.com/docs/en/hooks#subagentstop>). Only regular files
+/// count, at most `limit` of them.
+fn claude_subagent_transcripts(transcript_path: &Path, limit: usize) -> Vec<PathBuf> {
+    let Some(session) = transcript_path.file_stem() else {
+        return Vec::new();
+    };
+    let dir = transcript_path.with_file_name(session).join("subagents");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut transcripts = entries
+        .take(1024)
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("agent-") && name.ends_with(".jsonl")
+        })
+        .filter_map(|entry| {
+            // `DirEntry::metadata` does not follow a symlink.
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            Some((metadata.modified().ok(), entry.path()))
+        })
+        .collect::<Vec<_>>();
+    transcripts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    transcripts.truncate(limit);
+    transcripts.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Read the most recent legacy usage record or modern `token_count` event
@@ -910,6 +1056,144 @@ mod tests {
     fn claude_code_missing_file_is_none_not_zero() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(extract_claude_code_usage(&tmp.path().join("nope.jsonl")).is_none());
+    }
+
+    /// A subagent line as Claude Code writes it to
+    /// `<session>/subagents/agent-<id>.jsonl`, on another model.
+    fn subagent_line(msg_id: &str, input: u64, output: u64) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "isSidechain": true,
+            "agentId": "a1",
+            "message": {
+                "id": msg_id,
+                "model": "claude-haiku-5",
+                "usage": {"input_tokens": input, "output_tokens": output}
+            }
+        })
+        .to_string()
+    }
+
+    /// #2031: the session transcript holds none of its subagents' responses,
+    /// so the full-session sum reads `<session>/subagents/agent-*.jsonl` too.
+    #[test]
+    fn claude_code_sums_the_sessions_subagent_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let main_1 = claude_line("main-1", 10, 20, 30, 40);
+        std::fs::write(&path, format!("{main_1}\n")).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let sub_1 = subagent_line("sub-1", 1, 2);
+        // `main-1` again: a response both transcripts recorded counts once.
+        std::fs::write(
+            subagents.join("agent-a1.jsonl"),
+            format!("{sub_1}\n{main_1}\n"),
+        )
+        .unwrap();
+        let sub_2 = subagent_line("sub-2", 3, 4);
+        std::fs::write(subagents.join("agent-a2.jsonl"), format!("{sub_2}\n")).unwrap();
+        // Claude Code's metadata file beside a transcript is not one.
+        let metadata = subagent_line("not-a-transcript", 99, 99);
+        std::fs::write(subagents.join("agent-a1.json"), format!("{metadata}\n")).unwrap();
+        // Another session's subagents stay out.
+        let other = tmp.path().join("other").join("subagents");
+        std::fs::create_dir_all(&other).unwrap();
+        let foreign = subagent_line("foreign", 99, 99);
+        std::fs::write(other.join("agent-b1.jsonl"), format!("{foreign}\n")).unwrap();
+
+        let usage = extract_claude_code_usage(&path).unwrap();
+        assert_eq!(usage.input_tokens, 14);
+        assert_eq!(usage.output_tokens, 26);
+        assert_eq!(usage.cache_write_tokens, 30);
+        assert_eq!(usage.cache_read_tokens, 40);
+        assert_eq!(
+            usage.model.as_deref(),
+            Some("claude-sonnet-5"),
+            "the session keeps the main conversation's model"
+        );
+    }
+
+    /// One live read of a Claude Code session, its subagents included.
+    fn read_claude_session(path: &Path, data_dir: &Path) -> LiveCallBatch {
+        use ai_memory_core::AgentKind;
+        extract_live_calls(path, AgentKind::ClaudeCode, data_dir, "key")
+            .unwrap()
+            .with_claude_subagents(path, data_dir, "key")
+    }
+
+    /// #2031: live batches carry the subagents' responses behind the main
+    /// conversation's, each subagent transcript with its own cursor.
+    #[test]
+    fn live_token_calls_add_subagent_responses_beside_a_main_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let main_1 = claude_line("main-1", 10, 20, 0, 0);
+        std::fs::write(&path, format!("{main_1}\n")).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let subagent = subagents.join("agent-a1.jsonl");
+        let sub_1 = subagent_line("sub-1", 1, 2);
+        let sub_2 = subagent_line("sub-2", 3, 4);
+        std::fs::write(&subagent, format!("{sub_1}\n{sub_2}\n")).unwrap();
+        let read = || read_claude_session(&path, tmp.path());
+        let ids = |batch: &LiveCallBatch| {
+            batch
+                .calls
+                .iter()
+                .map(|call| call.call_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let first = read();
+        assert_eq!(ids(&first), ["main-1", "sub-1", "sub-2"]);
+        assert_eq!(first.calls[1].model.as_deref(), Some("claude-haiku-5"));
+        assert_eq!(ids(&read()), ids(&first), "uncommitted data must replay");
+        first.commit();
+        assert!(read().calls.is_empty());
+
+        // Without a new main response, a subagent response waits for one.
+        let sub_3 = subagent_line("sub-3", 5, 6);
+        std::fs::write(&subagent, format!("{sub_1}\n{sub_2}\n{sub_3}\n")).unwrap();
+        let waiting = read();
+        assert!(waiting.calls.is_empty());
+        waiting.commit();
+        let main_2 = claude_line("main-2", 10, 20, 0, 0);
+        std::fs::write(&path, format!("{main_1}\n{main_2}\n")).unwrap();
+        let next = read();
+        assert_eq!(ids(&next), ["main-2", "sub-3"]);
+        next.commit();
+        assert!(read().calls.is_empty());
+    }
+
+    /// #2031: the server reads at most `LIVE_BATCH_CALLS` responses from one
+    /// event, so subagent responses past that wait for the next one.
+    #[test]
+    fn live_token_calls_keep_subagent_responses_within_one_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let main = |count: u32| {
+            (1..=count)
+                .map(|n| claude_line(&format!("main-{n}"), 1, 1, 0, 0) + "\n")
+                .collect::<String>()
+        };
+        std::fs::write(&path, main(200)).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        let sub = (1..=100)
+            .map(|n| subagent_line(&format!("sub-{n}"), 1, 1) + "\n")
+            .collect::<String>();
+        std::fs::write(subagents.join("agent-a1.jsonl"), sub).unwrap();
+
+        let first = read_claude_session(&path, tmp.path());
+        assert_eq!(first.calls.len(), LIVE_BATCH_CALLS);
+        assert_eq!(first.calls[200].call_id, "sub-1");
+        first.commit();
+        std::fs::write(&path, main(201)).unwrap();
+        let rest = read_claude_session(&path, tmp.path());
+        assert_eq!(rest.calls.len(), 45);
+        assert_eq!(rest.calls[0].call_id, "main-201");
+        assert_eq!(rest.calls[1].call_id, "sub-57");
     }
 
     fn codex_record(input: u64, output: u64, cache_write: u64, cached: u64) -> String {

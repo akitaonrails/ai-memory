@@ -1694,6 +1694,27 @@ async fn recent_page_lists_order_timestamps_chronologically() {
         .get_or_create_project(ws, "scratch", None)
         .await
         .unwrap();
+    // Both a newer peer project and an identically named project in another
+    // workspace must stay out of the limited result.
+    let other_workspace = store.writer.get_or_create_workspace("other").await.unwrap();
+    for (workspace, name) in [(ws, "peer"), (other_workspace, "scratch")] {
+        let foreign = store
+            .writer
+            .get_or_create_project(workspace, name, None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(new_page(
+                workspace,
+                foreign,
+                "notes/foreign.md",
+                "Foreign",
+                "body",
+            ))
+            .await
+            .unwrap();
+    }
     let second = "2026-01-01T12:00:00Z"
         .parse::<jiff::Timestamp>()
         .unwrap()
@@ -1814,6 +1835,62 @@ async fn recent_page_lists_order_timestamps_chronologically() {
         let (status, body) = get_body(&web, uri).await;
         assert_eq!(status, StatusCode::OK);
         assert_order(&body, &expected);
+    }
+}
+
+#[tokio::test]
+async fn legacy_recent_keeps_unrepresentable_timestamps_last() {
+    let (tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+    for (path, stamp) in [
+        ("notes/z-invalid.md", i64::MAX),
+        ("notes/a-invalid.md", i64::MIN),
+        ("notes/valid.md", 0),
+    ] {
+        let id = store
+            .writer
+            .upsert_page(new_page(ws, project, path, "Page", "body"))
+            .await
+            .unwrap();
+        conn.execute(
+            "UPDATE pages SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![stamp, id.as_bytes()],
+        )
+        .unwrap();
+    }
+    let app = api_router(store.reader.clone(), wiki);
+    let uri = "/workspaces/default/projects/scratch/recent";
+    let expected = [
+        ("notes/valid.md", "1970-01-01T00:00:00Z"),
+        ("notes/a-invalid.md", ""),
+        ("notes/z-invalid.md", ""),
+    ];
+    for limit in [1, 2, 3] {
+        let (status, body) = get_body(&app, &format!("{uri}?limit={limit}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows: Value = serde_json::from_str(&body).unwrap();
+        let actual: Vec<_> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["path"].as_str().unwrap(),
+                    row["updated_at"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected[..limit]);
     }
 }
 
@@ -5209,6 +5286,26 @@ async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
             .unwrap()
     };
     let base = "/workspaces/default/projects/private-memory/recent";
+    let legacy = format!("{base}?limit=1");
+    let refused = app
+        .clone()
+        .oneshot(request(legacy.clone(), users[1]))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let granted = app
+        .clone()
+        .oneshot(request(legacy.clone(), users[0]))
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(granted.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+    assert!(matches!(json[0]["path"].as_str(), Some("p0.md" | "p1.md")));
+
     let first = app
         .clone()
         .oneshot(request(
@@ -5245,6 +5342,14 @@ async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
             .revoke_memory(users[0], proj, None)
             .await
             .unwrap()
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(legacy, users[0]))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
     );
     assert_eq!(
         app.oneshot(request(url, users[0])).await.unwrap().status(),
@@ -6551,6 +6656,21 @@ async fn search_alias_fixture() -> (
     .await
     .unwrap();
     (tmp, store, wiki, ws, project)
+}
+
+#[tokio::test]
+async fn legacy_recent_uses_the_exact_project_name() {
+    let (_tmp, store, wiki, _, _) = search_alias_fixture().await;
+    let app = api_router(store.reader.clone(), wiki);
+    let (status, body) = get_body(&app, "/workspaces/default/projects/api/recent?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows[0]["path"], "notes/alias.md");
+
+    let (status, body) =
+        get_body(&app, "/workspaces/default/projects/acme-api/recent?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "[]");
 }
 
 #[tokio::test]

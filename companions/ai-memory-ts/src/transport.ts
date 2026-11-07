@@ -189,6 +189,10 @@ export class Transport {
   readonly #maxResponseBytes: number;
   #nextId = 0;
   #sessionId: string | undefined;
+  // Bumped by every `resetSession`, so a handshake that started earlier can
+  // tell it has been superseded by a newer one (e.g. a concurrent refresh)
+  // and must not adopt its now-stale session id (#2047).
+  #sessionEpoch = 0;
 
   /** The validated server URL, without a trailing slash. Never holds a secret. */
   readonly serverUrl: string;
@@ -507,20 +511,33 @@ export class Transport {
     }
   }
 
-  /** Keep the `Mcp-Session-Id` a stateful server issued on `initialize`. */
-  adoptSession(headers: Headers): boolean {
+  /**
+   * Keep the `Mcp-Session-Id` a stateful server issued on `initialize`, unless
+   * a newer handshake has superseded this one. `epoch` is the value
+   * `resetSession` returned when this handshake began; if it is no longer the
+   * current epoch a later `resetSession` (a concurrent refresh) owns the
+   * session, so the stale id is dropped rather than overwriting the live one
+   * (#2047). Returns how the handshake resolved: it opened a session
+   * (`adopted`), the server is stateless (`stateless`), or it was superseded.
+   */
+  adoptSession(headers: Headers, epoch: number): "adopted" | "stateless" | "superseded" {
+    if (epoch !== this.#sessionEpoch) return "superseded";
     const value = headers.get(SESSION_HEADER);
-    if (value === null) return false;
+    if (value === null) return "stateless";
     if (!/^[\x21-\x7e]{1,256}$/.test(value)) {
       throw new ProtocolError("initialize answered with an invalid Mcp-Session-Id");
     }
     this.#sessionId = value;
-    return true;
+    return "adopted";
   }
 
-  /** Forget a stateful session, so the next probe starts a new one. */
-  resetSession(): void {
+  /**
+   * Forget a stateful session, so the next probe starts a new one, and return
+   * the new epoch the caller passes back to `adoptSession`.
+   */
+  resetSession(): number {
     this.#sessionId = undefined;
+    return ++this.#sessionEpoch;
   }
 
   /** Decode a JSON-RPC `error` member into the matching error class. */

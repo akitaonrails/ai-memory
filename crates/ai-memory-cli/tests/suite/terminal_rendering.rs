@@ -1125,3 +1125,48 @@ async fn move_session_batch() {
         9,
     );
 }
+
+/// A marker ships with the repository, so the workspace and project names it
+/// declares are foreign text too: the scope note every marker-scoped command
+/// prints (`resolve_scope`) and the workspace-only note (`resolve_workspace`)
+/// must print them inert. Both notes come before any request, so a dead
+/// server is enough.
+#[tokio::test]
+async fn marker_scope_names_are_inert() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("work").join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join(".ai-memory.toml"),
+        "workspace = \"ws\u{1b}]0;owned\u{7}\u{202e}evil\"\nproject = \"proj\u{1b}[31mred\"\n",
+    )
+    .unwrap();
+    let dead = ai_memory_test_support::dead_http_endpoint();
+    let id = "00000000-0000-4000-8000-000000000000";
+    for args in [
+        &["search", "foo"][..],
+        &["recent"],
+        &["repair-split", "--project-id", id, "--from-project-id", id],
+    ] {
+        let mut cmd = command(root.path(), &dead, args);
+        cmd.current_dir(&repo);
+        let output = tokio::time::timeout(Duration::from_secs(30), cmd.output())
+            .await
+            .expect("CLI exceeded the fixture deadline")
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for text in [&stdout, &stderr] {
+            assert!(
+                !text.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+                "`{}` printed a raw control: {text:?}",
+                args.join(" ")
+            );
+        }
+        assert!(
+            stderr.contains("evil"),
+            "`{}` announced the marker scope: {stderr}",
+            args.join(" ")
+        );
+    }
+}

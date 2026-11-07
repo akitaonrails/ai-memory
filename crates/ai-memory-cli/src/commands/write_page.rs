@@ -106,7 +106,8 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
     }
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-write-page-wrote-page-id-under",
             &[
                 ("value0", terminal_text(&resp.path)),

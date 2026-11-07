@@ -296,9 +296,12 @@ pub fn kiro_selects_v3_engine(args: &[OsString]) -> bool {
 }
 
 /// Whether Kiro CLI arguments explicitly select the v2 engine.
+///
+/// Kiro CLI documents both `--v2` and `chat --agent-engine v2`:
+/// <https://kiro.dev/docs/cli/agent-harness/>.
 #[must_use]
 pub fn kiro_selects_v2_engine(args: &[OsString]) -> bool {
-    flag_value(args, &["--agent-engine"]).as_deref() == Some("v2")
+    has_flag(args, &["--v2"]) || flag_value(args, &["--agent-engine"]).as_deref() == Some("v2")
 }
 
 /// Exact Kiro session id supplied through `--resume-id`, when present.

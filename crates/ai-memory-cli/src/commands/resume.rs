@@ -71,6 +71,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
     };
     let selected = &candidates[index];
     let target = continue_session::resolve_target(config, &selected.link)?;
+    let endpoint = continue_session::endpoint_for_link(config, &selected.link, &target).await?;
     let project_id = project_registry::project_binding(
         config,
         &endpoint,
