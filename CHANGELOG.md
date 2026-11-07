@@ -14,7 +14,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 
 - Honored Kiro's explicit `--v2` selector when a managed workstream last used
-  v3, so ai-memory no longer adds a conflicting `--v3` flag.
+  v3, so ai-memory no longer adds a conflicting `--v3` flag (#2049).
 
 ## [3.4.3] - 2026-11-06
 
