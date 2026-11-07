@@ -9278,18 +9278,21 @@ mod tests {
             .unwrap(),
             ManagedHarness::KiroV3
         );
-        assert_eq!(
-            resolve_kiro_harness(
-                &[OsString::from("--agent-engine=v2")],
+        for selector in ["--v2", "--agent-engine=v2"] {
+            let args = ["chat", selector].map(OsString::from);
+            let harness = resolve_kiro_harness(
+                &args,
                 Some("sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e"),
                 Some(&v3_cursor),
                 ManagedHarness::KiroV3,
                 temp.path(),
                 &cwd,
             )
-            .unwrap(),
-            ManagedHarness::Kiro
-        );
+            .unwrap();
+            let plan = build_launch_plan(harness, None, args.to_vec(), None).unwrap();
+            assert_eq!(harness, ManagedHarness::Kiro, "{selector}: {:?}", plan.args);
+            assert_eq!(plan.args, args);
+        }
         assert_eq!(
             resolve_kiro_harness(
                 &[

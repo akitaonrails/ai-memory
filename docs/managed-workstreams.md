@@ -1156,10 +1156,10 @@ operations, malformed records, and unknown schema versions are not imported.
 The engines can never cross-resume: exact store metadata is checked before a
 linked `--resume-id` is injected, and the incompatible engine flavor is also
 stored in the opaque incremental cursor. Explicit `--v3`, v3-only `--mode`,
-or `--agent-engine v3` selects v3; explicit `--agent-engine v2` selects v2; an
-unknown engine value remains passthrough instead of being guessed. Once a v3
-session is linked, a later plain `ai-memory run kiro` recovers that engine
-transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
+or `--agent-engine v3` selects v3. Both `--v2` and `--agent-engine v2` select
+v2, even when the workstream last used v3. An unknown engine value remains
+passthrough. Once a v3 session is linked, a later plain `ai-memory run kiro`
+recovers that engine transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
 `~/.kiro/sessions` even when `KIRO_HOME` redirected other state, so ai-memory
 checks the configured v3 root first and that default root as a compatibility
 fallback. If a linked session exists only in the fallback, ai-memory removes
