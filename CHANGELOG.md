@@ -61,6 +61,13 @@ version in [`docs/changelog/`](docs/changelog/):
   tombstone the page while the new file stayed on disk and came back on the next
   reindex. A delete now waits for that page's lock; other pages are not held up.
   (#2067)
+- `install-hooks --agent cursor` now writes a `~/.cursor/hooks.json` Cursor can
+  load. Cursor strips `//` (and `/* */`) comments before parsing, with a regex
+  that ignores JSON string boundaries, so the `//` in the `https://`/`http://`
+  server URL truncated the line, parsing failed, and Cursor silently dropped the
+  whole file — no Cursor session was captured. Forward slashes are now escaped as
+  `\/`, which is valid JSON that survives the comment strip and decodes
+  unchanged (#2069).
 - Fixed the native installer link when `AI_MEMORY_LIB_DIR` is relative (#2052).
 - Corrected the 2.6.6 note that frontmatter reads exactly as before the
   switch to `serde-saphyr`. A few YAML 1.1 shapes read otherwise, and a page
