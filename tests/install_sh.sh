@@ -71,6 +71,17 @@ run_install on-path "file://${base_on_path}" PATH="${TMP_ROOT}/on-path/home/.loc
 grep -Fxq "next: ai-memory setup" <(sed 's/^[^:]*: //' "${TMP_ROOT}/on-path/out.log") \
   || fail "on-PATH next step not the bare command: $(cat "${TMP_ROOT}/on-path/out.log")"
 
+# The link must keep working from a different cwd when both overrides are
+# relative to the directory that launched install.sh.
+(
+  cd "${TMP_ROOT}"
+  run_install relative "file://${base}" \
+    AI_MEMORY_BIN_DIR="relative/bin dir" AI_MEMORY_LIB_DIR="relative/lib dir"
+) || fail "relative install refused: $(cat "${TMP_ROOT}/relative/out.log")"
+relative_version=$("${TMP_ROOT}/relative/bin dir/ai-memory" --version) \
+  || fail "relative install reported success but left an unusable link"
+[ "${relative_version}" = "ai-memory 0.0.0-test" ] || fail "unexpected binary behind relative install link"
+
 # A symlink member pointing outside the tree is refused, and nothing lands.
 plain_tree "${TMP_ROOT}/symlink-tree"
 ln -s /etc/passwd "${TMP_ROOT}/symlink-tree/hooks/escape"
