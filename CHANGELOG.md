@@ -44,6 +44,26 @@ version in [`docs/changelog/`](docs/changelog/):
   the validation error, and a config-parse failure report (`failure_report`,
   `auth enable`'s manual-wiring fallback) redacts any `token`/`password`/`secret`
   assignment or URL userinfo it echoes back. (GHSA-6pmr-q79m-87vp)
+- `ai-memory restore` no longer leaves the restored data group- or
+  world-readable on Unix. The tarball is extracted with the archive's
+  permission bits dropped, so under a normal umask the restored `db/` (the
+  SQLite database holding API-key hashes and session text) and `config.toml`
+  (the token pepper and provider credentials) landed at `0755`/`0644`. The
+  restore now creates its roots and staging directories owner-only, locks the
+  staged `wiki/` and `db/` roots and the two secret files down to the owner
+  before swapping them into place, and leaves an existing, possibly shared,
+  data dir's own permissions untouched. (GHSA-mhmf-rmgx-j388)
+- A session that crossed repositories mid-flight no longer leaks one project's
+  observations into another project's consolidated page. A session can hold
+  observations in more than one `(workspace, project)`; the bounded SessionEnd
+  reader gated on the scope but its snapshot queries then read every row of the
+  session id, so consolidating into project A could publish project B's
+  prompts, tool names and bodies into A's page. Every snapshot query now filters
+  by the bound scope, and `memory_consolidate` resolves and authorizes the write
+  target once, then binds the consolidation to exactly that scope
+  (`consolidate_session_in_scope`) instead of re-resolving it, which closes the
+  window in which a concurrent cross-project observation could move the write
+  after the grant check. (GHSA-xfgc-hc4c-wj7h)
 
 ### Fixed
 
