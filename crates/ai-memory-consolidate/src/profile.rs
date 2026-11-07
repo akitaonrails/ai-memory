@@ -633,6 +633,7 @@ pub(crate) fn user_written(body: &str) -> Option<String> {
         || looks_like_codex_assessor_transcript_line(body)
         || looks_like_claude_cross_session_message(body)
         || looks_like_claude_plugin_prompt(body)
+        || looks_like_desktop_side_session_brief(body)
     {
         return None;
     }
@@ -703,6 +704,18 @@ fn looks_like_claude_plugin_prompt(body: &str) -> bool {
             .is_some_and(|tail| {
                 tail.is_empty() || tail.starts_with('\n') || tail.starts_with("\r\n")
             })
+}
+
+/// The Claude desktop app lets one session start another with an
+/// agent-written brief, then appends a fixed footer pointing at the group's
+/// shared `side-session-notes/` folder. The whole first prompt is the lead
+/// agent's words plus that footer, never the user's, so none of it is a habit
+/// — and the footer carries a local filesystem path that must not reach
+/// evidence quotes (#2041). Both halves of the fixed footer must be present so
+/// an ordinary prompt that merely mentions a notes folder is kept.
+fn looks_like_desktop_side_session_brief(body: &str) -> bool {
+    body.contains("Shared notes folder for this group of sessions")
+        && body.contains("side-session-notes/")
 }
 
 /// Remove Claude Code's leading side-agent note while retaining the user's
@@ -2908,6 +2921,26 @@ mod tests {
         assert_eq!(user_written(paste).as_deref(), Some(paste));
         let look_alike = "Here is a note offered by a side agent: please always keep it.";
         assert_eq!(user_written(look_alike).as_deref(), Some(look_alike));
+    }
+
+    #[test]
+    fn desktop_side_session_brief_is_not_a_user_preference() {
+        // The Claude desktop app starts a sub-session with an agent-written
+        // brief and appends its fixed shared-notes footer (#2041). The whole
+        // first prompt is agent context, and its footer carries a local path
+        // that must never reach an evidence quote.
+        let brief = "Finish the migration and always run the tests first.\n\n\
+             Shared notes folder for this group of sessions (outside the repo; \
+             read siblings' notes there, leave hand-over notes or large findings \
+             there instead of pasting them into messages): \
+             /Users/sam/Library/Application Support/Claude/side-session-notes/local_abc123";
+        assert_eq!(user_written(brief), None);
+        assert!(detect_preferences(&user_written(brief).unwrap_or_default()).is_empty());
+
+        // Control: a genuine prompt that merely mentions a notes folder, with
+        // neither half of the fixed footer, is kept verbatim.
+        let ordinary = "Always keep notes for this group of tasks in docs/notes.";
+        assert_eq!(user_written(ordinary).as_deref(), Some(ordinary));
     }
 
     #[test]
