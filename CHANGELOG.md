@@ -48,6 +48,18 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 
 - Fixed the native installer link when `AI_MEMORY_LIB_DIR` is relative (#2052).
+- Corrected the 2.6.6 note that frontmatter reads exactly as before the
+  switch to `serde-saphyr`. A few YAML 1.1 shapes read otherwise, and a page
+  using one stopped indexing at that upgrade, with only a
+  `reconcile reindex failed` warning in the server log:
+  - a `#` glued to a closing quote or a block indicator
+    (`title: 'x'# note`, `>#x`) is refused; put a space before the `#`;
+  - U+2028 as a line break is refused; use a real line break;
+  - inside a value, U+0085 and U+2028 are now plain characters: a quoted
+    `x<U+0085>y` is no longer folded to `x y`, and the indentation after a
+    U+2028 in a block scalar is kept.
+
+  Tests now pin these readings. (#2040)
 ## [3.4.3] - 2026-11-06
 
 ### Changed
