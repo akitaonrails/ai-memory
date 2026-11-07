@@ -96,6 +96,9 @@ sh install.sh
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
 
+Relative `AI_MEMORY_BIN_DIR` and `AI_MEMORY_LIB_DIR` paths are resolved from
+the directory where you start `install.sh`.
+
 Native Windows has its own script, `install.ps1`, published next to
 `install.sh` with its own `install.ps1.sha256`. In PowerShell (no
 administrator rights needed):

@@ -154,6 +154,12 @@ main() {
     release_base="${release_base%/}"
     version="${AI_MEMORY_VERSION:-latest}"
 
+    # A relative link target is resolved from the link's directory.
+    case "$lib_dir" in
+        /*) ;;
+        *) lib_dir="$(pwd -P)/$lib_dir" ;;
+    esac
+
     case "$bin_dir$lib_dir" in
         *"
 "*) die "install paths must not contain a newline" ;;
