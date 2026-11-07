@@ -470,4 +470,83 @@ assert_contains "${HOOK_CASE_DIR}/native.log" "argv: hook --agent claude-code --
 assert_no_container "hook with an installed client (no update check)"
 printf 'wrapper hook native routing checks passed\n'
 
+# GHSA-f43g-26gw-x9pw: the checksum-verified native-client install must fail
+# closed. `native_host_binary` runs inside command-substitution / `|| { … }`
+# contexts where bash disables errexit for the whole body, so a failing
+# `sha256sum -c` used to fall through to tar/mv and install an unverified
+# binary. A mismatched sidecar must now stop the upgrade and leave nothing
+# installed; a matching one must still install.
+VERIFY_ROOT="${TMP_ROOT}/verify"
+mkdir -p "${VERIFY_ROOT}/fixture/payload/hooks"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"${VERIFY_ROOT}/fixture/payload/ai-memory"
+chmod 0755 "${VERIFY_ROOT}/fixture/payload/ai-memory"
+tar -czf "${VERIFY_ROOT}/fixture/archive.tar.gz" -C "${VERIFY_ROOT}/fixture/payload" ai-memory hooks
+GOOD_DIGEST="$(sha256sum "${VERIFY_ROOT}/fixture/archive.tar.gz" | awk '{ print $1 }')"
+
+run_verify_case() {
+  # $1 case name, $2 digest written into the .sha256 sidecar
+  local name="$1" digest="$2" case_dir stub
+  case_dir="${VERIFY_ROOT}/${name}"
+  stub="${case_dir}/bin"
+  mkdir -p "${case_dir}/home" "${case_dir}/cache" "${case_dir}/data" "${stub}"
+  cat >"${stub}/curl" <<CURL
+#!/usr/bin/env bash
+set -euo pipefail
+url=""; out=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+base="\${url##*/}"
+case "\${url}" in
+  *.sha256) printf '%s  %s\n' "${digest}" "\${base%.sha256}" >"\${out}" ;;
+  *) cp "${VERIFY_ROOT}/fixture/archive.tar.gz" "\${out}" ;;
+esac
+CURL
+  chmod 0755 "${stub}/curl"
+  (
+    cd "${case_dir}"
+    PATH="${stub}:${PATH}" \
+    HOME="${case_dir}/home" \
+    XDG_CACHE_HOME="${case_dir}/cache" \
+    XDG_DATA_HOME="${case_dir}/data" \
+    AI_MEMORY_DOCKER="${FAKE_DOCKER_NO_CONTAINER}" \
+    AI_MEMORY_SKIP_SELF_UPGRADE=1 \
+    AI_MEMORY_WRAPPER_TEST_LOG="${case_dir}/docker.log" \
+      "${ROOT}/bin/ai-memory" upgrade >"${case_dir}/output.log" 2>&1
+  )
+}
+
+# A docker stub whose `ps` reports no running container, so `upgrade` finishes
+# after the native-client refresh instead of recreating a container.
+FAKE_DOCKER_NO_CONTAINER="${VERIFY_ROOT}/docker-empty"
+cat >"${FAKE_DOCKER_NO_CONTAINER}" <<'DOCKER'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${AI_MEMORY_WRAPPER_TEST_LOG}"
+case "${1:-}" in
+  pull) exit 0 ;;
+  ps) : ;;
+  *) exit 0 ;;
+esac
+DOCKER
+chmod 0755 "${FAKE_DOCKER_NO_CONTAINER}"
+
+if run_verify_case mismatch "0000000000000000000000000000000000000000000000000000000000000000"; then
+  fail "upgrade with a mismatched native-client checksum returned success"
+fi
+assert_contains "${VERIFY_ROOT}/mismatch/output.log" "checksum mismatch"
+if [ -e "${VERIFY_ROOT}/mismatch/data/ai-memory/native-runner/ai-memory" ]; then
+  fail "a mismatched native-client archive was installed anyway"
+fi
+
+run_verify_case valid "${GOOD_DIGEST}" \
+  || fail "upgrade with a valid native-client checksum did not succeed"
+[ -x "${VERIFY_ROOT}/valid/data/ai-memory/native-runner/ai-memory" ] \
+  || fail "a verified native-client archive was not installed"
+printf 'wrapper native-client checksum verification checks passed\n'
+
 printf 'wrapper upgrade ownership checks passed\n'

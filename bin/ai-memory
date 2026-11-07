@@ -561,10 +561,28 @@ native_host_binary() {
     rm -rf "${tmp}"
     mkdir -p "${tmp}"
     echo "ai-memory: installing checksum-verified native host-launch client (${artifact})" >&2
-    curl -fsSL "${base}" -o "${tmp}/${artifact}.tar.gz"
-    curl -fsSL "${base}.sha256" -o "${tmp}/${artifact}.tar.gz.sha256"
+    # This function is called in command-substitution / `|| { … }` contexts
+    # where bash turns errexit off for the whole body, so a failing step here
+    # does NOT abort on its own. Every download and the checksum must be
+    # checked explicitly and clean up + `return 1` on failure; otherwise a
+    # mismatched archive would fall through to `tar`/`mv` and install an
+    # unverified binary (GHSA-f43g-26gw-x9pw).
+    curl -fsSL "${base}" -o "${tmp}/${artifact}.tar.gz" || {
+      echo "ai-memory: could not download the native host-launch client" >&2
+      rm -rf "${tmp}"
+      return 1
+    }
+    curl -fsSL "${base}.sha256" -o "${tmp}/${artifact}.tar.gz.sha256" || {
+      echo "ai-memory: could not download the native host-launch client checksum" >&2
+      rm -rf "${tmp}"
+      return 1
+    }
     if command -v sha256sum >/dev/null 2>&1; then
-      (cd "${tmp}" && sha256sum -c "${artifact}.tar.gz.sha256" >/dev/null)
+      (cd "${tmp}" && sha256sum -c "${artifact}.tar.gz.sha256" >/dev/null 2>&1) || {
+        echo "ai-memory: native host-launch client checksum mismatch" >&2
+        rm -rf "${tmp}"
+        return 1
+      }
     else
       remote_sum=$(awk 'NR == 1 { print $1 }' "${tmp}/${artifact}.tar.gz.sha256")
       local_sum=$(shasum -a 256 "${tmp}/${artifact}.tar.gz" | awk '{ print $1 }')

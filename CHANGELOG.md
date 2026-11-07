@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Security
+
+- `ai-memory upgrade` (and any managed launch that refreshes the native host
+  client) now fails closed when the downloaded release archive does not match
+  its published checksum, instead of installing the unverified binary. The
+  `sha256sum -c` verification ran in a shell context where bash disables
+  errexit, so a mismatch fell through to the install. (GHSA-f43g-26gw-x9pw)
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed
