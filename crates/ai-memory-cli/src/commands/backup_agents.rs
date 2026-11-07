@@ -878,7 +878,11 @@ fn collect_dir_assets(
         if file_type.is_dir() {
             let dir_name = entry.file_name();
             let dir_name_str = dir_name.to_string_lossy();
-            if dir_name_str.starts_with('.')
+            // A plugin's manifest directory is the one dot-directory a
+            // restored plugin or marketplace cannot load without.
+            if (dir_name_str.starts_with('.')
+                && dir_name_str != ".claude-plugin"
+                && dir_name_str != ".codex-plugin")
                 || dir_name_str == "cache"
                 || dir_name_str == "node_modules"
                 || dir_name_str == "target"
