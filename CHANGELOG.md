@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed XLSX imports that appended pronunciation hints to shared and inline
+  cell values. Imported cells now keep their base text.
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed

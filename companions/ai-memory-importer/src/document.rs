@@ -789,6 +789,9 @@ fn xlsx_shared_strings(xml: &str) -> Result<Vec<String>> {
     let mut strings = Vec::new();
     let mut current = None::<String>;
     let mut in_text = false;
+    // SpreadsheetML phonetic runs annotate the base text (ISO/IEC 29500-1
+    // §18.4.6). Keep reading their XML so the normal nesting checks still run.
+    let mut phonetic_depth = 0_usize;
     loop {
         match reader.read_event().context("parse XLSX shared strings")? {
             Event::Start(tag) if tag.local_name().as_ref() == "si" => {
@@ -797,20 +800,25 @@ fn xlsx_shared_strings(xml: &str) -> Result<Vec<String>> {
                 }
                 current = Some(String::new());
             }
+            Event::Start(tag) if tag.local_name().as_ref() == "rPh" => phonetic_depth += 1,
+            Event::End(tag) if tag.local_name().as_ref() == "rPh" => phonetic_depth -= 1,
             Event::Start(tag) if tag.local_name().as_ref() == "t" => in_text = true,
-            Event::Text(text) if in_text => {
+            Event::Text(text) if in_text && phonetic_depth == 0 => {
                 if let Some(current) = current.as_mut() {
                     push_bounded(current, &text.xml10_content())?;
                 }
             }
-            Event::CData(text) if in_text => {
+            Event::CData(text) if in_text && phonetic_depth == 0 => {
                 if let Some(current) = current.as_mut() {
                     push_bounded(current, &text.xml10_content())?;
                 }
             }
             Event::GeneralRef(reference) if in_text => {
                 if let Some(current) = current.as_mut() {
-                    push_bounded(current, &xml_reference(&reference)?)?;
+                    let decoded = xml_reference(&reference)?;
+                    if phonetic_depth == 0 {
+                        push_bounded(current, &decoded)?;
+                    }
                 }
             }
             Event::End(tag) if tag.local_name().as_ref() == "t" => in_text = false,
@@ -850,6 +858,8 @@ fn extract_xlsx_sheet_with_limit(
     let mut row_cells = None::<usize>;
     let mut cell = None::<(Option<String>, String)>;
     let mut capture_value = false;
+    // Inline strings use the same phonetic markup as shared strings.
+    let mut phonetic_depth = 0_usize;
     loop {
         match reader.read_event().context("parse XLSX worksheet")? {
             Event::Start(tag) if tag.local_name().as_ref() == "row" => {
@@ -898,24 +908,29 @@ fn extract_xlsx_sheet_with_limit(
                 )?;
                 *row_cells += 1;
             }
+            Event::Start(tag) if tag.local_name().as_ref() == "rPh" => phonetic_depth += 1,
+            Event::End(tag) if tag.local_name().as_ref() == "rPh" => phonetic_depth -= 1,
             Event::Start(tag)
                 if cell.is_some() && matches!(tag.local_name().as_ref(), "v" | "t") =>
             {
                 capture_value = true;
             }
-            Event::Text(text) if capture_value => {
+            Event::Text(text) if capture_value && phonetic_depth == 0 => {
                 if let Some((_, value)) = cell.as_mut() {
                     push_bounded(value, &text.xml10_content())?;
                 }
             }
-            Event::CData(text) if capture_value => {
+            Event::CData(text) if capture_value && phonetic_depth == 0 => {
                 if let Some((_, value)) = cell.as_mut() {
                     push_bounded(value, &text.xml10_content())?;
                 }
             }
             Event::GeneralRef(reference) if capture_value => {
                 if let Some((_, value)) = cell.as_mut() {
-                    push_bounded(value, &xml_reference(&reference)?)?;
+                    let decoded = xml_reference(&reference)?;
+                    if phonetic_depth == 0 {
+                        push_bounded(value, &decoded)?;
+                    }
                 }
             }
             Event::End(tag) if matches!(tag.local_name().as_ref(), "v" | "t") => {
@@ -1483,7 +1498,7 @@ mod tests {
             &[
                 (
                     "[Content_Types].xml",
-                    r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+                    r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>"#,
                 ),
                 (
                     "_rels/.rels",
@@ -1495,15 +1510,28 @@ mod tests {
                 ),
                 (
                     "xl/_rels/workbook.xml.rels",
-                    r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+                    r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#,
                 ),
                 (
                     "xl/worksheets/sheet1.xml",
-                    r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="XFD1048576"><v>42</v></c></row></sheetData></worksheet>"#,
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="s"><v>0</v></c>
+      <c r="B1" t="inlineStr"><is><r><t>大</t></r><r><t>阪</t></r><rPh sb="0" eb="2"><t>オオサカ</t></rPh></is></c>
+    </row>
+    <row r="1048576"><c r="A1048576" t="s"><v>1</v></c><c r="XFD1048576"><v>42</v></c></row>
+  </sheetData>
+</worksheet>"#,
                 ),
                 (
                     "xl/sharedStrings.xml",
-                    r#"<?xml version="1.0" encoding="UTF-8"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Item</t></si></sst>"#,
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <si><t>東京</t><rPh sb="0" eb="2"><t>トウキョウ</t></rPh></si>
+  <si><t>Item</t></si>
+</sst>"#,
                 ),
             ],
         );
@@ -1656,12 +1684,15 @@ mod tests {
     }
 
     #[test]
-    fn xlsx_extracts_sheet_names_and_cells() {
+    fn xlsx_extracts_sheet_names_and_cells_without_phonetic_hints() {
         let temp = TempDir::new().unwrap();
         let file = temp.path().join("totals.xlsx");
         write_xlsx(&file);
         let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
         assert!(plan.body.contains("## Sheet: Totals"), "{}", plan.body);
+        assert!(plan.body.contains("    東京\t大阪\n"), "{}", plan.body);
+        assert!(!plan.body.contains("トウキョウ"));
+        assert!(!plan.body.contains("オオサカ"));
         assert!(plan.body.contains("Item\t42"), "{}", plan.body);
     }
 
@@ -1680,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn xlsx_empty_shared_strings_keep_the_entry_limit_and_nesting_guard() {
+    fn xlsx_keeps_shared_string_limits_and_validates_phonetic_xml() {
         let entries = "<si/>".repeat(MAX_SHARED_STRINGS);
         let at_limit = format!("<sst>{entries}</sst>");
         assert_eq!(
@@ -1691,13 +1722,27 @@ mod tests {
         let error = xlsx_shared_strings(&over_limit).unwrap_err();
         assert!(error.to_string().contains("shared-string limit"), "{error}");
 
-        let error = xlsx_shared_strings("<sst><si><si/></si></sst>").unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("nested XLSX shared string entry"),
-            "{error}"
-        );
+        for xml in [
+            "<sst><si><si/></si></sst>",
+            r#"<sst><si><t>東京</t><rPh sb="0" eb="2"><si/></rPh></si></sst>"#,
+        ] {
+            let error = xlsx_shared_strings(xml).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("nested XLSX shared string entry"),
+                "{error}"
+            );
+        }
+
+        let shared =
+            r#"<sst><si><t>東京</t><rPh sb="0" eb="2"><t>&undeclared;</t></rPh></si></sst>"#;
+        let error = xlsx_shared_strings(shared).unwrap_err();
+        assert!(error.to_string().contains("unsupported entity"), "{error}");
+
+        let sheet = r#"<worksheet><sheetData><row><c t="inlineStr"><is><t>大阪</t><rPh sb="0" eb="2"><t>&undeclared;</t></rPh></is></c></row></sheetData></worksheet>"#;
+        let error = extract_xlsx_sheet(sheet, &[], &mut 0, &mut String::new()).unwrap_err();
+        assert!(error.to_string().contains("unsupported entity"), "{error}");
     }
 
     #[test]
