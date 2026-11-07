@@ -558,6 +558,15 @@ assert_eq "capture-only marker: find_marker still resolves nearest" \
 assert_eq "capture-only marker: find_settings_marker skips it for the outer" \
     "$TMP/scope/.ai-memory.toml" \
     "$(ai_memory_find_settings_marker "$TMP/scope/inner")"
+# `[messaging] inbox_notice_on_prompt` is a setting like the others: the
+# native walk (`declares_more_than_capture`) stops at such a marker, so the
+# script walk must too, or the two resolve different scopes for one cwd.
+mkdir -p "$TMP/inbox-scope/inner"
+printf 'workspace = "acme"\n' >"$TMP/inbox-scope/.ai-memory.toml"
+printf '[messaging]\ninbox_notice_on_prompt = true\n' >"$TMP/inbox-scope/inner/.ai-memory.toml"
+assert_eq "inbox-notice-only marker is a settings boundary" \
+    "$TMP/inbox-scope/inner/.ai-memory.toml" \
+    "$(ai_memory_find_settings_marker "$TMP/inbox-scope/inner")"
 assert_eq "capture-only marker: marker_qs forwards the OUTER scope" \
     "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"
