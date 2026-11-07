@@ -6931,6 +6931,29 @@ mod tests {
     }
 
     #[test]
+    fn the_next_run_hint_neutralizes_terminal_controls_in_folder_paths() {
+        let next = NextRun {
+            harness: Some("claude".into()),
+            ..NextRun::default()
+        };
+        let command = next_run_command(
+            &next,
+            None,
+            &[folder("/w/evil\u{1b}]0;x\u{7}\u{202e}dir", true)],
+        );
+        let hint = next_run_hint(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
+            &command,
+        );
+        assert!(!hint.contains('\u{1b}'), "{hint:?}");
+        assert!(!hint.contains('\u{7}'), "{hint:?}");
+        assert!(!hint.contains('\u{202e}'), "{hint:?}");
+        assert!(hint.contains("--jail-rw-map"), "{hint:?}");
+        assert!(hint.contains("evil"), "{hint:?}");
+    }
+
+    #[test]
     fn flag_folders_are_validated_and_deduplicated() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
