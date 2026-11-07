@@ -2741,9 +2741,13 @@ mod slow {
         .unwrap();
         let docker = bin_dir.join("docker");
         std::fs::write(&docker, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        // The fake download serves the wrapper only. The later native-client
+        // refresh is independent and has its own checksum tests.
+        let native = bin_dir.join("native-client");
+        std::fs::write(&native, "#!/usr/bin/env bash\nexit 0\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt as _;
-            for path in [&wrapper, &payload, &curl, &docker] {
+            for path in [&wrapper, &payload, &curl, &docker, &native] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
@@ -2758,7 +2762,9 @@ mod slow {
             .env("PATH", path)
             .env("HOME", tmp.path())
             .env("XDG_DATA_HOME", tmp.path().join("data"))
+            .env("XDG_CACHE_HOME", tmp.path().join("cache"))
             .env("AI_MEMORY_DOCKER", &docker)
+            .env("AI_MEMORY_NATIVE_BIN", &native)
             .env(
                 "AI_MEMORY_WRAPPER_URL",
                 "https://example.invalid/ai-memory-wrapper",
