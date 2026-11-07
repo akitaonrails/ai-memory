@@ -5099,6 +5099,12 @@ async fn prepare_previous_session_history(
     cwd: &Path,
     env: &EffectiveChildEnv,
 ) -> Result<Option<PreviousSessionHistory>> {
+    // The dossier the next harness reads must carry no more than the ledger
+    // upload of the same session would: the checkout's `[capture] ignore_paths`
+    // drops a tool call and its result, and the sanitizer redacts credentials
+    // (GHSA-h8wj-74hc-vjjp).
+    let capture = TranscriptCapture::for_checkout(&config.data_dir, cwd);
+    let sanitizer = Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from)?;
     let mut failures = Vec::new();
     for &harness in previous_harness_candidates(previous.agent) {
         let recorded = match super::project_registry::recorded_session_store(
@@ -5159,6 +5165,7 @@ async fn prepare_previous_session_history(
                 continue;
             }
         };
+        let transcript = sanitize_previous_session_history(transcript, &capture, &sanitizer);
         if transcript.events.is_empty() {
             return Ok(None);
         }
@@ -5197,6 +5204,35 @@ fn previous_harness_candidates(agent: AgentKind) -> &'static [ManagedHarness] {
         AgentKind::AntigravityCli => &[ManagedHarness::Antigravity],
         AgentKind::CopilotCli => &[ManagedHarness::Copilot],
         _ => &[],
+    }
+}
+
+/// Run the exported transcript through the same two filters the ledger upload
+/// applies before it becomes the dossier the next harness reads: the checkout's
+/// `[capture] ignore_paths` (which drops a tool call together with its result)
+/// and the `Sanitizer` (which redacts credentials). Without this the dossier
+/// would hand the next agent — usually another vendor's — content the operator
+/// kept out of ai-memory (GHSA-h8wj-74hc-vjjp).
+fn sanitize_previous_session_history(
+    transcript: ExportedTranscript,
+    capture: &TranscriptCapture,
+    sanitizer: &Sanitizer,
+) -> ExportedTranscript {
+    let ExportedTranscript {
+        native_session_id,
+        source_cursor,
+        events,
+        losses,
+    } = transcript;
+    let mut events = capture.filter_ledger_events(events);
+    for event in &mut events {
+        event.content = sanitizer.scrub(&event.content);
+    }
+    ExportedTranscript {
+        native_session_id,
+        source_cursor,
+        events,
+        losses,
     }
 }
 
@@ -13127,6 +13163,80 @@ mod tests {
             requests.lock().unwrap()[0].source_cursor.as_deref(),
             Some("cursor"),
             "the cursor still advances past the excluded events"
+        );
+    }
+
+    /// GHSA-h8wj-74hc-vjjp: the previous-session dossier the next harness reads
+    /// must carry no more than the ledger upload above would. The capture policy
+    /// drops an `ignore_paths` call with its result, and the sanitizer redacts a
+    /// credential in a kept result, before either reaches the rendered dossier.
+    #[test]
+    fn previous_session_dossier_carries_no_more_than_the_ledger() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let event = |kind, content: String, metadata: serde_json::Value| {
+            ai_memory_core::NewWorkstreamEvent {
+                event_id: format!("e-{}", content.len()),
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "sid-1".into(),
+                source_record_id: None,
+                kind,
+                role: None,
+                content,
+                occurred_at: None,
+                metadata,
+            }
+        };
+        let read = |path: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolCall,
+                format!(
+                    "Read: {}",
+                    serde_json::json!({"file_path": repo.path().join(path)})
+                ),
+                serde_json::json!({"tool": "Read", "tool_use_id": id}),
+            )
+        };
+        let output = |text: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolResult,
+                text.into(),
+                serde_json::json!({"tool_use_id": id}),
+            )
+        };
+        let transcript = ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                read("docs/adr/1.md", "adr"),
+                read("src/lib.rs", "pub"),
+                output("ADRSENTINEL private decision", "adr"),
+                // FAKE token shape, never a live value.
+                output("PUBLICCONTROL token ghp_FAKEfakeFAKEfakeFAKEfake012345678", "pub"),
+            ],
+            losses: Vec::new(),
+        };
+        let filtered = sanitize_previous_session_history(
+            transcript,
+            &TranscriptCapture::for_checkout(repo.path(), repo.path()),
+            &Sanitizer::builtin(),
+        );
+        let dossier = render_previous_session_history(ManagedHarness::Claude, &filtered);
+        assert!(dossier.contains("PUBLICCONTROL"), "public control: {dossier}");
+        assert!(dossier.contains("src/lib.rs"), "public call: {dossier}");
+        assert!(!dossier.contains("ADRSENTINEL"), "excluded output: {dossier}");
+        assert!(!dossier.contains("docs/adr"), "excluded call: {dossier}");
+        assert!(
+            !dossier.contains("ghp_FAKEfakeFAKEfakeFAKEfake012345678"),
+            "unsanitized credential: {dossier}"
+        );
+        assert!(
+            dossier.contains("[REDACTED:github_token]"),
+            "redaction marker: {dossier}"
         );
     }
 

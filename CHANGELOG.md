@@ -18,6 +18,11 @@ version in [`docs/changelog/`](docs/changelog/):
   its published checksum, instead of installing the unverified binary. The
   `sha256sum -c` verification ran in a shell context where bash disables
   errexit, so a mismatch fell through to the install. (GHSA-f43g-26gw-x9pw)
+- The previous-session history that `ai-memory run` hands the next harness on a
+  switch is now filtered through the checkout's `[capture] ignore_paths` and the
+  sanitizer, the same two filters every other path into memory uses. A file an
+  operator kept out of ai-memory, or a credential in a tool result, no longer
+  reaches the next agent through this dossier. (GHSA-h8wj-74hc-vjjp)
 
 ## [3.4.3] - 2026-11-06
 
