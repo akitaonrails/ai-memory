@@ -2153,7 +2153,7 @@ fn parse_kimi(
                             Some("assistant"),
                             &format!("{name}: {arguments}"),
                             occurred_at.clone(),
-                            json!({"tool": name}),
+                            with_tool_use_id(json!({"tool": name}), first_string(call, &["id"])),
                         );
                     }
                 }
@@ -2170,7 +2170,10 @@ fn parse_kimi(
                         Some("tool"),
                         &body,
                         occurred_at,
-                        json!({}),
+                        with_tool_use_id(
+                            json!({}),
+                            first_string(message, &["toolCallId", "tool_call_id"]),
+                        ),
                     );
                 }
                 _ => {}
@@ -10121,7 +10124,10 @@ mod tests {
         assert_eq!(export.events[1].content, "visible answer");
         assert_eq!(export.events[2].content, "bash: {\"cmd\":\"ls\"}");
         assert_eq!(export.events[2].metadata["tool"], "bash");
+        // The native id pairs the result with its call, as on the loop path.
+        assert_eq!(export.events[2].metadata["tool_use_id"], "call_1");
         assert_eq!(export.events[3].role.as_deref(), Some("tool"));
+        assert_eq!(export.events[3].metadata["tool_use_id"], "call_1");
         assert_eq!(export.events[4].content, "compact summary");
         assert_eq!(export.events[5].content, "loop visible answer");
         assert_eq!(export.events[6].content, "Read: {\"path\":\"README.md\"}");
