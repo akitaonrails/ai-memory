@@ -540,7 +540,10 @@ ai_memory_home_route() {
     _ai_hr_file="$1"; _ai_hr_cwd="$2"; _ai_hr_identity="$3"
     [ -f "$_ai_hr_file" ] || return 0
     [ "$(wc -c <"$_ai_hr_file")" -le 65536 ] || { printf 'invalid'; return 0; }
-    LC_ALL=C awk -v cwd="$_ai_hr_cwd" -v home="$_amhome" -v identity="$_ai_hr_identity" '
+    # Through the environment, not `-v`: awk reads escape sequences in a `-v`
+    # value, so a Windows cwd's backslashes never reached `cleanpath`.
+    _AI_HR_CWD="$_ai_hr_cwd" _AI_HR_HOME="$_amhome" _AI_HR_IDENTITY="$_ai_hr_identity" \
+        LC_ALL=C awk '
         function invalid() { bad = 1 }
         function cleanpath(value,    n, raw, out, i, root, home_relative, rel_depth, j) {
             gsub(/\\/, "/", value)
@@ -605,7 +608,10 @@ ai_memory_home_route() {
             }
             kind=""; selector=""; route_workspace=""; route_project=""; route_identity_style=""; route_aliases=""; delete field_seen
         }
-        BEGIN { count=0; bad=0; best_depth=0; tie=0 }
+        BEGIN {
+            count=0; bad=0; best_depth=0; tie=0
+            cwd=ENVIRON["_AI_HR_CWD"]; home=ENVIRON["_AI_HR_HOME"]; identity=ENVIRON["_AI_HR_IDENTITY"]
+        }
         {
             line=$0; sub(/\r$/, "", line)
             if (match(line, /^[[:space:]]*\[routes\.(identity|path)\."[^"\\]+"\][[:space:]]*$/)) {
