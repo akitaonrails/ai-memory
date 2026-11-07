@@ -67,7 +67,8 @@ pub async fn run(config: &Config, args: HandoffsArgs) -> Result<()> {
     if response.handoffs.is_empty() {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-handoffs-no-open-handoffs-for-workspace-project",
                 &[
                     ("value0", workspace.to_string()),

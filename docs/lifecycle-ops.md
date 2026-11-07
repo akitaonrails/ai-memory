@@ -158,6 +158,14 @@ other unexpected status) prints the server's own error before the refusal
 instead, since the operator asked what would happen and the server has a
 real answer.
 
+The preview asks the server the confirmed purge will use. In a checkout whose
+`.ai-memory.toml` selects a server profile (`server = "<name>"`, see
+[marker-file.md](marker-file.md)), both go to that profile's URL with its
+stored token, never to the install's server with the config bearer. A profile
+that does not resolve fails the command before anything is sent, the same way
+the confirmed purge fails, and `AI_MEMORY_SERVER_URL` still picks the server
+for one command.
+
 A handoff this session only *accepted* (did not author) keeps its row and
 its text either way, confirmed or previewed, and loses only its
 `accepted_by_session` pointer (`ON DELETE SET NULL`) once the session row is

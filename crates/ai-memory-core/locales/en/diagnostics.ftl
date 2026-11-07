@@ -281,6 +281,7 @@ diag-would-write = # Would write: { $value0 }{ "\u000A" }
 diag-would-write-grok-first-turn-handoff-rule = # Would write Grok first-turn handoff rule: { $value0 }{ "\u000A" }
 diag-the-server-did-not-confirm-project-id = the server did not confirm project-ID selection; upgrade the server before launching
 diag-the-server-returned-a-different-managed-project = the server returned a different managed project scope; refusing to launch
+diag-checkout-server-changed-before-resume = this checkout now selects a different server; run `ai-memory run` there to link it before resuming
 diag-listing-authorized-project-candidates-upgrade-the-server = listing authorized project candidates; upgrade the server if this endpoint is unavailable
 diag-no-writable-project-candidates-are-available-ask = no writable project candidates are available; ask the operator for an authorized project ID and use --project-id <id>
 diag-project-name-is-ambiguous-rerun-with-project = project name is ambiguous; rerun with --project-id <id>. Authorized choices: { $choices }

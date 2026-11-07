@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::cli::{AgentBackupScope, McpClient, RestoreAgentsArgs};
 use crate::commands::backup_agents::matches_agent_filter;
-use crate::commands::path_util::{claude_config_dir, home_dir};
+use crate::commands::path_util::{agent_config_home, claude_config_dir, home_dir};
 use crate::config::Config;
 
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
@@ -88,6 +88,7 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
     }
 
     let claude_override = claude_config_dir(std::env::var_os("CLAUDE_CONFIG_DIR"));
+    let copilot_override = agent_config_home(std::env::var_os("COPILOT_HOME"));
     let mut archive_paths = HashSet::with_capacity(manifest.entries.len());
     let mut target_paths = HashSet::with_capacity(manifest.entries.len());
     let mut planned = Vec::new();
@@ -151,7 +152,11 @@ pub fn run(_config: &Config, args: RestoreAgentsArgs) -> Result<()> {
             );
         }
 
-        let (base, target_path) = resolve_target(entry, &home, &cwd, claude_override.as_deref())?;
+        let overrides = TargetOverrides {
+            claude: claude_override.as_deref(),
+            copilot: copilot_override.as_deref(),
+        };
+        let (base, target_path) = resolve_target(entry, &home, &cwd, overrides)?;
         if !target_paths.insert(target_path.clone()) {
             bail!(
                 "{}",
@@ -362,11 +367,20 @@ fn stage_archive(src: &Path, staging: &Path) -> Result<(Vec<u8>, HashMap<String,
     ))
 }
 
+/// Agent homes moved by environment variables, read once per restore.
+#[derive(Clone, Copy)]
+struct TargetOverrides<'a> {
+    /// `CLAUDE_CONFIG_DIR`.
+    claude: Option<&'a Path>,
+    /// `COPILOT_HOME`.
+    copilot: Option<&'a Path>,
+}
+
 fn resolve_target(
     entry: &AgentBackupEntry,
     home: &Path,
     cwd: &Path,
-    claude_override: Option<&Path>,
+    overrides: TargetOverrides<'_>,
 ) -> Result<(PathBuf, PathBuf)> {
     if entry.scope == AgentAssetScope::Project {
         return Ok((cwd.to_path_buf(), cwd.join(&entry.target_relative)));
@@ -396,8 +410,14 @@ fn resolve_target(
         return Ok((base.clone(), base.join(relative)));
     }
     if entry.agent == AgentKind::ClaudeCode
-        && let Some(custom_dir) = claude_override
+        && let Some(custom_dir) = overrides.claude
         && let Some(relative) = entry.target_relative.strip_prefix(".claude/")
+    {
+        return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
+    }
+    if entry.agent == AgentKind::CopilotCli
+        && let Some(custom_dir) = overrides.copilot
+        && let Some(relative) = entry.target_relative.strip_prefix(".copilot/")
     {
         return Ok((custom_dir.to_path_buf(), custom_dir.join(relative)));
     }
@@ -724,6 +744,7 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".kimi/",
                 ".qwen/",
                 ".qoder/",
+                ".copilot/skills/",
             ];
             let allowed = rel_path == ".claude.json"
                 || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
@@ -754,6 +775,7 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".gemini/skills/",
                 ".devin/skills/",
                 ".grok/skills/",
+                ".github/skills/",
             ];
             let allowed = EXACT.contains(&rel_path)
                 || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
