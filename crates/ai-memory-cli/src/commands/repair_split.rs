@@ -50,7 +50,8 @@ pub async fn run(config: &Config, args: RepairSplitArgs) -> Result<()> {
     .await?;
     println!(
         "{}",
-        config.i18n.format(
+        crate::localization::format(
+            &config.i18n,
             "cli-repair-split-done",
             &[
                 ("workspace", workspace),
