@@ -47,6 +47,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The recreate script `ai-memory upgrade` writes for a standalone Docker
+  install now keeps the container's network mode. A server started with
+  `--network host` used to come back on the default bridge, where the host
+  could not reach it and it could not reach a local LLM (#2102).
 - Fixed the native installer link when `AI_MEMORY_LIB_DIR` is relative (#2052).
 - Corrected the 2.6.6 note that frontmatter reads exactly as before the
   switch to `serde-saphyr`. A few YAML 1.1 shapes read otherwise, and a page
