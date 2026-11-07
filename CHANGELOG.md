@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Fixed `ai-memory-wikisync sync --propagate-deletes` deleting a newer server
   page after a repository deletion when only unexported metadata had changed.
-  A newer version now requires the usual conflict resolution.
+  A newer version now requires the usual conflict resolution (#2055).
 
 ## [3.4.3] - 2026-11-06
 
