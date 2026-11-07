@@ -395,6 +395,7 @@ diag-archive-entry-is-not-a-regular-file = archive entry { $value0 } is not a re
 diag-archive-contains-a-non-utf-8-path = archive contains a non-UTF-8 path
 diag-archive-entry-exceeds-the-byte-limit = archive entry { $value0 } exceeds the { $value1 } byte limit
 diag-archive-expands-beyond-the-byte-limit = archive expands beyond the { $max_archive_bytes } byte limit
+diag-archive-has-more-bytes-after-the-tar-end = archive has more than { $max_tar_padding_bytes } bytes after the tar end marker
 diag-archive-contains-more-than-one-manifest-json = archive contains more than one manifest.json
 diag-archive-contains-duplicate-asset-path = archive contains duplicate asset path { $value0 }
 diag-staging-archive-entry = staging archive entry { $value0 }

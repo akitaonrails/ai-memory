@@ -390,6 +390,7 @@ diag-archive-entry-is-not-a-regular-file = a entrada { $value0 } do arquivo não
 diag-archive-contains-a-non-utf-8-path = o arquivo contém um caminho que não está em UTF-8
 diag-archive-entry-exceeds-the-byte-limit = a entrada { $value0 } do arquivo excede o limite de { $value1 } bytes
 diag-archive-expands-beyond-the-byte-limit = o arquivo expande além do limite de { $max_archive_bytes } bytes
+diag-archive-has-more-bytes-after-the-tar-end = o arquivo contém mais de { $max_tar_padding_bytes } bytes após o marcador de fim do tar
 diag-archive-contains-more-than-one-manifest-json = o arquivo contém mais de um manifest.json
 diag-archive-contains-duplicate-asset-path = o arquivo contém o caminho de item duplicado { $value0 }
 diag-staging-archive-entry = preparando a entrada { $value0 } do arquivo

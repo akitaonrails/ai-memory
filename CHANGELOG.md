@@ -45,6 +45,11 @@ version in [`docs/changelog/`](docs/changelog/):
   `auth enable`'s manual-wiring fallback) redacts any `token`/`password`/`secret`
   assignment or URL userinfo it echoes back. (GHSA-6pmr-q79m-87vp)
 
+### Fixed
+
+- Fixed `restore-agents` accepting backups with missing or invalid gzip
+  trailers. It verifies the gzip stream before restoring any assets.
+
 ## [3.4.3] - 2026-11-06
 
 ### Changed
