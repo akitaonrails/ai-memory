@@ -226,7 +226,8 @@ fn print_human_report(
     };
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-bootstrap-kind-complete-for-workspace-project",
             &[
                 ("value0", kind.to_string()),
