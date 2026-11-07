@@ -692,7 +692,9 @@ fn render_prompts(prompts: &[RecapItem], room: usize) -> String {
         // when that room is worth a clipped prompt; everything older is
         // counted as omitted.
         let left = room.saturating_sub(used);
-        if kept.is_empty() || left >= MIN_CLIPPED_PROMPT {
+        // Under the marker's length `clip` keeps none of the prompt, and a
+        // bare newline would hide it from the omitted count below.
+        if (kept.is_empty() && left > chars(TRUNCATED) + 1) || left >= MIN_CLIPPED_PROMPT {
             let mut clipped = clip(line, left.saturating_sub(1));
             clipped.push('\n');
             kept.push(clipped);
@@ -1007,6 +1009,20 @@ mod tests {
         assert!(recap.contains("HEAD "), "{recap}");
         assert!(recap.contains("[truncated]"), "{recap}");
         assert!(recap.chars().count() <= RECAP_BUDGET_DEFAULT);
+    }
+
+    /// Room too small for any of a lone prompt's text: the prompt is counted
+    /// as omitted, not kept as a bare newline that the count then misses.
+    #[test]
+    fn a_prompt_with_no_room_for_its_text_is_counted_as_omitted() {
+        let prompts = vec![RecapItem {
+            at: "2026-10-12T01:00:57Z".into(),
+            text: "x".repeat(200),
+        }];
+        assert_eq!(
+            render_prompts(&prompts, OMITTED_LINE_RESERVE + 5),
+            "- _1 earlier prompts omitted to fit; see the full record below._\n"
+        );
     }
 
     #[test]
