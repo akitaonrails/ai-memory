@@ -245,6 +245,10 @@ ai-memory setup
 missing or mismatched checksum and any archive entry that is absolute or holds
 `..`, unpacks the release to `%LOCALAPPDATA%\Programs\ai-memory` and adds that
 directory to your user `PATH` (set `AI_MEMORY_NO_MODIFY_PATH=1` to skip that).
+The destination must not exist, even as an empty directory or a link. Use
+`ai-memory upgrade` for an existing installation. Failed copy/publication
+attempts leave the destination alone and report their staging directory for
+inspection; see the [native installer details](install.md#one-step-native-install-installsh--ai-memory-setup).
 `ai-memory setup` then initialises the data dir (`%LOCALAPPDATA%\ai-memory`),
 registers the server to start at logon (see
 [Scenario E](#scenario-e-keep-the-server-running-native-windows-service)),

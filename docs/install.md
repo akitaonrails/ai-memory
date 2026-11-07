@@ -110,8 +110,14 @@ unpacking when the checksum file is missing, names another asset, or does not
 match, and refuses an archive entry that is absolute or holds `..`. The
 release goes to `%LOCALAPPDATA%\Programs\ai-memory` (`AI_MEMORY_INSTALL_DIR`
 overrides it), which is added to your user `PATH` unless
-`AI_MEMORY_NO_MODIFY_PATH=1`. An existing install there is left alone; update it
-with `ai-memory upgrade`. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
+`AI_MEMORY_NO_MODIFY_PATH=1`. The destination must not exist: even an empty
+directory, an unrelated file, or a directory link is refused before download.
+Choose a new dedicated directory; update an existing installation with
+`ai-memory upgrade`. A validated release is copied to a new sibling staging
+directory and published only if the destination is still absent. On a copy or
+publication failure, the destination is never deleted; the error identifies
+the leftover staging directory for inspection and later cleanup. It is not a
+completed installation. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
 work as for `install.sh`. On Windows on Arm it installs the x86_64 build, which
 Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
 failure under `iex` leaves your PowerShell window open. Details are in
