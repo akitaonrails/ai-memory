@@ -60,6 +60,84 @@ version in [`docs/changelog/`](docs/changelog/):
     U+2028 in a block scalar is kept.
 
   Tests now pin these readings. (#2040)
+- Fixed XLSX imports that appended pronunciation hints to shared and inline
+  cell values. Imported cells now keep their base text (#2048).
+- The legacy JSON recent-pages endpoint now orders and limits results in
+  SQLite using the project's existing recency index. Requests for a short
+  list no longer load and sort the whole project (#2051).
+- `ai-memory backup-agents` now also collects GitHub Copilot CLI skills, from
+  `$COPILOT_HOME/skills` (default `~/.copilot/skills`) and the repository's
+  `.github/skills`, the roots `install-skills --agent copilot-cli` writes, so
+  `restore-agents` puts them back in the same places and no longer loses them.
+  It follows `COPILOT_HOME` on the restoring machine and accepts no other
+  Copilot or `.github` destination (#2037).
+- A Claude Code subagent's tool event no longer reads the main conversation's
+  token usage. It read the main session's transcript, took the response that
+  started the subagent and moved the transcript cursor past it. With
+  `drop_subagent_captures = true` the router then dropped the event, so that
+  response never reached the token-usage ledger. The main conversation's
+  next event now reports it (#2034).
+- A Claude Code session's token usage now includes its subagents. Claude
+  Code writes each subagent's turns to its own transcript,
+  `<session>/subagents/agent-<id>.jsonl`, and the native hook read only the
+  session's transcript, so the Token usage ledger and the session totals
+  missed every subagent response. The hook now also reads those transcripts,
+  with a cursor for each, on the main conversation's events and within the
+  256 responses the server takes from one event. The session-end total and
+  the close of an abandoned session add them too, and the session keeps the
+  main conversation's model (#2031).
+- Generated TypeScript hooks now leave native OIDC spool entries queued for
+  `ai-memory hook-drain` to deliver with the right credentials. Their drain
+  previously posted those entries without a bearer and removed them after
+  a 401 from the gateway (#2050).
+- Honored Kiro's explicit `--v2` selector when a managed workstream last used
+  v3, so ai-memory no longer adds a conflicting `--v3` flag (#2049).
+- `purge-project` and `purge-session` without `--confirm` now ask for their
+  dry-run preview on the server the confirmed purge will use. In a checkout
+  whose `.ai-memory.toml` selects a server profile, the preview went to the
+  install's own server with the config bearer, so it could show another
+  server's counts, or none, for a purge that `--confirm` then ran on the
+  profile's server. A profile that does not resolve now fails the preview
+  closed with the hook's reason, as it already failed the confirmed purge
+  (#2056).
+- Fixed managed launches using the ambient directory's server instead of the
+  selected checkout's profile for workstreams, local state and transcripts,
+  including jail preflight and project-split repair. `resume` and `continue`
+  refuse a saved link whose checkout now selects another server (#2029).
+- Fixed ignored hook session-end events binding an agent in the mismatch
+  cache when the session does not exist. A later valid start can establish
+  the session under its real agent; persisted mismatches still fail closed
+  (#2029).
+- The workspace and project names a repository's `.ai-memory.toml` declares
+  no longer reach the terminal with their control characters. The scope note
+  every marker-scoped command prints, the workspace-only note, and 34 more CLI
+  lines that quote a workspace or project name (from the marker, a flag or the
+  server) printed them as written, so a cloned repository could retitle the
+  terminal or reorder a line with an OSC sequence or a bidi control. They now
+  go through the same neutralizing helper as the lines around `ai-memory run`,
+  and so do the folder paths in the "Next time" line a jailed run prints when
+  it quits (#2058).
+- DSH hooks no longer fail to fire on Windows. `install-hooks` and
+  `setup --agent dsh` wrote the bridge's `configPath` with a `\\?\` verbatim
+  prefix, which the Node plugin's `fs.readFileSync` resolves as a relative
+  path and fails to load, so no hooks registered. The generated `configPath`
+  is now a plain drive path (#2032).
+- Fixed a race in the TypeScript SDK where a tool call waiting on an
+  `initialize` response could re-adopt a session that a concurrent
+  `capabilities({ refresh: true })` had already superseded, routing later
+  calls to the retired session (HTTP 404). A superseded handshake no longer
+  overwrites the live session or sends its handshake notification (#2047).
+- Profile harvest no longer promotes a Claude desktop app sub-session's
+  agent-written brief as one of the user's habits. Its fixed shared-notes
+  footer, which ends in a `side-session-notes/` path, now marks the whole
+  first prompt as agent-written, so neither the brief nor its local
+  filesystem path reaches the profile or an evidence quote (#2041).
+- Grok backfill no longer drops a later byte-identical transcript record. Two
+  identical JSONL lines hashed to one record id, so the second reached ingest
+  under the first's key and was deduplicated away. Repeated records now carry
+  a deterministic occurrence suffix that agrees between a full backfill and an
+  incremental cursor replay, while every unique record keeps its
+  rewrite-stable id (#2053).
 ## [3.4.3] - 2026-11-06
 
 ### Changed
