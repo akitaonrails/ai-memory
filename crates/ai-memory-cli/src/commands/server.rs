@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use super::render_shared::mask_url_userinfo;
 use super::show::terminal_text;
 use crate::cli::{ServerAddArgs, ServerArgs, ServerCommand, ServerListArgs, ServerRemoveArgs};
 use crate::config::Config;
@@ -174,7 +175,9 @@ fn list(
             .map(|(name, profile)| {
                 serde_json::json!({
                     "name": name.as_str(),
-                    "url": profile.url,
+                    // A profile URL may carry `user:password@` userinfo; never
+                    // print the credential (GHSA-6pmr-q79m-87vp item 4).
+                    "url": mask_url_userinfo(&profile.url),
                     "roots": profile.roots,
                     "token": token_state(data_dir, name),
                 })
@@ -199,7 +202,7 @@ fn list(
             i18n.diagnostic(&format!(
                 "{}\n  url:   {}\n  roots: {}\n  token: {}",
                 terminal_text(name.as_str()),
-                terminal_text(&profile.url),
+                terminal_text(&mask_url_userinfo(&profile.url)),
                 terminal_text(&roots),
                 terminal_text(token_state(data_dir, name))
             ))
@@ -315,6 +318,52 @@ mod tests {
             assert!(listed.contains("stored"), "{listed}");
             assert!(listed.contains("missing"), "{listed}");
         }
+    }
+
+    /// GHSA-6pmr item 4: a profile URL may carry `user:password@` userinfo; it
+    /// is stored but never printed — not in the listing of a valid URL, and not
+    /// echoed back in a validation error.
+    #[test]
+    fn url_userinfo_is_never_printed_in_a_listing_or_a_validation_error() {
+        let dd = tempfile::tempdir().unwrap();
+        let root = dd.path().join("b").to_string_lossy().into_owned();
+        add_ok(
+            dd.path(),
+            add_args(
+                "team-b",
+                "https://alice:s3cr3tpassword@b.example",
+                &[&root],
+                None,
+            ),
+            None,
+        );
+        for json in [false, true] {
+            let listed = output(|out| {
+                list(
+                    &ai_memory_core::i18n::Localizer::default(),
+                    dd.path(),
+                    &ServerListArgs { json },
+                    out,
+                )
+            });
+            assert!(!listed.contains("s3cr3tpassword"), "json={json}: {listed}");
+            assert!(
+                listed.contains("[REDACTED]@b.example"),
+                "json={json}: {listed}"
+            );
+        }
+        // A rejected URL (wrong scheme) does not echo the userinfo back.
+        let mut out = Vec::new();
+        let err = add(
+            &ai_memory_core::i18n::Localizer::default(),
+            dd.path(),
+            add_args("bad", "ftp://alice:s3cr3tpassword@host", &[], None),
+            None,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("s3cr3tpassword"), "{err}");
+        assert!(err.to_string().contains("[REDACTED]@host"), "{err}");
     }
 
     #[test]

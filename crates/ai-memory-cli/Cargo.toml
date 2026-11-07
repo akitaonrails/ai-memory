@@ -38,6 +38,7 @@ ai-memory-store.workspace = true
 ai-memory-web.workspace = true
 ai-memory-workstream.workspace = true
 ai-memory-wiki.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
 sha2.workspace = true
@@ -108,7 +109,6 @@ uuid.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
-regex.workspace = true
 ai-memory-test-support.workspace = true
 ruzstd.workspace = true
 tempfile.workspace = true

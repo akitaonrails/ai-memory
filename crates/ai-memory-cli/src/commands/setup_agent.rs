@@ -43,7 +43,7 @@ use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_CLI_V2_EVENTS,
     KIRO_CLI_V3_EVENTS, build_claude_code_payload, build_devin_payload, build_dsh_hooks_payload,
-    build_grok_payload, build_pool_settings_yaml, hook_script_for_current_platform,
+    build_grok_payload, build_pool_settings_yaml, hook_script_for_current_platform, mask_secret,
 };
 use crate::commands::{install_hooks, install_mcp};
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -82,6 +82,16 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         auth_token: args
             .auth_token
             .or_else(|| config.auth.renderable_bearer_token().map(str::to_owned)),
+        ..args
+    };
+    // setup-agent only ever PRINTS the token into a snippet for the operator to
+    // merge into their agent config; it never writes it to a protected file. So
+    // mask the inline bearer in every snippet it emits, so the live value is not
+    // left in the terminal scrollback, a CI log or an agent transcript
+    // (GHSA-6pmr-q79m-87vp item 1). The notes that key off "a token was given"
+    // still fire — the masked value is still `Some`.
+    let args = SetupAgentArgs {
+        auth_token: args.auth_token.as_deref().map(mask_secret),
         ..args
     };
     if matches!(

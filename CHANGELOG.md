@@ -33,6 +33,17 @@ version in [`docs/changelog/`](docs/changelog/):
   same fix lands in the `ai-memory-client` capture scrubber. Text already stored
   is not rewritten, so a credential that was actually captured should be rotated
   and the affected observations purged. (GHSA-6pmr-q79m-87vp)
+- The CLI no longer echoes a live bearer token or a URL's embedded credential
+  back to the terminal. `install-mcp`, `install-hooks` and `setup-agent` masked
+  nothing when they printed a ready-to-paste config snippet (no `--apply`), so
+  an inline `--auth-token` was shown verbatim; the Hermes and connection-pool
+  blocks printed the token even on `--apply`. The token is now masked to a
+  four-character prefix plus `[REDACTED]` on every printed path, while `--apply`
+  still writes the real key to the config file. A server-profile URL that
+  carries `user:pass@` is masked to `[REDACTED]@host` in `server list` and in
+  the validation error, and a config-parse failure report (`failure_report`,
+  `auth enable`'s manual-wiring fallback) redacts any `token`/`password`/`secret`
+  assignment or URL userinfo it echoes back. (GHSA-6pmr-q79m-87vp)
 
 ## [3.4.3] - 2026-11-06
 

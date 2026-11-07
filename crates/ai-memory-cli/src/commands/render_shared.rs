@@ -348,6 +348,100 @@ pub(crate) fn bearer_header_value(token: Option<&str>) -> Option<String> {
     token.map(|t| format!("Bearer {t}"))
 }
 
+/// The marker a masked secret shows in place of its value.
+pub(crate) const SECRET_MASK: &str = "[REDACTED]";
+
+/// Mask a secret for display: a short recognizable prefix of a long,
+/// high-entropy value, then [`SECRET_MASK`], so a credential printed in a
+/// preview, a fallback snippet, a parse error or a profile listing cannot be
+/// read back out of the terminal scrollback, a CI log or an agent transcript.
+///
+/// The person running the command already holds the value; the preview keeps
+/// its shape (it stays valid JSON/TOML/YAML) but no longer carries the live
+/// token. A short value shows nothing but the marker — there is no safe prefix
+/// of it to reveal.
+#[must_use]
+pub(crate) fn mask_secret(secret: &str) -> String {
+    // 12 is the minimum credential length ai-memory mints or accepts; below it
+    // a 4-character prefix is too much of the whole to reveal.
+    if secret.chars().count() < 12 {
+        SECRET_MASK.to_string()
+    } else {
+        let prefix: String = secret.chars().take(4).collect();
+        format!("{prefix}...{SECRET_MASK}")
+    }
+}
+
+/// Replace a URL's `user:password@` userinfo with [`SECRET_MASK`], so a
+/// credential embedded in a server-profile URL is not printed in a listing or
+/// echoed back in a validation error (GHSA-6pmr-q79m-87vp item 4). Works
+/// lexically — the userinfo is the span between `://` and the `@` that precedes
+/// the host — so it also strips the userinfo from a string that does not parse
+/// as a URL (the raw value an "is not a URL" error quotes). A URL with no
+/// userinfo is returned unchanged.
+#[must_use]
+pub(crate) fn mask_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let authority_start = scheme_end + "://".len();
+    let rest = &url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // Only the last `@` separates userinfo from host; a password may contain
+    // an escaped `@`, but the host never does.
+    match authority.rfind('@') {
+        Some(at) => format!(
+            "{}{SECRET_MASK}@{}",
+            &url[..authority_start],
+            &rest[at + 1..]
+        ),
+        None => url.to_owned(),
+    }
+}
+
+/// Redact credential values a configuration *parse error* echoes back from the
+/// offending source line (GHSA-6pmr-q79m-87vp item 3). A TOML syntax error on a
+/// line that holds `bearer_token = "…"` repeats that whole line, so the secret
+/// lands on the terminal; this keeps the key, the assignment and the error's
+/// shape and masks only the value. Also masks `user:password@` userinfo in any
+/// URL the text echoes (a bad `servers.toml` line, a profile URL).
+///
+/// Deliberately narrow — it only rewrites a known credential key's assignment
+/// or a URL's userinfo, never ordinary error prose — so it is safe to run over
+/// every failure report. Values below the assignment key stay; only the value
+/// to end of line is masked, which matches how a parser quotes the line.
+#[must_use]
+pub(crate) fn redact_config_echo(text: &str) -> String {
+    use std::sync::OnceLock;
+    static SECRET_ASSIGNMENT: OnceLock<regex::Regex> = OnceLock::new();
+    static URL_USERINFO: OnceLock<regex::Regex> = OnceLock::new();
+    let assignment = SECRET_ASSIGNMENT.get_or_init(|| {
+        // A credential key as a whole word (`\b` both sides, so `token_count`
+        // or `secrets_dir` is untouched), then a TOML `=` assignment, or a
+        // `:` assignment whose value opens with a quote (YAML) — the quote is
+        // consumed into `pre` (the `regex` crate has no look-ahead), which
+        // keeps ordinary error prose such as `invalid token: expired` out. The
+        // value runs to end of line, matching how a parser quotes the line.
+        regex::Regex::new(
+            r#"(?im)(?P<pre>\b(?:bearer_token|auth_token|access_token|api_key|apikey|password|passwd|secret|token)\b[ \t]*(?:=[ \t]*|:[ \t]*["']))(?P<val>\S.*)$"#,
+        )
+        .expect("config-echo secret-assignment pattern compiles")
+    });
+    let userinfo = URL_USERINFO.get_or_init(|| {
+        regex::Regex::new(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<userinfo>[^/@\s]+)@")
+            .expect("config-echo url-userinfo pattern compiles")
+    });
+    let masked = assignment.replace_all(text, |caps: &regex::Captures<'_>| {
+        format!("{}{SECRET_MASK}", &caps["pre"])
+    });
+    userinfo
+        .replace_all(&masked, |caps: &regex::Captures<'_>| {
+            format!("{}{SECRET_MASK}@", &caps["scheme"])
+        })
+        .into_owned()
+}
+
 /// Emit a TypeScript string literal containing `s`. Escapes
 /// backslashes, double quotes, and common control characters. This is
 /// sufficient for URL, auth-token, and path strings embedded into
@@ -5900,5 +5994,61 @@ $payload = [Console]::In.ReadToEnd()
             cmd.contains("AI_MEMORY_AUTH_TOKEN=tok123"),
             "must inline token: {cmd}"
         );
+    }
+
+    // GHSA-6pmr-q79m-87vp: the display-masking helpers.
+
+    #[test]
+    fn mask_secret_shows_a_short_prefix_of_a_long_value_and_nothing_of_a_short_one() {
+        let token = "aim_SYNTHETICvalueAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let masked = mask_secret(token);
+        assert_eq!(masked, "aim_...[REDACTED]");
+        assert!(!masked.contains("SYNTHETIC"), "{masked}");
+        // Too short for a safe prefix: nothing of it is shown.
+        assert_eq!(mask_secret("short"), "[REDACTED]");
+    }
+
+    #[test]
+    fn mask_url_userinfo_strips_only_the_credential() {
+        assert_eq!(
+            mask_url_userinfo("http://alice:s3cr3tpass@host:49374/mcp"),
+            "http://[REDACTED]@host:49374/mcp"
+        );
+        // A bare user (token-as-username) is masked too.
+        assert_eq!(
+            mask_url_userinfo("https://tok_SYNTHETIC012345@host/"),
+            "https://[REDACTED]@host/"
+        );
+        // No userinfo: unchanged.
+        assert_eq!(
+            mask_url_userinfo("https://host:49374/mcp"),
+            "https://host:49374/mcp"
+        );
+        // A later `@` in the path never trips it.
+        assert_eq!(
+            mask_url_userinfo("https://host/path@tail"),
+            "https://host/path@tail"
+        );
+    }
+
+    #[test]
+    fn redact_config_echo_masks_a_toml_secret_line_and_a_url_but_not_prose() {
+        // A TOML parser echoes the offending line; the value is masked, the key
+        // and the error's shape kept.
+        let echo = "TOML parse error at line 2\n  |\n2 | bearer_token = \"aim_SYNTHETICsecretvalue\" trailing\n  |";
+        let out = redact_config_echo(echo);
+        assert!(!out.contains("aim_SYNTHETICsecretvalue"), "{out}");
+        assert!(out.contains("bearer_token = [REDACTED]"), "{out}");
+        assert!(out.contains("line 2") && out.contains("2 |"), "{out}");
+        // A `token = "…"` servers.toml line and a `user:pass@` URL are covered.
+        assert!(!redact_config_echo("token = \"leak-secret-value\"").contains("leak-secret-value"));
+        assert_eq!(
+            redact_config_echo("url = \"https://u:p4ssword-long@host\""),
+            "url = \"https://[REDACTED]@host\""
+        );
+        // Ordinary prose that merely mentions a word is left intact (`:` with no
+        // quoted value), so a real error stays readable.
+        let prose = "the token: expired before the request completed";
+        assert_eq!(redact_config_echo(prose), prose);
     }
 }

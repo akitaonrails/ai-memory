@@ -96,6 +96,11 @@ pub fn failure_report(error: &anyhow::Error) -> String {
     let report = error
         .downcast_ref::<RenderedFailure>()
         .map_or_else(|| format!("Error: {error:?}"), ToString::to_string);
+    // A configuration parse error echoes the offending source line, which can
+    // hold `bearer_token = "…"` or a `user:password@` URL (GHSA-6pmr-q79m-87vp
+    // item 3). This is the one place every fatal failure leaves the process, so
+    // redact the credential out of any echoed assignment or URL here.
+    let report = crate::commands::render_shared::redact_config_echo(&report);
     crate::commands::show::terminal_body(&report)
 }
 
@@ -239,6 +244,27 @@ fn parse_error(error: &clap::Error, i18n: &Localizer) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// GHSA-6pmr item 3: a configuration parse error echoes the offending
+    /// source line, which can hold the bearer. `failure_report` is the single
+    /// place every fatal error leaves the process, so it must redact the
+    /// credential out of that echo. Fails if the redaction is removed.
+    #[test]
+    fn failure_report_redacts_a_credential_echoed_by_a_config_parse_error() {
+        let echoed = "TOML parse error at line 2, column 16\n  |\n2 | bearer_token = \"aim_SYNTHETICsecretvalue\" trailing\n  |                ^";
+        let error = anyhow::anyhow!("{echoed}").context("loading config.toml");
+        let report = failure_report(&error);
+        assert!(
+            !report.contains("aim_SYNTHETICsecretvalue"),
+            "leaked: {report}"
+        );
+        assert!(report.contains("bearer_token = [REDACTED]"), "{report}");
+        // The error's shape is kept.
+        assert!(
+            report.contains("line 2") && report.contains("2 |"),
+            "{report}"
+        );
+    }
 
     #[test]
     fn help_catalogs_track_the_command_tree() {
