@@ -97,7 +97,8 @@ error, a warning, a workstream, project or profile name) goes through
 way and then neutralizes terminal controls; hook warnings get the same from
 `process_diagnostic`, and the catalog lines of `run` and the commands that
 recover, resume or report its workstreams use `localization::format`, as does
-any other catalog line that quotes an error or a reason.
+any other catalog line that quotes an error, a reason, or a workspace or
+project name (a marker the repository shipped or the server supplies those).
 Web templates use `label`, the same lookup, for fixed text that Rust passes to them.
 Hook commands run before configuration loads, so they follow only
 `AI_MEMORY_LANGUAGE`. Commented configuration snippets printed for pasting stay

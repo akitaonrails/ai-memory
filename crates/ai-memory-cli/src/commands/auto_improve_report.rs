@@ -101,7 +101,8 @@ fn print_human_report(
 ) {
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-auto-improve-report-auto-improve-telemetry-for-project",
             &[("value0", project.to_string())]
         )

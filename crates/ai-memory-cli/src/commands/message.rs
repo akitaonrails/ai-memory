@@ -153,7 +153,8 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
 
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-message-sent-message-from-from-workspace-from-project-to",
             &[
                 ("value0", super::show::terminal_text(&resp.message_id)),
@@ -194,7 +195,8 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
     if response.messages.is_empty() {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-message-no-pending-mailbox-messages-for-workspace-project",
                 &[
                     ("value0", mailbox.to_string()),
@@ -209,7 +211,8 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
     let now_ms = jiff::Timestamp::now().as_millisecond();
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-message-pending-mailbox-messages-for-workspace-project-oldest-first",
             &[
                 ("value0", mailbox.to_string()),
@@ -290,7 +293,8 @@ async fn pop(config: &Config, args: MessagePopArgs) -> Result<()> {
     let Some(message) = resp.message else {
         println!(
             "{}",
-            i18n.format(
+            crate::localization::format(
+                i18n,
                 "cli-message-no-pending-messages-in-workspace-project-s-inbox",
                 &[
                     ("value0", workspace.to_string()),
@@ -341,7 +345,8 @@ fn render_popped(
     let _ = writeln!(
         out,
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-message-popped-message-for-workspace-project",
             &[
                 (

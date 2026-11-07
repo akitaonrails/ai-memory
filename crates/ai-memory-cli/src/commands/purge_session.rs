@@ -143,7 +143,17 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
             println!("{line}");
         }
         bail!(
-            "{}", i18n.format("cli-purge-session-purge-session-is-destructive-and-irreversible-re-run-with-confirm-to-proceed", &[("value0", workspace.to_string()), ("value1", project.to_string()), ("value2", session_id.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-purge-session-purge-session-is-destructive-and-irreversible-re-run-with-confirm-to-proceed",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string()),
+                    ("value2", session_id.to_string())
+                ]
+            )
+        );
     }
 
     let endpoint = ServerEndpoint::for_checkout(config).await?;

@@ -190,7 +190,17 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
 
     if items.is_empty() {
         println!(
-            "{}", i18n.format("cli-repair-backfill-timestamps-ai-memory-repair-backfill-timestamps-for-workspace-project-no-local-transcri", &[("value0", workspace.to_string()), ("value1", project.to_string()), ("value2", format!("{}", uncaptured))]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-repair-backfill-timestamps-ai-memory-repair-backfill-timestamps-for-workspace-project-no-local-transcri",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string()),
+                    ("value2", format!("{}", uncaptured))
+                ]
+            )
+        );
         print_scan_limit_note(i18n, &limit_hit);
         return Ok(());
     }
@@ -228,11 +238,28 @@ pub async fn run(config: &Config, args: RepairBackfillTimestampsArgs) -> Result<
     }
 
     println!(
-        "{}", i18n.format("cli-repair-backfill-timestamps-ai-memory-repair-backfill-timestamps-for-workspace-project-total-repaired-se", &[("value0", workspace.to_string()), ("value1", project.to_string()), ("value2", format!("{}", total_repaired)), ("value3", (if dry_run {
-            "would be repaired"
-        } else {
-            "repaired"
-        }).to_string()), ("value4", format!("{}", total_skipped)), ("value5", format!("{}", uncaptured))]));
+        "{}",
+        crate::localization::format(
+            i18n,
+            "cli-repair-backfill-timestamps-ai-memory-repair-backfill-timestamps-for-workspace-project-total-repaired-se",
+            &[
+                ("value0", workspace.to_string()),
+                ("value1", project.to_string()),
+                ("value2", format!("{}", total_repaired)),
+                (
+                    "value3",
+                    (if dry_run {
+                        "would be repaired"
+                    } else {
+                        "repaired"
+                    })
+                    .to_string()
+                ),
+                ("value4", format!("{}", total_skipped)),
+                ("value5", format!("{}", uncaptured))
+            ]
+        )
+    );
     if responses.len() > 1 {
         println!(
             "{}", i18n.format("cli-repair-backfill-timestamps-sent-session-s-across-request-s-of-up-to-max-sessions-per-request-each-one-t", &[("value0", format!("{}", items.len())), ("value1", format!("{}", responses.len())), ("value2", format!("{}", MAX_SESSIONS_PER_REQUEST))]));
