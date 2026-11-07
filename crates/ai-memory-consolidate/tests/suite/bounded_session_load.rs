@@ -1443,10 +1443,7 @@ async fn hybrid_two_project_session_prompt_is_scoped_to_its_project() {
     // A must read only those, never the session's project-B rows.
     let all = store.reader.observations_for_session(sid).await.unwrap();
     assert_eq!(all.len(), COUNT_A + COUNT_B);
-    let project_a_only: Vec<_> = all
-        .into_iter()
-        .filter(|o| o.project_id == proj_a)
-        .collect();
+    let project_a_only: Vec<_> = all.into_iter().filter(|o| o.project_id == proj_a).collect();
     assert_eq!(project_a_only.len(), COUNT_A);
     let oracle = oracle_single_request(
         sid,
