@@ -787,8 +787,12 @@ ai_memory_marker_qs() {
             return 0
         fi
         if [ -n "$route" ]; then
+            # Split without globbing: route_aliases is a raw `["a","b"]`
+            # value, a bracket pattern that a file in the cwd would match.
             old_ifs=$IFS; IFS=$(printf '\034')
+            set -f
             set -- $route
+            set +f
             IFS=$old_ifs
             ws=$1; pr=$2; isty=${3:-}; route_aliases=${4:-}; ps=marker; routed=1
             [ -n "$route_aliases" ] && aliases=$(ai_memory_aliases_json_value "$route_aliases")
