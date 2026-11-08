@@ -74,7 +74,7 @@ version in [`docs/changelog/`](docs/changelog/):
   stray start marker to the new block's end as the managed block, replacing
   or stripping the text in between. The block is now the one whose start
   marker comes last before the end marker, so the stray marker and the text
-  after it are left as they are.
+  after it are left as they are. (#2117)
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
   the file back and records nothing, but the observers were still sent the
