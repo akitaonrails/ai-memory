@@ -1845,6 +1845,36 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
+/// Codex writes a tool output as a plain string, or as an array of
+/// `input_text` / `input_image` / `input_audio` / `encrypted_content` items
+/// for MCP results and `view_image` (`FunctionCallOutputPayload` in
+/// https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs).
+/// The text items are joined the way Codex's own
+/// `function_call_output_content_items_to_text` joins them.
+fn codex_tool_output(payload: &Value, losses: &mut Vec<String>) -> String {
+    if let Some(text) = first_string(payload, &["output", "content", "text"]) {
+        return text.to_string();
+    }
+    let Some(items) = payload.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        match (
+            item.get("type").and_then(Value::as_str),
+            item.get("text").and_then(Value::as_str),
+        ) {
+            (Some("input_text"), Some(text)) => {
+                if !text.trim().is_empty() {
+                    texts.push(text);
+                }
+            }
+            _ => losses.push("Codex non-text tool-output items were intentionally excluded".into()),
+        }
+    }
+    texts.join("\n")
+}
+
 fn parse_codex(
     value: &Value,
     session: &str,
@@ -1925,7 +1955,7 @@ fn parse_codex(
             );
         }
         "function_call_output" | "custom_tool_call_output" | "tool_result" => {
-            let body = first_string(payload, &["output", "content", "text"]).unwrap_or("");
+            let body = codex_tool_output(payload, losses);
             push_event(
                 events,
                 AgentKind::Codex,
@@ -1934,7 +1964,7 @@ fn parse_codex(
                 0,
                 WorkstreamEventKind::ToolResult,
                 Some("tool"),
-                body,
+                &body,
                 timestamp(value),
                 with_tool_use_id(json!({}), first_string(payload, &["call_id"])),
             );
@@ -9115,6 +9145,46 @@ mod tests {
             parse_codex(&value, "session", "record", &mut events, &mut losses);
             assert!(events.is_empty(), "{events:?}");
         }
+    }
+
+    #[test]
+    fn codex_adapter_reads_tool_output_content_items() {
+        let value = json!({
+            "type":"response_item",
+            "timestamp":"2026-01-01T00:00:00Z",
+            "payload":{
+                "type":"function_call_output",
+                "call_id":"call-1",
+                "output":[
+                    {"type":"input_text","text":"42 files"},
+                    {"type":"input_image","image_url":"data:image/png;base64,cHJpdmF0ZQ=="},
+                    {"type":"input_text","text":"  "},
+                    {"type":"input_text","text":"done"}
+                ]
+            }
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&value, "session", "record", &mut events, &mut losses);
+        assert_eq!(events.len(), 1, "array tool output must not be dropped");
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolResult);
+        assert_eq!(events[0].content, "42 files\ndone");
+        assert_eq!(events[0].metadata["tool_use_id"], "call-1");
+        assert!(!events[0].content.contains("base64"));
+        assert_eq!(
+            losses,
+            ["Codex non-text tool-output items were intentionally excluded"]
+        );
+
+        let string_form = json!({
+            "type":"response_item",
+            "payload":{"type":"custom_tool_call_output","call_id":"call-2","output":"plain"}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&string_form, "session", "record", &mut events, &mut losses);
+        assert_eq!(events[0].content, "plain");
+        assert!(losses.is_empty());
     }
 
     #[test]
