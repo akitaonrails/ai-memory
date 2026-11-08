@@ -67,6 +67,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The web UI's "Log out" no longer claims a sign-out that did not happen. It
+  went to the login page whatever `/auth/logout` answered, so a refused or
+  failed request left the session active, and it was offered on a Basic
+  sign-in and on a server without auth, where there is no browser session to
+  end. It now leaves the page only once the session is gone, shows an error
+  otherwise, and is hidden when there is no session. (#PR)
+
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
   the file back and records nothing, but the observers were still sent the

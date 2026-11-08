@@ -171,6 +171,7 @@ web-agent-operations = Operações dos agentes
 web-search-pages = Pesquisar páginas
 web-search-memory-base = Pesquisar na memória…
 web-log-out = Sair
+web-log-out-failed = Não foi possível sair. Confira a conexão e tente de novo.
 web-color-theme = Tema de cores
 web-light-theme = Tema claro
 web-light = Claro
