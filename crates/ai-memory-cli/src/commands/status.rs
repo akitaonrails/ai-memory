@@ -208,13 +208,7 @@ fn report_offline_spool(
             } else {
                 "cli-status-local-spool-rendered"
             };
-            eprintln!(
-                "{}",
-                i18n.format(
-                    key,
-                    &[("value0", rendered.to_string())]
-                )
-            );
+            eprintln!("{}", i18n.format(key, &[("value0", rendered.to_string())]));
         }
         return;
     }
@@ -253,10 +247,7 @@ fn report_offline_spool(
         };
         eprintln!(
             "{}",
-            i18n.format(
-                msg_key,
-                &[("value0", format!("{}", spool.capacity))]
-            )
+            i18n.format(msg_key, &[("value0", format!("{}", spool.capacity))])
         );
     } else if spool.pending > 0 {
         let msg_key = if unreachable {
@@ -266,10 +257,7 @@ fn report_offline_spool(
         };
         eprintln!(
             "{}",
-            i18n.format(
-                msg_key,
-                &[("value0", format!("{}", spool.pending))]
-            )
+            i18n.format(msg_key, &[("value0", format!("{}", spool.pending))])
         );
     }
 }
@@ -362,13 +350,7 @@ fn report_offline_logon_binary(
             } else {
                 "cli-status-windows-logon-rendered"
             };
-            eprintln!(
-                "{}",
-                i18n.format(
-                    key,
-                    &[("value0", rendered.to_string())]
-                )
-            );
+            eprintln!("{}", i18n.format(key, &[("value0", rendered.to_string())]));
         }
         return;
     }
@@ -418,7 +400,8 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
             if unreachable {
                 return Err(err);
             }
-            if let Some(server_err) = err.downcast_ref::<crate::http_client::ServerResponseError>() {
+            if let Some(server_err) = err.downcast_ref::<crate::http_client::ServerResponseError>()
+            {
                 let context = match server_err.status() {
                     reqwest::StatusCode::UNAUTHORIZED => i18n.format(
                         "cli-status-server-reachable-unauthenticated",
@@ -1010,8 +993,18 @@ mod tests {
             true,
             true,
         );
-        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, false, true);
-        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, true, true);
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            false,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            true,
+            true,
+        );
         report_offline_spool(
             &ai_memory_core::i18n::Localizer::default(),
             &SpoolHealth::default(),
@@ -1024,8 +1017,18 @@ mod tests {
             true,
             false,
         );
-        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, false, false);
-        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, true, false);
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            false,
+            false,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            true,
+            false,
+        );
     }
 
     /// A pre-#629 server's `/admin/status` response has no
@@ -1156,8 +1159,12 @@ mod tests {
             b"not json",
         )
         .unwrap();
-        let lines =
-            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), false, true);
+        let lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            false,
+            true,
+        );
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("error:"),
@@ -1177,8 +1184,12 @@ mod tests {
             b"not json",
         )
         .unwrap();
-        let lines =
-            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), true, true);
+        let lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            true,
+            true,
+        );
         assert_eq!(lines.len(), 1, "{lines:?}");
         let payload = lines[0].split_once(": ").expect("prefix then object").1;
         let value: serde_json::Value = serde_json::from_str(payload).unwrap();
