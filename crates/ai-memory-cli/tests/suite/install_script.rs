@@ -350,6 +350,36 @@ fn an_existing_binary_at_the_link_path_is_left_alone() {
     assert!(!home.lib().exists());
 }
 
+/// A link at the link path is replaced only when it points at this install's
+/// binary. One to a hand-built binary, as docs/macos.md suggests for a source
+/// build, is left alone and nothing is downloaded.
+#[test]
+fn a_link_to_a_hand_built_binary_is_left_alone() {
+    let files = tempfile::tempdir().unwrap();
+    let release = Release::serve(files.path());
+    release.publish(&release_archive(&[]));
+    let home = Home::new();
+    let built = home.root.join("src/target/release/ai-memory");
+    std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+    std::fs::write(&built, "#!/bin/sh\necho hand-built\n").unwrap();
+    std::fs::create_dir_all(home.link().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&built, home.link()).unwrap();
+
+    let out = home.install(&release);
+    assert!(!out.status.success(), "{}", report(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("links to {}", built.display())),
+        "{}",
+        report(&out)
+    );
+    assert_eq!(std::fs::read_link(home.link()).unwrap(), built);
+    assert!(!home.lib().exists());
+    assert!(
+        release.requests.lock().unwrap().is_empty(),
+        "a refused run reached the network"
+    );
+}
+
 /// A reinstall moves the lib dir aside and deletes it. Pointed at the
 /// directory holding the link, that deleted every other program there and
 /// left `ai-memory` a link to itself; it is refused before anything is
