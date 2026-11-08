@@ -1008,6 +1008,10 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::GeminiCli
             | AgentKind::QwenCode
             | AgentKind::Qoder
+            // Kimi Code's PreToolUse / PostToolUse / PostToolUseFailure carry
+            // Claude Code's snake_case `tool_name` / `tool_input` plus
+            // `tool_call_id` (MoonshotAI/kimi-code hooks.md).
+            | AgentKind::KimiCode
     )
 }
 
@@ -3511,6 +3515,97 @@ mod tests {
         );
         assert_eq!(env.title_hint.as_deref(), Some("hello"));
         assert_eq!(env.body_excerpt.as_deref(), Some("hello"));
+    }
+
+    /// Kimi Code's PreToolUse / PostToolUse / PostToolUseFailure carry
+    /// Claude Code's `tool_name` / `tool_input` plus `tool_call_id` and, on
+    /// success, `tool_output` (MoonshotAI/kimi-code hooks.md). Kimi Code was
+    /// absent from `closed_tool_agent`, so its tool observations were stored
+    /// with no title or body, the failure mode Grok had in #931.
+    #[test]
+    fn kimi_code_tool_events_keep_their_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kimi-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session_kimi-1",
+                "cwd": "/workspace/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_call_id": "call-kimi-1",
+                "tool_output": "MARKER_KIMI_OUTPUT",
+            }),
+        );
+        assert_eq!(post.agent, AgentKind::KimiCode);
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("kimi post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("tool_call_id: call-kimi-1"), "{body:?}");
+        assert!(body.contains("MARKER_KIMI_OUTPUT"), "{body:?}");
+
+        let read = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kimi-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session_kimi-1",
+                "cwd": "/workspace/project",
+                "tool_name": "Read",
+                "tool_input": {"path": "/workspace/project/sample.txt"},
+                "tool_call_id": "call-kimi-2",
+                "tool_output": "MARKER_KIMI_READ",
+            }),
+        );
+        assert_eq!(read.title_hint.as_deref(), Some("tool file"));
+        let body = read.body_excerpt.expect("kimi read body");
+        assert!(body.contains("MARKER_KIMI_READ"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("kimi-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session_kimi-1",
+                "cwd": "/workspace/project",
+                "tool_name": "Read",
+                "tool_input": {"path": "/workspace/project/sample.txt"},
+                "tool_call_id": "call-kimi-2",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+
+        let failure = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kimi-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUseFailure",
+                "session_id": "session_kimi-1",
+                "cwd": "/workspace/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test SENTINEL_COMMAND"},
+                "tool_call_id": "call-kimi-3",
+                "error": "MARKER_KIMI_ERROR",
+            }),
+        );
+        assert_eq!(failure.title_hint.as_deref(), Some("tool non-file"));
+        let body = failure.body_excerpt.expect("kimi failure body");
+        assert!(body.contains("outcome: error"), "{body:?}");
+        assert!(body.contains("MARKER_KIMI_ERROR"), "{body:?}");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
     }
 
     #[test]

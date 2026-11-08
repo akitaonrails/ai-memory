@@ -401,6 +401,18 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
             let (name, id, _) = cline_tool_fields(object)?;
             (name, id)
         }
+        // Kimi Code's PreToolUse / PostToolUse / PostToolUseFailure carry
+        // Claude Code's `tool_name` / `tool_input` plus `tool_call_id`
+        // (MoonshotAI/kimi-code docs/en/customization/hooks.md; the Bash
+        // example reads `payload.tool_input?.command`). Reconstructed
+        // transcript payloads still use `tool_use_id`.
+        AgentKind::KimiCode => (
+            object.get("tool_name")?.as_str()?,
+            object
+                .get("tool_call_id")
+                .or_else(|| object.get("tool_use_id"))
+                .and_then(Value::as_str),
+        ),
         _ => return None,
     };
     Some((name, id))
@@ -446,6 +458,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::GeminiCli
                             | AgentKind::QwenCode
                             | AgentKind::Qoder
+                            | AgentKind::KimiCode
                     ) {
                         "tool_input"
                     } else {
@@ -539,12 +552,15 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Claude Code's `PostToolUseFailure` carries the same `error` string
         // (<https://code.claude.com/docs/en/hooks>); an aborted call
         // (`is_interrupt`) did not succeed either. Its `PostToolUse` fires
-        // only on success and has no `error` key.
+        // only on success and has no `error` key. Kimi Code's
+        // PostToolUseFailure carries the same `error` string
+        // (MoonshotAI/kimi-code hooks.md).
         AgentKind::Zcode
         | AgentKind::Muse
         | AgentKind::QwenCode
         | AgentKind::Qoder
         | AgentKind::ClaudeCode
+        | AgentKind::KimiCode
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -1384,7 +1400,10 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // DSH's Claude Code hooks bridge forwards the same `tool_name` /
         // `tool_input` pair, so its file and shell calls read the ignore
         // paths exactly as Claude Code's do.
-        | AgentKind::Dsh => object
+        | AgentKind::Dsh
+        // Kimi Code sends the same `tool_name` / `tool_input` pair
+        // (MoonshotAI/kimi-code hooks.md); Read/Write/Edit take `path`.
+        | AgentKind::KimiCode => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -5292,6 +5311,7 @@ mod tests {
             AgentKind::CodeBuddy,
             AgentKind::QwenCode,
             AgentKind::Qoder,
+            AgentKind::KimiCode,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -6708,6 +6728,69 @@ mod tests {
             tool_observation_outcome(AgentKind::QwenCode, &json!({"tool_name": "write_file"})),
             ToolOutcome::Unknown
         );
+    }
+
+    #[test]
+    fn kimi_code_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::KimiCode, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-kimi-1"));
+
+        // Reconstructed transcript payloads still use `tool_use_id`.
+        let rebuilt = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_use_id": "call-kimi-2",
+        });
+        let metadata = tool_observation_metadata(AgentKind::KimiCode, &rebuilt, true).unwrap();
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-kimi-2"));
+
+        let no_input = json!({"tool_name": "Read", "tool_call_id": "call-kimi-1"});
+        assert!(tool_observation_metadata(AgentKind::KimiCode, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::KimiCode,
+                &json!({"tool_name": "Bash", "error": "disk full"})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::KimiCode,
+                &json!({"tool_name": "Bash", "tool_output": "ok"})
+            ),
+            ToolOutcome::Unknown
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let excluded = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "docs/adr/1.md"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let decision = policy.inspect(AgentKind::KimiCode, &excluded, "/repo");
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+
+        let public = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let decision = policy.inspect(AgentKind::KimiCode, &public, "/repo");
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
     }
 
     #[test]
