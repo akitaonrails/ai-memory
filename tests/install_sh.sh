@@ -239,4 +239,38 @@ grep -Fq "is or contains the link's directory" "${TMP_ROOT}/lib-is-bin-fresh/out
   || fail "one-directory refusal not explained: $(cat "${TMP_ROOT}/lib-is-bin-fresh/out.log")"
 [ ! -e "${fresh}" ] || fail "a refused first install created ${fresh}"
 
+# A lib dir is replaced only when it holds a release: the binary itself beside
+# a hooks bundle. A package manager's bin dir (its ai-memory a link into the
+# cellar), a directory whose ai-memory links to a hand-built one, and a
+# wrapper's own directory (no hooks bundle) all stay as they were.
+plain_tree "${TMP_ROOT}/not-a-release-tree"
+base="$(publish not-a-release "${TMP_ROOT}/not-a-release-tree")"
+home="${TMP_ROOT}/not-a-release/home"
+mkdir -p "${home}/brew/Cellar" "${home}/brew/bin" "${home}/src/target" "${home}/apps/ai-memory/hooks" \
+  "${home}/wrapper"
+printf '#!/bin/sh\necho brewed\n' >"${home}/brew/Cellar/ai-memory"
+printf '#!/bin/sh\necho hand-built\n' >"${home}/src/target/ai-memory"
+printf '#!/bin/sh\necho wrapper\n' >"${home}/wrapper/ai-memory"
+chmod 0755 "${home}/brew/Cellar/ai-memory" "${home}/src/target/ai-memory" "${home}/wrapper/ai-memory"
+ln -s ../Cellar/ai-memory "${home}/brew/bin/ai-memory"
+printf '#!/bin/sh\necho jq\n' >"${home}/brew/bin/jq"
+ln -s ../../src/target/ai-memory "${home}/apps/ai-memory/ai-memory"
+printf 'my hook\n' >"${home}/apps/ai-memory/hooks/mine.sh"
+printf 'notes\n' >"${home}/wrapper/notes.txt"
+for lib in "${home}/brew/bin" "${home}/apps/ai-memory" "${home}/wrapper"; do
+  if run_install not-a-release "file://${base}" AI_MEMORY_LIB_DIR="${lib}"; then
+    fail "AI_MEMORY_LIB_DIR=${lib} holds no release and was replaced"
+  fi
+  grep -Fq "holds no ai-memory release" "${TMP_ROOT}/not-a-release/out.log" \
+    || fail "refusal of ${lib} not explained: $(cat "${TMP_ROOT}/not-a-release/out.log")"
+done
+[ -f "${home}/brew/bin/jq" ] || fail "the package manager's bin dir lost a program"
+[ "$("${home}/brew/bin/ai-memory")" = brewed ] || fail "the package manager's link was replaced"
+[ "$("${home}/apps/ai-memory/ai-memory")" = hand-built ] || fail "the link to a hand-built binary was replaced"
+[ -f "${home}/apps/ai-memory/hooks/mine.sh" ] || fail "the linked binary's directory lost a file"
+[ "$("${home}/wrapper/ai-memory")" = wrapper ] || fail "the user's wrapper was replaced"
+[ -f "${home}/wrapper/notes.txt" ] || fail "the wrapper's directory lost a file"
+[ ! -e "${home}/.local/bin/ai-memory" ] && [ ! -L "${home}/.local/bin/ai-memory" ] \
+  || fail "a refused install created the link"
+
 printf 'install.sh checks passed\n'
