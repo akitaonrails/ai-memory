@@ -11,6 +11,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Captured Kimi Code tool calls with the same `tool <family>` title and body
+  as Claude Code's: the tool family, the outcome and the result. Kimi Code was
+  already a first-party agent with PreToolUse, PostToolUse and PostToolUseFailure
+  hooks, but was missing from the closed tool-payload lists, so every tool event
+  was stored with the event kind as its title and an empty body,
+  `[ingest] record_tool_names` never named a Kimi Code call, and
+  `[capture] ignore_paths` never classified its Read, Write, Edit or Bash
+  calls. The body keeps `tool_output` (or the `error` string on
+  PostToolUseFailure) and the call id is the documented `tool_call_id`. (#2126)
+
 ## [3.4.4] - 2026-11-08
 
 ### Security
