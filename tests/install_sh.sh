@@ -273,4 +273,27 @@ done
 [ ! -e "${home}/.local/bin/ai-memory" ] && [ ! -L "${home}/.local/bin/ai-memory" ] \
   || fail "a refused install created the link"
 
+# The reinstall deletes the whole lib dir, so one holding anything the release
+# does not ship (a release unpacked by hand, with the user's notes or a hidden
+# settings file in it) is refused once the release is unpacked, and keeps every
+# file.
+plain_tree "${TMP_ROOT}/foreign-tree"
+base="$(publish foreign "${TMP_ROOT}/foreign-tree")"
+for foreign in NOTES.txt .my-settings ..old-notes; do
+  lib="${TMP_ROOT}/foreign/home/apps/case${foreign}"
+  mkdir -p "${lib}"
+  tar -C "${lib}" -xzf "${TMP_ROOT}/foreign/release/latest/download/${ASSET}"
+  printf 'mine\n' >"${lib}/${foreign}"
+  if run_install foreign "file://${base}" AI_MEMORY_LIB_DIR="${lib}"; then
+    fail "a lib dir holding ${foreign}, which the release does not ship, was replaced"
+  fi
+  grep -Fq "holds ${foreign}, which the release does not ship" "${TMP_ROOT}/foreign/out.log" \
+    || fail "refusal for ${foreign} not explained: $(cat "${TMP_ROOT}/foreign/out.log")"
+  [ "$(cat "${lib}/${foreign}")" = mine ] || fail "the user's ${foreign} was deleted"
+  [ -x "${lib}/ai-memory" ] || fail "the refused lib dir lost its binary"
+  if ls -d "${lib}.new."* "${lib}.old."* >/dev/null 2>&1; then
+    fail "a refused reinstall left a staged copy beside ${lib}"
+  fi
+done
+
 printf 'install.sh checks passed\n'
