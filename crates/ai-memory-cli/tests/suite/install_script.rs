@@ -350,6 +350,49 @@ fn an_existing_binary_at_the_link_path_is_left_alone() {
     assert!(!home.lib().exists());
 }
 
+/// A reinstall moves the lib dir aside and deletes it. Pointed at the
+/// directory holding the link, that deleted every other program there and
+/// left `ai-memory` a link to itself; it is refused before anything is
+/// downloaded.
+#[test]
+fn a_lib_dir_that_is_the_bin_dir_is_refused_and_left_intact() {
+    let files = tempfile::tempdir().unwrap();
+    let release = Release::serve(files.path());
+    release.publish(&release_archive(&[]));
+    let home = Home::new();
+    let first = home.install(&release);
+    assert!(first.status.success(), "{}", report(&first));
+    let bin = home.link().parent().unwrap().to_path_buf();
+    std::fs::write(bin.join("other-tool"), "#!/bin/sh\necho mine\n").unwrap();
+    let requests = release.requests.lock().unwrap().len();
+
+    let out = home
+        .command(&release)
+        .env("AI_MEMORY_LIB_DIR", &bin)
+        .arg(script())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", report(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is or contains the link's directory"),
+        "{}",
+        report(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(bin.join("other-tool")).unwrap(),
+        "#!/bin/sh\necho mine\n"
+    );
+    assert_eq!(
+        std::fs::read_link(home.link()).unwrap(),
+        home.lib().join("ai-memory")
+    );
+    assert_eq!(
+        release.requests.lock().unwrap().len(),
+        requests,
+        "a refused run reached the network"
+    );
+}
+
 /// `curl … | sh` with the download cut short: every cut point leaves a
 /// script that defines functions at most, so nothing is fetched or written.
 #[test]
