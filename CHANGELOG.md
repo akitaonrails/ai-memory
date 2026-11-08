@@ -11,6 +11,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Captured OpenClaw tool calls with the same `tool <family>` title and body
+  as Claude Code's: the tool family, the outcome and the result. OpenClaw was
+  already a first-party agent with a generated plugin, and
+  `[capture] ignore_paths` already classified its `read` / `write` / `edit` /
+  `exec` calls, but it was missing from the closed tool-payload lists, so every
+  tool event was stored with the event kind as its title and an empty body, and
+  `[ingest] record_tool_names` never named an OpenClaw call. The body keeps
+  `output` (or `error`) and a non-empty `error` string maps to `outcome: error`.
+  (#2130)
+
 ## [3.4.4] - 2026-11-08
 
 ### Security
