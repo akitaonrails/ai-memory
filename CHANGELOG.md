@@ -73,7 +73,7 @@ version in [`docs/changelog/`](docs/changelog/):
   any pattern to match and was kept verbatim; once an earlier secret in the
   record was redacted to a short marker, the fragment fit inside the later
   caps. The cut now drops a token it lands inside. Event ids are derived as
-  before, so a resumed run replays its existing events. (#PR)
+  before, so a resumed run replays its existing events. (#2107)
 
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
