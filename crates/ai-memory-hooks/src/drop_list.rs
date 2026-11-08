@@ -377,6 +377,29 @@ mod tests {
             serde_json::json!({ "session_id": "s", "hook_event_name": "BeforeTool", "tool_name": "read_file", "tool_input": { "file_path": "a" }, "tool_use_id": "plugin-6" }),
         );
         assert!(!list.matches(&gemini_kept));
+        // Devin CLI sends Claude-shaped `tool_name` / `tool_use_id`.
+        let devin = agent_event(
+            "devin",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "exec",
+                "tool_input": { "command": "ls" },
+                "tool_use_id": "plugin-12"
+            }),
+        );
+        assert!(list.matches(&devin));
+        let devin_kept = agent_event(
+            "devin",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "exec",
+                "tool_input": { "command": "ls" },
+                "tool_use_id": "call_12"
+            }),
+        );
+        assert!(!list.matches(&devin_kept));
         // Cline CLI nests the call id at `tool_call.id`; the documented
         // envelope names the tool at `preToolUse.toolName` and has no id.
         let cline = agent_event(
