@@ -11,6 +11,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Captured Devin CLI tool calls with the same `tool <family>` title and body
+  as Claude Code's: the tool family, the outcome and the result. Devin CLI was
+  already a first-party agent with PreToolUse and PostToolUse hooks, and
+  `[capture] ignore_paths` already classified its `read` / `write` / `edit` /
+  `exec` calls, but it was missing from the closed tool-payload lists, so every
+  tool event was stored with the event kind as its title and an empty body, and
+  `[ingest] record_tool_names` never named a Devin call. The body keeps
+  `tool_response.output` (or `tool_response.error`) and the outcome comes from
+  `tool_response.success`. (#2128)
+
 ## [3.4.4] - 2026-11-08
 
 ### Security
