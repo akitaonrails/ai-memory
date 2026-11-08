@@ -67,6 +67,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `POST /admin/restore-page` (and `ai-memory restore-page --from`) with a `rev`
+  that does not exist, or that does not hold the page, now answers `404` instead
+  of `500`, and no longer writes a `pre-restore-page` checkpoint before failing.
+  A `rev` with surrounding whitespace, which the request already accepted as
+  non-blank, is now trimmed before use instead of failing as unknown.
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
   the file back and records nothing, but the observers were still sent the
