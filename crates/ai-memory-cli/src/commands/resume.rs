@@ -42,97 +42,99 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
     let endpoint = ServerEndpoint::for_checkout(config).await?;
     let cwd =
         std::env::current_dir().context(i18n.text("cli-resume-reading-the-current-checkout"))?;
-    let candidates = if args.all {
-        candidates_across_checkouts(config, &endpoint, &args, &cwd).await?
-    } else {
-        candidates_for_checkout(config, &endpoint, &args, &cwd).await?
-    };
+    loop {
+        let candidates = if args.all {
+            candidates_across_checkouts(config, &endpoint, &args, &cwd).await?
+        } else {
+            candidates_for_checkout(config, &endpoint, &args, &cwd).await?
+        };
 
-    let harnesses = available_harnesses(config);
-    let mut harness_indices = vec![0usize; candidates.len()];
-    let mut choices = candidates
-        .iter()
-        .map(|candidate| choice_for(candidate, None))
-        .collect::<Vec<_>>();
-    let Some(index) = select_with_horizontal(
-        i18n,
-        &i18n.text("cli-picker-resume-title"),
-        &mut choices,
-        &i18n.text("cli-picker-horizontal-hint"),
-        args.search.as_deref(),
-        &mut |index, direction, choice| {
-            let harness =
-                cycle_selected_harness(&mut harness_indices, index, &harnesses, direction);
-            *choice = choice_for(&candidates[index], harness);
-        },
-    )?
-    else {
-        return Ok(0);
-    };
-    let selected = &candidates[index];
-    let target = continue_session::resolve_target(config, &selected.link)?;
-    let endpoint = continue_session::endpoint_for_link(config, &selected.link, &target).await?;
-    let project_id = project_registry::project_binding(
-        config,
-        &endpoint,
-        &selected.link.workspace,
-        &selected.link.project,
-        &target,
-    )?
-    .map(|scope| scope.project_id);
-    let harness = selected_harness(harness_indices[index], &harnesses);
-    eprintln!(
-        "{}",
-        crate::localization::format(
+        let harnesses = available_harnesses(config);
+        let mut harness_indices = vec![0usize; candidates.len()];
+        let mut choices = candidates
+            .iter()
+            .map(|candidate| choice_for(candidate, None))
+            .collect::<Vec<_>>();
+        let Some(index) = select_with_horizontal(
             i18n,
-            "cli-resume-resuming-workstream-with-harness-in-at",
-            &[
-                ("value0", terminal_text(&selected.summary.name).to_string()),
-                (
-                    "value1",
-                    harness
-                        .map(harness_name)
-                        .unwrap_or_else(|| "auto".to_owned())
-                        .to_string()
-                ),
-                ("value2", scope_label(&selected.link).to_string()),
-                (
-                    "value3",
-                    terminal_text(&selected.target.to_string_lossy()).to_string()
-                )
-            ]
+            &i18n.text("cli-picker-resume-title"),
+            &mut choices,
+            &i18n.text("cli-picker-horizontal-hint"),
+            args.search.as_deref(),
+            &mut |index, direction, choice| {
+                let harness =
+                    cycle_selected_harness(&mut harness_indices, index, &harnesses, direction);
+                *choice = choice_for(&candidates[index], harness);
+            },
+        )?
+        else {
+            return Ok(0);
+        };
+        let selected = &candidates[index];
+        let target = continue_session::resolve_target(config, &selected.link)?;
+        let endpoint = continue_session::endpoint_for_link(config, &selected.link, &target).await?;
+        let project_id = project_registry::project_binding(
+            config,
+            &endpoint,
+            &selected.link.workspace,
+            &selected.link.project,
+            &target,
+        )?
+        .map(|scope| scope.project_id);
+        let harness = selected_harness(harness_indices[index], &harnesses);
+        eprintln!(
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-resume-resuming-workstream-with-harness-in-at",
+                &[
+                    ("value0", terminal_text(&selected.summary.name).to_string()),
+                    (
+                        "value1",
+                        harness
+                            .map(harness_name)
+                            .unwrap_or_else(|| "auto".to_owned())
+                            .to_string()
+                    ),
+                    ("value2", scope_label(&selected.link).to_string()),
+                    (
+                        "value3",
+                        terminal_text(&selected.target.to_string_lossy()).to_string()
+                    )
+                ]
+            )
+        );
+        crate::commands::run::run_from(
+            config,
+            RunArgs {
+                workspace: Some(selected.link.workspace.clone()),
+                project: project_id.is_none().then(|| selected.link.project.clone()),
+                project_id,
+                workstream: Some(selected.summary.name.clone()),
+                new_workstream: None,
+                executable: None,
+                yolo: args.yolo,
+                true_yolo: args.true_yolo,
+                jail: None,
+                no_jail: false,
+                jail_map: Vec::new(),
+                jail_rw_map: Vec::new(),
+                fresh: args.fresh,
+                force_unlock: false,
+                no_autowire: false,
+                no_exit_prompt: false,
+                require_server: false,
+                profile: None,
+                env: Vec::new(),
+                env_file: None,
+                harness,
+                claude_wrapper: None,
+                native_args: Vec::new(),
+            },
+            &target,
         )
-    );
-    crate::commands::run::run_from(
-        config,
-        RunArgs {
-            workspace: Some(selected.link.workspace.clone()),
-            project: project_id.is_none().then(|| selected.link.project.clone()),
-            project_id,
-            workstream: Some(selected.summary.name.clone()),
-            new_workstream: None,
-            executable: None,
-            yolo: args.yolo,
-            true_yolo: args.true_yolo,
-            jail: None,
-            no_jail: false,
-            jail_map: Vec::new(),
-            jail_rw_map: Vec::new(),
-            fresh: args.fresh,
-            force_unlock: false,
-            no_autowire: false,
-            no_exit_prompt: false,
-            require_server: false,
-            profile: None,
-            env: Vec::new(),
-            env_file: None,
-            harness,
-            claude_wrapper: None,
-            native_args: Vec::new(),
-        },
-        &target,
-    )
-    .await
+        .await?;
+    }
 }
 
 async fn candidates_for_checkout(

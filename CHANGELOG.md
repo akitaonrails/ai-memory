@@ -11,6 +11,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- Returned to the workstream picker after a harness launched by `ai-memory resume` exits, including on Ctrl+C.
+
 ## [3.4.4] - 2026-11-08
 
 ### Security
