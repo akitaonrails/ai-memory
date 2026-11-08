@@ -292,6 +292,9 @@ impl SessionDigest {
     /// The idle auto-end tick binds that count to the end stamp (review R36
     /// F3): an observation landing after the digest was built must invalidate
     /// the stamp instead of reaching the watermark without reaching the page.
+    /// It is the whole session's count, not the digest's own total: the digest
+    /// holds only this scope's rows, the stamp counts every project's, and a
+    /// session that crossed repositories would otherwise never end.
     ///
     /// # Errors
     /// Propagates any store error.
@@ -304,10 +307,7 @@ impl SessionDigest {
         reader
             .read_session_observations(workspace_id, project_id, session_id, move |snapshot| {
                 let (digest, _stats) = build_digest(snapshot, session_id)?;
-                // Overflow only with more than 9.2e18 observations: fail
-                // toward `Lost` at the stamp (an unrepresentable count never
-                // matches the stamp-time COUNT), never toward a wrong stamp.
-                let total = i64::try_from(digest.observation_count()).unwrap_or(i64::MAX);
+                let total = snapshot.whole_session_observation_count()?;
                 Ok((digest, total))
             })
             .await
