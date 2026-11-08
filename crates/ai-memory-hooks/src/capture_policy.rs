@@ -6738,7 +6738,10 @@ mod tests {
             ToolOutcome::Error
         );
         assert_eq!(
-            tool_observation_outcome(AgentKind::OpenClaw, &json!({"tool": "exec", "output": "ok"})),
+            tool_observation_outcome(
+                AgentKind::OpenClaw,
+                &json!({"tool": "exec", "output": "ok"})
+            ),
             ToolOutcome::Unknown
         );
 
