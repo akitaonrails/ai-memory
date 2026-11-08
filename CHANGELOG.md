@@ -64,6 +64,27 @@ version in [`docs/changelog/`](docs/changelog/):
   (`consolidate_session_in_scope`) instead of re-resolving it, which closes the
   window in which a concurrent cross-project observation could move the write
   after the grant check. (GHSA-xfgc-hc4c-wj7h)
+- A shared browser profile can no longer show one user another user's
+  restricted `/api/v1` data. Every `/api/v1` read is grant-filtered (#708), but
+  the workspace and project lists, the dependency graph, a project's page list,
+  its recent pages and a single page read were still sent `Cache-Control:
+  private, max-age=N`, so a browser could answer a later viewer from the first
+  viewer's cached copy without the server running the second viewer's grant
+  check. The list, graph and recent reads now use `private, no-store`, and the
+  single-page read `private, no-cache` with its `ETag` so `authorize_read` runs
+  on every revalidation. The server-rendered `/web` UI was not affected.
+  (GHSA-462j-m6hw-9gpf)
+- The macOS menu bar app no longer sends its saved bearer token to a server it
+  was not saved for. The Keychain held one token with no record of its server,
+  so changing the URL in Settings sent it to the new host, and with nothing
+  saved the data dir's root bearer (`auth-tokens/default`) went to whatever URL
+  was configured, including a remote one. Settings also applied the URL field
+  400 ms after each typing pause, so a half-typed address briefly became the
+  server receiving the token. A saved token is now bound to the server origin
+  it was saved for and sent only there; the data dir's root token is sent only
+  to a loopback server; and the URL applies on Return or when the window closes,
+  not while typing. An existing saved token keeps working with the server it was
+  already configured for. (GHSA-fqfw-62f9-3jhw)
 
 ### Fixed
 
