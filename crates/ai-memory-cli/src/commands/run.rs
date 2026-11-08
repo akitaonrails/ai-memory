@@ -361,7 +361,7 @@ async fn run_once_repairing_split(
     if !accepted {
         return Err(error);
     }
-    super::run_project_split::apply_repair(config, &split).await?;
+    super::run_project_split::apply_repair(config, &split, cwd).await?;
     run_once_with_wiring(config, args, cwd, wire_overrides).await
 }
 
@@ -791,7 +791,7 @@ async fn run_once_with_wiring(
     // cancelled again.
     if let (JailMode::Explicit(spec), Some(ai_jail)) = (&jail_plan.mode, &ai_jail) {
         ensure_jail_does_not_export_config_token(config)?;
-        ensure_jail_does_not_need_a_server_profile(config)?;
+        ensure_jail_does_not_need_a_server_profile(config, &repository.cwd)?;
         let support = ai_jail_support(ai_jail)
             .with_context(|| format!("reading the toggles {} supports", ai_jail.display()))?;
         // Only a harness named on the command line is known this early; an
@@ -845,7 +845,7 @@ async fn run_once_with_wiring(
         ));
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
-    let endpoint = ServerEndpoint::for_checkout(config).await?;
+    let endpoint = ServerEndpoint::for_checkout_at(config, &repository.cwd).await?;
     let project_id = if let Some(id) = args.project_id {
         Some(id)
     } else if args.project.is_none() {
@@ -3495,12 +3495,14 @@ fn print_next_run_hint(config: &Config) {
     );
 }
 
-/// The quit-time lines that offer [`next_run_command`].
+/// The quit-time lines that offer [`next_run_command`]. The command repeats
+/// the extra folders' paths, directory entries that can come from a cloned
+/// repository, so it is neutralized like the jail summary's folder names.
 fn next_run_hint(i18n: &ai_memory_core::i18n::Localizer, paint: Paint, command: &str) -> String {
     format!(
         "\n{}\n  {}\n",
         paint.dim(&i18n.diagnostic("Next time, start with the same jail choices:")),
-        paint.bold(command)
+        paint.bold(&super::show::terminal_text(command))
     )
 }
 
@@ -3701,7 +3703,7 @@ async fn confirm_yolo_and_maybe_reexec(
         (choices, outcome.folders, Some(next))
     };
     ensure_jail_does_not_export_config_token(config)?;
-    ensure_jail_does_not_need_a_server_profile(config)?;
+    ensure_jail_does_not_need_a_server_profile(config, &inputs.checkout_root)?;
     // The re-exec replaces this process (or, off Unix, this process exits
     // once the child does), so its own prepared lease must be released here
     // rather than left to the 90s orphan timeout — the jailed re-run opens
@@ -4029,8 +4031,8 @@ fn ensure_jail_does_not_export_config_token(config: &Config) -> Result<()> {
 /// read from ai-jail's private home and which must not be copied into the
 /// harness's environment either. Refuse instead of letting the jailed run
 /// fail on the profile or fall back to another server.
-fn ensure_jail_does_not_need_a_server_profile(config: &Config) -> Result<()> {
-    match crate::http_client::checkout_route(config) {
+fn ensure_jail_does_not_need_a_server_profile(config: &Config, cwd: &Path) -> Result<()> {
+    match crate::http_client::checkout_route_at(config, cwd) {
         crate::server_profiles::Route::InstallDefault => Ok(()),
         route => Err(anyhow!(
             "--jail cannot carry this checkout's server profile{} into the managed harness: \
@@ -5099,6 +5101,12 @@ async fn prepare_previous_session_history(
     cwd: &Path,
     env: &EffectiveChildEnv,
 ) -> Result<Option<PreviousSessionHistory>> {
+    // The dossier the next harness reads must carry no more than the ledger
+    // upload of the same session would: the checkout's `[capture] ignore_paths`
+    // drops a tool call and its result, and the sanitizer redacts credentials
+    // (GHSA-h8wj-74hc-vjjp).
+    let capture = TranscriptCapture::for_checkout(&config.data_dir, cwd);
+    let sanitizer = Sanitizer::new(&config.sanitize).map_err(anyhow::Error::from)?;
     let mut failures = Vec::new();
     for &harness in previous_harness_candidates(previous.agent) {
         let recorded = match super::project_registry::recorded_session_store(
@@ -5159,6 +5167,7 @@ async fn prepare_previous_session_history(
                 continue;
             }
         };
+        let transcript = sanitize_previous_session_history(transcript, &capture, &sanitizer);
         if transcript.events.is_empty() {
             return Ok(None);
         }
@@ -5197,6 +5206,35 @@ fn previous_harness_candidates(agent: AgentKind) -> &'static [ManagedHarness] {
         AgentKind::AntigravityCli => &[ManagedHarness::Antigravity],
         AgentKind::CopilotCli => &[ManagedHarness::Copilot],
         _ => &[],
+    }
+}
+
+/// Run the exported transcript through the same two filters the ledger upload
+/// applies before it becomes the dossier the next harness reads: the checkout's
+/// `[capture] ignore_paths` (which drops a tool call together with its result)
+/// and the `Sanitizer` (which redacts credentials). Without this the dossier
+/// would hand the next agent — usually another vendor's — content the operator
+/// kept out of ai-memory (GHSA-h8wj-74hc-vjjp).
+fn sanitize_previous_session_history(
+    transcript: ExportedTranscript,
+    capture: &TranscriptCapture,
+    sanitizer: &Sanitizer,
+) -> ExportedTranscript {
+    let ExportedTranscript {
+        native_session_id,
+        source_cursor,
+        events,
+        losses,
+    } = transcript;
+    let mut events = capture.filter_ledger_events(events);
+    for event in &mut events {
+        event.content = sanitizer.scrub(&event.content);
+    }
+    ExportedTranscript {
+        native_session_id,
+        source_cursor,
+        events,
+        losses,
     }
 }
 
@@ -6929,6 +6967,29 @@ mod tests {
     }
 
     #[test]
+    fn the_next_run_hint_neutralizes_terminal_controls_in_folder_paths() {
+        let next = NextRun {
+            harness: Some("claude".into()),
+            ..NextRun::default()
+        };
+        let command = next_run_command(
+            &next,
+            None,
+            &[folder("/w/evil\u{1b}]0;x\u{7}\u{202e}dir", true)],
+        );
+        let hint = next_run_hint(
+            &ai_memory_core::i18n::Localizer::default(),
+            Paint::PLAIN,
+            &command,
+        );
+        assert!(!hint.contains('\u{1b}'), "{hint:?}");
+        assert!(!hint.contains('\u{7}'), "{hint:?}");
+        assert!(!hint.contains('\u{202e}'), "{hint:?}");
+        assert!(hint.contains("--jail-rw-map"), "{hint:?}");
+        assert!(hint.contains("evil"), "{hint:?}");
+    }
+
+    #[test]
     fn flag_folders_are_validated_and_deduplicated() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
@@ -7055,7 +7116,7 @@ mod tests {
         let config = |server_url: Option<&str>| Config {
             data_dir: data_dir.clone(),
             runtime_env: crate::config::RuntimeEnv::for_checkout_tests(
-                repo.to_string_lossy(),
+                home.to_string_lossy(),
                 home.to_string_lossy(),
                 server_url,
                 false,
@@ -7063,19 +7124,19 @@ mod tests {
             ..Config::default()
         };
 
-        assert!(ensure_jail_does_not_need_a_server_profile(&config(None)).is_ok());
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None), &repo).is_ok());
         std::fs::write(repo.join(".ai-memory.toml"), "server = \"team-b\"\n").unwrap();
-        let error = ensure_jail_does_not_need_a_server_profile(&config(None))
+        let error = ensure_jail_does_not_need_a_server_profile(&config(None), &repo)
             .unwrap_err()
             .to_string();
         assert!(error.contains("`team-b`"), "{error}");
         assert!(!error.contains("PROFILE-TOKEN"), "{error}");
         assert!(
-            ensure_jail_does_not_need_a_server_profile(&config(Some("https://env.example")))
+            ensure_jail_does_not_need_a_server_profile(&config(Some("https://env.example")), &repo)
                 .is_ok()
         );
         std::fs::write(repo.join(".ai-memory.toml"), "server = \"nobody\"\n").unwrap();
-        assert!(ensure_jail_does_not_need_a_server_profile(&config(None)).is_err());
+        assert!(ensure_jail_does_not_need_a_server_profile(&config(None), &repo).is_err());
     }
 
     /// A jailed re-run keeps routing but must not turn a server bearer loaded
@@ -9242,18 +9303,21 @@ mod tests {
             .unwrap(),
             ManagedHarness::KiroV3
         );
-        assert_eq!(
-            resolve_kiro_harness(
-                &[OsString::from("--agent-engine=v2")],
+        for selector in ["--v2", "--agent-engine=v2"] {
+            let args = ["chat", selector].map(OsString::from);
+            let harness = resolve_kiro_harness(
+                &args,
                 Some("sess_c3774f9d-269e-40d1-aa02-2bb0c0817b4e"),
                 Some(&v3_cursor),
                 ManagedHarness::KiroV3,
                 temp.path(),
                 &cwd,
             )
-            .unwrap(),
-            ManagedHarness::Kiro
-        );
+            .unwrap();
+            let plan = build_launch_plan(harness, None, args.to_vec(), None).unwrap();
+            assert_eq!(harness, ManagedHarness::Kiro, "{selector}: {:?}", plan.args);
+            assert_eq!(plan.args, args);
+        }
         assert_eq!(
             resolve_kiro_harness(
                 &[
@@ -10307,6 +10371,97 @@ mod tests {
                 .unwrap_or(0)
                 == 0,
             "an offline half-wiring must not gate the next online launch"
+        );
+    }
+
+    /// A picker can launch a checkout other than the command's cwd. Its
+    /// managed prepare must reach the same server, with the same bearer, as
+    /// that checkout's hooks; the install's endpoint is a hostile control.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_checkout_routes_managed_prepare_to_its_profile() {
+        let (temp, mut config, mut args) = offline_run_fixture(0).await;
+        let repo = temp.path().join("repo").canonicalize().unwrap();
+        let home = temp.path().join("home");
+        config.runtime_env = crate::config::RuntimeEnv::for_checkout_tests(
+            home.to_string_lossy(),
+            home.to_string_lossy(),
+            None,
+            false,
+        );
+        config.auth.bearer_token = Some("INSTALL-TOKEN".into());
+        args.require_server = true;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().unwrap().push((
+                    request.method().clone(),
+                    request.uri().path().to_owned(),
+                    request.headers().get("authorization").cloned(),
+                ));
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "selected-profile-prepare",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/memory", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        crate::server_profiles::add(
+            &config.data_dir,
+            &crate::server_profiles::ProfileName::parse("selected").unwrap(),
+            &url,
+            &[repo.to_string_lossy().into_owned()],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"selected\"\n").unwrap();
+
+        let error = run_from_with_wiring(&config, args, &repo, &WireOverrides::default())
+            .await
+            .unwrap_err();
+        server.abort();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("selected-profile-prepare"), "{detail}");
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                (reqwest::Method::GET, "/memory/healthz".into(), None),
+                (
+                    reqwest::Method::POST,
+                    "/memory/workstream/runs".into(),
+                    Some("Bearer PROFILE-TOKEN".parse().unwrap())
+                ),
+            ],
+            "the probe is anonymous and the managed write uses only the selected profile's token"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_checkout_refuses_its_invalid_profile_before_any_server_request() {
+        let (temp, mut config, mut args) = offline_run_fixture(0).await;
+        let repo = temp.path().join("repo");
+        let home = temp.path().join("home");
+        config.runtime_env = crate::config::RuntimeEnv::for_checkout_tests(
+            home.to_string_lossy(),
+            home.to_string_lossy(),
+            None,
+            false,
+        );
+        args.require_server = true;
+        std::fs::write(repo.join(".ai-memory.toml"), "server = \"missing\"\n").unwrap();
+        let error = run_from_with_wiring(&config, args, &repo, &WireOverrides::default())
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("rejected-unknown-profile"), "{detail}");
+        assert!(
+            !detail.contains(&config.server_url),
+            "no fallback: {detail}"
         );
     }
 
@@ -13127,6 +13282,89 @@ mod tests {
             requests.lock().unwrap()[0].source_cursor.as_deref(),
             Some("cursor"),
             "the cursor still advances past the excluded events"
+        );
+    }
+
+    /// GHSA-h8wj-74hc-vjjp: the previous-session dossier the next harness reads
+    /// must carry no more than the ledger upload above would. The capture policy
+    /// drops an `ignore_paths` call with its result, and the sanitizer redacts a
+    /// credential in a kept result, before either reaches the rendered dossier.
+    #[test]
+    fn previous_session_dossier_carries_no_more_than_the_ledger() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            repo.path().join(".ai-memory.toml"),
+            "[capture]\nignore_paths = [\"docs/adr/**\"]\n",
+        )
+        .unwrap();
+        let event = |kind, content: String, metadata: serde_json::Value| {
+            ai_memory_core::NewWorkstreamEvent {
+                event_id: format!("e-{}", content.len()),
+                agent: AgentKind::ClaudeCode,
+                native_session_id: "sid-1".into(),
+                source_record_id: None,
+                kind,
+                role: None,
+                content,
+                occurred_at: None,
+                metadata,
+            }
+        };
+        let read = |path: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolCall,
+                format!(
+                    "Read: {}",
+                    serde_json::json!({"file_path": repo.path().join(path)})
+                ),
+                serde_json::json!({"tool": "Read", "tool_use_id": id}),
+            )
+        };
+        let output = |text: &str, id: &str| {
+            event(
+                ai_memory_core::WorkstreamEventKind::ToolResult,
+                text.into(),
+                serde_json::json!({"tool_use_id": id}),
+            )
+        };
+        let transcript = ExportedTranscript {
+            native_session_id: "sid-1".into(),
+            source_cursor: Some("cursor".into()),
+            events: vec![
+                read("docs/adr/1.md", "adr"),
+                read("src/lib.rs", "pub"),
+                output("ADRSENTINEL private decision", "adr"),
+                // FAKE token shape, never a live value.
+                output(
+                    "PUBLICCONTROL token ghp_FAKEfakeFAKEfakeFAKEfake012345678",
+                    "pub",
+                ),
+            ],
+            losses: Vec::new(),
+        };
+        let filtered = sanitize_previous_session_history(
+            transcript,
+            &TranscriptCapture::for_checkout(repo.path(), repo.path()),
+            &Sanitizer::builtin(),
+        );
+        let dossier = render_previous_session_history(ManagedHarness::Claude, &filtered);
+        assert!(
+            dossier.contains("PUBLICCONTROL"),
+            "public control: {dossier}"
+        );
+        assert!(dossier.contains("src/lib.rs"), "public call: {dossier}");
+        assert!(
+            !dossier.contains("ADRSENTINEL"),
+            "excluded output: {dossier}"
+        );
+        assert!(!dossier.contains("docs/adr"), "excluded call: {dossier}");
+        assert!(
+            !dossier.contains("ghp_FAKEfakeFAKEfakeFAKEfake012345678"),
+            "unsanitized credential: {dossier}"
+        );
+        assert!(
+            dossier.contains("[REDACTED:github_token]"),
+            "redaction marker: {dossier}"
         );
     }
 

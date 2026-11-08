@@ -9,6 +9,7 @@ use ai_memory_core::agent_backup::{
     AgentAssetKind, AgentAssetScope, AgentBackupEntry, AgentBackupManifest, HostInfo,
 };
 use ai_memory_core::ids::AgentKind;
+use ai_memory_core::routing_skills::{COPILOT_SKILL_DIR, GITHUB_SKILL_DIR, SKILLS_DIR};
 use ai_memory_core::sanitize::{SanitizeConfig, Sanitizer};
 use anyhow::{Context, Result};
 use flate2::Compression;
@@ -822,7 +823,42 @@ pub fn discover_assets(
         )?;
     }
 
-    // 12. VS Code / Copilot
+    // 12. GitHub Copilot CLI: the same skill roots `install-skills --agent
+    // copilot-cli` writes, `$COPILOT_HOME/skills` (default `~/.copilot/skills`)
+    // and the repository's `.github/skills`. The shared roots the same page
+    // lists (`~/.agents/skills`, `.agents/skills`, `.claude/skills`) are
+    // collected above for Codex and Claude Code. See
+    // https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills
+    if filter_agent(AgentKind::CopilotCli) {
+        if want_global {
+            let copilot_dir =
+                crate::commands::path_util::agent_config_home(std::env::var_os("COPILOT_HOME"))
+                    .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::CopilotCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &copilot_dir.join(SKILLS_DIR),
+                ".copilot/skills",
+                "copilot-cli/skills",
+            )?;
+        }
+
+        if want_project {
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::CopilotCli,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Project,
+                &cwd.join(GITHUB_SKILL_DIR).join(SKILLS_DIR),
+                ".github/skills",
+                "project/copilot-cli/skills",
+            )?;
+        }
+    }
+
+    // 13. VS Code / Copilot
     if want_project {
         push_if_file(
             &mut assets,

@@ -460,10 +460,17 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // `ghs_` (server-to-server / Actions), `ghr_` (refresh).
     (r"gh[pousr]_[A-Za-z0-9]{20,}", "github_token"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "github_token"),
-    // ai-memory's own DB-user API keys (`aim_`) and web-session secrets
-    // (`ams_`): the prefix plus 43 base64url characters. The 40-character
-    // floor keeps snake_case identifiers that start with `aim_` intact.
-    (r"\b(?:aim|ams)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
+    // ai-memory's own keys: native DB-user (`aim_`), web-session (`ams_`), and
+    // external mcp-auth (`amk_`). Each is the prefix plus a 256-bit base64url
+    // secret (43 characters); the 40-character floor keeps snake_case
+    // identifiers that start with one of the prefixes intact. Deliberately
+    // left-unanchored: `strip_control` runs before matching and can glue a
+    // word, or the visible tail of a removed ANSI sequence (`…[32m`), straight
+    // onto the prefix, where a `\b` or non-letter anchor would then miss the
+    // key. The distinctive prefix plus a 40-character base64url tail makes a
+    // false positive on real text negligible — unlike the AWS rule below,
+    // whose `AKIA`/`ASIA` prefix is ordinary uppercase text.
+    (r"(?:aim|ams|amk)_[A-Za-z0-9_-]{40,}", "ai_memory_key"),
     // AWS access-key IDs: long-lived (AKIA) and STS temporary (ASIA).
     //
     // Anchored to the exact published format — a 4-character prefix plus
@@ -474,7 +481,18 @@ const BUILTIN_PATTERNS: &[(&str, &str)] = &[
     // BEFORE storage and is irreversible: the observation loses the text with
     // no error and no way to recover it. The word boundaries keep a real key
     // from being missed when it sits inside punctuation.
-    (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "aws_key"),
+    //
+    // The left anchor also accepts a percent-encoded byte (`?key=%20AKIA…`),
+    // like the `sk-`/Stripe rules, so a key glued to an escape survives the
+    // strip. A letter removed from directly before the prefix (a stripped
+    // control character between two words) is still not matched: redacting
+    // `AKIA` mid-word is the irreversible uppercase-text destruction the floor
+    // above guards against, so that one case is left to the own-prefix rule's
+    // distinctive tail, which `AKIA` lacks.
+    (
+        r"(?:\b|%[0-9A-Fa-f]{2})(?P<secret>(?:AKIA|ASIA)[0-9A-Z]{16})\b",
+        "aws_key",
+    ),
     // Naked Google / Gemini API keys (legacy standard-key shape).
     (r"AIza[A-Za-z0-9_\-]{30,}", "google_api_key"),
     // Gemini authorization ("auth") keys. AI Studio has issued these instead
@@ -2515,6 +2533,46 @@ mod tests {
             "ams_ and aim_ are the key prefixes",
         ] {
             assert_eq!(s.scrub(raw), raw, "must be left alone: {raw}");
+        }
+    }
+
+    /// `strip_control` runs before matching, so a word glued onto a key by a
+    /// stripped character used to leave the key whole: the `aim_`/`ams_` rule
+    /// and the AWS rule both required a left word boundary that the removal
+    /// had just destroyed, and `amk_` had no rule at all (GHSA-6pmr-q79m-87vp,
+    /// item 5). The own-prefix rule is now left-unanchored; the AWS rule
+    /// additionally accepts a percent-encoded byte.
+    #[test]
+    fn a_key_glued_onto_a_word_by_a_stripped_character_is_still_redacted() {
+        let s = s();
+        let tail = "FAKEfake0123-_xy".repeat(3); // 48 base64url chars, > the 40 floor
+        for prefix in ["aim_", "ams_", "amk_"] {
+            let key = format!("{prefix}{tail}");
+            for glued in [
+                format!("title\u{7}{key}"),      // a removed BEL
+                format!("title\u{1b}[32m{key}"), // a removed ANSI colour code
+                format!("word%20{key}"),         // a percent-encoded byte
+                format!("prefixword{key}"),      // a letter directly before it
+            ] {
+                let out = s.scrub(&glued);
+                assert!(
+                    out.contains("[REDACTED:ai_memory_key]") && !out.contains(&tail),
+                    "glued key must be redacted: {glued:?} -> {out:?}"
+                );
+            }
+        }
+        // AWS: the percent-encoded byte is newly covered; a boundary case still
+        // works. (A letter removed from directly before `AKIA` stays unmatched
+        // on purpose — redacting it mid-word would destroy uppercase text.)
+        for aws in [
+            "url?k=%20AKIAFAKEFAKEFAKEFAKE",
+            "set AKIAFAKEFAKEFAKEFAKE here",
+        ] {
+            let out = s.scrub(aws);
+            assert!(
+                out.contains("[REDACTED:aws_key]") && !out.contains("FAKEFAKE"),
+                "AWS key must be redacted: {aws:?} -> {out:?}"
+            );
         }
     }
 }

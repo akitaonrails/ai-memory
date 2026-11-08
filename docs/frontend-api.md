@@ -788,15 +788,20 @@ or `too_large`; `from` is `null` when `to` replaced nothing at this path.
 - `POST /api/v1/search`: at most **25 scopes** per request.
 - HTTP body cap: **10 MB** (shared with the MCP body limit; you won't
   hit this for normal API traffic).
-- **Cache-Control + ETag.** Identity-independent read endpoints use
-  `Cache-Control: private, max-age=N` with an endpoint-specific TTL; page reads
-  also carry a SHA-256 `ETag`, and a matching `If-None-Match` receives `304 Not
-  Modified`. Briefing, overview, handoff-list, session-list and session
-  observation and page-history responses depend on the authenticated actor and therefore use
-  `Cache-Control: private, no-store`, so
-  a browser cannot reuse Alice's prompt-derived response after credentials at
-  the same URL switch to Bob. Search responses are not cacheable because the
-  request body affects the result.
+- **Cache-Control + ETag.** Every `/api/v1` read is grant-filtered (#708):
+  what it returns depends on who is signed in, so none of them may be served
+  from the browser's own cache to a later viewer at the same URL. The list,
+  graph and recent reads (workspaces, projects, pages, graph, recent) and the
+  actor-scoped briefing, overview, handoff-list, session-list, session
+  observation and page-history reads all use `Cache-Control: private,
+  no-store`. The single-page read carries a SHA-256 `ETag` and uses
+  `Cache-Control: private, no-cache`: the browser keeps the body but must
+  revalidate with `If-None-Match` every time, and because the server runs the
+  grant check before comparing the tag, a viewer without a grant receives `403`
+  rather than a `304` from the browser's copy. Search responses are not
+  cacheable because the request body affects the result. The effect is that a
+  browser cannot reuse Alice's response after credentials at the same URL
+  switch to Bob.
 
 ## 6. Custom UI hosting and base paths
 

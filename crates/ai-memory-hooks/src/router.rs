@@ -5216,12 +5216,23 @@ async fn process_authorized(
             .await;
         match result {
             Ok(admission) => {
-                state.session_agents.record(
-                    session_id,
-                    caller.as_deref(),
-                    env.agent,
-                    std::time::Instant::now(),
-                );
+                // Only a writer-issued session guard establishes an agent.
+                // An ignored end can succeed without any persisted session.
+                match &admission {
+                    HookSessionAdmission::Observation { session, .. }
+                    | HookSessionAdmission::EndOpen { session, .. }
+                    | HookSessionAdmission::ReEnd { session, .. }
+                    | HookSessionAdmission::AlreadyEnded { session } => {
+                        state.session_agents.record(
+                            session_id,
+                            caller.as_deref(),
+                            session.agent_kind(),
+                            std::time::Instant::now(),
+                        );
+                    }
+                    HookSessionAdmission::InvalidMissingEnd
+                    | HookSessionAdmission::InvalidScopedEnd => {}
+                }
                 break (admission, log_title, ingest_guard);
             }
             Err(StoreError::SessionAgentMismatch { bound }) => {
@@ -15181,6 +15192,186 @@ pub(crate) mod tests {
             Some(AgentKind::Codex)
         );
         assert_eq!(agents.lock().len(), 1);
+    }
+
+    /// An end for an unknown session creates nothing. It must not teach the
+    /// fast refusal cache an agent that can block the session's real start.
+    #[tokio::test]
+    async fn missing_end_does_not_bind_an_agent_or_refuse_the_real_start() {
+        for caller in [None, Some(IdentityKey::User("alice".into()))] {
+            let tmp = TempDir::new().unwrap();
+            let mut state = make_state(&tmp).await;
+            state.trusted_proxy_identity = true;
+            let state = Arc::new(state);
+            let cwd = "/home/user/missing-end";
+            let native = "missing-end-before-real-start";
+            let session = SessionId::from_native(native);
+            let caller_key = caller.as_ref().map(IdentityKey::storage_key);
+            let mut end = session_envelope("session-end", native, cwd);
+            end.agent = AgentKind::Dsh;
+            assert_eq!(
+                process_authorized(
+                    &state,
+                    end,
+                    caller.clone(),
+                    ai_memory_core::AuthLevel::Anonymous,
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .unwrap(),
+                HookProcessingOutcome::IgnoredEnd
+            );
+            assert_eq!(
+                state.reader.session_agent_kind(session).await.unwrap(),
+                None
+            );
+            assert_eq!(
+                state.session_agents.bound_agent(
+                    session,
+                    caller_key.as_deref(),
+                    std::time::Instant::now()
+                ),
+                None,
+                "an ignored end is not evidence of a persisted agent"
+            );
+            let actor = caller.as_ref().map(|_| {
+                axum::Extension(ai_memory_core::ActorContext {
+                    user: Some("alice".into()),
+                    ..Default::default()
+                })
+            });
+            let response = handle_hook(
+                State(state.clone()),
+                Query(HookQuery {
+                    event: "session-start".into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                }),
+                actor,
+                None,
+                None,
+                HeaderMap::new(),
+                Json(serde_json::json!({"session_id": native, "cwd": cwd})),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let observations =
+                wait_for_kinds(&state, native, &[ObservationKind::SessionStart]).await;
+            assert_eq!(observations.len(), 1, "only the real start was stored");
+            assert_eq!(
+                state.reader.session_agent_kind(session).await.unwrap(),
+                Some(AgentKind::ClaudeCode)
+            );
+            assert_eq!(
+                state.session_agents.bound_agent(
+                    session,
+                    caller_key.as_deref(),
+                    std::time::Instant::now()
+                ),
+                Some(AgentKind::ClaudeCode)
+            );
+            assert_eq!(
+                state.session_agents.bound_agent(
+                    session,
+                    Some("user:bob"),
+                    std::time::Instant::now()
+                ),
+                None,
+                "another caller learns nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_and_replayed_ends_rebuild_only_the_persisted_agent_cache() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let native = "ended-session-agent";
+        let session = SessionId::from_native(native);
+        let cwd = "/home/user/ended-agent";
+        process(
+            &state,
+            session_envelope("session-start", native, cwd),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            state.session_agents.lock().clear();
+            process(
+                &state,
+                session_envelope("session-end", native, cwd),
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state
+                    .session_agents
+                    .bound_agent(session, None, std::time::Instant::now()),
+                Some(AgentKind::ClaudeCode),
+                "both the first end and an idempotent replay verify the stored agent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_missing_end_and_start_keep_the_persisted_agent_binding() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = "/home/user/concurrent-agent";
+        for index in 0..4 {
+            let native = format!("concurrent-start-end-{index}");
+            let session = SessionId::from_native(&native);
+            let start = session_envelope("session-start", &native, cwd);
+            let mut end = session_envelope("session-end", &native, cwd);
+            end.agent = AgentKind::Dsh;
+            let (ended, started) = tokio::join!(
+                process_authorized(
+                    &state,
+                    end,
+                    None,
+                    ai_memory_core::AuthLevel::Anonymous,
+                    Vec::new(),
+                    None
+                ),
+                process_authorized(
+                    &state,
+                    start,
+                    None,
+                    ai_memory_core::AuthLevel::Anonymous,
+                    Vec::new(),
+                    None
+                ),
+            );
+            assert!(started.is_ok(), "{started:?}");
+            match ended {
+                Ok(outcome) => assert_eq!(outcome, HookProcessingOutcome::IgnoredEnd),
+                Err(error) => assert!(matches!(
+                    error.downcast_ref::<StoreError>(),
+                    Some(StoreError::SessionAgentMismatch {
+                        bound: AgentKind::ClaudeCode
+                    })
+                )),
+            }
+            assert_eq!(
+                state.reader.session_agent_kind(session).await.unwrap(),
+                Some(AgentKind::ClaudeCode)
+            );
+            assert_eq!(
+                state
+                    .session_agents
+                    .bound_agent(session, None, std::time::Instant::now()),
+                Some(AgentKind::ClaudeCode)
+            );
+        }
     }
 
     /// #2023: once the store has bound a session to an agent, `POST /hook`

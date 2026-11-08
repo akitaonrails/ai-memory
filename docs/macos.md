@@ -233,9 +233,12 @@ across rebuilds. The menu extra has no Dock icon.
 2. The status item is green when `GET /admin/status` succeeds, yellow when the
    server is up but the LLM/embedding role is in error or the write queue is
    non-empty, red when the server is unreachable. The app sends the token saved
-   in Settings, or, when none is saved, the one `init` wrote to
-   `auth-tokens/default` in its data dir, so an install the app initialized
-   needs no pasting.
+   in Settings only to the server it was saved for, so changing the URL does not
+   carry it to a different host; when no token is saved it sends the one `init`
+   wrote to `auth-tokens/default` in its data dir, but only to a loopback
+   server, so an install the app initialized needs no pasting. A token saved for
+   another server is not sent, and Settings says so with a **Clear saved token**
+   button.
 3. **Open Web UI**, **Show Status…**, **Open Config**, **Open Data Directory**,
    and **Open Logs** call the existing browser UI, the bundled CLI, and Finder.
 

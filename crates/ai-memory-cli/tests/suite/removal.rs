@@ -306,7 +306,9 @@ fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
 }
 
 /// A print-only preview of a project-scoped install must not hand the operator
-/// a bearer to paste into the checkout; the user-level preview still embeds it.
+/// a bearer to paste into the checkout, and since GHSA-6pmr-q79m-87vp item 1
+/// the user-level preview masks its inline bearer too (it used to embed it
+/// verbatim), so the live token is never left in the terminal scrollback.
 #[test]
 fn project_scope_preview_withholds_the_bearer_token() {
     let _guard = cli_test_lock();
@@ -343,8 +345,12 @@ fn project_scope_preview_withholds_the_bearer_token() {
 
     let global = preview("global");
     assert!(
-        global.contains("SEKRIT-PREVIEW"),
-        "control: the user-level preview embeds it as before: {global}"
+        !global.contains("SEKRIT-PREVIEW"),
+        "the user-level preview must not embed the raw bearer (GHSA-6pmr item 1): {global}"
+    );
+    assert!(
+        global.contains("[REDACTED]"),
+        "the user-level preview masks the bearer: {global}"
     );
     assert!(
         !home.path().join(".claude").exists() && !project.path().join(".claude").exists(),
@@ -2512,11 +2518,13 @@ fn an_explicit_freebuff_bridge_key_is_stored_outside_the_client_config() {
     );
 }
 
-/// Without `--apply` nothing is stored: a printed FreeBuff snippet is the
-/// operator's to place, so it still carries the key inline. This is the guard
-/// that keeps the redirect above from reaching the print path.
+/// Without `--apply` nothing is stored and nothing is written. Since
+/// GHSA-6pmr-q79m-87vp item 1 the printed snippet masks the inline bearer
+/// instead of carrying it verbatim, so the live key is not left in the
+/// terminal; `--apply` still stores the real key (the test above). This is the
+/// guard that keeps the store redirect above from reaching the print path.
 #[test]
-fn a_printed_freebuff_snippet_keeps_the_key_inline() {
+fn a_printed_freebuff_snippet_masks_the_key_and_stores_nothing() {
     const KEY: &str = "aim_freebuff_printed_0123456789";
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();
@@ -2533,8 +2541,12 @@ fn a_printed_freebuff_snippet_keeps_the_key_inline() {
     );
     let snippet = String::from_utf8_lossy(&output.stdout);
     assert!(
-        snippet.contains(KEY),
-        "the printed snippet dropped the key the operator has to place: {snippet}"
+        !snippet.contains(KEY),
+        "the printed snippet leaked the live bearer: {snippet}"
+    );
+    assert!(
+        snippet.contains("[REDACTED]"),
+        "the printed snippet did not mask the bearer: {snippet}"
     );
     assert!(
         !home

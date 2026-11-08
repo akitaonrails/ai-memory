@@ -1,6 +1,5 @@
 //! JSON routes for third-party read-only frontends.
 
-use std::cmp::Reverse;
 use std::sync::Arc;
 
 use ai_memory_core::{ObservationKind, PagePath, ProjectId, SessionId, WorkspaceId};
@@ -18,13 +17,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::state::WebState;
-
-/// Cache TTL for page-list, workspace, search, and summary endpoints.
-const LIST_CACHE_MAX_AGE: u32 = 30;
-/// Cache TTL for project page-list endpoint.
-const PAGES_LIST_CACHE_MAX_AGE: u32 = 60;
-/// Cache TTL (and ETag max-age) for single-page reads.
-const PAGE_CACHE_MAX_AGE: u32 = 300;
 
 /// Build the `/api/v1` router from a shared [`WebState`].
 pub(crate) fn build(state: Arc<WebState>) -> Router {
@@ -92,29 +84,36 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
         .with_state(state)
 }
 
-/// Attach `Cache-Control: private, max-age=N` to a successful response.
-///
-/// Applied only to 2xx bodies — error paths return their responses
-/// directly without calling this, so error responses stay uncached.
-fn with_cache(resp: Response, max_age: u32) -> Response {
-    let mut resp = resp;
-    if let Ok(val) = HeaderValue::from_str(&format!("private, max-age={max_age}")) {
-        resp.headers_mut().insert(header::CACHE_CONTROL, val);
-    }
-    resp
-}
-
 /// Prevent browser reuse of a response whose body depends on request identity.
 ///
-/// `private` alone still permits a browser cache to serve Alice's response
-/// after credentials at the same URL switch to Bob. These endpoints contain
-/// owner-scoped prompt text, so successful responses must be revalidated by
-/// executing the authorization/filtering path on every request.
+/// Every `/api/v1` read is grant-filtered (#708): what it returns depends on
+/// who is signed in. `private` alone still permits the browser's own cache to
+/// serve Alice's response after credentials at the same URL switch to Bob, so
+/// on a shared browser profile Bob could see Alice's restricted data without
+/// the server ever running his grant check. `no-store` forbids the browser
+/// from keeping the body at all, so the authorization/filtering path runs on
+/// every request.
 fn with_no_store(resp: Response) -> Response {
     let mut resp = resp;
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
+    );
+    resp
+}
+
+/// Force the browser to revalidate a response that carries an `ETag`.
+///
+/// `no-cache` lets the browser keep the body but never reuse it without first
+/// revalidating with `If-None-Match`. The single-page read runs `authorize_read`
+/// before it compares the tag, so a viewer without a grant gets 403 rather than
+/// a 304 served from the browser's copy, while a granted viewer still saves the
+/// body transfer on an unchanged page.
+fn with_revalidate(resp: Response) -> Response {
+    let mut resp = resp;
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
     );
     resp
 }
@@ -128,10 +127,7 @@ async fn workspaces_handler(
         .list_workspaces_with_stats(viewer_of(viewer))
         .await
         .map_err(internal_error)?;
-    Ok(with_cache(
-        Json(workspaces).into_response(),
-        LIST_CACHE_MAX_AGE,
-    ))
+    Ok(with_no_store(Json(workspaces).into_response()))
 }
 
 /// Cross-project dependency graph: every resolved link whose endpoints are
@@ -169,9 +165,8 @@ async fn graph_handler(
         .cross_project_edges(scope, viewer)
         .await
         .map_err(internal_error)?;
-    Ok(with_cache(
+    Ok(with_no_store(
         Json(serde_json::json!({ "edges": edges })).into_response(),
-        LIST_CACHE_MAX_AGE,
     ))
 }
 
@@ -189,7 +184,7 @@ async fn project_graph_handler(
         .project_link_graph(workspace_id, project_id)
         .await
         .map_err(internal_error)?;
-    Ok(with_cache(
+    Ok(with_no_store(
         Json(serde_json::json!({
             "workspace": workspace,
             "project": project,
@@ -198,7 +193,6 @@ async fn project_graph_handler(
             "edges": graph.edges,
         }))
         .into_response(),
-        LIST_CACHE_MAX_AGE,
     ))
 }
 
@@ -222,10 +216,7 @@ async fn projects_handler(
         state.reader.list_projects_with_stats(viewer).await
     }
     .map_err(internal_error)?;
-    Ok(with_cache(
-        Json(projects).into_response(),
-        LIST_CACHE_MAX_AGE,
-    ))
+    Ok(with_no_store(Json(projects).into_response()))
 }
 
 async fn pages_handler(
@@ -239,10 +230,7 @@ async fn pages_handler(
         .list_unexpired_pages(&workspace, &project)
         .await
         .map_err(internal_error)?;
-    Ok(with_cache(
-        Json(pages).into_response(),
-        PAGES_LIST_CACHE_MAX_AGE,
-    ))
+    Ok(with_no_store(Json(pages).into_response()))
 }
 
 async fn page_handler(
@@ -321,18 +309,16 @@ async fn page_handler(
         .and_then(|v| v.to_str().ok())
         && inm == etag_value
     {
-        let mut resp = axum::http::Response::builder()
+        let resp = axum::http::Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .body(axum::body::Body::empty())
             .expect("static builder cannot fail");
+        let mut resp = with_revalidate(resp);
         resp.headers_mut().insert(header::ETAG, etag_header.clone());
-        if let Ok(cc) = HeaderValue::from_str(&format!("private, max-age={PAGE_CACHE_MAX_AGE}")) {
-            resp.headers_mut().insert(header::CACHE_CONTROL, cc);
-        }
         return Ok(resp);
     }
 
-    let mut resp = with_cache(
+    let mut resp = with_revalidate(
         (
             [(
                 header::CONTENT_TYPE,
@@ -341,7 +327,6 @@ async fn page_handler(
             json,
         )
             .into_response(),
-        PAGE_CACHE_MAX_AGE,
     );
     resp.headers_mut().insert(header::ETAG, etag_header);
     Ok(resp)
@@ -647,21 +632,12 @@ async fn recent_handler(
         lookup_project(&state, &workspace, &project, viewer_of(viewer)).await?;
     let limit = query.limit.clamp(1, 100);
     if query.updated_since.is_none() && query.cursor.is_none() {
-        let mut pages = state
+        let pages = state
             .reader
-            .list_unexpired_pages(&workspace, &project)
+            .recent_unexpired_page_summaries(workspace_id, project_id, &workspace, &project, limit)
             .await
             .map_err(internal_error)?;
-        // RFC3339's variable fractional precision is not lexically ordered.
-        // The reader's empty fallback for an invalid timestamp stays last.
-        pages.sort_by_cached_key(|page| {
-            (
-                Reverse(page.updated_at.parse::<jiff::Timestamp>().ok()),
-                page.path.clone(),
-            )
-        });
-        pages.truncate(limit);
-        return Ok(with_cache(Json(pages).into_response(), LIST_CACHE_MAX_AGE));
+        return Ok(with_no_store(Json(pages).into_response()));
     }
     let cursor = query
         .cursor

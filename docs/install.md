@@ -96,6 +96,9 @@ sh install.sh
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
 
+Relative `AI_MEMORY_BIN_DIR` and `AI_MEMORY_LIB_DIR` paths are resolved from
+the directory where you start `install.sh`.
+
 Native Windows has its own script, `install.ps1`, published next to
 `install.sh` with its own `install.ps1.sha256`. In PowerShell (no
 administrator rights needed):
@@ -110,8 +113,15 @@ unpacking when the checksum file is missing, names another asset, or does not
 match, and refuses an archive entry that is absolute or holds `..`. The
 release goes to `%LOCALAPPDATA%\Programs\ai-memory` (`AI_MEMORY_INSTALL_DIR`
 overrides it), which is added to your user `PATH` unless
-`AI_MEMORY_NO_MODIFY_PATH=1`. An existing install there is left alone; update it
-with `ai-memory upgrade`. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
+`AI_MEMORY_NO_MODIFY_PATH=1`. The destination must not exist: even an empty
+directory, an unrelated file, or a directory link is refused before download.
+Remove it if it is empty or left over from a failed install, choose a new
+dedicated directory, or update an existing installation with
+`ai-memory upgrade`. A validated release is copied to a new sibling staging
+directory and published only if the destination is still absent. On a copy or
+publication failure, the destination is never deleted; the error identifies
+the leftover staging directory for inspection and later cleanup. It is not a
+completed installation. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
 work as for `install.sh`. On Windows on Arm it installs the x86_64 build, which
 Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
 failure under `iex` leaves your PowerShell window open. Details are in
@@ -1105,10 +1115,10 @@ failure: they POST first and write the event to the same
 `<data_dir>/hook-spool/` contract when the server is unreachable, answers
 5xx, or answers 408, 425 or 429 (a saturated server asks for a retry), then
 flush the backlog behind the next delivery that succeeds. Any other 4xx
-is a permanent rejection and is not retried. Script drains leave native OIDC
-entries untouched for `ai-memory hook-drain`, which resolves or refreshes their
-credentials from `auth.json`; they continue with other eligible entries within
-the same bounded scan. Session start
+is a permanent rejection and is not retried. POSIX, PowerShell, and generated
+TypeScript drains leave native OIDC entries untouched for `ai-memory hook-drain`
+to resolve or refresh credentials from `auth.json`. They continue with other
+eligible entries within the same bounded scan. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.

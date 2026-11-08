@@ -88,7 +88,7 @@ export type SessionInfo = Omit<ToolIndex, "tools">;
 
 /** Run `initialize` plus `notifications/initialized` when stateful. @internal */
 export async function initialize(transport: Transport, options?: CallOptions): Promise<SessionInfo> {
-  transport.resetSession();
+  const epoch = transport.resetSession();
   const newest = SUPPORTED_PROTOCOL_VERSIONS[0] ?? "2024-11-05";
   const { result, headers } = await transport.rpcWithHeaders(
     "initialize",
@@ -113,7 +113,13 @@ export async function initialize(transport: Transport, options?: CallOptions): P
       server.version,
     );
   }
-  const statefulSession = transport.adoptSession(headers);
+  // A superseded handshake (a concurrent refresh opened a newer session while
+  // this one was in flight) must neither overwrite the live session id nor
+  // send `notifications/initialized` against its stale one (#2047); it simply
+  // reports no stateful session of its own, and the caller's later calls run
+  // on the session the refresh established.
+  const adoption = transport.adoptSession(headers, epoch);
+  const statefulSession = adoption === "adopted";
   if (statefulSession) await transport.notify("notifications/initialized", options);
   return {
     server: { name: transport.safeText(server.name), version: transport.safeText(server.version) },

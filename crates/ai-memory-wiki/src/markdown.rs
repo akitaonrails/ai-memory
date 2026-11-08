@@ -1577,6 +1577,41 @@ mod tests {
         assert_eq!(emit(&md).unwrap(), "Hello\n");
     }
 
+    /// Shapes serde_yaml 0.9 (libyaml, YAML 1.1) read and granit-parser
+    /// (YAML 1.2) reads otherwise. Pinned so a parser bump that changes one
+    /// is a red test, not a page that silently stops indexing.
+    #[test]
+    fn frontmatter_shapes_read_differently_since_serde_saphyr() {
+        let refused = |yaml: &str| {
+            let err = parse(&format!("---\n{yaml}\n---\nbody\n")).unwrap_err();
+            assert!(
+                matches!(err, crate::error::WikiError::Yaml(_)),
+                "{yaml:?}: {err:?}"
+            );
+        };
+        // A comment glued to a closing quote or a block indicator.
+        refused("title: 'Release notes'# reviewed");
+        refused("a: \"x\"# c");
+        refused(">#x");
+        // U+2028 was a line break under YAML 1.1.
+        refused(">+\u{2028}");
+        refused("a: x\u{2028}b: y");
+        // Kept as content now, folded to a space before.
+        assert_eq!(
+            frontmatter_of("a: \"x\u{85}y\""),
+            serde_json::json!({ "a": "x\u{85}y" })
+        );
+        assert_eq!(
+            frontmatter_of("a: |\n  x\u{2028}  y"),
+            serde_json::json!({ "a": "x\u{2028}  y" })
+        );
+        // Control: with a space before `#`, both parsers agree.
+        assert_eq!(
+            frontmatter_of("title: 'Release notes' # reviewed"),
+            serde_json::json!({ "title": "Release notes" })
+        );
+    }
+
     fn frontmatter_of(yaml: &str) -> serde_json::Value {
         parse(&format!("---\n{yaml}\n---\nbody\n"))
             .unwrap()

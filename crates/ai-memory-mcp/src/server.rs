@@ -4494,16 +4494,23 @@ impl AiMemoryServer {
         let dry = args.dry_run.unwrap_or(false);
         // A session id reaches a repository without naming it, so it never
         // passes through scope resolution and the grant check that comes with
-        // it (#708). Authorize the repository the page would land in — the
-        // consolidator's own target, not a guess — before anything runs,
-        // dry runs included: a dry run reports the resolved path and the
-        // admission verdict, which is itself information about that
-        // repository. Writing a page needs `write`.
+        // it (#708). Resolve the consolidator's own write target ONCE here,
+        // authorize the repository the page would land in, then bind the
+        // consolidation to that exact scope below (`*_in_scope`). Resolving
+        // twice — once to authorize, once inside the consolidator — left a
+        // window in which a concurrent observation in another project could
+        // flip the target between the grant check and the write, landing the
+        // page (built from that project's observations) in a repository the
+        // caller was never granted (GHSA-xfgc-hc4c-wj7h). Authorize even a
+        // dry run: it reports the resolved path and the admission verdict,
+        // itself information about that repository. Writing a page needs
+        // `write`.
+        let target = consolidator
+            .session_target(session_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         if let Some(viewer) = Self::viewer_from_parts(Some(&parts))
-            && let Some((workspace_id, project_id)) = consolidator
-                .session_target(session_id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            && let Some((workspace_id, project_id)) = target
         {
             ai_memory_store::authorize_scope_for(
                 &self.reader,
@@ -4530,29 +4537,60 @@ impl AiMemoryServer {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if args.multi_page.unwrap_or(false) {
-            let outcomes = consolidator
-                .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(
-                        ai_memory_consolidate::redacted_error_summary(&e),
-                        None,
-                    )
-                })?;
+            // Bind to the authorized target when there is one; a `None` target
+            // (no observations, no session row) falls through to the
+            // re-resolving path, which reports the unknown session as unknown.
+            let outcomes = match target {
+                Some((ws, proj)) => {
+                    consolidator
+                        .consolidate_session_multi_in_scope(
+                            ws,
+                            proj,
+                            session_id,
+                            dry,
+                            actor,
+                            author_id,
+                            instructions,
+                        )
+                        .await
+                }
+                None => {
+                    consolidator
+                        .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
+                        .await
+                }
+            }
+            .map_err(|e| {
+                McpError::internal_error(ai_memory_consolidate::redacted_error_summary(&e), None)
+            })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
             ok_json(&serde_json::json!({ "outcomes": outcomes }))
         } else {
-            let outcome = consolidator
-                .consolidate_session(session_id, dry, actor, author_id, instructions)
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(
-                        ai_memory_consolidate::redacted_error_summary(&e),
-                        None,
-                    )
-                })?;
+            let outcome = match target {
+                Some((ws, proj)) => {
+                    consolidator
+                        .consolidate_session_in_scope(
+                            ws,
+                            proj,
+                            session_id,
+                            dry,
+                            actor,
+                            author_id,
+                            instructions,
+                        )
+                        .await
+                }
+                None => {
+                    consolidator
+                        .consolidate_session(session_id, dry, actor, author_id, instructions)
+                        .await
+                }
+            }
+            .map_err(|e| {
+                McpError::internal_error(ai_memory_consolidate::redacted_error_summary(&e), None)
+            })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
