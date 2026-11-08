@@ -472,6 +472,27 @@ fn cross_into_other_project(conn: &Connection) {
     .unwrap();
 }
 
+/// A session page at session 10's path in the second project, the way the
+/// consolidator leaves one when most of the session's rows landed there.
+fn page_in_other_project(conn: &Connection, latest: i64) {
+    conn.execute(
+        "INSERT INTO pages \
+         (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+          frontmatter_json, is_latest, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'sessions/s10.md', 'sessions/s10.md', 'episodic', \
+                 'distilled there', ?4, '{}', ?5, ?6, ?6)",
+        params![
+            &id(103)[..],
+            &id(1)[..],
+            &id(3)[..],
+            &[0u8; 32][..],
+            latest,
+            NOW + 60,
+        ],
+    )
+    .unwrap();
+}
+
 fn rows_in(conn: &Connection, project: ProjectId) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
@@ -518,6 +539,47 @@ async fn a_crossed_sessions_rows_stay_in_a_project_with_no_page_of_it() {
         "the watermark follows the surviving rows"
     );
     assert_eq!(rows_in(&conn, other_proj()), 3);
+}
+
+/// The consolidator writes a session's page where most of its rows landed, so
+/// the other project can hold the distillation of its own rows. A live head
+/// there makes those rows prunable; an evicted one does not. Without this
+/// control a guard that only accepts the session's home project would pass.
+#[tokio::test]
+async fn a_crossed_sessions_rows_prune_where_that_project_has_a_live_page() {
+    for (latest, prunable) in [(1, 3_usize), (0, 0)] {
+        let (_tmp, store) = open_seeded(None);
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+        cross_into_other_project(&conn);
+        page_in_other_project(&conn, latest);
+
+        assert_eq!(
+            store
+                .reader
+                .prunable_observation_count(ws(), other_proj(), CUTOFF)
+                .await
+                .unwrap(),
+            prunable,
+            "dry run with is_latest = {latest}"
+        );
+        let outcome = store
+            .writer
+            .prune_consolidated_observations(ws(), other_proj(), CUTOFF, 100)
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted, prunable, "prune with is_latest = {latest}");
+        assert_eq!(
+            rows_in(&conn, other_proj()),
+            3 - prunable as i64,
+            "rows left in the other project with is_latest = {latest}"
+        );
+        assert_eq!(
+            rows_in(&conn, proj()),
+            6,
+            "the prune of one project leaves the home project's rows alone"
+        );
+    }
 }
 
 /// #1843: the retention prune deletes a file index entry with its row, so a
