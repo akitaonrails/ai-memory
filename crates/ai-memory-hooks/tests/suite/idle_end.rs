@@ -923,6 +923,85 @@ async fn idle_tick_ends_a_session_that_crossed_into_another_project() {
     );
 }
 
+/// The other way into the stamp: when the agent wrote the session's page, the
+/// tick counts the session with `session_observation_count` instead of a
+/// digest. A crossed session must end through that branch too, so both
+/// branches and the stamp have to count the same population.
+#[tokio::test]
+async fn idle_tick_keeps_the_agents_page_for_a_crossed_session() {
+    let (_tmp, store, wiki, state) = harness().await;
+    let (ws, proj) = (state.workspace_id, state.project_id);
+    let away = store
+        .writer
+        .get_or_create_project(ws, "away", None)
+        .await
+        .unwrap();
+    let now = now_us();
+    let idle_at = now - 5 * HOUR_US;
+    let sid = begin(&store, ws, proj, idle_at, None).await;
+    observe(
+        &state,
+        sid,
+        ObservationKind::UserPrompt,
+        idle_at,
+        "agent wrote its own summary",
+    )
+    .await;
+    observe_titled(
+        &state,
+        sid,
+        away,
+        "a tool in the other project",
+        ObservationKind::PostToolUse,
+        idle_at,
+        "tool body",
+    )
+    .await;
+    wiki.write_page(ai_memory_wiki::WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new(page_path(sid)).unwrap(),
+        frontmatter: serde_json::json!({ "consolidated_by": "agent" }),
+        body: "Agent-authored summary of a crossed session.".into(),
+        tier: Tier::Episodic,
+        pinned: false,
+        title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ActorContext::default(),
+        evidence: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let sessions = store
+        .reader
+        .idle_open_sessions(now - 2 * HOUR_US, IDLE_END_BATCH)
+        .await
+        .unwrap();
+    let outcome = run_idle_end_tick(&IdleEndTickInput {
+        writer: &store.writer,
+        reader: &store.reader,
+        wiki: &wiki,
+        sessions,
+        now_us: jiff::Timestamp::now().as_microsecond(),
+        consolidate_on_session_end: true,
+        has_consolidator: true,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        (outcome.ended, outcome.skipped, outcome.pages_written),
+        (1, 0, 0),
+        "the agent's page is kept and the crossed session still ends"
+    );
+    assert!(matches!(
+        disposition(&store, ws, proj, sid).await,
+        SessionEndDisposition::AlreadyEnded
+    ));
+    assert_eq!(page_total(&store.reader, ws, proj, sid).await, 1);
+}
+
 #[tokio::test]
 async fn idle_tick_skips_a_session_ended_by_a_real_session_end_between_selection_and_write() {
     let (_tmp, store, _wiki, state) = harness().await;
