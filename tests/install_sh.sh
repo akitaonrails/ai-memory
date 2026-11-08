@@ -313,4 +313,35 @@ run_install rerun "file://${base}" || fail "rerun over its own release refused: 
 [ ! -e "${lib}/ai-memory.new" ] && [ ! -e "${lib}/.hooks.old" ] \
   || fail "the rerun kept the interrupted upgrade's swap files"
 
+# The link is replaced only when it points at this install's binary. A link to
+# a hand-built binary (docs/macos.md suggests one at this very path for a
+# source build) stays as it was, and nothing is unpacked.
+plain_tree "${TMP_ROOT}/link-tree"
+base="$(publish foreign-link "${TMP_ROOT}/link-tree")"
+home="${TMP_ROOT}/foreign-link/home"
+mkdir -p "${home}/src/target/release" "${home}/.local/bin"
+printf '#!/bin/sh\necho hand-built\n' >"${home}/src/target/release/ai-memory"
+chmod 0755 "${home}/src/target/release/ai-memory"
+ln -s "${home}/src/target/release/ai-memory" "${home}/.local/bin/ai-memory"
+if run_install foreign-link "file://${base}"; then
+  fail "a link to a hand-built binary was replaced"
+fi
+grep -Fq "links to ${home}/src/target/release/ai-memory" "${TMP_ROOT}/foreign-link/out.log" \
+  || fail "foreign link refusal not explained: $(cat "${TMP_ROOT}/foreign-link/out.log")"
+[ "$("${home}/.local/bin/ai-memory")" = hand-built ] || fail "the link no longer runs the hand-built binary"
+[ ! -e "${home}/.local/lib/ai-memory" ] || fail "a refused install unpacked the release"
+
+# Controls: this install's own link is still replaced when a removed lib dir
+# left it dangling, and when it was rewritten as a relative link to the binary.
+run_install own-link "file://${base}" || fail "first install refused: $(cat "${TMP_ROOT}/own-link/out.log")"
+home="${TMP_ROOT}/own-link/home"
+rm -rf "${home}/.local/lib/ai-memory"
+run_install own-link "file://${base}" \
+  || fail "a rerun over its own dangling link was refused: $(cat "${TMP_ROOT}/own-link/out.log")"
+ln -sf ../lib/ai-memory/ai-memory "${home}/.local/bin/ai-memory"
+run_install own-link "file://${base}" \
+  || fail "a rerun over a relative link to its binary was refused: $(cat "${TMP_ROOT}/own-link/out.log")"
+[ "$("${home}/.local/bin/ai-memory" --version)" = "ai-memory 0.0.0-test" ] \
+  || fail "the rerun left an unusable link"
+
 printf 'install.sh checks passed\n'
