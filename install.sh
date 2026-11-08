@@ -175,6 +175,20 @@ dir_contains() {
     done
 }
 
+# links_to <link> <file>: <link> is a symlink to <file>, as written or as
+# another spelling of the same existing path (a symlinked parent directory).
+links_to() {
+    to="$(readlink "$1")" || return 1
+    [ "$to" != "$2" ] || return 0
+    case "$to" in
+        /*) ;;
+        *) to="$(dirname "$1")/$to" ;;
+    esac
+    [ "${to##*/}" = "${2##*/}" ] || return 1
+    from="$(real_dir "$(dirname "$to")")"
+    [ -n "$from" ] && [ "$from" = "$(real_dir "$(dirname "$2")")" ]
+}
+
 # check_replaceable <lib-dir> <release-tree>: a reinstall deletes the whole
 # lib dir, so every entry in it must also be in the release replacing it, or be
 # one that `ai-memory upgrade` leaves while it swaps the binary and hooks/ in
@@ -229,10 +243,12 @@ main() {
         die "$lib_dir is or contains the link's directory $bin_dir, and every install replaces the lib dir whole; set AI_MEMORY_LIB_DIR to a directory of its own"
     fi
 
-    # Never replace something this script did not put there: a Docker wrapper
-    # or a hand-built binary at the same path is the user's.
+    # Never replace something this script did not put there: a Docker wrapper,
+    # a hand-built binary, or a link to either at the same path is the user's.
     if [ -e "$link" ] || [ -L "$link" ]; then
         [ -L "$link" ] || die "$link already exists and is not a link to an install.sh release; move it aside or set AI_MEMORY_BIN_DIR"
+        links_to "$link" "$lib_dir/ai-memory" ||
+            die "$link links to $(readlink "$link"), not to this install's $lib_dir/ai-memory; move it aside or set AI_MEMORY_BIN_DIR"
     fi
     # An existing lib dir is replaced only when it holds a release: the binary
     # itself, not a link to another one, beside the hooks bundle every release
