@@ -67,6 +67,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory run` no longer stores the fragment of a credential cut at the
+  128 KiB limit of a native transcript record. That cut ran before the
+  sanitizer, so a key whose tail fell past the limit could be too short for
+  any pattern to match and was kept verbatim; once an earlier secret in the
+  record was redacted to a short marker, the fragment fit inside the later
+  caps. The cut now drops a token it lands inside. Event ids are derived as
+  before, so a resumed run replays its existing events. (#PR)
+
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
   the file back and records nothing, but the observers were still sent the
