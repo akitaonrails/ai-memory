@@ -207,4 +207,36 @@ if ls -d "${TMP_ROOT}/broken/home/.local/lib/ai-memory.new."* >/dev/null 2>&1; t
   fail "a refused release left its staged copy behind"
 fi
 
+# A reinstall moves the lib dir aside and deletes it, so an AI_MEMORY_LIB_DIR
+# naming the directory that holds the link is refused before anything changes:
+# the link a first install left there passed for a release, every other program
+# in that directory was deleted, and ai-memory became a link to itself.
+plain_tree "${TMP_ROOT}/lib-is-bin-tree"
+base="$(publish lib-is-bin "${TMP_ROOT}/lib-is-bin-tree")"
+run_install lib-is-bin "file://${base}" || fail "first install refused: $(cat "${TMP_ROOT}/lib-is-bin/out.log")"
+bin="${TMP_ROOT}/lib-is-bin/home/.local/bin"
+printf '#!/bin/sh\necho mine\n' >"${bin}/my-tool"
+chmod 0755 "${bin}/my-tool"
+ln -s .local/bin "${TMP_ROOT}/lib-is-bin/home/bin"
+for lib in "${bin}" "${bin}/" "${TMP_ROOT}/lib-is-bin/home/bin" "${TMP_ROOT}/lib-is-bin/home/.local"; do
+  if run_install lib-is-bin "file://${base}" AI_MEMORY_LIB_DIR="${lib}"; then
+    fail "AI_MEMORY_LIB_DIR=${lib} replaced the directory holding the link"
+  fi
+  grep -Fq "is or contains the link's directory" "${TMP_ROOT}/lib-is-bin/out.log" \
+    || fail "refusal of AI_MEMORY_LIB_DIR=${lib} not explained: $(cat "${TMP_ROOT}/lib-is-bin/out.log")"
+  [ "$("${bin}/my-tool")" = mine ] || fail "AI_MEMORY_LIB_DIR=${lib} deleted the user's program"
+  [ "$("${bin}/ai-memory" --version)" = "ai-memory 0.0.0-test" ] \
+    || fail "AI_MEMORY_LIB_DIR=${lib} broke the existing install"
+done
+
+# One directory for both, before either exists, ended with the same link to
+# itself after a reported success.
+fresh="${TMP_ROOT}/lib-is-bin-fresh/tools"
+if run_install lib-is-bin-fresh "file://${base}" AI_MEMORY_BIN_DIR="${fresh}" AI_MEMORY_LIB_DIR="${fresh}"; then
+  fail "a first install with one directory for the link and the release succeeded"
+fi
+grep -Fq "is or contains the link's directory" "${TMP_ROOT}/lib-is-bin-fresh/out.log" \
+  || fail "one-directory refusal not explained: $(cat "${TMP_ROOT}/lib-is-bin-fresh/out.log")"
+[ ! -e "${fresh}" ] || fail "a refused first install created ${fresh}"
+
 printf 'install.sh checks passed\n'
