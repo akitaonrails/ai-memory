@@ -67,6 +67,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- An image in a Claude Code or Pi-family tool result (a screenshot, an image
+  file read by a tool) is no longer copied into the managed run ledger and
+  `backfill` as a JSON dump of the image block, base64 data included. The text
+  parts of the result are kept, and each left-out image is reported as a loss,
+  as the Command Code reader already did.
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
   the file back and records nothing, but the observers were still sent the

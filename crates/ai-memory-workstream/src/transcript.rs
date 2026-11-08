@@ -2005,7 +2005,7 @@ fn parse_pi_family(
                     losses,
                 ),
                 "tool" | "toolResult" | "tool_result" => {
-                    let body = message.get("content").map(value_text).unwrap_or_default();
+                    let body = tool_result_text(agent, message.get("content"), losses);
                     let tool = first_string(message, &["toolName", "tool", "name"]);
                     push_event(
                         events,
@@ -3244,7 +3244,7 @@ fn parse_content_blocks(
                 );
             }
             "tool_result" | "toolResult" => {
-                let body = block.get("content").map(value_text).unwrap_or_default();
+                let body = tool_result_text(agent, block.get("content"), losses);
                 if claude_managed_packet_echo(agent, &body) {
                     losses.push(
                         "Claude managed workstream delivery packets were intentionally excluded"
@@ -3280,6 +3280,32 @@ fn parse_content_blocks(
             _ => {}
         }
     }
+}
+
+/// An image block in a tool result has no text field, so `value_text` would
+/// store the whole block, base64 data included, as the result's content.
+fn tool_result_text(agent: AgentKind, content: Option<&Value>, losses: &mut Vec<String>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    let Value::Array(items) = content else {
+        return value_text(content);
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) == Some("image") {
+            losses.push(format!(
+                "{} image tool results were intentionally excluded",
+                agent.as_str()
+            ));
+            continue;
+        }
+        let text = value_text(item);
+        if !text.is_empty() {
+            texts.push(text);
+        }
+    }
+    texts.join("\n")
 }
 
 fn claude_managed_packet_echo(agent: AgentKind, body: &str) -> bool {
@@ -6820,6 +6846,57 @@ mod tests {
         assert_eq!(
             transcript_interval_digests(&exact.events),
             transcript_interval_digests(&delta.events)
+        );
+    }
+
+    #[test]
+    fn tool_result_images_are_excluded_not_stored_as_json() {
+        let claude = json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"text","text":"screenshot taken"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}}
+            ]},
+            {"type":"tool_result","tool_use_id":"t2","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}}
+            ]}
+        ]}});
+        let pi = json!({"type":"message","message":{"role":"toolResult","toolCallId":"t3","toolName":"read","content":[
+            {"type":"text","text":"read image"},
+            {"type":"image","data":"cHJpdmF0ZSBpbWFnZQ==","mimeType":"image/png"}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&claude, "session", "claude", &mut events, &mut losses);
+        parse_pi_family(
+            AgentKind::Pi,
+            &pi,
+            "session",
+            "pi",
+            &mut events,
+            &mut losses,
+        );
+
+        let results = events
+            .iter()
+            .map(|event| {
+                (
+                    event.metadata["tool_use_id"].as_str().unwrap(),
+                    event.content.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, [("t1", "screenshot taken"), ("t3", "read image")]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.content.contains("cHJpdmF0ZSBpbWFnZQ")),
+            "image data reached the ledger"
+        );
+        assert_eq!(losses.len(), 3);
+        assert!(
+            losses
+                .iter()
+                .all(|loss| loss.ends_with("image tool results were intentionally excluded"))
         );
     }
 
