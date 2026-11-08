@@ -296,4 +296,21 @@ for foreign in NOTES.txt .my-settings ..old-notes; do
   fi
 done
 
+# Control: a rerun over its own release still replaces it in place, the newer
+# binary behind the same link, also when an interrupted `ai-memory upgrade`
+# left its swap files in the lib dir.
+plain_tree "${TMP_ROOT}/rerun-tree"
+base="$(publish rerun "${TMP_ROOT}/rerun-tree")"
+run_install rerun "file://${base}" || fail "first install refused: $(cat "${TMP_ROOT}/rerun/out.log")"
+lib="${TMP_ROOT}/rerun/home/.local/lib/ai-memory"
+cp "${lib}/ai-memory" "${lib}/ai-memory.new"
+mkdir -p "${lib}/.hooks.new" "${lib}/.hooks.old"
+printf '#!/bin/sh\necho "ai-memory 0.0.1-test"\n' >"${TMP_ROOT}/rerun-tree/ai-memory"
+base="$(publish rerun "${TMP_ROOT}/rerun-tree")"
+run_install rerun "file://${base}" || fail "rerun over its own release refused: $(cat "${TMP_ROOT}/rerun/out.log")"
+[ "$("${TMP_ROOT}/rerun/home/.local/bin/ai-memory" --version)" = "ai-memory 0.0.1-test" ] \
+  || fail "the rerun did not replace the release behind the link"
+[ ! -e "${lib}/ai-memory.new" ] && [ ! -e "${lib}/.hooks.old" ] \
+  || fail "the rerun kept the interrupted upgrade's swap files"
+
 printf 'install.sh checks passed\n'
