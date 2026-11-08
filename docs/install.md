@@ -77,9 +77,10 @@ drop to plain http); BusyBox wget is refused there. The release goes to
 `~/.local/lib/ai-memory`, and `~/.local/bin/ai-memory` becomes a link to the
 binary, so the bundled `hooks/` directory sits beside it and
 `ai-memory upgrade` can later replace both. An `ai-memory` at the link path that
-is not such a link (the Docker wrapper, a hand-built binary) is left alone and
-the script exits. The whole script runs from one function called on its last
-line, so a download cut short runs nothing. To read it before running it:
+is not such a link (the Docker wrapper, a hand-built binary, or a link to one of
+them) is left alone and the script exits. The whole script runs from one
+function called on its last line, so a download cut short runs nothing. To read
+it before running it:
 
 ```bash
 curl -fsSLO https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh
@@ -92,12 +93,23 @@ sh install.sh
 |---|---|---|
 | `AI_MEMORY_VERSION` | latest | Install this release, e.g. `3.0.0` |
 | `AI_MEMORY_BIN_DIR` | `~/.local/bin` | Where the `ai-memory` link goes |
-| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked |
+| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked; a directory of its own, since a rerun replaces it whole |
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
 
 Relative `AI_MEMORY_BIN_DIR` and `AI_MEMORY_LIB_DIR` paths are resolved from
 the directory where you start `install.sh`.
+
+Running `install.sh` again replaces its own release in place, and it deletes
+the old lib dir to do so. Before downloading, it therefore refuses a lib dir
+that is the bin dir or a directory above it, and one that holds no release (the
+`ai-memory` binary itself, not a link, beside the `hooks/` bundle). Once the new
+release is unpacked, it also refuses a lib dir holding anything that release
+does not ship, apart from the `ai-memory.new`, `.hooks.new` and `.hooks.old` an
+interrupted `ai-memory upgrade` can leave there. The link is replaced only when
+it points at this install's binary. Each refusal names what it found; move that
+aside, or pick another directory with `AI_MEMORY_LIB_DIR` or
+`AI_MEMORY_BIN_DIR`.
 
 Native Windows has its own script, `install.ps1`, published next to
 `install.sh` with its own `install.ps1.sha256`. In PowerShell (no
