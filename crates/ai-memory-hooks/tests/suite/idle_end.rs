@@ -130,17 +130,40 @@ async fn begin(
 }
 
 async fn observe(state: &HookState, sid: SessionId, kind: ObservationKind, at: i64, body: &str) {
+    observe_titled(
+        state,
+        sid,
+        state.project_id,
+        "idle tick test event",
+        kind,
+        at,
+        body,
+    )
+    .await;
+}
+
+/// [`observe`] with its own title (what a session page lists) and project: the
+/// row a session leaves behind when its work moves to a different repository.
+async fn observe_titled(
+    state: &HookState,
+    sid: SessionId,
+    proj: ProjectId,
+    title: &str,
+    kind: ObservationKind,
+    at: i64,
+    body: &str,
+) {
     state
         .writer
         .insert_observation(Sanitized::new(
             NewObservation {
                 session_id: sid,
                 workspace_id: state.workspace_id,
-                project_id: state.project_id,
+                project_id: proj,
                 kind,
                 extension: None,
                 source_event: None,
-                title: "idle tick test event".into(),
+                title: title.into(),
                 body: body.into(),
                 importance: 5,
                 occurred_at: Some(at),
@@ -794,6 +817,110 @@ async fn idle_tick_keeps_a_session_page_written_by_the_agent() {
     assert_eq!(page_total(&store.reader, ws, proj, sid).await, 1);
     let doc = wiki.read_page(ws, proj, &path).unwrap();
     assert!(doc.body.contains("Agent-authored summary"));
+}
+
+/// A session that crossed into another project is still one idle session: the
+/// tick ends it with a page built from its home project's rows, and its
+/// watermark covers the other project's rows too, so a later end with nothing
+/// new is `AlreadyEnded`. The stamp used to compare the whole session against a
+/// digest of one project, and this session came back `Lost` on every tick
+/// until the abandoned-session close. The single-project session is the
+/// control.
+#[tokio::test]
+async fn idle_tick_ends_a_session_that_crossed_into_another_project() {
+    let (_tmp, store, wiki, state) = harness().await;
+    let (ws, proj) = (state.workspace_id, state.project_id);
+    let away = store
+        .writer
+        .get_or_create_project(ws, "away", None)
+        .await
+        .unwrap();
+    let now = now_us();
+    let idle_at = now - 5 * HOUR_US;
+    let crossed = begin(&store, ws, proj, idle_at, None).await;
+    observe_titled(
+        &state,
+        crossed,
+        proj,
+        "the prompt at home",
+        ObservationKind::UserPrompt,
+        idle_at,
+        "home body",
+    )
+    .await;
+    observe_titled(
+        &state,
+        crossed,
+        away,
+        "the prompt that went away",
+        ObservationKind::UserPrompt,
+        idle_at,
+        "away body",
+    )
+    .await;
+    let single = begin(&store, ws, proj, idle_at, None).await;
+    observe(
+        &state,
+        single,
+        ObservationKind::UserPrompt,
+        idle_at,
+        "a single project prompt",
+    )
+    .await;
+
+    let sessions = store
+        .reader
+        .idle_open_sessions(now - 2 * HOUR_US, IDLE_END_BATCH)
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 2);
+    let outcome = run_idle_end_tick(&IdleEndTickInput {
+        writer: &store.writer,
+        reader: &store.reader,
+        wiki: &wiki,
+        sessions,
+        now_us: jiff::Timestamp::now().as_microsecond(),
+        consolidate_on_session_end: true,
+        has_consolidator: true,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        (outcome.ended, outcome.skipped, outcome.pages_written),
+        (2, 0, 2),
+        "the crossed session ends in the same tick as its single-project control"
+    );
+    for sid in [crossed, single] {
+        assert!(
+            matches!(
+                disposition(&store, ws, proj, sid).await,
+                SessionEndDisposition::AlreadyEnded
+            ),
+            "the watermark must cover every row of the session"
+        );
+    }
+    let page = wiki
+        .read_page(ws, proj, &PagePath::new(page_path(crossed)).unwrap())
+        .unwrap();
+    assert!(
+        page.body.contains("the prompt at home"),
+        "the page is built from the home project's rows: {}",
+        page.body
+    );
+    assert!(
+        !page.body.contains("the prompt that went away"),
+        "the other project's rows stay out of this project's page: {}",
+        page.body
+    );
+    assert!(
+        store
+            .reader
+            .idle_open_sessions(now - 2 * HOUR_US, IDLE_END_BATCH)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a second tick has nothing left to end"
+    );
 }
 
 #[tokio::test]
