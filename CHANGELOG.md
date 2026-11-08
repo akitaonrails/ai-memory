@@ -72,6 +72,7 @@ version in [`docs/changelog/`](docs/changelog/):
   answers `409 Conflict` instead of `500`. The proposal was found in scope but
   was no longer pending, so the store refused the approval and the handler
   reported that refusal as a server fault. The page keeps the first decision.
+  (#2115)
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
   the file back and records nothing, but the observers were still sent the
