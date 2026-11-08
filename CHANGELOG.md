@@ -70,7 +70,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - The Docker image now builds from base images pinned by digest
   (`rust:1.95-slim-bookworm` and `debian:bookworm-slim`), so two builds of the
   same commit use the same OS and toolchain. Dependabot proposes digest
-  refreshes monthly, keeping the base images' security fixes current. (#PR)
+  refreshes monthly, keeping the base images' security fixes current. (#2109)
 
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
