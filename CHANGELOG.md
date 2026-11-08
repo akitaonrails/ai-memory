@@ -67,6 +67,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The compaction recap now escapes untrusted-history fence markers in the
+  session id it prints in its header and footer, as the post-compaction anchor
+  already did. A session id carrying an end marker could close the fence early
+  in the recap, so text after it was no longer marked as untrusted history.
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
   the file back and records nothing, but the observers were still sent the
