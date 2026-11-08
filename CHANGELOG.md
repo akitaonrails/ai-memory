@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.4] - 2026-11-08
+
 ### Security
 
 - `ai-memory upgrade` (and any managed launch that refreshes the native host
@@ -4647,7 +4649,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.3...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.4...HEAD
+[3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
 [3.4.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.3
 [3.4.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.2
 [3.4.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.1
