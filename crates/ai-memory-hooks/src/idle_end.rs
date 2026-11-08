@@ -26,9 +26,9 @@
 //!   session is skipped entirely;
 //! - the end stamp re-verifies, inside its CAS, that the session is still
 //!   open in its scope, that the session's observation count (every row of
-//!   the session, the digest's population) still equals the count the digest
-//!   was built from, and that the latest page version is still the one the
-//!   tick wrote or kept;
+//!   the session, whatever project each landed in) still equals the count
+//!   read in the digest's snapshot, and that the latest page version is still
+//!   the one the tick wrote or kept;
 //! - the lifecycle-only end applies the same scope/open guards before any
 //!   mutation and re-checks substantiveness atomically;
 //! - sessions bound to an active managed run are excluded before any write,

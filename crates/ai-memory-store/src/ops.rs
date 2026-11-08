@@ -3899,8 +3899,8 @@ pub struct IdleEndCandidate {
 /// Each candidate is stamped by its own guarded write. The substantive end
 /// is an `UPDATE … WHERE ended_at IS NULL` CAS that ALSO re-verifies what the
 /// summary page saw: the session's observation count (every row of the
-/// session, the digest's population) must still equal the
-/// count the digest was built from, and the latest page version must still
+/// session, whatever project each landed in) must still equal the
+/// count read in the digest's snapshot, and the latest page version must still
 /// be the one the tick wrote or kept. Any mismatch — a non-end observation,
 /// a checkpoint page, or a real `SessionEnd` landing after the tick's read —
 /// reports [`IdleEndResult::Lost`] and rolls the candidate's transaction
