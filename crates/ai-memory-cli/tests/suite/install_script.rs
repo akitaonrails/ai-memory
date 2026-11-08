@@ -423,6 +423,42 @@ fn a_lib_dir_that_is_the_bin_dir_is_refused_and_left_intact() {
     );
 }
 
+/// The reinstall deletes the whole lib dir, so one holding a file the release
+/// does not ship is refused once the release is unpacked, and keeps the file.
+#[test]
+fn a_lib_dir_holding_a_file_the_release_lacks_is_left_alone() {
+    let files = tempfile::tempdir().unwrap();
+    let release = Release::serve(files.path());
+    release.publish(&release_archive(&[]));
+    let home = Home::new();
+    let first = home.install(&release);
+    assert!(first.status.success(), "{}", report(&first));
+    std::fs::write(home.lib().join("NOTES.txt"), "mine\n").unwrap();
+
+    let out = home.install(&release);
+    assert!(!out.status.success(), "{}", report(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("holds NOTES.txt"),
+        "{}",
+        report(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.lib().join("NOTES.txt")).unwrap(),
+        "mine\n"
+    );
+    assert!(home.lib().join("ai-memory").is_file());
+    let siblings: Vec<String> = std::fs::read_dir(home.lib().parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        siblings,
+        ["ai-memory"],
+        "a refused rerun left a staged copy"
+    );
+}
+
 /// `curl … | sh` with the download cut short: every cut point leaves a
 /// script that defines functions at most, so nothing is fetched or written.
 #[test]
