@@ -1216,4 +1216,101 @@ mod tests {
         assert_eq!(spool_age_line(Some(3_661_000)), "1h 1m");
         assert_eq!(spool_age_line(Some(172_800_000)), "2d 0h");
     }
+
+    #[test]
+    fn offline_recovery_hint_reachable_server_omits_unreachable_label() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            super::super::recovery::journal_path(temp.path()),
+            b"not json",
+        )
+        .unwrap();
+        let human = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            false,
+            false,
+        );
+        let rendered_human = human.join("\n");
+        assert!(!rendered_human.contains("once the server is back"));
+        assert!(rendered_human.contains("to deliver queued events"));
+
+        let json_lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            true,
+            false,
+        );
+        assert_eq!(json_lines.len(), 1);
+        assert!(json_lines[0].starts_with("recovery hint: "));
+        assert!(!json_lines[0].contains("(server unreachable)"));
+    }
+
+    #[tokio::test]
+    async fn status_run_reports_server_reachable_on_unauthorized() {
+        let app = axum::Router::new().route(
+            "/admin/status",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "error": "admin operation requires authentication in multi-user mode"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            server_url: format!("http://{address}"),
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let result = run(&config, StatusArgs { json: false }).await;
+        server.abort();
+
+        let err = result.expect_err("status must fail on 401");
+        assert!(!crate::http_client::server_unreachable(&err));
+        let message = format!("{err:#}");
+        assert!(message.contains("server reachable at"), "{message}");
+        assert!(message.contains("not authenticated"), "{message}");
+        assert!(!message.contains("server unreachable"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn status_run_reports_server_reachable_on_forbidden() {
+        let app = axum::Router::new().route(
+            "/admin/status",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "error": "admin operation is root-only in multi-user mode"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            server_url: format!("http://{address}"),
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let result = run(&config, StatusArgs { json: false }).await;
+        server.abort();
+
+        let err = result.expect_err("status must fail on 403");
+        assert!(!crate::http_client::server_unreachable(&err));
+        let message = format!("{err:#}");
+        assert!(message.contains("server reachable at"), "{message}");
+        assert!(message.contains("root/admin permissions"), "{message}");
+        assert!(!message.contains("server unreachable"), "{message}");
+    }
 }
