@@ -175,6 +175,23 @@ dir_contains() {
     done
 }
 
+# check_replaceable <lib-dir> <release-tree>: a reinstall deletes the whole
+# lib dir, so every entry in it must also be in the release replacing it, or be
+# one that `ai-memory upgrade` leaves while it swaps the binary and hooks/ in
+# place (`ai-memory.new`, `.hooks.new`, `.hooks.old`). A file the user keeps
+# there would go with the directory.
+check_replaceable() {
+    for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        name="${entry##*/}"
+        case "$name" in
+            ai-memory.new | .hooks.new | .hooks.old) continue ;;
+        esac
+        [ -e "$2/$name" ] ||
+            die "$1 holds $name, which the release does not ship and a reinstall would delete; move it aside or set AI_MEMORY_LIB_DIR"
+    done
+}
+
 main() {
     home="${HOME:-}"
     [ -n "$home" ] || die "HOME is not set"
@@ -244,6 +261,9 @@ main() {
     tar --no-same-owner -xzf "$work/$asset" -C "$work/release"
     [ -f "$work/release/ai-memory" ] || die "$asset has no ai-memory binary"
     chmod 0755 "$work/release/ai-memory"
+    if [ -e "$lib_dir" ]; then
+        check_replaceable "$lib_dir" "$work/release"
+    fi
 
     mkdir -p "$(dirname "$lib_dir")" "$bin_dir"
     staged="$lib_dir.new.$$"
