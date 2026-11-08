@@ -217,8 +217,15 @@ main() {
     if [ -e "$link" ] || [ -L "$link" ]; then
         [ -L "$link" ] || die "$link already exists and is not a link to an install.sh release; move it aside or set AI_MEMORY_BIN_DIR"
     fi
-    if [ -e "$lib_dir" ] && [ ! -f "$lib_dir/ai-memory" ]; then
-        die "$lib_dir exists but holds no ai-memory release; move it aside or set AI_MEMORY_LIB_DIR"
+    # An existing lib dir is replaced only when it holds a release: the binary
+    # itself, not a link to another one, beside the hooks bundle every release
+    # ships. A package manager's bin dir, or a wrapper's own directory, holds
+    # an `ai-memory` too and is the user's.
+    if [ -e "$lib_dir" ]; then
+        if [ ! -f "$lib_dir/ai-memory" ] || [ -L "$lib_dir/ai-memory" ] ||
+            [ ! -d "$lib_dir/hooks" ]; then
+            die "$lib_dir exists but holds no ai-memory release; move it aside or set AI_MEMORY_LIB_DIR"
+        fi
     fi
 
     work="$(mktemp -d "${TMPDIR:-/tmp}/ai-memory-install.XXXXXX")"
