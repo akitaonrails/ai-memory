@@ -361,7 +361,10 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
-        AgentKind::OpenCode => (
+        // The generated OpenClaw plugin posts the same `tool` / `callID` /
+        // `args` shape as OpenCode (`openclaw_plugin.rs`; docs.openclaw.ai
+        // `before_tool_call` / `after_tool_call`).
+        AgentKind::OpenCode | AgentKind::OpenClaw => (
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
@@ -540,11 +543,14 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // (<https://code.claude.com/docs/en/hooks>); an aborted call
         // (`is_interrupt`) did not succeed either. Its `PostToolUse` fires
         // only on success and has no `error` key.
+        // OpenClaw's `after_tool_call` carries optional `error` (string);
+        // absence of error is not success (docs.openclaw.ai tool-policy).
         AgentKind::Zcode
         | AgentKind::Muse
         | AgentKind::QwenCode
         | AgentKind::Qoder
         | AgentKind::ClaudeCode
+        | AgentKind::OpenClaw
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -6707,6 +6713,65 @@ mod tests {
         assert_eq!(
             tool_observation_outcome(AgentKind::QwenCode, &json!({"tool_name": "write_file"})),
             ToolOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn openclaw_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool": "read",
+            "args": {"path": "src/lib.rs"},
+            "callID": "call_openclaw_1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::OpenClaw, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call_openclaw_1"));
+
+        let no_input = json!({"tool": "read", "callID": "call_openclaw_1"});
+        assert!(tool_observation_metadata(AgentKind::OpenClaw, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::OpenClaw,
+                &json!({"tool": "exec", "error": "MARKER_OPENCLAW_ERROR"})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::OpenClaw, &json!({"tool": "exec", "output": "ok"})),
+            ToolOutcome::Unknown
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let dropped = json!({
+            "tool": "read",
+            "args": {"path": "docs/adr/1.md"},
+            "callID": "call_openclaw_drop",
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::OpenClaw, &dropped, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        let kept = json!({
+            "tool": "read",
+            "args": {"path": "src/lib.rs"},
+            "callID": "call_openclaw_keep",
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::OpenClaw, &kept, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
         );
     }
 
