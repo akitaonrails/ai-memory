@@ -72,7 +72,7 @@ version in [`docs/changelog/`](docs/changelog/):
   failed request left the session active, and it was offered on a Basic
   sign-in and on a server without auth, where there is no browser session to
   end. It now leaves the page only once the session is gone, shows an error
-  otherwise, and is hidden when there is no session. (#PR)
+  otherwise, and is hidden when there is no session. (#2108)
 
 - Approving an auto-improvement proposal that conflicts with a newer version of
   its page no longer notifies non-blocking observer webhooks. The approval rolls
