@@ -115,7 +115,8 @@ release goes to `%LOCALAPPDATA%\Programs\ai-memory` (`AI_MEMORY_INSTALL_DIR`
 overrides it), which is added to your user `PATH` unless
 `AI_MEMORY_NO_MODIFY_PATH=1`. The destination must not exist: even an empty
 directory, an unrelated file, or a directory link is refused before download.
-Choose a new dedicated directory; update an existing installation with
+Remove it if it is empty or left over from a failed install, choose a new
+dedicated directory, or update an existing installation with
 `ai-memory upgrade`. A validated release is copied to a new sibling staging
 directory and published only if the destination is still absent. On a copy or
 publication failure, the destination is never deleted; the error identifies

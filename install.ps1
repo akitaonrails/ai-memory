@@ -83,7 +83,7 @@ function Install-AiMemory {
     try { $existing = Get-Item -LiteralPath $dest -Force -ErrorAction Stop }
     catch [System.Management.Automation.ItemNotFoundException] { }
     if ($null -ne $existing) {
-        Fail "destination already exists at $dest; choose a new dedicated directory, or run ``ai-memory upgrade`` for an existing installation"
+        Fail "destination already exists at $dest; remove it if it is empty or left over from a failed install, pick a new dedicated directory, or run ``ai-memory upgrade`` to update an existing installation"
     }
 
     $work = Join-Path ([IO.Path]::GetTempPath()) ("ai-memory-install-" + [Guid]::NewGuid().ToString('N'))
