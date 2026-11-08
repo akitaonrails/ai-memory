@@ -16,7 +16,9 @@
 #   AI_MEMORY_VERSION           release to install, e.g. 3.0.0 (default: latest)
 #   AI_MEMORY_BIN_DIR           where the `ai-memory` link goes (default: ~/.local/bin)
 #   AI_MEMORY_LIB_DIR           where the release is unpacked
-#                               (default: ~/.local/lib/ai-memory)
+#                               (default: ~/.local/lib/ai-memory); every install
+#                               replaces it whole, so it must be a directory of
+#                               its own, never the bin dir or one above it
 #   AI_MEMORY_RELEASE_BASE_URL  Releases-compatible URL prefix, the one
 #                               `ai-memory upgrade` reads (default: GitHub).
 #                               The checksum comes from the same place as the
@@ -145,6 +147,34 @@ check_members() {
     done <"$2"
 }
 
+# real_dir <dir>: the physical path of an existing directory, symlinks
+# resolved, or nothing when it does not exist.
+real_dir() {
+    (cd -P -- "$1" 2>/dev/null && pwd -P) || true
+}
+
+# dir_contains <dir> <path>: <path> is <dir> or lies below it. Two spellings of
+# one existing directory (a trailing slash, a symlinked parent) compare equal by
+# their physical paths; a part that does not exist yet compares as written.
+dir_contains() {
+    case "$2" in
+        /*) path="$2" ;;
+        *) path="$(pwd -P)/$2" ;;
+    esac
+    real="$(real_dir "$1")"
+    while :; do
+        if [ "${path%/}" = "${1%/}" ]; then
+            return 0
+        fi
+        if [ -n "$real" ] && [ "$(real_dir "$path")" = "$real" ]; then
+            return 0
+        fi
+        parent="$(dirname "$path")"
+        [ "$parent" != "$path" ] || return 1
+        path="$parent"
+    done
+}
+
 main() {
     home="${HOME:-}"
     [ -n "$home" ] || die "HOME is not set"
@@ -174,6 +204,13 @@ main() {
     target="$(detect_target)"
     asset="ai-memory-$target.tar.gz"
     link="$bin_dir/ai-memory"
+
+    # A reinstall moves the lib dir aside and deletes it, so the bin dir, or
+    # any directory above it, would take every other program there with it
+    # and leave the link pointing at itself.
+    if dir_contains "$lib_dir" "$bin_dir"; then
+        die "$lib_dir is or contains the link's directory $bin_dir, and every install replaces the lib dir whole; set AI_MEMORY_LIB_DIR to a directory of its own"
+    fi
 
     # Never replace something this script did not put there: a Docker wrapper
     # or a hand-built binary at the same path is the user's.
