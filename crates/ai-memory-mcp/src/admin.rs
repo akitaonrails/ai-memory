@@ -4021,6 +4021,10 @@ async fn handle_pending_write_approve(
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "status": "conflict" })),
         ),
+        Err(WikiError::Store(StoreError::InvalidState(msg))) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        ),
         Err(e) => internal_err(e.to_string()),
     }
 }
@@ -13762,6 +13766,52 @@ mod tests {
             .unwrap()
             .expect("approve writes target page");
         assert_eq!(page.body, "# Stored\n\nfrom stored proposal");
+    }
+
+    /// Approving a proposal that was already decided (a double click on
+    /// `/web/pending`, two reviewers) conflicts with its state; the store
+    /// refuses it as `InvalidState` and the page keeps the first approval.
+    #[tokio::test]
+    async fn pending_write_approve_of_a_decided_proposal_returns_409() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/twice.md", "# Twice\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let approve = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/approve?workspace=default&project=scratch"
+                ))
+                .extension(ai_memory_core::ActorContext {
+                    user: Some("reviewer".into()),
+                    ..ai_memory_core::ActorContext::default()
+                })
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(approve()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router.oneshot(approve()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let page = store
+            .reader
+            .page_body_by_ids(ws, proj, "notes/twice.md")
+            .await
+            .unwrap()
+            .expect("the first approval stays");
+        assert_eq!(page.body, "# Twice\n");
+        let on_disk =
+            std::fs::read_to_string(scratch_project_dir(tmp.path()).join("notes/twice.md"));
+        assert!(
+            on_disk.is_ok_and(|text| text.contains("# Twice")),
+            "the refused approval must not remove the approved file"
+        );
     }
 
     /// #1205: a `POST /admin/pending-writes/{id}/approve` whose `id` does
