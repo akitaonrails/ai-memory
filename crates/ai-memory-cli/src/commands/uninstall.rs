@@ -23,7 +23,7 @@ use ai_memory_core::routing_skills::{
     GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER, GROK_RULES_DIR, GROK_SKILL_DIR,
     MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
 };
-use ai_memory_core::{MARKER_END, MARKER_START, find_marker_line};
+use ai_memory_core::{MARKER_END, find_managed_block};
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -1261,10 +1261,7 @@ fn strip_instructions_block(content: &str) -> (String, bool) {
     // managed block can't be matched as the real end delimiter (which would
     // leave an orphan tail behind, breaking the install->uninstall
     // round-trip).
-    let Some(start) = find_marker_line(content, MARKER_START, 0) else {
-        return (content.to_string(), false);
-    };
-    let Some(end_pos) = find_marker_line(content, MARKER_END, start) else {
+    let Some((start, end_pos)) = find_managed_block(content) else {
         return (content.to_string(), false);
     };
     let end = end_pos + MARKER_END.len();
@@ -1977,6 +1974,7 @@ fn strip_mcp_toml(content: &str, name: Option<&str>, url: &str) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_memory_core::MARKER_START;
     #[cfg(unix)]
     use std::time::Duration;
 
@@ -2497,6 +2495,15 @@ mod tests {
         assert!(stripped.contains("More notes."));
         assert!(!stripped.contains("BODY"));
         assert!(!stripped.contains(MARKER_START));
+    }
+
+    #[test]
+    fn strip_instructions_keeps_text_after_a_start_marker_without_its_end() {
+        let original = format!("# A\n{MARKER_START}\nmy notes\n");
+        let installed = format!("{original}\n{MARKER_START}\nBODY\n{MARKER_END}\n");
+        let (stripped, found) = strip_instructions_block(&installed);
+        assert!(found);
+        assert_eq!(stripped, original);
     }
 
     #[test]
