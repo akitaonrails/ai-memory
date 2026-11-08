@@ -442,6 +442,89 @@ async fn a_crossed_repository_session_snapshot_reads_only_its_scope() {
     );
 }
 
+/// The one thing a snapshot reports past its own scope is a number. A crossed
+/// session's digest holds only the snapshot's rows, but the idle end's stamp
+/// and `ended_observation_count` count every row of the session, so the stamp
+/// needs the whole session's count from the digest's own snapshot. The scoped
+/// summary is the control that the rows stay partitioned, and another
+/// session's row must not be counted.
+#[tokio::test]
+async fn a_crossed_session_snapshot_counts_the_whole_session_as_a_number_only() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(ws, "home", None)
+        .await
+        .unwrap();
+    let elsewhere = store
+        .writer
+        .get_or_create_project(ws, "elsewhere", None)
+        .await
+        .unwrap();
+    let session = open_session(&store, ws, home, AgentKind::Codex).await;
+    let unrelated = open_session(&store, ws, home, AgentKind::Codex).await;
+    let sanitizer = Sanitizer::builtin();
+    for (sid, proj) in [
+        (session, home),
+        (session, home),
+        (session, elsewhere),
+        (unrelated, home),
+    ] {
+        let obs = Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "body".into(),
+                importance: 5,
+                file_path: None,
+            },
+            &sanitizer,
+        );
+        store.writer.insert_observation(obs).await.unwrap();
+    }
+
+    let from_home = store
+        .reader
+        .read_session_observations(ws, home, session, |snap| {
+            Ok((
+                snap.kind_summary()?.total,
+                snap.whole_session_observation_count()?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        from_home,
+        (2, 3),
+        "the summary stays in the snapshot's scope, the generation count does not"
+    );
+    let from_elsewhere = store
+        .reader
+        .read_session_observations_in_scope(ws, elsewhere, session, |snap| {
+            Ok((
+                snap.kind_summary()?.total,
+                snap.whole_session_observation_count()?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        from_elsewhere,
+        (1, 3),
+        "the same count from the other scope"
+    );
+}
+
 fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -> NewPage {
     NewPage {
         workspace_id: ws,
