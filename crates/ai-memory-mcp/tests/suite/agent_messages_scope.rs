@@ -406,3 +406,41 @@ async fn a_sender_named_by_its_remote_reaches_the_repository_owner_past_an_empty
         "only the first message arrived"
     );
 }
+
+/// Both recipient fields are required (#2082, `docs/security-boundaries.md`
+/// row 8f). A blank one used to fall through to the caller's inferred current
+/// project, delivering the message into the sender's own inbox instead of
+/// refusing it. The sender here is explicit, so only the required-recipient
+/// guard is under test.
+#[tokio::test]
+async fn blank_recipient_send_is_refused_and_lands_in_no_inbox() {
+    let h = Harness::new().await;
+    for (to_ws, to_proj) in [("", "  "), ("", C), (WS, "")] {
+        let err = h
+            .call(
+                None,
+                "memory_message_send",
+                json!({
+                    "from_workspace": WS, "from_project": A,
+                    "to_workspace": to_ws, "to_project": to_proj,
+                    "body": "hello?",
+                }),
+            )
+            .await
+            .expect_err("a blank recipient coordinate must be refused");
+        assert!(
+            err.contains("to_workspace and to_project are required"),
+            "{to_ws:?}/{to_proj:?}: {err}"
+        );
+    }
+    // Nothing was delivered anywhere — in particular not into the sender's
+    // own inbox (project-a), which is where the fall-through used to land it.
+    assert_eq!(h.pending_for(h.a).await, 0, "sender inbox stays empty");
+    assert_eq!(h.pending_for(h.b).await, 0, "the inferred slot stays empty");
+    assert_eq!(h.pending_for(h.c).await, 0, "no phantom delivery");
+
+    // Control: a fully named recipient proceeds and lands in that inbox.
+    h.send(A, C, "please do X").await;
+    assert_eq!(h.pending_for(h.c).await, 1, "the named recipient received it");
+    assert_eq!(h.pending_for(h.a).await, 0, "still not in the sender's inbox");
+}
