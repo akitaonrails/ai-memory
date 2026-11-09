@@ -182,7 +182,7 @@ fn offers_basic_challenge(resp: &Response) -> bool {
         })
 }
 
-fn is_api_v1_path(path: &str) -> bool {
+pub(crate) fn is_api_v1_path(path: &str) -> bool {
     path == "/api/v1" || path.starts_with("/api/v1/")
 }
 
