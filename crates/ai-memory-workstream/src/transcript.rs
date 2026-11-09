@@ -5407,6 +5407,8 @@ fn percent_decode(value: &str) -> String {
     while index < bytes.len() {
         if bytes[index] == b'%'
             && let Some(hex) = bytes.get(index + 1..index + 3)
+            // `from_str_radix` also takes a sign: `%+5` must stay verbatim.
+            && hex.iter().all(u8::is_ascii_hexdigit)
             && let Ok(hex) = std::str::from_utf8(hex)
             && let Ok(byte) = u8::from_str_radix(hex, 16)
         {
@@ -12004,6 +12006,11 @@ mod tests {
         assert_eq!(
             path_from_file_uri("file:///tmp/100%done"),
             Some(PathBuf::from("/tmp/100%done"))
+        );
+        // `u8::from_str_radix` accepts a leading `+`, but `%+5` is no escape.
+        assert_eq!(
+            path_from_file_uri("file:///tmp/a%+5b"),
+            Some(PathBuf::from("/tmp/a%+5b"))
         );
         assert_eq!(path_from_file_uri("https://example.com/x"), None);
         assert_eq!(path_from_file_uri("file://"), None);
