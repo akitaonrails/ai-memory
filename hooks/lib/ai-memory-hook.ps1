@@ -708,6 +708,21 @@ function Get-AiMemoryStateDir {
 # bundle consume one another's entries on a shared data dir. A down server
 # then costs latency instead of the event.
 
+# Bearer token the server minted into `<data dir>/auth-tokens/default`
+# (`[auth].bearer_token_file`). A hook installed without a baked token relies
+# on it; the native exe reads it, so this wrapper must too or its POST is a
+# silent 401 (#2134). Empty when absent or unreadable.
+function Get-AiMemoryStoredToken {
+    try {
+        $path = Join-Path (Join-Path (Get-AiMemoryStateDir) "auth-tokens") "default"
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "" }
+        $token = [IO.File]::ReadAllText($path).Trim()
+        return $token
+    } catch {
+        return ""
+    }
+}
+
 function Get-AiMemorySpoolDir {
     return (Join-Path (Get-AiMemoryStateDir) "hook-spool")
 }
@@ -1115,8 +1130,10 @@ function Invoke-AiMemoryHook {
     $Headers = @{}
     $Headers["X-AI-Memory-Client"] = "hook-ps"
 
-    if ($env:AI_MEMORY_AUTH_TOKEN) {
-        $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
+    $BearerToken = $env:AI_MEMORY_AUTH_TOKEN
+    if (-not $BearerToken) { $BearerToken = Get-AiMemoryStoredToken }
+    if ($BearerToken) {
+        $Headers["Authorization"] = "Bearer $BearerToken"
     }
 
     # Capture producer path, with the shell bundle's offline-spool parity

@@ -34,6 +34,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed DSH hooks failing to parse under PowerShell on Windows. The generated
+  command now starts with the `&` call operator, so the quoted executable path is
+  invoked rather than read as a string expression. (#2134)
+- Fixed the PowerShell hook wrapper not falling back to the stored bearer token
+  file (`<data_dir>/auth-tokens/default`) when `AI_MEMORY_AUTH_TOKEN` is unset;
+  its POSTs were rejected with 401 and dropped silently. (#2134)
 - Fixed `restore` replacing the live wiki and database even when it failed
   to save the archived configuration as `config.toml.from-backup` (#2064).
 - Fixed `restore-agents` accepting backups with missing or invalid gzip

@@ -758,6 +758,21 @@ else
         && printf 'ok' || printf 'missing')
     assert_eq "powershell delivers the subagent brief (static)" "ok" "$PS_SUB"
 fi
+# #2134: a hook installed without a baked token relies on the server's token
+# file; the wrapper must fall back to it when AI_MEMORY_AUTH_TOKEN is unset.
+PS_TOKEN_STATIC=$(grep -q 'function Get-AiMemoryStoredToken' hooks/lib/ai-memory-hook.ps1 \
+    && grep -Fq 'if (-not $BearerToken) { $BearerToken = Get-AiMemoryStoredToken }' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell wrapper falls back to the stored token file (static)" "ok" "$PS_TOKEN_STATIC"
+if [ -n "$PSH" ]; then
+    mkdir -p "$TMP/ps-token/auth-tokens" "$TMP/ps-token-empty"
+    printf 'stored-secret\n' > "$TMP/ps-token/auth-tokens/default"
+    PS_TOKEN_DIR=$(host_path "$TMP/ps-token")
+    PS_TOKEN_EMPTY_DIR=$(host_path "$TMP/ps-token-empty")
+    PS_TOKEN_OUT=$("$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+        "\$env:AI_MEMORY_DATA_DIR='$PS_TOKEN_DIR'; . '$PS_LIB'; (Get-AiMemoryStoredToken) + '|' + (\$env:AI_MEMORY_DATA_DIR='$PS_TOKEN_EMPTY_DIR'; Get-AiMemoryStoredToken)")
+    assert_eq "powershell reads the stored token file, empty when absent" "stored-secret|" "$PS_TOKEN_OUT"
+fi
 
 # A capture-only marker with no scope-declaring ancestor: still transparent,
 # and resolution falls back exactly as it does with no marker at all.

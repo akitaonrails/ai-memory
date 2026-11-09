@@ -2864,7 +2864,13 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // spawns `getShellConfiguration()`). A command that fails to parse exits
     // 1, which Gemini treats as a non-blocking error, so the session runs on
     // and captures nothing (#1484).
-    if matches!(agent, "codex" | "grok" | "copilot-cli" | "gemini-cli") {
+    // DSH's `@deepseek-ai/dsh-hooks-claude-code` bridge runs each command
+    // through PowerShell `-NoLogo -NoProfile -NonInteractive -Command` on
+    // Windows; this extends the same allowlist to dsh (#2134).
+    if matches!(
+        agent,
+        "codex" | "grok" | "copilot-cli" | "gemini-cli" | "dsh"
+    ) {
         "& "
     } else {
         ""
@@ -2904,7 +2910,7 @@ fn cmd_bare_escape(field: &str) -> String {
 
 #[test]
 fn powershell_call_operator_is_limited_to_known_powershell_runners() {
-    for agent in ["codex", "grok", "copilot-cli", "gemini-cli"] {
+    for agent in ["codex", "grok", "copilot-cli", "gemini-cli", "dsh"] {
         assert_eq!(powershell_call_operator(agent), "& ", "agent: {agent}");
     }
 
@@ -2951,6 +2957,22 @@ fn grok_windows_command_invokes_rather_than_quotes() {
     assert!(
         cmd.starts_with("& \""),
         "grok must use the call operator: {cmd}"
+    );
+}
+
+/// DSH's Claude Code bridge runs hook commands through PowerShell `-Command`,
+/// so the quoted executable needs the call operator (#2134).
+#[test]
+fn dsh_windows_command_invokes_rather_than_quotes() {
+    let cmd = hook_command(
+        Path::new("stop.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(HookCommandPlatform::WindowsNative, "dsh", None, None),
+    );
+    assert!(
+        cmd.starts_with("& \""),
+        "dsh must use the call operator: {cmd}"
     );
 }
 
