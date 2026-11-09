@@ -3517,8 +3517,12 @@ async fn handle_expire_handoffs(
     let owner_filter = ai_memory_core::OwnerFilter::for_actor_context(&actor);
     let author_id = author_ext.map(|axum::Extension(u)| u);
 
+    // Saturating like the other `*_days` windows here: a span past the
+    // timestamp range is "older than anything", not a wrapped future cutoff.
     let older_than_us = req.older_than_days.map(|days| {
-        jiff::Timestamp::now().as_microsecond() - i64::from(days) * 24 * 60 * 60 * 1_000_000
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(days).saturating_mul(US_PER_DAY))
     });
 
     match state
