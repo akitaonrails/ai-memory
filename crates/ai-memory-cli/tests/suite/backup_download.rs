@@ -23,6 +23,7 @@ enum Reply {
     Complete,
     Interrupted,
     GatewayHtml,
+    // Invalid destinations are rejected after the headers, so send no body.
     Empty,
 }
 
@@ -95,6 +96,7 @@ fn download(home: &Path, dest: &Path, export: bool, reply: Reply) -> Output {
                 socket
                     .write_all(b"HTTP/1.1 204 No Content\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n")
                     .unwrap();
+                return;
             }
         }
         socket.shutdown(Shutdown::Write).unwrap();
@@ -292,7 +294,7 @@ fn archive_download_refuses_a_directory_without_creating_a_temporary_output() {
         let dest = archives.join("backup.tar.gz");
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(dest.join("keep"), b"untouched directory").unwrap();
-        let output = download(home.path(), &dest, export, Reply::Complete);
+        let output = download(home.path(), &dest, export, Reply::Empty);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("output path is a directory"));
         assert_eq!(
@@ -314,7 +316,7 @@ fn archive_download_refuses_a_read_only_regular_file_without_touching_it() {
         let dest = archives.join("backup.tar.gz");
         std::fs::write(&dest, b"previous usable archive").unwrap();
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o400)).unwrap();
-        let output = download(home.path(), &dest, export, Reply::Complete);
+        let output = download(home.path(), &dest, export, Reply::Empty);
         assert!(!output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stderr)
