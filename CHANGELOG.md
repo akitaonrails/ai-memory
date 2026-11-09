@@ -69,6 +69,12 @@ version in [`docs/changelog/`](docs/changelog/):
   meaning rather than by keywords, so the language does not matter, counts
   only `user-prompt` observations, and skips a refusal with no reason or a
   one-off rename. Proposals still follow the approval policy. (#1992)
+- `assistant_excerpt_max_bytes` (`AI_MEMORY_ASSISTANT_EXCERPT_MAX_BYTES`) sets
+  the byte cap on the assistant excerpt stored when `capture_assistant` is on.
+  The default stays 2,000 and the value is clamped to 16 KiB. The client now
+  sends up to 16 KiB of the scrubbed text and the server applies the cap, so
+  a longer answer (about 600 CJK characters fit in 2,000 bytes) is no longer
+  always cut in half. (#2118)
 
 ## [3.4.4] - 2026-11-08
 

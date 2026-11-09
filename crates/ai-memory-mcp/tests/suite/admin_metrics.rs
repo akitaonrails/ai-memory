@@ -91,6 +91,7 @@ async fn harness_with(index_file_paths: bool) -> Harness {
         session_consolidation_notify: None,
         profile_notify: None,
         capture_assistant_enabled: false,
+        assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
         claim_handoff_on_session_start: false,
         create_handoff_on_session_end: false,
         per_user_slots: false,

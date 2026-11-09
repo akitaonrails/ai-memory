@@ -70,13 +70,18 @@ log_level = "info"
 
 # Server-side half of the assistant/Stop capture opt-in (#196). When true, the
 # server persists a Claude Code Stop event's final assistant turn (sanitized and
-# capped at 2 KB) as the Stop body. OFF by default: assistant text is privacy-
+# capped by `assistant_excerpt_max_bytes`, 2 KB by default) as the Stop body. OFF by default: assistant text is privacy-
 # sensitive — it can quote code, secrets, or content from paths ai-memory never
 # sees, and it flows into consolidation/reviewer prompts (and out to a cloud LLM
 # provider if one is configured). This is a DOUBLE opt-in: the client must also
 # be installed with `ai-memory install-hooks --agent claude-code
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
+
+# Byte cap on that stored assistant excerpt (#2118). Raise it when long answers
+# lose their second half (2 KB is about 600 CJK characters). Clamped to 16 KiB.
+# Env equivalent: `AI_MEMORY_ASSISTANT_EXCERPT_MAX_BYTES`.
+# assistant_excerpt_max_bytes = 2000
 
 # Strip root-level anyOf/oneOf/allOf from MCP tool input schemas on every
 # tools/list, even without a `?flavor=moonshot` / `?flavor=bedrock` marker.
