@@ -124,11 +124,28 @@ public enum DataDirToken {
         return token.isEmpty ? nil : token
     }
 
-    /// The Keychain token when one is saved, else the data dir's token file.
-    public static func effective(saved: String?, dataDir: URL, fileManager: FileManager = .default) -> String? {
-        if let saved, !saved.isEmpty {
+    /// The token to send to `serverURL`, bound to the server it belongs to.
+    ///
+    /// The saved Keychain token is returned only when its recorded origin is the
+    /// server's origin, so changing the URL in Settings does not carry it to a
+    /// different host. Otherwise the data dir's root bearer is used, but only for
+    /// a loopback server (this Mac), because that file is the local server's
+    /// token. A non-loopback server with no matching saved token receives
+    /// nothing.
+    public static func effective(
+        saved: String?,
+        savedOrigin: ServerOrigin?,
+        serverURL: URL,
+        dataDir: URL,
+        fileManager: FileManager = .default
+    ) -> String? {
+        let target = ServerOrigin.of(serverURL)
+        if let saved, !saved.isEmpty, let target, let savedOrigin, savedOrigin == target {
             return saved
         }
-        return read(dataDir: dataDir, fileManager: fileManager)
+        if let target, target.isLoopback {
+            return read(dataDir: dataDir, fileManager: fileManager)
+        }
+        return nil
     }
 }
