@@ -2989,7 +2989,7 @@ fn parse_grok(
                     Some("assistant"),
                     &format!("{name}: {arguments}"),
                     timestamp(value),
-                    json!({"tool": name}),
+                    with_tool_use_id(json!({"tool": name}), first_string(call, &["id"])),
                 );
             }
         }
@@ -3005,7 +3005,10 @@ fn parse_grok(
                 Some("tool"),
                 &body,
                 timestamp(value),
-                json!({}),
+                with_tool_use_id(
+                    json!({}),
+                    first_string(value, &["tool_call_id", "toolCallId"]),
+                ),
             );
         }
         "backend_tool_call" => {
@@ -10475,6 +10478,9 @@ mod tests {
                 ),
             ]
         );
+        // The native id pairs the result with its call.
+        assert_eq!(export.events[2].metadata["tool_use_id"], "call-1");
+        assert_eq!(export.events[3].metadata["tool_use_id"], "call-1");
         assert!(
             export
                 .losses
