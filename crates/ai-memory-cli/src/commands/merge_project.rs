@@ -42,8 +42,12 @@ pub async fn run(config: &Config, args: MergeProjectArgs) -> Result<()> {
             i18n.text("cli-merge-project-exactly-one-of-into-or-into-project-id-is-required")
         );
     }
+    // The workspace can come from this checkout's marker, so the merge goes
+    // to the server that marker selects, like rename-project and
+    // move-project (#2016). A profile that does not resolve fails here,
+    // before anything is sent.
+    let endpoint = ServerEndpoint::for_checkout(config).await?;
     let workspace = super::resolve_workspace(config, args.workspace.as_deref())?;
-    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let report: serde_json::Value = post_json(
         &endpoint,
         "/admin/merge-project",
