@@ -1562,6 +1562,9 @@ impl Wiki {
     ) -> WikiResult<()> {
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.read().await;
+        // Same-path writers hold this from file rename through upsert; without
+        // it a delete could land between the two (invariant #16).
+        let _page_guard = self.lock_page(workspace_id, project_id, path).await;
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
@@ -2647,15 +2650,16 @@ impl Wiki {
             let abstract_text = frontmatter_abstract(&markdown.frontmatter);
             self.embed_page_version(*page_id, &markdown.body, abstract_text)
                 .await?;
-        }
-
-        if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
-            chain.dispatch_async(
-                Some(path.as_str()),
-                &markdown.frontmatter,
-                &markdown.body,
-                ctx,
-            );
+            // Observers hear only about a version that landed: a conflict
+            // rolled the file back and recorded nothing.
+            if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+                chain.dispatch_async(
+                    Some(path.as_str()),
+                    &markdown.frontmatter,
+                    &markdown.body,
+                    ctx,
+                );
+            }
         }
         Ok(result)
     }
@@ -3541,9 +3545,9 @@ impl Wiki {
     ///
     /// Checked twice under the page lock: before the file is replaced, so a
     /// normal mismatch never touches disk, and again in the store transaction
-    /// that writes the version, which is the authority (a plain delete takes
-    /// only the shared mutation lock and can land between the two); a
-    /// mismatch there restores the file.
+    /// that writes the version, which is the authority (a write from another
+    /// process or an independently constructed handle shares no lock with
+    /// this one); a mismatch there restores the file.
     ///
     /// # Errors
     /// As [`Self::write_page`].
@@ -6054,6 +6058,75 @@ mod tests {
         );
     }
 
+    // A plain delete used to take only the shared mutation guard, so it could
+    // quarantine the file and tombstone the row between a same-path writer's
+    // rename and its upsert: a committed version lost its file, or a deleted
+    // page came back on the next reindex (invariant #16).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_page_lock_waits_before_removing_and_allows_another_path() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("notes/held-delete.md").unwrap();
+        let other = PagePath::new("notes/independent-delete.md").unwrap();
+        let original = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "original",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        wiki.write_page(req(
+            ws,
+            proj,
+            other.as_str(),
+            "control",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let abs = wiki.abs_path(ws, proj, &path);
+
+        let global = wiki.mutation_lock.read().await;
+        let page = wiki.lock_page(ws, proj, &path).await;
+        let delete = wiki.delete_page(ws, proj, &path, None, None);
+        tokio::pin!(delete);
+        wait_for_page_waiter(&wiki, &(ws, proj, path.clone()), delete.as_mut()).await;
+        assert!(
+            abs.exists(),
+            "the delete removed the file under a held page lock"
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().into())
+                .await
+                .unwrap(),
+            Some(original),
+            "the delete tombstoned the row under a held page lock"
+        );
+
+        finish_lock_test(wiki.delete_page(ws, proj, &other, None, None))
+            .await
+            .unwrap();
+        assert!(!wiki.abs_path(ws, proj, &other).exists());
+
+        drop(page);
+        drop(global);
+        finish_lock_test(delete).await.unwrap();
+        assert!(!abs.exists());
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().into())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
     // The newer file on disk has another body, so the disk-inheritance rule
     // cannot supply `generated.at`; a past timestamp makes the restore fail
     // on every run without the checkpoint's own value, not only when the
@@ -6548,6 +6621,119 @@ mod tests {
                 .unwrap()
                 .body,
             "external body"
+        );
+    }
+
+    // A conflicting approval rolls the file back and records no version, so
+    // a non-blocking observer must not hear about it: a mirror would copy
+    // content that never landed. An approved control is still delivered.
+    #[tokio::test]
+    async fn auto_improve_approval_conflict_dispatches_no_observer_webhook() {
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::net::TcpListener;
+
+        type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+        let seen: Seen = Arc::default();
+        let app = Router::new()
+            .route(
+                "/observe",
+                post(
+                    |State(seen): State<Seen>, Json(payload): Json<serde_json::Value>| async move {
+                        seen.lock().unwrap().push(payload.to_string());
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let conflicted = stage_one(
+            &store,
+            ws,
+            proj,
+            "notes/observed-conflict.md",
+            "conflicting proposal body",
+        )
+        .await;
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/observed-conflict.md",
+            "external body",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        let approved = stage_one(
+            &store,
+            ws,
+            proj,
+            "notes/observed-approved.md",
+            "approved proposal body",
+        )
+        .await;
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "mirror-observer".into(),
+                url: format!("http://{addr}/observe"),
+                timeout_ms: 1_000,
+                failure_policy: FailurePolicy::Ignore,
+                events: vec![AdmissionOp::WritePage],
+                blocking: false,
+            }])
+            .unwrap(),
+        );
+
+        assert_eq!(
+            wiki.approve_auto_improve_proposal(
+                ws,
+                proj,
+                conflicted,
+                ActorContext::default(),
+                None,
+                None
+            )
+            .await
+            .unwrap(),
+            ApproveAutoImproveProposalResult::Conflict
+        );
+        assert!(matches!(
+            wiki.approve_auto_improve_proposal(
+                ws,
+                proj,
+                approved,
+                ActorContext::default(),
+                None,
+                None
+            )
+            .await
+            .unwrap(),
+            ApproveAutoImproveProposalResult::Approved { .. }
+        ));
+
+        let delivered = |needle: &str| seen.lock().unwrap().iter().any(|p| p.contains(needle));
+        for _ in 0..50 {
+            if delivered("approved proposal body") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // The conflicting dispatch, if any, was spawned before the control's.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            delivered("approved proposal body"),
+            "the approved control must reach the observer"
+        );
+        assert!(
+            !delivered("conflicting proposal body"),
+            "the observer was told about a conflicting approval that wrote nothing"
         );
     }
 

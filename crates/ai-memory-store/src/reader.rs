@@ -5170,6 +5170,8 @@ impl ReaderPool {
             let snapshot = SessionObservationSnapshot {
                 conn: &tx,
                 session_id: session_id.as_bytes().to_vec(),
+                workspace_id: workspace_id.as_bytes().to_vec(),
+                project_id: project_id.as_bytes().to_vec(),
                 rows_read: std::cell::Cell::new(0),
             };
             read(&snapshot)
@@ -5221,6 +5223,8 @@ impl ReaderPool {
             let snapshot = SessionObservationSnapshot {
                 conn: &tx,
                 session_id: session_id.as_bytes().to_vec(),
+                workspace_id: workspace_id.as_bytes().to_vec(),
+                project_id: project_id.as_bytes().to_vec(),
                 rows_read: std::cell::Cell::new(0),
             };
             read(&snapshot)
@@ -15110,6 +15114,12 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
 pub struct SessionObservationSnapshot<'c> {
     conn: &'c Connection,
     session_id: Vec<u8>,
+    /// The scope this snapshot is bound to. A session can cross repositories
+    /// mid-flight, holding observations in more than one `(workspace_id,
+    /// project_id)`; every query here filters by this pair so a caller
+    /// resolved to one scope never reads another's rows (GHSA-xfgc-hc4c-wj7h).
+    workspace_id: Vec<u8>,
+    project_id: Vec<u8>,
     rows_read: std::cell::Cell<usize>,
 }
 
@@ -15164,8 +15174,9 @@ fn failed_tool_sql() -> String {
 /// before a single row is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationProjectionTotals {
-    /// Rows the session holds — every observation of it, regardless of the
-    /// scope the consolidation target was resolved from.
+    /// Rows the session holds in the snapshot's scope — observations in the
+    /// `(workspace_id, project_id)` the snapshot was bound to, not a
+    /// cross-repository session's rows in another scope.
     pub total: usize,
     /// Oldest `created_at` (microseconds since the epoch); `None` while the
     /// session holds no rows.
@@ -15253,7 +15264,8 @@ impl SessionObservationSnapshot<'_> {
                     MAX(CASE WHEN kind = ?2 THEN created_at END), \
                     COALESCE(SUM(kind = ?6 AND {failed}), 0), \
                     MAX(CASE WHEN kind = ?6 AND {failed} THEN created_at END) \
-             FROM observations WHERE session_id = ?1"
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?9 AND project_id = ?10"
         );
         let summary = self.conn.query_row(
             &sql,
@@ -15266,6 +15278,8 @@ impl SessionObservationSnapshot<'_> {
                 ObservationKind::PostToolUse.as_str(),
                 TOOL_BODY_SEPARATOR,
                 FAILED_TOOL_OUTCOME_LINE,
+                self.workspace_id,
+                self.project_id,
             ],
             |row| {
                 Ok(SessionKindSummary {
@@ -15294,8 +15308,9 @@ impl SessionObservationSnapshot<'_> {
     pub fn projection_totals(&self) -> StoreResult<ObservationProjectionTotals> {
         let (total, first, last): (i64, Option<i64>, Option<i64>) = self.conn.query_row(
             "SELECT COUNT(*), MIN(created_at), MAX(created_at) \
-             FROM observations WHERE session_id = ?1",
-            params![self.session_id],
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            params![self.session_id, self.workspace_id, self.project_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         Ok(ObservationProjectionTotals {
@@ -15313,6 +15328,7 @@ impl SessionObservationSnapshot<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT kind, title, COUNT(*) FROM observations \
              WHERE session_id = ?1 AND kind IN (?2, ?3) AND title <> '' \
+               AND workspace_id = ?4 AND project_id = ?5 \
              GROUP BY kind, title",
         )?;
         let rows = stmt.query_map(
@@ -15320,6 +15336,8 @@ impl SessionObservationSnapshot<'_> {
                 self.session_id,
                 ObservationKind::PreToolUse.as_str(),
                 ObservationKind::PostToolUse.as_str(),
+                self.workspace_id,
+                self.project_id,
             ],
             |row| {
                 Ok((
@@ -15355,8 +15373,14 @@ impl SessionObservationSnapshot<'_> {
     pub fn prompt_titles(&self, head: usize, tail: usize) -> StoreResult<SessionPromptTitles> {
         let total = self.conn.query_row(
             "SELECT COUNT(*) FROM observations \
-             WHERE session_id = ?1 AND kind = ?2",
-            params![self.session_id, ObservationKind::UserPrompt.as_str()],
+             WHERE session_id = ?1 AND kind = ?2 \
+               AND workspace_id = ?3 AND project_id = ?4",
+            params![
+                self.session_id,
+                ObservationKind::UserPrompt.as_str(),
+                self.workspace_id,
+                self.project_id,
+            ],
             |row| row.get::<_, i64>(0),
         )?;
         let total = usize::try_from(total).unwrap_or(usize::MAX);
@@ -15392,6 +15416,7 @@ impl SessionObservationSnapshot<'_> {
         let sql = format!(
             "SELECT title FROM observations \
              WHERE session_id = ?1 AND kind = ?2 \
+               AND workspace_id = ?4 AND project_id = ?5 \
              ORDER BY created_at {direction}, rowid {direction} LIMIT ?3"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
@@ -15400,6 +15425,8 @@ impl SessionObservationSnapshot<'_> {
                 self.session_id,
                 ObservationKind::UserPrompt.as_str(),
                 i64::try_from(limit).unwrap_or(i64::MAX),
+                self.workspace_id,
+                self.project_id,
             ],
             |row| row.get(0),
         )?;
@@ -15428,12 +15455,15 @@ impl SessionObservationSnapshot<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END \
              FROM observations WHERE session_id = ?1 AND kind = ?2 \
+               AND workspace_id = ?4 AND project_id = ?5 \
              ORDER BY created_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query(params![
             self.session_id,
             ObservationKind::UserPrompt.as_str(),
             body_for_titles_like,
+            self.workspace_id,
+            self.project_id,
         ])?;
         while let Some(row) = rows.next()? {
             let title: String = row.get(0)?;
@@ -15470,7 +15500,8 @@ impl SessionObservationSnapshot<'_> {
         };
         let sql = format!(
             "SELECT kind, extension, source_event, substr(title, 1, ?3), created_at \
-             FROM observations WHERE session_id = ?1 \
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?4 AND project_id = ?5 \
              ORDER BY created_at {direction}, rowid {direction} LIMIT ?2"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
@@ -15478,6 +15509,8 @@ impl SessionObservationSnapshot<'_> {
             self.session_id,
             i64::try_from(limit).unwrap_or(i64::MAX),
             i64::try_from(SESSION_LINE_TITLE_CHARS).unwrap_or(80),
+            self.workspace_id,
+            self.project_id,
         ])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -15528,9 +15561,14 @@ impl SessionObservationSnapshot<'_> {
         let mut sql = String::from(
             "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
                     title, body, importance, created_at \
-             FROM observations WHERE session_id = ?",
+             FROM observations \
+             WHERE session_id = ? AND workspace_id = ? AND project_id = ?",
         );
-        let mut sql_params: Vec<Value> = vec![Value::Blob(self.session_id.clone())];
+        let mut sql_params: Vec<Value> = vec![
+            Value::Blob(self.session_id.clone()),
+            Value::Blob(self.workspace_id.clone()),
+            Value::Blob(self.project_id.clone()),
+        ];
         if let Some(bound) = at_or_before {
             sql.push_str(" AND created_at <= ?");
             sql_params.push(Value::Integer(bound));
@@ -15579,10 +15617,11 @@ impl SessionObservationSnapshot<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT rowid, id, session_id, workspace_id, project_id, kind, extension, \
                     source_event, title, body, importance, created_at \
-             FROM observations WHERE session_id = ?1 \
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
              ORDER BY created_at ASC, rowid ASC",
         )?;
-        let mut rows = stmt.query(params![self.session_id])?;
+        let mut rows = stmt.query(params![self.session_id, self.workspace_id, self.project_id])?;
         while let Some(row) = rows.next()? {
             let rowid: i64 = row.get(0)?;
             let observation = row_to_observation_at(row, 1)??;
@@ -15596,7 +15635,7 @@ impl SessionObservationSnapshot<'_> {
 
     /// Materialise one row of the session by its `rowid` — the point fetch a
     /// streamed pass uses to re-read a body it chose to keep. One row, or
-    /// none when the `rowid` belongs to another session or is gone.
+    /// none when the `rowid` belongs to another session or scope, or is gone.
     ///
     /// # Errors
     /// Propagates any SQL error.
@@ -15604,9 +15643,16 @@ impl SessionObservationSnapshot<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
                     title, body, importance, created_at \
-             FROM observations WHERE session_id = ?1 AND rowid = ?2",
+             FROM observations \
+             WHERE session_id = ?1 AND rowid = ?2 \
+               AND workspace_id = ?3 AND project_id = ?4",
         )?;
-        let mut rows = stmt.query(params![self.session_id, rowid])?;
+        let mut rows = stmt.query(params![
+            self.session_id,
+            rowid,
+            self.workspace_id,
+            self.project_id
+        ])?;
         match rows.next()? {
             Some(row) => {
                 let observation = row_to_observation(row)??;

@@ -5,8 +5,9 @@
 # Downloads ai-memory-windows-x86_64.zip from a GitHub release, verifies it
 # against the release's published .sha256 file, refuses an archive with an
 # absolute or `..` entry, unpacks it into %LOCALAPPDATA%\Programs\ai-memory and
-# adds that directory to your user PATH. No administrator rights, and nothing
-# outside that directory and your PATH is touched. A missing or mismatched
+# adds that directory to your user PATH. No administrator rights. Existing
+# destinations are refused before download; failed publication staging is
+# retained beside the destination and its path is reported. A missing or mismatched
 # checksum stops the install before anything is unpacked.
 #
 # Then run `ai-memory setup` to create the data dir, register the server to
@@ -73,9 +74,16 @@ function Install-AiMemory {
 
     $dest = if ($env:AI_MEMORY_INSTALL_DIR) { $env:AI_MEMORY_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\ai-memory' }
     if (-not [IO.Path]::IsPathRooted($dest)) { Fail "AI_MEMORY_INSTALL_DIR must be an absolute path, not $dest" }
+    $dest = [IO.Path]::GetFullPath($dest)
     $exe = Join-Path $dest 'ai-memory.exe'
-    if (Test-Path -LiteralPath $exe) {
-        Fail "ai-memory is already installed at $exe; run ``ai-memory upgrade`` to update it"
+    # Any existing filesystem entry belongs to its caller, even an empty
+    # directory. Check before downloading or executing a release, not just
+    # before publishing it. Get-Item also sees dangling directory links.
+    $existing = $null
+    try { $existing = Get-Item -LiteralPath $dest -Force -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { }
+    if ($null -ne $existing) {
+        Fail "destination already exists at $dest; remove it if it is empty or left over from a failed install, pick a new dedicated directory, or run ``ai-memory upgrade`` to update an existing installation"
     }
 
     $work = Join-Path ([IO.Path]::GetTempPath()) ("ai-memory-install-" + [Guid]::NewGuid().ToString('N'))
@@ -124,20 +132,50 @@ function Install-AiMemory {
 
         $parent = Split-Path -Parent $dest
         if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
-        if (Test-Path -LiteralPath $dest) {
-            # An empty or leftover directory with no binary: replace it.
-            Remove-Item -LiteralPath $dest -Recurse -Force
+        # CreateDirectoryW fails if another attempt already owns this name;
+        # Directory.CreateDirectory would silently accept an existing folder.
+        # Compile only in the installer's own temporary directory on PS 5.1.
+        if (-not ('AiMemory.InstallDirectory' -as [type])) {
+            $savedTmp, $savedTemp = $env:TMP, $env:TEMP
+            try {
+                $env:TMP = $work; $env:TEMP = $work
+                Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace AiMemory {
+    public static class InstallDirectory {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateDirectoryW(string path, IntPtr attributes);
+        public static void CreateExclusive(string path) {
+            if (!CreateDirectoryW(path, IntPtr.Zero))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot create install staging directory");
         }
-        # Copy, not move (#1480): an antivirus scan of the binary that just ran
-        # can still hold it open, and Windows refuses to rename or delete a file
-        # in use, which Move-Item needs. Reading it is allowed, and the staged
-        # copy is then removed below on a best-effort basis.
+    }
+}
+'@
+            } finally {
+                $env:TMP = $savedTmp; $env:TEMP = $savedTemp
+            }
+        }
+        $prepared = Join-Path $parent ('.ai-memory-install-' + [Guid]::NewGuid().ToString('N'))
+        [AiMemory.InstallDirectory]::CreateExclusive($prepared)
+        # Copy the binary that ran (#1480): antivirus may still hold it open
+        # without delete sharing. Publish its unexecuted copy from the same
+        # volume as the destination. Directory.Move refuses *any* existing
+        # destination, including one created after the initial check.
+        # https://learn.microsoft.com/dotnet/api/system.io.directory.move
         try {
-            Copy-Item -LiteralPath $staged -Destination $dest -Recurse
+            foreach ($entry in Get-ChildItem -LiteralPath $staged -Force) {
+                Copy-Item -LiteralPath $entry.FullName -Destination $prepared -Recurse
+            }
+            [IO.Directory]::Move($prepared, $dest)
         } catch {
-            # A partial copy holding ai-memory.exe would pass for an install on
-            # the next run.
-            Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+            # Never remove the destination: it may belong to a concurrent
+            # process. Retain failed staging rather than risking a cleanup of
+            # a directory replaced by somebody else after we created it.
+            Say "installation was not published; inspect leftover staging at $prepared before removing it"
             throw
         }
     } finally {
