@@ -471,7 +471,7 @@ pub fn build_launch_plan_with_env_lookup(
             }
             ManagedHarness::Codex => {
                 if let Some(id) = linked_session_id {
-                    let noninteractive = first_arg_is(&args, "exec");
+                    let noninteractive = codex_exec(&args);
                     let mut resumed = if noninteractive {
                         vec![
                             OsString::from("exec"),
@@ -719,7 +719,7 @@ pub fn is_interactive_session_invocation(
 fn noninteractive_invocation(harness: ManagedHarness, args: &[OsString]) -> bool {
     match harness {
         ManagedHarness::Claude => has_flag(args, &["--print", "-p"]),
-        ManagedHarness::Codex => first_arg_is(args, "exec"),
+        ManagedHarness::Codex => codex_exec(args),
         ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => first_arg_is(args, "run"),
         ManagedHarness::Crush => first_arg_is(args, "run"),
         ManagedHarness::Pi | ManagedHarness::Omp => has_flag(args, &["--print", "-p"]),
@@ -777,7 +777,7 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
         }
     }
     if harness == ManagedHarness::Codex
-        && first_arg_is(args, "exec")
+        && codex_exec(args)
         && args
             .get(1)
             .and_then(|arg| arg.to_str())
@@ -817,10 +817,12 @@ fn launch_mode(harness: ManagedHarness, args: &[OsString]) -> LaunchMode {
             "sandbox",
             "debug",
             "apply",
+            "a",
             "archive",
             "delete",
             "unarchive",
             "cloud",
+            "cloud-tasks",
             "exec-server",
             "features",
             "help",
@@ -1043,8 +1045,7 @@ pub fn has_native_session_selector(harness: ManagedHarness, args: &[OsString]) -
         ManagedHarness::Codex => {
             first_arg_is(args, "resume")
                 || first_arg_is(args, "fork")
-                || args.first().and_then(|arg| arg.to_str()) == Some("exec")
-                    && args.get(1).and_then(|arg| arg.to_str()) == Some("resume")
+                || codex_exec(args) && args.get(1).and_then(|arg| arg.to_str()) == Some("resume")
         }
         ManagedHarness::OpenCode | ManagedHarness::OpenCode2 => {
             has_flag(args, &["--session", "-s", "--continue", "-c", "--fork"])
@@ -1126,9 +1127,7 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
     match harness {
         ManagedHarness::Claude => flag_value(args, &["--resume", "-r", "--session-id"]),
         ManagedHarness::Codex => {
-            if first_arg_is(args, "exec")
-                && args.get(1).and_then(|arg| arg.to_str()) == Some("resume")
-            {
+            if codex_exec(args) && args.get(1).and_then(|arg| arg.to_str()) == Some("resume") {
                 args.get(2)
                     .and_then(|value| value.to_str())
                     .filter(|value| !value.starts_with('-'))
@@ -1158,6 +1157,12 @@ fn explicit_session_id(harness: ManagedHarness, args: &[OsString]) -> Option<Str
 
 fn first_arg_is(args: &[OsString], expected: &str) -> bool {
     args.first().and_then(|value| value.to_str()) == Some(expected)
+}
+
+/// `codex exec`, or `codex e`: Codex's CLI aliases `exec` as `e` (and `apply`
+/// as `a`, `cloud` as `cloud-tasks`), so both spellings run the same command.
+fn codex_exec(args: &[OsString]) -> bool {
+    first_arg_is(args, "exec") || first_arg_is(args, "e")
 }
 
 fn kiro_root_subcommand(args: &[OsString]) -> Option<&str> {
@@ -1907,6 +1912,38 @@ mod tests {
             ["exec", "resume", "codex-id", "--json", "continue here"]
         );
         assert_eq!(plan.mode, LaunchMode::Session);
+    }
+
+    /// `e`, `a` and `cloud-tasks` are Codex's own aliases for `exec`,
+    /// `apply` and `cloud`, so they launch exactly like the full names.
+    #[test]
+    fn codex_subcommand_aliases_launch_like_their_full_names() {
+        let native = vec![
+            OsString::from("e"),
+            OsString::from("--json"),
+            OsString::from("continue here"),
+        ];
+        let plan =
+            build_launch_plan(ManagedHarness::Codex, None, native, Some("codex-id")).unwrap();
+        assert_eq!(
+            strings(&plan.args),
+            ["exec", "resume", "codex-id", "--json", "continue here"]
+        );
+        assert!(!allows_native_session_adoption(
+            ManagedHarness::Codex,
+            &[OsString::from("e"), OsString::from("continue here")]
+        ));
+        for alias in ["a", "cloud-tasks"] {
+            let plan = build_launch_plan(
+                ManagedHarness::Codex,
+                None,
+                vec![OsString::from(alias)],
+                Some("codex-id"),
+            )
+            .unwrap();
+            assert_eq!(plan.mode, LaunchMode::Passthrough, "{alias}");
+            assert_eq!(strings(&plan.args), [alias]);
+        }
     }
 
     #[test]
