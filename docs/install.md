@@ -3362,6 +3362,23 @@ current ids. Keys are created in the
 [FutureInfra console](https://futureinfra.ai/console/?screen=ai-router). This
 example configures the LLM only; configure embeddings separately.
 
+[Standard Compute](https://standardcompute.com) is an OpenAI-compatible LLM
+gateway and also uses the existing `openai-compat` provider. Supply a
+Standard Compute API key:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://api.stdcmpt.com/v1
+-e AI_MEMORY_LLM_MODEL=StandardCompute
+-e LLM_API_KEY="$STANDARDCOMPUTE_API_KEY"
+```
+
+The `StandardCompute` model id is routed: each request goes to the cheapest
+enabled model that can handle it, with automatic fallback. To pin a specific
+model instead, use an id from `GET https://api.stdcmpt.com/v1/models`. See the
+[Standard Compute docs](https://docs.standardcompute.com) for details. This
+example configures the LLM only; configure embeddings separately.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
