@@ -54,6 +54,110 @@ def cfg_test_item(lines, index):
     return (item, path_attr) if item < len(lines) else (None, None)
 
 
+def _raw_string_prefix(line, i):
+    """If `line[i:]` opens a raw string (`r"`, `r#"`, `br#"`), return
+    `(num_hashes, index_after_opening_quote)`; otherwise None. `line[i]` is the
+    `r` or `b` and must begin a token, so a bare `r`/`b` inside an identifier
+    (`for`, a variable named `b`) is not mistaken for a prefix."""
+    if i > 0 and (line[i - 1].isalnum() or line[i - 1] == "_"):
+        return None
+    j = i + 1 if line[i] == "b" else i
+    if j >= len(line) or line[j] != "r":
+        return None
+    j += 1
+    hashes = 0
+    while j < len(line) and line[j] == "#":
+        hashes += 1
+        j += 1
+    if j < len(line) and line[j] == '"':
+        return hashes, j + 1
+    return None
+
+
+def _skip_char_or_lifetime(line, i):
+    """Advance past a char literal or lifetime at `line[i] == "'"` so a `'{'` or
+    `'}'` byte is not counted as a brace."""
+    length = len(line)
+    if i + 1 < length and line[i + 1] == "\\":
+        j = i + 2
+        while j < length and line[j] != "'":
+            j += 1
+        return j + 1 if j < length else length
+    if i + 2 < length and line[i + 2] == "'":
+        return i + 3
+    return i + 1
+
+
+def matching_brace_line(lines, header):
+    """0-based index of the line whose brace closes the item opened on
+    `lines[header]` (its line ends in `{`). Rust strings, raw strings, char
+    literals, and line/block comments are skipped, so a `}` inside a fixture
+    string does not end the item early (rustfmt otherwise indents real body
+    lines, leaving only the item's own brace at column 0). Falls back to the
+    last line when the braces never balance."""
+    depth = 0
+    mode = "code"  # code | string | raw | block
+    block_depth = 0
+    raw_hashes = 0
+    escape = False
+    line_no = header
+    while line_no < len(lines):
+        line = lines[line_no]
+        i = 0
+        while i < len(line):
+            c = line[i]
+            if mode == "code":
+                pair = line[i : i + 2]
+                if c == '"':
+                    mode, escape = "string", False
+                elif pair == "//":
+                    break
+                elif pair == "/*":
+                    mode, block_depth = "block", 1
+                    i += 2
+                    continue
+                elif c == "'":
+                    i = _skip_char_or_lifetime(line, i)
+                    continue
+                elif c in "rb" and (prefix := _raw_string_prefix(line, i)) is not None:
+                    raw_hashes, i = prefix
+                    mode = "raw"
+                    continue
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return line_no
+            elif mode == "string":
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    escape = True
+                elif c == '"':
+                    mode = "code"
+            elif mode == "raw":
+                if c == '"' and line[i + 1 : i + 1 + raw_hashes] == "#" * raw_hashes:
+                    mode = "code"
+                    i += 1 + raw_hashes
+                    continue
+            elif mode == "block":
+                pair = line[i : i + 2]
+                if pair == "/*":
+                    block_depth += 1
+                    i += 2
+                    continue
+                if pair == "*/":
+                    block_depth -= 1
+                    i += 2
+                    if block_depth == 0:
+                        mode = "code"
+                    continue
+            i += 1
+        line_no += 1
+    return len(lines) - 1
+
+
 def test_module_ranges(lines):
     """1-based inclusive line ranges of top-level `#[cfg(test)]` modules."""
     ranges = []
@@ -63,9 +167,7 @@ def test_module_ranges(lines):
         if header is None or not TEST_MOD_HEADER.match(lines[header]):
             index += 1
             continue
-        end = header + 1
-        while end < len(lines) and lines[end] != "}":
-            end += 1
+        end = matching_brace_line(lines, header)
         ranges.append((header + 1, end + 1))
         index = end + 1
     return ranges
