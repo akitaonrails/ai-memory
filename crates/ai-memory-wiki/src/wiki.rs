@@ -6744,6 +6744,8 @@ mod tests {
                 failure_policy: FailurePolicy::Ignore,
                 events: vec![AdmissionOp::WritePage],
                 blocking: false,
+                projects: Vec::new(),
+                headers: Vec::new(),
             }])
             .unwrap(),
         );
