@@ -151,6 +151,7 @@ async fn harness() -> Harness {
         session_consolidation_notify: None,
         profile_notify: None,
         capture_assistant_enabled: false,
+        assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
         claim_handoff_on_session_start: true,
         create_handoff_on_session_end: true,
         per_user_slots: false,

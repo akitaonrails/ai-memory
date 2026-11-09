@@ -22,6 +22,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `hook_rate_per_sec` | `0.0` | `AI_MEMORY_HOOK_RATE_PER_SEC` | Hook ingest tokens per second per actor and session source. 0 disables the limiter. |
 | `hook_rate_burst` | `0.0` (falls back to the rate, minimum one token, when the limiter is on) | `AI_MEMORY_HOOK_RATE_BURST` | Burst size of the hook ingest limiter. |
 | `capture_assistant` | `false` | `AI_MEMORY_CAPTURE_ASSISTANT` | Server side half of the assistant turn capture opt-in on Claude Code `Stop` events. |
+| `assistant_excerpt_max_bytes` | `2000` | `AI_MEMORY_ASSISTANT_EXCERPT_MAX_BYTES` | Byte cap on the stored assistant excerpt when `capture_assistant` is on. Clamped to 16 KiB. |
 | `consolidate_on_session_end` | `false` | `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` | Queue LLM consolidation on SessionEnd when an LLM provider is configured. |
 | `backfill_on_start` | `true` | `AI_MEMORY_BACKFILL_ON_START` | Import a project's existing local harness history once, when SessionStart finds its store empty. |
 | `run_autowire` | `true` | `AI_MEMORY_RUN_AUTOWIRE` | Install a harness's hooks and MCP server on the first `ai-memory run` launch when they are missing. |

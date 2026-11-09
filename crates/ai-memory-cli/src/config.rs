@@ -519,6 +519,10 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
+    /// Byte cap on the assistant excerpt stored when `capture_assistant` is on
+    /// (#2118). Defaults to 2,000; clamped to 16 KiB where it is applied. Set
+    /// with `AI_MEMORY_ASSISTANT_EXCERPT_MAX_BYTES`.
+    pub assistant_excerpt_max_bytes: usize,
     /// On by default. When the project's ai-memory store is brand new (empty),
     /// the SessionStart hook triggers a one-time, bounded import of this
     /// project's existing local harness session history so installing hooks
@@ -1561,6 +1565,7 @@ impl Default for Config {
             llm_fallback_unresolved: Vec::new(),
             consolidate_on_session_end: false,
             capture_assistant: false,
+            assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
             backfill_on_start: true,
             run_autowire: true,
             run: RunSettings::default(),
@@ -4745,6 +4750,19 @@ mod tests {
             "child stdout: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+
+    /// #2118: the stored assistant excerpt cap defaults to the 2 KB contract and
+    /// an operator can raise it from `config.toml`.
+    #[test]
+    fn assistant_excerpt_max_bytes_defaults_to_2000_and_loads() {
+        assert_eq!(Config::default().assistant_excerpt_max_bytes, 2_000);
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "assistant_excerpt_max_bytes = 8000\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.assistant_excerpt_max_bytes, 8_000);
     }
 
     #[test]
