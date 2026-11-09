@@ -740,12 +740,17 @@ pub fn claude_session_ran_in_background(
         return Ok(false);
     };
     let reader = BufReader::new(File::open(&path)?);
-    for line in reader.lines() {
+    // Split on bytes: a line that is not UTF-8 is one unreadable record, not
+    // a failed scan (`lines()` would end it with an error).
+    for line in reader.split(b'\n') {
         let line = line?;
+        let Ok(line) = std::str::from_utf8(&line) else {
+            continue;
+        };
         if !line.contains("\"sessionKind\"") {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if value.get("sessionKind").and_then(Value::as_str) == Some("bg")
@@ -874,13 +879,18 @@ pub fn claude_continued_sessions(
         let reader = BufReader::new(File::open(&path)?);
         let mut cleared = false;
         let mut cleared_in_checkout = false;
-        for line in reader.lines() {
+        // Other projects' live transcripts are read too: a line that is not
+        // UTF-8 (one cut mid-write) is skipped instead of failing the scan.
+        for line in reader.split(b'\n') {
             let line = line?;
+            let Ok(line) = std::str::from_utf8(&line) else {
+                continue;
+            };
             let clear_command = line.contains(CLAUDE_CLEAR_COMMAND);
             if !clear_command && !line.contains(&attached_marker) {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
             let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
@@ -8710,6 +8720,37 @@ mod tests {
         );
         assert_eq!(find("fg").as_deref(), Some("bg"));
         assert_eq!(find("unrelated"), None);
+    }
+
+    /// The scan reads every Claude transcript written since the launch,
+    /// including other projects' live sessions. A line that is not UTF-8 (a
+    /// record cut inside a multibyte character while it is being written) is
+    /// one unreadable record, not a reason to stop following this launch's
+    /// `/clear`.
+    #[test]
+    fn claude_continued_session_skips_a_line_that_is_not_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let clear = json!({
+            "type": "user",
+            "sessionId": "cleared",
+            "cwd": cwd,
+            "message": {"role": "user", "content": CLAUDE_CLEAR_COMMAND},
+        });
+        let turn =
+            json!({"type": "user", "sessionId": "cleared", "session_id": "launch", "cwd": cwd});
+        fs::write(project.join("cleared.jsonl"), format!("{clear}\n{turn}\n")).unwrap();
+        let mut partial = b"{\"type\":\"user\",\"message\":\"caf".to_vec();
+        partial.push(0xc3);
+        fs::write(project.join("busy.jsonl"), partial).unwrap();
+
+        let found = claude_continued_session(temp.path(), &cwd, None, "launch", started_at)
+            .expect("an unreadable record does not fail the scan");
+        assert_eq!(found, Some(ClaudeContinuation::Cleared("cleared".into())));
     }
 
     #[test]
