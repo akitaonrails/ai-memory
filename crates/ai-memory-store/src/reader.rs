@@ -9816,7 +9816,7 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn snapshot_to(&self, dest_path: PathBuf) -> StoreResult<()> {
         self.with_conn(move |conn| {
-            conn.backup(rusqlite::DatabaseName::Main, &dest_path, None)
+            conn.backup(rusqlite::MAIN_DB, &dest_path, rusqlite::backup::NO_PROGRESS)
                 .map_err(StoreError::from)
         })
         .await

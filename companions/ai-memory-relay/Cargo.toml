@@ -28,7 +28,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls-native-roots",
 ] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 # Default map ordering makes content comparisons independent of input key order.
 serde_json = "1"
