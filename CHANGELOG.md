@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Security
+
+- Updated the MCP Rust SDK to 3.9.0 so the bridge rejects oversized HTTP
+  response bodies. (GHSA-c9f9-cp8h-jcj5)
+
 ## [3.4.4] - 2026-11-08
 
 ### Security
