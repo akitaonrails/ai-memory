@@ -2486,7 +2486,7 @@ fn render_handoff_notice(h: &Handoff, now: jiff::Timestamp) -> String {
         .max(0)
         / 1_000;
     format!(
-        "📬 ai-memory: a pending handoff `{id}` from `{from}`, left {age} ago. \
+        "📬 ai-memory: a pending handoff `{id}` from `{from}`, left {age}. \
          To pick it up, call `memory_handoff_accept` with handoff_id `{id}`.",
         id = h.scope.id,
         from = h.origin.from_agent.as_str(),
@@ -6610,7 +6610,8 @@ pub(crate) mod tests {
         // call to make.
         assert!(notice.contains(&id.to_string()));
         assert!(notice.contains("claude-code") || notice.contains(AgentKind::ClaudeCode.as_str()));
-        assert!(notice.contains("1 hour ago"));
+        // The age bucket already ends in "ago": the notice must not add one.
+        assert!(notice.contains("left 1 hour ago. "), "{notice}");
         assert!(notice.contains("memory_handoff_accept"));
         assert!(
             notice.contains(&id.to_string()),
