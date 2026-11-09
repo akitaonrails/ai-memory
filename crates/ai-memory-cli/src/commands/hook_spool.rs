@@ -2422,7 +2422,8 @@ impl<'a> ProfileTokens<'a> {
 /// Rewrite `url`'s scheme and authority onto `server_url`, keeping path and
 /// query. Used only to retry an endpoint that has already proven unreachable.
 fn reroot_url(url: &str, server_url: &str) -> Option<String> {
-    let base = server_url.trim_end_matches('/');
+    // Only the origin: the spooled path already carries any mount path.
+    let (base, _) = crate::http_client::split_origin_and_path(server_url);
     let rest = url.split_once("://").map(|(_, r)| r)?;
     let path_and_query = rest.find(['/', '?']).map(|i| &rest[i..]).unwrap_or("");
     Some(format!("{base}{path_and_query}"))
@@ -4358,6 +4359,21 @@ mod tests {
         assert_eq!(
             loaded.attempts, 0,
             "an endpoint-level miss must not charge the entry actually attempted"
+        );
+    }
+
+    /// A configured `server_url` with a mount path (`/wiki`) must only lend
+    /// the retry its scheme and authority: the spooled URL already carries the
+    /// mount path, and repeating it 404s the retry until the entry is dropped.
+    #[test]
+    fn reroot_keeps_the_spooled_path_under_a_mounted_server_url() {
+        assert_eq!(
+            reroot_url(
+                "http://127.0.0.1:4444/wiki/hook?event=x",
+                "http://127.0.0.1:5555/wiki/"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:5555/wiki/hook?event=x")
         );
     }
 
