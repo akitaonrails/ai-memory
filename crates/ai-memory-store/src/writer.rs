@@ -872,6 +872,15 @@ pub(crate) enum WriteCmd {
         run_id: ManagedRunId,
         reply: oneshot::Sender<StoreResult<bool>>,
     },
+    RenewAttachedLease {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent: AgentKind,
+        native_session_id: String,
+        owner_user: Option<String>,
+        lease_micros: i64,
+        reply: oneshot::Sender<StoreResult<Option<crate::workstream::RenewedAttachLease>>>,
+    },
     CancelManagedRun {
         run_id: ManagedRunId,
         reply: oneshot::Sender<StoreResult<bool>>,
@@ -3845,6 +3854,34 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Renew the lease of the active run a hook-attached (directly launched)
+    /// session owns, located by its native session id within the caller's own
+    /// scope and operator (#2113). Returns `None` when no still-live attached run
+    /// matches — a foreign scope/operator cannot renew another's lease.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn renew_attached_lease(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        agent: AgentKind,
+        native_session_id: impl Into<String>,
+        owner_user: Option<String>,
+        lease_micros: i64,
+    ) -> StoreResult<Option<crate::workstream::RenewedAttachLease>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RenewAttachedLease {
+            workspace_id,
+            project_id,
+            agent,
+            native_session_id: native_session_id.into(),
+            owner_user,
+            lease_micros,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Release a managed-run lease after a handled launcher failure.
     pub async fn cancel_managed_run(&self, run_id: ManagedRunId) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
@@ -5463,6 +5500,26 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             WriteCmd::HeartbeatManagedRun { run_id, reply } => {
                 let result = crate::workstream::heartbeat(&mut conn, run_id);
                 send_or_warn(reply, result, "heartbeat_managed_run");
+            }
+            WriteCmd::RenewAttachedLease {
+                workspace_id,
+                project_id,
+                agent,
+                native_session_id,
+                owner_user,
+                lease_micros,
+                reply,
+            } => {
+                let result = crate::workstream::renew_attached_lease(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    agent,
+                    &native_session_id,
+                    owner_user.as_deref(),
+                    lease_micros,
+                );
+                send_or_warn(reply, result, "renew_attached_lease");
             }
             WriteCmd::CancelManagedRun { run_id, reply } => {
                 let result = crate::workstream::cancel_run(&mut conn, run_id);

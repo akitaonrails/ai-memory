@@ -135,7 +135,7 @@ pub use workstream::{
     LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
     ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
     OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    RenamedWorkstream, RenewedAttachLease, StoredManagedRunStatus, StoredWorkstreamSummary,
     WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};

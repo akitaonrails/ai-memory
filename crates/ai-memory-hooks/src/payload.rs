@@ -144,6 +144,20 @@ pub struct HookQuery {
     /// Compact JSON array of validated former project names from the local
     /// marker. Accepted only with a full git-remote identity.
     pub aliases: Option<String>,
+    /// Per-project opt-in for hook-driven managed-workstream attach (#2113),
+    /// forwarded from `[workstream] attach_direct_launches`. A truthy value lets
+    /// a session NOT launched by `ai-memory run` join a managed workstream using
+    /// only its lifecycle hooks; absent/falsy keeps the legacy direct-launch
+    /// path. Paired with `ws_select` and `ws_idle`.
+    pub ws_attach: Option<String>,
+    /// Which workstream a hook-driven attach targets (`[workstream] select`):
+    /// `newest` (default), `new`, or a workstream name. Ignored unless
+    /// `ws_attach` is truthy.
+    pub ws_select: Option<String>,
+    /// Idle lease duration in seconds for a hook-driven attach
+    /// (`[workstream] lease_idle_secs`), clamped server-side. Ignored unless
+    /// `ws_attach` is truthy.
+    pub ws_idle: Option<String>,
 }
 
 /// Coalesced view of an incoming hook event after light parsing of the
@@ -197,6 +211,10 @@ pub struct HookEnvelope {
     pub all_owners_requested: bool,
     /// Invocation-scoped managed-run id forwarded by the host hook.
     pub managed_run: Option<String>,
+    /// Hook-driven managed-workstream attach request (#2113), present only when
+    /// the project opted in via `[workstream] attach_direct_launches` and no
+    /// wrapper `managed_run` id is present. `None` for every legacy session.
+    pub attach: Option<AttachParams>,
     /// Whether this execution opted out of the automatic handoff (the
     /// `auto_handoff=0` query flag, from `AI_MEMORY_AUTO_HANDOFF`, #1951).
     pub auto_handoff_off: bool,
@@ -262,6 +280,7 @@ impl std::fmt::Debug for HookEnvelope {
                 &self.recall_default_global_requested,
             )
             .field("managed_run", &self.managed_run)
+            .field("attach", &self.attach)
             .field("auto_handoff_off", &self.auto_handoff_off)
             .field(
                 "capture_assistant_requested",
@@ -333,6 +352,97 @@ pub(crate) fn query_flag_falsy(value: Option<&str>) -> bool {
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("0" | "false" | "no" | "off")
     )
+}
+
+/// Which workstream a hook-driven attach (#2113) targets when a direct-launch
+/// session opts into managed mode via `[workstream] select`. Forwarded as the
+/// `ws_select` query flag; unknown or malformed values fall back to `Newest`,
+/// so a typo never routes a session into a surprising bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum AttachSelect {
+    /// Join the most recent workstream for this checkout+owner that has no live
+    /// lease, creating one only when none exists. The default.
+    Newest,
+    /// Always create and select a fresh workstream.
+    New,
+    /// Select a named workstream, creating it when absent (matching
+    /// `run --new NAME` by-name semantics).
+    Named(String),
+}
+
+/// Smallest accepted hook-attach idle lease, in seconds.
+pub(crate) const ATTACH_LEASE_IDLE_MIN_SECS: i64 = 60;
+/// Largest accepted hook-attach idle lease, in seconds (one day).
+pub(crate) const ATTACH_LEASE_IDLE_MAX_SECS: i64 = 86_400;
+/// Idle lease used when `[workstream] lease_idle_secs` is absent or unparseable.
+pub(crate) const ATTACH_LEASE_IDLE_DEFAULT_SECS: i64 = 900;
+/// Upper bound on the `ws_select` name the parser will keep before falling back
+/// to `Newest`; mirrors `MAX_WORKSTREAM_NAME_CHARS` in the store so a name this
+/// side accepts is one the store's `WorkstreamSelection::validate` also accepts.
+const ATTACH_SELECT_NAME_MAX_CHARS: usize = 128;
+
+/// Hook-driven managed-workstream attach request (#2113), parsed from the
+/// `ws_attach` / `ws_select` / `ws_idle` query flags the host hook forwards
+/// from a project's `.ai-memory.toml [workstream]` section. Present only when
+/// `ws_attach` is truthy; absent for every session that did not opt in, which
+/// leaves legacy direct-launch capture and handoff behavior untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttachParams {
+    /// Which workstream to join or create.
+    pub select: AttachSelect,
+    /// Idle lease duration in seconds, already clamped to
+    /// `[ATTACH_LEASE_IDLE_MIN_SECS, ATTACH_LEASE_IDLE_MAX_SECS]`.
+    pub lease_idle_secs: i64,
+}
+
+impl AttachParams {
+    /// Parse the forwarded attach flags. Returns `None` unless `ws_attach` is
+    /// truthy, so a project that never set `attach_direct_launches` produces no
+    /// attach intent even if a stray `ws_select`/`ws_idle` rode along.
+    #[must_use]
+    pub fn parse(attach: Option<&str>, select: Option<&str>, idle: Option<&str>) -> Option<Self> {
+        if !query_flag_truthy(attach) {
+            return None;
+        }
+        Some(Self {
+            select: parse_attach_select(select),
+            lease_idle_secs: parse_attach_idle_secs(idle),
+        })
+    }
+}
+
+/// Map the `ws_select` flag to an [`AttachSelect`]. `newest` (or absent) is the
+/// default; `new` always creates; any other value is a workstream name, kept
+/// only when it passes the same shape the store enforces, else `Newest`.
+fn parse_attach_select(value: Option<&str>) -> AttachSelect {
+    let Some(trimmed) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return AttachSelect::Newest;
+    };
+    match trimmed.to_ascii_lowercase().as_str() {
+        "newest" => AttachSelect::Newest,
+        "new" => AttachSelect::New,
+        _ => {
+            let shape_ok = trimmed.chars().count() <= ATTACH_SELECT_NAME_MAX_CHARS
+                && !trimmed.chars().any(char::is_control)
+                && !trimmed.contains(['/', '\\']);
+            if shape_ok {
+                AttachSelect::Named(trimmed.to_string())
+            } else {
+                AttachSelect::Newest
+            }
+        }
+    }
+}
+
+/// Clamp the `ws_idle` flag into `[ATTACH_LEASE_IDLE_MIN_SECS,
+/// ATTACH_LEASE_IDLE_MAX_SECS]`, defaulting when absent or unparseable.
+fn parse_attach_idle_secs(value: Option<&str>) -> i64 {
+    value
+        .map(str::trim)
+        .and_then(|v| v.parse::<i64>().ok())
+        .map_or(ATTACH_LEASE_IDLE_DEFAULT_SECS, |secs| {
+            secs.clamp(ATTACH_LEASE_IDLE_MIN_SECS, ATTACH_LEASE_IDLE_MAX_SECS)
+        })
 }
 
 pub(crate) fn marker_aliases_from_wire(
@@ -700,6 +810,19 @@ impl HookEnvelope {
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
         let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
+        // The wrapper's `ai-memory run` lease always wins: a session it launched
+        // is already managed, so a stray `ws_attach` on the same event never
+        // forks a second attach. Hook-driven attach only applies to a direct
+        // launch with no `managed_run` id (#2113).
+        let attach = if managed_run.is_some() {
+            None
+        } else {
+            AttachParams::parse(
+                query.ws_attach.as_deref(),
+                query.ws_select.as_deref(),
+                query.ws_idle.as_deref(),
+            )
+        };
         let auto_handoff_off = query_flag_falsy(query.auto_handoff.as_deref());
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
@@ -795,6 +918,7 @@ impl HookEnvelope {
             recall_default_global_requested,
             all_owners_requested,
             managed_run,
+            attach,
             auto_handoff_off,
             capture_assistant_requested,
             ingest_key,
@@ -1862,6 +1986,96 @@ mod tests {
         );
         assert_eq!(env.occurred_at, None);
         assert_eq!(env.occurred_at_micros(), None);
+    }
+
+    #[test]
+    fn attach_parse_requires_a_truthy_ws_attach() {
+        // Without the opt-in flag, stray select/idle values never synthesize an
+        // attach intent — a project that did not set attach_direct_launches is
+        // left on the legacy direct-launch path.
+        assert_eq!(AttachParams::parse(None, Some("new"), Some("300")), None);
+        assert_eq!(AttachParams::parse(Some("0"), Some("new"), None), None);
+        assert_eq!(AttachParams::parse(Some(""), None, None), None);
+    }
+
+    #[test]
+    fn attach_parse_defaults_select_and_idle() {
+        let attach = AttachParams::parse(Some("1"), None, None).expect("opted in");
+        assert_eq!(attach.select, AttachSelect::Newest);
+        assert_eq!(attach.lease_idle_secs, ATTACH_LEASE_IDLE_DEFAULT_SECS);
+    }
+
+    #[test]
+    fn attach_parse_reads_select_variants() {
+        let newest = AttachParams::parse(Some("true"), Some("NEWEST"), None).unwrap();
+        assert_eq!(newest.select, AttachSelect::Newest);
+        let fresh = AttachParams::parse(Some("yes"), Some(" New "), None).unwrap();
+        assert_eq!(fresh.select, AttachSelect::New);
+        let named = AttachParams::parse(Some("on"), Some("  review-branch "), None).unwrap();
+        assert_eq!(named.select, AttachSelect::Named("review-branch".into()));
+    }
+
+    #[test]
+    fn attach_parse_rejects_malformed_select_names() {
+        // A name the store's validator would refuse (path separators, control
+        // chars, over-length) falls back to the safe default rather than
+        // forwarding garbage the attach branch would have to re-reject.
+        for bogus in ["../escape", "a\\b", "with\u{7}bell", &"x".repeat(129)] {
+            let attach = AttachParams::parse(Some("1"), Some(bogus), None).unwrap();
+            assert_eq!(
+                attach.select,
+                AttachSelect::Newest,
+                "malformed select {bogus:?} must fall back to Newest"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_parse_clamps_idle_seconds() {
+        let too_small = AttachParams::parse(Some("1"), None, Some("5")).unwrap();
+        assert_eq!(too_small.lease_idle_secs, ATTACH_LEASE_IDLE_MIN_SECS);
+        let too_big = AttachParams::parse(Some("1"), None, Some("999999")).unwrap();
+        assert_eq!(too_big.lease_idle_secs, ATTACH_LEASE_IDLE_MAX_SECS);
+        let in_range = AttachParams::parse(Some("1"), None, Some("1200")).unwrap();
+        assert_eq!(in_range.lease_idle_secs, 1200);
+        let garbage = AttachParams::parse(Some("1"), None, Some("soon")).unwrap();
+        assert_eq!(garbage.lease_idle_secs, ATTACH_LEASE_IDLE_DEFAULT_SECS);
+    }
+
+    #[test]
+    fn envelope_carries_the_attach_request_from_the_query() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "session-start".into(),
+                ws_attach: Some("1".into()),
+                ws_select: Some("my-stream".into()),
+                ws_idle: Some("1800".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s" }),
+        );
+        let attach = env.attach.expect("attach requested");
+        assert_eq!(attach.select, AttachSelect::Named("my-stream".into()));
+        assert_eq!(attach.lease_idle_secs, 1800);
+    }
+
+    #[test]
+    fn a_wrapper_managed_run_suppresses_hook_attach() {
+        // The wrapper's `ai-memory run` lease always wins: a session it launched
+        // is already managed, so a stray ws_attach on the same event must never
+        // fork a second attach intent.
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                managed_run: Some("run-7".into()),
+                ws_attach: Some("1".into()),
+                ws_select: Some("new".into()),
+                ..Default::default()
+            },
+            serde_json::json!({ "session_id": "s" }),
+        );
+        assert_eq!(env.managed_run.as_deref(), Some("run-7"));
+        assert_eq!(env.attach, None, "wrapper run must suppress hook attach");
     }
 
     #[test]

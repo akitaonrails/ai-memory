@@ -6455,3 +6455,152 @@ async fn an_explicit_handoff_from_a_live_session_is_delivered_and_claimed_once()
         .unwrap();
     assert!(!again.handoff_accepted, "claimed exactly once");
 }
+
+/// #2113: a directly-launched (hook-attached) session renews its own run's lease
+/// by native session id, and the renewal is strictly bounded to its own scope
+/// and operator. Dropping the owner or `(workspace, project)` predicate in
+/// `renew_attached_lease` would let any session hold another operator's or
+/// project's workstream lease — so each foreign probe below must return `None`
+/// while the legitimate control renews. A finished/released run is terminal and
+/// is never revived by a late event.
+#[tokio::test]
+async fn an_attached_lease_renews_only_within_its_own_scope_and_operator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other-app", None)
+        .await
+        .unwrap();
+    let alice = operator("alice");
+    let bob = operator("bob");
+    let prepare = |project_id, lease_owner: &str| PrepareWorkstreamRun {
+        scope_by_id: false,
+        workspace_id: ws,
+        project_id,
+        repo_fingerprint: format!("repo-{project_id}"),
+        worktree_fingerprint: format!("worktree-{project_id}"),
+        cwd: format!("/repo/{project_id}"),
+        agent: AgentKind::ClaudeCode,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::New("attached".into()),
+        lease_owner: lease_owner.into(),
+    };
+    const IDLE: i64 = 900 * 1_000_000;
+
+    // Alice's directly-launched Claude session attaches and links its native
+    // session, exactly as a hook-driven SessionStart would.
+    let run = store
+        .writer
+        .prepare_workstream_run_owned(prepare(proj, "hook:host:sess-a"), Some(alice.clone()))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(run.run_id, AgentKind::ClaudeCode, "sess-a")
+            .await
+            .unwrap()
+    );
+
+    // Control: the same scope + operator + native session renews and resolves
+    // to the exact run and workstream.
+    let renewed = store
+        .writer
+        .renew_attached_lease(
+            ws,
+            proj,
+            AgentKind::ClaudeCode,
+            "sess-a",
+            Some(alice.clone()),
+            IDLE,
+        )
+        .await
+        .unwrap()
+        .expect("alice renews her own attached lease");
+    assert_eq!(renewed.run_id, run.run_id);
+    assert_eq!(renewed.workstream_id, run.workstream_id);
+
+    // A foreign operator cannot locate or extend it.
+    assert!(
+        store
+            .writer
+            .renew_attached_lease(ws, proj, AgentKind::ClaudeCode, "sess-a", Some(bob), IDLE)
+            .await
+            .unwrap()
+            .is_none(),
+        "a foreign operator must not renew another's attach lease"
+    );
+    // A foreign (workspace, project) cannot either.
+    assert!(
+        store
+            .writer
+            .renew_attached_lease(
+                ws,
+                other_proj,
+                AgentKind::ClaudeCode,
+                "sess-a",
+                Some(alice.clone()),
+                IDLE,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "a foreign project must not renew the lease"
+    );
+    // A different native session id does not match.
+    assert!(
+        store
+            .writer
+            .renew_attached_lease(
+                ws,
+                proj,
+                AgentKind::ClaudeCode,
+                "sess-b",
+                Some(alice.clone()),
+                IDLE,
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A different agent kind does not match.
+    assert!(
+        store
+            .writer
+            .renew_attached_lease(
+                ws,
+                proj,
+                AgentKind::Codex,
+                "sess-a",
+                Some(alice.clone()),
+                IDLE
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // An anonymous caller does not match an owned run.
+    assert!(
+        store
+            .writer
+            .renew_attached_lease(ws, proj, AgentKind::ClaudeCode, "sess-a", None, IDLE)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A released run is terminal: a late event cannot renew it.
+    assert!(store.writer.cancel_managed_run(run.run_id).await.unwrap());
+    assert!(
+        store
+            .writer
+            .renew_attached_lease(ws, proj, AgentKind::ClaudeCode, "sess-a", Some(alice), IDLE)
+            .await
+            .unwrap()
+            .is_none(),
+        "a released attach run is never revived by a late event"
+    );
+}

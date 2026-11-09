@@ -777,6 +777,11 @@ fn build_marker_query_suffix(
     let (mut profile_contribute, mut profile_consume) = (None, None);
     let mut handoff_off = false;
     let mut recovery_off = false;
+    // `[workstream]` hook-driven attach opt-in (#2113). Off unless the nearest
+    // settings marker turns it on; `select`/`lease_idle_secs` only matter then.
+    let mut attach_on = false;
+    let mut attach_select = None;
+    let mut attach_idle = None;
     // The nearest marker that declares more than `[capture]` (#668): a
     // nested capture-only marker (e.g. one that only sets `ignore_paths`)
     // must not shadow an outer marker's workspace/project/briefing/etc.
@@ -812,6 +817,20 @@ fn build_marker_query_suffix(
             crate::marker::parse_toml_section_flag(&marker, "recovery", "deliver_on_session_start")
                 .as_deref()
                 .is_some_and(crate::marker::is_falsy);
+        // `[workstream] attach_direct_launches = true` opts a non-`run` session
+        // into joining a managed workstream through its hooks (#2113). The
+        // section-scoped reads keep `select` from colliding with any same-named
+        // key elsewhere. `select`/`lease_idle_secs` ride along only when attach
+        // is on; the server validates and clamps both.
+        attach_on =
+            crate::marker::parse_toml_section_flag(&marker, "workstream", "attach_direct_launches")
+                .as_deref()
+                .is_some_and(crate::marker::is_truthy);
+        if attach_on {
+            attach_select = crate::marker::parse_toml_section_flag(&marker, "workstream", "select");
+            attach_idle =
+                crate::marker::parse_toml_section_flag(&marker, "workstream", "lease_idle_secs");
+        }
     }
     if let Some(val) = scope.workspace {
         qs.push_str(&format!("&workspace={}", url_encode(&val)));
@@ -879,6 +898,19 @@ fn build_marker_query_suffix(
     }
     if let Some(val) = briefing_budget.filter(|v| !v.is_empty()) {
         qs.push_str(&format!("&briefing_budget={}", url_encode(&val)));
+    }
+    // Hook-driven workstream attach (#2113): only sent when the marker opted in,
+    // so a repository without `[workstream] attach_direct_launches` sends nothing
+    // and the server takes its normal unmanaged path. `ws_select`/`ws_idle` are
+    // advisory; the server validates `select` and clamps the idle seconds.
+    if attach_on {
+        qs.push_str("&ws_attach=1");
+        if let Some(val) = attach_select.filter(|v| !v.is_empty()) {
+            qs.push_str(&format!("&ws_select={}", url_encode(&val)));
+        }
+        if let Some(val) = attach_idle.filter(|v| !v.is_empty()) {
+            qs.push_str(&format!("&ws_idle={}", url_encode(&val)));
+        }
     }
     qs
 }
@@ -1903,6 +1935,42 @@ mod tests {
             qs.contains("&identity=acme%2Fplatform&identity_src=explicit"),
             "{qs}"
         );
+    }
+
+    /// `[workstream] attach_direct_launches` forwards the hook-attach flags
+    /// (#2113); without it, nothing workstream-related reaches the server, so a
+    /// project that never opted in keeps its legacy direct-launch path.
+    #[test]
+    fn marker_query_suffix_forwards_the_workstream_attach_opt_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let marker = tmp.path().join(".ai-memory.toml");
+
+        // No marker at all: no workstream flags.
+        let qs = marker_query_suffix(cwd, None);
+        assert!(!qs.contains("ws_attach"), "{qs}");
+
+        // Opted in with an explicit named selection and idle lease.
+        std::fs::write(
+            &marker,
+            "[workstream]\nattach_direct_launches = true\nselect = \"review\"\nlease_idle_secs = 1800\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(qs.contains("&ws_attach=1"), "{qs}");
+        assert!(qs.contains("&ws_select=review"), "{qs}");
+        assert!(qs.contains("&ws_idle=1800"), "{qs}");
+
+        // Present but turned off: the select/idle keys are not forwarded either,
+        // so the server never sees an attach intent for an opted-out project.
+        std::fs::write(
+            &marker,
+            "[workstream]\nattach_direct_launches = false\nselect = \"review\"\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(cwd, None);
+        assert!(!qs.contains("ws_attach"), "{qs}");
+        assert!(!qs.contains("ws_select"), "{qs}");
     }
 
     #[test]

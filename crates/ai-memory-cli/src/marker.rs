@@ -1258,7 +1258,7 @@ fn declares_more_than_capture(text: &str) -> bool {
         "identity",
         "identity_style",
     ];
-    const FLAG_KEYS: [&str; 8] = [
+    const FLAG_KEYS: [&str; 10] = [
         "default_global",
         "inject_on_session_start",
         "inject_on_subagent_start",
@@ -1267,6 +1267,10 @@ fn declares_more_than_capture(text: &str) -> bool {
         "consume",
         "deliver_on_session_start",
         "inbox_notice_on_prompt",
+        // `[workstream]` attach opt-in (#2113): a marker that enables or tunes
+        // hook-driven attach is a resolution boundary, not capture-only.
+        "attach_direct_launches",
+        "lease_idle_secs",
     ];
     QUOTED_KEYS
         .iter()
@@ -2424,6 +2428,8 @@ project = "infra" # this is fine
             "[briefing]\ninject_on_subagent_start = true\n",
             "[briefing]\nmax_chars = 4000\n",
             "[handoff]\ndeliver_on_session_start = false\n",
+            "[workstream]\nattach_direct_launches = true\n",
+            "[workstream]\nlease_idle_secs = 1800\n",
         ] {
             assert!(
                 declares_more_than_capture(text),

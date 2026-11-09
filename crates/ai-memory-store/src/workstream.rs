@@ -973,6 +973,85 @@ pub(crate) fn heartbeat(conn: &mut Connection, run_id: ManagedRunId) -> StoreRes
     Ok(changed > 0)
 }
 
+/// The active managed run a hook-attached session owns, after its lease was
+/// extended.
+#[derive(Debug, Clone)]
+pub struct RenewedAttachLease {
+    /// The attached run whose lease was extended.
+    pub run_id: ManagedRunId,
+    /// The workstream that run belongs to.
+    pub workstream_id: WorkstreamId,
+}
+
+/// Renew the lease of the active managed run a directly-launched (hook-attached,
+/// #2113) session owns, located by its native session id inside the caller's own
+/// scope and operator. A directly-launched session has no wrapper heartbeat, so
+/// every one of its hook events renews here instead, pushing the lease out by
+/// `lease_micros` (the marker's `lease_idle_secs`) so the run lapses only after
+/// that much idle time.
+///
+/// Returns `None` when no *still-live* active run exists for this exact
+/// `(workspace, project, agent, native session, owner)`. This is the attach
+/// isolation boundary: a foreign operator or a foreign `(workspace, project)`
+/// can neither locate nor extend another session's attach lease, and a lease
+/// that has already lapsed is not silently revived — the session must re-attach
+/// so a workstream another session has since claimed is never stolen back.
+pub(crate) fn renew_attached_lease(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    agent: AgentKind,
+    native_session_id: &str,
+    owner_user: Option<&str>,
+    lease_micros: i64,
+) -> StoreResult<Option<RenewedAttachLease>> {
+    let native_identity =
+        match NativeSessionIdentity::parse(native_session_id, &Sanitizer::builtin()) {
+            Ok(id) => id,
+            Err(_) => return Ok(None),
+        };
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    // Scope + operator + still-live are all guards, not conveniences: dropping
+    // the `owner_user` or workspace/project predicate would let any session renew
+    // (and thereby hold) another operator's or project's workstream lease.
+    let found: Option<(Vec<u8>, Vec<u8>)> = tx
+        .query_row(
+            "SELECT r.id, r.workstream_id FROM managed_runs r \
+             JOIN workstream_native_sessions s \
+               ON s.workstream_id = r.workstream_id AND s.agent_kind = r.agent_kind \
+             JOIN workstreams w ON w.id = r.workstream_id \
+             WHERE r.state = 'active' AND r.agent_kind = ?1 \
+               AND s.native_session_id = ?2 AND s.is_current = 1 \
+               AND w.workspace_id = ?3 AND w.project_id = ?4 \
+               AND r.owner_user IS ?5 \
+               AND r.lease_expires_at > ?6 \
+             LIMIT 1",
+            params![
+                agent.as_str(),
+                native_identity.as_str(),
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                owner_user,
+                now,
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((run_id, workstream_id)) = found else {
+        return Ok(None);
+    };
+    tx.execute(
+        "UPDATE managed_runs SET lease_expires_at = ?1 WHERE id = ?2 AND state = 'active'",
+        params![now + lease_micros, run_id],
+    )?;
+    tx.commit()?;
+    Ok(Some(RenewedAttachLease {
+        run_id: ManagedRunId::from_slice(&run_id)?,
+        workstream_id: WorkstreamId::from_slice(&workstream_id)?,
+    }))
+}
+
 /// Release an active managed-run lease without importing any events.
 pub(crate) fn cancel_run(conn: &mut Connection, run_id: ManagedRunId) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
