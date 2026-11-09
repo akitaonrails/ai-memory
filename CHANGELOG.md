@@ -192,6 +192,13 @@ version in [`docs/changelog/`](docs/changelog/):
   rows, so those rows were the last copy of that work. They are now kept unless
   that project holds a live page of the session, as the sweep's dry run also
   reports. Rows already pruned cannot be recovered (#2124).
+- `merge-project` run in a checkout whose `.ai-memory.toml` selects a server
+  profile now merges on that profile's server. It took its default workspace
+  from the marker but sent the dry run and the merge to the install's own
+  server with the config bearer, so a same-named workspace there was merged
+  while the profile's server was never asked. It now follows the marker like
+  `rename-project` and `move-project`, fails before sending anything when the
+  profile does not resolve, and still honours `AI_MEMORY_SERVER_URL` (#2150).
 
 
 ## [3.4.4] - 2026-11-08
