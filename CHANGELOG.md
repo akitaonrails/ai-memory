@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - `backup` and `export-okf` now preserve the previous archive when a server
   returns a successful response without a gzip signature, such as an HTML login
-  page or an empty response.
+  page or an empty response (#2138).
 
 ## [3.4.4] - 2026-11-08
 
