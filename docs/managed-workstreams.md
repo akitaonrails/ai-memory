@@ -465,8 +465,9 @@ launch harness for the highlighted row. Each row remembers its choice while you
 navigate. `auto` is the initial choice and preserves bare `ai-memory run`'s
 discovery of the newest usable session; the remaining choices are supported
 harness executables detected in the host `PATH`. Enter launches the displayed
-workstream/harness combination. Escape clears a non-empty search, then cancels
-when the search is empty; Ctrl-C always cancels.
+workstream/harness combination. When the harness exits, including after Ctrl+C,
+the workstream picker reopens with an updated list. Escape clears a non-empty
+search, then returns to the shell when the search is empty; Ctrl-C always cancels.
 
 Just type to filter workstream names with a case-insensitive substring search;
 there is no search mode or prefix key. Results update immediately, and every

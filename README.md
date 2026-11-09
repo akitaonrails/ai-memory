@@ -487,7 +487,7 @@ ai-memory run --profile work claude  # reusable config.toml env/account preset
 ai-memory continue           # resume the newest managed checkout
 # after a dead launcher left its lease behind (same operator only)
 ai-memory run --force-unlock codex
-ai-memory resume             # pick from ALL workstreams in this checkout only
+ai-memory resume             # pick a workstream; return to the picker after exit
 ai-memory resume --search auth # find a workstream by name (case-insensitive)
 ai-memory resume --all       # pick across every linked checkout
 ```
