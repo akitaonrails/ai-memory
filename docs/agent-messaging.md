@@ -399,7 +399,11 @@ The design enforces this on several levels:
   outbox/cancel by the sender coordinate.
 
 On a shared/multi-user server, sending requires the normal write capability, and
-each message records who sent it for audit.
+each message records who sent it for audit. The CLI and the MCP tools apply the
+same per-project grants: `ai-memory message` calls `/messages*` with the
+operator's own key. Listing needs read access to the project. Popping,
+cancelling and receiving a message need write access. Naming a project as the
+sender needs read access to it. The `/admin/messages*` routes remain root-only.
 
 ## On-start "hot context" and the inbox notice
 

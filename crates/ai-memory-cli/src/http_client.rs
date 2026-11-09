@@ -98,6 +98,18 @@ pub(crate) fn server_response_error_for_test(
     .into()
 }
 
+/// Whether `error` is a 404 for a route this server does not have, as opposed
+/// to a route that answered 404 with a JSON `error`, such as a missing project.
+pub(crate) fn is_missing_route(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerResponseError>()
+        .is_some_and(|e| {
+            e.status == reqwest::StatusCode::NOT_FOUND
+                && serde_json::from_str::<serde_json::Value>(&e.body)
+                    .map_or(true, |body| body.get("error").is_none())
+        })
+}
+
 /// Pass a 2xx response through, else consume the body into a
 /// [`ServerResponseError`].
 ///

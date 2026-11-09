@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `ai-memory message send`, `list`, `pop` and `cancel` now work with a normal
+  API key on a multi-user server. They returned 403 because they called the
+  root-only `/admin/messages*` routes. The new `/messages*` routes apply the same
+  per-project grants as the `memory_message_*` MCP tools, and the CLI falls back
+  to the `/admin` routes on an older server. Those routes stay root-only. Admin
+  pop and cancel now also run the admission and observer webhooks, as the MCP
+  tools already did. (#2146)
+
 - `[maintenance] lint_llm_interval_secs` (default `0`, off) runs the LLM
   contradiction pass across every project on its own persisted cadence, with
   one `lint` provider call per project that has enough semantic pages. With no
