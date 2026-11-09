@@ -441,6 +441,14 @@ async fn blank_recipient_send_is_refused_and_lands_in_no_inbox() {
 
     // Control: a fully named recipient proceeds and lands in that inbox.
     h.send(A, C, "please do X").await;
-    assert_eq!(h.pending_for(h.c).await, 1, "the named recipient received it");
-    assert_eq!(h.pending_for(h.a).await, 0, "still not in the sender's inbox");
+    assert_eq!(
+        h.pending_for(h.c).await,
+        1,
+        "the named recipient received it"
+    );
+    assert_eq!(
+        h.pending_for(h.a).await,
+        0,
+        "still not in the sender's inbox"
+    );
 }
