@@ -80,6 +80,65 @@ enum ConfigPlacement {
     Divert,
 }
 
+/// Lock a directory a restore creates down to owner-only (`0700`).
+///
+/// A backup holds the SQLite database (API-key hashes, session and
+/// observation text) and `config.toml` (the token pepper and provider
+/// credentials). The archive is extracted with `set_preserve_permissions`
+/// off, so without this every restored file lands at the process umask —
+/// world- or group-readable on a shared host. These helpers restrict the
+/// roots a restore *creates*; an existing data dir is left as the operator
+/// set it, since it may be shared on purpose. A no-op off Unix, where the
+/// mode bits do not apply.
+#[cfg(unix)]
+fn restrict_dir_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Lock a file a restore creates down to owner-only (`0600`). See
+/// [`restrict_dir_to_owner`].
+#[cfg(unix)]
+fn restrict_file_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_file_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Lock the staged `wiki/` and `db/` roots and the two secret-bearing files
+/// (the SQLite database and `config.toml`) down to the owner before they are
+/// renamed into a data dir that may be shared. The directory modes alone bar
+/// a non-owner from traversing in; the file modes are defence in depth.
+fn restrict_staged_tree(staging: &Path) -> Result<()> {
+    for dir in REPLACED_DIRS {
+        let staged = staging.join(dir);
+        if staged.is_dir() {
+            restrict_dir_to_owner(&staged)
+                .with_context(|| format!("restricting permissions on {}", staged.display()))?;
+        }
+    }
+    let staged_db = staging.join("db").join("memory.sqlite");
+    if staged_db.is_file() {
+        restrict_file_to_owner(&staged_db)
+            .with_context(|| format!("restricting permissions on {}", staged_db.display()))?;
+    }
+    let staged_config = staging.join(CONFIG_FILE);
+    if staged_config.is_file() {
+        restrict_file_to_owner(&staged_config)
+            .with_context(|| format!("restricting permissions on {}", staged_config.display()))?;
+    }
+    Ok(())
+}
+
 /// Run the `restore` subcommand.
 ///
 /// # Errors
@@ -168,7 +227,14 @@ async fn restore_data_dir_with_legacy_pepper(
             data_dir.display(),
         );
     }
+    let data_dir_existed = data_dir.exists();
     std::fs::create_dir_all(data_dir)?;
+    if !data_dir_existed {
+        // We created the restore root, so it is ours to lock down. An
+        // existing data dir is left untouched — it may be shared on purpose.
+        restrict_dir_to_owner(data_dir)
+            .with_context(|| format!("restricting permissions on {}", data_dir.display()))?;
+    }
 
     // Both scratch directories live inside the data dir so every move below
     // is a rename on one filesystem, never a copy that could half-complete.
@@ -224,6 +290,10 @@ async fn stage_then_swap(
 ) -> Result<ConfigOutcome> {
     std::fs::create_dir(staging)
         .with_context(|| format!("creating staging dir {}", staging.display()))?;
+    // The staging dir briefly holds the archive's SQLite database and config
+    // before they are swapped live; lock it to the owner before extraction.
+    restrict_dir_to_owner(staging)
+        .with_context(|| format!("restricting permissions on {}", staging.display()))?;
 
     // 1. Extract into staging, validating every entry on the way. A
     //    truncated gzip stream, an unreadable member or a path outside the
@@ -343,6 +413,11 @@ async fn stage_then_swap(
     }
     drop(store);
 
+    // Extraction dropped the archive's permission bits, so the restored tree
+    // sits at the process umask. Lock its roots and secret files down before
+    // they move into a data dir that may be shared.
+    restrict_staged_tree(staging)?;
+
     // 3. Exchange the live directories for the staged ones.
     swap_into_place(i18n, data_dir, staging, previous, placement)?;
     info!(into = %data_dir.display(), "restored data swapped into place");
@@ -359,11 +434,7 @@ async fn stage_then_swap(
 /// Move the staged config beside the live one, owner-only: it can hold the
 /// API-key pepper and other credentials.
 fn save_archived_config(staged: &Path, beside: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o600))?;
-    }
+    restrict_file_to_owner(staged)?;
     std::fs::rename(staged, beside)
 }
 
@@ -379,6 +450,10 @@ fn swap_into_place(
     placement: ConfigPlacement,
 ) -> Result<()> {
     std::fs::create_dir(previous).with_context(|| format!("creating {}", previous.display()))?;
+    // `previous` holds the live wiki/ and db/ while the swap runs; keep it
+    // owner-only so the old database is not briefly exposed on a shared host.
+    restrict_dir_to_owner(previous)
+        .with_context(|| format!("restricting permissions on {}", previous.display()))?;
 
     // Entries moved from the data dir into `previous`, and staged entries
     // already placed live: the two lists a rollback has to undo.
@@ -1710,6 +1785,84 @@ mod tests {
         );
         assert!(!data.path().join(CONFIG_FROM_BACKUP_FILE).exists());
         assert!(restore_scratch_dirs(data.path()).is_empty());
+    }
+
+    /// GHSA-mhmf: a restore must not leave the backup's SQLite database or
+    /// `config.toml` — which carry API-key hashes, the token pepper and
+    /// provider credentials — group- or world-readable. Extraction drops the
+    /// archive's permission bits, so under a normal umask every restored file
+    /// would land at `0755`/`0644`; the restore instead locks its own roots
+    /// and the two secret files down to the owner. Bites: with the
+    /// `restrict_*` calls removed the restored modes carry the umask's
+    /// group/other bits and the `& 0o077` assertions fail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_locks_restored_secrets_to_the_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let owner_only = |p: &Path| {
+            assert_eq!(
+                mode(p) & 0o077,
+                0,
+                "{} is group/world accessible: {:o}",
+                p.display(),
+                mode(p)
+            );
+        };
+
+        // A data dir the restore creates itself: the root and every
+        // secret-bearing path it restores must be owner-only.
+        let data = tempfile::TempDir::new().unwrap();
+        let root = data.path().join("store");
+        let scratch = tempfile::TempDir::new().unwrap();
+        let from = write_tarball(scratch.path(), "good.tar.gz", &good_archive());
+
+        restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            &root,
+            &from,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        owner_only(&root);
+        owner_only(&root.join("db"));
+        owner_only(&root.join("db/memory.sqlite"));
+        owner_only(&root.join("wiki"));
+        owner_only(&root.join("config.toml"));
+        // Control: the tightening does not break the owner's own access.
+        drop(Store::open(&root).unwrap());
+
+        // An existing, possibly shared, data dir: the replaced roots and the
+        // installed config are locked, but the operator's own data dir root
+        // is left exactly as they set it.
+        let shared = tempfile::TempDir::new().unwrap();
+        seed_live_data(shared.path());
+        std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let from2 = write_tarball(scratch.path(), "good2.tar.gz", &good_archive());
+
+        restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            shared.path(),
+            &from2,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        owner_only(&shared.path().join("db"));
+        owner_only(&shared.path().join("db/memory.sqlite"));
+        owner_only(&shared.path().join("wiki"));
+        owner_only(&shared.path().join("config.toml"));
+        assert_eq!(
+            mode(shared.path()),
+            0o750,
+            "an existing data dir root must not be re-permissioned"
+        );
     }
 
     #[tokio::test]

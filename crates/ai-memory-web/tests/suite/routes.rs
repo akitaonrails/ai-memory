@@ -3419,13 +3419,9 @@ async fn api_responses_set_cache_control_private() {
         .expect("Cache-Control header must be present on /workspaces")
         .to_str()
         .unwrap();
-    assert!(
-        cc.contains("private"),
-        "Cache-Control must be private: {cc}"
-    );
-    assert!(
-        cc.contains("max-age=30"),
-        "Cache-Control must be max-age=30 for /workspaces: {cc}"
+    assert_eq!(
+        cc, "private, no-store",
+        "/workspaces is grant-filtered, so it must not be browser-cacheable: {cc}"
     );
 }
 
@@ -3502,6 +3498,101 @@ async fn actor_scoped_api_responses_are_never_reused_across_credentials() {
     }
 }
 
+/// Every `/api/v1` read is grant-filtered (#708): what it returns depends on
+/// who is signed in. If any of them is sent with a cacheable `max-age`, a
+/// shared browser profile can serve one viewer's restricted response to the
+/// next viewer at the same URL without the server running the second viewer's
+/// grant check. The list/graph/recent reads must therefore be `no-store`, and
+/// the single-page read `no-cache` so its `authorize_read` runs on every
+/// revalidation. This test fails against the old `with_cache` (`max-age`).
+#[tokio::test]
+async fn viewer_filtered_api_reads_are_never_served_from_cache() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new("secrets.md").unwrap(),
+        frontmatter: serde_json::json!({"kind": "fact"}),
+        body: "# Secret\n\nRestricted content.".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+
+    // The list, graph and recent reads must forbid the browser cache entirely.
+    for uri in [
+        "/workspaces",
+        "/projects",
+        "/graph",
+        "/workspaces/default/projects/scratch/graph",
+        "/workspaces/default/projects/scratch/pages",
+        "/workspaces/default/projects/scratch/recent",
+    ] {
+        let req = Request::builder()
+            .uri(uri)
+            .extension(ai_memory_core::ActorContext {
+                user: Some("alice".into()),
+                ..ai_memory_core::ActorContext::default()
+            })
+            .extension(ai_memory_core::AuthLevel::User)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, no-store"),
+            "grant-filtered read {uri} must not be browser-cacheable"
+        );
+    }
+
+    // The single-page read keeps its ETag but must be revalidated every time,
+    // so the server re-runs authorize_read instead of a browser serving a 304.
+    let page_uri = "/workspaces/default/projects/scratch/pages/secrets.md";
+    let req = Request::builder()
+        .uri(page_uri)
+        .extension(ai_memory_core::ActorContext {
+            user: Some("alice".into()),
+            ..ai_memory_core::ActorContext::default()
+        })
+        .extension(ai_memory_core::AuthLevel::User)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, no-cache"),
+        "single-page read must be revalidated, not served from the browser cache"
+    );
+    assert!(
+        resp.headers().get(header::ETAG).is_some(),
+        "the page read keeps its ETag for conditional revalidation"
+    );
+}
+
 #[tokio::test]
 async fn api_page_handler_emits_etag_and_supports_if_none_match() {
     let (_tmp, store, wiki) = setup().await;
@@ -3560,7 +3651,10 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         .expect("Cache-Control must be present on single-page read")
         .to_str()
         .unwrap();
-    assert!(cc.contains("max-age=300"), "page max-age must be 300: {cc}");
+    assert_eq!(
+        cc, "private, no-cache",
+        "a single-page read must be revalidated so authorize_read runs every time: {cc}"
+    );
 
     // Second request with the returned ETag: must return 304 with empty body.
     let resp304 = app
@@ -5217,7 +5311,7 @@ async fn api_recent_incremental_paginates_over_120_pages_and_binds_cursor() {
         .unwrap();
     assert_eq!(
         response.headers()[header::CACHE_CONTROL],
-        "private, max-age=30"
+        "private, no-store"
     );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await

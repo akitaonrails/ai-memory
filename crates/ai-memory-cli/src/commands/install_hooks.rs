@@ -3266,6 +3266,24 @@ fn path_needs_shell_quoting(path: &Path) -> bool {
         .any(|segment| shell_quote(segment) != segment)
 }
 
+/// Escape every `/` as `\/` in a serialized JSON document.
+///
+/// Cursor strips `//` to end-of-line and `/* … */` comments *before* parsing
+/// `~/.cursor/hooks.json`, with a regex that ignores string boundaries
+/// (`parseJSONC(e){let t=e.replace(/\/\/.*$/gm,"");return
+/// t=t.replace(/\/\*[\s\S]*?\*\//g,""),JSON.parse(t)}`). A `--server-url
+/// https://…` baked into a command therefore truncates the line, `JSON.parse`
+/// fails, and Cursor drops the whole file silently — no Cursor session is ever
+/// captured (#2069). `\/` is valid JSON that decodes to `/`, and it leaves no
+/// `//` for the line-comment pass and no intact `*/` for the block pass, so the
+/// document survives both and parses to the same value. `/` only ever appears
+/// inside JSON string literals (never in structural tokens), so escaping the
+/// whole serialized text is safe and also repairs any `//` in a user's own
+/// preserved entries.
+fn escape_slashes_for_cursor_jsonc(json: &str) -> String {
+    json.replace('/', "\\/")
+}
+
 fn merge_cursor_hooks(
     staged: &Path,
     server_url: &str,
@@ -3290,7 +3308,7 @@ fn merge_cursor_hooks(
         .context("internal: payload builder didn't return a hooks object")?
         .clone();
     apply_atomic(config_path, |existing| {
-        mutate_json(existing, |root| {
+        let json = mutate_json(existing, |root| {
             // Cursor requires "version": 1 at the top level.
             // Overwrite unconditionally — the schema is versioned
             // so future Cursor releases can bump this; we'll bump
@@ -3305,7 +3323,10 @@ fn merge_cursor_hooks(
                 overlay_event_hooks(hooks, event, value);
             }
             Ok(())
-        })
+        })?;
+        // Cursor's comment stripper would otherwise drop the whole file over
+        // the `//` in a `https://` server URL (#2069).
+        Ok(escape_slashes_for_cursor_jsonc(&json))
     })
 }
 
@@ -16425,6 +16446,72 @@ process.exit(0);
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    // Cursor strips comments before parsing hooks.json, with a regex that
+    // ignores string boundaries, so a `//` anywhere — including inside a
+    // `https://` server URL baked into a command — truncates the line,
+    // `JSON.parse` throws, and Cursor drops the whole file and captures
+    // nothing (#2069). Model Cursor's exact `parseJSONC` from the shipped
+    // cursor-agent bundle (2026.11.05 `6139.index.js`):
+    //   e.replace(/\/\/.*$/gm,"").replace(/\/\*[\s\S]*?\*\//g,"")
+    // and prove the rendered file carries no bare `//`, still parses after the
+    // strip, and keeps the full `https://` URL in an ai-memory command.
+    #[test]
+    fn cursor_hooks_survive_cursors_comment_stripper() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let url = "https://memory.example.com:8443/mcp";
+        merge_cursor_hooks(
+            hooks_tmp.path(),
+            url,
+            None,
+            Some(config_tmp.path()),
+            None,
+            &config_path,
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.contains("//"),
+            "rendered hooks.json still carries a bare `//` Cursor would strip: {raw}"
+        );
+
+        // Cursor's parseJSONC, modeled from the shipped bundle.
+        let line = regex::Regex::new(r"(?m)//.*$").unwrap();
+        let block = regex::Regex::new(r"(?s)/\*.*?\*/").unwrap();
+        let stripped = block
+            .replace_all(&line.replace_all(&raw, ""), "")
+            .into_owned();
+        let parsed: serde_json::Value = serde_json::from_str(&stripped)
+            .expect("Cursor would drop a hooks.json it cannot parse after stripping comments");
+        assert!(
+            parsed
+                .get("hooks")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|hooks| !hooks.is_empty()),
+            "our hooks did not survive Cursor's comment strip: {stripped}"
+        );
+
+        let commands = cursor_ai_memory_commands(&config_path);
+        assert!(
+            commands.iter().any(|(_, command)| command.contains(url)),
+            "no ai-memory command kept the https:// server URL intact: {commands:?}"
+        );
     }
 
     // ----------------------------------------------------------------

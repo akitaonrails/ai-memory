@@ -732,16 +732,35 @@ mod slow {
     async fn post_batch_until_accepted(client: &reqwest::Client, endpoint: &str, items: &[Value]) {
         let mut pending = items.to_vec();
         let mut ack = Value::Null;
-        for attempt in 0..10u64 {
-            let response = client
+        for attempt in 0..20u64 {
+            // A shared server saturated by every session draining at once can
+            // take longer than the client request timeout to answer a single
+            // batch. The real spool drain treats a transient timeout as a
+            // retryable attempt and resends, so model the same bounded backoff
+            // here instead of failing the whole batch on one slow response.
+            let response = match client
                 .post(endpoint)
                 .bearer_auth(TOKEN)
                 .json(&pending)
                 .send()
                 .await
-                .unwrap();
+            {
+                Ok(response) => response,
+                Err(err) if err.is_timeout() => {
+                    tokio::time::sleep(Duration::from_millis(20 * (attempt + 1))).await;
+                    continue;
+                }
+                Err(err) => panic!("unexpected transport error posting batch: {err}"),
+            };
             let status = response.status();
-            ack = response.json().await.unwrap();
+            ack = match response.json().await {
+                Ok(ack) => ack,
+                Err(err) if err.is_timeout() => {
+                    tokio::time::sleep(Duration::from_millis(20 * (attempt + 1))).await;
+                    continue;
+                }
+                Err(err) => panic!("unexpected error reading batch response: {err}"),
+            };
             assert!(
                 status.is_success() || status == reqwest::StatusCode::TOO_MANY_REQUESTS,
                 "{status} {ack}"
@@ -764,7 +783,7 @@ mod slow {
                 .collect();
             tokio::time::sleep(Duration::from_millis(20 * (attempt + 1))).await;
         }
-        panic!("batch never fully accepted after 10 attempts: {ack}");
+        panic!("batch never fully accepted after 20 attempts: {ack}");
     }
 
     #[tokio::test]

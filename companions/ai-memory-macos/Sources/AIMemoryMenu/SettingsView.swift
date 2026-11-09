@@ -9,13 +9,14 @@ struct SettingsView: View {
     @State private var token: String = ""
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
-    @State private var saveTask: Task<Void, Never>?
 
     var body: some View {
         Form {
             Section("Server") {
+                // Edits apply on Return or when the window closes, never while
+                // typing, so a half-typed URL never briefly becomes the server
+                // the token is sent to.
                 TextField("URL", text: $serverURL)
-                    .onChange(of: serverURL) { _, _ in scheduleSave() }
                     .onSubmit { persist() }
                 SecureField(
                     model.tokenConfigured
@@ -25,8 +26,12 @@ struct SettingsView: View {
                             : "Bearer token (optional)",
                     text: $token
                 )
-                .onChange(of: token) { _, _ in scheduleSave() }
                 .onSubmit { persist() }
+                if model.savedTokenIsForAnotherServer {
+                    Text("The saved token was set for another server, so it is not being sent to this one. Enter a token for this server, or clear it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 if model.tokenConfigured {
                     Button("Clear saved token") {
                         token = ""
@@ -41,7 +46,6 @@ struct SettingsView: View {
             }
             Section("Data") {
                 TextField("Data directory override", text: $dataDir, prompt: Text(FirstRun.defaultDataDir().path))
-                    .onChange(of: dataDir) { _, _ in scheduleSave() }
                     .onSubmit { persist() }
                 Text("Empty keeps ~/Library/Application Support/ai-memory. Changing this does not move existing files.")
                     .font(.caption)
@@ -71,23 +75,16 @@ struct SettingsView: View {
         }
     }
 
-    private func scheduleSave() {
-        saveTask?.cancel()
-        saveTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(400))
-            guard !Task.isCancelled else { return }
-            persist()
-        }
-    }
-
     private func persist() {
-        saveTask?.cancel()
         model.saveSettings(
             serverURLString: serverURL,
             dataDirOverride: dataDir,
             token: token.isEmpty ? nil : token,
             clearToken: false
         )
+        // Forget the typed token once it is saved so it cannot be re-bound to
+        // the next URL the field is submitted with.
+        token = ""
     }
 
     private func setLoginItem(_ enabled: Bool) {

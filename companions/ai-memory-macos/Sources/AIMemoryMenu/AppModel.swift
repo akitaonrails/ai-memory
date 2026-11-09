@@ -37,6 +37,13 @@ final class AppModel {
         self.runner = runner
         self.tokenConfigured = tokenStore.read()?.isEmpty == false
         self.dataDirTokenPresent = DataDirToken.read(dataDir: settings.resolvedDataDir) != nil
+        // A token saved by an earlier version has no recorded origin. Bind it
+        // to the server configured at first launch, where it was already being
+        // sent, so the upgrade keeps working until a later URL change.
+        if self.tokenConfigured, self.settings.tokenOrigin == nil {
+            self.settings.adoptUnboundToken()
+            self.settings.save()
+        }
         startPolling()
     }
 
@@ -74,7 +81,27 @@ final class AppModel {
     }
 
     private var effectiveToken: String? {
-        DataDirToken.effective(saved: tokenStore.read(), dataDir: dataDir)
+        DataDirToken.effective(
+            saved: tokenStore.read(),
+            savedOrigin: settings.tokenOrigin,
+            serverURL: settings.serverURL,
+            dataDir: dataDir
+        )
+    }
+
+    /// True when a token is saved but belongs to a different server than the
+    /// one now configured, so it is not being sent. Drives the Settings caption
+    /// and keeps "Clear saved token" available.
+    var savedTokenIsForAnotherServer: Bool {
+        guard tokenStore.read()?.isEmpty == false else {
+            return false
+        }
+        guard let origin = settings.tokenOrigin,
+              let target = ServerOrigin.of(settings.serverURL)
+        else {
+            return true
+        }
+        return origin != target
     }
 
     var dataDir: URL {
@@ -244,20 +271,21 @@ final class AppModel {
         token: String?,
         clearToken: Bool
     ) {
-        if let url = URL(string: serverURLString), url.scheme != nil {
-            settings.serverURL = url
-        }
-        let trimmed = dataDirOverride.trimmingCharacters(in: .whitespacesAndNewlines)
-        settings.dataDirOverride = trimmed.isEmpty ? nil : URL(fileURLWithPath: trimmed)
-        settings.save()
+        settings.applyEdit(
+            serverURLString: serverURLString,
+            dataDirOverride: dataDirOverride,
+            tokenInEdit: clearToken ? nil : token
+        )
         if clearToken {
             try? tokenStore.clear()
+            settings.clearTokenBinding()
         } else if let token {
             let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
             if !value.isEmpty {
                 try? tokenStore.save(value)
             }
         }
+        settings.save()
         tokenConfigured = tokenStore.read()?.isEmpty == false
         Task { await poll() }
     }
