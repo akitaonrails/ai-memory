@@ -318,7 +318,10 @@ pub(crate) fn localized_refusal_response(
     refusal: &ai_memory_store::ScopeResolutionError,
 ) -> Response {
     if refusal.is_forbidden() {
-        let mut response = (
+        // Unmarked (no PasswordChangeRequired): the HTML auth redirect shows
+        // this project refusal as-is instead of sending the user to the
+        // change-password form.
+        (
             StatusCode::FORBIDDEN,
             if i18n.tag() == "en" {
                 refusal.to_string()
@@ -326,11 +329,7 @@ pub(crate) fn localized_refusal_response(
                 i18n.text("web-project-access-denied")
             },
         )
-            .into_response();
-        response
-            .extensions_mut()
-            .insert(crate::html_auth::ProjectRefused);
-        response
+            .into_response()
     } else if refusal.is_not_found() {
         not_found_response(i18n)
     } else if refusal.is_bad_request() {

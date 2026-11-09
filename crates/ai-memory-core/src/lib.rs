@@ -61,8 +61,8 @@ pub use active_project::{
 };
 pub use actor::{
     ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey,
-    LegacyBrowserAuth, OwnerFilter, SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp,
-    parse_skip_admission_chain, skip_admission_chain_for,
+    LegacyBrowserAuth, OwnerFilter, PasswordChangeRequired, SKIP_ADMISSION_CHAIN_HEADER,
+    owner_identity, owner_stamp, parse_skip_admission_chain, skip_admission_chain_for,
 };
 pub use agent_backup::{
     AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
