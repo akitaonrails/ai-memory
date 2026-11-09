@@ -143,8 +143,8 @@ ai_memory_profile_flag() {
 # Whether "$1" (a marker file) declares anything beyond a `[capture]`
 # section: any root-level scope key (workspace/project/project_strategy), or
 # any of the other settings ai_memory_marker_qs / ai_memory_briefing_qs
-# forward (drop_subagent_captures, default_global, [briefing], [profile] and
-# [handoff] keys). Mirrors
+# forward (drop_subagent_captures, default_global, [briefing], [profile],
+# [handoff] and [messaging] keys). Mirrors
 # `declares_more_than_capture` in marker.rs. A marker with any of these is a
 # resolution boundary; only a marker whose only content is `[capture]` (e.g.
 # ignore_paths) is scope/settings-transparent (#668).
@@ -157,7 +157,7 @@ ai_memory_marker_declares_settings() {
     ai_memory_strip_utf8_bom <"$file" \
         | LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' && return 0
     ai_memory_marker_declares_server "$file" && return 0
-    for key in default_global inject_on_session_start inject_on_subagent_start max_chars contribute consume deliver_on_session_start; do
+    for key in default_global inject_on_session_start inject_on_subagent_start max_chars contribute consume deliver_on_session_start inbox_notice_on_prompt; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
     done
     return 1
