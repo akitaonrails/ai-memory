@@ -968,3 +968,37 @@ async fn merge_project_merges_on_the_marker_profile_server() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains(&dead), "{stderr}");
 }
+
+/// A marker selecting a profile that does not resolve fails `merge-project`
+/// closed with the hook's reason, dry run and confirmed run alike: the
+/// checkout's workspace is never sent to the install's server instead.
+#[test]
+fn merge_project_fails_closed_on_a_refused_profile() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    sb.write_marker("workspace = \"team-b\"\nserver = \"nobody\"\n");
+    for args in [
+        &["merge-project", "--from", "src", "--into", "dst"][..],
+        &[
+            "merge-project",
+            "--from",
+            "src",
+            "--into",
+            "dst",
+            "--confirm",
+        ],
+    ] {
+        let out = in_repo(&sb, args, &[]);
+        assert!(!out.status.success(), "`{}`", args.join(" "));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("rejected-unknown-profile"),
+            "`{}`: {stderr}",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains(&dead),
+            "nothing dialed the install's server: {stderr}"
+        );
+    }
+}
