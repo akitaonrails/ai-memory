@@ -274,9 +274,20 @@ pub fn find_marker_line(haystack: &str, marker: &str, from: usize) -> Option<usi
 /// or stripped.
 #[must_use]
 pub fn find_managed_block(haystack: &str) -> Option<(usize, usize)> {
-    let mut start = find_marker_line(haystack, MARKER_START, 0)?;
-    let end = find_marker_line(haystack, MARKER_END, start)?;
-    while let Some(next) = find_marker_line(haystack, MARKER_START, start + MARKER_START.len()) {
+    find_delimited_block(haystack, MARKER_START, MARKER_END)
+}
+
+/// [`find_managed_block`] for any pair of line-anchored delimiters: the
+/// first `end` after a `start`, paired with the last `start` before it, so a
+/// start line that lost its end never spans the text after it.
+pub(crate) fn find_delimited_block(
+    haystack: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> Option<(usize, usize)> {
+    let mut start = find_marker_line(haystack, start_marker, 0)?;
+    let end = find_marker_line(haystack, end_marker, start)?;
+    while let Some(next) = find_marker_line(haystack, start_marker, start + start_marker.len()) {
         if next >= end {
             break;
         }
