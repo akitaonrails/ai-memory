@@ -3899,8 +3899,8 @@ pub struct IdleEndCandidate {
 /// Each candidate is stamped by its own guarded write. The substantive end
 /// is an `UPDATE … WHERE ended_at IS NULL` CAS that ALSO re-verifies what the
 /// summary page saw: the session's observation count (every row of the
-/// session, the digest's population) must still equal the
-/// count the digest was built from, and the latest page version must still
+/// session, whatever project each landed in) must still equal the
+/// count read in the digest's snapshot, and the latest page version must still
 /// be the one the tick wrote or kept. Any mismatch — a non-end observation,
 /// a checkpoint page, or a real `SessionEnd` landing after the tick's read —
 /// reports [`IdleEndResult::Lost`] and rolls the candidate's transaction
@@ -5098,16 +5098,20 @@ pub struct ObservationPruneOutcome {
 
 /// Eligibility shared, byte for byte, by the observation prune and its dry-run
 /// count (`ReaderPool::prunable_observation_count`), applied once per distinct
-/// candidate session as alias `s`. `summary_page_id` names the heuristic page;
-/// a consolidation rewrite supersedes that row, so only the live head at its
-/// path says whether the distillation survives (decay eviction clears
-/// `is_latest`). A queued job still needs its raw capture, and an ended session
-/// whose observation count advanced has resumed but not yet reached the next
-/// consolidation enqueue.
+/// candidate session as alias `s`, with `?1` and `?2` naming the project being
+/// pruned. `summary_page_id` names the heuristic page; a consolidation rewrite
+/// supersedes that row, so only the live head at its path says whether the
+/// distillation survives (decay eviction clears `is_latest`). That head has to
+/// be in the project being pruned: a session that crossed repositories holds
+/// rows in more than one, each project's page is built only from its own rows,
+/// and a page elsewhere says nothing about these. A queued job still needs its
+/// raw capture, and an ended session whose observation count advanced has
+/// resumed but not yet reached the next consolidation enqueue.
 pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "EXISTS ( \
     SELECT 1 FROM pages pointer \
-    JOIN pages head USING (workspace_id, project_id, path) \
-    WHERE pointer.id = s.summary_page_id AND head.is_latest = 1 \
+    JOIN pages head ON head.path = pointer.path \
+    WHERE pointer.id = s.summary_page_id \
+      AND head.workspace_id = ?1 AND head.project_id = ?2 AND head.is_latest = 1 \
 ) AND NOT EXISTS ( \
     SELECT 1 FROM session_consolidation_jobs j \
     WHERE j.session_id = s.id \
@@ -5123,13 +5127,15 @@ pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "EXISTS ( \
 /// Raw capture is the store's growth driver, but it is also the only input
 /// consolidation, auto-improvement and the `raw_hits` fallback have. Deleting
 /// it is safe exactly when its durable distillation still exists, so the
-/// predicate requires a live head at the path `sessions.summary_page_id` — the
-/// marker [`end_session_row`] writes — names ([`OBSERVATION_PRUNE_SESSION_GUARD_SQL`]
-/// says why the pointer's own row is not enough). An evicted head means its
-/// session's raw capture is the last copy and must stay; a page hard-deleted
-/// by the same sweep is excluded for free, because the `ON DELETE SET NULL`
-/// foreign key has already cleared the pointer. A session with no `sessions`
-/// row, or one that never ended, matches nothing and can never be pruned.
+/// predicate requires a live head, in this project, at the path
+/// `sessions.summary_page_id` — the marker [`end_session_row`] writes — names
+/// ([`OBSERVATION_PRUNE_SESSION_GUARD_SQL`] says why the pointer's own row is
+/// not enough, and why another project's page does not count). An evicted
+/// head means its session's raw capture is the last copy and must stay; a
+/// page hard-deleted by the same sweep is excluded for free, because the
+/// `ON DELETE SET NULL` foreign key has already cleared the pointer. A session
+/// with no `sessions` row, or one that never ended, matches nothing and can
+/// never be pruned.
 ///
 /// A session with a consolidation job the worker can still claim is excluded
 /// by [`OBSERVATION_PRUNE_SESSION_GUARD_SQL`] even when every other predicate
