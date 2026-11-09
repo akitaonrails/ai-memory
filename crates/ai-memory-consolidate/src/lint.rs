@@ -445,8 +445,11 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
             && let Some(t) = fm.get("title").and_then(serde_json::Value::as_str)
             && !t.trim().is_empty()
         {
+            // Case-insensitive with whitespace collapsed: the key the
+            // consolidator's `title_collision_key` and the curator group by.
+            let key = t.split_whitespace().collect::<Vec<_>>().join(" ");
             titles
-                .entry(t.to_lowercase())
+                .entry(key.to_lowercase())
                 .or_default()
                 .push(c.path.as_str().to_string());
         }
@@ -1032,6 +1035,35 @@ mod tests {
         let findings = rule_based_findings(&[a, b], STALE_DAYS);
         let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
         assert_eq!(dupes.len(), 1);
+        assert_eq!(dupes[0].pages.len(), 2);
+    }
+
+    /// The consolidator's collision guard (`title_collision_key`) and the
+    /// curator group titles case-insensitively with whitespace collapsed, and
+    /// the guard relies on lint flagging exactly what it calls a collision.
+    #[test]
+    fn rule_pass_groups_duplicate_titles_across_whitespace() {
+        let a = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/a.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Release  Notes"}"#.into(),
+            expires_at_us: None,
+            salience: None,
+            compacted_at_us: None,
+        };
+        let b = DecayCandidate {
+            path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
+            frontmatter_json: r#"{"title": " release notes "}"#.into(),
+            ..a.clone()
+        };
+        let findings = rule_based_findings(&[a, b], STALE_DAYS);
+        let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
+        assert_eq!(dupes.len(), 1, "{findings:?}");
         assert_eq!(dupes[0].pages.len(), 2);
     }
 
