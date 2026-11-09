@@ -31,6 +31,12 @@ version in [`docs/changelog/`](docs/changelog/):
   response bodies. (GHSA-c9f9-cp8h-jcj5) (#2140)
 - Updated the bundled SQLite in `ai-memory`, `ai-memory-importer`, and
   `ai-memory-relay` to address RUSTSEC-2026-0459 (CVE-2026-119375). (#2140)
+- Stopped the example backup script and its mirror `.gitignore` from syncing
+  the data dir's bearer tokens (`auth-tokens/`, `auth-token`, `auth-header`,
+  all plaintext mode 0600) and the pre-delivery hook spool (`hook-spool/`) to a
+  pushed git mirror. The generic secret globs matched none of them, so a user
+  following `docs/backup.md` leaked their root token to the remote. Both now
+  exclude every one, and `docs/backup.md` documents them. (GHSA-w35v)
 
 ### Fixed
 
