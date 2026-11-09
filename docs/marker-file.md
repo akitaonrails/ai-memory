@@ -474,10 +474,10 @@ so they reach the server your hooks capture to: `run`, `resume`, `continue`,
 `restore-page`, `handoffs`, `message`, `pending-writes`, `profile`, `lint`,
 `forget-sweep`, `curator`, `auto-improve`, `auto-improve-report`, `embed`,
 `bootstrap`, `backfill`, `repair-backfill-timestamps`, `repair-split`,
-`finalize-session`, `rename-project`, `move-project`, `move-session`,
-`purge-project` and `purge-session` (their preview without `--confirm`
-included). They use the profile's URL and stored token, never the bearer
-from your config, and they fail
+`finalize-session`, `rename-project`, `move-project`, `merge-project`,
+`move-session`, `purge-project` and `purge-session` (their preview without
+`--confirm` included). They use the profile's URL and stored token, never
+the bearer from your config, and they fail
 closed with the same reason the hook reports when the profile does not
 resolve. They match the profile's roots against the directory as your
 shell names it (`PWD`, when it is the same directory as the process's working
