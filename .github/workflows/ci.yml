@@ -390,6 +390,7 @@ jobs:
       - run: scripts/check-native-packaging.sh
       - run: tests/wrapper_upgrade.sh
       - run: tests/install_sh.sh
+      - run: bash tests/backup_snapshot.sh
 
   # `tests/hooks/test_lib.sh` covers `hooks/_lib.sh`, the POSIX shell bundle —
   # the one shipped surface no Rust job reaches. Its own header says "POSIX

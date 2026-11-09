@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed the scheduled backup example skipping the online snapshot after a
+  failed mirror push and failing to retry that push when the files were unchanged.
+
 ## [3.4.4] - 2026-11-08
 
 ### Security
