@@ -1736,6 +1736,15 @@ where
     {
         payload = serde_json::to_string(&json)?;
     }
+    // The Codex hook supplies the label from the local index, never from stdin.
+    if agent_kind == AgentKind::Codex
+        && json
+            .as_object_mut()
+            .and_then(|body| body.remove(ai_memory_hooks::session_name::MARKER))
+            .is_some()
+    {
+        payload = serde_json::to_string(&json)?;
+    }
     let (payload_cwd, canonical_session_id) = hook_context(&args.agent, &json);
     // Hermes reports its own process cwd on every event, which for a gateway
     // is wherever the gateway started. The session's working directory is
@@ -1940,6 +1949,22 @@ where
         },
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
+    if !external_capture
+        && agent_kind == AgentKind::Codex
+        && hook_event == HookEvent::Stop
+        && json.get("_ai_memory_capture").is_none()
+        && let Some(home) = home.as_deref()
+        && let Some(session_id) = json.get("session_id").and_then(serde_json::Value::as_str)
+        && Some(session_id) == canonical_session_id.as_deref()
+        && let Some(name) = ai_memory_hooks::session_name::codex_marker(
+            &super::agent_plugins::codex_home(home, &|key| runtime_env.var_os(key)),
+            session_id,
+            &spool_policy.sanitize,
+        )
+    {
+        json[ai_memory_hooks::session_name::MARKER] = name;
+        payload = serde_json::to_string(&json)?;
+    }
     let mut live_batch = None;
     // Claude Code runs hooks inside subagents too, tagging their events with
     // `agent_id` while `transcript_path` still names the main session's

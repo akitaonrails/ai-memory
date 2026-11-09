@@ -391,6 +391,8 @@ pub(crate) struct ProjectView {
 
 /// One recent session on the project page.
 pub(crate) struct SessionRow {
+    /// Optional native label from this session's harness.
+    pub display_name: Option<String>,
     /// Human-readable harness label.
     pub agent_label: &'static str,
     /// Session duration or open marker.

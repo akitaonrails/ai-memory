@@ -85,9 +85,9 @@ pub use message::{
 };
 pub use observation::{
     FAILED_TOOL_OUTCOME_LINE, FILE_PATH_MAX_CHARS, NewObservation, NewSession, NewSessionUsage,
-    Observation, ObservationKind, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR,
-    TOOL_OUTCOME_LINE_PREFIX, TokenCall, TokenCallContext, TokenToolRef, TokenToolRelation,
-    valid_file_path_key,
+    Observation, ObservationKind, SessionDisplayName, TOOL_BODY_HEADER_MAX_CHARS,
+    TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX, TokenCall, TokenCallContext, TokenToolRef,
+    TokenToolRelation, valid_file_path_key,
 };
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,

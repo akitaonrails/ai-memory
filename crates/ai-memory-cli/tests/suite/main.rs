@@ -47,6 +47,7 @@ mod serve_config;
 mod serve_shutdown;
 mod server_profiles;
 mod service_host_windows;
+mod session_display_name;
 mod setup_e2e;
 mod shutdown_signals;
 mod terminal_rendering;
