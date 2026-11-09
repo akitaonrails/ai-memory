@@ -113,6 +113,13 @@ shown as the refusal itself. JSON clients
 and `/api/v1` still receive JSON 401/403. Once human auth becomes active, the
 engine expires the deprecated `ai_memory_auth` compatibility cookie.
 
+The wiki's **Log out** button appears only for a browser session. It goes to
+the login page once `POST /auth/logout` has ended the session (or answers that
+there was none); if the request fails, the page stays and says so. A Basic
+sign-in with the root token has no session to end and shows no button: the
+browser keeps sending the cached credential until it is closed or its saved
+login is cleared.
+
 ## Trusted proxy identity
 
 A deployment that terminates SSO validates the end user's credential, then

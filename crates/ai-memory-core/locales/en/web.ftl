@@ -171,6 +171,7 @@ web-agent-operations = Agent operations
 web-search-pages = Search pages
 web-search-memory-base = Search memory…
 web-log-out = Log out
+web-log-out-failed = Could not log out. Check the connection and try again.
 web-color-theme = Color theme
 web-light-theme = Light theme
 web-light = Light
