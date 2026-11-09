@@ -3842,9 +3842,15 @@ fn push_event(
     if content.trim().is_empty() {
         return;
     }
-    let content = truncate_utf8(content, MAX_EVENT_BYTES);
+    // The id keeps the plain byte cut so an event read before this change
+    // replays with the same id; only the stored text drops a cut token.
+    let identity = truncate_utf8(content, MAX_EVENT_BYTES);
+    let content = truncate_utf8_whole_tokens(content, MAX_EVENT_BYTES);
+    if content.trim().is_empty() {
+        return;
+    }
     let seed = format!(
-        "{}\0{session}\0{record_id}\0{block}\0{}\0{content}",
+        "{}\0{session}\0{record_id}\0{block}\0{}\0{identity}",
         agent.as_str(),
         kind.as_str()
     );
@@ -6284,6 +6290,39 @@ fn truncate_utf8(value: &str, max: usize) -> &str {
     &value[..end]
 }
 
+/// [`truncate_utf8`] that also drops a token the cut lands inside.
+///
+/// This cut runs before the sanitizer, which only sees the text later in the
+/// hook. A credential whose tail is cut off can fall below every pattern's
+/// minimum length (`sk-` needs 16 characters after the prefix) and survive
+/// as a verbatim prefix; when an earlier secret is then redacted to a short
+/// marker, that prefix can move inside the later caps. So when the cut falls
+/// inside a run of credential characters, the whole run goes. A record that
+/// is one unbroken run longer than the cap keeps nothing.
+fn truncate_utf8_whole_tokens(value: &str, max: usize) -> &str {
+    let cut = truncate_utf8(value, max);
+    let rest = &value[cut.len()..];
+    let splits_token = rest.chars().next().is_some_and(is_credential_char)
+        && cut.chars().next_back().is_some_and(is_credential_char);
+    if !splits_token {
+        return cut;
+    }
+    match cut
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_credential_char(*c))
+    {
+        Some((at, c)) => &cut[..at + c.len_utf8()],
+        None => "",
+    }
+}
+
+/// Characters a credential the sanitizer recognizes can contain: key bodies,
+/// base64 and JWT segments, and percent-encoding.
+fn is_credential_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=' | '%')
+}
+
 fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
@@ -6316,6 +6355,84 @@ fn deduplicate_losses(losses: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_event_cut_drops_a_token_it_lands_inside() {
+        // (input, max, kept)
+        let cases = [
+            ("short", 64, "short"),
+            ("alpha beta", 7, "alpha "),
+            ("alpha beta", 6, "alpha "),
+            ("alpha beta", 5, "alpha"),
+            ("key=sk-ABCDEFGH tail", 10, ""),
+            ("note: key=sk-ABCDEFGH", 15, "note: "),
+            ("\"sk-ABC\",\"sk-DEF\"", 12, "\"sk-ABC\",\""),
+            ("é sk-ABCDEF", 6, "é "),
+            ("unbrokenrun", 4, ""),
+        ];
+        for (input, max, kept) in cases {
+            assert_eq!(
+                truncate_utf8_whole_tokens(input, max),
+                kept,
+                "{input:?} at {max}"
+            );
+        }
+    }
+
+    /// The audit construction: a long fake key fills the event up to the
+    /// 128 KiB cut, and a second fake key straddles it. The plain byte cut
+    /// left `sk-` plus 15 characters, below the `sk-` rule's 16; the sanitizer
+    /// then shrinks the first key to a marker, and the fragment fit inside
+    /// the hook's 64 KiB and the store's 16 KiB caps verbatim.
+    #[test]
+    fn a_key_straddling_the_event_cut_never_reaches_storage_as_a_fragment() {
+        let content = format!(
+            "sk-{} sk-{}",
+            "A".repeat(MAX_EVENT_BYTES - 22),
+            "B".repeat(40)
+        );
+        let mut events = Vec::new();
+        push_event(
+            &mut events,
+            AgentKind::ClaudeCode,
+            "session",
+            "record",
+            0,
+            WorkstreamEventKind::Annotation,
+            Some("user"),
+            &content,
+            None,
+            json!({}),
+        );
+        let [event] = events.as_slice() else {
+            panic!("one event expected, got {}", events.len());
+        };
+        // The hook (scrub, then 64 KiB) and the store (scrub, then 16 KiB).
+        let sanitizer = ai_memory_core::Sanitizer::default();
+        let hooked =
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&event.content), 64 * 1024);
+        let stored = ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&hooked), 16 * 1024);
+        assert!(
+            !stored.contains("sk-AAAA"),
+            "the full key is redacted: {stored}"
+        );
+        assert!(
+            !stored.contains("BBB"),
+            "a key fragment reached storage: {stored}"
+        );
+        // The id still comes from the plain byte cut, so an event read
+        // before this change replays under the same id.
+        let seed = format!(
+            "{}\0session\0record\00\0{}\0{}",
+            AgentKind::ClaudeCode.as_str(),
+            WorkstreamEventKind::Annotation.as_str(),
+            truncate_utf8(&content, MAX_EVENT_BYTES)
+        );
+        assert_eq!(
+            event.event_id,
+            format!("native:{:x}", Sha256::digest(seed.as_bytes()))
+        );
+    }
 
     #[test]
     fn checkout_path_comparison_fails_closed_when_canonicalization_fails() {
