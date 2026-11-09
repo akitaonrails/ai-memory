@@ -293,6 +293,8 @@ cli-backfill-ai-memory-already-has-captured-sessions-nothing-to-backfill-use-for
 cli-backfill-ai-memory-would-import-local-session-s-into-dry-run = ai-memory: would import { $value0 } local session(s) into { $value1 }/{ $value2 } (dry run).
 cli-backfill-ai-memory-no-local-session-history-found-to-backfill-for = ai-memory: no local session history found to backfill for { $value0 }/{ $value1 }.
 cli-backup-requesting-backup-from-server = requesting backup from server
+cli-archive-download-reading-signature = reading the downloaded archive signature
+cli-archive-download-not-gzip = the server response does not start with a gzip signature
 cli-backup-agents-locating-user-home-directory = locating user home directory
 cli-backup-agents-locating-current-working-directory = locating current working directory
 cli-backup-agents-no-ai-agent-assets-detected-for-backup = No AI agent assets detected for backup.
