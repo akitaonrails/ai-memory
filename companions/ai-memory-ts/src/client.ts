@@ -449,14 +449,17 @@ export class PagesNamespace {
     );
     const o = record(decoded, "memory_read_page");
     const frontmatter = o["frontmatter"];
-    const sections = requiredList(o, "sections", "memory_read_page", (value, where) => {
-      const section = record(value, where);
-      return {
-        anchor: str(section, "anchor", where),
-        level: num(section, "level", where),
-        sha256: str(section, "sha256", where),
-      };
-    });
+    const hasSectionMetadata = Object.hasOwn(o, "sections") || Object.hasOwn(o, "sections_truncated");
+    const sections = hasSectionMetadata
+      ? requiredList(o, "sections", "memory_read_page", (value, where) => {
+          const section = record(value, where);
+          return {
+            anchor: str(section, "anchor", where),
+            level: num(section, "level", where),
+            sha256: str(section, "sha256", where),
+          };
+        })
+      : [];
     return {
       pageId: str(o, "page_id", "memory_read_page"),
       path: str(o, "path", "memory_read_page"),
@@ -469,7 +472,9 @@ export class PagesNamespace {
           ? (frontmatter as Raw)
           : {},
       sections,
-      sectionsTruncated: bool(o, "sections_truncated", "memory_read_page"),
+      sectionsTruncated: hasSectionMetadata
+        ? bool(o, "sections_truncated", "memory_read_page")
+        : false,
       related: Array.isArray(o["related"])
         ? list(o, "related", "memory_read_page", relatedPage)
         : undefined,

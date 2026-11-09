@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored TypeScript SDK page reads and updates on supported servers that
+  predate the section metadata added in 3.3.0.
+
 ## [3.4.4] - 2026-11-08
 
 ### Security

@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restored `pages.read` and `pages.update` compatibility with servers that
+  predate the section metadata added in 3.3.0.
+
 - Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
   GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
   Node 22 and 24.
