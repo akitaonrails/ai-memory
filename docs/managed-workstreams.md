@@ -854,6 +854,9 @@ journal entries; correlated entries are quarantined before that pass and can
 only be deleted after a later clean pass and exact transcript replay. If the
 server is still unreachable, `recover` exits successfully
 and prints the remaining spool/journal counts and startup guidance.
+When the server is reachable but the journal is unreadable, `recover` still
+drains the hook spool. It preserves the journal for repair, reports its error
+alongside the spool counts, and exits with status 1.
 
 To restore the strict behavior (fail with the usual "could not reach …"
 diagnosis and never start the agent), pass `--require-server`, set
