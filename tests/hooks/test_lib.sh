@@ -541,6 +541,10 @@ assert_eq "home drive route matches components" "windows${ROUTE_FS}drive${ROUTE_
     "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'c:/work/api/lib' '')"
 assert_eq "home UNC route matches components" "windows${ROUTE_FS}unc${ROUTE_FS}${ROUTE_FS}" \
     "$(ai_memory_home_route "$HOME/.ai-memory.toml" '//server/share/api/lib' '')"
+# A Windows cwd keeps its backslashes all the way into the matcher: awk's
+# `-v` would read `\b` and `\n` as escapes before `cleanpath` saw them.
+assert_eq "home drive route matches a backslash cwd" "windows${ROUTE_FS}drive${ROUTE_FS}${ROUTE_FS}" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'C:\Work\API\bin\new' '')"
 printf '[routes.path."C:/"]\nroute_workspace="windows"\nroute_project="drive"\n' >"$HOME/.ai-memory.toml"
 assert_eq "home drive root route is rejected" "invalid" \
     "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'C:/child' '')"
