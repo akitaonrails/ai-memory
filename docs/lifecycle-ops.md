@@ -542,6 +542,14 @@ operation. Names may be replaced independently with `--from-project-id` and
 `--into-project-id`; each id is resolved inside `--workspace`, so an id from
 another workspace returns 404 and reaches no mutation.
 
+`--workspace` defaults to the nearest `.ai-memory.toml` marker's workspace, so
+the command goes where that marker routes. In a checkout whose marker selects
+a server profile (`server = "<name>"`, see [marker-file.md](marker-file.md)),
+the dry run and `--confirm` both go to that profile's URL with its stored
+token, never to the install's server with the config bearer. A profile that
+does not resolve fails the command before anything is sent, and
+`AI_MEMORY_SERVER_URL` still picks the server for one command.
+
 The writer verifies both latest-page sets under the transaction. It refuses if
 the source has an open session or an unexpired active managed-run lease. A
 same-path collision produces a new version whose body is the target body, a
