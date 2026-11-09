@@ -769,6 +769,15 @@ scope), the `handoffs` it produced (`from_session_id`), its
   disk with no latest row is re-indexed as a new latest page by the next
   reconciliation pass.
 
+The file step follows the page rows the store sweeps. For a re-home, every
+other project holding a latest `sessions/<id>.md` row has its file relocated
+(`move`) or removed (`regenerate`), whichever project the request named as
+the source; a file in a project with no latest row is left alone there,
+except in the source project the request names, whose file is always handled
+so the watcher cannot re-index it. More than one source file for one `move`
+destination is refused like an existing destination file, before anything
+moves.
+
 The audit row (`op = move_session`) carries the operator when the request
 was attributed. What does NOT move: `sessions.cwd` (historical truth; the
 response carries `cwd_warning` when its basename is not the destination
@@ -787,8 +796,8 @@ open-session guard does not apply to a re-home, whose row does not move),
 then, under the
 wiki's exclusive mutation gate, fire `op=move_session` admission webhooks
 (source names in `ctx.workspace`/`ctx.project`, destination names in
-`ctx.destination_*`), move the file, and re-stamp SQLite. Disk goes first
-and SQL last, as in `move-project`: a store failure renames the file back,
+`ctx.destination_*`), move the file(s), and re-stamp SQLite. Disk goes first
+and SQL last, as in `move-project`: a store failure renames the files back,
 so the move is all-or-nothing unless the filesystem also refuses the
 rollback, in which case the error names the manual repair. A `--confirm`
 run takes a wiki checkpoint before and after; a batch takes one pair for

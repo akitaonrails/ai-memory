@@ -40,6 +40,15 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed the PowerShell hook wrapper not falling back to the stored bearer token
   file (`<data_dir>/auth-tokens/default`) when `AI_MEMORY_AUTH_TOKEN` is unset;
   its POSTs were rejected with 401 and dropped silently. (#2134)
+- Fixed `move-session` leaving the session summary's Markdown file in the
+  source project when the target already owned the session row. The route
+  reported `moved` or `regenerated` while only the SQLite rows changed, and
+  the watcher then recreated a live row in the stray project from the
+  orphaned file. The file step now follows every project holding a latest
+  page row for the session: `--pages move` relocates the file and
+  `--pages regenerate` removes it, with the same collision checks in the dry
+  run and the confirmed move, and a failed store step puts the files back.
+  (#2137)
 - Fixed `restore` replacing the live wiki and database even when it failed
   to save the archived configuration as `config.toml.from-backup` (#2064).
 - Fixed `restore-agents` accepting backups with missing or invalid gzip

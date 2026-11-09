@@ -8084,25 +8084,20 @@ async fn move_planned_session(
         }
     };
 
-    // A page file already at the destination blocks a page move; checked here
-    // too so the dry run predicts what the wiki re-checks under its lock. When
-    // the source scope IS the destination (single-form re-home) there is no
-    // file to move and the wiki skips the file step too.
+    // A page file already at the destination blocks a page move; planned here
+    // too so the dry run predicts what the wiki re-checks under its lock. The
+    // plan follows the page rows the store sweeps: for a re-home that
+    // includes stray scopes other than `plan.from`.
     state
         .wiki
         .validate_project_tree(to.0, to.1)
         .map_err(move_session_wiki_err)?;
-    let dst_file = state
+    let file_moves = !state
         .wiki
-        .project_root(to.0, to.1)
-        .join("sessions")
-        .join(&file_name);
-    let file_moves = plan.from != to && src_file.is_file();
-    if req.pages == PagesMode::Move && file_moves && dst_file.exists() {
-        return Err(move_session_wiki_err(WikiError::DestinationPageExists(
-            dst_file.display().to_string(),
-        )));
-    }
+        .plan_session_page_files(sid, plan.from, to, req.pages)
+        .await
+        .map_err(move_session_wiki_err)?
+        .is_empty();
 
     if !req.confirm {
         let summary = state

@@ -6411,6 +6411,41 @@ impl ReaderPool {
         .await
     }
 
+    /// Scopes other than `(workspace_id, project_id)` that hold a LATEST
+    /// `sessions/<session_id>.md` page row. These are the scopes a re-home
+    /// (`move-session` of a session already rooted in the destination)
+    /// sweeps, so the wiki uses them to plan the matching file step.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_page_latest_scopes_outside(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let path = format!("sessions/{session_id}.md");
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT workspace_id, project_id FROM pages \
+                 WHERE path = ?1 AND is_latest = 1 \
+                   AND NOT (workspace_id = ?2 AND project_id = ?3) \
+                 ORDER BY workspace_id, project_id",
+            )?;
+            let rows = stmt.query_map(
+                params![path, workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (ws, proj) = row?;
+                out.push((WorkspaceId::from_slice(&ws)?, ProjectId::from_slice(&proj)?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// The recorded `(workspace, project)` of a session that has not ended.
     /// A mid-session checkpoint writes its artifacts there, next to where the
     /// session's eventual end writes them, whatever scope the event resolved
