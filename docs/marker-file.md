@@ -1330,6 +1330,45 @@ project rather than minting a phantom project named `scratchpad` or `data`.
 The host hook resolves repo-root itself, so a missing override already proves
 the cwd resolved to nothing.
 
+### Re-briefing on a project change: `[routing] brief_on_project_change`
+
+`mid_session` decides where a wandering session's observations are *recorded*,
+but the session brief — pinned pages, `_rules/`, `_slots/` — is injected only
+once, at session start, for the project the starting cwd resolved to. A session
+that starts one level up (say `~/projects`, which has no marker) and then works
+inside `~/projects/acme/site` (which has its own marker) never sees that
+project's rules.
+
+`[routing] brief_on_project_change = true` (default `false`) closes that gap for
+Claude Code. When a prompt's cwd resolves **through a marker** to a project
+other than the session's own, and that project has not been briefed in this
+session yet, the server returns its core brief — the same pinned, `_rules/` and
+`_slots/` pages a session start injects, within the same budget — as additional
+context on that prompt.
+
+```toml
+[routing]
+brief_on_project_change = false   # default; true to opt in
+```
+
+It is deliberately narrow:
+
+- **Marker only.** A bare cwd that resolves by git-root or folder name never
+  re-briefs, the same rule `mid_session` applies to rescoping. Only a
+  `.ai-memory.toml` that names a project counts (`project_src=marker`).
+- **A different project only.** A prompt that stays in the session's own project
+  asks for nothing.
+- **Once per project per session.** The server records which projects a session
+  has already been briefed into (bounded and in memory, with a 12-hour TTL);
+  losing that record can only repeat a brief, never skip the first one.
+- **Claude Code only.** It rides Claude Code's `UserPromptSubmit`; a Cursor
+  payload, which runs the same hook settings, is excluded.
+
+The opt-in, the differs-from-the-session test and the once-per-project record
+all live on the server. The hook only asks when a prompt's marker routing
+changed since the last one it asked about, so a session that stays put sends no
+extra request.
+
 ## Who reads the marker
 
 Both entry points, as of v1.20:

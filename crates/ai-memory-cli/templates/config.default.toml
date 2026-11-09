@@ -656,8 +656,16 @@ min_session_age_secs = 600
 #               (`sessions.project_id` is single-valued, and consolidation
 #               writes one page in the session's project). Recommended when
 #               one agent session means one project.
+#
+# brief_on_project_change: when true, a mid-session event that resolves through a
+# `.ai-memory.toml` marker to a project other than the session's own gets that
+# project's core brief (pinned, `_rules/`, `_slots/`, within the brief budget)
+# as additional context, once per project per session. Delivered on Claude Code's
+# UserPromptSubmit. A bare cwd with no marker never triggers it. Off by default.
+# Env equivalent: `AI_MEMORY_ROUTING__BRIEF_ON_PROJECT_CHANGE`.
 [routing]
 mid_session = "follow-cwd"
+brief_on_project_change = false
 
 # How the "currently active project" pointer is keyed. Unscoped MCP calls —
 # the normal case, since the tools default to the current project — resolve

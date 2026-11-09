@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `[routing] brief_on_project_change` (default `false`) re-briefs the agent when
+  a session moves mid-session into another project. When a Claude Code prompt's
+  cwd resolves through a `.ai-memory.toml` marker to a project other than the
+  one the session started in, and that project has not been briefed in this
+  session yet, its core brief (pinned, `_rules/`, `_slots/`, within the brief
+  budget) is returned as additional context — once per project per session. A
+  bare cwd with no marker never triggers it; the server owns the opt-in, the
+  differs-from-session test and the once-per-session record, and a Cursor
+  payload (which runs the same hook settings) is excluded (#2103).
 - `[maintenance] lint_llm_interval_secs` (default `0`, off) runs the LLM
   contradiction pass across every project on its own persisted cadence, with
   one `lint` provider call per project that has enough semantic pages. With no

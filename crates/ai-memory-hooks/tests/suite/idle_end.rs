@@ -82,6 +82,7 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         )),
         ingest_gates: IngestGates::default(),
         session_agents: SessionAgents::default(),
+        project_briefs: ai_memory_hooks::ProjectBriefs::default(),
         cwd_probes: CwdProbes::default(),
         per_user_slots: false,
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),

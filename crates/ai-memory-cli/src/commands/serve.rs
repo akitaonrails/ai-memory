@@ -1668,6 +1668,9 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 )),
                 ingest_gates: ai_memory_hooks::IngestGates::default(),
                 session_agents: ai_memory_hooks::SessionAgents::default(),
+                project_briefs: ai_memory_hooks::ProjectBriefs::new(
+                    config.routing.brief_on_project_change,
+                ),
                 cwd_probes: ai_memory_hooks::CwdProbes::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
