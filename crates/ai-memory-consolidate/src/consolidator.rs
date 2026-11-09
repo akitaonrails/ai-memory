@@ -2402,9 +2402,17 @@ fn fold_rule_slug(title: &str, digest_fold_loss: bool) -> String {
             out.pop();
         }
     }
-    match suffix {
+    let slug = match suffix {
         Some(suffix) => format!("{out}{suffix}"),
         None => out,
+    };
+    // A device stem (`con`, `nul`, `com1`) fails `ensure_portable`, which
+    // would abort the whole batch; a trailing `-` keeps it a plain name, as
+    // `make_component_portable` does for the non-rule paths.
+    if ai_memory_core::is_dos_device_name(&slug) {
+        format!("{slug}-")
+    } else {
+        slug
     }
 }
 
@@ -4076,6 +4084,20 @@ mod tests {
             "don-t-merge-before-lint"
         );
         assert_eq!(slugify_for_rule("---hyphenated---"), "hyphenated");
+    }
+
+    /// A rule titled after a DOS device would land on `_rules/con.md`,
+    /// which `ensure_portable` refuses, and `Wiki::apply_batch` would then
+    /// abort every page in the batch (#848's class, for the rule branch).
+    #[test]
+    fn slugify_keeps_device_name_titles_portable() {
+        for title in ["CON", "nul", "Aux", "COM1", "lpt3"] {
+            let slug = slugify_for_rule(title);
+            let path = PagePath::new(format!("_rules/{slug}.md")).unwrap();
+            assert!(path.ensure_portable().is_ok(), "{title} -> {slug}");
+        }
+        assert_eq!(slugify_for_rule("CON"), "con-");
+        assert_eq!(slugify_for_rule("Console output"), "console-output");
     }
 
     /// Empty and punctuation-only titles fall back to a static slug

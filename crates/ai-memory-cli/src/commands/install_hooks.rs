@@ -4719,7 +4719,7 @@ pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(te
   }
   if (/^\s*aliases\s*=/m.test(text)) return true;
   if (/^\s*server\s*=/m.test(text)) return true;
-  for (const key of ["default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start"]) {
+  for (const key of ["default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start", "inbox_notice_on_prompt"]) {
     if (tomlFlag(text, key) !== undefined) return true;
   }
   return false;
@@ -13938,7 +13938,7 @@ model = "gpt-5"
         ));
         assert!(plugin.contains("if (/^\\s*aliases\\s*=/m.test(text)) return true;"));
         assert!(plugin.contains(
-            "for (const key of [\"default_global\", \"inject_on_session_start\", \"inject_on_subagent_start\", \"max_chars\", \"contribute\", \"consume\", \"deliver_on_session_start\"])"
+            "for (const key of [\"default_global\", \"inject_on_session_start\", \"inject_on_subagent_start\", \"max_chars\", \"contribute\", \"consume\", \"deliver_on_session_start\", \"inbox_notice_on_prompt\"])"
         ));
         assert!(plugin.contains("if (declaresSettings(text)) return marker;"));
         assert!(plugin.contains(

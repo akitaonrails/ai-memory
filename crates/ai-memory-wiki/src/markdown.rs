@@ -1102,6 +1102,9 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
     let lower = target.to_ascii_lowercase();
     if target.is_empty()
         || target.contains("://")
+        // A `//host/path` destination is protocol-relative: it leaves the
+        // wiki for `host`, so it names no local page.
+        || (!wikilink && target.starts_with("//"))
         || target.contains('\\')
         || lower.starts_with("mailto:")
         || lower.starts_with("data:")
@@ -1389,6 +1392,15 @@ mod tests {
         // `https://...` must not be parsed as project "https".
         let links = extract_links("[[https://example.com]] [[mailto:a@b.com]]", &page());
         assert!(links.is_empty(), "URLs/schemes are not links: {links:?}");
+    }
+
+    #[test]
+    fn extract_links_protocol_relative_destination_is_external() {
+        // `//host/path` is a network-path reference (RFC 3986 §4.2): a
+        // renderer sends the reader to `host`, so it is no wiki page.
+        let links = extract_links("[x](//example.com/guide.md) [y](/notes/a.md)", &page());
+        let paths: Vec<_> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["notes/a.md"], "{links:?}");
     }
 
     #[test]

@@ -479,8 +479,33 @@ fn is_response_format_rejection(err: &LlmError) -> bool {
 /// either truncates the object early or never closes it. This
 /// version tracks whether we're inside a `"..."` literal and
 /// honours backslash escapes the JSON spec defines.
+///
+/// A balanced span that does not parse as a JSON object is braced prose (a
+/// `{title}` placeholder before the answer), so the search moves past it to
+/// the next one. When none parses, the first balanced span is returned as
+/// before, so a malformed answer still surfaces its own parse error.
 pub(crate) fn first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
+    let first = &s[start..=balanced_end(s, start)?];
+    let mut span = first;
+    let mut end = start + first.len();
+    loop {
+        if serde_json::from_str::<serde_json::Value>(span).is_ok_and(|v| v.is_object()) {
+            return Some(span);
+        }
+        let Some(next) = s[end..].find('{').map(|i| end + i) else {
+            return Some(first);
+        };
+        let Some(close) = balanced_end(s, next) else {
+            return Some(first);
+        };
+        span = &s[next..=close];
+        end = close + 1;
+    }
+}
+
+/// Byte index of the `}` closing the `{` at `start`, string-aware.
+fn balanced_end(s: &str, start: usize) -> Option<usize> {
     let mut depth = 0_i32;
     let mut in_string = false;
     let mut escape = false;
@@ -502,7 +527,7 @@ pub(crate) fn first_json_object(s: &str) -> Option<&str> {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(&s[start..=start + i]);
+                    return Some(start + i);
                 }
             }
             _ => {}
@@ -1101,6 +1126,19 @@ mod tests {
             Some("{\"a\":{\"b\":2}}"),
         );
         assert_eq!(first_json_object("no json here"), None);
+    }
+
+    /// Prose before the answer can carry its own braces (a `{title}`
+    /// placeholder, a `{…}` aside). Those are balanced but not JSON, so the
+    /// answer object after them must still be found.
+    #[test]
+    fn first_json_object_skips_braced_prose_before_the_answer() {
+        assert_eq!(
+            first_json_object("Fill the {title} field.\n{\"findings\":[]}"),
+            Some("{\"findings\":[]}"),
+        );
+        // A truncated answer still finds nothing rather than an inner object.
+        assert_eq!(first_json_object("{\"findings\":[{\"k\":1}"), None);
     }
 
     // ── strip_reasoning_blocks ───────────────────────────────────────────

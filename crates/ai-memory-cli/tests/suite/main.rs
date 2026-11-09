@@ -54,5 +54,6 @@ mod upgrade_e2e;
 mod windows_plain_paths;
 mod workstream_provenance;
 mod yolo_ai_jail;
+mod yolo_kiro;
 
 mod workstream_identity;

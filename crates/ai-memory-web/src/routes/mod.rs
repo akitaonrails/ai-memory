@@ -101,17 +101,14 @@ pub(crate) async fn require_admin(
         Err(e) if e.is_authentication_required() => Err(StatusCode::UNAUTHORIZED.into_response()),
         Err(_) => {
             use askama::Template;
-            let mut response =
+            // Unmarked, so the HTML auth redirect shows this refusal instead
+            // of sending the user to the change-password form.
+            Err(
                 match (crate::templates::AdminRequiredView { i18n: i18n.clone() }).render() {
                     Ok(body) => (StatusCode::FORBIDDEN, Html(body)).into_response(),
                     Err(_) => StatusCode::FORBIDDEN.into_response(),
-                };
-            // A 403 here means "not root", not "change your password": keep
-            // the HTML auth redirect from sending the user to that form.
-            response
-                .extensions_mut()
-                .insert(crate::html_auth::AdminRequired);
-            Err(response)
+                },
+            )
         }
     }
 }

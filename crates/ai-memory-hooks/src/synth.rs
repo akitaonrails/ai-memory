@@ -30,9 +30,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::capture_policy::ToolFamily;
-use crate::payload::{
-    is_safe_tool_title, listable_tool_name, tool_family_from_title, tool_title_display,
-};
+use crate::payload::{listable_tool_name, tool_family_from_title, tool_title_display};
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
@@ -292,6 +290,9 @@ impl SessionDigest {
     /// The idle auto-end tick binds that count to the end stamp (review R36
     /// F3): an observation landing after the digest was built must invalidate
     /// the stamp instead of reaching the watermark without reaching the page.
+    /// It is the whole session's count, not the digest's own total: the digest
+    /// holds only this scope's rows, the stamp counts every project's, and a
+    /// session that crossed repositories would otherwise never end.
     ///
     /// # Errors
     /// Propagates any store error.
@@ -304,10 +305,7 @@ impl SessionDigest {
         reader
             .read_session_observations(workspace_id, project_id, session_id, move |snapshot| {
                 let (digest, _stats) = build_digest(snapshot, session_id)?;
-                // Overflow only with more than 9.2e18 observations: fail
-                // toward `Lost` at the stamp (an unrepresentable count never
-                // matches the stamp-time COUNT), never toward a wrong stamp.
-                let total = i64::try_from(digest.observation_count()).unwrap_or(i64::MAX);
+                let total = snapshot.whole_session_observation_count()?;
                 Ok((digest, total))
             })
             .await
@@ -661,7 +659,7 @@ fn fallback_title(obs: &Observation) -> Option<String> {
     // ("tool non-file") would take the label as its page title.
     (!obs.title.is_empty()
         && !looks_like_title_scaffolding(&obs.title)
-        && !is_safe_tool_title(&obs.title))
+        && tool_family_from_title(&obs.title).is_none())
     .then(|| obs.title.clone())
 }
 
@@ -726,7 +724,7 @@ fn session_summary(digest: &SessionDigest) -> String {
         let nameable: Vec<&str> = by_calls
             .iter()
             .map(|(name, _)| *name)
-            .filter(|name| !is_safe_tool_title(name))
+            .filter(|name| tool_family_from_title(name).is_none())
             .collect();
         parts.push(if nameable.is_empty() {
             format!("{calls} completed tool call{}", plural(calls))
@@ -1363,6 +1361,31 @@ mod tests {
             !summary.contains("across"),
             "nothing nameable is left, so the clause must go rather than be filled: {summary}"
         );
+    }
+
+    /// The reserved-protocol path titles a call with the bare family name
+    /// ("non-file", "file") rather than "tool non-file". Both spellings are
+    /// family labels: counted, never named, never a page title.
+    #[test]
+    fn bare_family_labels_are_counted_but_not_named() {
+        let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
+        for (tool, calls) in [("non-file", 9), ("file", 4), ("unknown", 2)] {
+            for _ in 0..calls {
+                observations.push(obs(ObservationKind::PostToolUse, tool));
+            }
+        }
+        assert_eq!(
+            session_summary(&tally_session(&observations)),
+            "1 prompt, 15 completed tool calls."
+        );
+
+        let sid = test_session_id();
+        let labels_only = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+            obs(ObservationKind::PostToolUse, "file"),
+        ];
+        assert_eq!(derive_title(&labels_only, sid), format!("Session {sid}"));
     }
 
     /// A session that mixes both keeps the names it has. The families still
@@ -2064,6 +2087,34 @@ mod load_with_count_scopes {
 
     use super::*;
 
+    async fn insert_obs(
+        store: &Store,
+        sid: SessionId,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        kind: ObservationKind,
+        body: &str,
+    ) {
+        let obs = NewObservation {
+            session_id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            kind,
+            extension: None,
+            source_event: None,
+            title: "scoped test event".into(),
+            body: body.into(),
+            importance: 5,
+            occurred_at: None,
+            file_path: None,
+        };
+        store
+            .writer
+            .insert_observation(Sanitized::new(obs, &Sanitizer::builtin()))
+            .await
+            .unwrap();
+    }
+
     /// The new raw-id entry point must refuse foreign tuples the way the
     /// bounded read refuses them: the idle tick's digest can never load a
     /// session's observations through a scope the session does not belong
@@ -2107,33 +2158,6 @@ mod load_with_count_scopes {
             })
             .await
             .unwrap();
-        async fn insert_obs(
-            store: &Store,
-            sid: SessionId,
-            ws: WorkspaceId,
-            proj: ProjectId,
-            kind: ObservationKind,
-            body: &str,
-        ) {
-            let obs = NewObservation {
-                session_id: sid,
-                workspace_id: ws,
-                project_id: proj,
-                kind,
-                extension: None,
-                source_event: None,
-                title: "scoped test event".into(),
-                body: body.into(),
-                importance: 5,
-                occurred_at: None,
-                file_path: None,
-            };
-            store
-                .writer
-                .insert_observation(Sanitized::new(obs, &Sanitizer::builtin()))
-                .await
-                .unwrap();
-        }
         insert_obs(&store, sid, ws, proj, ObservationKind::UserPrompt, "prompt").await;
         insert_obs(&store, sid, ws, proj, ObservationKind::PostToolUse, "tool").await;
         let reader = store.reader.clone();
@@ -2164,5 +2188,53 @@ mod load_with_count_scopes {
             .unwrap();
         assert_eq!(count, 2, "the digest's snapshot counts both rows");
         assert_eq!(digest.total, 2);
+    }
+
+    /// The digest holds only this scope's rows, but the count it hands the
+    /// idle end's stamp is the whole session's, the population the stamp
+    /// re-counts. When they were the same number a session that crossed into
+    /// another project could never pass the stamp's check.
+    #[tokio::test]
+    async fn the_count_covers_every_project_while_the_digest_keeps_to_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "idle", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+            })
+            .await
+            .unwrap();
+        insert_obs(&store, sid, ws, proj, ObservationKind::UserPrompt, "home").await;
+        insert_obs(&store, sid, ws, other, ObservationKind::UserPrompt, "away").await;
+        insert_obs(&store, sid, ws, other, ObservationKind::PostToolUse, "away").await;
+
+        let (digest, count) = SessionDigest::load_with_count(&store.reader.clone(), ws, proj, sid)
+            .await
+            .unwrap();
+        assert_eq!(count, 3, "the count covers every project's rows");
+        assert_eq!(digest.total, 1, "the digest holds only this project's row");
     }
 }

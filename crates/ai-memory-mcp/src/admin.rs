@@ -3517,8 +3517,12 @@ async fn handle_expire_handoffs(
     let owner_filter = ai_memory_core::OwnerFilter::for_actor_context(&actor);
     let author_id = author_ext.map(|axum::Extension(u)| u);
 
+    // Saturating like the other `*_days` windows here: a span past the
+    // timestamp range is "older than anything", not a wrapped future cutoff.
     let older_than_us = req.older_than_days.map(|days| {
-        jiff::Timestamp::now().as_microsecond() - i64::from(days) * 24 * 60 * 60 * 1_000_000
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(days).saturating_mul(US_PER_DAY))
     });
 
     match state
@@ -4026,6 +4030,10 @@ async fn handle_pending_write_approve(
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "status": "conflict" })),
         ),
+        Err(WikiError::Store(StoreError::InvalidState(msg))) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        ),
         Err(e) => internal_err(e.to_string()),
     }
 }
@@ -4077,6 +4085,12 @@ async fn handle_pending_write_reject(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "rejected" })),
+        ),
+        // The proposal exists in scope (checked above) but is no longer
+        // pending: it was decided already, a conflict rather than a fault.
+        Err(StoreError::InvalidState(msg)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
         ),
         Err(e) => internal_err(e.to_string()),
     }
@@ -4783,7 +4797,7 @@ async fn handle_restore_page(
     })?;
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
     let (restore_source, version_id) = match (&req.rev, &req.page_id) {
-        (Some(rev), None) if !rev.trim().is_empty() => (rev.clone(), None),
+        (Some(rev), None) if !rev.trim().is_empty() => (rev.trim().to_owned(), None),
         (None, Some(page_id)) if !page_id.trim().is_empty() => {
             let version = page_id.parse::<PageId>().map_err(|_| {
                 (
@@ -4803,6 +4817,22 @@ async fn handle_restore_page(
         }
     };
 
+    if version_id.is_none() {
+        state
+            .wiki
+            .page_at_checkpoint(ws, proj, &path, &restore_source)
+            .await
+            .map_err(|error| match error {
+                WikiError::GitOwner(_) => internal_err(error.to_string()),
+                _ => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("cannot read {} at {restore_source}: {error}", path.as_str())
+                    })),
+                ),
+            })?;
+    }
+
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
         format!(
@@ -4813,10 +4843,10 @@ async fn handle_restore_page(
         ),
     )?;
 
-    let page_id = if let Some(rev) = &req.rev {
+    let page_id = if version_id.is_none() {
         state
             .wiki
-            .restore_page_from_checkpoint(ws, proj, path.clone(), rev)
+            .restore_page_from_checkpoint(ws, proj, path.clone(), &restore_source)
             .await
             .map_err(|error| match error {
                 WikiError::Store(StoreError::SessionPurged(_)) => (
@@ -13802,6 +13832,52 @@ mod tests {
         assert_eq!(page.body, "# Stored\n\nfrom stored proposal");
     }
 
+    /// Approving a proposal that was already decided (a double click on
+    /// `/web/pending`, two reviewers) conflicts with its state; the store
+    /// refuses it as `InvalidState` and the page keeps the first approval.
+    #[tokio::test]
+    async fn pending_write_approve_of_a_decided_proposal_returns_409() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, proposal_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/twice.md", "# Twice\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let approve = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/approve?workspace=default&project=scratch"
+                ))
+                .extension(ai_memory_core::ActorContext {
+                    user: Some("reviewer".into()),
+                    ..ai_memory_core::ActorContext::default()
+                })
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(approve()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router.oneshot(approve()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let page = store
+            .reader
+            .page_body_by_ids(ws, proj, "notes/twice.md")
+            .await
+            .unwrap()
+            .expect("the first approval stays");
+        assert_eq!(page.body, "# Twice\n");
+        let on_disk =
+            std::fs::read_to_string(scratch_project_dir(tmp.path()).join("notes/twice.md"));
+        assert!(
+            on_disk.is_ok_and(|text| text.contains("# Twice")),
+            "the refused approval must not remove the approved file"
+        );
+    }
+
     /// #1205: a `POST /admin/pending-writes/{id}/approve` whose `id` does
     /// not exist in the requested workspace (or belongs to a different
     /// one) must answer `404 Not Found`, not `500 Internal Server Error`.
@@ -13894,6 +13970,42 @@ mod tests {
             "reject of an unknown id must be 404, not 500 (regression for #1205): {}",
             resp.status(),
         );
+    }
+
+    /// Rejecting a proposal that was already decided (a double click on
+    /// `/web/pending`, two reviewers) is a conflict with its state, the
+    /// 409 the store's `InvalidState` maps to elsewhere, not a server error.
+    #[tokio::test]
+    async fn pending_write_reject_of_a_decided_proposal_returns_409() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (_ws, _proj, proposal_id) =
+            stage_pending_write(&store, "default", "scratch", "notes/twice.md", "# Twice\n").await;
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let reject = || {
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/admin/pending-writes/{proposal_id}/reject?workspace=default&project=scratch"
+                ))
+                .header("content-type", "application/json")
+                .extension(ai_memory_core::ActorContext {
+                    user: Some("reviewer".into()),
+                    ..ai_memory_core::ActorContext::default()
+                })
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({"reason":"not now"})).unwrap(),
+                ))
+                .unwrap()
+        };
+
+        let first = router.clone().oneshot(reject()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router.oneshot(reject()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
     }
 
     /// #1205: an id that exists in another workspace must still be 404

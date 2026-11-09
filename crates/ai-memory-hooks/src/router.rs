@@ -2489,7 +2489,7 @@ fn render_handoff_notice(h: &Handoff, now: jiff::Timestamp) -> String {
         .max(0)
         / 1_000;
     format!(
-        "📬 ai-memory: a pending handoff `{id}` from `{from}`, left {age} ago. \
+        "📬 ai-memory: a pending handoff `{id}` from `{from}`, left {age}. \
          To pick it up, call `memory_handoff_accept` with handoff_id `{id}`.",
         id = h.scope.id,
         from = h.origin.from_agent.as_str(),
@@ -6304,7 +6304,11 @@ fn is_acknowledgment(text: &str) -> bool {
     }
     let mut rest = trimmed;
     loop {
-        rest = rest.trim_start_matches([',', '.', '!', ' ', '，', '。', '！']);
+        // Any whitespace separates phrases: a multi-line "ok\nthanks" is
+        // the same acknowledgment as "ok thanks".
+        rest = rest.trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | '.' | '!' | '，' | '。' | '！')
+        });
         if rest.is_empty() {
             return true;
         }
@@ -6653,7 +6657,8 @@ pub(crate) mod tests {
         // call to make.
         assert!(notice.contains(&id.to_string()));
         assert!(notice.contains("claude-code") || notice.contains(AgentKind::ClaudeCode.as_str()));
-        assert!(notice.contains("1 hour ago"));
+        // The age bucket already ends in "ago": the notice must not add one.
+        assert!(notice.contains("left 1 hour ago. "), "{notice}");
         assert!(notice.contains("memory_handoff_accept"));
         assert!(
             notice.contains(&id.to_string()),
@@ -28266,6 +28271,21 @@ pub(crate) mod tests {
         )];
         let q = derive_open_questions(&obs, &Some("好的，接下来写单元测试".to_string()));
         assert_eq!(q, ["Continue from: 好的，接下来写单元测试"]);
+    }
+
+    /// A line break, tab or ideographic space between two phrases separates
+    /// them like a plain space: "ok\nthanks" is the acknowledgment "ok thanks".
+    #[test]
+    fn is_acknowledgment_splits_phrases_on_any_whitespace() {
+        for ack in [
+            "ok\nthanks",
+            "ok,\r\nthanks",
+            "thanks\tok",
+            "好的\u{3000}谢谢",
+        ] {
+            assert!(is_acknowledgment(ack), "{ack:?} is an acknowledgment");
+        }
+        assert!(!is_acknowledgment("ok\nnow run the tests"));
     }
 
     /// End-to-end proof that a client-supplied `occurred_at` reaches every

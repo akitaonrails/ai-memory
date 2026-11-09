@@ -65,7 +65,7 @@ function Test-AiMemoryMarkerDeclaresSettings {
     }
     if ([regex]::IsMatch($text, '(?m)^\s*aliases\s*=')) { return $true }
     if ([regex]::IsMatch($text, '(?m)^[\s﻿]*server\s*=')) { return $true }
-    foreach ($key in @("default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start")) {
+    foreach ($key in @("default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start", "inbox_notice_on_prompt")) {
         if ([regex]::IsMatch($text, "(?m)^\s*$key\s*=")) { return $true }
     }
     return $false

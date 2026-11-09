@@ -175,11 +175,11 @@ struct EmbeddingTriple {
 /// Run the `status` subcommand.
 ///
 /// # Errors
-/// Print local spool state when the server could not be reached.
+/// Print local spool state when the server could not be reached or returned an error.
 ///
 /// Goes to stderr so it cannot corrupt `--json` consumers, which expect a
 /// single object on stdout and get a non-zero exit here anyway. The
-/// unreachable-server error still propagates unchanged; this only adds the
+/// underlying error still propagates unchanged; this only adds the
 /// local half of the picture that the caller can actually act on.
 /// Render the last-persisted stamp as an age, or `-` when this server
 /// process has not written an event yet.
@@ -195,20 +195,29 @@ fn last_write_line(unix_ms: Option<u64>) -> String {
     spool_age_line(Some(now_ms.saturating_sub(ms)))
 }
 
-fn report_offline_spool(i18n: &ai_memory_core::i18n::Localizer, spool: &SpoolHealth, json: bool) {
+fn report_offline_spool(
+    i18n: &ai_memory_core::i18n::Localizer,
+    spool: &SpoolHealth,
+    json: bool,
+    unreachable: bool,
+) {
     if json {
         if let Ok(rendered) = serde_json::to_string(spool) {
-            eprintln!(
-                "{}",
-                i18n.format(
-                    "cli-status-local-spool-server-unreachable-rendered",
-                    &[("value0", rendered.to_string())]
-                )
-            );
+            let key = if unreachable {
+                "cli-status-local-spool-server-unreachable-rendered"
+            } else {
+                "cli-status-local-spool-rendered"
+            };
+            eprintln!("{}", i18n.format(key, &[("value0", rendered.to_string())]));
         }
         return;
     }
-    eprintln!("{}", i18n.text("cli-status-local-spool-server-unreachable"));
+    let header_key = if unreachable {
+        "cli-status-local-spool-server-unreachable"
+    } else {
+        "cli-status-local-spool"
+    };
+    eprintln!("{}", i18n.text(header_key));
     eprintln!(
         "{}",
         i18n.format(
@@ -231,20 +240,39 @@ fn report_offline_spool(i18n: &ai_memory_core::i18n::Localizer, spool: &SpoolHea
         )
     );
     if spool.at_capacity() {
+        let msg_key = if unreachable {
+            "cli-status-the-spool-is-full-events-newly-captured-events-are-dropped-until-space-is-av"
+        } else {
+            "cli-status-the-spool-is-full-events-newly-captured-events-are-dropped-until-space-is-av-reachable"
+        };
         eprintln!(
-            "{}", i18n.format("cli-status-the-spool-is-full-events-newly-captured-events-are-dropped-until-space-is-av", &[("value0", format!("{}", spool.capacity))]));
+            "{}",
+            i18n.format(msg_key, &[("value0", format!("{}", spool.capacity))])
+        );
     } else if spool.pending > 0 {
+        let msg_key = if unreachable {
+            "cli-status-event-s-are-queued-locally-and-will-be-delivered-once-the-server-is-reachabl"
+        } else {
+            "cli-status-event-s-are-queued-locally"
+        };
         eprintln!(
-            "{}", i18n.format("cli-status-event-s-are-queued-locally-and-will-be-delivered-once-the-server-is-reachabl", &[("value0", format!("{}", spool.pending))]));
+            "{}",
+            i18n.format(msg_key, &[("value0", format!("{}", spool.pending))])
+        );
     }
 }
 
-/// One line pointing at `ai-memory recover` while the server is down, when
-/// there is actually something waiting: queued hook events or journaled
+/// One line pointing at `ai-memory recover` while the server is down or reporting
+/// an error, when there is actually something waiting: queued hook events or journaled
 /// outage runs. Goes to stderr like the spool block above, so `--json`
 /// consumers' stdout stays a single object.
-fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool) {
-    for line in offline_recovery_hint_lines(config, spool, json) {
+fn report_offline_recovery_hint(
+    config: &Config,
+    spool: &SpoolHealth,
+    json: bool,
+    unreachable: bool,
+) {
+    for line in offline_recovery_hint_lines(config, spool, json, unreachable) {
         eprintln!("{line}");
     }
 }
@@ -261,7 +289,12 @@ fn report_offline_recovery_hint(config: &Config, spool: &SpoolHealth, json: bool
 /// The online path at `status/presentation.rs` and `journal_error` in
 /// [`json_report`] already treat it as reportable; this matches their label
 /// and key.
-fn offline_recovery_hint_lines(config: &Config, spool: &SpoolHealth, json: bool) -> Vec<String> {
+fn offline_recovery_hint_lines(
+    config: &Config,
+    spool: &SpoolHealth,
+    json: bool,
+    unreachable: bool,
+) -> Vec<String> {
     let (journal_pending, _, _, journal_error) = super::recovery::journal_summary(&config.data_dir);
     if spool.pending == 0 && journal_pending == 0 && journal_error.is_none() {
         return Vec::new();
@@ -272,39 +305,52 @@ fn offline_recovery_hint_lines(config: &Config, spool: &SpoolHealth, json: bool)
             "journal_error": journal_error,
             "spool_pending": spool.pending,
         });
-        return vec![format!("recovery hint (server unreachable): {rendered}")];
+        let label = if unreachable {
+            "recovery hint (server unreachable)"
+        } else {
+            "recovery hint"
+        };
+        return vec![format!("{label}: {rendered}")];
     }
     let mut lines = Vec::new();
     if let Some(error) = &journal_error {
         lines.push(format!("  error:      {error}"));
     }
-    lines.push(format!(
-        "  run `{}` once the server is back to deliver queued events and \
-         repair unrecorded runs ({journal_pending} journaled)",
-        fix_lines::RECOVER
-    ));
+    if unreachable {
+        lines.push(format!(
+            "  run `{}` once the server is back to deliver queued events and \
+             repair unrecorded runs ({journal_pending} journaled)",
+            fix_lines::RECOVER
+        ));
+    } else {
+        lines.push(format!(
+            "  run `{}` to deliver queued events and \
+             repair unrecorded runs ({journal_pending} journaled)",
+            fix_lines::RECOVER
+        ));
+    }
     lines
 }
 
-/// The missing logon binary while the server is down, on stderr like the
-/// spool block, so `--json` consumers' stdout stays a single object.
+/// The missing logon binary while the server is down or reporting an error,
+/// on stderr like the spool block, so `--json` consumers' stdout stays a single object.
 fn report_offline_logon_binary(
     i18n: &ai_memory_core::i18n::Localizer,
     problem: Option<&super::user_service::MissingLogonBinary>,
     json: bool,
+    unreachable: bool,
 ) {
     let Some(problem) = problem else {
         return;
     };
     if json {
         if let Ok(rendered) = serde_json::to_string(problem) {
-            eprintln!(
-                "{}",
-                i18n.format(
-                    "cli-status-windows-logon-server-unreachable-rendered",
-                    &[("value0", rendered.to_string())]
-                )
-            );
+            let key = if unreachable {
+                "cli-status-windows-logon-server-unreachable-rendered"
+            } else {
+                "cli-status-windows-logon-rendered"
+            };
+            eprintln!("{}", i18n.format(key, &[("value0", rendered.to_string())]));
         }
         return;
     }
@@ -347,10 +393,38 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
     let report: Report = match get_json::<Report>(&ep, "/admin/status", &[]).await {
         Ok(report) => report,
         Err(err) => {
-            report_offline_spool(i18n, &spool, args.json);
-            report_offline_recovery_hint(config, &spool, args.json);
-            report_offline_logon_binary(i18n, windows_logon.as_ref(), args.json);
-            return Err(err);
+            let unreachable = crate::http_client::server_unreachable(&err);
+            report_offline_spool(i18n, &spool, args.json, unreachable);
+            report_offline_recovery_hint(config, &spool, args.json, unreachable);
+            report_offline_logon_binary(i18n, windows_logon.as_ref(), args.json, unreachable);
+            if unreachable {
+                return Err(err);
+            }
+            if let Some(server_err) = err.downcast_ref::<crate::http_client::ServerResponseError>()
+            {
+                let context = match server_err.status() {
+                    reqwest::StatusCode::UNAUTHORIZED => i18n.format(
+                        "cli-status-server-reachable-unauthenticated",
+                        &[("url", crate::http_client::display_url(&ep.url))],
+                    ),
+                    reqwest::StatusCode::FORBIDDEN => i18n.format(
+                        "cli-status-server-reachable-forbidden",
+                        &[("url", crate::http_client::display_url(&ep.url))],
+                    ),
+                    status => i18n.format(
+                        "cli-status-server-reachable-error",
+                        &[
+                            ("url", crate::http_client::display_url(&ep.url)),
+                            ("status", status.to_string()),
+                        ],
+                    ),
+                };
+                return Err(err.context(context));
+            }
+            return Err(err.context(i18n.format(
+                "cli-status-server-reachable-unprocessed",
+                &[("url", crate::http_client::display_url(&ep.url))],
+            )));
         }
     };
     let (journal_pending, journal_degraded, journal_finish_failed, journal_error) =
@@ -906,19 +980,55 @@ mod tests {
             vec!["pending", "oldest_age_ms", "retries_total", "capacity"]
         );
 
-        // Both render paths must tolerate an empty spool.
+        // Both render paths must tolerate an empty spool, offline and reachable.
         report_offline_spool(
             &ai_memory_core::i18n::Localizer::default(),
             &SpoolHealth::default(),
+            false,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            true,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            false,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            true,
+            true,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &SpoolHealth::default(),
+            false,
             false,
         );
         report_offline_spool(
             &ai_memory_core::i18n::Localizer::default(),
             &SpoolHealth::default(),
             true,
+            false,
         );
-        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, false);
-        report_offline_spool(&ai_memory_core::i18n::Localizer::default(), &spool, true);
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            false,
+            false,
+        );
+        report_offline_spool(
+            &ai_memory_core::i18n::Localizer::default(),
+            &spool,
+            true,
+            false,
+        );
     }
 
     /// A pre-#629 server's `/admin/status` response has no
@@ -1049,8 +1159,12 @@ mod tests {
             b"not json",
         )
         .unwrap();
-        let lines =
-            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), false);
+        let lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            false,
+            true,
+        );
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("error:"),
@@ -1070,8 +1184,12 @@ mod tests {
             b"not json",
         )
         .unwrap();
-        let lines =
-            offline_recovery_hint_lines(&config_for(temp.path()), &SpoolHealth::default(), true);
+        let lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            true,
+            true,
+        );
         assert_eq!(lines.len(), 1, "{lines:?}");
         let payload = lines[0].split_once(": ").expect("prefix then object").1;
         let value: serde_json::Value = serde_json::from_str(payload).unwrap();
@@ -1091,7 +1209,8 @@ mod tests {
                 offline_recovery_hint_lines(
                     &config_for(temp.path()),
                     &SpoolHealth::default(),
-                    json
+                    json,
+                    true,
                 )
                 .is_empty(),
                 "nothing queued and no journal error must print nothing (json={json})"
@@ -1107,5 +1226,102 @@ mod tests {
         assert_eq!(spool_age_line(Some(60_000)), "1m 0s");
         assert_eq!(spool_age_line(Some(3_661_000)), "1h 1m");
         assert_eq!(spool_age_line(Some(172_800_000)), "2d 0h");
+    }
+
+    #[test]
+    fn offline_recovery_hint_reachable_server_omits_unreachable_label() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            super::super::recovery::journal_path(temp.path()),
+            b"not json",
+        )
+        .unwrap();
+        let human = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            false,
+            false,
+        );
+        let rendered_human = human.join("\n");
+        assert!(!rendered_human.contains("once the server is back"));
+        assert!(rendered_human.contains("to deliver queued events"));
+
+        let json_lines = offline_recovery_hint_lines(
+            &config_for(temp.path()),
+            &SpoolHealth::default(),
+            true,
+            false,
+        );
+        assert_eq!(json_lines.len(), 1);
+        assert!(json_lines[0].starts_with("recovery hint: "));
+        assert!(!json_lines[0].contains("(server unreachable)"));
+    }
+
+    #[tokio::test]
+    async fn status_run_reports_server_reachable_on_unauthorized() {
+        let app = axum::Router::new().route(
+            "/admin/status",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "error": "admin operation requires authentication in multi-user mode"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            server_url: format!("http://{address}"),
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let result = run(&config, StatusArgs { json: false }).await;
+        server.abort();
+
+        let err = result.expect_err("status must fail on 401");
+        assert!(!crate::http_client::server_unreachable(&err));
+        let message = format!("{err:#}");
+        assert!(message.contains("server reachable at"), "{message}");
+        assert!(message.contains("not authenticated"), "{message}");
+        assert!(!message.contains("server unreachable"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn status_run_reports_server_reachable_on_forbidden() {
+        let app = axum::Router::new().route(
+            "/admin/status",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({
+                        "error": "admin operation is root-only in multi-user mode"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            server_url: format!("http://{address}"),
+            data_dir: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let result = run(&config, StatusArgs { json: false }).await;
+        server.abort();
+
+        let err = result.expect_err("status must fail on 403");
+        assert!(!crate::http_client::server_unreachable(&err));
+        let message = format!("{err:#}");
+        assert!(message.contains("server reachable at"), "{message}");
+        assert!(message.contains("root/admin permissions"), "{message}");
+        assert!(!message.contains("server unreachable"), "{message}");
     }
 }

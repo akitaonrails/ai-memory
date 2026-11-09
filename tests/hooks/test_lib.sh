@@ -493,6 +493,13 @@ EOF
 HOME_IDENTITY_ROUTE=$(ai_memory_marker_qs "$HOME/src/api/lib")
 assert_eq "home exact hostful identity wins path and forwards aliases safely" "yes" \
     "$(case "$HOME_IDENTITY_ROUTE" in (*'&workspace=identity&project=identity-api&project_src=marker'*'&identity=github.com%2Facme%2Fapi&identity_src=git_remote&identity_style=path'*'&aliases=%5B%22main%22%5D'*) printf yes ;; (*) printf no ;; esac)"
+# The route's fields are split with an unquoted expansion; `["main"]` is a
+# bracket glob, so a one-letter file in the hook's own cwd must not replace it.
+mkdir -p "$TMP/glob-cwd"
+: >"$TMP/glob-cwd/m"
+HOME_GLOB_ROUTE=$(cd "$TMP/glob-cwd" && ai_memory_marker_qs "$HOME/src/api/lib")
+assert_eq "home route aliases are not glob-expanded in the hook's cwd" "yes" \
+    "$(case "$HOME_GLOB_ROUTE" in (*'&aliases=%5B%22main%22%5D'*) printf yes ;; (*) printf no ;; esac)"
 HOME_SIBLING=$(ai_memory_marker_qs "$HOME/src/api-sibling")
 assert_eq "home route does not string-prefix match a sibling" "yes" \
     "$(case "$HOME_SIBLING" in (*'&project=broad&project_src=marker'*) printf yes ;; (*) printf no ;; esac)"
@@ -534,6 +541,10 @@ assert_eq "home drive route matches components" "windows${ROUTE_FS}drive${ROUTE_
     "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'c:/work/api/lib' '')"
 assert_eq "home UNC route matches components" "windows${ROUTE_FS}unc${ROUTE_FS}${ROUTE_FS}" \
     "$(ai_memory_home_route "$HOME/.ai-memory.toml" '//server/share/api/lib' '')"
+# A Windows cwd keeps its backslashes all the way into the matcher: awk's
+# `-v` would read `\b` and `\n` as escapes before `cleanpath` saw them.
+assert_eq "home drive route matches a backslash cwd" "windows${ROUTE_FS}drive${ROUTE_FS}${ROUTE_FS}" \
+    "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'C:\Work\API\bin\new' '')"
 printf '[routes.path."C:/"]\nroute_workspace="windows"\nroute_project="drive"\n' >"$HOME/.ai-memory.toml"
 assert_eq "home drive root route is rejected" "invalid" \
     "$(ai_memory_home_route "$HOME/.ai-memory.toml" 'C:/child' '')"
@@ -558,6 +569,15 @@ assert_eq "capture-only marker: find_marker still resolves nearest" \
 assert_eq "capture-only marker: find_settings_marker skips it for the outer" \
     "$TMP/scope/.ai-memory.toml" \
     "$(ai_memory_find_settings_marker "$TMP/scope/inner")"
+# `[messaging] inbox_notice_on_prompt` is a setting like the others: the
+# native walk (`declares_more_than_capture`) stops at such a marker, so the
+# script walk must too, or the two resolve different scopes for one cwd.
+mkdir -p "$TMP/inbox-scope/inner"
+printf 'workspace = "acme"\n' >"$TMP/inbox-scope/.ai-memory.toml"
+printf '[messaging]\ninbox_notice_on_prompt = true\n' >"$TMP/inbox-scope/inner/.ai-memory.toml"
+assert_eq "inbox-notice-only marker is a settings boundary" \
+    "$TMP/inbox-scope/inner/.ai-memory.toml" \
+    "$(ai_memory_find_settings_marker "$TMP/inbox-scope/inner")"
 assert_eq "capture-only marker: marker_qs forwards the OUTER scope" \
     "&cwd=$(ai_memory_url_encode "$TMP/scope/inner")&workspace=acme&project=infra&project_src=marker&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/scope/inner")"

@@ -63,8 +63,8 @@ mod views;
 
 pub use html_auth::{HtmlAuthRedirectConfig, html_auth_redirect_mw, sanitize_next};
 pub use mount::{
-    SplitWebRouters, WebMountSpec, inject_base_href, inject_base_path_meta, normalize_prefix,
-    split_web_routers, split_web_routers_with_metrics, web_base_href,
+    ApiCors, SplitWebRouters, WebMountSpec, api_cors_mw, inject_base_href, inject_base_path_meta,
+    normalize_prefix, split_web_routers, split_web_routers_with_metrics, web_base_href,
 };
 pub use recall::Recall;
 pub use state::WebState;
