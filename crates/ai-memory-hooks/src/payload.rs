@@ -981,6 +981,10 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // Claude's snake_case tool aliases.
             | AgentKind::Cursor
             | AgentKind::OpenCode
+            // The generated OpenClaw plugin posts OpenCode's `tool` /
+            // `callID` / `args` / `output` fields
+            // (https://docs.openclaw.ai/plugins/hooks/tool-policy).
+            | AgentKind::OpenClaw
             | AgentKind::Pi
             | AgentKind::Omp
             | AgentKind::AntigravityCli
@@ -2384,6 +2388,92 @@ mod tests {
         let body = failure.body_excerpt.expect("devin failure body");
         assert!(body.contains("outcome: error"), "{body:?}");
         assert!(body.contains("MARKER_DEVIN_ERROR"), "{body:?}");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
+    }
+
+    /// The generated OpenClaw plugin posts `tool` / `callID` / `args` /
+    /// `output` / `error` (docs.openclaw.ai after_tool_call). OpenClaw was
+    /// absent from `closed_tool_agent`, so its tool observations were stored
+    /// with no title or body, the failure mode Grok had in #931.
+    #[test]
+    fn openclaw_tool_events_keep_their_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("openclaw".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "openclaw-session-1",
+                "cwd": "/workspace/project",
+                "tool": "exec",
+                "args": {"command": "ls"},
+                "callID": "call_openclaw_1",
+                "output": "MARKER_OPENCLAW_OUTPUT",
+            }),
+        );
+        assert_eq!(post.agent, AgentKind::OpenClaw);
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("openclaw post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("tool_call_id: call_openclaw_1"), "{body:?}");
+        assert!(body.contains("MARKER_OPENCLAW_OUTPUT"), "{body:?}");
+
+        let read = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("openclaw".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "openclaw-session-1",
+                "cwd": "/workspace/project",
+                "tool": "read",
+                "args": {"path": "/workspace/project/sample.txt"},
+                "callID": "call_openclaw_2",
+                "output": "MARKER_OPENCLAW_READ",
+            }),
+        );
+        assert_eq!(read.title_hint.as_deref(), Some("tool file"));
+        let body = read.body_excerpt.expect("openclaw read body");
+        assert!(body.contains("MARKER_OPENCLAW_READ"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("openclaw".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "openclaw-session-1",
+                "cwd": "/workspace/project",
+                "tool": "read",
+                "args": {"path": "/workspace/project/sample.txt"},
+                "callID": "call_openclaw_2",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+
+        let failure = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("openclaw".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "openclaw-session-1",
+                "cwd": "/workspace/project",
+                "tool": "exec",
+                "args": {"command": "npm test SENTINEL_COMMAND"},
+                "callID": "call_openclaw_3",
+                "error": "MARKER_OPENCLAW_ERROR",
+            }),
+        );
+        assert_eq!(failure.title_hint.as_deref(), Some("tool non-file"));
+        let body = failure.body_excerpt.expect("openclaw failure body");
+        assert!(body.contains("outcome: error"), "{body:?}");
+        assert!(body.contains("MARKER_OPENCLAW_ERROR"), "{body:?}");
         assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
     }
 

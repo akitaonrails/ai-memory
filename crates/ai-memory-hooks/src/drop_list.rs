@@ -303,6 +303,19 @@ mod tests {
             serde_json::json!({ "sessionID": "s", "tool": "read", "callID": "plugin-7" }),
         );
         assert!(list.matches(&opencode));
+        // OpenClaw posts the same `tool` / `callID` fields as OpenCode.
+        let openclaw = agent_event(
+            "openclaw",
+            "post-tool-use",
+            serde_json::json!({ "sessionID": "s", "tool": "read", "callID": "plugin-13" }),
+        );
+        assert!(list.matches(&openclaw));
+        let openclaw_kept = agent_event(
+            "openclaw",
+            "post-tool-use",
+            serde_json::json!({ "sessionID": "s", "tool": "read", "callID": "call-13" }),
+        );
+        assert!(!list.matches(&openclaw_kept));
         // Hermes nests the call id under `extra`.
         let hermes = agent_event(
             "hermes",
