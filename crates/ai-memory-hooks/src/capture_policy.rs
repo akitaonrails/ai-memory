@@ -357,7 +357,11 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::IbmBob
         | AgentKind::Dsh
         | AgentKind::QwenCode
-        | AgentKind::Qoder => (
+        | AgentKind::Qoder
+        // Devin CLI's PreToolUse / PostToolUse carry `tool_name` /
+        // `tool_input`; an in-tree PostToolUse fixture also has
+        // `tool_use_id` (docs.devin.ai lifecycle-hooks).
+        | AgentKind::Devin => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
@@ -459,6 +463,7 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::QwenCode
                             | AgentKind::Qoder
                             | AgentKind::KimiCode
+                            | AgentKind::Devin
                     ) {
                         "tool_input"
                     } else {
@@ -513,7 +518,10 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
                 }
             }
         }
-        AgentKind::KiroCli => match raw
+        // Kiro v2 and Devin CLI PostToolUse `tool_response` carry a `success`
+        // boolean. Devin documents `{success, output, error}`
+        // (docs.devin.ai lifecycle-hooks).
+        AgentKind::KiroCli | AgentKind::Devin => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
             .and_then(Value::as_bool)
@@ -6791,6 +6799,40 @@ mod tests {
         });
         let decision = policy.inspect(AgentKind::KimiCode, &public, "/repo");
         assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
+    }
+
+    #[test]
+    fn devin_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool_name": "exec",
+            "tool_input": {"command": "ls", "shell_id": "main"},
+            "tool_use_id": "call_devin_1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::Devin, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call_devin_1"));
+
+        let no_input = json!({"tool_name": "exec", "tool_use_id": "call_devin_1"});
+        assert!(tool_observation_metadata(AgentKind::Devin, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::Devin,
+                &json!({"tool_response": {"success": true, "output": "ok", "error": null}})
+            ),
+            ToolOutcome::Success
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::Devin,
+                &json!({"tool_response": {"success": false, "output": "", "error": "nope"}})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Devin, &json!({"tool_name": "exec"})),
+            ToolOutcome::Unknown
+        );
     }
 
     #[test]
