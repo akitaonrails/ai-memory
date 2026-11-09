@@ -5,3 +5,15 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
+  # docker/Dockerfile pins its base images by digest; this keeps the digests
+  # (and with them the base OS security fixes) current through reviewed PRs.
+  - package-ecosystem: docker
+    directory: "/docker"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    ignore:
+      # The builder's Rust version follows rust-toolchain.toml; bump both
+      # together by hand.
+      - dependency-name: "rust"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
