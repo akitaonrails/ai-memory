@@ -586,6 +586,7 @@ fn apply_after_run_action(
         };
     args.workstream = Some(outcome.workstream_name.clone());
     args.new_workstream = None;
+    args.or_new = false;
     args.fresh = false;
     // The first launch already noted that `--true-yolo` is `--yolo` now.
     args.yolo |= std::mem::take(&mut args.true_yolo);
@@ -845,6 +846,7 @@ async fn run_once_with_wiring(
         ));
     }
     let may_adopt_native_session = args.new_workstream.is_none() && !force_fresh;
+    let or_new = args.or_new;
     let endpoint = ServerEndpoint::for_checkout_at(config, &repository.cwd).await?;
     let project_id = if let Some(id) = args.project_id {
         Some(id)
@@ -928,10 +930,11 @@ async fn run_once_with_wiring(
     let interrupted_before_spawn = CancellationToken::new();
     let interrupt_task = tokio::spawn(capture_interrupts(interrupted_before_spawn.clone()));
     let prepared = async {
-        match prepare_managed_run(
+        match prepare_selected_run(
             &config.i18n,
             &endpoint,
             &prepare,
+            or_new,
             interactive,
             &interrupted_before_spawn,
         )
@@ -956,10 +959,11 @@ async fn run_once_with_wiring(
                 prepare.project_id = Some(scope.project_id);
                 prepare.project.clear();
                 prepare.repository_identity = None;
-                prepare_managed_run(
+                prepare_selected_run(
                     &config.i18n,
                     &endpoint,
                     &prepare,
+                    or_new,
                     interactive,
                     &interrupted_before_spawn,
                 )
@@ -970,13 +974,30 @@ async fn run_once_with_wiring(
     }
     .await
     .context("opening managed workstream; the agent was not started");
-    let prepared = match prepared {
+    let (prepared, created_by_or_new) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             interrupt_task.abort();
             return Err(error);
         }
     };
+    if or_new {
+        let verb = if created_by_or_new {
+            "created workstream"
+        } else {
+            "selected existing workstream"
+        };
+        eprintln!(
+            "{}",
+            diagnostic(
+                &config.i18n,
+                format!("ai-memory: {verb} {}", prepared.workstream_name)
+            )
+        );
+    }
+    // A workstream `--or-new` just created is as fresh as `--new`'s: it must
+    // not adopt a native session that predates it.
+    let may_adopt_native_session = may_adopt_native_session && !created_by_or_new;
     if let Some(warning) = prepared.manifest_warning.as_deref() {
         eprintln!(
             "{}",
@@ -5906,6 +5927,62 @@ fn complete_prepare_run(
     }
 }
 
+/// `--workstream NAME --or-new`: select NAME, or create it as `--new NAME`
+/// would when the server says it does not exist. The flag is true when this
+/// call created it. Composed from the two existing server operations, so the
+/// lease and duplicate-name guards stay the only arbiters: when another caller
+/// creates NAME between our miss and our create, the create is refused as a
+/// duplicate and we fall back to selecting what that caller made.
+async fn prepare_selected_run(
+    i18n: &ai_memory_core::i18n::Localizer,
+    endpoint: &ServerEndpoint,
+    request: &PrepareManagedRunRequest,
+    or_new: bool,
+    interactive: bool,
+    interrupted: &CancellationToken,
+) -> Result<(PrepareManagedRunResponse, bool)> {
+    let selected = prepare_managed_run(i18n, endpoint, request, interactive, interrupted).await;
+    let Some(name) = request.workstream.as_ref().filter(|_| or_new) else {
+        return selected.map(|prepared| (prepared, false));
+    };
+    match selected {
+        Err(error) if is_missing_workstream(&error) => {
+            let mut create = request.clone();
+            create.workstream = None;
+            create.new_workstream = Some(name.clone());
+            match prepare_managed_run(i18n, endpoint, &create, interactive, interrupted).await {
+                Err(error) if is_duplicate_workstream(&error) => {
+                    prepare_managed_run(i18n, endpoint, request, interactive, interrupted)
+                        .await
+                        .map(|prepared| (prepared, false))
+                }
+                created => created.map(|prepared| (prepared, true)),
+            }
+        }
+        selected => selected.map(|prepared| (prepared, false)),
+    }
+}
+
+fn is_missing_workstream(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerResponseError>()
+        .is_some_and(|response| {
+            response.status() == reqwest::StatusCode::NOT_FOUND
+                && response.body().contains("managed workstream '")
+        })
+}
+
+fn is_duplicate_workstream(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerResponseError>()
+        .is_some_and(|response| {
+            response.status() == reqwest::StatusCode::CONFLICT
+                && response
+                    .body()
+                    .contains("already exists; select it with --workstream")
+        })
+}
+
 async fn prepare_managed_run(
     i18n: &ai_memory_core::i18n::Localizer,
     endpoint: &ServerEndpoint,
@@ -7430,6 +7507,7 @@ mod tests {
             project: Some("repo".into()),
             workstream: None,
             new_workstream: Some("initial".into()),
+            or_new: false,
             executable: None,
             yolo: true,
             true_yolo: true,
@@ -8613,6 +8691,199 @@ mod tests {
         );
     }
 
+    fn or_new_request(name: &str) -> PrepareManagedRunRequest {
+        PrepareManagedRunRequest {
+            workstream: Some(name.into()),
+            ..held_lease_request()
+        }
+    }
+
+    fn prepared_workstream(name: &str) -> PrepareManagedRunResponse {
+        PrepareManagedRunResponse {
+            resolved_project: None,
+            workstream_id: WorkstreamId::new(),
+            workstream_name: name.into(),
+            run_id: ManagedRunId::new(),
+            resolved_agent: Some(AgentKind::ClaudeCode),
+            native_session_id: None,
+            source_cursor: None,
+            previous_native_session: None,
+            sync_after: 0,
+            sync_through: 0,
+            may_adopt_existing_session: false,
+            manifest_warning: None,
+        }
+    }
+
+    async fn prepare_or_new(
+        endpoint: &ServerEndpoint,
+        name: &str,
+    ) -> (PrepareManagedRunResponse, bool) {
+        prepare_selected_run(
+            &ai_memory_core::i18n::Localizer::default(),
+            endpoint,
+            &or_new_request(name),
+            true,
+            false,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn or_new_selects_an_existing_workstream_without_creating() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                handler_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert!(
+                        body["new_workstream"].is_null(),
+                        "a resolvable name must never reach the create path"
+                    );
+                    axum::Json(prepared_workstream("401")).into_response()
+                }
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+        let (prepared, created) = prepare_or_new(&endpoint, "401").await;
+        assert_eq!(prepared.workstream_name, "401");
+        assert!(!created, "an existing workstream is selected, not created");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "no second (create) attempt"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn or_new_creates_a_missing_workstream() {
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    if body["new_workstream"].is_string() {
+                        axum::Json(prepared_workstream("401")).into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({
+                                "error": "managed workstream '401' not found"
+                            })),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        let (endpoint, server) = serve(app).await;
+        let (prepared, created) = prepare_or_new(&endpoint, "401").await;
+        assert_eq!(prepared.workstream_name, "401");
+        assert!(created, "a missing name is created like --new");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn or_new_falls_back_to_select_when_a_racing_create_wins() {
+        let selects = Arc::new(AtomicUsize::new(0));
+        let handler_selects = Arc::clone(&selects);
+        let app = Router::new().route(
+            "/workstream/runs",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let selects = Arc::clone(&handler_selects);
+                async move {
+                    if body["new_workstream"].is_string() {
+                        // Another caller created the name between our miss and
+                        // our create, so the server refuses ours as a duplicate.
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "error": "workstream '401' already exists; select it with --workstream"
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if selects.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(serde_json::json!({
+                                "error": "managed workstream '401' not found"
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(prepared_workstream("401")).into_response()
+                    }
+                }
+            }),
+        );
+        let (endpoint, server) = serve(app).await;
+        let (prepared, created) = prepare_or_new(&endpoint, "401").await;
+        assert_eq!(prepared.workstream_name, "401");
+        assert!(
+            !created,
+            "the racing caller's workstream is selected, not reported as ours"
+        );
+        assert_eq!(
+            selects.load(Ordering::SeqCst),
+            2,
+            "miss, then re-select after the duplicate"
+        );
+        server.abort();
+    }
+
+    /// `--or-new` composes the two server calls purely from the status and body
+    /// of the error `prepare_managed_run` returns. These assert the detectors
+    /// match the exact strings `ai-memory-store` emits (workstream.rs) and
+    /// nothing else, so an unrelated 404/409 never turns into a create or a
+    /// re-select.
+    #[test]
+    fn missing_and_duplicate_workstream_detection_matches_store_messages() {
+        use crate::http_client::server_response_error_for_test;
+        let missing = server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "managed workstream '401' not found" }).to_string(),
+        );
+        assert!(is_missing_workstream(&missing));
+        assert!(!is_duplicate_workstream(&missing));
+
+        let duplicate = server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::CONFLICT,
+            serde_json::json!({
+                "error": "workstream '401' already exists; select it with --workstream"
+            })
+            .to_string(),
+        );
+        assert!(is_duplicate_workstream(&duplicate));
+        assert!(!is_missing_workstream(&duplicate));
+
+        // A 404 for another reason is not a missing workstream.
+        let other_404 = server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "route not found" }).to_string(),
+        );
+        assert!(!is_missing_workstream(&other_404));
+        // The lease-busy 409 is handled by the retry layer, not by or-new.
+        let lease_busy = server_response_error_for_test(
+            reqwest::Method::POST,
+            "/workstream/runs",
+            reqwest::StatusCode::CONFLICT,
+            serde_json::json!({ "error": "workstream is already active: owned by x:1" })
+                .to_string(),
+        );
+        assert!(!is_duplicate_workstream(&lease_busy));
+    }
+
     #[test]
     fn held_lease_parses_the_store_busy_message() {
         let held = parse_held_lease(
@@ -9734,6 +10005,7 @@ mod tests {
             project: None,
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(PathBuf::from("definitely-not-a-harness")),
             yolo: false,
             true_yolo: false,
@@ -10086,6 +10358,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(script.clone()),
             yolo: false,
             true_yolo: false,
@@ -10197,6 +10470,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(script),
             yolo: false,
             true_yolo: false,
@@ -10787,6 +11061,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(script),
             yolo: false,
             true_yolo: false,
@@ -11669,6 +11944,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: None,
             profile: None,
             yolo: false,
@@ -11804,6 +12080,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(script.clone()),
             yolo: false,
             true_yolo: false,
@@ -12222,6 +12499,7 @@ mod tests {
             project: Some("proj".into()),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: Some(executable),
             yolo: false,
             true_yolo: false,

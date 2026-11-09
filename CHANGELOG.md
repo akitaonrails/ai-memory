@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `ai-memory run --workstream NAME --or-new` selects the named workstream when
+  it exists and creates it, as `--new NAME` would, when the server reports it
+  does not — instead of failing with a 404 or a 409. The run line names the
+  branch taken (`selected existing workstream NAME` / `created workstream
+  NAME`). `--or-new` requires `--workstream` and conflicts with `--new`; if a
+  racing caller creates the name first, it is selected rather than duplicated
+  (#2045).
 - `[maintenance] lint_llm_interval_secs` (default `0`, off) runs the LLM
   contradiction pass across every project on its own persisted cadence, with
   one `lint` provider call per project that has enough semantic pages. With no

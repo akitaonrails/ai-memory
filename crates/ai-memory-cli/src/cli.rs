@@ -460,6 +460,14 @@ pub struct RunArgs {
     /// Create and select a fresh named workstream.
     #[arg(long = "new", conflicts_with = "workstream")]
     pub new_workstream: Option<String>,
+    /// With `--workstream NAME`: create NAME as `--new NAME` would when it does
+    /// not exist yet, instead of failing. An existing NAME resumes as usual.
+    #[arg(
+        long = "or-new",
+        requires = "workstream",
+        conflicts_with = "new_workstream"
+    )]
+    pub or_new: bool,
     /// Override the native harness executable path.
     #[arg(long)]
     pub executable: Option<PathBuf>,
