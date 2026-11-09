@@ -40,6 +40,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory run` resuming a session whose checkout now resolves to a
+  different project that already holds its own sessions or pages now prints the
+  exact commands to reconcile it — the `merge-project` dry run, the `--confirm`
+  to apply, and the `.ai-memory.toml` marker alternative — instead of only
+  pointing at `docs/lifecycle-ops.md`. (#1993)
 - Fixed DSH hooks failing to parse under PowerShell on Windows. The generated
   command now starts with the `&` call operator, so the quoted executable path is
   invoked rather than read as a string expression. (#2134)
