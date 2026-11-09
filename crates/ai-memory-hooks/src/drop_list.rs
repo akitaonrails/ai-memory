@@ -408,6 +408,40 @@ mod tests {
             }),
         );
         assert!(!list.matches(&cline_kept));
+        // Kimi Code carries the call id as `tool_call_id`.
+        let kimi = agent_event(
+            "kimi-code",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Read",
+                "tool_input": { "path": "a" },
+                "tool_call_id": "plugin-10"
+            }),
+        );
+        assert!(list.matches(&kimi));
+        let kimi_kept = agent_event(
+            "kimi-code",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Read",
+                "tool_input": { "path": "a" },
+                "tool_call_id": "call-10"
+            }),
+        );
+        assert!(!list.matches(&kimi_kept));
+        // Reconstructed transcript payloads still use `tool_use_id`.
+        let kimi_rebuilt = agent_event(
+            "kimi-code",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Read",
+                "tool_use_id": "plugin-11"
+            }),
+        );
+        assert!(list.matches(&kimi_rebuilt));
         // Controls: the same agents with ordinary ids and names stay.
         let kept = agent_event(
             "opencode",
