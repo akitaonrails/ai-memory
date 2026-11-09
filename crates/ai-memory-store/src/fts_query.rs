@@ -308,7 +308,7 @@ fn append_cjk_query(phrases: &mut Vec<String>, run: &mut Vec<char>, column: Opti
     run.clear();
 }
 
-fn is_cjk(ch: char) -> bool {
+pub(crate) fn is_cjk(ch: char) -> bool {
     ch.is_alphanumeric()
         && matches!(
         ch as u32,

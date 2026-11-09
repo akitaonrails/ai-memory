@@ -83,6 +83,9 @@ pub fn is_rotated_log_ledger_path(s: &str) -> bool {
 /// direction for a caller deciding what to delete.
 #[must_use]
 pub fn body_opens_with_log_ledger(body: &str) -> bool {
+    // An editor may have saved the file with a BOM; the page parser drops it
+    // before the frontmatter, so the gate reads past it the same way.
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     let mut lines = body.lines();
 
     let Some(first) = lines.next() else {
@@ -149,6 +152,19 @@ mod tests {
         let body =
             "---\ntype: Note\ntitle: Log 2026-09\n---\n\n## [2026-09-25T10:00:00Z] tool call\n";
         assert!(body_opens_with_log_ledger(body));
+    }
+
+    /// A ledger saved once by an editor that writes a BOM (Notepad) keeps it,
+    /// since the hooks only append. `markdown::parse` strips the BOM, so the
+    /// gate must too or the ledger is indexed as an ordinary page.
+    #[test]
+    fn a_leading_bom_does_not_hide_the_ledger() {
+        assert!(body_opens_with_log_ledger(
+            "\u{feff}## [2026-09-25T10:00:00Z] tool call"
+        ));
+        assert!(body_opens_with_log_ledger(
+            "\u{feff}---\ntype: Note\n---\n\n## [2026-09-25T10:00:00Z] tool call\n"
+        ));
     }
 
     #[test]

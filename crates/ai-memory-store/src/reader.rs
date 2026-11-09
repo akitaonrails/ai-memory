@@ -9816,7 +9816,7 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn snapshot_to(&self, dest_path: PathBuf) -> StoreResult<()> {
         self.with_conn(move |conn| {
-            conn.backup(rusqlite::DatabaseName::Main, &dest_path, None)
+            conn.backup(rusqlite::MAIN_DB, &dest_path, rusqlite::backup::NO_PROGRESS)
                 .map_err(StoreError::from)
         })
         .await
@@ -15298,6 +15298,24 @@ impl SessionObservationSnapshot<'_> {
             },
         )?;
         Ok(summary)
+    }
+
+    /// Every observation of the session, whatever project each row landed in.
+    ///
+    /// The one read of this snapshot that is deliberately not bound to its
+    /// scope, and it returns a number, never a row. A digest is built only from
+    /// the snapshot's own scope, but `ended_observation_count` and the idle
+    /// end's stamp count the whole session, so the generation a digest is
+    /// stamped against has to be counted the same way, in the same snapshot.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn whole_session_observation_count(&self) -> StoreResult<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+            params![self.session_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// Row count and the session's first and last `created_at` in one

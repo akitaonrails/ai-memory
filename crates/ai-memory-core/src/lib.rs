@@ -61,8 +61,8 @@ pub use active_project::{
 };
 pub use actor::{
     ActorContext, AuthLevel, AuthorizedViewer, AuthzError, Capability, IdentityKey,
-    LegacyBrowserAuth, OwnerFilter, SKIP_ADMISSION_CHAIN_HEADER, owner_identity, owner_stamp,
-    parse_skip_admission_chain, skip_admission_chain_for,
+    LegacyBrowserAuth, OwnerFilter, PasswordChangeRequired, SKIP_ADMISSION_CHAIN_HEADER,
+    owner_identity, owner_stamp, parse_skip_admission_chain, skip_admission_chain_for,
 };
 pub use agent_backup::{
     AGENT_BACKUP_SCHEMA_VERSION, AgentAssetKind, AgentAssetScope, AgentBackupEntry,
@@ -95,8 +95,8 @@ pub use page::{
     normalize_entity, parse_expires_at_instant,
 };
 pub use routing_snippet::{
-    COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block, find_marker_line,
-    full_block,
+    COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block,
+    find_managed_block, find_marker_line, full_block,
 };
 pub use sanitize::{
     OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_for_title,

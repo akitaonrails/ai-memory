@@ -335,6 +335,32 @@ pub struct SplitWebRouters {
     /// Builtin login / change-password redirect targets. `None` when web is
     /// disabled or a custom SPA is mounted (no builtin auth pages).
     pub html_auth: Option<Arc<crate::HtmlAuthRedirectConfig>>,
+    /// The operator's `/api/v1` CORS policy, `None` without configured
+    /// origins. Not applied to [`Self::protected`]: the host layers it with
+    /// [`api_cors_mw`] *outside* its auth middleware, because a browser sends
+    /// a CORS preflight without credentials and an auth layer in front of the
+    /// policy would refuse every one of them.
+    pub api_cors: Option<ApiCors>,
+}
+
+/// The `/api/v1` CORS policy, carried by [`SplitWebRouters::api_cors`].
+#[derive(Clone, Debug)]
+pub struct ApiCors(CorsLayer);
+
+/// Apply the [`ApiCors`] policy to `/api/v1` requests only (CORS stays off
+/// `/web`, `/mcp`, `/hook` and `/admin`). Layer it outside the auth
+/// middleware on [`SplitWebRouters::protected`]: the preflight is answered
+/// here, and the API's own 401/403 then carry the CORS headers a calling page
+/// needs to read them. Every non-preflight request still goes through auth.
+pub async fn api_cors_mw(State(cors): State<ApiCors>, req: Request<Body>, next: Next) -> Response {
+    use tower::{Layer, ServiceExt};
+    if !crate::html_auth::is_api_v1_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+    match cors.0.layer(next).oneshot(req).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    }
 }
 
 /// Refuse to be framed by any page. With auth off, a page inside an iframe
@@ -382,6 +408,7 @@ pub fn split_web_routers_with_metrics(
         public: split.public.layer(layer()),
         protected: split.protected.layer(layer()),
         html_auth: split.html_auth,
+        api_cors: split.api_cors,
     })
 }
 
@@ -397,6 +424,7 @@ fn split_web_routers_unframed(
             public: axum::Router::new(),
             protected: axum::Router::new(),
             html_auth: None,
+            api_cors: None,
         });
     }
     let mut state = crate::WebState::new(reader, wiki)
@@ -409,13 +437,15 @@ fn split_web_routers_unframed(
     if let Some(metrics) = ingest_metrics {
         state = state.with_ingest_metrics(metrics);
     }
-    let api = build_api_router(state.clone(), spec.cors_origins);
-    let protected_api = axum::Router::new().nest("/api/v1", api);
+    let api_cors = api_cors_policy(spec.cors_origins);
+    let protected_api =
+        axum::Router::new().nest("/api/v1", crate::routes::build_api(Arc::new(state.clone())));
     if !enable_web {
         return Ok(SplitWebRouters {
             public: axum::Router::new(),
             protected: protected_api,
             html_auth: None,
+            api_cors,
         });
     }
     let slug = normalize_prefix(spec.web_slug);
@@ -433,6 +463,7 @@ fn split_web_routers_unframed(
             public,
             protected: protected_api,
             html_auth: None,
+            api_cors,
         });
     }
     let auth_cfg = Arc::new(crate::HtmlAuthRedirectConfig::from_mount(
@@ -454,12 +485,14 @@ fn split_web_routers_unframed(
         ),
         protected: mount_builtin_browser(protected_api, state, &slug, mount, browser_inject),
         html_auth: Some(auth_cfg),
+        api_cors,
     })
 }
 
 /// Test-only composition helper. Production must attach distinct auth
 /// middleware to [`SplitWebRouters::public`] and
-/// [`SplitWebRouters::protected`] before merging them.
+/// [`SplitWebRouters::protected`] before merging them, and layer
+/// [`SplitWebRouters::api_cors`] outside that auth.
 #[cfg(test)]
 fn mount_web_router(
     router: axum::Router,
@@ -469,17 +502,21 @@ fn mount_web_router(
     spec: WebMountSpec<'_>,
 ) -> Result<axum::Router> {
     let split = split_web_routers(enable_web, reader, wiki, spec)?;
-    Ok(router.merge(split.protected).merge(split.public))
+    let protected = match split.api_cors {
+        Some(cors) => split
+            .protected
+            .layer(axum::middleware::from_fn_with_state(cors, api_cors_mw)),
+        None => split.protected,
+    };
+    Ok(router.merge(protected).merge(split.public))
 }
 
-/// Build the `/api/v1` router and apply the per-origin CORS layer if
-/// the operator configured any. The layer is scoped to this router only
-/// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
-/// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(state: crate::WebState, cors_origins: &[String]) -> axum::Router {
-    let api = crate::routes::build_api(Arc::new(state));
+/// Build the operator's `/api/v1` CORS policy, if they configured origins.
+/// [`api_cors_mw`] scopes it to that prefix (CORS_NOT_APPLIED_TO_OTHER_ROUTES
+/// invariant — `/mcp`, `/hook`, `/admin`, and `/web` must remain CORS-free).
+fn api_cors_policy(cors_origins: &[String]) -> Option<ApiCors> {
     if cors_origins.is_empty() {
-        return api;
+        return None;
     }
     // Origins were already validated before binding, so parsing here
     // is expected to succeed; `.expect` surfaces a logic bug if it does not.
@@ -497,8 +534,8 @@ fn build_api_router(state: crate::WebState, cors_origins: &[String]) -> axum::Ro
         ])
         .allow_credentials(true)
         .max_age(Duration::from_secs(600));
-    info!(origins = ?cors_origins, "CORS layer attached to /api/v1");
-    api.layer(cors)
+    info!(origins = ?cors_origins, "CORS policy configured for /api/v1");
+    Some(ApiCors(cors))
 }
 
 /// Mount the operator's custom SPA from `--web-ui-dir`. Reads
