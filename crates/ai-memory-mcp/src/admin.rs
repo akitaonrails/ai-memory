@@ -4791,7 +4791,7 @@ async fn handle_restore_page(
     })?;
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
     let (restore_source, version_id) = match (&req.rev, &req.page_id) {
-        (Some(rev), None) if !rev.trim().is_empty() => (rev.clone(), None),
+        (Some(rev), None) if !rev.trim().is_empty() => (rev.trim().to_owned(), None),
         (None, Some(page_id)) if !page_id.trim().is_empty() => {
             let version = page_id.parse::<PageId>().map_err(|_| {
                 (
@@ -4811,6 +4811,22 @@ async fn handle_restore_page(
         }
     };
 
+    if version_id.is_none() {
+        state
+            .wiki
+            .page_at_checkpoint(ws, proj, &path, &restore_source)
+            .await
+            .map_err(|error| match error {
+                WikiError::GitOwner(_) => internal_err(error.to_string()),
+                _ => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("cannot read {} at {restore_source}: {error}", path.as_str())
+                    })),
+                ),
+            })?;
+    }
+
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
         format!(
@@ -4821,10 +4837,10 @@ async fn handle_restore_page(
         ),
     )?;
 
-    let page_id = if let Some(rev) = &req.rev {
+    let page_id = if version_id.is_none() {
         state
             .wiki
-            .restore_page_from_checkpoint(ws, proj, path.clone(), rev)
+            .restore_page_from_checkpoint(ws, proj, path.clone(), &restore_source)
             .await
             .map_err(|error| match error {
                 WikiError::Store(StoreError::SessionPurged(_)) => (
