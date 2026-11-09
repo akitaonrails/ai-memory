@@ -13,10 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Security
 
-- Updated the MCP Rust SDK to 3.9.0 so the bridge rejects oversized HTTP
-  response bodies. (GHSA-c9f9-cp8h-jcj5)
+- Updated the MCP Rust SDK to 3.9.0 so the bridge limits non-streaming HTTP
+  response bodies. (GHSA-c9f9-cp8h-jcj5) (#2140)
 - Updated the bundled SQLite in `ai-memory`, `ai-memory-importer`, and
-  `ai-memory-relay` to address RUSTSEC-2026-0459 (CVE-2026-119375).
+  `ai-memory-relay` to address RUSTSEC-2026-0459 (CVE-2026-119375). (#2140)
 
 ## [3.4.4] - 2026-11-08
 
