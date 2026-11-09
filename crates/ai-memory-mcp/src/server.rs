@@ -7407,6 +7407,14 @@ impl AiMemoryServer {
             "Pass from_workspace and from_project to name the sending project.",
         )
         .await?;
+        // Both recipient fields are required: a blank one would fall through
+        // to the caller's current project and deliver to the sender's inbox.
+        if args.to_workspace.trim().is_empty() || args.to_project.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "to_workspace and to_project are required: name the recipient project",
+                None,
+            ));
+        }
         // Recipient MUST already exist: resolved without creating it, so a typo
         // fails closed with a scope error naming the target instead of dropping
         // a message into a phantom inbox nobody reads. And it needs `write`:
@@ -12472,6 +12480,39 @@ mod tests {
             result.is_err(),
             "sending to a non-existent recipient project must fail closed, not create it"
         );
+    }
+
+    /// Both recipient fields are required. A blank one used to fall through
+    /// to the caller's current project, so the message landed in the
+    /// sender's own inbox instead of being refused.
+    #[tokio::test]
+    async fn message_send_with_a_blank_recipient_is_invalid_params() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        for (to_workspace, to_project) in [("", "  "), ("", "scratch"), ("default", "")] {
+            let err = server
+                .memory_message_send(
+                    Parameters(MessageSendArgs {
+                        to_workspace: to_workspace.into(),
+                        to_project: to_project.into(),
+                        to_agent: None,
+                        body: "hello?".into(),
+                        subject: None,
+                        nature: ai_memory_core::MessageNature::Unknown,
+                        evidence: None,
+                        from_agent: None,
+                        from_project: Some("scratch".into()),
+                        from_workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{to_workspace:?}/{to_project:?}: {err:?}"
+            );
+        }
     }
 
     /// The design's open question 3 (#708): delivering into a restricted
