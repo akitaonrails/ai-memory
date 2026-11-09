@@ -2833,7 +2833,15 @@ fn pi_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
 }
 
 fn hook_server_url_from_mcp_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
+    // Drop query/fragment before the `/mcp` peel, as `install_hooks`'s
+    // namesake does: a `?flavor=moonshot` marker would stop the suffix from
+    // matching and leak into the hook URL.
+    let trimmed = url
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
     trimmed.strip_suffix("/mcp").unwrap_or(trimmed).to_string()
 }
 
@@ -6063,6 +6071,26 @@ mod tests {
 
         assert!(guidance.contains("--server-url http://host:49374/base --auth-token <token>"));
         assert!(!guidance.contains("--server-url http://host:49374/base/mcp"));
+    }
+
+    /// A query or fragment on the MCP URL (Kimi's `?flavor=moonshot`) must not
+    /// stop the `/mcp` peel or leak into the hook URL, as in `install-hooks`.
+    #[test]
+    fn pi_guidance_drops_the_mcp_url_query_before_peeling() {
+        let mut args = args_for(McpClient::Pi);
+        args.server_url = Some("http://host:49374/base/mcp?flavor=moonshot".into());
+        args.auth_token = Some("tok".into());
+
+        let guidance = render_pi(&args).unwrap();
+
+        assert!(
+            guidance.contains("--server-url http://host:49374/base --auth-token <token>"),
+            "{guidance}"
+        );
+        assert!(
+            !guidance.contains("flavor=moonshot --auth-token"),
+            "{guidance}"
+        );
     }
 
     /// The Codex apply path must emit block-form `[mcp_servers.<name>]`

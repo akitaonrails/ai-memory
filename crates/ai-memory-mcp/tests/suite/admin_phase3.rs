@@ -1079,6 +1079,80 @@ async fn checkpoints_list_and_restore_page_round_trip() {
     );
 }
 
+#[tokio::test]
+async fn restore_page_from_an_unknown_rev_is_404_and_writes_no_checkpoint() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let write = |path: &str, body: &str| WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new(path).unwrap(),
+        frontmatter: serde_json::json!({"title": "Recover", "tier": "semantic"}),
+        body: body.into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: Some("Recover".into()),
+        admission_ctx: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
+        evidence: Vec::new(),
+    };
+    state
+        .wiki
+        .write_page(write("notes/recover.md", "old body"))
+        .await
+        .unwrap();
+    let old_oid = state.wiki.commit_all("old checkpoint").unwrap().unwrap();
+    state
+        .wiki
+        .write_page(write("notes/other.md", "uncommitted"))
+        .await
+        .unwrap();
+    let commits = state.wiki.git().commit_count();
+
+    for (path, rev) in [
+        ("notes/recover.md", "0000000".to_owned()),
+        ("notes/missing.md", old_oid.to_string()),
+    ] {
+        let resp = post(
+            state.clone(),
+            "/admin/restore-page",
+            json!({"workspace": "default", "project": "scratch", "path": path, "rev": rev}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path} at {rev}");
+    }
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused restore must not write its pre-restore checkpoint"
+    );
+
+    let resp = post(
+        state.clone(),
+        "/admin/restore-page",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "path": "notes/recover.md",
+            "rev": format!(" {old_oid} "),
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["restored_from"], old_oid.to_string());
+}
+
 #[derive(Clone, Copy)]
 enum SessionRestoreCase {
     PurgedSummary,

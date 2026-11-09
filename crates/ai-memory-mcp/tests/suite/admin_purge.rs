@@ -1034,6 +1034,58 @@ async fn omitted_confirm_is_the_documented_400_on_every_guarded_route() {
     }
 }
 
+/// An `older_than_days` too large for a microsecond timestamp means "older
+/// than anything stored", so it expires nothing. The cutoff used to
+/// overflow: a debug build panicked and a release build wrapped it into the
+/// future, which expired every open handoff in the scope.
+#[tokio::test]
+async fn expire_handoffs_with_a_huge_older_than_days_expires_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "baton", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_handoff(NewHandoff {
+            workspace_id: ws,
+            project_id: proj,
+            from_session_id: None,
+            from_agent: AgentKind::ClaudeCode,
+            to_agent: None,
+            cwd: None,
+            summary: "fresh baton".into(),
+            open_questions: vec![],
+            next_steps: vec![],
+            files_touched: vec![],
+            owner_user: None,
+        })
+        .await
+        .unwrap();
+
+    let resp = post(
+        state,
+        "/admin/handoffs/expire",
+        json!({
+            "workspace": "default",
+            "project": "baton",
+            "confirm": true,
+            "older_than_days": 200_000_000_u32,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["expired"], 0, "{body}");
+}
+
 /// Non-existent project must return 404.
 #[tokio::test]
 async fn purge_project_nonexistent_returns_404() {

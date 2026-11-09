@@ -172,7 +172,9 @@ If you symlink the built binary onto `PATH` for convenience (e.g.
 *after* the `install-hooks` call above, not before. See the `install-hooks`
 symlink caution in Scenario A
 ([#546](https://github.com/akitaonrails/ai-memory/issues/546)); it applies
-here too and is the exact layout that bug was filed against.
+here too and is the exact layout that bug was filed against. `install.sh`
+leaves such a link alone and stops, so remove it first if you later switch to
+the release install.
 
 ## Scenario C: Docker Wrapper
 

@@ -1656,6 +1656,73 @@ async fn idle_end_counts_the_same_observation_population_as_the_digest() {
     );
 }
 
+/// The guard counts the whole session on purpose. A late row in another
+/// project moves the same generation the watermark covers, so it loses the
+/// stamp and the next tick reads the session again. Scoping the guard to the
+/// digest's project would let the watermark pass over a row nobody compared.
+#[tokio::test]
+async fn idle_end_cas_counts_a_late_row_in_another_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other = store
+        .writer
+        .get_or_create_project(ws, "late-row", None)
+        .await
+        .unwrap();
+    let now = jiff::Timestamp::now().as_microsecond();
+    let watermark = now - 5 * HOUR_US;
+
+    let sid = begin(&store, ws, proj, watermark - HOUR_US, None).await;
+    insert(
+        &store,
+        observation(
+            sid,
+            ws,
+            proj,
+            ObservationKind::UserPrompt,
+            watermark,
+            "home scope",
+        ),
+    )
+    .await;
+    let page = session_page(&store, ws, proj, sid).await;
+    insert(
+        &store,
+        observation(
+            sid,
+            ws,
+            other,
+            ObservationKind::PostToolUse,
+            now,
+            "late row in another project",
+        ),
+    )
+    .await;
+    let results = store
+        .writer
+        .end_idle_sessions(
+            vec![substantive(sid, ws, proj, page, 1, now, watermark)],
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        results,
+        vec![IdleEndResult::Lost],
+        "a row after the digest read loses the stamp, whatever project it landed in"
+    );
+    assert_eq!(
+        store
+            .reader
+            .session_end_disposition(sid, ws, proj, AgentKind::Codex)
+            .await
+            .unwrap(),
+        SessionEndDisposition::Open,
+        "the session stays open for the next tick"
+    );
+}
+
 /// R36b-3: the raw-id reader refuses foreign workspaces, foreign projects
 /// and missing session ids with a zero count — and returns the count for
 /// the right tuple (legitimate control in the same fixture).

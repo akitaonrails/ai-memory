@@ -247,8 +247,9 @@ from hook paths.
    survive. A fourth pass, disabled unless `[decay] observation_retention_days`
    is positive, then deletes raw `observations` older than that age, but only
    for sessions already consolidated into a summary page whose path still has
-   a live head (a later rewrite of that page counts; an evicted or deleted
-   head does not), so raw capture is never removed while it is the last copy
+   a live head in the project holding those rows (a later rewrite of that page
+   counts; an evicted or deleted head, or a page only in another project, does
+   not), so raw capture is never removed while it is the last copy
    of that session's work, and never for a session that still has a `session_consolidation_jobs`
    row in `pending` or `running` — a queued (or lease-stale) consolidation
    still reads the raw capture — and never while the live observation count is

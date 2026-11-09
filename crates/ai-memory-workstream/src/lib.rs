@@ -12,8 +12,8 @@ pub use harness::{
     build_launch_plan_with_env, build_launch_plan_with_env_lookup, clean_path, crush_data_dir,
     crush_global_config_path, env_dir_override, has_native_session_selector,
     is_interactive_session_invocation, kiro_explicit_session_id, kiro_selects_non_default_engine,
-    kiro_selects_v2_engine, kiro_selects_v3_engine, omp_agent_dir, omp_profile_flag,
-    omp_profile_flag_env, store_override_vars,
+    kiro_selects_v2_engine, kiro_selects_v3_engine, kiro_yolo_engine_is_unverified, omp_agent_dir,
+    omp_profile_flag, omp_profile_flag_env, store_override_vars,
 };
 pub use jail::{
     FORWARDED_ENV_NAMES, JAIL_TOGGLES, JailChecklistItem, JailEnv, JailHostFacts, JailOs, JailRisk,

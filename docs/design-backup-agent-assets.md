@@ -134,6 +134,8 @@ Stored in the root of the generated tarball:
    - Restoring rejects traversal and permits only allowlisted agent destinations. Claude Desktop uses the same platform-specific path resolver as `install-mcp`.
    - Archive entries are regular UTF-8 paths only, and entry count, manifest,
      per-file, and total expanded sizes are bounded before content is staged.
+   - Restore checks the gzip checksum and size trailer before applying any
+     assets. It accepts up to 1 MiB of padding after the tar end marker.
    - Every manifest entry must have exactly one body and a well-formed SHA-256;
      duplicate paths/destinations, missing bodies, unmanifested bodies, and
      checksum mismatches are refused. Checksums detect corruption or internal

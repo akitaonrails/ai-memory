@@ -303,6 +303,19 @@ mod tests {
             serde_json::json!({ "sessionID": "s", "tool": "read", "callID": "plugin-7" }),
         );
         assert!(list.matches(&opencode));
+        // OpenClaw posts the same `tool` / `callID` fields as OpenCode.
+        let openclaw = agent_event(
+            "openclaw",
+            "post-tool-use",
+            serde_json::json!({ "sessionID": "s", "tool": "read", "callID": "plugin-13" }),
+        );
+        assert!(list.matches(&openclaw));
+        let openclaw_kept = agent_event(
+            "openclaw",
+            "post-tool-use",
+            serde_json::json!({ "sessionID": "s", "tool": "read", "callID": "call-13" }),
+        );
+        assert!(!list.matches(&openclaw_kept));
         // Hermes nests the call id under `extra`.
         let hermes = agent_event(
             "hermes",
@@ -377,6 +390,29 @@ mod tests {
             serde_json::json!({ "session_id": "s", "hook_event_name": "BeforeTool", "tool_name": "read_file", "tool_input": { "file_path": "a" }, "tool_use_id": "plugin-6" }),
         );
         assert!(!list.matches(&gemini_kept));
+        // Devin CLI sends Claude-shaped `tool_name` / `tool_use_id`.
+        let devin = agent_event(
+            "devin",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "exec",
+                "tool_input": { "command": "ls" },
+                "tool_use_id": "plugin-12"
+            }),
+        );
+        assert!(list.matches(&devin));
+        let devin_kept = agent_event(
+            "devin",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "exec",
+                "tool_input": { "command": "ls" },
+                "tool_use_id": "call_12"
+            }),
+        );
+        assert!(!list.matches(&devin_kept));
         // Cline CLI nests the call id at `tool_call.id`; the documented
         // envelope names the tool at `preToolUse.toolName` and has no id.
         let cline = agent_event(
@@ -408,6 +444,40 @@ mod tests {
             }),
         );
         assert!(!list.matches(&cline_kept));
+        // Kimi Code carries the call id as `tool_call_id`.
+        let kimi = agent_event(
+            "kimi-code",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Read",
+                "tool_input": { "path": "a" },
+                "tool_call_id": "plugin-10"
+            }),
+        );
+        assert!(list.matches(&kimi));
+        let kimi_kept = agent_event(
+            "kimi-code",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Read",
+                "tool_input": { "path": "a" },
+                "tool_call_id": "call-10"
+            }),
+        );
+        assert!(!list.matches(&kimi_kept));
+        // Reconstructed transcript payloads still use `tool_use_id`.
+        let kimi_rebuilt = agent_event(
+            "kimi-code",
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "s",
+                "tool_name": "Read",
+                "tool_use_id": "plugin-11"
+            }),
+        );
+        assert!(list.matches(&kimi_rebuilt));
         // Controls: the same agents with ordinary ids and names stay.
         let kept = agent_event(
             "opencode",
