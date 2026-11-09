@@ -136,4 +136,77 @@ mod slow {
         );
         drop(server);
     }
+
+    /// A profile start line whose end was deleted by hand stays where it is,
+    /// with the text after it: `apply` writes a fresh block after it, a re-run
+    /// changes nothing, and `--remove` restores the file. Before, the second
+    /// apply paired the stray start with the new block's end and replaced the
+    /// user's text between them.
+    #[tokio::test]
+    async fn a_start_marker_that_lost_its_end_keeps_the_text_after_it() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let client = reqwest::Client::new();
+        let (server, base) = start_serve(&client, &data_dir.path().join("serve.log"), |port| {
+            let mut cmd = hermetic(BIN);
+            cmd.args([
+                "serve",
+                "--transport",
+                "http",
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--no-watcher",
+            ])
+            .env("AI_MEMORY_DATA_DIR", data_dir.path())
+            .env("AI_MEMORY_HOME", home.path())
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
+            cmd
+        })
+        .await;
+        run_cli(
+            &[
+                "write-page",
+                "--workspace",
+                "default",
+                "--project",
+                "_global",
+                "--path",
+                "profile/tools/pnpm.md",
+                "--body",
+                "Use pnpm, not npm.",
+            ],
+            data_dir.path(),
+            home.path(),
+            None,
+            &base,
+        );
+
+        let workspace = tempfile::tempdir().expect("repos");
+        let repo = workspace.path().join("delta");
+        std::fs::create_dir_all(repo.join(".git")).expect("fake checkout");
+        let original = "# Delta rules\n<!-- ai-memory:profile:start -->\nmy notes\n";
+        std::fs::write(repo.join("AGENTS.md"), original).expect("seed AGENTS.md");
+
+        let out = apply(&repo, data_dir.path(), home.path(), &base, &[]);
+        assert!(out.contains("updated"), "{out}");
+        let first = std::fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+        assert!(first.starts_with(original), "{first}");
+        assert!(first.contains("pnpm"), "{first}");
+
+        let again = apply(&repo, data_dir.path(), home.path(), &base, &[]);
+        assert!(again.contains("no-op"), "a re-run is idempotent: {again}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+            first,
+            "my notes survive the re-run"
+        );
+
+        apply(&repo, data_dir.path(), home.path(), &base, &["--remove"]);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("AGENTS.md")).unwrap(),
+            original,
+            "--remove restores the file"
+        );
+        drop(server);
+    }
 }
