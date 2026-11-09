@@ -14,7 +14,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 
 - Restored TypeScript SDK page reads and updates on supported servers that
-  predate the section metadata added in 3.3.0.
+  predate the section metadata added in 3.3.0 (#2136).
 
 ## [3.4.4] - 2026-11-08
 
