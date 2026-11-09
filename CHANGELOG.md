@@ -11,6 +11,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+- Documented Standard Compute as an endpoint for the existing `openai-compat`
+  provider.
+
 ## [3.4.4] - 2026-11-08
 
 ### Security
