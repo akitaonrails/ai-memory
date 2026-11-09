@@ -770,7 +770,7 @@ if [ -n "$PSH" ]; then
     PS_TOKEN_DIR=$(host_path "$TMP/ps-token")
     PS_TOKEN_EMPTY_DIR=$(host_path "$TMP/ps-token-empty")
     PS_TOKEN_OUT=$("$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
-        "\$env:AI_MEMORY_DATA_DIR='$PS_TOKEN_DIR'; . '$PS_LIB'; (Get-AiMemoryStoredToken) + '|' + (\$env:AI_MEMORY_DATA_DIR='$PS_TOKEN_EMPTY_DIR'; Get-AiMemoryStoredToken)")
+        "\$env:AI_MEMORY_DATA_DIR='$PS_TOKEN_DIR'; . '$PS_LIB'; \$present = Get-AiMemoryStoredToken; \$env:AI_MEMORY_DATA_DIR='$PS_TOKEN_EMPTY_DIR'; \$absent = Get-AiMemoryStoredToken; \$present + '|' + \$absent")
     assert_eq "powershell reads the stored token file, empty when absent" "stored-secret|" "$PS_TOKEN_OUT"
 fi
 
