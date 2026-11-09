@@ -1031,6 +1031,9 @@ fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
 /// The distinction matters downstream: a family is a partition of the calls,
 /// not a name for what they did, so a reader gains nothing from being told a
 /// session spent itself "across tool non-file and tool unknown".
+// Only the `tool `-prefixed spelling: production filters use
+// `tool_family_from_title`, which also knows the bare reserved-protocol form.
+#[cfg(test)]
 pub(crate) fn is_safe_tool_title(title: &str) -> bool {
     title.starts_with("tool ") && split_tool_title(title).is_some()
 }

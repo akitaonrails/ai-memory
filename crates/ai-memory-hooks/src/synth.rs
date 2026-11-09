@@ -30,9 +30,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::capture_policy::ToolFamily;
-use crate::payload::{
-    is_safe_tool_title, listable_tool_name, tool_family_from_title, tool_title_display,
-};
+use crate::payload::{listable_tool_name, tool_family_from_title, tool_title_display};
 
 const RAW_OBSERVATION_MAX_LINES: usize = 500;
 const RAW_OBSERVATION_HEAD_LINES: usize = 250;
@@ -661,7 +659,7 @@ fn fallback_title(obs: &Observation) -> Option<String> {
     // ("tool non-file") would take the label as its page title.
     (!obs.title.is_empty()
         && !looks_like_title_scaffolding(&obs.title)
-        && !is_safe_tool_title(&obs.title))
+        && tool_family_from_title(&obs.title).is_none())
     .then(|| obs.title.clone())
 }
 
@@ -726,7 +724,7 @@ fn session_summary(digest: &SessionDigest) -> String {
         let nameable: Vec<&str> = by_calls
             .iter()
             .map(|(name, _)| *name)
-            .filter(|name| !is_safe_tool_title(name))
+            .filter(|name| tool_family_from_title(name).is_none())
             .collect();
         parts.push(if nameable.is_empty() {
             format!("{calls} completed tool call{}", plural(calls))
@@ -1363,6 +1361,31 @@ mod tests {
             !summary.contains("across"),
             "nothing nameable is left, so the clause must go rather than be filled: {summary}"
         );
+    }
+
+    /// The reserved-protocol path titles a call with the bare family name
+    /// ("non-file", "file") rather than "tool non-file". Both spellings are
+    /// family labels: counted, never named, never a page title.
+    #[test]
+    fn bare_family_labels_are_counted_but_not_named() {
+        let mut observations = vec![obs(ObservationKind::UserPrompt, "do the thing")];
+        for (tool, calls) in [("non-file", 9), ("file", 4), ("unknown", 2)] {
+            for _ in 0..calls {
+                observations.push(obs(ObservationKind::PostToolUse, tool));
+            }
+        }
+        assert_eq!(
+            session_summary(&tally_session(&observations)),
+            "1 prompt, 15 completed tool calls."
+        );
+
+        let sid = test_session_id();
+        let labels_only = vec![
+            obs(ObservationKind::SessionStart, "claude-opus-5[1m]"),
+            obs(ObservationKind::UserPrompt, ""),
+            obs(ObservationKind::PostToolUse, "file"),
+        ];
+        assert_eq!(derive_title(&labels_only, sid), format!("Session {sid}"));
     }
 
     /// A session that mixes both keeps the names it has. The families still
