@@ -124,8 +124,8 @@ getrandom = "0.3"
 base64 = "0.22"
 
 # Storage.
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-refinery = { version = "0.8", features = ["rusqlite"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup", "fallible_uint"] }
+refinery = { version = "0.10", features = ["rusqlite"] }
 sha2 = "0.10"
 # Argon2id PHC for human passwords. Tokens stay SHA-256+pepper (hot-path
 # unique lookup); the slow KDF is reserved for the password class.
@@ -151,7 +151,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 # rmcp 3.x speaks the MCP 2026-07-28 revision (stateless `server/discover`,
 # per-request `_meta` negotiation) while keeping the legacy `initialize`
 # handshake, so both-era clients connect without a shim (#1924).
-rmcp = { version = "3.8", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "3.9", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Same `http` 1.x rmcp/axum use, so handlers can read the injected

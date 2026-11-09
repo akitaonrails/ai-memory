@@ -13570,7 +13570,8 @@ pub(crate) mod tests {
                     counter.fetch_add(1, Ordering::Relaxed);
                     false
                 }),
-            );
+            )
+            .unwrap();
             let summary = backfill_cjk_indexes_in_batches(&mut conn, 1).unwrap();
             assert_eq!(
                 (summary.pages, summary.observations),
