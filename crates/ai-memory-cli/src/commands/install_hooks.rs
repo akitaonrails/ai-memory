@@ -1212,6 +1212,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                 ClaudeRenderTarget {
                     settings_path: &settings_path,
                     scope: args.scope,
+                    absolute_paths: args.absolute_paths,
                 },
                 ClaudeCaptureScope {
                     assistant: args.capture_assistant,
@@ -1282,7 +1283,14 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         AgentChoice::Grok => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-            render_grok(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            render_grok(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                args.absolute_paths,
+            )
         }
         AgentChoice::Zero => render_zero(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Zcode => render_zcode(&server_url, auth, &config.data_dir, strategy),
@@ -1296,7 +1304,14 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         AgentChoice::Devin => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-            render_devin(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            render_devin(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                args.absolute_paths,
+            )
         }
         AgentChoice::Openclaw => {
             openclaw_plugin::render(&server_url, auth, strategy, &preview_capture_mode);
@@ -1305,22 +1320,50 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         AgentChoice::KimiCode => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-            render_kimi_code(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            render_kimi_code(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                args.absolute_paths,
+            )
         }
         AgentChoice::KiroCli => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-            render_kiro_cli(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            render_kiro_cli(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                args.absolute_paths,
+            )
         }
         AgentChoice::KiroCliV3 => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-            render_kiro_cli_v3(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            render_kiro_cli_v3(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                args.absolute_paths,
+            )
         }
         AgentChoice::Pool => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-            render_pool(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            render_pool(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                args.absolute_paths,
+            )
         }
         AgentChoice::CopilotCli => {
             let hooks_dir =
@@ -1341,7 +1384,14 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         AgentChoice::Dsh => {
             let hooks_dir =
                 resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent, &config.data_dir)?;
-            render_dsh(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
+            render_dsh(
+                &hooks_dir,
+                &server_url,
+                auth,
+                &config.data_dir,
+                strategy,
+                args.absolute_paths,
+            )
         }
         AgentChoice::Cline => render_cline_hooks(
             &server_url,
@@ -2477,6 +2527,7 @@ fn apply_to_claude_code_settings_in(
             Some(data_dir),
             args.project_strategy.and_then(ProjectStrategyArg::baked),
             args.capture_assistant,
+            args.absolute_paths,
         ),
         capture_prompts,
     );
@@ -2500,6 +2551,7 @@ fn apply_to_claude_code_settings_with_staged(
             Some(data_dir),
             args.project_strategy.and_then(ProjectStrategyArg::baked),
             args.capture_assistant,
+            args.absolute_paths,
         ),
         capture_prompts,
     );
@@ -2618,6 +2670,7 @@ fn apply_to_grok_settings(
         auth_token,
         Some(data_dir),
         strategy,
+        args.absolute_paths,
     );
     let our_hooks = payload
         .get("hooks")
@@ -2699,6 +2752,7 @@ fn apply_to_devin_settings_with_staged(
         auth_token,
         Some(data_dir),
         strategy,
+        args.absolute_paths,
     );
     let our_hooks = payload
         .get("hooks")
@@ -2778,6 +2832,7 @@ fn apply_to_command_code_settings_in(
         "command-code",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        args.absolute_paths,
     );
     apply_to_command_code_settings_with_payload(payload, args)
 }
@@ -2800,6 +2855,7 @@ fn apply_to_command_code_settings_with_staged(
         args.project_strategy.and_then(ProjectStrategyArg::baked),
         // Command Code is refused by `capture_assistant_allowed`; never bake it.
         false,
+        args.absolute_paths,
     );
     apply_to_command_code_settings_with_payload(payload, args)
 }
@@ -2879,6 +2935,7 @@ fn apply_to_copilot_cli_hooks_in(
         "copilot-cli",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        args.absolute_paths,
     );
     apply_to_copilot_cli_hooks_with_payload(payload, args)
 }
@@ -2901,6 +2958,7 @@ fn apply_to_copilot_cli_hooks_with_staged(
         args.project_strategy.and_then(ProjectStrategyArg::baked),
         // Copilot CLI is refused by `capture_assistant_allowed`; never bake it.
         false,
+        args.absolute_paths,
     );
     apply_to_copilot_cli_hooks_with_payload(payload, args)
 }
@@ -3002,6 +3060,7 @@ fn apply_to_codex_settings_in(
         "codex",
         Some(data_dir),
         args.project_strategy.and_then(ProjectStrategyArg::baked),
+        args.absolute_paths,
     );
     apply_to_codex_settings_with_payload(i18n, payload, args)
 }
@@ -3027,6 +3086,7 @@ fn apply_to_codex_settings_with_staged(
         // asked. `capture_assistant_allowed` already gated it, so this only bakes
         // on a native path.
         args.capture_assistant,
+        args.absolute_paths,
     );
     apply_to_codex_settings_with_payload(i18n, payload, args)
 }
@@ -3104,6 +3164,7 @@ fn merge_codex_hooks(
         Some(data_dir),
         project_strategy,
         capture_assistant,
+        false,
     );
     merge_codex_payload(payload, config_path)
 }
@@ -3170,6 +3231,7 @@ fn apply_to_cursor_settings(
         cursor_command_data_dir(data_dir, &crate::config::default_data_dir()),
         strategy,
         &path,
+        args.absolute_paths,
     )?;
     println!(
         "✓ {} {} ({})",
@@ -3302,6 +3364,7 @@ fn merge_cursor_hooks(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
     config_path: &Path,
+    absolute_paths: bool,
 ) -> Result<ApplyOutcome> {
     let payload = build_profile_payload_for_agent(
         &CURSOR_PROFILE,
@@ -3312,6 +3375,7 @@ fn merge_cursor_hooks(
         data_dir,
         project_strategy,
         false,
+        absolute_paths,
     );
     let our_hooks = payload
         .get("hooks")
@@ -3378,6 +3442,7 @@ fn apply_to_gemini_settings(
         data_dir,
         strategy,
         &path,
+        args.absolute_paths,
     )?;
     println!(
         "✓ {} {} ({})",
@@ -3399,6 +3464,7 @@ fn merge_gemini_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    absolute_paths: bool,
 ) -> Result<ApplyOutcome> {
     let payload = build_profile_payload_for_agent(
         &GEMINI_PROFILE,
@@ -3409,6 +3475,7 @@ fn merge_gemini_hooks(
         Some(data_dir),
         project_strategy,
         false,
+        absolute_paths,
     );
     let our_hooks = payload
         .get("hooks")
@@ -3464,6 +3531,7 @@ fn apply_to_antigravity_settings(
         data_dir,
         strategy,
         &path,
+        args.absolute_paths,
     )?;
     println!(
         "✓ {} {} ({})",
@@ -3494,6 +3562,7 @@ fn merge_antigravity_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    absolute_paths: bool,
 ) -> Result<ApplyOutcome> {
     let payload = build_antigravity_payload_with_data_dir(
         staged,
@@ -3501,6 +3570,7 @@ fn merge_antigravity_hooks(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     let our_group = payload
         .get("ai-memory")
@@ -3557,6 +3627,7 @@ fn apply_to_kimi_code_config(
         data_dir,
         strategy,
         &path,
+        args.absolute_paths,
     )?;
     println!(
         "✓ {} {} ({})",
@@ -3578,6 +3649,7 @@ fn merge_kimi_code_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    absolute_paths: bool,
 ) -> Result<ApplyOutcome> {
     let commands = kimi_code_hook_commands(
         staged,
@@ -3585,6 +3657,7 @@ fn merge_kimi_code_hooks(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     apply_atomic(config_path, |existing| {
         mutate_toml(existing, |doc| upsert_kimi_code_hooks(doc, &commands))
@@ -3685,6 +3758,7 @@ fn apply_to_kiro_cli_agent_configs(
         auth_token,
         data_dir,
         args.project_strategy,
+        args.absolute_paths,
     )?;
 
     let staged = stage_hook_scripts(i18n, hooks_dir, "kiro-cli", data_dir)?;
@@ -3697,6 +3771,7 @@ fn apply_to_kiro_cli_agent_configs(
             data_dir,
             strategy.and_then(ProjectStrategyArg::baked),
             &path,
+            args.absolute_paths,
         )?;
         println!(
             "✓ {} {} ({})",
@@ -3722,6 +3797,7 @@ fn preflight_kiro_cli_agent_configs(
     auth_token: Option<&str>,
     data_dir: &Path,
     explicit_strategy: Option<ProjectStrategyArg>,
+    absolute_paths: bool,
 ) -> Result<Vec<(PathBuf, Option<ProjectStrategyArg>)>> {
     let mut prepared = Vec::with_capacity(targets.len());
     for path in targets {
@@ -3737,6 +3813,7 @@ fn preflight_kiro_cli_agent_configs(
             data_dir,
             strategy.and_then(ProjectStrategyArg::baked),
             &path,
+            absolute_paths,
         )?;
         prepared.push((path, strategy));
     }
@@ -3753,6 +3830,7 @@ fn merge_kiro_cli_agent_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    absolute_paths: bool,
 ) -> Result<ApplyOutcome> {
     apply_atomic(config_path, |existing| {
         render_kiro_cli_agent_hooks(
@@ -3763,10 +3841,12 @@ fn merge_kiro_cli_agent_hooks(
             data_dir,
             project_strategy,
             config_path,
+            absolute_paths,
         )
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_kiro_cli_agent_hooks(
     existing: &str,
     staged: &Path,
@@ -3775,6 +3855,7 @@ fn render_kiro_cli_agent_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    absolute_paths: bool,
 ) -> Result<String> {
     let our_hooks = build_kiro_cli_v2_hooks_value(
         staged,
@@ -3782,6 +3863,7 @@ fn render_kiro_cli_agent_hooks(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     mutate_json(existing, |root| {
         let hooks = root
@@ -3823,7 +3905,14 @@ fn apply_to_kiro_cli_v3_hooks(
     // Validate before staging scripts so an incompatible registration file
     // cannot leave a partial installation behind.
     render_kiro_cli_v3_hooks(
-        &existing, hooks_dir, server_url, auth_token, data_dir, strategy, &path,
+        &existing,
+        hooks_dir,
+        server_url,
+        auth_token,
+        data_dir,
+        strategy,
+        &path,
+        args.absolute_paths,
     )?;
 
     let staged = stage_hook_scripts(i18n, hooks_dir, "kiro-cli", data_dir)?;
@@ -3835,6 +3924,7 @@ fn apply_to_kiro_cli_v3_hooks(
         data_dir,
         strategy,
         &path,
+        args.absolute_paths,
     )?;
     println!(
         "✓ {} {} ({})",
@@ -3856,6 +3946,7 @@ fn merge_kiro_cli_v3_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    absolute_paths: bool,
 ) -> Result<ApplyOutcome> {
     apply_atomic(config_path, |existing| {
         render_kiro_cli_v3_hooks(
@@ -3866,10 +3957,12 @@ fn merge_kiro_cli_v3_hooks(
             data_dir,
             project_strategy,
             config_path,
+            absolute_paths,
         )
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_kiro_cli_v3_hooks(
     existing: &str,
     command_dir: &Path,
@@ -3878,6 +3971,7 @@ fn render_kiro_cli_v3_hooks(
     data_dir: &Path,
     project_strategy: Option<&str>,
     config_path: &Path,
+    absolute_paths: bool,
 ) -> Result<String> {
     let desired = build_kiro_cli_v3_hooks_value(
         command_dir,
@@ -3885,6 +3979,7 @@ fn render_kiro_cli_v3_hooks(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     let desired_hooks = desired
         .get("hooks")
@@ -7172,6 +7267,7 @@ struct ClaudeCaptureScope {
 struct ClaudeRenderTarget<'a> {
     settings_path: &'a Path,
     scope: HookInstallScope,
+    absolute_paths: bool,
 }
 
 fn render_claude_code(
@@ -7186,6 +7282,7 @@ fn render_claude_code(
     let ClaudeRenderTarget {
         settings_path,
         scope,
+        absolute_paths,
     } = target;
     let ClaudeCaptureScope {
         assistant: capture_assistant,
@@ -7224,6 +7321,7 @@ fn render_claude_code(
             Some(data_dir),
             project_strategy,
             capture_assistant,
+            absolute_paths,
         ),
         capture_prompts,
     );
@@ -7260,6 +7358,7 @@ fn render_grok(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
@@ -7282,6 +7381,7 @@ fn render_grok(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing grok hook config")?;
@@ -8409,6 +8509,7 @@ fn render_devin(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
@@ -8431,6 +8532,7 @@ fn render_devin(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing devin hook config")?;
@@ -8463,6 +8565,7 @@ fn render_kimi_code(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
@@ -8485,6 +8588,7 @@ fn render_kimi_code(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     let mut doc = toml_edit::DocumentMut::new();
     upsert_kimi_code_hooks(&mut doc, &commands)?;
@@ -8509,6 +8613,7 @@ fn render_kiro_cli(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
@@ -8531,6 +8636,7 @@ fn render_kiro_cli(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     println!("// Kiro CLI v2-engine hooks — merge the \"hooks\" object into each");
     println!("// agent config under $KIRO_HOME/agents (~/.kiro/agents when unset),");
@@ -8560,6 +8666,7 @@ fn render_kiro_cli_v3(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Result<()> {
     for (_, script) in KIRO_CLI_V3_EVENTS {
         let abs = hooks_dir.join(hook_script_for_current_platform(script).as_ref());
@@ -8578,6 +8685,7 @@ fn render_kiro_cli_v3(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     println!("// Kiro CLI v3 hooks — write this document to");
     println!("// $KIRO_HOME/hooks/ai-memory.json (~/.kiro/hooks/ai-memory.json when unset),");
@@ -8608,6 +8716,7 @@ fn render_pool(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
@@ -8631,7 +8740,8 @@ fn render_pool(
             server_url,
             auth_token,
             data_dir,
-            project_strategy
+            project_strategy,
+            absolute_paths
         )
     );
     Ok(())
@@ -8643,6 +8753,7 @@ fn render_pool_output(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> String {
     let snippet = build_pool_settings_yaml_with_data_dir(
         hooks_dir,
@@ -8650,6 +8761,7 @@ fn render_pool_output(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     let mut out = String::new();
     out.push_str("# Pool (Poolside Agent CLI) hook config — merge into the repo-root\n");
@@ -8693,7 +8805,14 @@ fn apply_to_pool(
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
     print!(
         "{}",
-        render_pool_output(&command_dir, server_url, auth_token, data_dir, strategy)
+        render_pool_output(
+            &command_dir,
+            server_url,
+            auth_token,
+            data_dir,
+            strategy,
+            args.absolute_paths
+        )
     );
     Ok(())
 }
@@ -8922,6 +9041,7 @@ fn render_dsh(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Result<()> {
     // Soft check (same rationale as render_claude_code): warn, don't bail,
     // so the docker host-path flow still works.
@@ -8945,7 +9065,8 @@ fn render_dsh(
             server_url,
             auth_token,
             data_dir,
-            project_strategy
+            project_strategy,
+            absolute_paths
         )
     );
     Ok(())
@@ -8957,6 +9078,7 @@ fn render_dsh_output(
     auth_token: Option<&str>,
     data_dir: &Path,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> String {
     let payload = build_dsh_hooks_payload(
         hooks_dir,
@@ -8964,6 +9086,7 @@ fn render_dsh_output(
         auth_token,
         Some(data_dir),
         project_strategy,
+        absolute_paths,
     );
     let mut out = String::new();
     out.push_str("# DeepSeek Harness (DSH) hook config - DSH has no fixed agent\n");
@@ -9017,6 +9140,7 @@ fn apply_to_dsh(
         auth_token,
         Some(data_dir),
         strategy,
+        args.absolute_paths,
     );
     let hooks_json = command_dir.join("hooks.json");
     write_private_dsh_config(
@@ -9410,6 +9534,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::CommandCode,
             config_file: Some(config_path.clone()),
             ..default_hook_args()
@@ -9497,6 +9622,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::CopilotCli,
             config_file: Some(config_path.clone()),
             ..default_hook_args()
@@ -9710,6 +9836,7 @@ mod tests {
 
     fn droid_args(config_file: &Path) -> InstallHooksArgs {
         InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Droid,
             config_file: Some(config_file.to_path_buf()),
             ..default_hook_args()
@@ -9739,6 +9866,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::CodeBuddy,
             config_file: Some(settings.clone()),
             ..default_hook_args()
@@ -9808,6 +9936,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::QwenCode,
             config_file: Some(settings.clone()),
             ..default_hook_args()
@@ -9873,6 +10002,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Qoder,
             config_file: Some(settings.clone()),
             ..default_hook_args()
@@ -9934,6 +10064,7 @@ mod tests {
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::IbmBob,
             config_file: Some(settings.clone()),
             ..default_hook_args()
@@ -10052,6 +10183,7 @@ mod tests {
 
     fn muse_args(config_file: &Path) -> InstallHooksArgs {
         InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Muse,
             config_file: Some(config_file.to_path_buf()),
             ..default_hook_args()
@@ -10407,6 +10539,7 @@ mod tests {
 
     fn default_hook_args() -> InstallHooksArgs {
         InstallHooksArgs {
+            absolute_paths: false,
             profile: None,
             agent: AgentChoice::OpenCode,
             capture_assistant: false,
@@ -10681,6 +10814,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(cfg),
             project_strategy: None,
@@ -10708,6 +10842,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(cfg),
             project_strategy: Some(ProjectStrategyArg::Basename),
@@ -10724,6 +10859,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
     fn install_project_strategy_none_when_target_absent() {
         let tmp = TempDir::new().unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(tmp.path().join("nope.json")),
             project_strategy: None,
@@ -10743,6 +10879,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Openclaw,
             config_file: Some(tmp.path().to_path_buf()),
             project_strategy: None,
@@ -11072,6 +11209,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             Some("tok-test"),
             Some(Path::new("/data")),
             Some("repo-root"),
+            false,
         );
         assert!(snippet.starts_with("hooks:\n"), "snippet: {snippet}");
         for (event, script) in POOL_EVENTS {
@@ -11113,6 +11251,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             None,
             Path::new("/data"),
             None,
+            false,
         );
         assert!(out.contains(".poolside/settings.yaml"));
         assert!(out.contains("does not write committed project files"));
@@ -11131,6 +11270,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
             None,
             Path::new("/data"),
             None,
+            false,
         );
         // The Claude Code hooks.json document is embedded for the bridge.
         assert!(out.contains("\"hooks\""));
@@ -11500,6 +11640,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zero,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -11658,6 +11799,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zcode,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -11761,6 +11903,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zcode,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -11846,6 +11989,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         let path = tmp.path().join("config.json");
         fs::write(&path, r#"{"hooks": {"enabled": false, "events": {}}}"#).unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zcode,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -11879,6 +12023,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         )
         .unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Zcode,
             capture_assistant: false,
             config_file: Some(path.clone()),
@@ -12732,6 +12877,7 @@ model = "gpt-5"
             codex_home.path().to_str().unwrap(),
         )]);
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Codex,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12768,6 +12914,7 @@ model = "gpt-5"
 
         let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12826,6 +12973,7 @@ model = "gpt-5"
         let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
 
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12881,6 +13029,7 @@ model = "gpt-5"
         std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
 
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -12927,6 +13076,7 @@ model = "gpt-5"
             config
         };
         let args = || InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -13082,6 +13232,7 @@ model = "gpt-5"
         let home = TempDir::new().unwrap();
         let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Codex,
             scope: HookInstallScope::Project,
             server_url: Some("http://127.0.0.1:49374".to_string()),
@@ -13113,6 +13264,7 @@ model = "gpt-5"
         std::fs::create_dir_all(crate::config::hook_auth_token_path_in(&config.data_dir)).unwrap();
         let settings = home.path().join("settings.local.json");
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             scope: HookInstallScope::Project,
             apply: true,
@@ -13136,6 +13288,7 @@ model = "gpt-5"
         capture_assistant: bool,
     ) -> InstallHooksArgs {
         InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             apply: true,
             capture_assistant,
@@ -15096,6 +15249,7 @@ model = "gpt-5"
     fn omp_extension_is_directly_discoverable_by_omp() {
         let tmp = TempDir::new().unwrap();
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Omp,
             capture_assistant: false,
             no_capture_prompts: false,
@@ -15130,6 +15284,7 @@ model = "gpt-5"
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("extensions").join("ai-memory-pi.ts");
         let args = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::Pi,
             capture_assistant: false,
             no_capture_prompts: false,
@@ -16423,6 +16578,7 @@ process.exit(0);
             Some(config_tmp.path()),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -16560,6 +16716,7 @@ process.exit(0);
             None,
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -16585,6 +16742,7 @@ process.exit(0);
                 None,
                 None,
                 &config_path,
+                false,
             )
             .unwrap(),
             ApplyOutcome::NoOp
@@ -16605,6 +16763,7 @@ process.exit(0);
             Some(&data_dir),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         for (event, command) in cursor_ai_memory_commands(&config_path) {
@@ -16714,6 +16873,7 @@ process.exit(0);
             Some(config_tmp.path()),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         assert_ne!(
@@ -16729,6 +16889,7 @@ process.exit(0);
             Some(config_tmp.path()),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
@@ -16768,6 +16929,7 @@ process.exit(0);
             Some(config_tmp.path()),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -16993,6 +17155,7 @@ process.exit(0);
             config_tmp.path(),
             staging_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::Codex,
                 capture_assistant: false,
@@ -17065,6 +17228,7 @@ process.exit(0);
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -17124,6 +17288,7 @@ process.exit(0);
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -17196,6 +17361,7 @@ process.exit(0);
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -17236,6 +17402,7 @@ process.exit(0);
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         assert_ne!(
@@ -17251,6 +17418,7 @@ process.exit(0);
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
@@ -17312,6 +17480,7 @@ process.exit(0);
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         assert_eq!(outcome, ApplyOutcome::Created);
@@ -17379,6 +17548,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
 
@@ -17450,6 +17620,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         assert_ne!(
@@ -17465,6 +17636,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
@@ -17571,6 +17743,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             staging_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::ClaudeCode,
                 capture_assistant: false,
@@ -17658,6 +17831,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         .unwrap();
 
         let disabled = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(config_path.clone()),
             no_capture_prompts: true,
@@ -17692,6 +17866,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         assert_disabled();
 
         let bare_reapply = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(config_path.clone()),
             ..default_hook_args()
@@ -17709,6 +17884,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         assert_disabled();
 
         let enabled = InstallHooksArgs {
+            absolute_paths: false,
             agent: AgentChoice::ClaudeCode,
             config_file: Some(config_path.clone()),
             capture_prompts: true,
@@ -17791,6 +17967,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap();
         assert_eq!(outcome, ApplyOutcome::Updated);
@@ -17862,6 +18039,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 config_tmp.path(),
                 None,
                 &config_path,
+                false,
             )
         };
         assert_eq!(apply().unwrap(), ApplyOutcome::Updated);
@@ -17964,6 +18142,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 config_tmp.path(),
                 Some("repo-root"),
                 &config_path,
+                false,
             )
         };
         assert_eq!(apply().unwrap(), ApplyOutcome::Created);
@@ -18019,6 +18198,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 tmp.path(),
                 None,
                 &config_path,
+                false,
             )
             .unwrap(),
             ApplyOutcome::Updated
@@ -18044,6 +18224,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("unsupported Kiro hook schema version"));
@@ -18060,6 +18241,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             tmp.path(),
             None,
             &config_path,
+            false,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("reserved name"));
@@ -18116,6 +18298,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             None,
             tmp.path(),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(prepared[0].1, Some(ProjectStrategyArg::RepoRoot));
@@ -18130,6 +18313,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             None,
             tmp.path(),
             None,
+            false,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("valid JSON"));
@@ -18171,6 +18355,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             config_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
@@ -18240,6 +18425,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             config_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,
@@ -18297,6 +18483,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         let hooks_v1_path = config_tmp.path().join("hooks.v1.json");
 
         let args_v1 = InstallHooksArgs {
+            absolute_paths: false,
             profile: None,
             agent: AgentChoice::Devin,
             capture_assistant: false,
@@ -18349,6 +18536,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         fs::write(&config_path, "{}").unwrap();
 
         let args_config = InstallHooksArgs {
+            absolute_paths: false,
             profile: None,
             agent: AgentChoice::Devin,
             capture_assistant: false,
@@ -18427,6 +18615,7 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             config_tmp.path(),
             config_tmp.path(),
             &InstallHooksArgs {
+                absolute_paths: false,
                 profile: None,
                 agent: AgentChoice::Devin,
                 capture_assistant: false,

@@ -602,6 +602,7 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
         install_hooks::run_with_opencode_dialect(
             config,
             InstallHooksArgs {
+                absolute_paths: false,
                 agent: AgentChoice::OpenCode,
                 hooks_dir: None,
                 server_url: Some(args.server_url.clone()),
@@ -765,6 +766,7 @@ fn emit_dsh(emit_root: &Path, args: &SetupAgentArgs) {
         args.auth_token.as_deref(),
         None,
         None,
+        false,
     );
     println!("# DeepSeek Harness (DSH) — DSH has no fixed agent config file.");
     println!("# Hook scripts (must be reachable from the host that runs DSH):");

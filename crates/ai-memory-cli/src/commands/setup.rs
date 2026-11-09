@@ -337,6 +337,7 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         plan,
         &user_service::SystemRunner,
         SERVICE_READY_TIMEOUT,
+        args.absolute_paths,
     )
     .await
 }
@@ -836,6 +837,7 @@ async fn execute(
     plan: SetupPlan,
     runner: &dyn CommandRunner,
     ready_timeout: Duration,
+    absolute_paths: bool,
 ) -> Result<()> {
     let i18n = &config.i18n;
     let mut problems: Vec<String> = Vec::new();
@@ -919,7 +921,7 @@ async fn execute(
     let mut skills_done = BTreeSet::new();
     for agent in &plan.agents {
         println!("\n== {}", agent.agent.kind().as_str());
-        for problem in wire_agent(&config, agent, &mut skills_done) {
+        for problem in wire_agent(&config, agent, absolute_paths, &mut skills_done) {
             problems.push(format!("{}: {problem}", agent.agent.kind().as_str()));
         }
     }
@@ -1076,6 +1078,7 @@ async fn wait_until_reachable(endpoint: &ServerEndpoint, timeout: Duration) -> b
 fn wire_agent(
     config: &Config,
     plan: &AgentPlan,
+    absolute_paths: bool,
     skills_done: &mut BTreeSet<String>,
 ) -> Vec<String> {
     let i18n = &config.i18n;
@@ -1090,7 +1093,7 @@ fn wire_agent(
     }
     let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
     match opencode_dialect(plan.agent, &child_env) {
-        Ok(dialect) => wire_mcp_and_hooks(config, plan, dialect, &mut problems),
+        Ok(dialect) => wire_mcp_and_hooks(config, plan, dialect, absolute_paths, &mut problems),
         // A guessed major writes a plugin and MCP shape the installed OpenCode
         // ignores without an error, so nothing is written instead.
         Err(error) => problems.push(format!("skipped install-mcp and install-hooks: {error:#}")),
@@ -1111,11 +1114,33 @@ fn wire_agent(
     problems
 }
 
+/// The `install-hooks` args `setup` builds for one agent.
+fn hooks_install_args(agent: AgentChoice, absolute_paths: bool) -> InstallHooksArgs {
+    InstallHooksArgs {
+        agent,
+        hooks_dir: None,
+        server_url: None,
+        auth_token: None,
+        as_user: None,
+        apply: true,
+        config_file: None,
+        scope: HookInstallScope::Global,
+        project_strategy: None,
+        capture_assistant: false,
+        capture_mode: None,
+        no_capture_prompts: false,
+        capture_prompts: false,
+        profile: None,
+        absolute_paths,
+    }
+}
+
 /// `install-mcp` then `install-hooks` for one agent, in one OpenCode dialect.
 fn wire_mcp_and_hooks(
     config: &Config,
     plan: &AgentPlan,
     dialect: Option<OpenCodeDialect>,
+    absolute_paths: bool,
     problems: &mut Vec<String>,
 ) {
     let i18n = &config.i18n;
@@ -1144,22 +1169,7 @@ fn wire_mcp_and_hooks(
             }
         }
     }
-    let hooks = InstallHooksArgs {
-        agent: plan.agent,
-        hooks_dir: None,
-        server_url: None,
-        auth_token: None,
-        as_user: None,
-        apply: true,
-        config_file: None,
-        scope: HookInstallScope::Global,
-        project_strategy: None,
-        capture_assistant: false,
-        capture_mode: None,
-        no_capture_prompts: false,
-        capture_prompts: false,
-        profile: None,
-    };
+    let hooks = hooks_install_args(plan.agent, absolute_paths);
     if let Err(error) =
         install_hooks::run_with_opencode_dialect_and_mcp_path(config, hooks, dialect, None)
     {
@@ -1301,6 +1311,12 @@ async fn memory_status(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_forwards_absolute_paths() {
+        assert!(hooks_install_args(AgentChoice::ClaudeCode, true).absolute_paths);
+        assert!(!hooks_install_args(AgentChoice::ClaudeCode, false).absolute_paths);
+    }
 
     /// Muse is detected by its config or data directory under the home or
     /// the absolute XDG roots, and not otherwise.

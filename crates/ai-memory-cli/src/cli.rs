@@ -2178,6 +2178,10 @@ pub struct SetupArgs {
     /// holds the write end, so the page goes away with the app.
     #[arg(long, requires = "web", hide = true)]
     pub stop_on_stdin_eof: bool,
+    /// Write the absolute, shell-quoted exe and data dir into the hook commands
+    /// that `setup` installs, instead of the `"$HOME/..."` form.
+    #[arg(long)]
+    pub absolute_paths: bool,
 }
 
 /// Arguments for `status`.
@@ -3570,6 +3574,11 @@ pub struct InstallHooksArgs {
     /// `PI_PROFILE`; `default` selects the default profile.
     #[arg(long)]
     pub profile: Option<String>,
+    /// Write the absolute, shell-quoted exe and data dir into hook commands
+    /// instead of the `"$HOME/..."` form. `AI_MEMORY_HOOK_ABSOLUTE_PATHS=1`
+    /// opts out the same way.
+    #[arg(long)]
+    pub absolute_paths: bool,
 }
 
 /// Arguments for `install-mcp`.

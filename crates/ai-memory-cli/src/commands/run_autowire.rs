@@ -318,6 +318,7 @@ fn wire_installs(config: &Config, targets: WireTargets, overrides: &WireOverride
     // routes it through the bridge or an env-var reference (#552).
     let auth_token = config.auth.renderable_bearer_token().map(str::to_owned);
     let hook_install = |config_file: Option<PathBuf>| InstallHooksArgs {
+        absolute_paths: false,
         agent,
         hooks_dir: overrides.hooks_dir.clone(),
         server_url: server_url.clone(),
