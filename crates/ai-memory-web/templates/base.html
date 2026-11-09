@@ -41,7 +41,7 @@
       {% block header_search %}
       <form action="search" method="get" class="topbar-search"><label for="header-search" class="sr-only">{{ i18n.text("web-search-pages") }}</label><input id="header-search" name="q" type="search" placeholder="{{ i18n.text("web-search-memory-base") }}"><span aria-hidden="true">⌕</span></form>
       {% endblock %}
-      <button type="button" id="ai-memory-logout" class="quiet-button">{{ i18n.text("web-log-out") }}</button>
+      <button type="button" id="ai-memory-logout" class="quiet-button" data-error="{{ i18n.text("web-log-out-failed") }}">{{ i18n.text("web-log-out") }}</button>
       {% endblock %}
       <label for="interface-language" class="sr-only">{{ i18n.text("web-language") }}</label>
       <select id="interface-language" aria-label="{{ i18n.text("web-language") }}">
@@ -73,7 +73,13 @@
     });
     var btn=document.getElementById("ai-memory-logout");
     if(btn){ {% include "_js_cookie.html" %}
-      btn.addEventListener("click",function(){var base=document.querySelector('meta[name="ai-memory-base-path"]')?.content||"";var login=document.querySelector('meta[name="ai-memory-login-path"]')?.content||(base+"/web/login");fetch(base+"/auth/logout",{method:"POST",credentials:"include",headers:{"Accept":"application/json","X-CSRF-Token":decodeURIComponent(cookie("ai_memory_csrf")||"")}}).finally(function(){location.assign(login);});});
+      // Only a browser session (it carries the CSRF cookie) can be ended
+      // here. A Basic sign-in or a server without auth has none, so a
+      // "Log out" there would claim a sign-out that never happens.
+      if(!cookie("ai_memory_csrf")){btn.remove();}
+      // Leave the page only once the server ended the session, or answers
+      // that there is none (401). Otherwise say so and keep the button.
+      else btn.addEventListener("click",function(){var base=document.querySelector('meta[name="ai-memory-base-path"]')?.content||"";var login=document.querySelector('meta[name="ai-memory-login-path"]')?.content||(base+"/web/login");var failed=document.getElementById("ai-memory-logout-error");if(failed)failed.remove();btn.disabled=true;fetch(base+"/auth/logout",{method:"POST",credentials:"include",headers:{"Accept":"application/json","X-CSRF-Token":decodeURIComponent(cookie("ai_memory_csrf")||"")}}).then(function(r){if(!r.ok&&r.status!==401)throw new Error("logout "+r.status);location.assign(login);}).catch(function(){btn.disabled=false;var note=document.createElement("span");note.id="ai-memory-logout-error";note.setAttribute("role","alert");note.textContent=btn.dataset.error;btn.after(note);});});
     }
   })();
   </script>

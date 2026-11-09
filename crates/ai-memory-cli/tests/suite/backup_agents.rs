@@ -1556,6 +1556,74 @@ fn backup_agents_does_not_follow_config_or_asset_root_symlinks() {
     );
 }
 
+/// A plugin's manifest lives in a dot-directory (`.claude-plugin`,
+/// `.codex-plugin`); skipping it with the other dot-directories archived
+/// plugins and marketplaces that no longer load after a restore.
+#[test]
+fn backup_agents_keeps_plugin_manifest_directories() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let plugins = home.path().join(".claude/plugins/marketplaces/acme");
+    for (relative, body) in [
+        (".claude-plugin/marketplace.json", "{}"),
+        ("plugins/demo/.claude-plugin/plugin.json", "{}"),
+        ("plugins/demo/skills/demo/SKILL.md", "# Demo"),
+        (".git/HEAD", "ref: refs/heads/main"),
+    ] {
+        let path = plugins.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    let codex_manifest = home
+        .path()
+        .join(".codex/plugins/demo/.codex-plugin/plugin.json");
+    fs::create_dir_all(codex_manifest.parent().unwrap()).unwrap();
+    fs::write(&codex_manifest, "{}").unwrap();
+    let archive = project.path().join("backup.tar.gz");
+
+    let output = command_with_env(home.path(), project.path())
+        .args(["backup-agents", "-o", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "backup-agents failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(
+        fs::File::open(&archive).unwrap(),
+    ));
+    let paths: Vec<String> = tar
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    for expected in [
+        "claude/plugins/marketplaces/acme/.claude-plugin/marketplace.json",
+        "claude/plugins/marketplaces/acme/plugins/demo/.claude-plugin/plugin.json",
+        "claude/plugins/marketplaces/acme/plugins/demo/skills/demo/SKILL.md",
+        "codex/plugins/demo/.codex-plugin/plugin.json",
+    ] {
+        assert!(
+            paths.iter().any(|path| path == expected),
+            "missing {expected} in {paths:?}"
+        );
+    }
+    assert!(
+        !paths.iter().any(|path| path.contains("/.git/")),
+        "VCS state must stay out of the archive: {paths:?}"
+    );
+}
+
 #[test]
 fn failed_backup_leaves_the_previous_archive_intact() {
     let _guard = cli_test_lock();

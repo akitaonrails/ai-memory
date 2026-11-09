@@ -77,17 +77,18 @@ pub fn query_hash(normalized: &str) -> [u8; 16] {
     out
 }
 
-/// Split text into comparison tokens: runs of ASCII alphanumeric characters
-/// form words, while every non-ASCII alphanumeric character is its own token.
-/// CJK scripts do not separate words with spaces, so an unspaced CJK query
-/// would otherwise collapse into one giant token that matches nothing but
-/// itself; per-character tokens keep similarity working for the languages the
-/// FTS side already special-cases.
+/// Split text into comparison tokens: runs of alphanumeric characters form
+/// words, while every CJK character is its own token. CJK scripts do not
+/// separate words with spaces, so an unspaced CJK query would otherwise
+/// collapse into one giant token that matches nothing but itself;
+/// per-character tokens keep similarity working for the languages the FTS
+/// side already special-cases. Accented Latin letters stay inside their word:
+/// as tokens of their own, `migração` and `configuração` would share three.
 fn query_tokens(text: &str) -> std::collections::BTreeSet<String> {
     let mut tokens = std::collections::BTreeSet::new();
     let mut current = String::new();
     for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() {
+        if ch.is_alphanumeric() && !crate::fts_query::is_cjk(ch) {
             for lower in ch.to_lowercase() {
                 current.push(lower);
             }
@@ -97,8 +98,7 @@ fn query_tokens(text: &str) -> std::collections::BTreeSet<String> {
             tokens.insert(std::mem::take(&mut current));
         }
         if ch.is_alphanumeric() {
-            // Non-ASCII alphanumeric (CJK ideographs, kana, …): a token of
-            // its own.
+            // CJK ideographs, kana, hangul: a token of its own.
             for lower in ch.to_lowercase() {
                 tokens.insert(lower.to_string());
             }
@@ -216,6 +216,16 @@ mod tests {
     #[test]
     fn cjk_queries_share_characters() {
         assert!(query_similarity("上次 会话 配置", "上次的会话配置") > 0.0);
+    }
+
+    /// Only the scripts the FTS side splits per character (`is_cjk`) become
+    /// one-character tokens; an accented Latin word stays one word, or two
+    /// unrelated Portuguese queries share their `ç`, `ã` and `o`.
+    #[test]
+    fn accented_latin_words_are_whole_tokens() {
+        assert_eq!(query_similarity("migração", "configuração"), 0.0);
+        assert_eq!(query_similarity("café", "cafe"), 0.0);
+        assert!((query_similarity("Configuração TLS", "configuração tls") - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -244,8 +244,10 @@ log_level = "info"
 # gigabytes a year), while the durable value is the compiled pages. Set
 # observation_retention_days to a positive number to let the sweep delete raw
 # observations older than that — but ONLY for sessions already consolidated into
-# a page that is still live. Unconsolidated sessions, and sessions whose page was
-# evicted by decay, keep every row. 0 (the default) disables the pass entirely.
+# a page that is still live in the project holding those observations.
+# Unconsolidated sessions, sessions whose page was evicted by decay, and the rows
+# a session left in a project with no page of it keep every row. 0 (the default)
+# disables the pass entirely.
 # Pruning is IRREVERSIBLE: observations are the input to consolidation, so a
 # pruned session can never be re-consolidated (a better model, a better prompt,
 # or a fixed consolidator bug make no difference) and its summary page becomes

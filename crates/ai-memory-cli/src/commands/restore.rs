@@ -419,28 +419,14 @@ async fn stage_then_swap(
     restrict_staged_tree(staging)?;
 
     // 3. Exchange the live directories for the staged ones.
-    swap_into_place(
-        i18n,
-        data_dir,
-        staging,
-        previous,
-        placement == ConfigPlacement::Install,
-    )?;
+    swap_into_place(i18n, data_dir, staging, previous, placement)?;
     info!(into = %data_dir.display(), "restored data swapped into place");
 
     Ok(match placement {
         ConfigPlacement::Absent => ConfigOutcome::NotInArchive,
         ConfigPlacement::Install => ConfigOutcome::Restored,
         ConfigPlacement::Divert => {
-            let beside = data_dir.join(CONFIG_FROM_BACKUP_FILE);
-            save_archived_config(&staging.join(CONFIG_FILE), &beside).with_context(|| {
-                format!(
-                    "the restore completed and kept the live config.toml, but saving the \
-                     backup's config.toml to {} failed",
-                    beside.display()
-                )
-            })?;
-            ConfigOutcome::SavedBeside(beside)
+            ConfigOutcome::SavedBeside(data_dir.join(CONFIG_FROM_BACKUP_FILE))
         }
     })
 }
@@ -461,7 +447,7 @@ fn swap_into_place(
     data_dir: &Path,
     staging: &Path,
     previous: &Path,
-    install_config: bool,
+    placement: ConfigPlacement,
 ) -> Result<()> {
     std::fs::create_dir(previous).with_context(|| format!("creating {}", previous.display()))?;
     // `previous` holds the live wiki/ and db/ while the swap runs; keep it
@@ -475,7 +461,8 @@ fn swap_into_place(
     let mut placed: Vec<&str> = Vec::new();
 
     let exchange = (|| -> Result<()> {
-        for name in REPLACED_DIRS {
+        let config = (placement == ConfigPlacement::Install).then_some(&CONFIG_FILE);
+        for name in REPLACED_DIRS.iter().chain(config) {
             let live = data_dir.join(name);
             if live.exists() {
                 std::fs::rename(&live, previous.join(name))
@@ -483,13 +470,6 @@ fn swap_into_place(
                 moved_aside.push(name);
             }
         }
-        let live_config = data_dir.join(CONFIG_FILE);
-        if install_config && live_config.exists() {
-            std::fs::rename(&live_config, previous.join(CONFIG_FILE))
-                .with_context(|| format!("moving {} aside", live_config.display()))?;
-            moved_aside.push(CONFIG_FILE);
-        }
-        let config = install_config.then_some(&CONFIG_FILE);
         for name in REPLACED_DIRS.iter().chain(config) {
             let staged = staging.join(name);
             if staged.exists() {
@@ -497,6 +477,13 @@ fn swap_into_place(
                     .with_context(|| format!("moving {} into place", staged.display()))?;
                 placed.push(name);
             }
+        }
+        if placement == ConfigPlacement::Divert {
+            // Keep the previous data until the sidecar rename succeeds. This
+            // must be the last fallible step because it replaces any old copy.
+            let beside = data_dir.join(CONFIG_FROM_BACKUP_FILE);
+            save_archived_config(&staging.join(CONFIG_FILE), &beside)
+                .with_context(|| format!("moving {} into place", beside.display()))?;
         }
         Ok(())
     })();
@@ -510,6 +497,9 @@ fn swap_into_place(
                 previous.display(),
                 data_dir.display(),
             );
+        }
+        if let Err(cleanup_error) = std::fs::remove_dir(previous) {
+            warn!(path = %previous.display(), error = %cleanup_error, "could not remove empty restore rollback dir");
         }
         return Err(e.context("restore swap failed; the previous data was moved back into place"));
     }
@@ -1445,6 +1435,8 @@ mod tests {
     async fn restore_keeps_a_live_config_and_saves_the_archived_one_beside_it() {
         let data = tempfile::TempDir::new().unwrap();
         seed_live_data(data.path());
+        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
+        std::fs::write(&beside, b"# previous archived config\n").unwrap();
         let scratch = tempfile::TempDir::new().unwrap();
         let archived = b"[auto_improve.eval]\nenabled = true\ncommand = [\"/bin/false\"]\n";
         let db = migrated_sqlite_bytes();
@@ -1468,7 +1460,6 @@ mod tests {
         .await
         .unwrap();
 
-        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
         assert_eq!(outcome, ConfigOutcome::SavedBeside(beside.clone()));
         assert_eq!(
             std::fs::read(data.path().join("config.toml")).unwrap(),
@@ -1488,6 +1479,32 @@ mod tests {
             b"new page"
         );
         assert!(restore_scratch_dirs(data.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_live_data_when_the_archived_config_cannot_be_saved() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
+        std::fs::create_dir(&beside).unwrap();
+        let marker = beside.join("keep.txt");
+        std::fs::write(&marker, b"operator file").unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let from = write_tarball(scratch.path(), "backup.tar.gz", &good_archive());
+
+        let error = restore_data_dir(
+            &ai_memory_core::i18n::Localizer::default(),
+            data.path(),
+            &from,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains(CONFIG_FROM_BACKUP_FILE));
+        assert_live_data_untouched(data.path());
+        assert_eq!(std::fs::read(marker).unwrap(), b"operator file");
     }
 
     #[tokio::test]

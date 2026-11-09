@@ -1109,7 +1109,13 @@ pub async fn require_dual_auth(
     match load_session(&state, req.headers(), req.method()).await {
         Ok(live) => {
             if live.user.must_change_password {
-                return json_err(StatusCode::FORBIDDEN, "password change required");
+                let mut response = json_err(StatusCode::FORBIDDEN, "password change required");
+                // The only 403 the HTML auth redirect turns into the
+                // change-password form.
+                response
+                    .extensions_mut()
+                    .insert(ai_memory_core::PasswordChangeRequired);
+                return response;
             }
             inject_session(&mut req, live);
             req.extensions_mut().insert(state.clone());
@@ -2182,6 +2188,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert!(
+            blocked
+                .extensions()
+                .get::<ai_memory_core::PasswordChangeRequired>()
+                .is_some(),
+            "the HTML redirect to the change-password form keys on this marker"
+        );
         assert_eq!(
             json_error(blocked).await,
             serde_json::json!({"error": "password change required"})

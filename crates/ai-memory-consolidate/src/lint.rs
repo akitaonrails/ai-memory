@@ -382,10 +382,21 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
         if candidate_is_expired(c, now_us) {
             continue;
         }
+        let frontmatter: Option<serde_json::Value> = serde_json::from_str(&c.frontmatter_json).ok();
         // Stale: episodic, older than the lambda-derived threshold, zero accesses.
+        // A pinned page and an A2 compacted residue never decay (the sweep and
+        // the curator's `cold_episodic` skip both), so they are never stale.
+        let never_decays = c.pinned
+            || c.compacted_at_us.is_some()
+            || frontmatter
+                .as_ref()
+                .and_then(|fm| fm.get("pinned"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
         #[allow(clippy::cast_precision_loss)]
         let age_days = (now_us - c.updated_at_us) as f64 / US_PER_DAY;
-        if c.tier == Tier::Episodic && age_days > stale_days && c.access_count == 0 {
+        if c.tier == Tier::Episodic && age_days > stale_days && c.access_count == 0 && !never_decays
+        {
             out.push(LintFinding {
                 kind: "stale".into(),
                 severity: "info".into(),
@@ -403,7 +414,6 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
         //      when it classifies an observation as a rule.
         //   2. Page path starts with `_rules/` — same routing
         //      target. Either signal suffices.
-        let frontmatter: Option<serde_json::Value> = serde_json::from_str(&c.frontmatter_json).ok();
         let kind_is_rule = frontmatter
             .as_ref()
             .and_then(|fm| fm.get("kind"))
@@ -435,8 +445,11 @@ fn rule_based_findings(candidates: &[DecayCandidate], stale_days: f64) -> Vec<Li
             && let Some(t) = fm.get("title").and_then(serde_json::Value::as_str)
             && !t.trim().is_empty()
         {
+            // Case-insensitive with whitespace collapsed: the key the
+            // consolidator's `title_collision_key` and the curator group by.
+            let key = t.split_whitespace().collect::<Vec<_>>().join(" ");
             titles
-                .entry(t.to_lowercase())
+                .entry(key.to_lowercase())
                 .or_default()
                 .push(c.path.as_str().to_string());
         }
@@ -900,6 +913,37 @@ mod tests {
         }
     }
 
+    /// The stale rule measures decay, and a pinned page or an A2 compacted
+    /// residue never decays: the sweep and the curator's `cold_episodic`
+    /// both skip them, so lint must not report them stale on every pass.
+    #[test]
+    fn pinned_and_compacted_pages_are_not_stale() {
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        let sixty_days_ago = now_us - (60.0 * US_PER_DAY) as i64;
+        let candidate =
+            |path: &str, pinned: bool, frontmatter: &str, compacted: bool| DecayCandidate {
+                id: ai_memory_core::PageId::new(),
+                path: ai_memory_core::PagePath::new(path).unwrap(),
+                tier: Tier::Episodic,
+                pinned,
+                updated_at_us: sixty_days_ago,
+                access_count: 0,
+                last_accessed_at_us: None,
+                frontmatter_json: frontmatter.into(),
+                expires_at_us: None,
+                salience: None,
+                compacted_at_us: compacted.then_some(sixty_days_ago),
+            };
+        let candidates = [
+            candidate("sessions/pinned.md", true, "{}", false),
+            candidate("sessions/fm-pinned.md", false, r#"{"pinned": true}"#, false),
+            candidate("sessions/compacted.md", false, "{}", true),
+        ];
+        let findings = rule_based_findings(&candidates, STALE_DAYS);
+        let stale: Vec<_> = findings.iter().filter(|f| f.kind == "stale").collect();
+        assert!(stale.is_empty(), "{stale:?}");
+    }
+
     /// End-to-end through the rule: a 60-day unread episodic page is stale
     /// at the default lambda but NOT at the slower one the reporter runs.
     #[test]
@@ -991,6 +1035,35 @@ mod tests {
         let findings = rule_based_findings(&[a, b], STALE_DAYS);
         let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
         assert_eq!(dupes.len(), 1);
+        assert_eq!(dupes[0].pages.len(), 2);
+    }
+
+    /// The consolidator's collision guard (`title_collision_key`) and the
+    /// curator group titles case-insensitively with whitespace collapsed, and
+    /// the guard relies on lint flagging exactly what it calls a collision.
+    #[test]
+    fn rule_pass_groups_duplicate_titles_across_whitespace() {
+        let a = DecayCandidate {
+            id: ai_memory_core::PageId::new(),
+            path: ai_memory_core::PagePath::new("concepts/a.md").unwrap(),
+            tier: Tier::Semantic,
+            pinned: false,
+            updated_at_us: Timestamp::now().as_microsecond(),
+            access_count: 0,
+            last_accessed_at_us: None,
+            frontmatter_json: r#"{"title": "Release  Notes"}"#.into(),
+            expires_at_us: None,
+            salience: None,
+            compacted_at_us: None,
+        };
+        let b = DecayCandidate {
+            path: ai_memory_core::PagePath::new("concepts/b.md").unwrap(),
+            frontmatter_json: r#"{"title": " release notes "}"#.into(),
+            ..a.clone()
+        };
+        let findings = rule_based_findings(&[a, b], STALE_DAYS);
+        let dupes: Vec<_> = findings.iter().filter(|f| f.kind == "duplicate").collect();
+        assert_eq!(dupes.len(), 1, "{findings:?}");
         assert_eq!(dupes[0].pages.len(), 2);
     }
 

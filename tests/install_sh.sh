@@ -207,4 +207,141 @@ if ls -d "${TMP_ROOT}/broken/home/.local/lib/ai-memory.new."* >/dev/null 2>&1; t
   fail "a refused release left its staged copy behind"
 fi
 
+# A reinstall moves the lib dir aside and deletes it, so an AI_MEMORY_LIB_DIR
+# naming the directory that holds the link is refused before anything changes:
+# the link a first install left there passed for a release, every other program
+# in that directory was deleted, and ai-memory became a link to itself.
+plain_tree "${TMP_ROOT}/lib-is-bin-tree"
+base="$(publish lib-is-bin "${TMP_ROOT}/lib-is-bin-tree")"
+run_install lib-is-bin "file://${base}" || fail "first install refused: $(cat "${TMP_ROOT}/lib-is-bin/out.log")"
+bin="${TMP_ROOT}/lib-is-bin/home/.local/bin"
+printf '#!/bin/sh\necho mine\n' >"${bin}/my-tool"
+chmod 0755 "${bin}/my-tool"
+ln -s .local/bin "${TMP_ROOT}/lib-is-bin/home/bin"
+for lib in "${bin}" "${bin}/" "${TMP_ROOT}/lib-is-bin/home/bin" "${TMP_ROOT}/lib-is-bin/home/.local"; do
+  if run_install lib-is-bin "file://${base}" AI_MEMORY_LIB_DIR="${lib}"; then
+    fail "AI_MEMORY_LIB_DIR=${lib} replaced the directory holding the link"
+  fi
+  grep -Fq "is or contains the link's directory" "${TMP_ROOT}/lib-is-bin/out.log" \
+    || fail "refusal of AI_MEMORY_LIB_DIR=${lib} not explained: $(cat "${TMP_ROOT}/lib-is-bin/out.log")"
+  [ "$("${bin}/my-tool")" = mine ] || fail "AI_MEMORY_LIB_DIR=${lib} deleted the user's program"
+  [ "$("${bin}/ai-memory" --version)" = "ai-memory 0.0.0-test" ] \
+    || fail "AI_MEMORY_LIB_DIR=${lib} broke the existing install"
+done
+
+# One directory for both, before either exists, ended with the same link to
+# itself after a reported success.
+fresh="${TMP_ROOT}/lib-is-bin-fresh/tools"
+if run_install lib-is-bin-fresh "file://${base}" AI_MEMORY_BIN_DIR="${fresh}" AI_MEMORY_LIB_DIR="${fresh}"; then
+  fail "a first install with one directory for the link and the release succeeded"
+fi
+grep -Fq "is or contains the link's directory" "${TMP_ROOT}/lib-is-bin-fresh/out.log" \
+  || fail "one-directory refusal not explained: $(cat "${TMP_ROOT}/lib-is-bin-fresh/out.log")"
+[ ! -e "${fresh}" ] || fail "a refused first install created ${fresh}"
+
+# A lib dir is replaced only when it holds a release: the binary itself beside
+# a hooks bundle. A package manager's bin dir (its ai-memory a link into the
+# cellar), a directory whose ai-memory links to a hand-built one, and a
+# wrapper's own directory (no hooks bundle) all stay as they were.
+plain_tree "${TMP_ROOT}/not-a-release-tree"
+base="$(publish not-a-release "${TMP_ROOT}/not-a-release-tree")"
+home="${TMP_ROOT}/not-a-release/home"
+mkdir -p "${home}/brew/Cellar" "${home}/brew/bin" "${home}/src/target" "${home}/apps/ai-memory/hooks" \
+  "${home}/wrapper"
+printf '#!/bin/sh\necho brewed\n' >"${home}/brew/Cellar/ai-memory"
+printf '#!/bin/sh\necho hand-built\n' >"${home}/src/target/ai-memory"
+printf '#!/bin/sh\necho wrapper\n' >"${home}/wrapper/ai-memory"
+chmod 0755 "${home}/brew/Cellar/ai-memory" "${home}/src/target/ai-memory" "${home}/wrapper/ai-memory"
+ln -s ../Cellar/ai-memory "${home}/brew/bin/ai-memory"
+printf '#!/bin/sh\necho jq\n' >"${home}/brew/bin/jq"
+ln -s ../../src/target/ai-memory "${home}/apps/ai-memory/ai-memory"
+printf 'my hook\n' >"${home}/apps/ai-memory/hooks/mine.sh"
+printf 'notes\n' >"${home}/wrapper/notes.txt"
+for lib in "${home}/brew/bin" "${home}/apps/ai-memory" "${home}/wrapper"; do
+  if run_install not-a-release "file://${base}" AI_MEMORY_LIB_DIR="${lib}"; then
+    fail "AI_MEMORY_LIB_DIR=${lib} holds no release and was replaced"
+  fi
+  grep -Fq "holds no ai-memory release" "${TMP_ROOT}/not-a-release/out.log" \
+    || fail "refusal of ${lib} not explained: $(cat "${TMP_ROOT}/not-a-release/out.log")"
+done
+[ -f "${home}/brew/bin/jq" ] || fail "the package manager's bin dir lost a program"
+[ "$("${home}/brew/bin/ai-memory")" = brewed ] || fail "the package manager's link was replaced"
+[ "$("${home}/apps/ai-memory/ai-memory")" = hand-built ] || fail "the link to a hand-built binary was replaced"
+[ -f "${home}/apps/ai-memory/hooks/mine.sh" ] || fail "the linked binary's directory lost a file"
+[ "$("${home}/wrapper/ai-memory")" = wrapper ] || fail "the user's wrapper was replaced"
+[ -f "${home}/wrapper/notes.txt" ] || fail "the wrapper's directory lost a file"
+[ ! -e "${home}/.local/bin/ai-memory" ] && [ ! -L "${home}/.local/bin/ai-memory" ] \
+  || fail "a refused install created the link"
+
+# The reinstall deletes the whole lib dir, so one holding anything the release
+# does not ship (a release unpacked by hand, with the user's notes or a hidden
+# settings file in it) is refused once the release is unpacked, and keeps every
+# file.
+plain_tree "${TMP_ROOT}/foreign-tree"
+base="$(publish foreign "${TMP_ROOT}/foreign-tree")"
+for foreign in NOTES.txt .my-settings ..old-notes; do
+  lib="${TMP_ROOT}/foreign/home/apps/case${foreign}"
+  mkdir -p "${lib}"
+  tar -C "${lib}" -xzf "${TMP_ROOT}/foreign/release/latest/download/${ASSET}"
+  printf 'mine\n' >"${lib}/${foreign}"
+  if run_install foreign "file://${base}" AI_MEMORY_LIB_DIR="${lib}"; then
+    fail "a lib dir holding ${foreign}, which the release does not ship, was replaced"
+  fi
+  grep -Fq "holds ${foreign}, which the release does not ship" "${TMP_ROOT}/foreign/out.log" \
+    || fail "refusal for ${foreign} not explained: $(cat "${TMP_ROOT}/foreign/out.log")"
+  [ "$(cat "${lib}/${foreign}")" = mine ] || fail "the user's ${foreign} was deleted"
+  [ -x "${lib}/ai-memory" ] || fail "the refused lib dir lost its binary"
+  if ls -d "${lib}.new."* "${lib}.old."* >/dev/null 2>&1; then
+    fail "a refused reinstall left a staged copy beside ${lib}"
+  fi
+done
+
+# Control: a rerun over its own release still replaces it in place, the newer
+# binary behind the same link, also when an interrupted `ai-memory upgrade`
+# left its swap files in the lib dir.
+plain_tree "${TMP_ROOT}/rerun-tree"
+base="$(publish rerun "${TMP_ROOT}/rerun-tree")"
+run_install rerun "file://${base}" || fail "first install refused: $(cat "${TMP_ROOT}/rerun/out.log")"
+lib="${TMP_ROOT}/rerun/home/.local/lib/ai-memory"
+cp "${lib}/ai-memory" "${lib}/ai-memory.new"
+mkdir -p "${lib}/.hooks.new" "${lib}/.hooks.old"
+printf '#!/bin/sh\necho "ai-memory 0.0.1-test"\n' >"${TMP_ROOT}/rerun-tree/ai-memory"
+base="$(publish rerun "${TMP_ROOT}/rerun-tree")"
+run_install rerun "file://${base}" || fail "rerun over its own release refused: $(cat "${TMP_ROOT}/rerun/out.log")"
+[ "$("${TMP_ROOT}/rerun/home/.local/bin/ai-memory" --version)" = "ai-memory 0.0.1-test" ] \
+  || fail "the rerun did not replace the release behind the link"
+[ ! -e "${lib}/ai-memory.new" ] && [ ! -e "${lib}/.hooks.old" ] \
+  || fail "the rerun kept the interrupted upgrade's swap files"
+
+# The link is replaced only when it points at this install's binary. A link to
+# a hand-built binary (docs/macos.md suggests one at this very path for a
+# source build) stays as it was, and nothing is unpacked.
+plain_tree "${TMP_ROOT}/link-tree"
+base="$(publish foreign-link "${TMP_ROOT}/link-tree")"
+home="${TMP_ROOT}/foreign-link/home"
+mkdir -p "${home}/src/target/release" "${home}/.local/bin"
+printf '#!/bin/sh\necho hand-built\n' >"${home}/src/target/release/ai-memory"
+chmod 0755 "${home}/src/target/release/ai-memory"
+ln -s "${home}/src/target/release/ai-memory" "${home}/.local/bin/ai-memory"
+if run_install foreign-link "file://${base}"; then
+  fail "a link to a hand-built binary was replaced"
+fi
+grep -Fq "links to ${home}/src/target/release/ai-memory" "${TMP_ROOT}/foreign-link/out.log" \
+  || fail "foreign link refusal not explained: $(cat "${TMP_ROOT}/foreign-link/out.log")"
+[ "$("${home}/.local/bin/ai-memory")" = hand-built ] || fail "the link no longer runs the hand-built binary"
+[ ! -e "${home}/.local/lib/ai-memory" ] || fail "a refused install unpacked the release"
+
+# Controls: this install's own link is still replaced when a removed lib dir
+# left it dangling, and when it was rewritten as a relative link to the binary.
+run_install own-link "file://${base}" || fail "first install refused: $(cat "${TMP_ROOT}/own-link/out.log")"
+home="${TMP_ROOT}/own-link/home"
+rm -rf "${home}/.local/lib/ai-memory"
+run_install own-link "file://${base}" \
+  || fail "a rerun over its own dangling link was refused: $(cat "${TMP_ROOT}/own-link/out.log")"
+ln -sf ../lib/ai-memory/ai-memory "${home}/.local/bin/ai-memory"
+run_install own-link "file://${base}" \
+  || fail "a rerun over a relative link to its binary was refused: $(cat "${TMP_ROOT}/own-link/out.log")"
+[ "$("${home}/.local/bin/ai-memory" --version)" = "ai-memory 0.0.0-test" ] \
+  || fail "the rerun left an unusable link"
+
 printf 'install.sh checks passed\n'

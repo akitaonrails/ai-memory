@@ -318,6 +318,9 @@ pub(crate) fn localized_refusal_response(
     refusal: &ai_memory_store::ScopeResolutionError,
 ) -> Response {
     if refusal.is_forbidden() {
+        // Unmarked (no PasswordChangeRequired): the HTML auth redirect shows
+        // this project refusal as-is instead of sending the user to the
+        // change-password form.
         (
             StatusCode::FORBIDDEN,
             if i18n.tag() == "en" {
@@ -349,4 +352,51 @@ pub(crate) fn not_found_response(i18n: &ai_memory_core::i18n::Localizer) -> Resp
         .render()
         .unwrap_or_else(|_| "<h1>Not found</h1>".to_owned());
     (StatusCode::NOT_FOUND, Html(html)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    use crate::html_auth::{HtmlAuthRedirectConfig, html_auth_redirect_mw};
+
+    /// A project the viewer may not read is a refusal to show, not a
+    /// password gate: behind the browser redirect layer it must stay a 403
+    /// rather than send the viewer to the change-password form.
+    #[tokio::test]
+    async fn project_refusal_is_not_redirected_to_change_password() {
+        let cfg = Arc::new(HtmlAuthRedirectConfig::from_mount("", "/web"));
+        let router = Router::new()
+            .route(
+                "/w/default/private",
+                get(|| async {
+                    super::refusal_response(&ai_memory_store::ScopeResolutionError::Forbidden(
+                        "not authorized for project private".into(),
+                    ))
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                cfg,
+                html_auth_redirect_mw,
+            ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/w/default/private")
+                    .header(header::ACCEPT, "text/html")
+                    .header("sec-fetch-dest", "document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+    }
 }
