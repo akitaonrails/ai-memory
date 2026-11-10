@@ -777,6 +777,7 @@ diag-root-must-be-absolute-or-start-with = root `{ $raw }` must be absolute or s
 diag-cannot-remove-token = cannot remove token
 diag-cannot-write = cannot write { $value0 }
 diag-could-not-locate-for-global-skill-install = could not locate $HOME for global skill install
+diag-could-not-locate-the-hermes-home-for-global-skill-install = could not locate the Hermes home for global skill install
 diag-fetching-the-local-embedding-model = fetching the local embedding model (set up offline per docs/local-embeddings.md if this host has no network)
 diag-connecting-to = connecting to { $url }
 diag-restore-swap-failed-moved-back = restore swap failed; the previous data was moved back into place
