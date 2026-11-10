@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.5] - 2026-11-10
+
 ### Security
 
 - On a server with authentication on, a browser app on an origin allowed with
@@ -4872,7 +4874,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.4...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.5...HEAD
+[3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
 [3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
 [3.4.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.3
 [3.4.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.2
