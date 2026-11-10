@@ -22,7 +22,7 @@ version in [`docs/changelog/`](docs/changelog/):
   schemas. A call that names no `workspace`, `project`, `project_id` or
   `global` gets the current directory's project filled in, by the same rule as
   the session-less `mcp-bridge` (#1979). It exits non-zero on a tool error or
-  a JSON-RPC error, and 2 on arguments that are not one JSON object (#TBD).
+  a JSON-RPC error, and 2 on arguments that are not one JSON object (#2182).
 - `ai-memory run --workstream NAME --or-new` selects the named workstream when
   it exists and creates it, as `--new NAME` would, when the server reports it
   does not — instead of failing with a 404 or a 409. The run line names the
