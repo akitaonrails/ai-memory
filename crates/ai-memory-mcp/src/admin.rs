@@ -7996,6 +7996,47 @@ fn move_session_page_label(
 /// Guards, then the dry run or the real move of one planned session. The
 /// caller wraps the call in the pre/post checkpoints so a batch takes one
 /// pair, not one per session.
+/// Live-session guards. An open session may still receive events, and a
+/// queued consolidation would write the page under the old scope; both
+/// are the operator's call with `force`. A re-home leaves the row where
+/// it is, so an open session is no reason to refuse gathering its strays.
+async fn refuse_live_session_move(
+    state: &Arc<AdminState>,
+    req: &MoveSessionRequest,
+    sid: SessionId,
+    rehome: bool,
+) -> Result<(), MoveErr> {
+    if req.force {
+        return Ok(());
+    }
+    let (open, pending_job) = session_move_blockers(&state.reader, sid)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    if open && !rehome {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "session {sid} is still open (no session end recorded); \
+                     finish it or force the move (--force / force: true)"
+                )
+            })),
+        ));
+    }
+    if pending_job {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "session {sid} has a pending or running consolidation job; \
+                     wait for it or force the move (--force / force: true)"
+                )
+            })),
+        ));
+    }
+    Ok(())
+}
+
 async fn move_planned_session(
     state: &Arc<AdminState>,
     req: &MoveSessionRequest,
@@ -8004,39 +8045,7 @@ async fn move_planned_session(
     actor: &ai_memory_core::ActorContext,
 ) -> Result<MoveSessionReport, MoveErr> {
     let sid = plan.session_id;
-    let rehome = plan.is_rehome();
-
-    // Live-session guards. An open session may still receive events, and a
-    // queued consolidation would write the page under the old scope; both
-    // are the operator's call with `force`. A re-home leaves the row where
-    // it is, so an open session is no reason to refuse gathering its strays.
-    let (open, pending_job) = session_move_blockers(&state.reader, sid)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-    if !req.force {
-        if open && !rehome {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "session {sid} is still open (no session end recorded); \
-                         finish it or force the move (--force / force: true)"
-                    )
-                })),
-            ));
-        }
-        if pending_job {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "session {sid} has a pending or running consolidation job; \
-                         wait for it or force the move (--force / force: true)"
-                    )
-                })),
-            ));
-        }
-    }
+    refuse_live_session_move(state, req, sid, plan.is_rehome()).await?;
 
     state
         .wiki
@@ -8220,6 +8229,10 @@ async fn move_single_session(
         plan.to_label.project
     );
     let warning = plan.to.manifest_warning();
+    // Refuse a live session before the pre-move checkpoint is written.
+    refuse_live_session_move(state, req, session_id, plan.is_rehome())
+        .await
+        .map_err(|error| with_manifest_warning(error, warning.as_ref()))?;
     let pre_checkpoint = checkpoint_or_500(&state.wiki, format!("pre-{label}"))
         .map_err(|error| with_manifest_warning(error, warning.as_ref()))?;
     let mut report = move_planned_session(state, req, plan, author_id, &actor)

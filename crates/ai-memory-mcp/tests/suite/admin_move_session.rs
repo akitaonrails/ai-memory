@@ -598,6 +598,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
             .await
             .unwrap()
     );
+    let commits = state.wiki.git().commit_count();
 
     let resp = post(
         &state,
@@ -606,6 +607,11 @@ async fn move_session_pending_job_or_open_session_needs_force() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused move must not write its pre-move checkpoint"
+    );
     let body = body_json(resp).await;
     assert!(
         body["error"]
