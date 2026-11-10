@@ -86,6 +86,12 @@ version in [`docs/changelog/`](docs/changelog/):
   folder became `bin C:\Users\<you>` and no hook ran. cmd.exe agents and
   Antigravity are unchanged, and existing entries are still recognized and
   replaced on re-apply. (#2176)
+- `restore --with-config` (and a restore into a data dir with no
+  `config.toml`) now checks that the backup's config, with the environment
+  applied, supplies the `[auth].token_pepper` its API keys were hashed with,
+  before anything live is replaced. It used to skip that check, report success,
+  and leave a server that refused to start; the refusal now points at the
+  original pepper instead of `--with-config`. (#2172)
 
 ### Security
 
