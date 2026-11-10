@@ -3613,6 +3613,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `workstreams [--workspace NAME] [--project NAME] [--limit N] [--json]` | host wrapper or native binary | List recent workstreams selectable from the current checkout, including current selection and linked harnesses, without exposing paths or native session ids |
 | `rename-workstream (--from NAME \| --workstream-id ID) --to NAME [--workspace NAME] [--project NAME] [--json]` | host wrapper or native binary | Retitle one workstream selectable from the current checkout; metadata only, so the stable id, the ledger, the listing order, and the current selection are unaffected |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
+| `call [tool] [json-arguments]` | thin HTTP client or native binary | Call any MCP tool of the configured server from a shell (`call memory_query '{"query":"wal mode"}'`), or list the tools and their input schemas when no tool is named |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |

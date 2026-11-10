@@ -218,6 +218,10 @@ pub enum Command {
     /// Accepts either `--path` (exact path) or a positional query that
     /// searches FTS5 and fetches the top matching page.
     ReadPage(ReadPageArgs),
+    /// Call one MCP tool of the configured server from the shell, or list the
+    /// tools and their input schemas when no tool is named. For agents that
+    /// cannot load MCP.
+    Call(CallArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
     /// Delete a single wiki page. The server routes scope resolution
@@ -2389,6 +2393,27 @@ pub struct ReadPageArgs {
     /// Emit the page as JSON (includes frontmatter).
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `call`.
+#[derive(Debug, Args)]
+pub struct CallArgs {
+    /// MCP tool name (e.g. `memory_query`). Omit to list the server's tools
+    /// with their input schemas.
+    pub tool: Option<String>,
+    /// The tool's arguments as one JSON object (e.g. '{"query":"wal mode"}').
+    /// A call that names no `workspace`, `project`, `project_id` or `global`
+    /// gets the current project's scope when the tool accepts one.
+    #[arg(value_parser = parse_json_object)]
+    pub arguments: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+fn parse_json_object(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match serde_json::from_str(raw) {
+        Ok(serde_json::Value::Object(object)) => Ok(object),
+        Ok(_) => Err("expected a JSON object".to_owned()),
+        Err(error) => Err(format!("invalid JSON: {error}")),
+    }
 }
 
 /// Arguments for `delete-page`.

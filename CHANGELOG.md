@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `ai-memory call <tool> [json-arguments]` is a shell path to every MCP
+  tool for agents that cannot or should not load MCP (`memory_query`,
+  `memory_briefing`, `memory_patch_page`, `memory_handoff_begin`, and the rest).
+  It posts the call to the configured server's `/mcp` endpoint the way the
+  other thin-client commands reach the server and prints the tool's text
+  result. With no tool name it lists the server's tools and their input
+  schemas. A call that names no `workspace`, `project`, `project_id` or
+  `global` gets the current directory's project filled in, by the same rule as
+  the session-less `mcp-bridge` (#1979). It exits non-zero on a tool error or
+  a JSON-RPC error, and 2 on arguments that are not one JSON object (#2182).
 - Added first-party Tencent WorkBuddy support. `workbuddy` (alias
   `work-buddy`) is an `AgentKind` (migration V103), so hook events are
   attributed to it and a Claude Code-shaped tool payload (`tool_name`,
