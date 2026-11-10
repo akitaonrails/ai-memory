@@ -459,3 +459,31 @@ async fn a_personal_slot_restores_to_its_exact_path_and_only_for_root() {
         "a restore must never land on the shared slot"
     );
 }
+
+/// The agent-facing `memory_delete_page` tool acknowledges an already-absent
+/// path with `deleted: true` — the idempotent "the page is gone" contract the
+/// TS SDK's `DeletePageResult` documents and relies on. #2181 made the shared
+/// `Wiki::delete_page` honest so `ai-memory profile forget` can tell a real
+/// deletion from a no-op, but that honesty lives on `/admin/delete-page`, not
+/// here: a regression to `false` on this tool breaks the SDK and was what broke
+/// `main` CI (#2190). The scope ("scratch") exists; only the page is absent.
+#[tokio::test]
+async fn memory_delete_page_acks_an_absent_page() {
+    let h = harness().await;
+    let acked = call(
+        &h.http,
+        ROOT_TOKEN,
+        "memory_delete_page",
+        scoped(
+            "scratch",
+            json!({ "path": "profile/workflow/never-there.md" }),
+        ),
+    )
+    .await
+    .expect("deleting an absent page in a resolved scope succeeds");
+    assert_eq!(
+        acked["deleted"],
+        json!(true),
+        "memory_delete_page must ack deleted:true for an already-absent page"
+    );
+}
