@@ -76,6 +76,9 @@ const SPOOL_CAPACITY_LOCK_FILE: &str = ".capacity.lock";
 /// (the cap is a soft bound), never discarded.
 const SPOOL_CAPACITY_LOCK_WAIT: Duration = Duration::from_millis(50);
 const MAX_SPOOL_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+// A new entry starts with a one-digit attempt count. Leave room for the
+// longest u32 count so retry bookkeeping never makes it unreadable.
+const MAX_NEW_SPOOL_ENTRY_BYTES: u64 = MAX_SPOOL_ENTRY_BYTES - u32::MAX.ilog10() as u64;
 /// A live enqueuer may still own its `*.json.tmp`; only recover one after a
 /// much longer interval than the hook's normal write and fsync latency.
 const STRANDED_TEMP_GRACE_MS: u64 = 5 * 60 * 1000;
@@ -274,7 +277,8 @@ fn now_ms() -> u64 {
 /// same millisecond without clobbering an earlier event.
 ///
 /// # Errors
-/// Returns an error only when the spool file cannot be written.
+/// Returns an error when the entry exceeds the reader's size limit or the
+/// spool file cannot be written.
 #[cfg(test)]
 pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
     enqueue_with_config(spool, entry, None)
@@ -285,6 +289,16 @@ pub fn enqueue_with_config(
     entry: &SpoolEntry,
     config: Option<&crate::config::Config>,
 ) -> std::io::Result<()> {
+    let bytes = encode_spool_entry(entry, MAX_NEW_SPOOL_ENTRY_BYTES).inspect_err(|error| {
+        if is_oversized_spool_entry(error) {
+            eprintln!(
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook warning: event was not queued because its spool entry exceeds {MAX_NEW_SPOOL_ENTRY_BYTES} bytes"
+                ))
+            );
+        }
+    })?;
     create_spool_dir(spool)?;
     let seq = ENQUEUE_SEQ.fetch_add(1, Ordering::Relaxed);
     let recovery_key = recovery_coordinate_key_for_entry(entry, config)?;
@@ -295,7 +309,6 @@ pub fn enqueue_with_config(
     );
     let tmp = spool.join(format!("{name}.tmp"));
     let final_path = spool.join(&name);
-    let bytes = serde_json::to_vec(entry)?;
     write_private(&tmp, &bytes)?;
     // The capacity lock only serializes concurrent count-then-rename checks
     // so a burst cannot overshoot the cap. If another enqueuer holds it past
@@ -2241,25 +2254,88 @@ fn completed_tombstone_for_path(path: &Path) -> bool {
     matches == 1
 }
 
+#[derive(Debug)]
+struct OversizedSpoolEntry;
+
+impl std::fmt::Display for OversizedSpoolEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("spool entry exceeds its byte limit")
+    }
+}
+
+impl std::error::Error for OversizedSpoolEntry {}
+
+fn oversized_spool_entry_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, OversizedSpoolEntry)
+}
+
+fn is_oversized_spool_entry(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<OversizedSpoolEntry>())
+}
+
+fn encode_spool_entry(entry: &SpoolEntry, limit: u64) -> std::io::Result<Vec<u8>> {
+    // The body is serialized as a JSON string. Check the actual encoded size
+    // as well, because escaping and envelope fields can put it over the cap.
+    if entry.body.len() as u64 > limit {
+        return Err(oversized_spool_entry_error());
+    }
+    let bytes = serde_json::to_vec(entry)?;
+    if bytes.len() as u64 > limit {
+        return Err(oversized_spool_entry_error());
+    }
+    Ok(bytes)
+}
+
 fn read_spool_entry_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let file = File::open(path)?;
     if file.metadata()?.len() > MAX_SPOOL_ENTRY_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "spool entry exceeds its byte limit",
-        ));
+        return Err(oversized_spool_entry_error());
     }
     let mut bytes = Vec::new();
     file.take(MAX_SPOOL_ENTRY_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_SPOOL_ENTRY_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "spool entry exceeds its byte limit",
-        ));
+        return Err(oversized_spool_entry_error());
     }
     Ok(bytes)
+}
+
+/// An oversized entry cannot be decoded to read `created_ms`. Use the
+/// timestamp only on regular files with a complete queue name from a native
+/// or legacy writer. Health reporting accepts looser names and must not decide
+/// whether a file can be removed.
+fn expired_oversized_queue_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(created_ms) = created_ms_from_name(name) else {
+        return false;
+    };
+    if now_ms().saturating_sub(created_ms) <= MAX_AGE_MS {
+        return false;
+    }
+    let mut fields = name
+        .strip_suffix(".json")
+        .unwrap_or_default()
+        .splitn(4, '-')
+        .skip(1);
+    let pid = fields.next().unwrap_or_default();
+    let sequence = fields.next().unwrap_or_default();
+    let valid_hex = |value: &str, len| {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    pid.parse::<u32>()
+        .is_ok_and(|number| number != 0 && number.to_string() == pid)
+        && valid_hex(sequence, 16)
+        && fields.next().is_none_or(|key| valid_hex(key, 64))
+        && std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > MAX_SPOOL_ENTRY_BYTES)
 }
 
 fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> {
@@ -2267,9 +2343,19 @@ fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> 
         let _ = std::fs::remove_file(path);
         return None;
     }
-    let Ok(bytes) = read_spool_entry_bytes(path) else {
-        result.remaining += 1;
-        return None;
+    let bytes = match read_spool_entry_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if is_oversized_spool_entry(&error)
+                && expired_oversized_queue_file(path)
+                && std::fs::remove_file(path).is_ok()
+            {
+                result.dropped += 1;
+            } else {
+                result.remaining += 1;
+            }
+            return None;
+        }
     };
     let Ok(mut entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
         // Unparseable spool file: drop it so it can't wedge the queue.
@@ -2506,7 +2592,7 @@ fn rewrite_entry(path: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    let bytes = serde_json::to_vec(entry)?;
+    let bytes = encode_spool_entry(entry, MAX_SPOOL_ENTRY_BYTES)?;
     write_private(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)
 }
@@ -3388,6 +3474,160 @@ mod tests {
         file.set_len(MAX_SPOOL_ENTRY_BYTES + 1).unwrap();
         let error = read_spool_entry_bytes(&path).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn oversized_spool_enqueue_refuses_serialized_entry_before_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(temp.path());
+        let body = serde_json::json!({
+            "tool_response": "x".repeat(MAX_SPOOL_ENTRY_BYTES as usize - 64),
+        })
+        .to_string();
+        assert!((body.len() as u64) < MAX_SPOOL_ENTRY_BYTES);
+        let entry = entry_for(
+            "http://127.0.0.1:49374/hook?event=post-tool-use&agent=claude-code".into(),
+            body,
+            None,
+            false,
+        );
+        assert!((serde_json::to_vec(&entry).unwrap().len() as u64) > MAX_SPOOL_ENTRY_BYTES);
+        let error = enqueue(&spool, &entry).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!spool.exists(), "oversized enqueue must not stage a file");
+    }
+
+    #[test]
+    fn oversized_spool_enqueue_reserves_retry_counter_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(temp.path());
+        let mut entry = entry_for(
+            "http://127.0.0.1:49374/hook".into(),
+            "{}".into(),
+            None,
+            false,
+        );
+        let overhead = serde_json::to_vec(&entry).unwrap().len();
+        entry
+            .body
+            .push_str(&" ".repeat(MAX_NEW_SPOOL_ENTRY_BYTES as usize - overhead));
+        enqueue(&spool, &entry).unwrap();
+        let (files, _) = list_entries(&spool).unwrap();
+        let path = &files[0];
+
+        entry.body.push(' ');
+        assert!(is_oversized_spool_entry(
+            &enqueue(&spool, &entry).unwrap_err()
+        ));
+        entry.body.pop();
+
+        entry.attempts = u32::MAX;
+        rewrite_entry(path, &entry).unwrap();
+        assert_eq!(
+            read_spool_entry_bytes(path).unwrap().len() as u64,
+            MAX_SPOOL_ENTRY_BYTES
+        );
+        assert_eq!(spool_len(&spool), 1);
+    }
+
+    #[test]
+    fn oversized_spool_retry_preserves_previous_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("event.json");
+        let mut entry = entry_for(
+            "http://127.0.0.1:49374/hook".into(),
+            "{}".into(),
+            None,
+            false,
+        );
+        entry.attempts = 9;
+        entry.created_ms = now_ms() - MAX_AGE_MS - 1;
+        let bytes = serde_json::to_vec(&entry).unwrap().len();
+        entry
+            .body
+            .push_str(&" ".repeat(MAX_SPOOL_ENTRY_BYTES as usize - bytes));
+        rewrite_entry(&path, &entry).unwrap();
+
+        entry.attempts = 10;
+        let error = rewrite_entry(&path, &entry).unwrap_err();
+        assert!(is_oversized_spool_entry(&error));
+        assert!(!note_retry_persist(Err(error)));
+        let stored: SpoolEntry =
+            serde_json::from_slice(&read_spool_entry_bytes(&path).unwrap()).unwrap();
+        assert_eq!(stored.attempts, 9);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+
+        let mut result = DrainResult::default();
+        assert!(load_live_entry(&path, &mut result).is_none());
+        assert_eq!(result.dropped, 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn oversized_spool_expiry_only_removes_expired_queue_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = now_ms();
+        let expired = now - MAX_AGE_MS - 1;
+        let cases = [
+            (format!("{expired:013}-42-0000000000000000.json"), true),
+            (
+                format!("{expired:013}-42-0000000000000000-{}.json", "a".repeat(64)),
+                true,
+            ),
+            (format!("{now:013}-42-0000000000000000.json"), false),
+            (format!("{expired:013}-foreign-report.json"), false),
+            (format!("{expired:013}-0-0000000000000000.json"), false),
+            (format!("{expired:013}-042-0000000000000000.json"), false),
+            (
+                format!("{expired:013}-4294967296-0000000000000000.json"),
+                false,
+            ),
+            (format!("{expired:013}-42-ABCDEF0000000000.json"), false),
+            (
+                format!("{expired:013}-42-0000000000000000-{}.json", "A".repeat(64)),
+                false,
+            ),
+            ("oversized.json".into(), false),
+        ];
+        for (name, should_drop) in cases {
+            let path = temp.path().join(name);
+            File::create(&path)
+                .unwrap()
+                .set_len(MAX_SPOOL_ENTRY_BYTES + 1)
+                .unwrap();
+            let mut result = DrainResult::default();
+            assert!(load_live_entry(&path, &mut result).is_none());
+            assert_eq!(
+                result.dropped,
+                usize::from(should_drop),
+                "{}",
+                path.display()
+            );
+            assert_eq!(result.remaining, usize::from(!should_drop));
+            assert_eq!(path.exists(), !should_drop);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_spool_expiry_leaves_non_regular_queue_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let expired = now_ms() - MAX_AGE_MS - 1;
+        let path = temp
+            .path()
+            .join(format!("{expired:013}-42-0000000000000000.json"));
+        let target = temp.path().join("elsewhere.json");
+        File::create(&target)
+            .unwrap()
+            .set_len(MAX_SPOOL_ENTRY_BYTES + 1)
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let mut result = DrainResult::default();
+        assert!(load_live_entry(&path, &mut result).is_none());
+        assert_eq!(result.dropped, 0);
+        assert_eq!(result.remaining, 1);
+        assert!(path.is_symlink());
+        assert!(target.is_file());
     }
 
     #[test]

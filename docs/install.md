@@ -1161,6 +1161,10 @@ On Unix, the helper uses a trusted `setsid` launcher when available and falls
 back to a separate process group otherwise; Windows uses detached/breakaway
 process flags. The spool is capped, so a permanently undrained backlog is
 eventually pruned rather than unbounded, but old undelivered events can be lost.
+Native hooks warn and skip an event when its serialized queue entry would
+exceed the 10 MiB read limit with space reserved for its retry counter. An
+existing oversized entry with a recognized queue filename expires after seven
+days based on the timestamp in its filename.
 
 Native hook drains drop an event after 8 failed passes by default, including
 passes when the server is unreachable. Set `max_attempts = 0` under

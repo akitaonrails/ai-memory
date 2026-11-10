@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Native hooks now warn and refuse queue entries that would exceed the spool's
+  10 MiB read limit as their retry counts grow. Existing oversized entries with
+  recognized queue names expire after seven days. (#2179)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends

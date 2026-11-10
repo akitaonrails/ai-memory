@@ -122,6 +122,7 @@ diag-ai-memory-hook-warning-handoff-fetch-failed = ai-memory hook warning: hando
 diag-ai-memory-hook-warning-not-authorized-for = ai-memory hook warning: not authorized for this project's memory ({ $value0 }); nothing was injected
 diag-ai-memory-hook-drain-breakaway-spawn-failed = ai-memory hook-drain: breakaway spawn failed with access denied; retrying without breakaway
 diag-ai-memory-hook-spool-at-capacity-dropping = ai-memory: hook-spool at capacity ({ $max_spool_files }); dropping one new UNDELIVERED event
+diag-ai-memory-hook-warning-spool-entry-too-large = ai-memory hook warning: event was not queued because its spool entry exceeds { $max_new_spool_entry_bytes } bytes
 diag-ai-memory-hook-drain-warning-could-not = ai-memory hook-drain warning: could not recover stranded temp entries in { $value0 }: { $error }
 diag-ai-memory-hook-drain-recovered-dropped-malformed = ai-memory hook-drain: recovered { $value0 }, dropped { $value1 } malformed, left { $value2 } unreadable temp entr{ $value3 }
 diag-ai-memory-hook-drain-warning-could-not-2 = ai-memory hook-drain warning: could not list the spool directory { $value0 }: { $e }; no events were attempted

@@ -111,6 +111,7 @@ diag-ai-memory-hook-warning-handoff-fetch-failed = aviso do hook do ai-memory: f
 diag-ai-memory-hook-warning-not-authorized-for = aviso do hook do ai-memory: sem autorização para a memória deste projeto ({ $value0 }); nada foi injetado
 diag-ai-memory-hook-drain-breakaway-spawn-failed = hook-drain do ai-memory: a criação do processo desvinculado falhou com acesso negado; tentando sem desvincular
 diag-ai-memory-hook-spool-at-capacity-dropping = ai-memory: a fila de hooks está na capacidade máxima ({ $max_spool_files }); descartando um novo evento NÃO ENTREGUE
+diag-ai-memory-hook-warning-spool-entry-too-large = aviso do hook do ai-memory: o evento não entrou na fila porque sua entrada excede { $max_new_spool_entry_bytes } bytes
 diag-ai-memory-hook-drain-warning-could-not = aviso do hook-drain do ai-memory: não foi possível recuperar entradas temporárias abandonadas em { $value0 }: { $error }
 diag-ai-memory-hook-drain-recovered-dropped-malformed = hook-drain do ai-memory: { $value0 } recuperado(s), { $value1 } malformado(s) descartado(s), { $value2 } { $value3 ->
         [y] entrada temporária ilegível mantida
