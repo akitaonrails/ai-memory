@@ -70,6 +70,7 @@ cli-merge-project-exactly-one-of-into-or-into-project-id-is-required = exactly o
 cli-merge-project-verb-page-versions-sessions-observations-handoffs-workstreams-page-conflicts = { $value0 } { $value1 } -> { $value2 }: { $value3 } page versions, { $value4 } sessions, { $value5 } observations, { $value6 } handoffs, { $value7 } workstreams, { $value8 } page conflicts.
 cli-merge-project-re-run-the-same-command-with-confirm-to-apply-this-merge = Re-run the same command with --confirm to apply this merge.
 cli-merge-project-warning-merge-committed-but-scope-manifest-refresh-failed-warning = warning: merge committed but scope manifest refresh failed: { $value0 }
+cli-merge-project-ai-memory-projects-merged-but-the-client-local-checkout-link-could-not-be-up = ai-memory: projects merged, but the client-local checkout link could not be updated ({ $value0 })
 cli-message-reading-message-body-from-stdin-e = reading message body from stdin: { $value0 }
 cli-message-sent-message-from-from-workspace-from-project-to = Sent message { $value0 } from { $value1 }/{ $value2 } to { $value3 }/{ $value4 }.
 cli-message-no-pending-mailbox-messages-for-workspace-project = No pending { $value0 } messages for { $value1 }/{ $value2 }.

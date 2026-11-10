@@ -3323,6 +3323,15 @@ fn parse_content_blocks(
                     agent.as_str()
                 ));
             }
+            // Claude `image` / `document` blocks (https://docs.anthropic.com/en/api/messages)
+            // and Codex `input_image` items (`ContentItem` in
+            // https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs).
+            "image" | "document" | "input_image" => {
+                losses.push(format!(
+                    "{} message attachments were intentionally excluded",
+                    agent.as_str()
+                ));
+            }
             _ => {}
         }
     }
@@ -7062,6 +7071,37 @@ mod tests {
             losses
                 .iter()
                 .all(|loss| loss.ends_with("image tool results were intentionally excluded"))
+        );
+    }
+
+    #[test]
+    fn message_attachments_are_recorded_as_losses() {
+        let claude = json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+            {"type":"text","text":"what is wrong here?"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}},
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"cHJpdmF0ZSBwZGY="}}
+        ]}});
+        let codex = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"compare with this"},
+            {"type":"input_image","image_url":"data:image/png;base64,cHJpdmF0ZSBpbWFnZQ=="}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&claude, "session", "claude", &mut events, &mut losses);
+        parse_codex(&codex, "session", "codex", &mut events, &mut losses);
+
+        let messages = events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["what is wrong here?", "compare with this"]);
+        assert_eq!(
+            losses,
+            [
+                "claude-code message attachments were intentionally excluded",
+                "claude-code message attachments were intentionally excluded",
+                "codex message attachments were intentionally excluded",
+            ]
         );
     }
 

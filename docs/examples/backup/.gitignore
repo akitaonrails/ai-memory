@@ -22,6 +22,16 @@ config/**/.secrets
 # Server pidfile.
 data/.serve.lock
 
+# Bearer tokens and hook Authorization material (plaintext, mode 0600). These
+# grant full access to the server; a mirror push would expose them. NEVER sync.
+data/auth-tokens/
+data/auth-token
+data/auth-header
+
+# Pre-delivery hook spool: transient, drained after delivery, and may hold
+# un-sanitized payload text. Not durable memory (that is wiki/ and raw/).
+data/hook-spool/
+
 # Derived SQLite index (rebuildable via `ai-memory reindex`).
 data/db/
 

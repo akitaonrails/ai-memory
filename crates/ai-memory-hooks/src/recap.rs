@@ -705,7 +705,9 @@ fn render_prompts(prompts: &[RecapItem], room: usize) -> String {
     kept.reverse();
     let omitted = lines.len() - kept.len();
     let mut out = String::new();
-    if omitted > 0 {
+    if omitted == 1 {
+        out.push_str("- _1 earlier prompt omitted to fit; see the full record below._\n");
+    } else if omitted > 1 {
         out.push_str(&format!(
             "- _{omitted} earlier prompts omitted to fit; see the full record below._\n"
         ));
@@ -1022,7 +1024,7 @@ mod tests {
         }];
         assert_eq!(
             render_prompts(&prompts, OMITTED_LINE_RESERVE + 5),
-            "- _1 earlier prompts omitted to fit; see the full record below._\n"
+            "- _1 earlier prompt omitted to fit; see the full record below._\n"
         );
     }
 

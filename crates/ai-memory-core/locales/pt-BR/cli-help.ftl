@@ -554,12 +554,12 @@ cli-help-root-profile-status-user-help = { "Operador cujo perfil privado examina
 cli-help-root-profile-list-about = { "Listar entradas do perfil" }
 cli-help-root-profile-list-workspace-help = { "Espaço de trabalho cujo perfil examinar quando `[profile] share = \"workspace\"`" }
 cli-help-root-profile-list-user-help = { "Operador cujo perfil privado examinar quando o perfil é por usuário (`share = \"user\"`)" }
-cli-help-root-profile-show-about = { "Exibir uma entrada (prefixo `profile/` opcional)" }
-cli-help-root-profile-show-path-help = { "Caminho da entrada, ex.: `tools/pnpm.md`" }
+cli-help-root-profile-show-about = { "Exibir uma entrada (prefixo `profile/` e sufixo `.md` opcionais)" }
+cli-help-root-profile-show-path-help = { "Caminho da entrada, ex.: `tools/pnpm` ou `tools/pnpm.md`" }
 cli-help-root-profile-show-workspace-help = { "Espaço de trabalho cujo perfil examinar quando `[profile] share = \"workspace\"`" }
 cli-help-root-profile-show-user-help = { "Operador cujo perfil privado examinar quando o perfil é por usuário (`share = \"user\"`)" }
-cli-help-root-profile-forget-about = { "Remover uma entrada (prefixo `profile/` opcional). O git mantém o histórico e o coletor deixa o assunto de fora até você declará-lo novamente" }
-cli-help-root-profile-forget-path-help = { "Caminho da entrada, ex.: `tools/pnpm.md`" }
+cli-help-root-profile-forget-about = { "Remover uma entrada (prefixo `profile/` e sufixo `.md` opcionais). O git mantém o histórico e o coletor deixa o assunto de fora até você declará-lo novamente" }
+cli-help-root-profile-forget-path-help = { "Caminho da entrada, ex.: `tools/pnpm` ou `tools/pnpm.md`" }
 cli-help-root-profile-forget-workspace-help = { "Espaço de trabalho cujo perfil examinar quando `[profile] share = \"workspace\"`" }
 cli-help-root-profile-forget-user-help = { "Operador cujo perfil privado examinar quando o perfil é por usuário (`share = \"user\"`)" }
 cli-help-root-profile-review-about = { "Exibir cada entrada com suas evidências, os hábitos que ainda não atingiram o critério e as entradas que o coletor preserva" }

@@ -542,6 +542,23 @@ operation. Names may be replaced independently with `--from-project-id` and
 `--into-project-id`; each id is resolved inside `--workspace`, so an id from
 another workspace returns 404 and reaches no mutation.
 
+After `--confirm` the command also updates this client's own records, as
+`repair-split` does: the checkout link filed under the source's name moves to
+the target (a link the target already has wins), and every saved project
+binding that named the source now names the target. Without that, a checkout
+bound to the source keeps sending the removed project id, and `ai-memory run`
+and `ai-memory workstreams` get 404 from it. The update is local to the
+machine that ran the merge, and a failure there is reported as a warning
+after the merge has been applied.
+
+`--workspace` defaults to the nearest `.ai-memory.toml` marker's workspace, so
+the command goes where that marker routes. In a checkout whose marker selects
+a server profile (`server = "<name>"`, see [marker-file.md](marker-file.md)),
+the dry run and `--confirm` both go to that profile's URL with its stored
+token, never to the install's server with the config bearer. A profile that
+does not resolve fails the command before anything is sent, and
+`AI_MEMORY_SERVER_URL` still picks the server for one command.
+
 The writer verifies both latest-page sets under the transaction. It refuses if
 the source has an open session or an unexpired active managed-run lease. A
 same-path collision produces a new version whose body is the target body, a
@@ -559,6 +576,14 @@ transaction. The wiki mutation lock snapshots the target tree before installing
 the merged files and restores it if the transaction refuses; after a commit it
 removes the now-empty source tree, refreshes scope manifests and checkpoints
 the result.
+
+A repository identity on the source (the git remote a checkout routes by, with
+its derived name keys) moves to the target when the target has none, so later
+captures and `ai-memory run` from that checkout resolve to the merged project
+instead of opening a new one. A target that already belongs to another
+repository keeps its own identity and the source's is dropped. A checkout of
+the source's repository then needs `project = "<target>"` in its
+`.ai-memory.toml` to keep landing in the merged project.
 
 ### `move-project`
 
@@ -769,6 +794,15 @@ scope), the `handoffs` it produced (`from_session_id`), its
   disk with no latest row is re-indexed as a new latest page by the next
   reconciliation pass.
 
+The file step follows the page rows the store sweeps. For a re-home, every
+other project holding a latest `sessions/<id>.md` row has its file relocated
+(`move`) or removed (`regenerate`), whichever project the request named as
+the source; a file in a project with no latest row is left alone there,
+except in the source project the request names, whose file is always handled
+so the watcher cannot re-index it. More than one source file for one `move`
+destination is refused like an existing destination file, before anything
+moves.
+
 The audit row (`op = move_session`) carries the operator when the request
 was attributed. What does NOT move: `sessions.cwd` (historical truth; the
 response carries `cwd_warning` when its basename is not the destination
@@ -787,8 +821,8 @@ open-session guard does not apply to a re-home, whose row does not move),
 then, under the
 wiki's exclusive mutation gate, fire `op=move_session` admission webhooks
 (source names in `ctx.workspace`/`ctx.project`, destination names in
-`ctx.destination_*`), move the file, and re-stamp SQLite. Disk goes first
-and SQL last, as in `move-project`: a store failure renames the file back,
+`ctx.destination_*`), move the file(s), and re-stamp SQLite. Disk goes first
+and SQL last, as in `move-project`: a store failure renames the files back,
 so the move is all-or-nothing unless the filesystem also refuses the
 rollback, in which case the error names the manual repair. A `--confirm`
 run takes a wiki checkpoint before and after; a batch takes one pair for

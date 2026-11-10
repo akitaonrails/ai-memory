@@ -642,7 +642,13 @@ def run_smoke(harness: Harness) -> None:
     spool_before_native = harness.hook_spool_json_count()
     receiver = uuid.uuid4()
     native_start = harness.native_hook("session-start", receiver)
-    require(MARKER in native_start.stdout, "capture-owner SessionStart did not receive handoff")
+    # Under external capture the baton is offered, not consumed (#2148): the
+    # SessionStart announces it by id with memory_handoff_accept and never
+    # delivers (and burns) the handoff body.
+    require(
+        "memory_handoff_accept" in native_start.stdout and MARKER not in native_start.stdout,
+        "capture-owner SessionStart must offer the handoff, not deliver its body",
+    )
     harness.native_hook("user-prompt-submit", receiver)
     harness.native_hook("session-end", receiver)
     after_native = harness.observation_count()
@@ -652,7 +658,7 @@ def run_smoke(harness: Harness) -> None:
         spool_after_native == spool_before_native,
         "capture-owner native hooks created spool JSON files",
     )
-    require(harness.handoff_state(main_session) == "accepted", "capture-owner hook did not preserve and accept the external handoff")
+    require(harness.handoff_state(main_session) == "open", "capture-owner hook must leave the external handoff open for an explicit accept")
 
     harness.enqueue(main_queue, canonical_file, "enqueue-identical-replay")
     harness.flush(main_queue, "flush-identical-replay")
