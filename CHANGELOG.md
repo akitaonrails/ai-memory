@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `restore --with-config` (and a restore into a data dir with no
+  `config.toml`) now checks that the backup's config, with the environment
+  applied, supplies the `[auth].token_pepper` its API keys were hashed with,
+  before anything live is replaced. It used to skip that check, report success,
+  and leave a server that refused to start; the refusal now points at the
+  original pepper instead of `--with-config`. (#2172)
+
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
