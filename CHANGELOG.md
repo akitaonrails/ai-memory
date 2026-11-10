@@ -14,7 +14,7 @@ version in [`docs/changelog/`](docs/changelog/):
 ### Fixed
 
 - Fixed conditional page reads returning a full response for a matching weak
-  ETag, a list of validators or the `If-None-Match: *` wildcard.
+  ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
