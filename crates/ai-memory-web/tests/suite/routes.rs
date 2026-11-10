@@ -3596,6 +3596,123 @@ async fn viewer_filtered_api_reads_are_never_served_from_cache() {
 }
 
 #[tokio::test]
+async fn api_cors_supports_conditional_page_reads() {
+    use ai_memory_web::{WebMountSpec, api_cors_mw, split_web_routers};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let project = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, project, "cache.md", "# Conditional page read"))
+        .await
+        .unwrap();
+
+    let origin = "https://app.example.com";
+    let cors_origins = [origin.to_string()];
+    let split = split_web_routers(
+        false,
+        store.reader.clone(),
+        wiki,
+        WebMountSpec {
+            enable_api: true,
+            web_ui_dir: None,
+            cors_origins: &cors_origins,
+            web_slug: "/web",
+            base_href: "/web/",
+            base_path: "",
+            trusted_proxy_identity: false,
+            recall: ai_memory_web::Recall::default(),
+            runtime: None,
+            health: None,
+        },
+    )
+    .unwrap();
+    let router = split.protected.layer(axum::middleware::from_fn_with_state(
+        split.api_cors.unwrap(),
+        api_cors_mw,
+    ));
+    let request = |method| {
+        Request::builder()
+            .method(method)
+            .uri("/api/v1/workspaces/default/projects/scratch/pages/cache.md")
+            .header(header::ORIGIN, origin)
+    };
+    let preflight = router
+        .clone()
+        .oneshot(
+            request(Method::OPTIONS)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization, if-none-match",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    let allowed = preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+        .to_str()
+        .unwrap();
+    for name in [header::AUTHORIZATION, header::IF_NONE_MATCH] {
+        assert!(
+            allowed
+                .split(',')
+                .any(|value| value.trim() == name.as_str()),
+            "preflight does not allow {name}: {allowed}"
+        );
+    }
+
+    let resp = router
+        .clone()
+        .oneshot(request(Method::GET).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+        "true"
+    );
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+        "etag"
+    );
+    let etag = resp.headers()[header::ETAG].clone();
+    let conditional = router
+        .oneshot(
+            request(Method::GET)
+                .header(header::IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        conditional.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        origin
+    );
+    assert_eq!(
+        conditional.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+        "etag"
+    );
+    assert_eq!(conditional.headers()[header::ETAG], etag);
+}
+
+#[tokio::test]
 async fn api_page_handler_emits_etag_and_supports_if_none_match() {
     let (_tmp, store, wiki) = setup().await;
     let ws = store
@@ -3658,26 +3775,44 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         "a single-page read must be revalidated so authorize_read runs every time: {cc}"
     );
 
-    // Second request with the returned ETag: must return 304 with empty body.
-    let resp304 = app
-        .oneshot(
-            Request::builder()
-                .uri("/workspaces/default/projects/scratch/pages/etag-test.md")
-                .header(header::IF_NONE_MATCH, &etag)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        resp304.status(),
-        StatusCode::NOT_MODIFIED,
-        "matching ETag must yield 304"
-    );
-    let body_bytes = axum::body::to_bytes(resp304.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(body_bytes.is_empty(), "304 body must be empty");
+    for (validators, expected) in [
+        (vec![etag.clone()], StatusCode::NOT_MODIFIED),
+        (vec![format!("W/{etag}")], StatusCode::NOT_MODIFIED),
+        (
+            vec![format!(r#""other,tag", W/{etag}"#)],
+            StatusCode::NOT_MODIFIED,
+        ),
+        (
+            vec![r#""other""#.into(), format!("W/{etag}")],
+            StatusCode::NOT_MODIFIED,
+        ),
+        (vec!["*".into()], StatusCode::NOT_MODIFIED),
+        (vec![r#""other,tag""#.into()], StatusCode::OK),
+        (vec![format!("{etag}, invalid")], StatusCode::OK),
+        (vec!["*".into(), etag.clone()], StatusCode::OK),
+    ] {
+        let mut req =
+            Request::builder().uri("/workspaces/default/projects/scratch/pages/etag-test.md");
+        for validator in &validators {
+            req = req.header(header::IF_NONE_MATCH, validator);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "{validators:?}");
+        assert_eq!(resp.headers()[header::ETAG], etag, "{validators:?}");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-cache");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.is_empty(),
+            expected == StatusCode::NOT_MODIFIED,
+            "{validators:?}"
+        );
+    }
 }
 
 /// The ETag stands for the whole JSON page, not just its markdown. Pinning a
@@ -4643,6 +4778,24 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
             "{uri}"
         );
         assert_eq!(get(app.clone(), uri, None).await.0, StatusCode::OK, "{uri}");
+    }
+
+    let conditional_get = |viewer: UserId, validator: &str| {
+        let req = Request::builder()
+            .uri("/workspaces/default/projects/alice-client-work/pages/secrets/rates.md")
+            .header(header::IF_NONE_MATCH, validator)
+            .extension(AuthorizedViewer(viewer))
+            .body(Body::empty())
+            .unwrap();
+        api.clone().oneshot(req)
+    };
+    let authorized = conditional_get(alice, "*").await.unwrap();
+    assert_eq!(authorized.status(), StatusCode::NOT_MODIFIED);
+    let weak_etag = format!("W/{}", authorized.headers()[header::ETAG].to_str().unwrap());
+    for validator in ["*", &weak_etag] {
+        let refused = conditional_get(bob, validator).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{validator}");
+        assert!(refused.headers().get(header::ETAG).is_none());
     }
 
     // Finding it, through the API's global search and the wiki search box.

@@ -199,7 +199,7 @@ pub(crate) enum WriteCmd {
         /// Authenticated operator recorded in the `audit_log` row (NULL when
         /// single-user / unauthenticated).
         author_id: Option<ai_memory_core::UserId>,
-        reply: oneshot::Sender<StoreResult<()>>,
+        reply: oneshot::Sender<StoreResult<bool>>,
     },
     DeletePageIfLatest {
         workspace_id: WorkspaceId,
@@ -3212,7 +3212,9 @@ impl WriterHandle {
     /// Delete every version of a page (by path) from the index. The wiki file
     /// removal is the caller's concern; this drops the derived rows so the
     /// page stops appearing in search/recent (the watcher does NOT reconcile
-    /// file deletions — it only handles create/modify events).
+    /// file deletions — it only handles create/modify events). Idempotent;
+    /// returns `true` when a page existed and was removed, `false` for a no-op
+    /// delete of an absent path.
     ///
     /// # Errors
     /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or a
@@ -3223,7 +3225,7 @@ impl WriterHandle {
         project_id: ProjectId,
         path: PagePath,
         author_id: Option<ai_memory_core::UserId>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::DeletePage {
             workspace_id,

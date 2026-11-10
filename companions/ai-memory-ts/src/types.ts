@@ -332,9 +332,9 @@ export interface Page {
   readonly totalChars: number | undefined;
   /** Parsed frontmatter (tags, tier, pinned and other metadata). Untrusted. */
   readonly frontmatter: Readonly<Record<string, unknown>>;
-  /** Bounded heading hashes for anchored patches. */
+  /** Bounded heading hashes for anchored patches, or an empty list on servers before 3.3.0. */
   readonly sections: readonly PageSection[];
-  /** True when the page has more sections than the response cap. */
+  /** True when the server reports more sections than the response cap. */
   readonly sectionsTruncated: boolean;
   /** Pages reachable through links, present only with `includeRelated`. */
   readonly related: readonly RelatedPage[] | undefined;

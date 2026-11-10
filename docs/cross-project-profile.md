@@ -132,6 +132,10 @@ ai-memory profile list --user alice      # an operator's private profile (share 
 ai-memory profile list --workspace work  # a workspace profile (share = "workspace")
 ```
 
+`show` and `forget` accept the path with or without the `profile/` prefix or
+the `.md` suffix. An existing exact path takes precedence. `forget` returns
+an error when no entry matches.
+
 ## Turning the profile into hard rules for one repository
 
 The digest is a default the agent applies when nothing more specific speaks.

@@ -159,7 +159,8 @@ impl FallbackLlmProvider {
             state.last_error_status = err.http_status();
             state.last_error_class = Some(err.class());
             if let Some(cooldown) = cooldown {
-                state.circuit_open_until = Some(Instant::now() + cooldown);
+                let deadline = Instant::now() + cooldown;
+                state.circuit_open_until = state.circuit_open_until.max(Some(deadline));
             }
             cooldown.is_some() && !circuit_was_open
         };
@@ -759,6 +760,33 @@ mod tests {
                 "hint {hint}s produced {actual:?}"
             );
         }
+    }
+
+    #[test]
+    fn overlapping_transient_failures_preserve_the_longer_cooldown() {
+        let chain = FallbackLlmProvider::new(vec![Candidate::new(
+            "primary",
+            "m1",
+            Arc::new(ScriptedLlm::ok("primary", "m1", "unused")),
+        )]);
+        chain.record_error(
+            0,
+            &LlmError::Provider {
+                status: 429,
+                body: String::new(),
+                retry_after: Some(Duration::from_secs(1_800)),
+            },
+        );
+        let deadline = chain.entries[0].state.lock().unwrap().circuit_open_until;
+
+        // Another request was already in flight when the first failure
+        // opened the circuit. Its default cooldown is shorter.
+        chain.record_error(0, &transient(503));
+
+        assert_eq!(
+            chain.entries[0].state.lock().unwrap().circuit_open_until,
+            deadline
+        );
     }
 
     #[tokio::test]

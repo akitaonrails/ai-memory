@@ -530,8 +530,10 @@ fn api_cors_policy(cors_origins: &[String]) -> Option<ApiCors> {
         .allow_headers([
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
+            header::IF_NONE_MATCH,
             HeaderName::from_static("x-csrf-token"),
         ])
+        .expose_headers([header::ETAG])
         .allow_credentials(true)
         .max_age(Duration::from_secs(600));
     info!(origins = ?cors_origins, "CORS policy configured for /api/v1");

@@ -98,7 +98,8 @@ sh install.sh
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
 
 Relative `AI_MEMORY_BIN_DIR` and `AI_MEMORY_LIB_DIR` paths are resolved from
-the directory where you start `install.sh`.
+the directory where you start `install.sh`. A trailing slash on
+`AI_MEMORY_LIB_DIR` is optional.
 
 Running `install.sh` again replaces its own release in place, and it deletes
 the old lib dir to do so. Before downloading, it therefore refuses a lib dir
@@ -4076,6 +4077,9 @@ GitHub Release, refuses an unverified update, pulls the latest Docker
 image, refreshes the checksum-verified native host client, rewrites previously
 staged hook registrations to that native command when supported, and
 prints how to restart the server container so the new binary is used.
+If installing the native host client fails, the upgrade reports an error
+before refreshing hooks. The next host command that checks for updates can
+retry the client installation.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
 When a Compose file is found, the wrapper first verifies that its project owns

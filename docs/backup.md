@@ -183,14 +183,17 @@ cadence):
    bundles are not.
 3. `git add -A && git commit -m "auto: snapshot $(date +%F)"` if anything
    changed; skip if there is no delta.
-4. `git push origin main` with a timeout so a hung network does not block the
-   next run.
+4. `git push origin main` with a timeout. Each run attempts the push so a
+   previously unpushed commit can reach the mirror even if nothing changed.
 5. Run `ai-memory backup --to
    $TARBALL_DIR/ai-memory-$(date +%F).tar.gz` so SQLite is copied through its
    online backup API rather than racing the live WAL. Models are not included;
    redownload them after recovery.
 6. Rotate old tarballs and old script logs on a retention window (30 days by
    default).
+
+A failed mirror push still allows the online backup and rotation to run.
+The script returns a nonzero status so the scheduler can report the failure.
 
 See the example directory's [README](examples/backup/README.md) for the
 install-and-enable steps and non-systemd equivalents (macOS launchd, Windows

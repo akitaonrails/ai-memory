@@ -17,7 +17,7 @@ use super::apply_shared::{PrivateBackup, apply_atomic_with_backup, checkout_back
 use super::show::{terminal_body, terminal_text};
 use crate::cli::{ProfileApplyArgs, ProfileArgs, ProfileCommand, ProfileScopeArgs};
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, get_json, post_json};
+use crate::http_client::{ServerEndpoint, ServerResponseError, get_json, post_json};
 
 /// Dispatch a `profile` subcommand.
 ///
@@ -260,20 +260,55 @@ struct PageContent {
     body: String,
 }
 
-async fn show(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Result<()> {
-    let names = profile_scope(ep, scope).await?;
-    let path = profile_path(path);
-    let page: PageContent = get_json(
+async fn read_profile_page(
+    ep: &ServerEndpoint,
+    names: &ScopeNames,
+    path: &str,
+) -> Result<PageContent> {
+    get_json(
         ep,
         "/admin/read-page",
         &[
             ("workspace", names.workspace.as_str()),
             ("project", names.project.as_str()),
-            ("path", path.as_str()),
+            ("path", path),
         ],
     )
     .await
-    .with_context(|| format!("reading {path}"))?;
+    .with_context(|| format!("reading {}", terminal_text(path)))
+}
+
+fn is_missing_page(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ServerResponseError>()
+        .is_some_and(|response| response.status() == reqwest::StatusCode::NOT_FOUND)
+}
+
+async fn resolve_profile_page(
+    ep: &ServerEndpoint,
+    names: &ScopeNames,
+    path: &str,
+) -> Result<(String, PageContent)> {
+    match read_profile_page(ep, names, path).await {
+        // A manually written extensionless entry can coexist with a `.md`
+        // page at the same stem. Only try the suffix when the exact path misses.
+        Err(error)
+            if is_missing_page(&error)
+                && !Path::new(path)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md")) =>
+        {
+            let path = format!("{path}.md");
+            let page = read_profile_page(ep, names, &path).await?;
+            Ok((path, page))
+        }
+        result => Ok((path.to_owned(), result?)),
+    }
+}
+
+async fn show(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Result<()> {
+    let names = profile_scope(ep, scope).await?;
+    let (_, page) = resolve_profile_page(ep, &names, &profile_path(path)).await?;
     println!(
         "# {} ({}/{})\n",
         terminal_text(&page.path),
@@ -290,10 +325,28 @@ struct DeleteResponse {
     deleted: bool,
 }
 
+fn nothing_forgotten(ep: &ServerEndpoint, path: &str) -> String {
+    ep.i18n.format(
+        "cli-profile-was-not-in-the-profile-nothing-changed",
+        &[("value0", terminal_text(path))],
+    )
+}
+
 async fn forget(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Result<()> {
     let i18n = &ep.i18n;
     let names = profile_scope(ep, scope).await?;
     let path = profile_path(path);
+    // The generic delete endpoint is idempotent and acknowledges even a
+    // missing page. Resolve an existing entry before requesting its deletion.
+    let (path, _) = resolve_profile_page(ep, &names, &path)
+        .await
+        .map_err(|error| {
+            if is_missing_page(&error) {
+                error.context(nothing_forgotten(ep, &path))
+            } else {
+                error
+            }
+        })?;
     let resp: DeleteResponse = post_json(
         ep,
         "/admin/delete-page",
@@ -305,23 +358,16 @@ async fn forget(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Re
     )
     .await
     .with_context(|| format!("forgetting {path}"))?;
-    if resp.deleted {
-        println!(
-            "{}",
-            i18n.format(
-                "cli-profile-forgot-the-git-history-keeps-it",
-                &[("value0", terminal_text(&resp.path))]
-            )
-        );
-    } else {
-        println!(
-            "{}",
-            i18n.format(
-                "cli-profile-was-not-in-the-profile-nothing-changed",
-                &[("value0", terminal_text(&resp.path))]
-            )
-        );
+    if !resp.deleted {
+        bail!(nothing_forgotten(ep, &resp.path));
     }
+    println!(
+        "{}",
+        i18n.format(
+            "cli-profile-forgot-the-git-history-keeps-it",
+            &[("value0", terminal_text(&resp.path))]
+        )
+    );
     Ok(())
 }
 

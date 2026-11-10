@@ -9,9 +9,25 @@ use std::time::{Duration, Instant};
 use super::e2e_support::hermetic;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
-const BODY: &[u8] = b"complete archive bytes";
 
-fn download(home: &Path, dest: &Path, export: bool, complete: bool) -> Output {
+fn archive_body() -> Vec<u8> {
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    tar::Builder::new(gzip)
+        .into_inner()
+        .unwrap()
+        .finish()
+        .unwrap()
+}
+
+enum Reply {
+    Complete,
+    Interrupted,
+    GatewayHtml,
+    // Invalid destinations are rejected after the headers, so send no body.
+    Empty,
+}
+
+fn download(home: &Path, dest: &Path, export: bool, reply: Reply) -> Output {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -46,16 +62,43 @@ fn download(home: &Path, dest: &Path, export: bool, complete: bool) -> Output {
             }),
             "{request}"
         );
-        let length = if complete {
-            BODY.len()
-        } else {
-            BODY.len() + 100
-        };
-        let mut response =
-            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n")
-                .into_bytes();
-        response.extend_from_slice(BODY);
-        socket.write_all(&response).unwrap();
+        match reply {
+            Reply::Complete => {
+                let body = archive_body();
+                // A proxy may omit the type and split the gzip signature
+                // across HTTP chunks. A valid body must still be accepted.
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                for chunk in [&body[..1], &body[1..3], &body[3..]] {
+                    write!(socket, "{:x}\r\n", chunk.len()).unwrap();
+                    socket.write_all(chunk).unwrap();
+                    socket.write_all(b"\r\n").unwrap();
+                }
+                socket.write_all(b"0\r\n\r\n").unwrap();
+            }
+            Reply::Interrupted => {
+                let body = archive_body();
+                let length = body.len() + 100;
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                socket.write_all(&body).unwrap();
+            }
+            Reply::GatewayHtml => {
+                let body = b"<!doctype html><title>Gateway login required</title>";
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                socket.write_all(body).unwrap();
+            }
+            Reply::Empty => {
+                socket
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                return;
+            }
+        }
         socket.shutdown(Shutdown::Write).unwrap();
     });
     let mut command = hermetic(BIN);
@@ -64,6 +107,7 @@ fn download(home: &Path, dest: &Path, export: bool, complete: bool) -> Output {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("AI_MEMORY_SERVER_URL", format!("http://{address}"))
+        .args(["--language", "en"])
         .arg("--data-dir")
         .arg(home.join("data"));
     if export {
@@ -95,7 +139,7 @@ fn assert_interrupted_download(existing: bool) {
         if existing {
             std::fs::write(&dest, b"previous usable archive").unwrap();
         }
-        let output = download(home.path(), &dest, export, false);
+        let output = download(home.path(), &dest, export, Reply::Interrupted);
         assert!(!output.status.success(), "truncated HTTP body must fail");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("reading response chunk"),
@@ -123,6 +167,40 @@ fn assert_interrupted_download(existing: bool) {
 }
 
 #[test]
+fn non_gzip_success_responses_do_not_replace_or_publish_archives() {
+    for export in [false, true] {
+        for existing in [false, true] {
+            for reply in [Reply::GatewayHtml, Reply::Empty] {
+                let home = tempfile::tempdir().unwrap();
+                let archives = home.path().join("archives");
+                std::fs::create_dir(&archives).unwrap();
+                let dest = archives.join("backup.tar.gz");
+                let previous = archive_body();
+                if existing {
+                    std::fs::write(&dest, &previous).unwrap();
+                }
+                let output = download(home.path(), &dest, export, reply);
+                assert!(!output.status.success(), "non-gzip body must fail");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("does not start with a gzip signature"),
+                    "{stderr}"
+                );
+                if existing {
+                    assert_eq!(std::fs::read(&dest).unwrap(), previous);
+                } else {
+                    assert!(!dest.exists());
+                }
+                assert_eq!(
+                    std::fs::read_dir(&archives).unwrap().count(),
+                    usize::from(existing)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn successful_archive_download_replaces_output_and_preserves_permissions() {
     for export in [false, true] {
         for existing in [false, true] {
@@ -137,13 +215,13 @@ fn successful_archive_download_replaces_output_and_preserves_permissions() {
                         .unwrap();
                 }
             }
-            let output = download(home.path(), &dest, export, true);
+            let output = download(home.path(), &dest, export, Reply::Complete);
             assert!(
                 output.status.success(),
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+            assert_eq!(std::fs::read(&dest).unwrap(), archive_body());
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -174,7 +252,7 @@ fn successful_archive_download_replaces_a_symlink_privately_without_altering_its
             let mode = if directory_target { 0o755 } else { 0o644 };
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
             symlink(&target, &dest).unwrap();
-            let output = download(home.path(), &dest, export, true);
+            let output = download(home.path(), &dest, export, Reply::Complete);
             assert!(
                 output.status.success(),
                 "{}",
@@ -186,7 +264,7 @@ fn successful_archive_download_replaces_a_symlink_privately_without_altering_its
                     .file_type()
                     .is_symlink()
             );
-            assert_eq!(std::fs::read(&dest).unwrap(), BODY);
+            assert_eq!(std::fs::read(&dest).unwrap(), archive_body());
             assert_eq!(
                 std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -216,7 +294,7 @@ fn archive_download_refuses_a_directory_without_creating_a_temporary_output() {
         let dest = archives.join("backup.tar.gz");
         std::fs::create_dir(&dest).unwrap();
         std::fs::write(dest.join("keep"), b"untouched directory").unwrap();
-        let output = download(home.path(), &dest, export, true);
+        let output = download(home.path(), &dest, export, Reply::Empty);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("output path is a directory"));
         assert_eq!(
@@ -238,7 +316,7 @@ fn archive_download_refuses_a_read_only_regular_file_without_touching_it() {
         let dest = archives.join("backup.tar.gz");
         std::fs::write(&dest, b"previous usable archive").unwrap();
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o400)).unwrap();
-        let output = download(home.path(), &dest, export, true);
+        let output = download(home.path(), &dest, export, Reply::Empty);
         assert!(!output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stderr)
@@ -265,7 +343,7 @@ fn interrupted_archive_download_preserves_the_destination_symlink_and_target() {
         let dest = archives.join("backup.tar.gz");
         std::fs::write(&target, b"previous usable archive").unwrap();
         symlink(&target, &dest).unwrap();
-        let output = download(home.path(), &dest, export, false);
+        let output = download(home.path(), &dest, export, Reply::Interrupted);
         assert!(!output.status.success());
         assert!(
             std::fs::symlink_metadata(&dest)
