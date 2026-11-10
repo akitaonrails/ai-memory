@@ -6745,11 +6745,12 @@ impl AiMemoryServer {
             checkpoint_or_mcp(wiki, format!("pre-memory_delete_page: {}", path.as_str()))?;
 
         let author_id = crate::actor::author_id_from_parts(&parts);
-        let deleted = match expected {
-            None => wiki
-                .delete_page(ws, proj, &path, admission_ctx, author_id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+        match expected {
+            None => {
+                wiki.delete_page(ws, proj, &path, admission_ctx, author_id)
+                    .await
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            }
             Some(expected) => {
                 // The authority: re-checked under the exclusive mutation lock
                 // and in the delete transaction.
@@ -6765,14 +6766,14 @@ impl AiMemoryServer {
                         current,
                     ));
                 }
-                deleted
             }
-        };
+        }
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_delete_page: {}", path.as_str()));
 
         ok_json(&serde_json::json!({
             "path": path.to_string(),
-            "deleted": deleted,
+            // The MCP acknowledgement includes paths that were already absent.
+            "deleted": true,
             "pre_checkpoint": pre_checkpoint,
             "checkpoint": checkpoint,
         }))
