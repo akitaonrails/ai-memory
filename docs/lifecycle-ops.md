@@ -568,6 +568,14 @@ the merged files and restores it if the transaction refuses; after a commit it
 removes the now-empty source tree, refreshes scope manifests and checkpoints
 the result.
 
+A repository identity on the source (the git remote a checkout routes by, with
+its derived name keys) moves to the target when the target has none, so later
+captures and `ai-memory run` from that checkout resolve to the merged project
+instead of opening a new one. A target that already belongs to another
+repository keeps its own identity and the source's is dropped. A checkout of
+the source's repository then needs `project = "<target>"` in its
+`.ai-memory.toml` to keep landing in the merged project.
+
 ### `move-project`
 
 ```bash
