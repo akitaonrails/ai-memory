@@ -98,7 +98,8 @@ sh install.sh
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
 
 Relative `AI_MEMORY_BIN_DIR` and `AI_MEMORY_LIB_DIR` paths are resolved from
-the directory where you start `install.sh`.
+the directory where you start `install.sh`. A trailing slash on
+`AI_MEMORY_LIB_DIR` is optional.
 
 Running `install.sh` again replaces its own release in place, and it deletes
 the old lib dir to do so. Before downloading, it therefore refuses a lib dir
