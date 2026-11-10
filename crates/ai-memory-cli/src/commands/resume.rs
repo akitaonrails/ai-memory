@@ -112,6 +112,7 @@ pub async fn run(config: &Config, args: ResumeArgs) -> Result<i32> {
                 project_id,
                 workstream: Some(selected.summary.name.clone()),
                 new_workstream: None,
+                or_new: false,
                 executable: None,
                 yolo: args.yolo,
                 true_yolo: args.true_yolo,

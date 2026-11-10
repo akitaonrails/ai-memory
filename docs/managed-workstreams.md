@@ -244,7 +244,7 @@ available through `ai-memory workstream-search`.
 
 ```text
 ai-memory run [--workspace NAME] [--project NAME]
-              [--workstream NAME | --new NAME] [--executable PATH]
+              [--workstream NAME [--or-new] | --new NAME] [--executable PATH]
               [--yolo] [--fresh] [--force-unlock] [--no-exit-prompt] [--profile NAME]
               [--env KEY=VALUE]... [--env-file PATH] [--require-server]
               [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity|copilot]
@@ -255,6 +255,20 @@ The default is the most recently selected workstream for the current repository
 and worktree, creating one named `default` on first use. `--new NAME` starts an
 independent line of work; `--workstream NAME` returns to one. These are optional
 branching controls; they do not switch harnesses.
+
+`--workstream NAME --or-new` is the "open the workstream for NAME" selector for
+a wrapper that does not want to look the name up first: it selects `NAME` when
+it exists (resume, lease check, chooser, `--fresh` all as usual) and creates it,
+exactly as `--new NAME` would, when the server reports it does not. The run line
+says which branch it took — `selected existing workstream NAME` or `created
+workstream NAME` — so a typo that silently starts a new line of work is visible
+at once. `--or-new` requires `--workstream` and cannot be combined with `--new`.
+The select-or-create is composed from the two existing server calls, so the
+duplicate-name guard stays the only arbiter: if another caller creates `NAME`
+between the miss and the create, that create is refused and `--or-new` selects
+what the other caller made rather than reporting a creation. Without the flag,
+`--workstream` still fails on a missing name and `--new` still fails on a
+duplicate.
 
 List the workstreams available to those selectors without launching a harness:
 
