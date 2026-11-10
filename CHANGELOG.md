@@ -49,6 +49,14 @@ version in [`docs/changelog/`](docs/changelog/):
   profile-only fix in #1855/#2041. Ordinary scaffolding such as an IDE context
   block stays listed as session history. Pages regenerate with the new rule on
   the next consolidation. (#2149)
+- A session run under external capture (`AI_MEMORY_CAPTURE_OWNER` set) no longer
+  consumes a pending handoff. The owner's own interactive runs share the project
+  with the captured harness, so claiming the baton stole it from the work it was
+  left for. Every handoff-delivery front door — SessionStart, Kimi's
+  `UserPromptSubmit`, Hermes' `pre_llm_call`, and Grok's `PostToolUse` — now
+  sends `claim=0` under external capture, and the server offers the handoff,
+  naming it and how to accept, without marking it claimed. A normal run claims
+  as before. (#2148)
 - `ai-memory run` resuming a session whose checkout now resolves to a
   different project that already holds its own sessions or pages now prints the
   exact commands to reconcile it — the `merge-project` dry run, the `--confirm`

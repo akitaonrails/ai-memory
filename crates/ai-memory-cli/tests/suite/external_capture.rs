@@ -582,8 +582,14 @@ mod slow {
         );
     }
 
+    /// Under external capture the owner's own runs share the project with the
+    /// captured harness, so a pending handoff is *offered*, never consumed: the
+    /// start announces the baton by id with `memory_handoff_accept` and leaves
+    /// it open for an explicit claim, rather than delivering (and consuming) its
+    /// body as a claim would. Native capture stays suppressed and MCP recall
+    /// still finds the seeded content (#2148).
     #[tokio::test]
-    async fn external_capture_preserves_native_handoffs_and_mcp_recall() {
+    async fn external_capture_offers_handoffs_without_consuming_them_and_keeps_mcp_recall() {
         let fixture = Fixture::start().await;
         for (agent, event) in [
             ("claude-code", "session-start"),
@@ -591,19 +597,27 @@ mod slow {
         ] {
             fixture.seed_handoff().await;
             let receiver = SessionId::new();
-            let output = fixture.native(receiver, agent, event);
-            assert!(output.contains(MARKER), "handoff was lost: {output}");
+            let offered = fixture.native(receiver, agent, event);
+            assert!(
+                offered.contains("memory_handoff_accept") && !offered.contains(MARKER),
+                "external capture must offer the baton, not deliver its body: {offered}"
+            );
             assert!(
                 fixture
                     .reader
                     .observations_for_session(receiver)
                     .await
                     .unwrap()
-                    .is_empty()
+                    .is_empty(),
+                "external capture must still suppress native capture"
             );
+            // Offer mode never consumes the baton: a fresh start still sees it.
+            let next = SessionId::new();
             assert!(
-                !fixture.native(receiver, agent, event).contains(MARKER),
-                "handoff was delivered twice"
+                fixture
+                    .native(next, agent, event)
+                    .contains("memory_handoff_accept"),
+                "an offered handoff must stay open for the next start"
             );
             fixture.native(receiver, agent, "session-end");
             assert!(!fixture.root.as_path().join("data/hook-spool").exists());
