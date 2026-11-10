@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Docker images now run the server under `tini`, which reaps orphaned helper
   processes rather than leaving zombies under the container's PID 1. It
   forwards shutdown signals to the server so graceful draining still works.
-  (#TBD)
+  (#2163)
 
 ## [3.4.5] - 2026-11-10
 
