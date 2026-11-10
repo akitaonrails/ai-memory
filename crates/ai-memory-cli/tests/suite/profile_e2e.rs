@@ -55,6 +55,87 @@ mod slow {
     }
 
     #[tokio::test]
+    async fn show_and_forget_accept_optional_md_without_hiding_exact_paths() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let home = tempfile::tempdir().expect("home");
+        let client = reqwest::Client::new();
+        let (_server, base) = start_serve(&client, &data_dir.path().join("serve.log"), |port| {
+            let mut cmd = hermetic(BIN);
+            cmd.args([
+                "serve",
+                "--transport",
+                "http",
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+                "--no-watcher",
+            ])
+            .env("AI_MEMORY_DATA_DIR", data_dir.path())
+            .env("AI_MEMORY_HOME", home.path())
+            .env("AI_MEMORY_EMBEDDING_PROVIDER", "none");
+            cmd
+        })
+        .await;
+        let run =
+            |args: &[&str]| run_cli(args, data_dir.path(), home.path(), Some(home.path()), &base);
+        for (path, body) in [
+            ("profile/workflow/never-push.md", "Never push."),
+            ("profile/workflow/exact", "The exact entry."),
+            ("profile/workflow/exact.md", "The Markdown sibling."),
+        ] {
+            run(&[
+                "write-page",
+                "--workspace",
+                "default",
+                "--project",
+                "_global",
+                "--path",
+                path,
+                "--body",
+                body,
+            ]);
+        }
+
+        let shown = run(&["profile", "show", "workflow/never-push"]);
+        assert!(shown.contains("profile/workflow/never-push.md"), "{shown}");
+        assert!(shown.contains("Never push."), "{shown}");
+        let forgotten = run(&["profile", "forget", "profile/workflow/never-push"]);
+        assert!(
+            forgotten.contains("Forgot profile/workflow/never-push.md"),
+            "{forgotten}"
+        );
+        assert!(!run(&["profile", "list"]).contains("profile/workflow/never-push.md"));
+
+        let shown = run(&["profile", "show", "workflow/exact"]);
+        assert!(shown.contains("The exact entry."), "{shown}");
+        let forgotten = run(&["profile", "forget", "workflow/exact"]);
+        assert!(
+            forgotten.contains("Forgot profile/workflow/exact ("),
+            "{forgotten}"
+        );
+        let shown = run(&["profile", "show", "workflow/exact"]);
+        assert!(shown.contains("The Markdown sibling."), "{shown}");
+
+        for missing in ["workflow/not-an-entry", "profile/workflow/not-an-entry.md"] {
+            let out = hermetic(BIN)
+                .args(["profile", "forget", missing])
+                .current_dir(home.path())
+                .env("AI_MEMORY_DATA_DIR", data_dir.path())
+                .env("AI_MEMORY_HOME", home.path())
+                .env("AI_MEMORY_SERVER_URL", &base)
+                .env("RUST_LOG", "off")
+                .output()
+                .expect("run profile forget");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(!out.status.success(), "{stdout}");
+            assert!(stderr.contains("nothing changed"), "{stderr}");
+            assert!(!stdout.contains("Forgot"), "{stdout}");
+        }
+        let shown = run(&["profile", "show", "workflow/exact.md"]);
+        assert!(shown.contains("The Markdown sibling."), "{shown}");
+    }
+
+    #[tokio::test]
     async fn a_habit_from_two_projects_is_applied_to_a_new_repository() {
         let data_dir = tempfile::tempdir().expect("data dir");
         let home = tempfile::tempdir().expect("home");
