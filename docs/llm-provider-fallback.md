@@ -158,8 +158,9 @@ circuit. Two entries with the same provider and model but different credentials
 therefore rotate independently. A transient error opens only that entry's
 circuit. The default cooldown is 30 seconds; a delta-seconds `Retry-After`
 header or Google `RetryInfo.retryDelay` response detail extends it, clamped to
-one hour. Other candidates remain eligible. A successful response closes that
-candidate's circuit. Restarting the server clears circuits. The implementation
+one hour. If overlapping requests fail, the circuit keeps the later deadline.
+Other candidates remain eligible. A successful response closes that candidate's
+circuit. Restarting the server clears circuits. The implementation
 uses no durable circuit state and no separate forced request deadline.
 
 If every eligible candidate fails, the wrapper returns a bounded aggregate
