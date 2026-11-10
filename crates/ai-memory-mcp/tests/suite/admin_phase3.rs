@@ -329,6 +329,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/alpha-repo")),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -364,6 +365,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some(std::path::PathBuf::from("/home/user/beta-repo")),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -455,6 +457,7 @@ async fn reorg_never_targets_a_reserved_scope() {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some(std::path::PathBuf::from(dir)),
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1185,6 +1188,7 @@ async fn check_session_restore(source: &str, case: SessionRestoreCase) {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

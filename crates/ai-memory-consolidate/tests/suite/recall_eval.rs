@@ -479,6 +479,7 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
             agent_kind: AgentKind::OpenCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .expect("begin session");
@@ -567,6 +568,7 @@ async fn profile_recall_across_projects() {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .expect("begin session");

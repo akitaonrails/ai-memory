@@ -2286,6 +2286,7 @@ async fn fetch_and_accept_handoff_at(
                 agent_kind: agent,
                 cwd: query.cwd.as_deref().map(std::path::PathBuf::from),
                 actor_user: owner_stamp_for_event(state, actor.as_ref()).await,
+                origin: None,
             }),
             None => None,
         }
@@ -5336,6 +5337,7 @@ async fn process_authorized(
             cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
             actor_user: owner_stamp.clone(),
             occurred_at: env.occurred_at_micros(),
+            origin: env.session_origin,
         };
         let kind = env.event.to_observation_kind();
         let raw_obs = NewObservation {
@@ -19614,6 +19616,7 @@ pub(crate) mod tests {
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -19715,6 +19718,7 @@ pub(crate) mod tests {
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -21720,6 +21724,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some(std::path::PathBuf::from("/tmp/target")),
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -22549,6 +22554,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(cwd.into()),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -23501,6 +23507,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(std::path::PathBuf::from(cwd)),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -29464,6 +29471,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();

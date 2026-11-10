@@ -104,6 +104,12 @@ pub struct HookQuery {
     /// Invocation-scoped `ai-memory run` lease. Absent for every direct
     /// harness launch, preserving legacy capture and handoff behavior.
     pub managed_run: Option<String>,
+    /// How a launcher started this session, forwarded from
+    /// `AI_MEMORY_SESSION_ORIGIN` (#2180). Only a recognised token
+    /// (`automation`) is honored; anything else is ignored. Absent for an
+    /// ordinary interactive session. Stamped on the session row so the profile
+    /// harvester can be told to skip automation sessions' prompts.
+    pub session_origin: Option<String>,
     /// Invocation-scoped opt-out of the automatic handoff, forwarded by the
     /// host hook from `AI_MEMORY_AUTO_HANDOFF` (#1951). An explicit falsy
     /// value keeps this session's end or turn checkpoint from leaving a
@@ -197,6 +203,10 @@ pub struct HookEnvelope {
     pub all_owners_requested: bool,
     /// Invocation-scoped managed-run id forwarded by the host hook.
     pub managed_run: Option<String>,
+    /// Validated session origin forwarded by the launcher, or `None` for an
+    /// ordinary interactive session (#2180). Stamped on the session row so the
+    /// profile harvester can skip automation sessions' prompts.
+    pub session_origin: Option<ai_memory_core::SessionOrigin>,
     /// Whether this execution opted out of the automatic handoff (the
     /// `auto_handoff=0` query flag, from `AI_MEMORY_AUTO_HANDOFF`, #1951).
     pub auto_handoff_off: bool,
@@ -262,6 +272,7 @@ impl std::fmt::Debug for HookEnvelope {
                 &self.recall_default_global_requested,
             )
             .field("managed_run", &self.managed_run)
+            .field("session_origin", &self.session_origin)
             .field("auto_handoff_off", &self.auto_handoff_off)
             .field(
                 "capture_assistant_requested",
@@ -700,6 +711,10 @@ impl HookEnvelope {
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
         let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
+        let session_origin = query
+            .session_origin
+            .as_deref()
+            .and_then(ai_memory_core::SessionOrigin::parse_wire);
         let auto_handoff_off = query_flag_falsy(query.auto_handoff.as_deref());
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
@@ -795,6 +810,7 @@ impl HookEnvelope {
             recall_default_global_requested,
             all_owners_requested,
             managed_run,
+            session_origin,
             auto_handoff_off,
             capture_assistant_requested,
             ingest_key,

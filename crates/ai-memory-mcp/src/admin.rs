@@ -10490,6 +10490,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -10505,6 +10506,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: None,
                     actor_user: Some(IdentityKey::User(owner.into()).storage_key()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -10728,6 +10730,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -10744,6 +10747,7 @@ mod tests {
                     agent_kind: AgentKind::Codex,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: Some(IdentityKey::User(user.into()).storage_key()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -10941,6 +10945,7 @@ mod tests {
                     agent_kind,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -12410,6 +12415,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12569,6 +12575,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12712,6 +12719,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12833,6 +12841,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12937,6 +12946,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13094,6 +13104,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

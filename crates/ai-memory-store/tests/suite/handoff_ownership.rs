@@ -193,6 +193,7 @@ async fn ownership_writes_reject_malformed_identity_keys() {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: Some("alice".into()),
+                origin: None,
             })
             .await
             .is_err()
@@ -433,6 +434,7 @@ async fn another_operators_refused_claim_keeps_the_receivers_sweep_marker() {
             agent_kind: AgentKind::Grok,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -876,6 +878,7 @@ async fn automatic_supersession_does_not_reach_across_operators() {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/repo".into()),
                 actor_user: stamp.clone(),
+                origin: None,
             })
             .await
             .unwrap();
@@ -1006,6 +1009,7 @@ async fn open_session_lookup_is_owner_scoped() {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: owner,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1091,6 +1095,7 @@ async fn a_session_start_claim_is_confirmed_only_to_its_own_live_session() {
         agent_kind: AgentKind::ClaudeCode,
         cwd: None,
         actor_user: Some(operator("alice")),
+        origin: None,
     };
     let receiver = SessionId::from_native("alice-claude-session");
     let sibling = SessionId::from_native("alice-other-session");

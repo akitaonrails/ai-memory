@@ -1442,6 +1442,7 @@ mod tests {
                     cwd: None,
                     actor_user: owner
                         .map(|name| ai_memory_core::IdentityKey::User(name.into()).storage_key()),
+                    origin: None,
                 })
                 .await
                 .unwrap();

@@ -388,6 +388,12 @@ ai_memory_managed_qs() {
     if [ -n "${AI_MEMORY_RUN_ID:-}" ]; then
         printf '&managed_run=%s' "$(ai_memory_url_encode "$AI_MEMORY_RUN_ID")"
     fi
+    # How a launcher started this session (#2180): forwarded only for the
+    # recognised `automation` token, so the server can stamp the session and
+    # the profile harvester can skip its prompts.
+    if [ "$(printf '%s' "${AI_MEMORY_SESSION_ORIGIN:-}" | tr -d '[:space:]')" = "automation" ]; then
+        printf '&session_origin=automation'
+    fi
     case "$(printf '%s' "${AI_MEMORY_AUTO_HANDOFF:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
         0|false|no|off) printf '&auto_handoff=0' ;;
     esac

@@ -56,6 +56,7 @@ pub(crate) async fn session(store: &Store, ws: WorkspaceId, proj: ProjectId) -> 
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -521,6 +522,7 @@ async fn stream_off_ranks_byte_identically_to_a_store_without_observations() {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();

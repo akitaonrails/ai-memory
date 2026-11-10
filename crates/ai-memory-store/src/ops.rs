@@ -2702,6 +2702,10 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
         .cwd
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    // `begin_session` creates interactive and system sessions (MCP `begin`,
+    // backfill, maintenance), which never carry a launcher origin, so this path
+    // leaves `sessions.origin` at its NULL default (#2180). The hook ingest path
+    // (`admit_hook_session_event`) is the only writer of a non-NULL origin.
     conn.execute(
         "INSERT INTO sessions \
          (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
@@ -3496,14 +3500,15 @@ pub fn admit_hook_session_event(
         Option<i64>,
         u64,
         Option<String>,
+        Option<String>,
     );
     let existing: Option<Row> = tx.query_row(
-        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count, cwd FROM sessions WHERE id = ?1",
+        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count, cwd, origin FROM sessions WHERE id = ?1",
         params![session.id.as_bytes()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
     ).optional()?;
     let (owner, ended_at, ended_count, stored_cwd, scope) = match existing {
-        Some((ws, project, agent, owner, ended_at, ended_count, cwd)) => {
+        Some((ws, project, agent, owner, ended_at, ended_count, cwd, stored_origin)) => {
             // Corrupt owners fail closed, including for Any recovery. Owner
             // and agent identify WHO the session belongs to, so a mismatch
             // there is a genuine UUID collision and is terminal. The owner is
@@ -3549,6 +3554,20 @@ pub fn admit_hook_session_event(
                 tx.commit()?;
                 return Ok(HookSessionAdmission::InvalidScopedEnd);
             }
+            // A session row can be created by the handoff-accept path before
+            // this automation-tagged capture event arrives (#2180). Stamp the
+            // origin the first time an automation event meets a row that has
+            // none, so the profile harvester's origin filter is reliable no
+            // matter which path created the row. The `origin IS NULL` guard
+            // bounds this to one effective write per session.
+            if let Some(origin) = session.origin
+                && stored_origin.is_none()
+            {
+                tx.execute(
+                    "UPDATE sessions SET origin = ?2 WHERE id = ?1 AND origin IS NULL",
+                    params![session.id.as_bytes(), origin.as_str()],
+                )?;
+            }
             let scope = if session_end {
                 (
                     WorkspaceId::from_slice(&ws)?,
@@ -3580,8 +3599,8 @@ pub fn admit_hook_session_event(
             // back to it when absent (live capture).
             let started_at = session.occurred_at.unwrap_or(now);
             tx.execute(
-                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), started_at, session.actor_user.as_deref()],
+                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), started_at, session.actor_user.as_deref(), session.origin.map(|o| o.as_str())],
             )?;
             (
                 session.actor_user.clone(),
@@ -9988,6 +10007,7 @@ pub(crate) mod tests {
                 agent_kind: kind,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             };
             begin_session(&mut conn, &session).unwrap_or_else(|e| {
                 panic!(
@@ -10287,6 +10307,7 @@ pub(crate) mod tests {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: owner.map(str::to_owned),
+            origin: None,
         }
     }
 
@@ -14822,6 +14843,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -14922,6 +14944,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15004,6 +15027,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15052,6 +15076,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15114,6 +15139,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 },
             )
             .unwrap();
@@ -15164,6 +15190,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15370,6 +15397,7 @@ pub(crate) mod tests {
                     agent_kind,
                     cwd: Some(std::path::PathBuf::from(r"C:\GIT\ai-memory")),
                     actor_user: None,
+                    origin: None,
                 },
             )
             .unwrap();
@@ -15401,6 +15429,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15445,6 +15474,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15476,6 +15506,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15506,6 +15537,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15540,6 +15572,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15571,6 +15604,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15617,6 +15651,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -16401,6 +16436,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -17049,6 +17085,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/repo/src".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -18318,6 +18355,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -18386,6 +18424,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -19188,6 +19227,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 },
             )
             .is_err(),
@@ -19205,6 +19245,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();

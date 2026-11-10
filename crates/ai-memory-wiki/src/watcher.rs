@@ -1176,6 +1176,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1272,6 +1273,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -3046,6 +3048,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

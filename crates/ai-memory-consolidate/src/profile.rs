@@ -2136,6 +2136,8 @@ pub async fn run_profile_pass(
     report.share = Some(share.as_str());
     let llm = llm.filter(|_| config.settings.llm);
     let max_tokens = config.settings.max_output_tokens;
+    let skip_automation =
+        config.settings.harvest_prompts == ai_memory_core::profile::HarvestPrompts::Interactive;
     let mut classify_budget = MAX_CLASSIFY_CALLS;
 
     for project in reader.profile_harvest_projects().await? {
@@ -2147,6 +2149,7 @@ pub async fn run_profile_pass(
             &project,
             &mut classify_budget,
             max_tokens,
+            skip_automation,
         )
         .await
         {
@@ -2187,6 +2190,7 @@ pub async fn run_profile_pass(
 
 /// Harvest one project from its marks. Returns new candidates, LLM calls and
 /// LLM fallbacks.
+#[allow(clippy::too_many_arguments)]
 async fn harvest_project(
     reader: &ReaderPool,
     writer: &WriterHandle,
@@ -2195,6 +2199,7 @@ async fn harvest_project(
     project: &ProfileHarvestProject,
     classify_budget: &mut usize,
     max_tokens: u32,
+    skip_automation: bool,
 ) -> Result<(usize, usize, usize), ai_memory_store::StoreError> {
     let (prompts, pages, tags) = reader
         .profile_harvest_inputs(
@@ -2202,6 +2207,7 @@ async fn harvest_project(
             project.project_id,
             project.mark,
             PROFILE_HARVEST_BATCH,
+            skip_automation,
         )
         .await?;
     // A page stamped from an auto-improve proposal the scheduler

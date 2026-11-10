@@ -1030,6 +1030,7 @@ mod tests {
                     agent_kind: ai_memory_core::AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1429,6 +1430,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1460,6 +1462,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1601,6 +1604,7 @@ mod tests {
                     agent_kind: ai_memory_core::AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1747,6 +1751,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1855,6 +1860,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1905,6 +1911,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

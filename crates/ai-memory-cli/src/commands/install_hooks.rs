@@ -4890,6 +4890,9 @@ pub(crate) fn ts_apply_marker_params(
     let body = r#"function applyMarkerParams(url: URL, cwd: string | undefined): boolean {
   const managedRun = process.env.AI_MEMORY_RUN_ID;
   if (managedRun) url.searchParams.set("managed_run", managedRun);
+  if ((process.env.AI_MEMORY_SESSION_ORIGIN ?? "").trim() === "automation") {
+    url.searchParams.set("session_origin", "automation");
+  }
   if (/^(0|false|no|off)$/.test((process.env.AI_MEMORY_AUTO_HANDOFF ?? "").trim().toLowerCase())) {
     url.searchParams.set("auto_handoff", "0");
   }
@@ -14342,6 +14345,11 @@ model = "gpt-5"
         assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"project_strategy\", projectStrategy)"));
         assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        // #2180: the generated client forwards an automation launcher's
+        // `AI_MEMORY_SESSION_ORIGIN` so the server can stamp the session and the
+        // profile harvester can skip its prompts. Only the recognised token.
+        assert!(plugin.contains("process.env.AI_MEMORY_SESSION_ORIGIN"));
+        assert!(plugin.contains("url.searchParams.set(\"session_origin\", \"automation\")"));
         assert!(plugin.contains("function tomlFlag"));
         assert!(plugin.contains("tomlFlag(body, \"default_global\")"));
         assert!(plugin.contains("tomlFlag(body, \"inject_on_session_start\")"));

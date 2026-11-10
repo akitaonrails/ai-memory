@@ -374,6 +374,7 @@ async fn digest_inputs_read_entries_stack_and_newness() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo/app".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -413,6 +414,145 @@ async fn digest_inputs_read_entries_stack_and_newness() {
         inputs.project_tags
     );
     assert!(inputs.project_has_pages);
+}
+
+/// The hook-ingest path (the only writer of a non-NULL origin) stamps it both
+/// when it creates the session row and when the row already exists (a
+/// handoff-accept or any prior event beat the first automation-tagged capture).
+/// `harvest_prompts = "interactive"` then skips both automation sessions'
+/// prompts while an ordinary origin-less session still contributes; the default
+/// keeps everything (#2180).
+#[tokio::test]
+async fn hook_ingest_stamps_origin_on_create_and_on_an_existing_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = default_workspace(&store).await;
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_owned(), None)
+        .await
+        .unwrap();
+
+    // An ordinary interactive session: `begin_session` leaves origin NULL, so it
+    // is never filtered. Its prompt is the control the filter must keep.
+    let interactive = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: interactive,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    store
+        .writer
+        .insert_observation(Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: interactive,
+                workspace_id: ws,
+                project_id: app,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: String::new(),
+                body: "use pnpm here".to_owned(),
+                importance: 5,
+                file_path: None,
+            },
+            &Sanitizer::builtin(),
+        ))
+        .await
+        .unwrap();
+
+    // Session A: the automation capture event creates the row itself.
+    let created_by_capture = SessionId::new();
+    // Session B: an origin-less row exists first (e.g. handoff accept), then the
+    // automation capture event arrives and must stamp it.
+    let pre_existing = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: pre_existing,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+
+    for (session, body) in [
+        (created_by_capture, "created by the automation capture"),
+        (pre_existing, "stamped onto the existing row"),
+    ] {
+        let new_session = NewSession {
+            occurred_at: None,
+            id: session,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+            origin: Some(ai_memory_core::SessionOrigin::Automation),
+        };
+        let obs = NewObservation {
+            occurred_at: None,
+            session_id: session,
+            workspace_id: ws,
+            project_id: app,
+            kind: ObservationKind::UserPrompt,
+            extension: None,
+            source_event: None,
+            title: String::new(),
+            body: body.to_owned(),
+            importance: 5,
+            file_path: None,
+        };
+        store
+            .writer
+            .admit_hook_session_event(
+                new_session,
+                Sanitized::new(obs, &Sanitizer::builtin()),
+                ai_memory_core::OwnerFilter::Any,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let mark = ai_memory_store::ProfileHarvestMark::default();
+    // With the policy off every prompt is read (control).
+    let (all, _, _) = store
+        .reader
+        .profile_harvest_inputs(ws, app, mark, 50, false)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3, "all three prompts present without the filter");
+    // With the policy on, both automation sessions are filtered (the one the
+    // capture created and the one whose row already existed), and only the
+    // interactive session's prompt remains.
+    let (kept, _, _) = store
+        .reader
+        .profile_harvest_inputs(ws, app, mark, 50, true)
+        .await
+        .unwrap();
+    let bodies: Vec<&str> = kept.iter().map(|p| p.body.as_str()).collect();
+    assert_eq!(bodies, vec!["use pnpm here"], "only the interactive prompt");
+    assert!(
+        kept.iter().all(|p| p.session_id == interactive),
+        "both automation sessions must be filtered out"
+    );
 }
 
 /// Newness honours the TTL, both directions. A project whose every page has

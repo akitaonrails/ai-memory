@@ -957,6 +957,7 @@ mod tests {
                 agent_kind: AgentKind::Hermes,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1016,6 +1017,7 @@ mod tests {
                 agent_kind: AgentKind::KiroCli,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1089,6 +1091,7 @@ mod tests {
                 agent_kind: AgentKind::CommandCode,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1162,6 +1165,7 @@ mod tests {
                 agent_kind: AgentKind::Pool,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1230,6 +1234,7 @@ mod tests {
                 agent_kind: AgentKind::Zcode,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1331,6 +1336,7 @@ mod tests {
                 agent_kind: AgentKind::Grizzybot,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1404,6 +1410,7 @@ mod tests {
                 agent_kind: AgentKind::CopilotCli,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1493,6 +1500,7 @@ mod tests {
                 agent_kind: AgentKind::Droid,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1615,6 +1623,7 @@ mod tests {
                 agent_kind: AgentKind::Muse,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1737,6 +1746,7 @@ mod tests {
                 agent_kind: AgentKind::CodeBuddy,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1844,6 +1854,7 @@ mod tests {
                 agent_kind: AgentKind::IbmBob,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -1953,6 +1964,7 @@ mod tests {
                 agent_kind: AgentKind::QwenCode,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -2044,6 +2056,7 @@ mod tests {
                 agent_kind: AgentKind::Qoder,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -2195,6 +2208,7 @@ mod tests {
                 agent_kind: AgentKind::WorkBuddy,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -2235,6 +2249,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: Some("user:alice".into()),
+                origin: None,
             },
         )
         .unwrap();
@@ -2658,6 +2673,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -2754,6 +2770,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -2923,6 +2940,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();

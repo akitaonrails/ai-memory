@@ -11429,6 +11429,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -11986,6 +11987,7 @@ mod tests {
                 cwd: None,
                 actor_user: None,
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12284,6 +12286,7 @@ mod tests {
                 cwd: None,
                 actor_user: None,
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12367,6 +12370,7 @@ mod tests {
                         cwd: None,
                         actor_user,
                         occurred_at: None,
+                        origin: None,
                     })
                     .await
                     .unwrap();
@@ -12464,6 +12468,7 @@ mod tests {
                     cwd: None,
                     actor_user: None,
                     occurred_at: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -15403,6 +15408,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -15537,6 +15543,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -15976,6 +15983,7 @@ mod tests {
                     agent_kind: AgentKind::Codex,
                     cwd: None,
                     actor_user: Some(owner.clone()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -16126,6 +16134,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -17969,6 +17978,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -18233,6 +18243,7 @@ mod tests {
                 agent_kind,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -18640,6 +18651,7 @@ mod tests {
                 cwd: Some(cwd.into()),
                 actor_user: actor_user
                     .map(|user| ai_memory_core::IdentityKey::User(user.into()).storage_key()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -20074,6 +20086,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -24002,6 +24015,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: Some(ai_memory_core::IdentityKey::User("alice".into()).storage_key()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -24942,6 +24956,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -25661,6 +25676,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/tmp/aim".into()),
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -27104,6 +27120,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -27521,6 +27538,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -27709,6 +27727,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -28108,6 +28127,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

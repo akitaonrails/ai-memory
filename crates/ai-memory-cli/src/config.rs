@@ -6485,11 +6485,18 @@ input_token_safety_margin = {margin}
 
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
+        // Defaults keep the historical harvest behaviour (#2180).
+        assert_eq!(
+            defaults.harvest_prompts,
+            ai_memory_core::profile::HarvestPrompts::All
+        );
+
         std::fs::write(
             &cfg_path,
             "[profile]\nenabled = true\nshare = \"workspace\"\nmin_projects = 3\n\
              inject_on_session_start = false\ndigest_max_bytes = 4000\n\
-             baseline_max_bytes = 8000\napply_max_lines = 20\nllm = false\n",
+             baseline_max_bytes = 8000\napply_max_lines = 20\nllm = false\n\
+             harvest_prompts = \"interactive\"\n",
         )
         .unwrap();
         let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
@@ -6501,6 +6508,10 @@ input_token_safety_margin = {margin}
         assert_eq!(cfg.profile.baseline_max_bytes, 8_000);
         assert_eq!(cfg.profile.apply_max_lines, 20);
         assert!(!cfg.profile.llm);
+        assert_eq!(
+            cfg.profile.harvest_prompts,
+            ai_memory_core::profile::HarvestPrompts::Interactive
+        );
         assert_eq!(
             cfg.profile.effective_share(true),
             Some(EffectiveProfileShare::Workspace)

@@ -14777,6 +14777,7 @@ impl ReaderPool {
         project_id: ProjectId,
         mark: crate::ProfileHarvestMark,
         limit: usize,
+        skip_automation: bool,
     ) -> StoreResult<(
         Vec<crate::ProfilePromptRow>,
         Vec<crate::ProfilePageRow>,
@@ -14790,6 +14791,7 @@ impl ReaderPool {
                     project_id,
                     mark.observations_until,
                     limit,
+                    skip_automation,
                 )?,
                 crate::profile::profile_pages_since(
                     conn,
@@ -17813,6 +17815,7 @@ mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(cwd.into()),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -18317,6 +18320,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -18331,6 +18335,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

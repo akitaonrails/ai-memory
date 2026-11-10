@@ -117,6 +117,7 @@ async fn harness_with_two_sessions() -> Harness {
                 agent_kind: ai_memory_core::AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

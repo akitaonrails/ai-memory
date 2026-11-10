@@ -62,6 +62,11 @@ const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGE
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
+/// How a launcher started this session (#2180). An orchestrator sets
+/// `AI_MEMORY_SESSION_ORIGIN=automation` so the server can stamp the session
+/// and the profile harvester can skip its prompts. Inherited execution
+/// context, like `AI_MEMORY_RUN_ID`; only a recognised token is forwarded.
+const SESSION_ORIGIN_ENV: &str = "AI_MEMORY_SESSION_ORIGIN";
 /// Per-execution opt-out of the automatic handoff (#1951): a falsy value
 /// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
 const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
@@ -843,6 +848,22 @@ fn managed_run_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<Stri
 
 fn managed_run_query_suffix() -> String {
     managed_run_query_suffix_with(env_lookup)
+}
+
+/// `&session_origin=<token>` when the launcher declared a recognised origin via
+/// `AI_MEMORY_SESSION_ORIGIN` (#2180). Validated against the closed set here so
+/// an unknown value never reaches the wire; absent sends nothing, matching an
+/// ordinary interactive session.
+fn session_origin_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
+    env_lookup(SESSION_ORIGIN_ENV)
+        .and_then(|value| ai_memory_core::SessionOrigin::parse_wire(&value))
+        .map_or_else(String::new, |origin| {
+            format!("&session_origin={}", url_encode(origin.as_str()))
+        })
+}
+
+fn session_origin_query_suffix() -> String {
+    session_origin_query_suffix_with(env_lookup)
 }
 
 /// `&auto_handoff=0` when `AI_MEMORY_AUTO_HANDOFF` turns the automatic
@@ -2115,8 +2136,9 @@ where
     let mut incremental_background_drain = false;
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
     let managed_qs = managed_run_query_suffix();
+    let session_origin_qs = session_origin_query_suffix();
     let auto_handoff_qs = auto_handoff_query_suffix_with(env_lookup);
-    let hook_qs = format!("{qs}{session_qs}{managed_qs}{auto_handoff_qs}");
+    let hook_qs = format!("{qs}{session_qs}{managed_qs}{session_origin_qs}{auto_handoff_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
     // mode is decided without a round-trip: an explicit `--auth-token` is
@@ -3474,6 +3496,41 @@ mod tests {
         }
         for keep in [None, Some(""), Some("on"), Some("1"), Some("maybe")] {
             assert_eq!(auto_handoff_query_suffix_with(lookup(keep)), "", "{keep:?}");
+        }
+    }
+
+    #[test]
+    fn session_origin_env_forwards_only_the_recognised_token() {
+        let lookup = |value: Option<&'static str>| {
+            move |name: &str| {
+                (name == SESSION_ORIGIN_ENV)
+                    .then_some(value)
+                    .flatten()
+                    .map(str::to_owned)
+            }
+        };
+        assert_eq!(
+            session_origin_query_suffix_with(lookup(Some("automation"))),
+            "&session_origin=automation",
+        );
+        assert_eq!(
+            session_origin_query_suffix_with(lookup(Some(" automation "))),
+            "&session_origin=automation",
+        );
+        // An unknown or absent origin forwards nothing, so the server sees an
+        // ordinary interactive session (#2180).
+        for none in [
+            None,
+            Some(""),
+            Some("auto"),
+            Some("Automation"),
+            Some("batch"),
+        ] {
+            assert_eq!(
+                session_origin_query_suffix_with(lookup(none)),
+                "",
+                "{none:?}"
+            );
         }
     }
 

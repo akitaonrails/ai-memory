@@ -449,6 +449,7 @@ async fn project_search_shows_observation_excerpts_only_to_the_sessions_owner() 
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: Some(ai_memory_core::IdentityKey::User("alice".into()).storage_key()),
+            origin: None,
         })
         .await
         .unwrap();
@@ -930,6 +931,7 @@ async fn kind_and_tier_filters_hold_in_every_stream() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

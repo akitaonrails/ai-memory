@@ -241,6 +241,7 @@ async fn dashboard_metric_links_sort_filter_and_reject_unknown_views() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1956,6 +1957,7 @@ async fn seed_session(
             agent_kind: AgentKind::OpenCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4167,6 +4169,7 @@ async fn project_view_shows_agent_attribution() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4239,6 +4242,7 @@ async fn project_view_shows_session_token_usage() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4311,6 +4315,7 @@ async fn project_view_ranks_live_token_responses_and_flags_large_usage() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4391,6 +4396,7 @@ async fn project_view_session_without_usage_shows_dash_not_zero() {
             agent_kind: AgentKind::OpenCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

@@ -123,6 +123,7 @@ async fn seed_ended_session_summary(
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -223,6 +224,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -926,6 +928,7 @@ async fn purge_session_dry_run_and_confirmed_purge_both_report_collateral_damage
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1711,6 +1714,7 @@ async fn purge_project_dry_run_counts_observations_stamped_from_another_projects
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1854,6 +1858,7 @@ async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();

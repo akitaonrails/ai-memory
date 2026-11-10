@@ -77,6 +77,7 @@ async fn harness() -> Harness {
             cwd: None,
             actor_user: None,
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();

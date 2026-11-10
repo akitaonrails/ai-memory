@@ -866,6 +866,12 @@ brief_on_project_change = false
 # through 20000). apply_max_lines is the most lines `ai-memory profile apply`
 # writes into a rules file. llm lets the profile use the configured LLM
 # provider when there is one.
+#
+# harvest_prompts is "all" (the default) or "interactive". "interactive" skips
+# prompts from sessions a launcher stamped as automation (an orchestrator sets
+# `AI_MEMORY_SESSION_ORIGIN=automation` in the harness environment), so a
+# generated brief is not harvested as your own preference. Those sessions are
+# still captured, and their curated pages and stack signals still contribute.
 # [profile]
 # enabled = "auto"
 # share = "auto"
@@ -876,6 +882,7 @@ brief_on_project_change = false
 # apply_max_lines = 40
 # max_output_tokens = 2000
 # llm = true
+# harvest_prompts = "all"
 
 # Admission webhooks: synchronous HTTP hooks the server calls just before it
 # persists a page (docs/admission-webhooks.md). Empty by default, so no chain is

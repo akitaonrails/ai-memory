@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `[profile] harvest_prompts = "interactive"` keeps an orchestrator's generated
+  session briefs out of the cross-project profile. A launcher sets
+  `AI_MEMORY_SESSION_ORIGIN=automation` in the harness environment; the hook
+  clients forward it, the server stamps a new `sessions.origin` column
+  (migration V104), and the profile harvester skips `user-prompt` observations
+  from those sessions. Capture, handoff and recall are unchanged, and the
+  automated sessions' curated pages and stack signals still contribute. The
+  default, `all`, harvests every session's prompts exactly as before (#2180).
 - `ai-memory call <tool> [json-arguments]` is a shell path to every MCP
   tool for agents that cannot or should not load MCP (`memory_query`,
   `memory_briefing`, `memory_patch_page`, `memory_handoff_begin`, and the rest).

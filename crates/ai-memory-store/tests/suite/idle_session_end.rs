@@ -41,6 +41,7 @@ fn backdated(started_at_us: i64, actor_user: Option<String>) -> NewSession {
         agent_kind: AgentKind::Codex,
         cwd: Some("/repo".into()),
         actor_user,
+        origin: None,
     }
 }
 

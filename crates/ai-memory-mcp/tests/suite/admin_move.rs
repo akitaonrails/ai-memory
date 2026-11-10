@@ -475,6 +475,7 @@ async fn a_copy_purge_merge_requires_its_own_acknowledgement() {
             agent_kind: AgentKind::Codex,
             cwd: Some("/src/proj".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -829,6 +830,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -2308,6 +2310,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -2671,6 +2674,7 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -2801,6 +2805,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -2890,6 +2895,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -3578,6 +3584,7 @@ async fn merge_project_dry_run_then_preserves_history_and_sessions() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -3724,6 +3731,7 @@ async fn merge_project_refuses_open_sessions_and_foreign_ids() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

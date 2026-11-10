@@ -381,6 +381,7 @@ async fn a_sender_named_by_its_remote_reaches_the_repository_owner_past_an_empty
             agent_kind: ai_memory_core::AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .expect("twin session");
