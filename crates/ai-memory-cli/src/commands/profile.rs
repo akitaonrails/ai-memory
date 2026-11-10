@@ -232,14 +232,20 @@ async fn list(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<()> {
     Ok(())
 }
 
-/// A profile path as the user may type it: with or without `profile/`.
+/// A profile path as the user may type it: with or without the `profile/`
+/// prefix, and with or without the `.md` suffix. `profile list` and the digest
+/// name entries as `profile/<name>.md`, so both forms resolve to that page.
 fn profile_path(raw: &str) -> String {
     let raw = raw.trim().trim_start_matches('/');
-    if raw.starts_with(ai_memory_core::profile::PROFILE_PATH_PREFIX) {
+    let mut path = if raw.starts_with(ai_memory_core::profile::PROFILE_PATH_PREFIX) {
         raw.to_owned()
     } else {
         format!("{}{raw}", ai_memory_core::profile::PROFILE_PATH_PREFIX)
+    };
+    if !path.ends_with(".md") {
+        path.push_str(".md");
     }
+    path
 }
 
 async fn profile_scope(ep: &ServerEndpoint, scope: &ProfileScopeArgs) -> Result<ScopeNames> {
@@ -305,23 +311,21 @@ async fn forget(ep: &ServerEndpoint, scope: &ProfileScopeArgs, path: &str) -> Re
     )
     .await
     .with_context(|| format!("forgetting {path}"))?;
-    if resp.deleted {
-        println!(
-            "{}",
-            i18n.format(
-                "cli-profile-forgot-the-git-history-keeps-it",
-                &[("value0", terminal_text(&resp.path))]
-            )
-        );
-    } else {
-        println!(
-            "{}",
-            i18n.format(
-                "cli-profile-was-not-in-the-profile-nothing-changed",
-                &[("value0", terminal_text(&resp.path))]
-            )
-        );
+    if !resp.deleted {
+        // The server reports whether a page actually existed, so a typo'd or
+        // already-forgotten entry fails loudly instead of printing "Forgot".
+        bail!(i18n.format(
+            "cli-profile-was-not-in-the-profile-nothing-changed",
+            &[("value0", terminal_text(&resp.path))]
+        ));
     }
+    println!(
+        "{}",
+        i18n.format(
+            "cli-profile-forgot-the-git-history-keeps-it",
+            &[("value0", terminal_text(&resp.path))]
+        )
+    );
     Ok(())
 }
 
@@ -776,6 +780,22 @@ mod tests {
             "profile/tools/pnpm.md"
         );
         assert_eq!(profile_path(" /tools/pnpm.md "), "profile/tools/pnpm.md");
+    }
+
+    #[test]
+    fn profile_paths_gain_the_md_suffix_when_typed_as_the_digest_names_them() {
+        // `profile list` and the digest name entries `profile/<name>.md`, and
+        // people type them without the suffix. `show`/`forget` must resolve the
+        // same page either way (#2181).
+        assert_eq!(
+            profile_path("workflow/never-push"),
+            "profile/workflow/never-push.md"
+        );
+        assert_eq!(
+            profile_path("profile/workflow/never-push"),
+            "profile/workflow/never-push.md"
+        );
+        assert_eq!(profile_path(" stack/python "), "profile/stack/python.md");
     }
 
     #[test]

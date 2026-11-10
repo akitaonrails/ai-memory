@@ -45,6 +45,9 @@ enum RewriteOp {
     /// Zero hooks.json — `hooks` array entries whose `id` carries the
     /// `ai-memory-` prefix.
     ZeroHooksJson,
+    /// ZCode `~/.zcode/cli/config.json` — `hooks.events` matcher-group
+    /// entries whose `statusMessage` carries the `ai-memory` signature.
+    ZcodeHooksJson,
     /// Kimi Code `[[hooks]]` rules inside config.toml.
     KimiCodeHooksToml,
     /// Kiro CLI v2 agent-config hooks with exact generated command signatures.
@@ -63,6 +66,9 @@ enum HookConfigShape {
     NestedHooksKey,
     /// Devin `hooks.v1.json`: the file itself is `{ "Event": [...] }`.
     FlatHookFile,
+    /// Cursor `hooks.json`: the nested shape, written back with every `/`
+    /// escaped so Cursor's comment stripper keeps the file.
+    CursorHooksFile,
 }
 
 /// Generated files that uninstall may delete after content re-validation.
@@ -249,7 +255,7 @@ fn build_plan(
             ),
             (
                 install_hooks::cursor_hooks_path()?,
-                HookConfigShape::NestedHooksKey,
+                HookConfigShape::CursorHooksFile,
             ),
             (
                 install_hooks::gemini_settings_path()?,
@@ -314,6 +320,7 @@ fn build_plan(
             let removal = match shape {
                 HookConfigShape::NestedHooksKey => strip_ai_memory_hooks(&content)?,
                 HookConfigShape::FlatHookFile => strip_ai_memory_hooks_flat(&content)?,
+                HookConfigShape::CursorHooksFile => strip_cursor_hooks(&content)?,
             };
             push_rewrite(
                 &mut plan,
@@ -388,6 +395,23 @@ fn build_plan(
                 zero,
                 removal.removed_events,
                 RewriteOp::ZeroHooksJson,
+            );
+        }
+
+        // ZCode installs its capture under `hooks.events` in
+        // `~/.zcode/cli/config.json`; without this pass `uninstall --only hooks`
+        // reports "nothing to remove" while all six generated hooks stay live
+        // (GHSA-qmg7-f7fg-rg4x).
+        let zcode = install_hooks::zcode_config_path()?;
+        if zcode.exists() {
+            let content = std::fs::read_to_string(&zcode)
+                .with_context(|| format!("reading {}", zcode.display()))?;
+            let removal = strip_zcode_hooks(&content)?;
+            push_rewrite(
+                &mut plan,
+                zcode,
+                removal.removed_events,
+                RewriteOp::ZcodeHooksJson,
             );
         }
 
@@ -768,10 +792,14 @@ fn apply_change(
                         RewriteOp::HooksJson(HookConfigShape::FlatHookFile) => {
                             strip_ai_memory_hooks_flat(&out)?.new_content
                         }
+                        RewriteOp::HooksJson(HookConfigShape::CursorHooksFile) => {
+                            strip_cursor_hooks(&out)?.new_content
+                        }
                         RewriteOp::AntigravityHooksJson => {
                             strip_antigravity_hooks(&out)?.new_content
                         }
                         RewriteOp::ZeroHooksJson => strip_zero_hooks(&out)?.new_content,
+                        RewriteOp::ZcodeHooksJson => strip_zcode_hooks(&out)?.new_content,
                         RewriteOp::KimiCodeHooksToml => strip_kimi_code_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV2HooksJson => strip_kiro_cli_v2_hooks(&out)?.new_content,
                         RewriteOp::KiroCliV3HooksJson => strip_kiro_cli_v3_hooks(&out)?.new_content,
@@ -1411,6 +1439,15 @@ fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
     })
 }
 
+/// Strip ai-memory's entries from Cursor's `hooks.json` and keep the escaped
+/// `\/` form install writes, so a `//` in a hook the user keeps does not make
+/// Cursor drop the whole file.
+fn strip_cursor_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removal = strip_ai_memory_hooks(content)?;
+    removal.new_content = install_hooks::escape_slashes_for_cursor_jsonc(&removal.new_content);
+    Ok(removal)
+}
+
 /// Remove ai-memory's entries from Zero's hooks.json `hooks` array. Zero
 /// hook entries are objects with an `id`; install writes ours with the
 /// `ai-memory-` prefix (issue #156), so the prefix IS the ownership
@@ -1432,6 +1469,68 @@ fn strip_zero_hooks(content: &str) -> Result<HookRemoval> {
             }
             !ours
         });
+        Ok(())
+    })?;
+    Ok(HookRemoval {
+        new_content,
+        removed_events,
+    })
+}
+
+/// Remove ai-memory's hook entries from ZCode's `~/.zcode/cli/config.json`
+/// `hooks.events` map (#512, GHSA-qmg7-f7fg-rg4x). Entries ai-memory wrote
+/// carry a `statusMessage` starting with `ai-memory`
+/// (`install_hooks::is_our_zcode_hook`), so ownership is proven by that
+/// signature alone and every sibling survives untouched: `hooks.enabled`,
+/// `hooks.maxOutputBytes`, other agents' hooks sharing a matcher group, and
+/// events ai-memory never wrote. A matcher group our own withdrawal empties is
+/// dropped (an empty group runs nothing and is pure downside under ZCode's
+/// strict validation); a group that was already empty, or still holds someone
+/// else's hooks, is left alone. An event key left with no matcher groups is
+/// removed, but the `hooks` block and its settings are not.
+fn strip_zcode_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removed_events = Vec::new();
+    let new_content = mutate_json(content, |root| {
+        let Some(events) = root
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.as_object_mut())
+            .and_then(|hooks| hooks.get_mut("events"))
+            .and_then(|events| events.as_object_mut())
+        else {
+            return Ok(());
+        };
+        let names: Vec<String> = events.keys().cloned().collect();
+        for name in names {
+            let Some(groups) = events.get_mut(&name).and_then(|slot| slot.as_array_mut()) else {
+                continue;
+            };
+            let mut removed_from_event = false;
+            groups.retain_mut(|group| {
+                let Some(hooks) = group
+                    .as_object_mut()
+                    .and_then(|group| group.get_mut("hooks"))
+                    .and_then(|v| v.as_array_mut())
+                else {
+                    return true;
+                };
+                let before = hooks.len();
+                hooks.retain(|hook| !install_hooks::is_our_zcode_hook(hook));
+                let we_emptied = hooks.len() != before;
+                if we_emptied {
+                    removed_from_event = true;
+                }
+                // Drop a group only when our own withdrawal is what emptied it;
+                // a pre-existing empty group, or one still running someone
+                // else's hook, stays.
+                !(we_emptied && hooks.is_empty())
+            });
+            if removed_from_event {
+                removed_events.push(name.clone());
+            }
+            if groups.is_empty() {
+                events.remove(&name);
+            }
+        }
         Ok(())
     })?;
     Ok(HookRemoval {
@@ -2609,6 +2708,30 @@ mod tests {
     }
 
     #[test]
+    fn strip_cursor_hooks_keeps_the_kept_hooks_loadable_by_cursor() {
+        let content = r#"{
+      "version": 1,
+      "hooks": {
+        "stop": [
+          {"type":"command","command":"AI_MEMORY_HOOK_URL=https:\/\/h \/x\/stop.sh"},
+          {"type":"command","command":"curl -s https:\/\/example.com\/ping"}
+        ]
+      }
+    }"#;
+        let out = strip_cursor_hooks(content).unwrap();
+        assert_eq!(out.removed_events, vec!["stop".to_string()]);
+        assert!(
+            !out.new_content.contains("//"),
+            "a bare // makes Cursor drop the file: {}",
+            out.new_content
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        let stop = v["hooks"]["stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "only ours removed");
+        assert_eq!(stop[0]["command"], "curl -s https://example.com/ping");
+    }
+
+    #[test]
     fn strip_hooks_prunes_emptied_hooks_object() {
         let content = r#"{"hooks":{"Stop":[{"type":"command","command":"AI_MEMORY_HOOK_URL=x /a/stop.sh"}]}}"#;
         let out = strip_ai_memory_hooks(content).unwrap();
@@ -2742,6 +2865,62 @@ mod tests {
             serde_json::json!(true),
             "the top-level enabled flag is not ours to touch"
         );
+    }
+
+    #[test]
+    fn strip_zcode_hooks_withdraws_ours_and_preserves_everything_else() {
+        // SessionStart: an ai-memory group next to a third-party group, so the
+        //   emptied ai-memory group is dropped and the other one stays.
+        // Stop: ai-memory and a user hook share one matcher group, so the group
+        //   survives with only the user hook.
+        // PreToolUse: only ai-memory, so the whole event key is removed.
+        // Notify: a pre-existing empty group we never touched must stay.
+        let content = r#"{
+            "model": "m",
+            "hooks": {
+                "enabled": true,
+                "maxOutputBytes": 65536,
+                "events": {
+                    "SessionStart": [
+                        {"hooks": [{"type":"command","command":"ai-memory","args":["hook"],"statusMessage":"ai-memory session start"}]},
+                        {"hooks": [{"type":"command","command":"printf x","statusMessage":"user hook"}]}
+                    ],
+                    "Stop": [
+                        {"hooks": [
+                            {"type":"command","command":"ai-memory","args":["hook"],"statusMessage":"ai-memory stop"},
+                            {"type":"command","command":"printf y","statusMessage":"user stop"}
+                        ]}
+                    ],
+                    "PreToolUse": [
+                        {"hooks": [{"type":"command","command":"ai-memory","args":["hook"],"statusMessage":"ai-memory pre tool"}]}
+                    ],
+                    "Notify": [
+                        {"hooks": []}
+                    ]
+                }
+            }
+        }"#;
+        let out = strip_zcode_hooks(content).unwrap();
+        let mut removed = out.removed_events.clone();
+        removed.sort();
+        assert_eq!(removed, vec!["PreToolUse", "SessionStart", "Stop"]);
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        assert_eq!(v["model"], "m", "siblings survive");
+        assert_eq!(v["hooks"]["enabled"], true);
+        assert_eq!(v["hooks"]["maxOutputBytes"], 65536);
+        let events = &v["hooks"]["events"];
+        // SessionStart kept its one non-ours group only.
+        let ss = events["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 1);
+        assert_eq!(ss[0]["hooks"][0]["statusMessage"], "user hook");
+        // Stop kept the shared group with only the user hook.
+        let stop = events["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(stop.len(), 1);
+        assert_eq!(stop[0]["statusMessage"], "user stop");
+        // PreToolUse was entirely ours and is gone.
+        assert!(events.get("PreToolUse").is_none(), "emptied event removed");
+        // A pre-existing empty group we did not touch stays.
+        assert_eq!(events["Notify"].as_array().unwrap().len(), 1);
     }
 
     // Devin's hooks.v1.json: the root object IS the event map (no "hooks"

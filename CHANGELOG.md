@@ -13,6 +13,30 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A hook event larger than the 10 MiB spool-entry cap (typically a base64
+  image in a `PostToolUse` `tool_response`) is no longer spooled whole. Such an
+  entry could be written but never read back, so it sat in `hook-spool/`
+  undeliverable forever — never sent, never charged an attempt, never aged out
+  — while `ai-memory doctor` kept counting it as waiting. It is now dropped as
+  one undelivered event at capture time, and an over-cap entry an older binary
+  already spooled is dropped (and counted) on the next drain instead of wedging
+  the queue. (#2179)
+- `ai-memory profile show` and `ai-memory profile forget` now accept an entry
+  the way `profile list` and the digest name it — with or without the `.md`
+  suffix — so `profile forget workflow/never-push` removes the entry instead
+  of targeting a non-existent `.md`-less sibling. `forget` also fails with a
+  non-zero exit when the entry was not there, because `/admin/delete-page` (and
+  the `memory_delete_page` tool) now report whether a page actually existed
+  rather than always claiming success. (#2181)
+- Fixed native install and reinstall with a trailing slash in
+  `AI_MEMORY_LIB_DIR`. (#2171)
+- Fixed conditional page reads returning a full response for a matching weak
+  ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
+- Fixed conditional page reads from configured cross-origin frontends by
+  exposing `ETag` and allowing `If-None-Match` on `/api/v1`. (#2175)
+- Fixed the container wrapper reporting success after a native host-client
+  extraction or install failure. The wrapper keeps the previous cached
+  archive and retries on the next host command that checks for updates. (#2174)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
@@ -46,8 +70,63 @@ version in [`docs/changelog/`](docs/changelog/):
   consolidation, the dream pass and the forget sweep never add that line, so on
   a default install the stream has almost nothing to rank until an agent writes
   an abstract by hand. (#2161)
-- Fixed conditional page reads from configured cross-origin frontends by
-  exposing `ETag` and allowing `If-None-Match` on `/api/v1`. (#2175)
+- The compaction recap now says "1 earlier prompt omitted to fit" when exactly
+  one older prompt does not fit its budget, instead of "1 earlier prompts
+  omitted". The anchor's own "1 prompt between these was omitted" line already
+  used the singular. (#2166)
+- `ai-memory uninstall` now keeps `~/.cursor/hooks.json` loadable by Cursor.
+  It removed ai-memory's entries and wrote the hooks you keep back with plain
+  `/`, so a hook with a URL such as `curl https://…` put a bare `//` in the
+  file and Cursor dropped every hook in it without a message. Uninstall now
+  writes the same `\/` escape that `install-hooks --agent cursor` writes.
+  (#2165)
+- `POST /admin/purge-session` (and `ai-memory purge-session --confirm`) for a
+  session that is not in the named workspace/project now answers 404 before
+  it does anything. It used to tell the `purge_session` admission webhook
+  about the purge and commit a `pre-purge-session` checkpoint of the wiki
+  first, and only then find that there was nothing to purge. (#2167)
+- The lint's `stale` rule now follows `[decay.half_life_days] episodic` when
+  it is set. The rule only flags episodic pages, but every lint path (the
+  `memory_lint` tool, `POST /admin/lint` and the scheduled lint) derived its
+  threshold from the scalar `[decay] lambda`, while the forget sweep scores
+  those same pages on the episodic curve. With `episodic = 180` an unread
+  session page was reported stale after about 30 days instead of about 156.
+  (#2168)
+- A native transcript export now records a loss when a message carries a
+  pasted image or attached document (Claude `image` / `document` blocks, Pi
+  `image` blocks, Codex `input_image` items). The text of the message was kept
+  and the attachment was dropped with nothing in the export's losses, unlike
+  images in tool results and every other excluded block type. (#2169)
+- `POST /admin/move-session` (and `ai-memory move-session --confirm`) now
+  refuses an open session, or one with a pending consolidation job, before it
+  writes its `pre-move-session` wiki checkpoint. The 409 used to come back
+  after that commit had already been added. (#2170)
+- On Windows, the hook commands generated for agents whose runner is
+  PowerShell (Codex, Grok, DSH, Copilot CLI, Gemini CLI) now single-quote the
+  executable, `--data-dir`, server URL, token and project strategy. They were
+  double-quoted, and PowerShell expands `$name` and backtick escapes inside
+  double quotes, so an install path or data dir containing either (`$` is legal
+  in Windows user and folder names) reached the hook rewritten: a `bin $HOME`
+  folder became `bin C:\Users\<you>` and no hook ran. cmd.exe agents and
+  Antigravity are unchanged, and existing entries are still recognized and
+  replaced on re-apply. (#2176)
+- `restore --with-config` (and a restore into a data dir with no
+  `config.toml`) now checks that the backup's config, with the environment
+  applied, supplies the `[auth].token_pepper` its API keys were hashed with,
+  before anything live is replaced. It used to skip that check, report success,
+  and leave a server that refused to start; the refusal now points at the
+  original pepper instead of `--with-config`. (#2172)
+
+### Security
+
+- `ai-memory uninstall --only hooks` now withdraws ZCode's capture hooks. ZCode
+  stores its wiring under `hooks.events` in `~/.zcode/cli/config.json`, a shape
+  the uninstall swept for no other agent, so it exited reporting that no
+  ai-memory wiring was found while all six generated capture hooks stayed
+  enabled. A user who trusted that result kept sending prompts and tool
+  activity under a capture they had asked to remove. The uninstall now strips
+  every ai-memory entry from that file while the user's own hooks, model and
+  hook-level settings survive. (GHSA-qmg7-f7fg-rg4x)
 
 ## [3.4.5] - 2026-11-10
 
