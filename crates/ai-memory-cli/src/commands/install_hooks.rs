@@ -5695,6 +5695,49 @@ function spawnNativeHook(event: string, payload: Record<string, unknown>, profil
   }}
 }}
 
+// The handoff for a server-routed repository (#2122) lives on the profile
+// server, claimed with the profile token. The native session-start both records
+// the start and claims+prints the handoff envelope on stdout (claim-once, as
+// for any native OpenCode start); this reads that envelope's `additionalContext`
+// for injection. A missing binary, a divergent profile (the native
+// `--expected-profile` guard emits nothing), a server that is down, or a
+// malformed envelope injects nothing — never the install default's handoff.
+function spawnNativeHandoff(cwd: string, id: string | undefined, profile: string): Promise<string | undefined> {{
+  return new Promise((resolve) => {{
+    if (!NATIVE_HOOK) return resolve(undefined);
+    try {{
+      const args = ["--data-dir", dirname(hookSpoolDir()), "hook", "--agent", AGENT,
+        "--event", "session-start", "--server-url", SERVER, "--capture-mode", CAPTURE_MODE,
+        "--expected-profile", profile];
+      if (NATIVE_PROJECT_STRATEGY) args.push("--project-strategy", NATIVE_PROJECT_STRATEGY);
+      const child = spawn(NATIVE_HOOK, args, {{
+        stdio: ["pipe", "pipe", "ignore"],
+        windowsHide: true,
+        env: {{ ...process.env, AI_MEMORY_AUTH_TOKEN: resolveToken() ?? "" }},
+        timeout: 5000,
+      }});
+      let out = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {{ if (out.length < 65536) out += chunk; }});
+      child.stdin.on("error", () => {{}});
+      child.on("error", () => resolve(undefined));
+      child.on("close", () => {{
+        const text = out.trim();
+        if (!text) return resolve(undefined);
+        try {{
+          const handoff = (JSON.parse(text) as {{ hookSpecificOutput?: {{ additionalContext?: unknown }} }}).hookSpecificOutput?.additionalContext;
+          resolve(typeof handoff === "string" && handoff.length > 0 ? handoff : undefined);
+        }} catch (_e) {{
+          resolve(undefined);
+        }}
+      }});
+      child.stdin.end(JSON.stringify({{ sessionID: id, cwd }}));
+    }} catch (_e) {{
+      resolve(undefined);
+    }}
+  }});
+}}
+
 function postHook(event: string, payload: Record<string, unknown>): void {{
   const url = new URL(`${{SERVER}}/hook`);
   url.searchParams.set("event", event);
@@ -5704,8 +5747,12 @@ function postHook(event: string, payload: Record<string, unknown>): void {{
   if (policy.disposition === "drop") {{
     // A drop *because the repository is server-routed* (#2122) goes to the
     // native hook, which owns the profile's server, token and spool. Every
-    // other drop, and a missing native binary, stays dropped.
-    if (policy.serverRoutedProfile && NATIVE_HOOK) spawnNativeHook(event, policy.payload, policy.serverRoutedProfile);
+    // other drop, and a missing native binary, stays dropped. `session-start`
+    // is the one exception: `fetchHandoff` runs the native session-start (which
+    // both records the start and claims the handoff for injection), so spawning
+    // it here too would double-record and claim the handoff into a discarded
+    // stdout. Let `fetchHandoff` own routed session starts.
+    if (policy.serverRoutedProfile && NATIVE_HOOK && event !== "session-start") spawnNativeHook(event, policy.payload, policy.serverRoutedProfile);
     return;
   }}
   try {{
@@ -5720,7 +5767,11 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   // resolves; with no directory that is its default or last active project,
   // so another repository's baton could be consumed. Leave it open instead.
   if (!cwd) return undefined;
-  if (captureServerRouted(cwd)) return undefined;
+  // #2122: a server-routed repository's handoff lives on the profile server,
+  // not the install default, so the native binary claims it; a repo whose
+  // marker names no readable profile, or an absent binary, injects nothing.
+  const serverRoute = captureServerRouted(cwd);
+  if (serverRoute) return serverRoute.profile && NATIVE_HOOK ? spawnNativeHandoff(cwd, id, serverRoute.profile) : undefined;
   // An allowlist build captures only marked repositories, and the native hook
   // returns before its handoff GET for any other (`hook.rs`). Do the same: the
   // server resolves the directory into a project to look the baton up, so a
@@ -14167,8 +14218,9 @@ model = "gpt-5"
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        // Three spool-delivery spawns plus the #2122 server-routed native spawn.
-        assert_eq!(plugin.matches("windowsHide: true").count(), 4);
+        // Three spool-delivery spawns plus the two #2122 server-routed native
+        // spawns (capture and handoff).
+        assert_eq!(plugin.matches("windowsHide: true").count(), 5);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -14596,7 +14648,7 @@ model = "gpt-5"
         // #2122: the OpenCode plugins route a server-routed drop to the native
         // hook rather than discarding it (OMP/Pi stay drop-only).
         assert!(plugin.contains("if (policy.disposition === \"drop\") {"));
-        assert!(plugin.contains("if (policy.serverRoutedProfile && NATIVE_HOOK) spawnNativeHook(event, policy.payload, policy.serverRoutedProfile);"));
+        assert!(plugin.contains("if (policy.serverRoutedProfile && NATIVE_HOOK && event !== \"session-start\") spawnNativeHook(event, policy.payload, policy.serverRoutedProfile);"));
     }
 
     /// #2122: both OpenCode plugins hand a server-routed drop to the native
@@ -14620,7 +14672,7 @@ model = "gpt-5"
             // assistant opt-in.
             assert!(plugin.contains(&format!("const NATIVE_HOOK: string | undefined = {exe};")));
             // postHook routes a server-routed drop to the native spawn.
-            assert!(plugin.contains("if (policy.serverRoutedProfile && NATIVE_HOOK) spawnNativeHook(event, policy.payload, policy.serverRoutedProfile);"));
+            assert!(plugin.contains("if (policy.serverRoutedProfile && NATIVE_HOOK && event !== \"session-start\") spawnNativeHook(event, policy.payload, policy.serverRoutedProfile);"));
             // The spawn demands exactly that profile and never passes a token
             // in argv; a missing binary returns before spawning (drop).
             let helper = &plugin[plugin.find("function spawnNativeHook(").unwrap()..];
@@ -14634,6 +14686,42 @@ model = "gpt-5"
             assert!(!helper.contains("AI_MEMORY_AUTH_TOKEN: profile"));
             assert!(helper.contains("windowsHide: true,"));
             assert!(helper.contains("child.stdin.end(JSON.stringify(payload));"));
+        }
+    }
+
+    /// #2122: both OpenCode plugins fetch a server-routed repository's handoff
+    /// through the native hook (profile server, claim-once) and inject the
+    /// `additionalContext` of its SessionStart envelope; `postHook` leaves the
+    /// routed session-start to this path, so the handoff is never claimed twice.
+    #[test]
+    fn opencode_plugins_fetch_server_routed_handoff_natively() {
+        let v1 = build_opencode_plugin("http://127.0.0.1:49374", Some("tok"), None, "denylist");
+        let v2 = build_opencode2_plugin(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            None,
+            "denylist",
+            false,
+        )
+        .unwrap();
+        for plugin in [&v1, &v2] {
+            // The routed session-start is not spawned by postHook (it would
+            // claim the handoff into a discarded stdout); fetchHandoff owns it.
+            assert!(plugin.contains("event !== \"session-start\") spawnNativeHook("));
+            let fetch = plugin.split_once("async function fetchHandoff(").unwrap().1;
+            assert!(fetch.contains("const serverRoute = captureServerRouted(cwd);"));
+            assert!(fetch.contains(
+                "if (serverRoute) return serverRoute.profile && NATIVE_HOOK ? spawnNativeHandoff(cwd, id, serverRoute.profile) : undefined;"
+            ));
+            // The native handoff spawn demands the profile, reads the envelope
+            // from stdout, and injects its additionalContext.
+            let helper = &plugin[plugin.find("function spawnNativeHandoff(").unwrap()..];
+            let helper = &helper[..helper.find("\nfunction postHook(").unwrap()];
+            assert!(helper.contains("\"--event\", \"session-start\", \"--server-url\", SERVER, \"--capture-mode\", CAPTURE_MODE,"));
+            assert!(helper.contains("\"--expected-profile\", profile"));
+            assert!(helper.contains("stdio: [\"pipe\", \"pipe\", \"ignore\"]"));
+            assert!(helper.contains(".hookSpecificOutput?.additionalContext"));
+            assert!(!helper.contains("--capture-assistant"));
         }
     }
 
@@ -15415,11 +15503,14 @@ model = "gpt-5"
         assert!(extension.contains(CAPTURE_ADMIT_GATE_TS), "{extension}");
     }
 
-    /// #992: the generated integrations do not route `server` profiles, so
-    /// every one must drop a routed repository's events and skip its handoff
-    /// fetch — both before anything reaches the install-default `SERVER`.
+    /// #992/#2122: nothing from a routed repository reaches the install-default
+    /// `SERVER`. Every integration drops the HTTP capture of a routed repo; the
+    /// OpenCode plugins then hand it to the native hook (which claims the
+    /// handoff on the profile server), while OMP/Pi skip the handoff fetch
+    /// entirely. Either way the routing decision precedes the `/handoff` GET.
     #[test]
     fn generated_integrations_fail_closed_on_a_server_profile_marker() {
+        let opencode_family = ["opencode", "opencode2"];
         let plugins = [
             (
                 "opencode",
@@ -15456,11 +15547,26 @@ model = "gpt-5"
                 .split_once("async function fetchHandoff(")
                 .unwrap_or_else(|| panic!("{agent}: no fetchHandoff"))
                 .1;
-            let guard = handoff
-                .find("if (captureServerRouted(")
-                .unwrap_or_else(|| panic!("{agent}: handoff fetch must be gated"));
             let request = handoff.find("/handoff`").unwrap();
-            assert!(guard < request, "{agent}: gate must precede the request");
+            if opencode_family.contains(&agent) {
+                // The routed repo is handed to the native hook (claim-once on
+                // the profile server) and never reaches the HTTP GET.
+                let guard = handoff
+                    .find("const serverRoute = captureServerRouted(cwd);")
+                    .unwrap_or_else(|| panic!("{agent}: handoff must check server routing"));
+                let native = handoff
+                    .find("spawnNativeHandoff(cwd, id, serverRoute.profile)")
+                    .unwrap_or_else(|| panic!("{agent}: routed handoff must go native"));
+                assert!(
+                    guard < request && native < request,
+                    "{agent}: routing must precede the GET"
+                );
+            } else {
+                let guard = handoff
+                    .find("if (captureServerRouted(")
+                    .unwrap_or_else(|| panic!("{agent}: handoff fetch must be gated"));
+                assert!(guard < request, "{agent}: gate must precede the request");
+            }
         }
     }
 
