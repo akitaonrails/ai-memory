@@ -86,6 +86,15 @@ version in [`docs/changelog/`](docs/changelog/):
   while the profile's server was never asked. It now follows the marker like
   `rename-project` and `move-project`, fails before sending anything when the
   profile does not resolve, and still honours `AI_MEMORY_SERVER_URL` (#2150).
+- Fixed `merge-project` dropping the source project's repository identity.
+  The git remote identity and its derived name keys sat on the project row the
+  merge deletes. After merging the remote-named half of a split into the
+  folder-named one, the direction `ai-memory run` prints for a split it cannot
+  repair by renaming, nothing routed the checkout to the merged project: the
+  next capture could open a new project under the remote's name, and
+  `ai-memory run`, still bound to the deleted project, had no candidate to
+  offer. The identity now moves to a target that carries none, and a target
+  that already belongs to another repository keeps its own. (#2156)
 - Fixed `restore` replacing the live wiki and database even when it failed
   to save the archived configuration as `config.toml.from-backup` (#2064).
 - Fixed `restore-agents` accepting backups with missing or invalid gzip
