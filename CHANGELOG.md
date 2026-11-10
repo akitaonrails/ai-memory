@@ -46,6 +46,10 @@ version in [`docs/changelog/`](docs/changelog/):
   consolidation, the dream pass and the forget sweep never add that line, so on
   a default install the stream has almost nothing to rank until an agent writes
   an abstract by hand. (#2161)
+- The compaction recap now says "1 earlier prompt omitted to fit" when exactly
+  one older prompt does not fit its budget, instead of "1 earlier prompts
+  omitted". The anchor's own "1 prompt between these was omitted" line already
+  used the singular. (#2166)
 
 ### Security
 
