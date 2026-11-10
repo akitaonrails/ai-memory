@@ -17,7 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   pasted image or attached document (Claude `image` / `document` blocks, Pi
   `image` blocks, Codex `input_image` items). The text of the message was kept
   and the attachment was dropped with nothing in the export's losses, unlike
-  images in tool results and every other excluded block type.
+  images in tool results and every other excluded block type. (#2169)
 
 ## [3.4.5] - 2026-11-10
 
