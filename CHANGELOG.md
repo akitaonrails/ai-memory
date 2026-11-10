@@ -13,6 +13,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed native install and reinstall with a trailing slash in
+  `AI_MEMORY_LIB_DIR`. (#2171)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
