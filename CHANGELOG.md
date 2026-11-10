@@ -73,6 +73,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `image` blocks, Codex `input_image` items). The text of the message was kept
   and the attachment was dropped with nothing in the export's losses, unlike
   images in tool results and every other excluded block type. (#2169)
+- `POST /admin/move-session` (and `ai-memory move-session --confirm`) now
+  refuses an open session, or one with a pending consolidation job, before it
+  writes its `pre-move-session` wiki checkpoint. The 409 used to come back
+  after that commit had already been added. (#2170)
 
 ### Security
 
