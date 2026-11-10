@@ -165,6 +165,50 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Restored TypeScript SDK page reads and updates on supported servers that
+  predate the section metadata added in 3.3.0 (#2136).
+- The TypeScript SDK's `pages.update` loads the complete body before applying
+  a change. It refuses an incomplete body when the read cap prevents this,
+  so a metadata-only edit cannot replace page text with a truncated preview (#2054).
+- Fixed `ai-memory-wikisync sync --propagate-deletes` deleting a newer server
+  page after a repository deletion when only unexported metadata had changed.
+  A newer version now requires the usual conflict resolution (#2055).
+- Fixed the scheduled backup example skipping the online snapshot after a
+  failed mirror push, and skipping retries when the files were unchanged (#2135).
+- Preserved the longer LLM fallback cooldown across overlapping provider
+  failures, honoring the provider's retry hint when another in-flight call
+  reports a shorter wait. (#2187)
+- Fixed conditional page reads from configured cross-origin frontends by
+  exposing `ETag` and allowing `If-None-Match` on `/api/v1`. (#2175)
+- `backup` and `export-okf` now preserve the previous archive when a server
+  returns a successful response without a gzip signature, such as an HTML login
+  page or an empty response (#2138).
+- Fixed `profile show` and `profile forget` choosing a `.md` sibling over an
+  existing exact path. `profile forget` also reports a missing entry when
+  connected to an older server. (#2188)
+- A hook event larger than the 10 MiB spool-entry cap (typically a base64
+  image in a `PostToolUse` `tool_response`) is no longer spooled whole. Such an
+  entry could be written but never read back, so it sat in `hook-spool/`
+  undeliverable forever — never sent, never charged an attempt, never aged out
+  — while `ai-memory doctor` kept counting it as waiting. It is now dropped as
+  one undelivered event at capture time, and an over-cap entry an older binary
+  already spooled is dropped (and counted) on the next drain instead of wedging
+  the queue. (#2179)
+- `ai-memory profile show` and `ai-memory profile forget` now accept an entry
+  the way `profile list` and the digest name it — with or without the `.md`
+  suffix — so `profile forget workflow/never-push` removes the entry instead
+  of targeting a non-existent `.md`-less sibling. `forget` also fails with a
+  non-zero exit when the entry was not there, because `/admin/delete-page`
+  reports whether it removed an entry, including Markdown the watcher has
+  not indexed yet. The `memory_delete_page` tool still acknowledges an
+  already-absent page with `deleted: true`. (#2181)
+- Fixed native install and reinstall with a trailing slash in
+  `AI_MEMORY_LIB_DIR`. (#2171)
+- Fixed conditional page reads returning a full response for a matching weak
+  ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
+- Fixed the container wrapper reporting success after a native host-client
+  extraction or install failure. The wrapper keeps the previous cached
+  archive and retries on the next host command that checks for updates. (#2174)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
@@ -255,6 +299,7 @@ version in [`docs/changelog/`](docs/changelog/):
   activity under a capture they had asked to remove. The uninstall now strips
   every ai-memory entry from that file while the user's own hooks, model and
   hook-level settings survive. (GHSA-qmg7-f7fg-rg4x)
+
 
 ## [3.4.5] - 2026-11-10
 
