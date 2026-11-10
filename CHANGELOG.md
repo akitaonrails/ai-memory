@@ -13,6 +13,27 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added first-party Tencent WorkBuddy support. `workbuddy` (alias
+  `work-buddy`) is an `AgentKind` (migration V103), so hook events are
+  attributed to it and a Claude Code-shaped tool payload (`tool_name`,
+  `tool_input`, `tool_response`) is stored as a closed tool observation
+  instead of an empty `other` capture. `install-hooks --agent workbuddy`
+  merges native `ai-memory hook --event … --agent workbuddy` commands for six
+  events (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  `PreCompact`, `Stop`) into the `hooks` key of `~/.workbuddy/settings.json`,
+  keeps sibling settings and your own hooks, and changes nothing on a re-run.
+  There is no script bundle. WorkBuddy fires no `SessionEnd`, so a finished
+  session closes with `ai-memory finalize-session --agent workbuddy`.
+  `install-mcp --client workbuddy` writes Claude Code's HTTP entry
+  (`type: "http"`, `url`, optional `headers`) under `mcpServers` in
+  `~/.workbuddy/mcp.json` (a token-file install gets the session-less stdio
+  bridge); WorkBuddy only activates the new server after you trust it in its
+  custom connector settings (自定义连接器), so approve `ai-memory` there after
+  the install. `install-skills --agent workbuddy` writes the managed skills to
+  `~/.workbuddy/skills` (global) or `.workbuddy/skills` (project). `setup`
+  wires WorkBuddy when `~/.workbuddy` exists, `setup-agent --agent workbuddy`
+  prints the hook block, and `uninstall` removes the entries. Transcript
+  backfill and managed workstreams are not part of this change (#2184).
 - The generated OpenCode plugins (V1 and V2) now capture a server-routed
   repository (`server = "<profile>"`, #992) through the native hook instead of
   dropping it. Its tool, prompt and lifecycle events, and its session-start

@@ -8,7 +8,7 @@ use ai_memory_core::routing_skills::{
     CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
     GROK_HANDOFF_RULE_CONTENT, GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER,
     GROK_RULES_DIR, GROK_SKILL_DIR, HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, ManagedSkill,
-    SKILLS_DIR,
+    SKILLS_DIR, WORKBUDDY_SKILL_DIR,
 };
 use anyhow::{Context, Result, bail};
 
@@ -316,6 +316,18 @@ fn resolve_target_roots_for_platform(
                 platform,
             )?]
         }
+        InstallSkillsAgent::WorkBuddy => {
+            vec![agent_root(
+                args.scope,
+                SkillRootKind::WorkBuddy,
+                cwd,
+                home,
+                appdata,
+                agent_home,
+                claude_config_dir,
+                platform,
+            )?]
+        }
         // Antigravity reads workspace skills from the cross-agent root.
         InstallSkillsAgent::Antigravity if args.scope == InstallSkillsScope::Project => {
             vec![agent_root(
@@ -396,6 +408,7 @@ enum SkillRootKind {
     Grok,
     CopilotCli,
     Hermes,
+    WorkBuddy,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -453,6 +466,7 @@ fn agent_root(
             InstallSkillsScope::Global => COPILOT_SKILL_DIR,
         },
         SkillRootKind::Hermes => HERMES_SKILL_DIR,
+        SkillRootKind::WorkBuddy => WORKBUDDY_SKILL_DIR,
     };
     Ok(base.join(agent_dir).join(SKILLS_DIR))
 }
@@ -760,6 +774,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("$HOME"), "{error}");
+    }
+
+    /// WorkBuddy reads skills from its own `.workbuddy/skills` root, global
+    /// (under `$HOME`) and project (under the checkout).
+    #[test]
+    fn workbuddy_skill_roots_are_its_own_directory() {
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+        let global = resolve_target_roots(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::WorkBuddy),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&global), ["/home/alice/.workbuddy/skills"]);
+        let project = resolve_target_roots(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::WorkBuddy),
+            cwd,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(root_names(&project), ["/repo/.workbuddy/skills"]);
     }
 
     #[test]

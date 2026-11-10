@@ -191,6 +191,7 @@ fn skills_for(agent: AgentChoice) -> InstallSkillsAgent {
         AgentChoice::Devin => InstallSkillsAgent::Devin,
         AgentChoice::Hermes => InstallSkillsAgent::Hermes,
         AgentChoice::AntigravityCli => InstallSkillsAgent::Antigravity,
+        AgentChoice::WorkBuddy => InstallSkillsAgent::WorkBuddy,
         _ => InstallSkillsAgent::Agents,
     }
 }
@@ -246,6 +247,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         }
         if let Some(dir) = codebuddy_detected(&home) {
             found.push((AgentChoice::CodeBuddy, Found::ConfigDir(dir)));
+        }
+        if let Some(dir) = workbuddy_detected(&home) {
+            found.push((AgentChoice::WorkBuddy, Found::ConfigDir(dir)));
         }
         if let Some(dir) = ibm_bob_detected(&home) {
             found.push((AgentChoice::IbmBob, Found::ConfigDir(dir)));
@@ -434,6 +438,13 @@ fn muse_detected(home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Option<
 /// by [`detect_agents`].
 fn codebuddy_detected(home: &Path) -> Option<PathBuf> {
     Some(home.join(".codebuddy")).filter(|dir| dir.is_dir())
+}
+
+/// WorkBuddy's directory, `~/.workbuddy`, when it exists. WorkBuddy has no
+/// native-session adapter, so setup finds it by that directory rather than by
+/// [`detect_agents`].
+fn workbuddy_detected(home: &Path) -> Option<PathBuf> {
+    Some(home.join(".workbuddy")).filter(|dir| dir.is_dir())
 }
 
 /// IBM Bob's shared configuration directory, `~/.bob`, when it exists.
@@ -1368,6 +1379,25 @@ mod tests {
             InstallSkillsAgent::Agents
         );
         assert_eq!(AgentPlan::new(AgentChoice::CodeBuddy, None).mcp, None);
+    }
+
+    #[test]
+    fn workbuddy_is_detected_and_wires_hooks_mcp_and_its_own_skills() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(workbuddy_detected(home.path()), None);
+        std::fs::create_dir_all(home.path().join(".workbuddy")).unwrap();
+        assert_eq!(
+            workbuddy_detected(home.path()),
+            Some(home.path().join(".workbuddy"))
+        );
+        assert_eq!(
+            skills_for(AgentChoice::WorkBuddy),
+            InstallSkillsAgent::WorkBuddy
+        );
+        assert_eq!(
+            AgentPlan::new(AgentChoice::WorkBuddy, None).mcp,
+            Some(McpClient::WorkBuddy)
+        );
     }
 
     #[test]

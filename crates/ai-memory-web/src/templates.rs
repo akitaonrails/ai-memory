@@ -123,6 +123,7 @@ pub(crate) fn agent_label(kind: ai_memory_core::AgentKind) -> &'static str {
         AgentKind::Droid => "Droid",
         AgentKind::Muse => "Muse",
         AgentKind::CodeBuddy => "CodeBuddy",
+        AgentKind::WorkBuddy => "WorkBuddy",
         AgentKind::IbmBob => "IBM Bob",
         AgentKind::Dsh => "DSH",
         AgentKind::Cline => "Cline",

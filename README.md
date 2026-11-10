@@ -157,6 +157,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Factory Droid | Supported |
 | Meta Muse Code | Supported |
 | CodeBuddy Code | Hooks-only |
+| WorkBuddy | Supported |
 | IBM Bob | Supported |
 | Qwen Code | Supported |
 | Qoder | Supported |

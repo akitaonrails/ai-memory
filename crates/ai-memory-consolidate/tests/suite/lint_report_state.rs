@@ -130,7 +130,7 @@ fn options(use_llm: bool, keep_llm_findings: bool) -> LintOptions {
     LintOptions {
         dry_run: false,
         use_llm,
-        decay_lambda: 0.02,
+        decay: ai_memory_store::DecayParams::default(),
         embedding: None,
         contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
         contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,

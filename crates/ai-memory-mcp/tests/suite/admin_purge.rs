@@ -599,6 +599,8 @@ async fn purge_session_unknown_session_is_404_before_admission_and_checkpoint() 
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeSession],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;

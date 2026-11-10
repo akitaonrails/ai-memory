@@ -958,6 +958,79 @@ fn uninstall_antigravity_hooks_preserves_user_entries() {
     assert!(after.get("other-group").is_some());
 }
 
+/// WorkBuddy stores its native hooks under the `hooks` key of
+/// `~/.workbuddy/settings.json` (Claude Code-shaped, no script bundle, no
+/// `SessionEnd`). Installing then uninstalling withdraws every ai-memory event
+/// while the user's own hook and sibling settings survive.
+#[test]
+fn workbuddy_install_hooks_then_uninstall_withdraws_capture_and_keeps_user_config() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let workbuddy = home.path().join(".workbuddy");
+    std::fs::create_dir_all(&workbuddy).unwrap();
+    // Pre-seed a third-party hook and an unrelated setting we must NOT touch.
+    std::fs::write(
+        workbuddy.join("settings.json"),
+        r#"{"model":"workbuddy-pro","hooks":{"Notification":[{"matcher":"","hooks":[{"type":"command","command":"/usr/bin/n.sh"}]}]}}"#,
+    )
+    .unwrap();
+
+    let status = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "workbuddy", "--apply"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "install-hooks failed");
+
+    // Install populated our six events (WorkBuddy fires no SessionEnd).
+    let installed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(workbuddy.join("settings.json")).unwrap())
+            .unwrap();
+    for ours in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PreCompact",
+        "Stop",
+    ] {
+        assert!(
+            installed["hooks"].get(ours).is_some(),
+            "{ours} should be installed"
+        );
+    }
+    assert!(
+        installed["hooks"].get("SessionEnd").is_none(),
+        "WorkBuddy fires no SessionEnd, so none should be installed"
+    );
+
+    let status = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "uninstall failed");
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(workbuddy.join("settings.json")).unwrap())
+            .unwrap();
+    // Sibling setting and third-party hook survived.
+    assert_eq!(after["model"], "workbuddy-pro");
+    assert!(after["hooks"]["Notification"].is_array());
+    // None of our events remain.
+    for ours in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "PreCompact",
+        "Stop",
+    ] {
+        assert!(
+            after["hooks"].get(ours).is_none(),
+            "{ours} should be removed"
+        );
+    }
+}
+
 #[test]
 fn uninstall_mcp_custom_url_removes_antigravity_only_by_endpoint() {
     let _guard = cli_test_lock();
