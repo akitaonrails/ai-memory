@@ -192,6 +192,12 @@ version in [`docs/changelog/`](docs/changelog/):
   rows, so those rows were the last copy of that work. They are now kept unless
   that project holds a live page of the session, as the sweep's dry run also
   reports. Rows already pruned cannot be recovered (#2124).
+- `ai-memory profile apply` no longer deletes the text after a profile start
+  delimiter whose end line was removed by hand. The first run appended a fresh
+  block after it, and the next run, or `--remove`, then treated everything from
+  the leftover start line to the new block's end as the block. The end
+  delimiter now pairs with the last start delimiter before it, as the routing
+  block's does since #2117 (#2152).
 
 
 ## [3.4.4] - 2026-11-08
