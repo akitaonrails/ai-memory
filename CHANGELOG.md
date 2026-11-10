@@ -68,6 +68,11 @@ version in [`docs/changelog/`](docs/changelog/):
   those same pages on the episodic curve. With `episodic = 180` an unread
   session page was reported stale after about 30 days instead of about 156.
   (#2168)
+- A native transcript export now records a loss when a message carries a
+  pasted image or attached document (Claude `image` / `document` blocks, Pi
+  `image` blocks, Codex `input_image` items). The text of the message was kept
+  and the attachment was dropped with nothing in the export's losses, unlike
+  images in tool results and every other excluded block type. (#2169)
 
 ### Security
 
