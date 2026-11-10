@@ -230,6 +230,79 @@ impl SessionAgents {
     }
 }
 
+/// How long [`ProjectBriefs`] remembers what a session was briefed with.
+const PROJECT_BRIEF_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+/// Most `(session, caller)` pairs [`ProjectBriefs`] tracks at once.
+const PROJECT_BRIEF_MAX_SESSIONS: usize = 4096;
+/// Most projects one session is briefed into. A session that wanders past this
+/// stops receiving mid-session briefs rather than growing the set.
+const PROJECT_BRIEF_MAX_PER_SESSION: usize = 64;
+
+/// The projects one `(session, caller)` has already been briefed into, and
+/// when the set was last touched (for the [`PROJECT_BRIEF_TTL`] lapse).
+type BriefedProjects = (
+    std::collections::HashSet<(WorkspaceId, ProjectId)>,
+    std::time::Instant,
+);
+
+/// `[routing] brief_on_project_change` (#2103): the projects each session was
+/// already briefed into mid-session, so a project is briefed once per session.
+///
+/// In memory and bounded on purpose. Losing an entry (restart, TTL, eviction)
+/// can only repeat a brief, never skip a first one, and a full table fails
+/// toward no brief. Keys carry the caller's identity like [`SessionAgents`].
+/// [`Default`] is the disabled tracker: [`Self::claim`] always refuses.
+#[derive(Clone, Default)]
+pub struct ProjectBriefs {
+    enabled: bool,
+    entries: Arc<std::sync::Mutex<HashMap<SessionAgentKey, BriefedProjects>>>,
+}
+
+impl ProjectBriefs {
+    /// A tracker that briefs when `enabled`.
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            entries: Arc::default(),
+        }
+    }
+
+    /// Record `scope` as briefed for `session` and report whether this is the
+    /// first time. `false` when the feature is off, the project was already
+    /// briefed, or the bounds are hit.
+    fn claim(
+        &self,
+        session: SessionId,
+        caller: Option<&str>,
+        scope: (WorkspaceId, ProjectId),
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (session, caller.map(str::to_owned));
+        if !entries.contains_key(&key) && entries.len() >= PROJECT_BRIEF_MAX_SESSIONS {
+            entries.retain(|_, (_, seen)| now.saturating_duration_since(*seen) < PROJECT_BRIEF_TTL);
+            if entries.len() >= PROJECT_BRIEF_MAX_SESSIONS {
+                return false;
+            }
+        }
+        let (briefed, seen) = entries
+            .entry(key)
+            .or_insert_with(|| (std::collections::HashSet::new(), now));
+        if now.saturating_duration_since(*seen) >= PROJECT_BRIEF_TTL {
+            briefed.clear();
+        }
+        *seen = now;
+        briefed.len() < PROJECT_BRIEF_MAX_PER_SESSION && briefed.insert(scope)
+    }
+}
+
 /// Runs the hook resolver's filesystem probes of a caller-supplied cwd (git
 /// discovery, canonicalization) off the async workers (#1514).
 ///
@@ -647,6 +720,9 @@ pub struct HookState {
     /// Agent each recently admitted session is bound to, so `POST /hook` can
     /// answer a mismatched agent with `409` (#2023).
     pub session_agents: SessionAgents,
+    /// `[routing] brief_on_project_change` (#2103): enabled flag plus the
+    /// per-session record of projects already briefed mid-session.
+    pub project_briefs: ProjectBriefs,
     /// Bounded blocking path for the resolver's filesystem probes of a
     /// caller's cwd, so a stuck `open()` cannot stall the async workers.
     pub cwd_probes: CwdProbes,
@@ -1893,6 +1969,13 @@ pub struct HandoffQuery {
     /// ignores it; the clients also send `handoff=0&recovery=0&profile_digest=0`
     /// so that server still returns only the notice.
     pub inbox_only: Option<String>,
+    /// Truthy from a Claude Code `UserPromptSubmit` whose marker routes to a
+    /// project other than the one the session started in (#2103). `GET /brief`
+    /// then answers with that project's core brief only when
+    /// `[routing] brief_on_project_change` is on, the override came from a
+    /// marker, the project differs from the session's own and this session was
+    /// not already briefed in it.
+    pub project_change: Option<String>,
 }
 
 impl HandoffQuery {
@@ -2466,7 +2549,53 @@ async fn fetch_brief(
     actor: Option<&IdentityKey>,
     viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<Option<String>> {
+    let project_change = crate::payload::query_flag_truthy(query.project_change.as_deref());
+    if project_change && !state.project_briefs.enabled {
+        return Ok(None);
+    }
+    // A marker-declared project only: a bare cwd never re-briefs, the same
+    // rule `[routing] mid_session` applies to rescoping.
+    if project_change && ProjectSource::parse(query.project_src.as_deref()) != ProjectSource::Marker
+    {
+        return Ok(None);
+    }
     let (ws, proj) = resolve_authorized_startup_scope(state, query, actor, viewer).await?;
+    let forced;
+    let query = if project_change {
+        let Some(session) = query
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(SessionId::from_native)
+        else {
+            return Ok(None);
+        };
+        let Some((session_ws, session_proj, _)) = state.reader.find_session_scope(session).await?
+        else {
+            return Ok(None);
+        };
+        let caller = actor.map(IdentityKey::storage_key);
+        if (session_ws, session_proj) == (ws, proj)
+            || !state.project_briefs.claim(
+                session,
+                caller.as_deref(),
+                (ws, proj),
+                std::time::Instant::now(),
+            )
+        {
+            return Ok(None);
+        }
+        // The same renderer and budget a session start uses; this route is the
+        // opt-in, so the marker's session-start flag is not consulted.
+        forced = HandoffQuery {
+            briefing: Some("true".to_owned()),
+            ..query.clone()
+        };
+        &forced
+    } else {
+        query
+    };
     let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     // An `additionalContext` over that agent's limit is swapped for a file
     // path and a short preview, which would cut the brief's closing fence;
@@ -6722,6 +6851,7 @@ pub(crate) mod tests {
 
     fn session_start_query(cwd: &str) -> HandoffQuery {
         HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -8907,6 +9037,7 @@ pub(crate) mod tests {
             )),
             ingest_gates: IngestGates::default(),
             session_agents: SessionAgents::default(),
+            project_briefs: ProjectBriefs::default(),
             cwd_probes: CwdProbes::default(),
             per_user_slots: false,
             mid_session_routing: MidSessionRouting::default(),
@@ -20130,6 +20261,7 @@ pub(crate) mod tests {
             handle_handoff(
                 State(state.clone()),
                 Query(HandoffQuery {
+                    project_change: None,
                     profile_contribute: None,
                     profile_consume: None,
                     profile_digest: None,
@@ -20759,6 +20891,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let query = || HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -20851,6 +20984,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let query = || HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -20962,6 +21096,7 @@ pub(crate) mod tests {
             .id;
         let state = Arc::new(state);
         let query = HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -21160,6 +21295,7 @@ pub(crate) mod tests {
             handle_handoff(
                 State(state.clone()),
                 Query(HandoffQuery {
+                    project_change: None,
                     profile_contribute: None,
                     profile_consume: None,
                     profile_digest: None,
@@ -22266,6 +22402,7 @@ pub(crate) mod tests {
         let rendered = fetch_and_accept_handoff(
             &state,
             HandoffQuery {
+                project_change: None,
                 profile_contribute: None,
                 profile_consume: None,
                 profile_digest: None,
@@ -22352,6 +22489,7 @@ pub(crate) mod tests {
         let rendered = fetch_and_accept_handoff(
             &state,
             HandoffQuery {
+                project_change: None,
                 profile_contribute: None,
                 profile_consume: None,
                 profile_digest: None,
@@ -22430,6 +22568,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let query = |session_id: &str| HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -22589,6 +22728,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let query = HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -22714,6 +22854,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let query = HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -22801,6 +22942,7 @@ pub(crate) mod tests {
         }
 
         let query = HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -23176,6 +23318,275 @@ pub(crate) mod tests {
         assert!(body.contains("SLOT-SECRET"), "{body}");
     }
 
+    /// `ProjectBriefs::claim` briefs a `(session, caller)` into each project at
+    /// most once, lapses after the TTL, and never grows past the per-session
+    /// cap. The disabled tracker never briefs.
+    #[test]
+    fn project_briefs_claim_briefs_each_project_once_and_stays_bounded() {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        let session = SessionId::new();
+        let ws = WorkspaceId::new();
+        let a = (ws, ProjectId::new());
+        let b = (ws, ProjectId::new());
+        let now = std::time::Instant::now();
+
+        assert!(
+            !ProjectBriefs::default().claim(session, None, a, now),
+            "the disabled tracker never briefs"
+        );
+
+        let briefs = ProjectBriefs::new(true);
+        assert!(
+            briefs.claim(session, None, a, now),
+            "the first entry into a project briefs"
+        );
+        assert!(
+            !briefs.claim(session, None, a, now),
+            "the same project never briefs twice"
+        );
+        assert!(
+            briefs.claim(session, None, b, now),
+            "a different project briefs"
+        );
+        assert!(
+            briefs.claim(session, Some("user:bob"), a, now),
+            "the caller is part of the key: another operator's turn briefs"
+        );
+        let later = now + PROJECT_BRIEF_TTL + std::time::Duration::from_secs(1);
+        assert!(
+            briefs.claim(session, None, a, later),
+            "after the TTL the memory lapses and the project briefs again"
+        );
+
+        let capped = ProjectBriefs::new(true);
+        let wanderer = SessionId::new();
+        for _ in 0..PROJECT_BRIEF_MAX_PER_SESSION {
+            assert!(capped.claim(wanderer, None, (ws, ProjectId::new()), now));
+        }
+        assert!(
+            !capped.claim(wanderer, None, (ws, ProjectId::new()), now),
+            "a session past the per-session cap stops briefing"
+        );
+    }
+
+    /// A brief page in this project, a session recorded in a *different*
+    /// project (`origin`) so entering this one is a change, and a session
+    /// already in this project. Returns the moved-in and the staying session.
+    async fn seed_mid_session(state: &HookState, cwd: &str) -> (SessionId, SessionId) {
+        // Write into `state.project_id` directly: `mid_session_query` pins the
+        // marker project (`scratch` → `state.project_id`), which is not the cwd
+        // basename `upsert_brief_page` would resolve to.
+        state
+            .writer
+            .upsert_page(brief_page(
+                state.workspace_id,
+                state.project_id,
+                "_slots/focus.md",
+                "MID-BRIEF",
+                true,
+            ))
+            .await
+            .unwrap();
+        let origin = state
+            .writer
+            .get_or_create_project(state.workspace_id, "origin", None)
+            .await
+            .unwrap();
+        let moved = SessionId::new();
+        let staying = SessionId::new();
+        for (id, project_id) in [(moved, origin), (staying, state.project_id)] {
+            state
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id,
+                    workspace_id: state.workspace_id,
+                    project_id,
+                    agent_kind: AgentKind::ClaudeCode,
+                    cwd: Some(std::path::PathBuf::from(cwd)),
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        (moved, staying)
+    }
+
+    fn mid_session_query(cwd: &str, session: SessionId) -> HandoffQuery {
+        HandoffQuery {
+            project_src: Some("marker".into()),
+            project_change: Some("1".into()),
+            session_id: Some(session.to_string()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            ..subagent_brief_query(cwd, Some("true"))
+        }
+    }
+
+    /// With `[routing] brief_on_project_change` on, a session that moves into a
+    /// marker-declared project is briefed into it once; the same project stays
+    /// quiet after, and a session already in this project never briefs.
+    #[tokio::test]
+    async fn mid_session_brief_fires_once_on_a_different_project_and_not_on_the_same() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.project_briefs = ProjectBriefs::new(true);
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let (moved, staying) = seed_mid_session(&state, &cwd).await;
+        let state = Arc::new(state);
+
+        let (status, body) = subagent_brief(&state, mid_session_query(&cwd, moved)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("MID-BRIEF"),
+            "entering a new project must brief: {body}"
+        );
+        let (_, body) = subagent_brief(&state, mid_session_query(&cwd, moved)).await;
+        assert!(
+            body.is_empty(),
+            "the same project must brief only once: {body}"
+        );
+        let (_, body) = subagent_brief(&state, mid_session_query(&cwd, staying)).await;
+        assert!(
+            body.is_empty(),
+            "a session already in this project has not changed project: {body}"
+        );
+    }
+
+    /// The feature off: a project change delivers nothing even with a session
+    /// that was elsewhere.
+    #[tokio::test]
+    async fn mid_session_brief_is_empty_when_the_feature_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let (moved, _) = seed_mid_session(&state, &cwd).await;
+        let state = Arc::new(state);
+        let (status, body) = subagent_brief(&state, mid_session_query(&cwd, moved)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty(), "the feature is off: {body}");
+    }
+
+    /// A re-brief needs a marker-declared project and a known session: a bare
+    /// cwd, a missing session id, and an unknown session each stay quiet. The
+    /// control proves the same fixture does brief with the full valid query.
+    #[tokio::test]
+    async fn mid_session_brief_requires_a_marker_project_and_a_known_session() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.project_briefs = ProjectBriefs::new(true);
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let (moved, _) = seed_mid_session(&state, &cwd).await;
+        let state = Arc::new(state);
+
+        let not_marker = HandoffQuery {
+            project_src: None,
+            ..mid_session_query(&cwd, moved)
+        };
+        let (_, body) = subagent_brief(&state, not_marker).await;
+        assert!(body.is_empty(), "a bare cwd must not re-brief: {body}");
+
+        let no_session = HandoffQuery {
+            session_id: None,
+            ..mid_session_query(&cwd, moved)
+        };
+        let (_, body) = subagent_brief(&state, no_session).await;
+        assert!(
+            body.is_empty(),
+            "a change with no session must stay quiet: {body}"
+        );
+
+        let unknown = mid_session_query(&cwd, SessionId::new());
+        let (_, body) = subagent_brief(&state, unknown).await;
+        assert!(
+            body.is_empty(),
+            "an unknown session has no recorded project: {body}"
+        );
+
+        // None of the refusals above claimed `moved`, so the valid query is its
+        // first brief.
+        let (_, body) = subagent_brief(&state, mid_session_query(&cwd, moved)).await;
+        assert!(
+            body.contains("MID-BRIEF"),
+            "the valid mid-session query must brief: {body}"
+        );
+    }
+
+    /// The mid-session re-brief resolves its project through the same Read gate
+    /// as the subagent brief (security-boundaries row 4n): a viewer who cannot
+    /// read the marker's project gets the 403 and none of the brief, even with
+    /// a project change and a session that was elsewhere. Control: a Read grant
+    /// briefs.
+    #[tokio::test]
+    async fn mid_session_brief_is_refused_for_a_repository_the_viewer_cannot_read() {
+        use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.project_briefs = ProjectBriefs::new(true);
+        state
+            .writer
+            .set_access_mode(state.project_id, ai_memory_store::AccessMode::Restricted)
+            .await
+            .unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let (moved, _) = seed_mid_session(&state, &cwd).await;
+        let human = |name: &'static str| {
+            let writer = state.writer.clone();
+            async move {
+                writer
+                    .create_human_user(
+                        NewUser {
+                            username: name.into(),
+                            name: None,
+                            email: None,
+                        },
+                        UserRole::User,
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let alice = human("alice").await;
+        let bob = human("bob").await;
+        state
+            .writer
+            .grant_memory(
+                alice,
+                state.project_id,
+                ai_memory_store::GrantLevel::Read,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let brief = |viewer: ai_memory_core::UserId| {
+            let state = state.clone();
+            let cwd = cwd.clone();
+            async move {
+                read_handoff_response(
+                    handle_brief(
+                        State(state),
+                        Query(mid_session_query(&cwd, moved)),
+                        None,
+                        Some(axum::Extension(AuthorizedViewer(viewer))),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        let (status, body) = brief(bob).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(!body.contains("MID-BRIEF"), "leaked the brief: {body}");
+
+        let (status, body) = brief(alice).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("MID-BRIEF"), "{body}");
+    }
+
     /// The route is mounted: a hook reaches `/brief` through the router.
     #[tokio::test]
     async fn hook_router_serves_the_brief() {
@@ -23234,6 +23645,7 @@ pub(crate) mod tests {
             .unwrap();
 
         let query = |briefing: Option<&str>| HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -23403,6 +23815,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let query = |briefing: Option<&str>| HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,
@@ -24261,6 +24674,7 @@ pub(crate) mod tests {
         let rendered = fetch_and_accept_handoff(
             &state,
             HandoffQuery {
+                project_change: None,
                 profile_contribute: None,
                 profile_consume: None,
                 profile_digest: None,
@@ -28544,6 +28958,7 @@ pub(crate) mod tests {
 
     fn profile_query(cwd: &str, agent: &str) -> HandoffQuery {
         HandoffQuery {
+            project_change: None,
             profile_contribute: None,
             profile_consume: None,
             profile_digest: None,

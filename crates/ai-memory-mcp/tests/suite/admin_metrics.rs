@@ -86,6 +86,7 @@ async fn harness_with(index_file_paths: bool) -> Harness {
         ingest_semaphore: ingest_semaphore.clone(),
         ingest_gates: ai_memory_hooks::IngestGates::default(),
         session_agents: ai_memory_hooks::SessionAgents::default(),
+        project_briefs: ai_memory_hooks::ProjectBriefs::default(),
         cwd_probes: ai_memory_hooks::CwdProbes::default(),
         consolidate_on_session_end: false,
         session_consolidation_notify: None,

@@ -1454,6 +1454,11 @@ pub struct RoutingSettings {
     /// `follow-cwd` (default) or `sticky`. See
     /// [`ai_memory_core::MidSessionRouting`] for full semantics.
     pub mid_session: ai_memory_core::MidSessionRouting,
+    /// Opt-in (default `false`): a mid-session event that resolves through a
+    /// `.ai-memory.toml` marker to a project other than the session's own gets
+    /// that project's core brief (pinned, `_rules/`, `_slots/`) once per
+    /// project per session (#2103).
+    pub brief_on_project_change: bool,
 }
 
 /// `[ingest]`: tool events the server drops whatever the client sends

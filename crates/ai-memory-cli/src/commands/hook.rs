@@ -506,6 +506,39 @@ fn sanitize_briefed_key(raw: &str) -> String {
         .collect()
 }
 
+/// `<data_dir>/project-brief/<key>` — the routing query of the last cwd this
+/// session sent for its mid-session project brief (#2103), keyed like the
+/// briefed markers. Session start records the starting query, so a prompt that
+/// stays in the starting project asks nothing, and a later prompt asks only
+/// when the marker routing changed. Bounded; losing it costs one extra
+/// request, which the server answers once per project per session anyway.
+fn project_brief_state_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    data_dir
+        .join("project-brief")
+        .join(briefed_session_key(agent, session_id, cwd))
+}
+
+const PROJECT_BRIEF_STATE_MAX_BYTES: usize = 2048;
+
+fn project_brief_state_matches(path: &Path, routing_qs: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|seen| seen == routing_qs)
+}
+
+fn record_project_brief_state(path: &Path, routing_qs: &str) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if routing_qs.len() > PROJECT_BRIEF_STATE_MAX_BYTES || fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = fs::write(path, routing_qs);
+}
+
 /// `<data_dir>/inbox-notice/<key>` — the last mid-session inbox notice this
 /// session was shown (#1942), keyed like the briefed markers (native session
 /// id when the payload carries one, else a stable hash of agent+cwd, so a
@@ -2256,6 +2289,22 @@ where
                 )
             );
         } else if agent_kind.session_start_injects_handoff() && handoff_scoped {
+            if agent_kind == AgentKind::ClaudeCode
+                && let Some(cwd) = policy_cwd.as_deref()
+            {
+                record_project_brief_state(
+                    &project_brief_state_path(
+                        &dd,
+                        &args.agent,
+                        canonical_session_id.as_deref(),
+                        policy_cwd.as_deref(),
+                    ),
+                    &marker_query_suffix_without_briefing(
+                        cwd,
+                        args.project_strategy.and_then(|s| s.baked()),
+                    ),
+                );
+            }
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
@@ -2462,6 +2511,46 @@ where
         // text. Empty handoff or any fetch error means print nothing at all
         // (kimi ignores empty stdout; warnings go to stderr).
         return Ok(());
+    }
+
+    // user-prompt, Claude Code only: `[routing] brief_on_project_change`
+    // (#2103). A prompt whose marker routes somewhere the session has not
+    // asked about asks `GET /brief` for that project's core brief. The server
+    // owns the opt-in, the "differs from the session's project" test and the
+    // once-per-project record; this side only avoids a request per prompt by
+    // asking when the marker routing changed since the last ask, and only for
+    // a marker-declared project (`project_src=marker`). The envelope is the one
+    // the inbox notice below uses. Cursor runs these hook settings too, so a
+    // Cursor payload gets nothing.
+    if hook_event == HookEvent::UserPrompt
+        && agent_kind == AgentKind::ClaudeCode
+        && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
+        && let Some(cwd) = policy_cwd.as_deref()
+        && let Some(session_id) = canonical_session_id.as_deref()
+    {
+        let routing_qs = marker_query_suffix_without_briefing(
+            cwd,
+            args.project_strategy.and_then(|s| s.baked()),
+        );
+        let asked = project_brief_state_path(&dd, &args.agent, Some(session_id), Some(cwd));
+        if routing_qs.contains("&project_src=marker")
+            && !project_brief_state_matches(&asked, &routing_qs)
+        {
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let brief_url = format!(
+                "{base}/brief?agent={}{routing_qs}&session_id={}&project_change=1",
+                args.agent,
+                url_encode(session_id),
+            );
+            let brief =
+                get_handoff(&client, &brief_url, bearer.as_deref(), handoff_timeout()).await;
+            record_project_brief_state(&asked, &routing_qs);
+            if let Some(brief) = brief {
+                writeln!(stdout, "{}", user_prompt_context_envelope(&brief))?;
+                return Ok(());
+            }
+        }
     }
 
     // user-prompt, Claude Code only: a repository that opted into

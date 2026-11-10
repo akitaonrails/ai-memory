@@ -339,6 +339,7 @@ Defined by `SanitizeConfig` in `ai-memory-core`. Built-in redaction patterns alw
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
 | `mid_session` | `follow-cwd` | `AI_MEMORY_ROUTING__MID_SESSION` | Attribution of a mid-session event after the cwd moved: `follow-cwd` or `sticky`. |
+| `brief_on_project_change` | `false` | `AI_MEMORY_ROUTING__BRIEF_ON_PROJECT_CHANGE` | Brief the agent with a project's pinned, `_rules/` and `_slots/` pages, once per project per session, when a mid-session event resolves through a marker to a project other than the session's own. |
 
 ## `[auto_scope]`
 
