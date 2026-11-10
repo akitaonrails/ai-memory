@@ -17,6 +17,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `AI_MEMORY_LIB_DIR`. (#2171)
 - Fixed conditional page reads returning a full response for a matching weak
   ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
+- Fixed the container wrapper reporting success after a native host-client
+  extraction or install failure. The wrapper keeps the previous cached
+  archive and retries on the next host command that checks for updates. (#2174)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
