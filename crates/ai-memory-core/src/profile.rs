@@ -1382,4 +1382,23 @@ mod tests {
             Some(prose.as_str())
         );
     }
+
+    #[test]
+    fn merge_keeps_text_after_a_start_marker_without_its_end() {
+        let block = render_profile_block(&["- use pnpm (`profile/tools/pnpm.md`)".into()], 0);
+        let existing = format!("# A\n{PROFILE_BLOCK_START}\nmy notes\n");
+        let first = merge_profile_block(&existing, &block);
+        assert_eq!(first, format!("{existing}\n{block}"));
+        assert_eq!(
+            merge_profile_block(&first, &block),
+            first,
+            "a re-run is a no-op and keeps my notes"
+        );
+        let newer = render_profile_block(&["- use bun (`profile/tools/bun.md`)".into()], 0);
+        assert_eq!(
+            merge_profile_block(&first, &newer),
+            format!("{existing}\n{newer}"),
+            "only the appended block is replaced"
+        );
+    }
 }
