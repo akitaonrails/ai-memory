@@ -19,6 +19,7 @@ version in [`docs/changelog/`](docs/changelog/):
   threshold from the scalar `[decay] lambda`, while the forget sweep scores
   those same pages on the episodic curve. With `episodic = 180` an unread
   session page was reported stale after about 30 days instead of about 156.
+  (#2168)
 
 ## [3.4.5] - 2026-11-10
 
