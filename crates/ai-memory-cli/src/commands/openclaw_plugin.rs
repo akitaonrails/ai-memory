@@ -434,6 +434,11 @@ async function fetchHandoff(event: any, ctx: any): Promise<string | undefined> {
   if (CAPTURE_MODE === "allowlist" && !findMarker(currentCwd)) return undefined;
   const url = new URL(`${{SERVER}}/handoff`);
   url.searchParams.set("agent", AGENT);
+  // An external-capture run shares its project with the owner's own sessions,
+  // so it offers the baton rather than consuming it (#2148): claim=0 makes the
+  // server announce the handoff for an explicit memory_handoff_accept. Parity
+  // with the native hook and the shell/PowerShell bundles.
+  if (captureOwnedExternally()) url.searchParams.set("claim", "0");
   if (!applyMarkerParams(url, currentCwd)) return undefined;
   try {{
     // The body is prepended to the prompt, so a redirect is refused: a

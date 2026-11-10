@@ -59,6 +59,10 @@ rsync_excludes=(
     --exclude=db/             # SQLite index, derived from wiki via `ai-memory reindex`
     --exclude=logs/           # rotated tracing output
     --exclude=.serve.lock     # server pidfile
+    --exclude=auth-tokens/    # per-profile bearer tokens, incl. the root token (plaintext, 0600) — NEVER mirror
+    --exclude=auth-token      # hook bearer token (plaintext, 0600)
+    --exclude=auth-header     # hook Authorization header value (plaintext, 0600)
+    --exclude=hook-spool/     # pre-delivery hook spool (transient; may hold un-sanitized payloads)
 )
 for glob in $SECRET_EXCLUDES; do
     rsync_excludes+=(--exclude="$glob")

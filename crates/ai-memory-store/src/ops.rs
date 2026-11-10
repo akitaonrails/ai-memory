@@ -8805,7 +8805,10 @@ pub fn move_project_workspace(
 /// change, so embeddings, evidence, access rows and graph edges follow their
 /// versions automatically. Same-path page collisions are represented by a
 /// new target version supplied by the wiki layer; both prior histories remain
-/// superseded and queryable.
+/// superseded and queryable. The source's repository identity and its derived
+/// name keys move to a target that carries no identity, so identity-based
+/// resolution reaches the merged project; a target that already has one keeps
+/// it.
 pub fn merge_project(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
@@ -9214,6 +9217,20 @@ pub fn merge_project(
         &serde_json::json!({"source_project_id": source_project.to_string()}).to_string(),
     )?;
 
+    // The repository identity routes a checkout's captures and managed runs
+    // to its project, and it lives on the row deleted below. Dropped with the
+    // source, nothing resolves that checkout to the merged project and its
+    // next capture can open a new one beside it (#2156). Read it now and hand
+    // it over once the unique identity index is free.
+    let source_identity: Option<(String, String, String, String)> = tx
+        .query_row(
+            "SELECT identity, identity_source, canonical_name, legacy_name \
+             FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![src, ws],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+
     let deleted = tx.execute(
         "DELETE FROM projects WHERE id = ?1 AND workspace_id = ?2",
         params![src, ws],
@@ -9222,6 +9239,25 @@ pub fn merge_project(
         return Err(StoreError::NotFound(
             "source project disappeared during merge".into(),
         ));
+    }
+    // An identity already on the target is never overwritten, the rule
+    // `adopt_project_identity` follows: one project routes one repository.
+    if let Some((identity, identity_source, canonical_name, legacy_name)) = source_identity
+        && !identity.is_empty()
+    {
+        tx.execute(
+            "UPDATE projects SET identity = ?1, identity_source = ?2, \
+             canonical_name = ?3, legacy_name = ?4 \
+             WHERE id = ?5 AND workspace_id = ?6 AND identity = ''",
+            params![
+                identity,
+                identity_source,
+                canonical_name,
+                legacy_name,
+                dst,
+                ws,
+            ],
+        )?;
     }
     if commit {
         tx.commit()?;
@@ -19387,6 +19423,73 @@ pub(crate) mod tests {
             adopt_project_identity(&mut conn, &ws, &folder, &remote, None, None).unwrap_err();
         assert!(matches!(error, StoreError::InvalidState(_)), "{error:?}");
         assert_eq!(name_and_identity(&conn, &remote).1, "github.com/acme/api");
+    }
+
+    /// The split renaming cannot repair: both halves hold sessions, so the
+    /// operator merges the remote-named project into the folder-named one,
+    /// the direction `ai-memory run` prints. The repository identity sits on
+    /// the row the merge deletes. It has to end up on the survivor, or the
+    /// next capture from that checkout opens a third project.
+    #[test]
+    fn merge_project_hands_the_repository_identity_to_the_surviving_project() {
+        let coordinates = |conn: &Connection, id: &ProjectId| -> [String; 4] {
+            conn.query_row(
+                "SELECT identity, identity_source, canonical_name, legacy_name \
+                 FROM projects WHERE id = ?1",
+                [id.as_bytes()],
+                |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?]),
+            )
+            .unwrap()
+        };
+
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        let session = SessionId::new();
+        begin_session(&mut conn, &hook_session(session, ws, remote, None)).unwrap();
+        end_session(&mut conn, &session, None).unwrap();
+        let carried = coordinates(&conn, &remote);
+        assert_eq!(carried[0], "github.com/acme/api");
+        assert!(coordinates(&conn, &folder).iter().all(String::is_empty));
+
+        // A dry run leaves the identity where it was.
+        merge_project(&mut conn, ws, remote, folder, &[], false).unwrap();
+        assert_eq!(coordinates(&conn, &remote), carried);
+        assert!(coordinates(&conn, &folder).iter().all(String::is_empty));
+
+        merge_project(&mut conn, ws, remote, folder, &[], true).unwrap();
+        assert_eq!(coordinates(&conn, &folder), carried);
+        assert_eq!(name_and_identity(&conn, &folder).0, "api");
+        let (resolved, _) = resolve_project_by_identity(
+            &mut conn,
+            &ws,
+            &acme_api_identity(),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
+            false,
+            "acme-api",
+            None,
+            None,
+            None,
+            crate::AccessMode::Open,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved, folder,
+            "identity-based resolution must reach the merged project"
+        );
+
+        // A target that already belongs to another repository keeps its own
+        // identity: one project routes one repository.
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        conn.execute(
+            "UPDATE projects SET identity = 'github.com/acme/other', \
+             identity_source = 'git_remote' WHERE id = ?1",
+            [folder.as_bytes()],
+        )
+        .unwrap();
+        merge_project(&mut conn, ws, remote, folder, &[], true).unwrap();
+        let (_, kept) = name_and_identity(&conn, &folder);
+        assert_eq!(kept, "github.com/acme/other");
     }
 
     #[test]

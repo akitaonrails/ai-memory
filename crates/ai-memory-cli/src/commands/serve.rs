@@ -2386,14 +2386,14 @@ async fn start_maintenance_scheduler(
                     let wiki = wiki.clone();
                     let llm = llm.clone();
                     let lint_turn = lint_turn.clone();
-                    let decay_lambda = decay.decay_params().lambda;
+                    let decay_params = decay.decay_params();
                     async move {
                         let started = std::time::Instant::now();
                         let outcome = run_scheduled_lint_tick(
                             &reader,
                             &wiki,
                             llm.as_ref(),
-                            decay_lambda,
+                            decay_params,
                             contradiction_band_min,
                             contradiction_band_max,
                             pass,
@@ -2980,7 +2980,7 @@ async fn run_scheduled_lint_tick(
     reader: &ReaderPool,
     wiki: &Wiki,
     llm: Option<&Arc<dyn LlmProvider>>,
-    decay_lambda: f64,
+    decay: ai_memory_store::DecayParams,
     contradiction_band_min: f32,
     contradiction_band_max: f32,
     pass: ScheduledLintPass,
@@ -3005,7 +3005,7 @@ async fn run_scheduled_lint_tick(
             ai_memory_consolidate::LintOptions {
                 dry_run: false,
                 use_llm: pass == ScheduledLintPass::Llm,
-                decay_lambda,
+                decay,
                 // The A5 embedding-band detector stays on the user-invoked
                 // `memory_lint` / admin lint, not the background passes.
                 embedding: None,
@@ -6626,7 +6626,7 @@ mod tests {
             &store.reader,
             &wiki,
             Some(&panic_llm),
-            ai_memory_store::DecayParams::default().lambda,
+            ai_memory_store::DecayParams::default(),
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             ScheduledLintPass::Rules {
@@ -6731,7 +6731,7 @@ mod tests {
                 &store.reader,
                 &wiki,
                 Some(&llm),
-                ai_memory_store::DecayParams::default().lambda,
+                ai_memory_store::DecayParams::default(),
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
                 pass,

@@ -3594,6 +3594,10 @@ async fn merge_project_dry_run_then_preserves_history_and_sessions() {
     assert_eq!(preview["dry_run"], true);
     assert_eq!(preview["page_versions"], 2);
     assert_eq!(preview["sessions"], 1);
+    // Both resolved ids are reported, so a client that named the projects can
+    // re-point a checkout bound to the source.
+    assert_eq!(preview["from_project_id"], source.to_string());
+    assert_eq!(preview["into_project_id"], target.to_string());
     assert!(
         store
             .reader

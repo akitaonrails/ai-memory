@@ -65,7 +65,6 @@ const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
 /// Per-execution opt-out of the automatic handoff (#1951): a falsy value
 /// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
 const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
-const CAPTURE_OWNER_ENV: &str = "AI_MEMORY_CAPTURE_OWNER";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
@@ -1614,8 +1613,17 @@ where
     let agent_kind = AgentKind::from_wire(&args.agent);
     let mut hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
-    // than server configuration. Hooks deliberately bypass Config::load.
-    let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
+    // than server configuration. Hooks deliberately bypass Config::load, and
+    // the captured runtime env (not a fresh global read) makes it injectable
+    // for tests, matching invariant #1.
+    let external_capture = runtime_env.capture_owner_active();
+    // An external-capture run shares its project with the owner's own
+    // interactive sessions, so no handoff-delivery front door may consume the
+    // baton: every `/handoff` fetch that would otherwise claim (SessionStart,
+    // Kimi's UserPromptSubmit, Hermes' pre_llm_call, Grok's PostToolUse) sends
+    // `claim=0`, and the server announces the baton as an offer instead,
+    // leaving it for an explicit `memory_handoff_accept` (#2148).
+    let claim_qs = if external_capture { "&claim=0" } else { "" };
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())
         || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
@@ -2341,7 +2349,7 @@ where
                 |session_id| format!("&session_id={}", url_encode(session_id)),
             );
             let handoff_url = format!(
-                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}{claim_qs}",
                 args.agent
             );
             if let Some(handoff) =
@@ -2518,7 +2526,7 @@ where
             qs.clone()
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}{claim_qs}",
             args.agent
         );
         let handoff =
@@ -2672,7 +2680,7 @@ where
             "&profile_digest=0"
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}{claim_qs}",
             args.agent
         );
         if let Some(handoff) =
@@ -2719,7 +2727,7 @@ where
                         format!("&session_id={}", url_encode(session_id))
                     });
                 let handoff_url = format!(
-                    "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                    "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}{claim_qs}",
                     args.agent
                 );
                 // Only a real body consumes this session's one chance. An empty
@@ -8517,6 +8525,112 @@ mod tests {
                     && request.contains("session_id=kiro-session")
             }),
             "{recorded:?}"
+        );
+    }
+
+    /// Under external capture (`AI_MEMORY_CAPTURE_OWNER` set) the owner's own
+    /// runs share the project with the captured harness, so EVERY handoff-
+    /// delivery front door must only *offer* the pending baton, never consume
+    /// it: each `/handoff` fetch carries `claim=0`. Covers all four doors that
+    /// would otherwise claim — SessionStart, Kimi's UserPromptSubmit, Hermes'
+    /// pre_llm_call and Grok's PostToolUse — so dropping `claim=0` from any one
+    /// bites here. A run without the variable claims as usual (#2148).
+    #[tokio::test]
+    async fn external_capture_offers_the_baton_at_every_handoff_front_door() {
+        // The recorded `GET /handoff` a hook sends for `agent`/`event` with a
+        // payload built against a per-case temp directory, under `runtime_env`.
+        async fn handoff_request(
+            agent: &str,
+            event: &str,
+            payload: impl FnOnce(&Path) -> String,
+            runtime_env: RuntimeEnv,
+        ) -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", "FRONT-DOOR-HANDOFF").await;
+            let args = HookArgs {
+                event: event.into(),
+                agent: agent.into(),
+                server_url: base.clone(),
+                auth_token: None,
+                project_strategy: None,
+                check_capture: false,
+                capture_assistant: false,
+                capture_mode: None,
+                expected_profile: None,
+            };
+            let mut stdout = Vec::new();
+            run_with_payload_in_home(
+                Some(tmp.path().join("data")),
+                args,
+                payload(tmp.path()),
+                &mut stdout,
+                |_, _| Ok(()),
+                None,
+                runtime_env,
+            )
+            .await
+            .unwrap();
+            let mut recorded = Vec::new();
+            while let Some(request) = first_request(&mut requests).await {
+                recorded.push(request);
+            }
+            recorded
+                .into_iter()
+                .find(|request| request.starts_with("GET /handoff?"))
+                .unwrap_or_else(|| panic!("{agent}/{event} fetched no handoff"))
+        }
+
+        let capture = || {
+            RuntimeEnv::with_process_env_for_tests(&[("AI_MEMORY_CAPTURE_OWNER", "owner.robot")])
+        };
+        let session_payload =
+            |cwd: &Path| serde_json::json!({ "session_id": "owner", "cwd": cwd }).to_string();
+
+        let start =
+            handoff_request("claude-code", "session-start", session_payload, capture()).await;
+        assert!(start.contains("claim=0"), "SessionStart: {start}");
+
+        let kimi = handoff_request(
+            "kimi-code",
+            "user-prompt-submit",
+            session_payload,
+            capture(),
+        )
+        .await;
+        assert!(kimi.contains("claim=0"), "Kimi UserPromptSubmit: {kimi}");
+
+        let hermes = handoff_request(
+            "hermes",
+            "user-prompt-submit",
+            |cwd| hermes_payload("pre_llm_call", cwd, pre_llm_call_extra(true)),
+            capture(),
+        )
+        .await;
+        assert!(hermes.contains("claim=0"), "Hermes pre_llm_call: {hermes}");
+
+        let grok = handoff_request(
+            "grok",
+            "post-tool-use",
+            |cwd| {
+                serde_json::json!({ "session_id": "owner", "cwd": cwd, "tool_name": "read_file" })
+                    .to_string()
+            },
+            capture(),
+        )
+        .await;
+        assert!(grok.contains("claim=0"), "Grok PostToolUse: {grok}");
+
+        // Control: without external capture the same start claims (no claim=0).
+        let normal = handoff_request(
+            "claude-code",
+            "session-start",
+            session_payload,
+            RuntimeEnv::with_process_env_for_tests(&[]),
+        )
+        .await;
+        assert!(
+            !normal.contains("claim=0"),
+            "a non-captured start still claims the baton: {normal}"
         );
     }
 

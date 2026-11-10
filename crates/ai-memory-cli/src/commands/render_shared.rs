@@ -2787,21 +2787,18 @@ fn windows_native_hook_command_with_exe(
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     // Antigravity's executor wraps the whole command in `cmd /c "…"` and
-    // does not strip inner quotes, so it needs the bare form (#611); every
-    // other Windows agent keeps the double-quoted form.
-    let bare = windows_hook_command_is_bare(context.agent);
-    let quote = if bare {
+    // does not strip inner quotes, so it needs the bare form (#611). A
+    // PowerShell runner expands `$name` and backtick escapes inside double
+    // quotes, so it gets single-quoted literals. Every other Windows agent
+    // keeps the double-quoted form.
+    let quote = if windows_hook_command_is_bare(context.agent) {
         NativeQuote::WindowsBare
-    } else {
+    } else if powershell_call_operator(context.agent).is_empty() {
         NativeQuote::Windows
+    } else {
+        NativeQuote::PowerShell
     };
-    let quote_field = |s: &str| {
-        if bare {
-            cmd_bare_escape(s)
-        } else {
-            win_double_quote(s)
-        }
-    };
+    let quote_field = |s: &str| quote.field(s);
     let mut cmd = format!(
         "{}{}{} hook --event {event} --agent {agent} --server-url {}",
         powershell_call_operator(context.agent),
@@ -2892,6 +2889,22 @@ enum NativeQuote {
     /// (#1767). A literal `"` is stripped so it cannot be written back into
     /// the command. `%` is left unchanged: caret does not stop percent expansion.
     WindowsBare,
+    /// Windows, for an agent whose runner is PowerShell (see
+    /// [`powershell_call_operator`]). Single quotes are PowerShell's literal
+    /// string: no `$name` expansion and no backtick escapes, both of which a
+    /// double-quoted path would undergo.
+    PowerShell,
+}
+
+impl NativeQuote {
+    fn field(self, s: &str) -> String {
+        match self {
+            Self::Posix => shell_quote(s),
+            Self::Windows => win_double_quote(s),
+            Self::WindowsBare => cmd_bare_escape(s),
+            Self::PowerShell => powershell_quote(s),
+        }
+    }
 }
 
 /// Whether an agent's Windows hook executor needs the command rendered
@@ -2910,11 +2923,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     // Render safe verbatim Windows data-dir forms as plain paths (#116).
     let lossy = data_dir.to_string_lossy();
     let path = strip_windows_verbatim_prefix(&lossy);
-    match quote {
-        NativeQuote::Posix => format!(" --data-dir {}", shell_quote(&path)),
-        NativeQuote::Windows => format!(" --data-dir {}", win_double_quote(&path)),
-        NativeQuote::WindowsBare => format!(" --data-dir {}", cmd_bare_escape(&path)),
-    }
+    format!(" --data-dir {}", quote.field(&path))
 }
 
 /// Append ` --project-strategy <value>` to a native hook command when an
@@ -2924,13 +2933,7 @@ fn native_project_strategy_arg(strategy: Option<&str>, quote: NativeQuote) -> St
     let Some(strategy) = strategy else {
         return String::new();
     };
-    match quote {
-        NativeQuote::Posix => format!(" --project-strategy {}", shell_quote(strategy)),
-        NativeQuote::Windows => format!(" --project-strategy {}", win_double_quote(strategy)),
-        NativeQuote::WindowsBare => {
-            format!(" --project-strategy {}", cmd_bare_escape(strategy))
-        }
-    }
+    format!(" --project-strategy {}", quote.field(strategy))
 }
 
 /// Convert a Windows path to Git Bash (MSYS2) format.
@@ -3022,7 +3025,13 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // spawns `getShellConfiguration()`). A command that fails to parse exits
     // 1, which Gemini treats as a non-blocking error, so the session runs on
     // and captures nothing (#1484).
-    if matches!(agent, "codex" | "grok" | "copilot-cli" | "gemini-cli") {
+    // DSH's `@deepseek-ai/dsh-hooks-claude-code` bridge runs each command
+    // through PowerShell `-NoLogo -NoProfile -NonInteractive -Command` on
+    // Windows; this extends the same allowlist to dsh (#2134).
+    if matches!(
+        agent,
+        "codex" | "grok" | "copilot-cli" | "gemini-cli" | "dsh"
+    ) {
         "& "
     } else {
         ""
@@ -3062,7 +3071,7 @@ fn cmd_bare_escape(field: &str) -> String {
 
 #[test]
 fn powershell_call_operator_is_limited_to_known_powershell_runners() {
-    for agent in ["codex", "grok", "copilot-cli", "gemini-cli"] {
+    for agent in ["codex", "grok", "copilot-cli", "gemini-cli", "dsh"] {
         assert_eq!(powershell_call_operator(agent), "& ", "agent: {agent}");
     }
 
@@ -3091,7 +3100,7 @@ fn codex_windows_command_invokes_rather_than_quotes() {
         HookCommandContext::new(HookCommandPlatform::WindowsNative, "codex", None, None),
     );
     assert!(
-        cmd.starts_with("& \""),
+        cmd.starts_with("& '"),
         "codex must use the call operator: {cmd}"
     );
 }
@@ -3107,8 +3116,24 @@ fn grok_windows_command_invokes_rather_than_quotes() {
         HookCommandContext::new(HookCommandPlatform::WindowsNative, "grok", None, None),
     );
     assert!(
-        cmd.starts_with("& \""),
+        cmd.starts_with("& '"),
         "grok must use the call operator: {cmd}"
+    );
+}
+
+/// DSH's Claude Code bridge runs hook commands through PowerShell `-Command`,
+/// so the quoted executable needs the call operator (#2134).
+#[test]
+fn dsh_windows_command_invokes_rather_than_quotes() {
+    let cmd = hook_command(
+        Path::new("stop.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(HookCommandPlatform::WindowsNative, "dsh", None, None),
+    );
+    assert!(
+        cmd.starts_with("& '"),
+        "dsh must use the call operator: {cmd}"
     );
 }
 
@@ -3130,7 +3155,7 @@ fn copilot_cli_windows_command_invokes_rather_than_quotes() {
         ),
     );
     assert!(
-        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        cmd.starts_with(r"& 'C:\Program Files\ai-memory\ai-memory.exe' --data-dir 'C:\Users\Alice Smith\ai-memory'"),
         "Copilot must invoke the quoted executable through PowerShell: {cmd}"
     );
 }
@@ -3178,6 +3203,55 @@ if (($args -join '|') -ne $expected) { exit 9 }
     );
 }
 
+/// A PowerShell runner expands `$name` and backtick escapes inside double
+/// quotes, so a Windows path holding either (a `$` is legal in user and folder
+/// names) reached the hook binary rewritten. The executable and every
+/// argument must arrive as literals.
+#[cfg(windows)]
+#[test]
+fn powershell_runner_passes_dollar_and_backtick_paths_literally() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = temp.path().join("bin $HOME `t");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let script = bin_dir.join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\ana$x `n data|hook|--event|pre-tool-use|--agent|copilot-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { [Console]::Error.WriteLine($args -join '|'); exit 9 }
+"#,
+    )
+    .unwrap();
+    let command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("pre-tool-use.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "copilot-cli",
+            Some(Path::new(r"C:\ana$x `n data")),
+            None,
+        ),
+    );
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "hook command did not reach the binary with literal paths: {command}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Gemini CLI runs its Windows hook commands through PowerShell `-Command`,
 /// so a quoted executable needs the call operator, including when its path
 /// and data directory contain spaces.
@@ -3196,7 +3270,7 @@ fn gemini_cli_windows_command_invokes_rather_than_quotes() {
         ),
     );
     assert!(
-        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        cmd.starts_with(r"& 'C:\Program Files\ai-memory\ai-memory.exe' --data-dir 'C:\Users\Alice Smith\ai-memory'"),
         "Gemini must invoke the quoted executable through PowerShell: {cmd}"
     );
 }
@@ -5306,9 +5380,10 @@ if (inheritOnly) {
             "bare (unquoted) args expected: {cmd}"
         );
 
-        // Same renderer, a non-antigravity agent identity: the double quotes
-        // stay, so the fix is scoped to antigravity and does not regress the
-        // other Windows JSON-hook agents.
+        // Same renderer, a non-antigravity agent identity: the fields stay
+        // quoted (grok runs under PowerShell, so single-quoted literals), so
+        // the fix is scoped to antigravity and does not regress the other
+        // Windows JSON-hook agents.
         let other = build_antigravity_payload_for_platform(
             Path::new(r"C:\Users\me\.local\bin"),
             "https://memory.example.com",
@@ -5324,8 +5399,8 @@ if (inheritOnly) {
             .and_then(|v| v.as_str())
             .expect("command string");
         assert!(
-            other_cmd.contains('"'),
-            "non-antigravity Windows agents keep their double quotes: {other_cmd}"
+            other_cmd.contains(r"--data-dir 'C:\Users\me\AppData\Local\ai-memory'"),
+            "non-antigravity Windows agents keep their quotes: {other_cmd}"
         );
         assert!(
             !other_cmd.contains("^ "),
@@ -5469,7 +5544,7 @@ if (inheritOnly) {
                 .and_then(|v| v.as_str())
                 .expect(agent);
             assert!(
-                other_cmd.contains(r#"--data-dir "C:\Users\Felipe Leite\AppData""#),
+                other_cmd.contains(r"--data-dir 'C:\Users\Felipe Leite\AppData'"),
                 "{agent} must quote the spaced data-dir, not merely some other field: {other_cmd}"
             );
             assert!(!other_cmd.contains("^ "), "{agent}: {other_cmd}");

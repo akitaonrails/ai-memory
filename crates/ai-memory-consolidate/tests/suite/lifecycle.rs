@@ -428,7 +428,7 @@ async fn m8_retention_lifecycle_end_to_end() {
         ai_memory_consolidate::LintOptions {
             dry_run: true,
             use_llm: true,
-            decay_lambda: ai_memory_store::DecayParams::default().lambda,
+            decay: ai_memory_store::DecayParams::default(),
             embedding: None,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,

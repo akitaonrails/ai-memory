@@ -586,6 +586,47 @@ async fn purge_session_dry_run_does_not_dispatch_admission_webhook() {
     );
 }
 
+/// A confirmed purge of a session that is not in the scope answers 404
+/// without telling the admission webhook and without a pre-purge checkpoint.
+#[tokio::test]
+async fn purge_session_unknown_session_is_404_before_admission_and_checkpoint() {
+    let (url, rx) = spawn_capture_hook().await;
+    let tmp = TempDir::new().unwrap();
+    let chain = AdmissionChain::new(vec![WebhookConfig {
+        name: "async-mirror".into(),
+        url,
+        timeout_ms: 2_000,
+        failure_policy: FailurePolicy::Ignore,
+        events: vec![AdmissionOp::PurgeSession],
+        blocking: false,
+    }])
+    .unwrap();
+    let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
+    seed_ended_session_summary(
+        &store,
+        &state.wiki,
+        "default",
+        "audit",
+        SessionId::new(),
+        "uncommitted summary body",
+    )
+    .await;
+    let commits = state.wiki.git().commit_count();
+
+    let resp = post_purge_session(state.clone(), "default", "audit", SessionId::new()).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        state.wiki.git().commit_count(),
+        commits,
+        "a refused purge must not write its pre-purge checkpoint"
+    );
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), rx).await;
+    assert!(
+        outcome.is_err(),
+        "a purge of an unknown session must not dispatch the admission webhook"
+    );
+}
+
 /// A session outside the named scope must still 404 on a preview, exactly
 /// like the confirmed purge does.
 #[tokio::test]

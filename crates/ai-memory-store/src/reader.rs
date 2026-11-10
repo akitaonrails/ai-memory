@@ -6500,6 +6500,41 @@ impl ReaderPool {
         .await
     }
 
+    /// Scopes other than `(workspace_id, project_id)` that hold a LATEST
+    /// `sessions/<session_id>.md` page row. These are the scopes a re-home
+    /// (`move-session` of a session already rooted in the destination)
+    /// sweeps, so the wiki uses them to plan the matching file step.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_page_latest_scopes_outside(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let path = format!("sessions/{session_id}.md");
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT workspace_id, project_id FROM pages \
+                 WHERE path = ?1 AND is_latest = 1 \
+                   AND NOT (workspace_id = ?2 AND project_id = ?3) \
+                 ORDER BY workspace_id, project_id",
+            )?;
+            let rows = stmt.query_map(
+                params![path, workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (ws, proj) = row?;
+                out.push((WorkspaceId::from_slice(&ws)?, ProjectId::from_slice(&proj)?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// The recorded `(workspace, project)` of a session that has not ended.
     /// A mid-session checkpoint writes its artifacts there, next to where the
     /// session's eventual end writes them, whatever scope the event resolved
@@ -14066,6 +14101,10 @@ impl ReaderPool {
 
     /// Server-wide [`SessionConsolidationQueue`] state.
     ///
+    /// `failed` counts only the failures no newer generation of the same
+    /// session has completed since (see
+    /// [`UNRECOVERED_FAILED_CONSOLIDATION_JOB`]).
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn session_consolidation_queue(&self) -> StoreResult<SessionConsolidationQueue> {
@@ -14083,10 +14122,18 @@ impl ReaderPool {
                     "pending" => queue.pending = n,
                     "running" => queue.running = n,
                     "completed" => queue.completed = n,
-                    "failed" => queue.failed = n,
                     _ => {}
                 }
             }
+            let failed: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM session_consolidation_jobs job \
+                     WHERE {UNRECOVERED_FAILED_CONSOLIDATION_JOB}"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            queue.failed = u64::try_from(failed).unwrap_or(0);
             queue.last_completed_at_us = conn.query_row(
                 "SELECT MAX(completed_at) FROM session_consolidation_jobs \
                  WHERE state = 'completed'",
@@ -14105,7 +14152,9 @@ impl ReaderPool {
     }
 
     /// The most recent consolidation jobs that gave up, newest first,
-    /// bounded to `limit`.
+    /// bounded to `limit`. A failure a newer generation of the same session
+    /// has since completed is left out (see
+    /// [`UNRECOVERED_FAILED_CONSOLIDATION_JOB`]).
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -14115,12 +14164,13 @@ impl ReaderPool {
     ) -> StoreResult<Vec<FailedConsolidationJob>> {
         let limit = i64::from(limit.clamp(1, 100));
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT session_id, attempts, COALESCE(completed_at, 0), \
-                        COALESCE(last_error, '') \
-                 FROM session_consolidation_jobs WHERE state = 'failed' \
-                 ORDER BY COALESCE(completed_at, 0) DESC LIMIT ?1",
-            )?;
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT job.session_id, job.attempts, COALESCE(job.completed_at, 0), \
+                        COALESCE(job.last_error, '') \
+                 FROM session_consolidation_jobs job \
+                 WHERE {UNRECOVERED_FAILED_CONSOLIDATION_JOB} \
+                 ORDER BY COALESCE(job.completed_at, 0) DESC LIMIT ?1"
+            ))?;
             let rows = stmt.query_map([limit], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -15129,6 +15179,22 @@ fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage>
     })
 }
 
+/// SQL predicate over a `session_consolidation_jobs` row aliased `job`: a
+/// failed job that still needs an operator.
+///
+/// A failed generation stops mattering once a newer generation of the same
+/// session completes: consolidation reads the session's current observations,
+/// so the newer page already covers everything the failed run would have
+/// written. Counting it anyway kept `/admin/status`, `status --json` and the
+/// health panel reporting sessions that were consolidated, and sent a #1692
+/// watchdog to re-run them. A failure newer than the last completed
+/// generation is still listed. Generation is the primary key's second column,
+/// so the probe is an index lookup.
+const UNRECOVERED_FAILED_CONSOLIDATION_JOB: &str = "job.state = 'failed' \
+     AND NOT EXISTS (SELECT 1 FROM session_consolidation_jobs newer \
+     WHERE newer.session_id = job.session_id AND newer.state = 'completed' \
+     AND newer.generation > job.generation)";
+
 /// SQL for [`PageMeta::created_at`]: when the page itself first appeared.
 ///
 /// `pages.created_at` is per version, so the latest row alone would report the
@@ -15503,70 +15569,53 @@ impl SessionObservationSnapshot<'_> {
     /// # Errors
     /// Propagates any SQL error.
     pub fn prompt_titles(&self, head: usize, tail: usize) -> StoreResult<SessionPromptTitles> {
-        let total = self.conn.query_row(
-            "SELECT COUNT(*) FROM observations \
-             WHERE session_id = ?1 AND kind = ?2 \
-               AND workspace_id = ?3 AND project_id = ?4",
-            params![
-                self.session_id,
-                ObservationKind::UserPrompt.as_str(),
-                self.workspace_id,
-                self.project_id,
-            ],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let total = usize::try_from(total).unwrap_or(usize::MAX);
-        if total <= head + tail {
-            return Ok(SessionPromptTitles {
-                total,
-                first: self.prompt_title_window(total, ObservationOrder::Asc)?,
-                last: Vec::new(),
-            });
-        }
-        let mut last = self.prompt_title_window(tail, ObservationOrder::Desc)?;
-        last.reverse();
-        Ok(SessionPromptTitles {
-            total,
-            first: self.prompt_title_window(head, ObservationOrder::Asc)?,
-            last,
-        })
-    }
-
-    /// The first `limit` user-prompt titles of the session in `order`.
-    ///
-    /// # Errors
-    /// Propagates any SQL error.
-    fn prompt_title_window(
-        &self,
-        limit: usize,
-        order: ObservationOrder,
-    ) -> StoreResult<Vec<String>> {
-        let direction = match order {
-            ObservationOrder::Asc => "ASC",
-            ObservationOrder::Desc => "DESC",
-        };
-        let sql = format!(
+        // Read every user-prompt title for the session, then drop the machine
+        // turns Claude Code routes through the prompt channel (`<task-notification>`,
+        // `<teammate-message …>`, the cross-session envelope, the post-compaction
+        // summary): they are not what the user asked, so they belong in neither
+        // the `## Prompts` list nor its count (#2149). Other scaffolding — an IDE
+        // context block, a shell prompt echoed into a paste — is still real
+        // session history and stays listed, as it always has. The filter is a
+        // leading-shape test, not SQL-expressible, and a session's titles are
+        // bounded and small, so windowing happens in Rust over the kept set.
+        let mut stmt = self.conn.prepare_cached(
             "SELECT title FROM observations \
              WHERE session_id = ?1 AND kind = ?2 \
-               AND workspace_id = ?4 AND project_id = ?5 \
-             ORDER BY created_at {direction}, rowid {direction} LIMIT ?3"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+               AND workspace_id = ?3 AND project_id = ?4 \
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
         let rows = stmt.query_map(
             params![
                 self.session_id,
                 ObservationKind::UserPrompt.as_str(),
-                i64::try_from(limit).unwrap_or(i64::MAX),
                 self.workspace_id,
                 self.project_id,
             ],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )?;
-        let mut out = Vec::with_capacity(limit);
+        let mut titles = Vec::new();
         for title in rows {
-            out.push(title?);
+            let title = title?;
+            if !ai_memory_core::looks_like_machine_turn(&title) {
+                titles.push(title);
+            }
         }
-        Ok(out)
+
+        let total = titles.len();
+        if total <= head + tail {
+            return Ok(SessionPromptTitles {
+                total,
+                first: titles,
+                last: Vec::new(),
+            });
+        }
+        let last = titles.split_off(total - tail);
+        titles.truncate(head);
+        Ok(SessionPromptTitles {
+            total,
+            first: titles,
+            last,
+        })
     }
 
     /// Walk the session's user prompts in capture order, one resident at a

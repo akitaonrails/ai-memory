@@ -31,7 +31,8 @@ pub mod routing_skills;
 pub mod scaffolding;
 pub use scaffolding::{
     is_codex_memory_agent_cwd, looks_like_codex_generated_prompt, looks_like_codex_instructions,
-    looks_like_codex_memory_agent_prompt, looks_like_markup_block, looks_like_scaffolding,
+    looks_like_codex_memory_agent_prompt, looks_like_machine_turn, looks_like_markup_block,
+    looks_like_scaffolding,
 };
 pub mod routing_snippet;
 pub mod sanitize;

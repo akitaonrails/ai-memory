@@ -788,7 +788,11 @@ brief_on_project_change = false
 #
 # abstract_vectors adds the L0 abstract-embedding stream to the fusion. A page
 # gets an abstract vector when its frontmatter carries `abstract:` and the
-# embedding backfill runs.
+# embedding backfill runs. Only an agent passing the optional `abstract` field
+# to memory_write_page or memory_patch_page writes that line. Session
+# consolidation, the dream pass and the forget sweep never add it, so on a
+# default install the stream ranks only the pages whose abstract an agent wrote
+# by hand, and leaving it off loses nothing until abstracts exist.
 #
 # belief_authority_weight folds a page's evidence-derived confidence into its
 # authority factor. 0.0 is inert and negative values are clamped to 0.

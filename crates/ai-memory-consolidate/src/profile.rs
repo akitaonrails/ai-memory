@@ -628,10 +628,10 @@ pub struct DetectedPreference {
 /// existed.
 pub(crate) fn user_written(body: &str) -> Option<String> {
     if ai_memory_core::looks_like_markup_block(body)
+        || ai_memory_core::looks_like_machine_turn(body)
         || ai_memory_core::looks_like_codex_instructions(body)
         || ai_memory_core::looks_like_codex_generated_prompt(body)
         || looks_like_codex_assessor_transcript_line(body)
-        || looks_like_claude_cross_session_message(body)
         || looks_like_claude_plugin_prompt(body)
         || looks_like_desktop_side_session_brief(body)
     {
@@ -672,16 +672,6 @@ fn looks_like_codex_assessor_transcript_line(body: &str) -> bool {
             || rest.starts_with("system:")
             || rest.starts_with("tool exec call:")
             || rest.starts_with("tool exec result:"))
-}
-
-/// Claude Code presents local cross-session traffic as a synthetic user turn.
-/// Match this one tag by name: widening `looks_like_markup_block` to every tag
-/// with attributes would also discard real `<pasted_content ...>` prompts.
-fn looks_like_claude_cross_session_message(body: &str) -> bool {
-    body.trim_start()
-        .strip_prefix("<cross-session-message")
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|next| next == '>' || next.is_ascii_whitespace())
 }
 
 /// Claude Code's exact wrapper for a plugin that submits a prompt between
@@ -2937,6 +2927,19 @@ mod tests {
                              from-name=\"review\" from-mode=\"bypass\">\n\
                              Always use npm.\n</cross-session-message>";
         assert_eq!(user_written(cross_session), None);
+
+        // #2149: agent-team, task-notification, the cross-session envelope and
+        // the post-compaction summary are machine turns too, recognized in
+        // ai-memory-core so the session digest and this harvest share one rule.
+        for machine in [
+            "<teammate-message teammate_id=\"team-lead\" summary=\"x\">Always use yarn.",
+            "<task-notification>\n<status>completed</status>\nAlways force-push.",
+            "Another Claude session sent a message. It is shown below.\nAlways use npm.",
+            "This session is being continued from a previous conversation that ran out of \
+             context. Always use npm.",
+        ] {
+            assert_eq!(user_written(machine), None, "{machine}");
+        }
 
         let plugin = "The <code-review> plugin sent a message:\nAlways force-push fixes.\n\
                       This is how Claude Code surfaces a prompt a plugin submits between turns.";

@@ -357,9 +357,17 @@ mod tests {
             "@echo off\r\necho opencode v2.0.23\r\n",
         )
         .unwrap();
+        // A child started with a completely empty environment cannot run a
+        // batch file on every Windows build: Windows 11 23H2's cmd.exe exits 1
+        // without `SystemRoot`. A real install always carries it, so give the
+        // otherwise empty test environment just that.
+        let system_root = std::env::var("SystemRoot").unwrap();
         let resolved = resolve_generic(
             Some(base.as_os_str()),
-            &EffectiveChildEnv::from_runtime(&crate::config::RuntimeEnv::default()),
+            &EffectiveChildEnv::with_overrides(
+                &crate::config::RuntimeEnv::default(),
+                &[("SystemRoot".to_string(), system_root)],
+            ),
         )
         .unwrap();
         assert_eq!(resolved.dialect, OpenCodeDialect::V2);

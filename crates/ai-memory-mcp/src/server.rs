@@ -4384,7 +4384,7 @@ impl AiMemoryServer {
             ai_memory_consolidate::LintOptions {
                 dry_run: args.dry_run.unwrap_or(false),
                 use_llm: !args.no_llm.unwrap_or(false),
-                decay_lambda: self.decay_params.lambda,
+                decay: self.decay_params,
                 // Drive the zero-LLM contradiction detector (A5) off the
                 // configured embedder's triple; `None` when no embedder is
                 // configured makes that pass a clean no-op.
