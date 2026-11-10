@@ -204,7 +204,9 @@ Safety rules:
 - **Deletes are opt-in.** Without `--propagate-deletes` a delete is only
   reported, and the page keeps its state entry so the next run reports it
   again. With it, a side is deleted only if it is unchanged since the last
-  sync; a delete against an edit is a conflict like any other. Pages gone
+  sync; a delete against an edit is a conflict like any other. When both
+  server version IDs are available, a newer version conflicts with a
+  repository delete even if only unexported metadata changed. Pages gone
   from both sides drop out of the state.
 - **Delete safety.** More than `--max-deletes` deletes (default 10) refuses
   the whole run. A pinned server page is never deleted unless `--prefer repo`

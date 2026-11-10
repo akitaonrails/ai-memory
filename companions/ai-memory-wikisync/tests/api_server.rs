@@ -1658,6 +1658,68 @@ async fn sync_delete_conflicts_follow_prefer() {
 }
 
 #[tokio::test]
+async fn sync_treats_server_only_metadata_edits_as_delete_conflicts() {
+    let mut page = decision();
+    page.pinned = false;
+    page.frontmatter["abstract"] = json!("Original abstract");
+    let path = page.path.clone();
+    let (addr, fixture) = serve(Fixture::with_pages(vec![page])).await;
+    let (_tmp, dest) = temp_dest();
+    sync(addr, &dest).await.expect("first sync");
+    let original = fs::read(dest.join(&path)).unwrap();
+    let base = state::load(&dest).unwrap();
+
+    fixture.update(&path, |page| {
+        page.frontmatter["abstract"] = json!("Server edit");
+    });
+    let edited_id = fixture.page(&path).unwrap().id;
+    assert_ne!(
+        base.pages[&path].page_id.as_deref(),
+        Some(edited_id.as_str())
+    );
+    fs::remove_file(dest.join(&path)).unwrap();
+    let args = deleting_args(addr, &dest, None);
+
+    let check = bidi::run(&args, SyncMode::Check).await.unwrap();
+    assert_eq!(check.status(), CheckStatus::Blocked);
+    let error = bidi::run(&args, SyncMode::Apply).await.unwrap_err();
+    assert!(error.to_string().contains("refused"), "{error}");
+    assert!(fixture.mcp_calls.lock().unwrap().is_empty());
+    assert_eq!(fixture.page(&path).unwrap().id, edited_id);
+    assert_eq!(state::load(&dest).unwrap(), base);
+
+    bidi::run(
+        &deleting_args(addr, &dest, Some(Prefer::Server)),
+        SyncMode::Apply,
+    )
+    .await
+    .expect("prefer server restores the unchanged projection");
+    assert_eq!(fs::read(dest.join(&path)).unwrap(), original);
+    assert!(fixture.mcp_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        state::load(&dest).unwrap().pages[&path].page_id.as_deref(),
+        Some(edited_id.as_str())
+    );
+
+    fixture.update(&path, |page| {
+        page.frontmatter["abstract"] = json!("Another server edit");
+    });
+    let latest_id = fixture.page(&path).unwrap().id;
+    fs::remove_file(dest.join(&path)).unwrap();
+    bidi::run(
+        &deleting_args(addr, &dest, Some(Prefer::Repo)),
+        SyncMode::Apply,
+    )
+    .await
+    .expect("prefer repo explicitly chooses deletion");
+    assert!(fixture.page(&path).is_none());
+    let calls = fixture.mcp_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["name"], "memory_delete_page");
+    assert_eq!(calls[0]["arguments"]["expected_page_id"], latest_id);
+}
+
+#[tokio::test]
 async fn sync_never_deletes_a_pinned_page_without_prefer_repo() {
     // decision() is pinned on the server.
     let (addr, fixture) = serve(Fixture::with_pages(vec![decision()])).await;

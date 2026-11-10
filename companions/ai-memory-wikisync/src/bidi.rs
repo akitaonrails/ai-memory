@@ -66,8 +66,8 @@ pub enum ServerSide<'a> {
     Absent,
     /// `304`: unchanged since the ETag recorded with the base.
     NotModified,
-    /// The page rendered into file bytes.
-    Rendered(&'a [u8]),
+    /// The page rendered into file bytes, with its latest version id if known.
+    Rendered(&'a [u8], Option<&'a str>),
 }
 
 /// The decision for one page.
@@ -129,13 +129,19 @@ pub fn decide(
             (true, _) if disk_is_base => Action::Unchanged,
             (true, _) => Action::Import { create: false },
         },
-        ServerSide::Rendered(server) => {
+        ServerSide::Rendered(server, page_id) => {
             let server_hash = state::sha256_hex(server);
             let server_is_base = base.is_some_and(|base| base.hash == server_hash);
+            // A server-only metadata edit can leave the exported bytes
+            // identical. A delete still affects that newer version.
+            let server_version_changed = base
+                .and_then(|base| base.page_id.as_deref())
+                .zip(page_id)
+                .is_some_and(|(old, current)| old != current);
             match disk_hash {
                 None if base.is_none() => Action::Export { create: true },
                 None if !policy.propagate_deletes => Action::DeletedInRepo,
-                None if server_is_base => Action::DeleteOnServer,
+                None if server_is_base && !server_version_changed => Action::DeleteOnServer,
                 None => match prefer {
                     Some(Prefer::Repo) => Action::DeleteOnServer,
                     Some(Prefer::Server) => Action::Export { create: true },
@@ -487,7 +493,10 @@ async fn build_plan(
             }
         }
         let server = match (&rendered, on_server.contains(&path)) {
-            (Some(bytes), _) => ServerSide::Rendered(bytes.as_bytes()),
+            (Some(bytes), _) => ServerSide::Rendered(
+                bytes.as_bytes(),
+                current.as_ref().and_then(|page| page.id.as_deref()),
+            ),
             (None, true) => ServerSide::NotModified,
             (None, false) => ServerSide::Absent,
         };
@@ -1177,7 +1186,7 @@ mod tests {
         let old = b"old".as_slice();
         let repo = b"repo edit".as_slice();
         let server = b"server edit".as_slice();
-        let rendered = ServerSide::Rendered;
+        let rendered = |bytes| ServerSide::Rendered(bytes, None);
         let none = Policy::default();
 
         // One side changed: the other side follows.
@@ -1264,7 +1273,12 @@ mod tests {
             }
             for server in [old, server] {
                 assert_eq!(
-                    decide(None, Some(&base(old)), ServerSide::Rendered(server), off),
+                    decide(
+                        None,
+                        Some(&base(old)),
+                        ServerSide::Rendered(server, None),
+                        off
+                    ),
                     Action::DeletedInRepo
                 );
             }
@@ -1287,11 +1301,22 @@ mod tests {
         for prefer in PREFERENCES {
             let on = policy(prefer, true);
             // The other side is unchanged since the last sync: delete it,
-            // whatever --prefer says.
-            assert_eq!(
-                decide(None, Some(&base(old)), ServerSide::Rendered(old), on),
-                Action::DeleteOnServer
-            );
+            // whatever --prefer says, including with a legacy baseline.
+            for page_id in [Some("v1".to_string()), None] {
+                let baseline = PageState {
+                    page_id,
+                    ..base(old)
+                };
+                assert_eq!(
+                    decide(
+                        None,
+                        Some(&baseline),
+                        ServerSide::Rendered(old, Some("v1")),
+                        on
+                    ),
+                    Action::DeleteOnServer
+                );
+            }
             assert_eq!(
                 decide(None, Some(&base(old)), ServerSide::NotModified, on),
                 Action::DeleteOnServer
@@ -1310,7 +1335,7 @@ mod tests {
                 Action::Import { create: true }
             );
             assert_eq!(
-                decide(None, None, ServerSide::Rendered(server), on),
+                decide(None, None, ServerSide::Rendered(server, None), on),
                 Action::Export { create: true }
             );
         }
@@ -1321,7 +1346,7 @@ mod tests {
             decide(
                 None,
                 Some(&base(old)),
-                ServerSide::Rendered(server),
+                ServerSide::Rendered(server, None),
                 policy(prefer, true),
             )
         };
