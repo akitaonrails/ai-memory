@@ -13988,6 +13988,10 @@ impl ReaderPool {
 
     /// Server-wide [`SessionConsolidationQueue`] state.
     ///
+    /// `failed` counts only the failures no newer generation of the same
+    /// session has completed since (see
+    /// [`UNRECOVERED_FAILED_CONSOLIDATION_JOB`]).
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn session_consolidation_queue(&self) -> StoreResult<SessionConsolidationQueue> {
@@ -14005,10 +14009,18 @@ impl ReaderPool {
                     "pending" => queue.pending = n,
                     "running" => queue.running = n,
                     "completed" => queue.completed = n,
-                    "failed" => queue.failed = n,
                     _ => {}
                 }
             }
+            let failed: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM session_consolidation_jobs job \
+                     WHERE {UNRECOVERED_FAILED_CONSOLIDATION_JOB}"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            queue.failed = u64::try_from(failed).unwrap_or(0);
             queue.last_completed_at_us = conn.query_row(
                 "SELECT MAX(completed_at) FROM session_consolidation_jobs \
                  WHERE state = 'completed'",
@@ -14027,7 +14039,9 @@ impl ReaderPool {
     }
 
     /// The most recent consolidation jobs that gave up, newest first,
-    /// bounded to `limit`.
+    /// bounded to `limit`. A failure a newer generation of the same session
+    /// has since completed is left out (see
+    /// [`UNRECOVERED_FAILED_CONSOLIDATION_JOB`]).
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -14037,12 +14051,13 @@ impl ReaderPool {
     ) -> StoreResult<Vec<FailedConsolidationJob>> {
         let limit = i64::from(limit.clamp(1, 100));
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT session_id, attempts, COALESCE(completed_at, 0), \
-                        COALESCE(last_error, '') \
-                 FROM session_consolidation_jobs WHERE state = 'failed' \
-                 ORDER BY COALESCE(completed_at, 0) DESC LIMIT ?1",
-            )?;
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT job.session_id, job.attempts, COALESCE(job.completed_at, 0), \
+                        COALESCE(job.last_error, '') \
+                 FROM session_consolidation_jobs job \
+                 WHERE {UNRECOVERED_FAILED_CONSOLIDATION_JOB} \
+                 ORDER BY COALESCE(job.completed_at, 0) DESC LIMIT ?1"
+            ))?;
             let rows = stmt.query_map([limit], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -15049,6 +15064,22 @@ fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage>
         kind: row.get(4)?,
     })
 }
+
+/// SQL predicate over a `session_consolidation_jobs` row aliased `job`: a
+/// failed job that still needs an operator.
+///
+/// A failed generation stops mattering once a newer generation of the same
+/// session completes: consolidation reads the session's current observations,
+/// so the newer page already covers everything the failed run would have
+/// written. Counting it anyway kept `/admin/status`, `status --json` and the
+/// health panel reporting sessions that were consolidated, and sent a #1692
+/// watchdog to re-run them. A failure newer than the last completed
+/// generation is still listed. Generation is the primary key's second column,
+/// so the probe is an index lookup.
+const UNRECOVERED_FAILED_CONSOLIDATION_JOB: &str = "job.state = 'failed' \
+     AND NOT EXISTS (SELECT 1 FROM session_consolidation_jobs newer \
+     WHERE newer.session_id = job.session_id AND newer.state = 'completed' \
+     AND newer.generation > job.generation)";
 
 /// SQL for [`PageMeta::created_at`]: when the page itself first appeared.
 ///

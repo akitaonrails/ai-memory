@@ -1057,7 +1057,9 @@ page content and scope names never reach it.
 and the worker's bounded error through the privacy strip). The session id is
 what a re-consolidation needs after the cause is fixed, so it belongs on the
 operator surface and not on the health panel, whose "counts and timestamps
-only" contract is unchanged (#1692).
+only" contract is unchanged (#1692). Both the `failed` count and the list leave
+out a failure that a newer generation of the same session has since completed:
+that newer page already covers the failed run's observations.
 
 ## CLI subcommand surface
 
