@@ -47,7 +47,7 @@ version in [`docs/changelog/`](docs/changelog/):
   succeeded, the old failure stayed in `failed` and `failed_sessions`, so the
   panel kept its warning and a #1692 watchdog re-ran sessions that were already
   consolidated (14 of 19 reported failures on one server). A failure newer than
-  the session's last completed generation is still reported. (#PR)
+  the session's last completed generation is still reported. (#2160)
 - Claude Code machine turns that reach the prompt channel — an agent-team
   `<teammate-message …>`, a `<cross-session-message …>`, a `<task-notification>`,
   the "Another Claude session sent a message" envelope, and the post-compaction
