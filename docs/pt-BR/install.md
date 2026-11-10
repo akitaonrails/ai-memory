@@ -2167,6 +2167,61 @@ a documentação de hooks do CodeBuddy e as cargas úteis relatadas na v2.164 at
 v2.167; os mantenedores ainda não a executaram de ponta a ponta. Inicie uma nova
 sessão do CodeBuddy após a instalação para que ele carregue os hooks.
 
+### WorkBuddy
+
+O WorkBuddy (`workbuddy`), o agente de código da Tencent, lê os hooks de ciclo
+de vida da chave `hooks` de `~/.workbuddy/settings.json` e os servidores MCP do
+mapa `mcpServers` de `~/.workbuddy/mcp.json`. Ambos os instaladores imitam seus
+equivalentes Tencent CodeBuddy e Claude Code:
+
+```bash
+ai-memory install-hooks --agent workbuddy --apply
+ai-memory install-mcp --client workbuddy --apply
+ai-memory install-skills --scope global --agent workbuddy
+```
+
+Sem `--apply`, cada comando imprime o bloco a mesclar manualmente, e
+`ai-memory setup-agent --agent workbuddy` imprime o bloco de hooks para um host
+que roda o WorkBuddy contra um servidor remoto. Rodar `--apply` de novo não muda
+nada.
+
+O WorkBuddy adota o contrato de hook no formato Claude Code do CodeBuddy: ele
+envia `session_id`, `cwd`, `tool_name`, `tool_input` e `tool_response` no stdin
+com os nomes de ferramenta do Claude Code, então cada entrada roda o comando
+nativo `ai-memory hook --event … --agent workbuddy` com um matcher vazio. Não há
+pacote de scripts; o spool local, a autenticação por bearer e
+`[capture] ignore_paths` se aplicam. Seis eventos são conectados: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact` e `Stop`.
+
+O hook `SessionStart` entrega o handoff da sessão anterior por meio de
+`hookSpecificOutput.additionalContext`, que o WorkBuddy anexa à sessão. Sem nada
+a entregar, os hooks `SessionStart` e `UserPromptSubmit` não imprimem nada, já
+que o WorkBuddy também anexa a saída deles.
+
+**O WorkBuddy nunca dispara um evento `SessionEnd`.** `Stop` é um limite de
+turno, não um fim de sessão, então uma sessão WorkBuddy ociosa permanece aberta.
+Encerre-a com `ai-memory finalize-session --agent workbuddy` após o turno final;
+isso grava a página de resumo e passa o bastão para a próxima sessão. Não há
+workstream gerenciado nem backfill de transcrição.
+
+A entrada MCP usa o formato HTTP do Claude Code (`type: "http"`, `url`, `headers`
+opcional) sob `mcpServers`. Quando o bearer da instalação vem de
+`[auth].bearer_token_file`, `install-mcp` grava a entrada stdio do `mcp-bridge`
+sem sessão, de modo que o token nunca entra em `mcp.json`; não se assume um
+cliente com id de sessão próprio, então passe `workspace` e `project` explícitos
+nas chamadas MCP com escopo de projeto.
+
+**O novo servidor só é utilizável depois que o WorkBuddy confia nele.** Após
+`install-mcp --apply`, abra as configurações de **conector personalizado**
+(自定义连接器) do WorkBuddy e aprove o servidor MCP `ai-memory` recém-adicionado.
+Até ser confiável, a entrada fica em `mcp.json`, mas as ferramentas do ai-memory
+não aparecem na sessão.
+
+As skills vão para `~/.workbuddy/skills` (global) ou `.workbuddy/skills`
+(projeto). `ai-memory setup` conecta o WorkBuddy quando `~/.workbuddy` existe, e
+`ai-memory uninstall` remove as entradas de hook. Inicie uma nova sessão
+WorkBuddy após instalar para que ela carregue os hooks.
+
 ### Hermes Agent (Nous Research)
 
 O Hermes declara hooks de ciclo de vida no bloco `hooks:` de
