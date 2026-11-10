@@ -1081,6 +1081,12 @@ Lists recent wiki git commits, newest first. The short OID is enough for
 ai-memory checkpoints --json
 ```
 
+From a checkout whose `.ai-memory.toml` selects a server profile, `checkpoints`
+lists that profile's server, the same one `restore-page` targets, so an OID
+printed here restores against the server that owns it. Set `AI_MEMORY_SERVER_URL`
+(or run from an unrouted directory) to list the install-default server's history
+instead.
+
 What it is for:
 
 - Finding the checkpoint just before a bad page write, delete, purge, move, or

@@ -165,6 +165,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory checkpoints` and `ai-memory commit` now use the wiki of the server
+  the checkout routes to, matching their paired command `restore-page`. From a
+  checkout whose `.ai-memory.toml` selects a server profile, `checkpoints`
+  listed the install-default server's history and `commit` wrote its checkpoint
+  there, so an OID from either could not be restored on the profile server
+  `restore-page` targets. An explicit `AI_MEMORY_SERVER_URL` still uses the
+  install-default wiki, and a marker that selects an unresolvable profile now
+  fails closed rather than acting on another server's wiki. (#2186)
 - Restored TypeScript SDK page reads and updates on supported servers that
   predate the section metadata added in 3.3.0 (#2136).
 - The TypeScript SDK's `pages.update` loads the complete body before applying

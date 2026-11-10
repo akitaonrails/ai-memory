@@ -272,3 +272,153 @@ async fn restore_page_refuses_empty_scope_flags_without_sending_a_mutation() {
     }
     server.abort();
 }
+
+/// Records which `/admin` path a wiki-git command reached on this server.
+type WikiHit = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A stub serving the wiki-git recovery routes (`/admin/checkpoints`,
+/// `/admin/commit`), each answer tagged with `tag` so a test can tell which
+/// server a routed command reached. Returns the base URL and the hit log.
+async fn wiki_git_stub(tag: &'static str) -> (String, WikiHit, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let hits: WikiHit = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cp_hits = hits.clone();
+    let commit_hits = hits.clone();
+    let app = axum::Router::new()
+        .route(
+            "/admin/checkpoints",
+            axum::routing::get(move || {
+                cp_hits.lock().unwrap().push("checkpoints".to_owned());
+                async move {
+                    axum::Json(serde_json::json!([{
+                        "oid": format!("{tag}00000000000000000000000000000000"),
+                        "short_oid": tag,
+                        "time": 1,
+                        "summary": format!("checkpoint on {tag}"),
+                    }]))
+                }
+            }),
+        )
+        .route(
+            "/admin/commit",
+            axum::routing::post(move || {
+                commit_hits.lock().unwrap().push("commit".to_owned());
+                async move {
+                    axum::Json(serde_json::json!({
+                        "committed": true,
+                        "oid": format!("{tag}00000000000000000000000000000000"),
+                    }))
+                }
+            }),
+        );
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, hits, handle)
+}
+
+/// Build a profile-routed checkout: `install_base` is the install default, the
+/// marker selects profile `team-b` -> `profile_base`. Returns `(home, data,
+/// repo)`; the `TempDir` is leaked into `home` and cleaned by the OS.
+fn profiled_checkout(install_base: &str, profile_base: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().canonicalize().expect("canonicalise home");
+    let data = home.join("data");
+    let root = home.join("work").join("team-b");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("create checkout");
+    std::fs::create_dir_all(&data).expect("create data dir");
+    std::fs::write(
+        data.join("config.toml"),
+        format!("server_url = \"{install_base}\"\n"),
+    )
+    .expect("write config.toml");
+    std::fs::write(repo.join(".ai-memory.toml"), "server = \"team-b\"\n").expect("write marker");
+    let add = crate::e2e_support::hermetic(bin())
+        .args(["server", "add", "team-b", "--url", profile_base, "--root"])
+        .arg(&root)
+        .args(["--auth-token", "PROFILE-TOKEN"])
+        .env("HOME", &home)
+        .env("AI_MEMORY_DATA_DIR", &data)
+        .output()
+        .expect("running ai-memory server add");
+    assert!(
+        add.status.success(),
+        "server add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    std::mem::forget(tmp);
+    (home, data, repo)
+}
+
+/// `checkpoints` follows the checkout's server profile, like its paired
+/// command `restore-page` (#2186). A profile-routed checkout used to list the
+/// install-default server's wiki history, so an OID it printed could not be
+/// restored against the profile server the same checkout's `restore-page`
+/// targets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoints_follows_the_checkout_profile_like_restore_page() {
+    let (install_base, install_hits, install_srv) = wiki_git_stub("aaaaaaa").await;
+    let (profile_base, profile_hits, profile_srv) = wiki_git_stub("bbbbbbb").await;
+    let (home, data, repo) = profiled_checkout(&install_base, &profile_base);
+
+    let out = crate::e2e_support::hermetic(bin())
+        .args(["checkpoints", "--json"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("AI_MEMORY_DATA_DIR", &data)
+        .output()
+        .expect("running ai-memory checkpoints");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "checkpoints failed: {stderr}");
+
+    assert_eq!(
+        *profile_hits.lock().unwrap(),
+        vec!["checkpoints".to_owned()],
+        "checkpoints must reach the profile server the checkout routes to; stdout: {stdout}"
+    );
+    assert!(
+        install_hits.lock().unwrap().is_empty(),
+        "checkpoints must not reach the install-default server from a profile-routed checkout"
+    );
+    assert!(
+        stdout.contains("bbbbbbb") && !stdout.contains("aaaaaaa"),
+        "checkpoints listed the wrong server's history; stdout: {stdout}"
+    );
+
+    install_srv.abort();
+    profile_srv.abort();
+}
+
+/// `commit` writes its checkpoint to the server the checkout routes to, so the
+/// checkpoint it creates is the one `checkpoints` lists and `restore-page`
+/// restores from the same directory (#2186).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_targets_the_checkout_profile_server() {
+    let (install_base, install_hits, install_srv) = wiki_git_stub("aaaaaaa").await;
+    let (profile_base, profile_hits, profile_srv) = wiki_git_stub("bbbbbbb").await;
+    let (home, data, repo) = profiled_checkout(&install_base, &profile_base);
+
+    let out = crate::e2e_support::hermetic(bin())
+        .args(["commit", "--message", "manual"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("AI_MEMORY_DATA_DIR", &data)
+        .output()
+        .expect("running ai-memory commit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "commit failed: {stderr}");
+
+    assert_eq!(
+        *profile_hits.lock().unwrap(),
+        vec!["commit".to_owned()],
+        "commit must reach the profile server the checkout routes to"
+    );
+    assert!(
+        install_hits.lock().unwrap().is_empty(),
+        "commit must not reach the install-default server from a profile-routed checkout"
+    );
+
+    install_srv.abort();
+    profile_srv.abort();
+}
