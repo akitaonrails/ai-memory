@@ -6688,6 +6688,10 @@ struct MergeProjectRequest {
 struct MergeProjectReport {
     from: String,
     into: String,
+    // The ids both sides resolved to. A merge named by project names gives
+    // the client no other way to re-point a checkout bound to the source.
+    from_project_id: String,
+    into_project_id: String,
     dry_run: bool,
     page_versions: u64,
     sessions: u64,
@@ -6897,6 +6901,8 @@ async fn handle_merge_project(
         Ok(MergeProjectReport {
             from: format!("{}/{}", req.workspace, source_name),
             into: format!("{}/{}", req.workspace, target_name),
+            from_project_id: source.to_string(),
+            into_project_id: target.to_string(),
             dry_run: !req.confirm,
             page_versions: summary.page_versions,
             sessions: summary.sessions,
