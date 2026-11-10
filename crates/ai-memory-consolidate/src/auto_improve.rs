@@ -151,6 +151,8 @@ impl Default for AutoImproveEvalConfig {
 /// Configuration for one auto-improvement review.
 #[derive(Debug, Clone)]
 pub struct AutoImproveReviewConfig {
+    /// Natural language for generated prose; `None` follows the input (#2185).
+    pub output_language: Option<String>,
     /// Minimum observations before a session is worth reviewing.
     pub min_observations: usize,
     /// Minimum session duration before a session is worth reviewing.
@@ -226,6 +228,7 @@ impl Default for AutoImproveReviewConfig {
             max_rule_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             eval: AutoImproveEvalConfig::default(),
+            output_language: None,
         }
     }
 }
@@ -722,7 +725,10 @@ pub async fn run_auto_improve_review(
                 ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
             let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
             let request = ChatRequest {
-                system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
+                system: Some(crate::with_output_language(
+                    AUTO_IMPROVE_SYSTEM_PROMPT,
+                    cfg.output_language.as_deref(),
+                )),
                 messages: vec![ChatMessage {
                     role: Role::User,
                     content: prompt_input.prompt,
@@ -2486,6 +2492,18 @@ Write page titles, markdown prose, patch content, and rationale in the dominant 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_language_override_extends_auto_improve_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(AUTO_IMPROVE_SYSTEM_PROMPT, None),
+            AUTO_IMPROVE_SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(AUTO_IMPROVE_SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(AUTO_IMPROVE_SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
     use ai_memory_core::{
         AgentKind, NewObservation, NewSession, Observation, ObservationId, ObservationKind,
         Sanitized, Sanitizer,
@@ -2750,6 +2768,7 @@ mod tests {
             max_rule_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS,
             max_procedure_page_tokens: DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             eval: AutoImproveEvalConfig::default(),
+            output_language: None,
         }
     }
 

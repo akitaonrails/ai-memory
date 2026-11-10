@@ -25,6 +25,7 @@ pub mod keep_tokens;
 mod link_guard;
 pub mod lint;
 mod llm_subject;
+mod output_language;
 mod path_sanitize;
 pub mod profile;
 pub mod projection;
@@ -93,6 +94,7 @@ pub use lint::{
     DEFAULT_CONTRADICTION_SIM_HIGH, DEFAULT_CONTRADICTION_SIM_LOW, LintError, LintFinding,
     LintOptions, LintReport, run_lint, stale_days_for,
 };
+pub use output_language::with_output_language;
 pub use sweep::{
     ColdClusterDedup, CompactedPage, DEFAULT_OBSERVATION_PRUNE_BATCH, EmbeddingCoord, EvictedPage,
     LedgerRetention, MergedCluster, ObservationRetention, SweepError, SweepReport, run_sweep,

@@ -84,6 +84,7 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
         max_procedure_page_tokens:
             ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
         eval: ai_memory_consolidate::AutoImproveEvalConfig::default(),
+        output_language: None,
     }
 }
 
@@ -4823,6 +4824,7 @@ impl AiMemoryServer {
             max_rule_page_tokens: defaults.max_rule_page_tokens,
             max_procedure_page_tokens: defaults.max_procedure_page_tokens,
             eval: defaults.eval.clone(),
+            output_language: defaults.output_language.clone(),
         };
 
         let report =

@@ -186,6 +186,8 @@ pub struct Consolidator {
     per_user_slots: bool,
     /// Include bounded literal tokens from omitted prompt observations.
     verbatim_residue: bool,
+    /// Operator-fixed output language for generated prose (#2185).
+    output_language: Option<String>,
     /// Prompt input/output limits derived from `[consolidation]`.
     budgets: PromptBudgets,
 }
@@ -211,6 +213,7 @@ impl Consolidator {
             project_id,
             per_user_slots: false,
             verbatim_residue: false,
+            output_language: None,
             budgets: PromptBudgets::default(),
         }
     }
@@ -254,6 +257,14 @@ impl Consolidator {
     #[must_use]
     pub fn with_verbatim_residue(mut self, enabled: bool) -> Self {
         self.verbatim_residue = enabled;
+        self
+    }
+
+    /// Force the natural language of generated prose (`[consolidation]
+    /// output_language`); `None` follows the input's dominant language.
+    #[must_use]
+    pub fn with_output_language(mut self, lang: Option<String>) -> Self {
+        self.output_language = lang;
         self
     }
 
@@ -402,7 +413,11 @@ impl Consolidator {
         // with a new id.
         let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation)
             .with_subject(self.llm_subject(ws, proj, session_id).await);
-        let request = assemble_single_request(&plan, &projected, self.budgets);
+        let mut request = assemble_single_request(&plan, &projected, self.budgets);
+        request.system = Some(crate::with_output_language(
+            SYSTEM_PROMPT,
+            self.output_language.as_deref(),
+        ));
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -956,7 +971,11 @@ impl Consolidator {
         // with a new id.
         let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation)
             .with_subject(self.llm_subject(ws, proj, session_id).await);
-        let request = assemble_batch_request(&plan, &projected, self.budgets);
+        let mut request = assemble_batch_request(&plan, &projected, self.budgets);
+        request.system = Some(crate::with_output_language(
+            BATCH_SYSTEM_PROMPT,
+            self.output_language.as_deref(),
+        ));
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -2622,6 +2641,30 @@ pub(crate) const SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_language_override_extends_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(SYSTEM_PROMPT, None),
+            SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
+
+    #[test]
+    fn output_language_override_extends_batch_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(BATCH_SYSTEM_PROMPT, None),
+            BATCH_SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(BATCH_SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(BATCH_SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
     use std::sync::atomic::{AtomicUsize, Ordering};

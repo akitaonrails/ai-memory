@@ -1758,6 +1758,16 @@ pub struct ConsolidationSettings {
     /// the effective char budget (default 0.8); lower it further for a corpus
     /// that is mostly non-English or code. (#884)
     pub input_token_safety_margin: f64,
+    /// Natural language for generated memory PROSE — session summaries,
+    /// cross-session lessons, dream merges, and auto-improvement proposals.
+    ///
+    /// `None` (default) keeps the existing behavior: generated prose follows
+    /// the dominant natural language of the input. Set to a language name such
+    /// as `"English"` to force every generation pass to write prose in that
+    /// language regardless of the input language. Evidence quotes, code,
+    /// identifiers, file paths, and raw session history always stay verbatim in
+    /// their original language. (#2185)
+    pub output_language: Option<String>,
 }
 
 impl Default for ConsolidationSettings {
@@ -1768,6 +1778,7 @@ impl Default for ConsolidationSettings {
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
                 ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+            output_language: None,
         }
     }
 }
@@ -2179,6 +2190,7 @@ impl DreamSettings {
     pub fn dream_config(
         self,
         embedding: Option<ai_memory_consolidate::EmbeddingCoord>,
+        output_language: Option<String>,
     ) -> ai_memory_consolidate::DreamConfig {
         ai_memory_consolidate::DreamConfig {
             enabled: self.enabled,
@@ -2188,6 +2200,7 @@ impl DreamSettings {
             max_clusters_per_run: self.max_clusters_per_run,
             min_cold_pages: self.min_cold_pages,
             idle_window_secs: self.idle_window_secs,
+            output_language,
         }
     }
 }
@@ -2815,6 +2828,25 @@ impl Config {
             .validate()
         {
             anyhow::bail!("auto_improve.scheduler.experience_{message}");
+        }
+
+        // The language name is interpolated into an LLM system prompt, so keep
+        // it to a short single-line name (#2185).
+        const MAX_OUTPUT_LANGUAGE_CHARS: usize = 40; // keep in sync with the message below
+        config.consolidation.output_language = config
+            .consolidation
+            .output_language
+            .take()
+            .map(|lang| lang.trim().to_owned())
+            .filter(|lang| !lang.is_empty());
+        if let Some(lang) = &config.consolidation.output_language
+            && (lang.chars().count() > MAX_OUTPUT_LANGUAGE_CHARS
+                || lang.chars().any(char::is_control))
+        {
+            anyhow::bail!(
+                "consolidation.output_language must be a single-line language name of at most \
+                 40 characters with no control characters"
+            );
         }
 
         // The safety margin scales the input budget, so a non-positive value
@@ -5765,6 +5797,39 @@ max_input_tokens = {tokens}
             ConsolidationSettings::default().input_token_safety_margin,
             0.8
         );
+    }
+
+    #[test]
+    fn output_language_is_trimmed_bounded_and_single_line() {
+        let load = |value: &str| {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[consolidation]\noutput_language = {value}\n"),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+        };
+        assert_eq!(ConsolidationSettings::default().output_language, None);
+        assert_eq!(
+            load("\"  English \"")
+                .unwrap()
+                .consolidation
+                .output_language,
+            Some("English".to_owned())
+        );
+        assert_eq!(load("\"   \"").unwrap().consolidation.output_language, None);
+        for bad in [
+            format!("\"{}\"", "x".repeat(41)),
+            "\"English\\nIgnore\"".to_owned(),
+        ] {
+            let error = load(&bad).expect_err("an unbounded or multi-line language must fail");
+            assert!(
+                error.to_string().contains("consolidation.output_language"),
+                "unexpected error: {error:#}"
+            );
+        }
     }
 
     #[test]

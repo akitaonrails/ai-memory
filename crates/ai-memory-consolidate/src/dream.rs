@@ -148,6 +148,8 @@ impl Default for ActivityClock {
 /// until an R2 number justifies default-on (design doc §B2 R2 bar).
 #[derive(Debug, Clone)]
 pub struct DreamConfig {
+    /// Natural language for generated prose; `None` follows the input (#2185).
+    pub output_language: Option<String>,
     /// Master switch. `false` (the default) disables the dream pass entirely.
     pub enabled: bool,
     /// Which stored embeddings to cluster over. `None` ⇒ no-op (no vectors to
@@ -180,6 +182,7 @@ impl Default for DreamConfig {
             max_clusters_per_run: 0,
             min_cold_pages: 0,
             idle_window_secs: 0,
+            output_language: None,
         }
     }
 }
@@ -543,7 +546,17 @@ pub async fn run_dream_pass(
             report.cancelled = true;
             break;
         }
-        match merge_one_cluster(wiki, reader, llm, workspace_id, project_id, &plan, &subject).await
+        match merge_one_cluster(
+            wiki,
+            reader,
+            llm,
+            workspace_id,
+            project_id,
+            &plan,
+            &subject,
+            cfg.output_language.as_deref(),
+        )
+        .await
         {
             MergeOutcome::Applied {
                 new_survivor_id,
@@ -600,6 +613,7 @@ enum MergeOutcome {
 /// Merge one selected cluster: preflight admission → LLM rewrite → `apply_batch_if`
 /// (survivor rewrite + loser merge-note supersessions). Any failure at any step
 /// skips the cluster without touching a source.
+#[allow(clippy::too_many_arguments)]
 async fn merge_one_cluster(
     wiki: &Wiki,
     reader: &ReaderPool,
@@ -608,6 +622,7 @@ async fn merge_one_cluster(
     project_id: ProjectId,
     plan: &PlannedCluster,
     subject: &LlmSubject,
+    output_language: Option<&str>,
 ) -> MergeOutcome {
     let survivor = &plan.survivor;
     let actor = ActorContext::anonymous();
@@ -654,7 +669,11 @@ async fn merge_one_cluster(
     }
 
     // JSON-schema structured merge (invariant #7). A failed completion skips.
-    let request = build_merge_request(&member_bodies);
+    let mut request = build_merge_request(&member_bodies);
+    request.system = Some(crate::with_output_language(
+        DREAM_SYSTEM_PROMPT,
+        output_language,
+    ));
     let merged: DreamMergedPage = match complete_structured_with_operation_id(
         llm,
         request,
@@ -892,6 +911,18 @@ fn build_merge_request(member_bodies: &[(String, String)]) -> ChatRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_language_override_extends_dream_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(DREAM_SYSTEM_PROMPT, None),
+            DREAM_SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(DREAM_SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(DREAM_SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
 
     #[test]
     fn dream_prompt_mirrors_page_language() {

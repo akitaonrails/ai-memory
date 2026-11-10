@@ -269,6 +269,8 @@ pub struct BootstrapOutcome {
 /// to concrete values.
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
+    /// Natural language for generated prose; `None` follows the input (#2185).
+    pub output_language: Option<String>,
     /// Project repo root on the client's filesystem. Used by
     /// [`Bootstrap::run`]'s client-side [`collect_sources`] call.
     /// Ignored by [`Bootstrap::process_sources`] — sources arrive
@@ -565,8 +567,12 @@ impl Bootstrap {
             let mut prior: Vec<String> = pages_by_path.keys().cloned().collect();
             prior.sort_unstable();
             let prior_refs: Vec<&str> = prior.iter().map(String::as_str).collect();
-            let request =
+            let mut request =
                 build_chunk_request(chunk, idx + 1, llm_chunks, chunk_budget, &prior_refs);
+            request.system = Some(crate::with_output_language(
+                SYSTEM_PROMPT,
+                cfg.output_language.as_deref(),
+            ));
             info!(
                 chunk = idx + 1,
                 total = llm_chunks,
@@ -1736,6 +1742,18 @@ fn render_manifest_body(input: ManifestRender<'_>) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn output_language_override_extends_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(SYSTEM_PROMPT, None),
+            SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
+
     fn rules_labels(repo: &Path) -> Vec<String> {
         collect_project_rules(repo)
             .unwrap()
@@ -2723,6 +2741,7 @@ mod tests {
             dry_run: false,
             force: false,
             resume,
+            output_language: None,
         }
     }
 

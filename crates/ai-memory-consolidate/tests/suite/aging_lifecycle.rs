@@ -230,6 +230,7 @@ fn dream_on() -> DreamConfig {
         max_clusters_per_run: 0,
         min_cold_pages: 0,
         idle_window_secs: 0,
+        output_language: None,
     }
 }
 

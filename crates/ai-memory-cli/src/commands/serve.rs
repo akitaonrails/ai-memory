@@ -1458,6 +1458,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
+            config.consolidation.output_language.clone(),
         ))
         .with_active_project(active_project.clone())
         .with_sanitizer(sanitizer.clone())
@@ -1497,6 +1498,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         config.contradiction_band_max,
         config.consolidate_on_session_end,
         consolidator.is_some(),
+        config.consolidation.output_language.clone(),
     )
     .await;
 
@@ -1726,6 +1728,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auto_improve_require_approval: config.auto_improve.require_approval,
                     auto_improve_review_config: auto_improve_review_config_from_settings(
                         &config.auto_improve,
+                        config.consolidation.output_language.clone(),
                     ),
                     embedder: embedder.clone(),
                     provider_health: provider_health.clone(),
@@ -2213,6 +2216,7 @@ async fn start_maintenance_scheduler(
     contradiction_band_max: f32,
     consolidate_on_session_end: bool,
     has_session_consolidator: bool,
+    output_language: Option<String>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -2505,7 +2509,10 @@ async fn start_maintenance_scheduler(
         let writer = writer.clone();
         let wiki = wiki.clone();
         let scheduler_settings = ScheduledAutoImproveSettings {
-            review: auto_improve_review_config_from_settings(&auto_improve),
+            review: auto_improve_review_config_from_settings(
+                &auto_improve,
+                output_language.clone(),
+            ),
             require_approval: auto_improve.require_approval,
             min_session_age_secs: scheduler.min_session_age_secs,
             max_sessions_per_tick: scheduler.max_sessions_per_tick,
@@ -2514,6 +2521,7 @@ async fn start_maintenance_scheduler(
                     sessions: scheduler.experience_sessions.max(1),
                     min_new_sessions: scheduler.experience_every_sessions,
                     entropy_filter: scheduler.experience_entropy_filter,
+                    output_language: output_language.clone(),
                     ..ai_memory_consolidate::ExperienceConfig::default()
                 }
             }),
@@ -2582,6 +2590,7 @@ async fn start_maintenance_scheduler(
                 let wiki = wiki.clone();
                 let activity_clock = activity_clock.clone();
                 let interval = std::time::Duration::from_secs(dream.effective_interval_secs());
+                let dream_output_language = output_language.clone();
                 tasks.push(tokio::spawn(async move {
                     run_dream_scheduler_loop(
                         reader,
@@ -2592,6 +2601,7 @@ async fn start_maintenance_scheduler(
                         embedding,
                         activity_clock,
                         interval,
+                        dream_output_language,
                     )
                     .await;
                 }));
@@ -2715,10 +2725,11 @@ async fn run_dream_scheduler_loop(
     embedding: ai_memory_consolidate::EmbeddingCoord,
     activity_clock: ai_memory_consolidate::ActivityClock,
     interval: std::time::Duration,
+    output_language: Option<String>,
 ) {
     /// How often the cancel watcher samples the activity clock during a run.
     const DREAM_ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
-    let cfg = dream.dream_config(Some(embedding));
+    let cfg = dream.dream_config(Some(embedding), output_language);
     let decay_params = decay.decay_params();
     loop {
         tokio::time::sleep(interval).await;
@@ -3094,6 +3105,7 @@ async fn run_scheduled_embedding_backfill_tick(
 
 fn auto_improve_review_config_from_settings(
     settings: &AutoImproveSettings,
+    output_language: Option<String>,
 ) -> AutoImproveReviewConfig {
     AutoImproveReviewConfig {
         min_observations: settings.min_observations,
@@ -3124,6 +3136,7 @@ fn auto_improve_review_config_from_settings(
             targets: settings.eval.targets.clone(),
             min_delta: settings.eval.min_delta,
         },
+        output_language,
     }
 }
 
@@ -3329,6 +3342,7 @@ fn configure_consolidator(
             )
             .with_per_user_slots(config.slots.per_user)
             .with_verbatim_residue(config.consolidation.verbatim_residue)
+            .with_output_language(config.consolidation.output_language.clone())
             .with_prompt_limits(
                 config.consolidation.max_input_tokens,
                 config.consolidation.max_output_tokens,
@@ -4750,6 +4764,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4805,6 +4820,7 @@ mod tests {
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
                 false,
                 false,
+                None,
             )
             .await;
             assert_eq!(
@@ -4856,6 +4872,7 @@ mod tests {
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
                 false,
                 false,
+                None,
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -4897,6 +4914,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert_eq!(tasks.len(), 2);
@@ -4924,6 +4942,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert_eq!(tasks.len(), 3);
@@ -4954,6 +4973,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             true,
             true,
+            None,
         )
         .await;
         assert!(tasks.is_empty());
@@ -5030,6 +5050,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             true,
             true,
+            None,
         )
         .await;
 
@@ -6851,6 +6872,7 @@ mod tests {
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
                 false,
                 false,
+                None,
             )
         };
 

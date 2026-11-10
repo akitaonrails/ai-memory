@@ -2648,6 +2648,9 @@ async fn handle_bootstrap(
         dry_run: req.dry_run,
         force: req.force,
         resume: req.resume,
+        // `[consolidation] output_language` rides on the server-configured
+        // review config; AppState holds no other consolidation settings.
+        output_language: state.auto_improve_review_config.output_language.clone(),
     };
 
     let bootstrap = Bootstrap {
@@ -2827,6 +2830,7 @@ async fn handle_auto_improve(
         max_rule_page_tokens: req.max_rule_page_tokens,
         max_procedure_page_tokens: req.max_procedure_page_tokens,
         eval: state.auto_improve_review_config.eval.clone(),
+        output_language: state.auto_improve_review_config.output_language.clone(),
     };
 
     let report =

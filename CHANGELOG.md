@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `[consolidation] output_language` fixes the natural language of generated
+  memory prose — session summaries, cross-session lessons, dream merges, and
+  auto-improvement proposals — regardless of the input's language (for example
+  `output_language = "English"`). Unset by default, so prose keeps following the
+  dominant language of the input. Evidence quotes, code, identifiers, file paths,
+  and raw session history always stay verbatim in their original language.
+  (#2185)
 - `[profile] harvest_prompts = "interactive"` keeps an orchestrator's generated
   session briefs out of the cross-project profile. A launcher sets
   `AI_MEMORY_SESSION_ORIGIN=automation` in the harness environment; the hook

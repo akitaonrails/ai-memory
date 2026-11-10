@@ -543,6 +543,12 @@ max_output_tokens = 32000
 # than English and can overshoot a provider's real input limit by about 40%.
 # Lower the margin for a corpus that is mostly non-English or code (#884).
 # input_token_safety_margin = 0.8
+#
+# Natural language for generated memory prose (session summaries, lessons, dream
+# merges, auto-improvement proposals). Unset by default: prose follows the
+# dominant language of the input. Evidence quotes, code, identifiers and paths
+# always stay verbatim. A short single-line language name, at most 40 characters.
+# output_language = "English"
 
 # Auto-improvement reviewer.
 #

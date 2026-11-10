@@ -222,6 +222,7 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | `max_input_tokens` | `100000` (`DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS`) | `AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` | Approximate token target for the whole consolidation prompt. |
 | `max_output_tokens` | `32000` (`DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS`) | `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS` | Maximum tokens the provider may generate for one consolidation response. |
 | `input_token_safety_margin` | `0.8` (`DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`) | `AI_MEMORY_CONSOLIDATION__INPUT_TOKEN_SAFETY_MARGIN` | Multiplier on the input budget, above 0 and at most 1. |
+| `output_language` | unset (follows the input's dominant language) | `AI_MEMORY_CONSOLIDATION__OUTPUT_LANGUAGE` | Force the natural language of generated memory prose (for example `English`); evidence, code and paths stay verbatim. At most 40 characters, single line. |
 
 ## `[auto_improve]`
 
