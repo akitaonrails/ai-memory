@@ -3462,9 +3462,15 @@ mod tests {
 
         let mut result = DrainResult::default();
         assert!(load_live_entry(&path, &mut result).is_none());
-        assert_eq!(result.dropped, 1, "an over-cap entry is an undelivered drop");
+        assert_eq!(
+            result.dropped, 1,
+            "an over-cap entry is an undelivered drop"
+        );
         assert_eq!(result.remaining, 0, "it must not be left queued");
-        assert!(!path.exists(), "the undeliverable entry is removed from disk");
+        assert!(
+            !path.exists(),
+            "the undeliverable entry is removed from disk"
+        );
     }
 
     #[test]

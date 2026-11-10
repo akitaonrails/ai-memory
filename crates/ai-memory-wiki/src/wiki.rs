@@ -1909,10 +1909,11 @@ impl Wiki {
             PageStoreRemoval::Delete {
                 author_id,
                 expected_latest_id: None,
-            } => self
-                .writer
-                .delete_page(workspace_id, project_id, path.clone(), author_id)
-                .await,
+            } => {
+                self.writer
+                    .delete_page(workspace_id, project_id, path.clone(), author_id)
+                    .await
+            }
             PageStoreRemoval::Decay { expected_latest_id } => {
                 self.writer
                     .soft_delete_for_decay_if_latest(
@@ -9595,7 +9596,10 @@ mod tests {
 
         let absent = PagePath::new("profile/workflow/never-push.md").unwrap();
         assert!(
-            !wiki.delete_page(ws, proj, &absent, None, None).await.unwrap(),
+            !wiki
+                .delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
             "deleting a path that holds no page must report nothing was removed"
         );
 
@@ -9609,11 +9613,16 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            wiki.delete_page(ws, proj, &absent, None, None).await.unwrap(),
+            wiki.delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
             "deleting an existing page must report it was removed"
         );
         assert!(
-            !wiki.delete_page(ws, proj, &absent, None, None).await.unwrap(),
+            !wiki
+                .delete_page(ws, proj, &absent, None, None)
+                .await
+                .unwrap(),
             "deleting the now-gone page again must report nothing was removed"
         );
     }

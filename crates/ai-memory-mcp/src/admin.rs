@@ -17452,8 +17452,10 @@ mod tests {
 
     /// `Wiki::delete_page` is idempotent for a path that doesn't exist
     /// inside an EXISTING (workspace, project) — the file is just not there
-    /// to quarantine. The handler reports `deleted: true` (i.e. "the call
-    /// succeeded") rather than 404, matching the documented MCP semantics.
+    /// to quarantine, so the call still succeeds with 200 rather than 404.
+    /// It reports `deleted: false` because nothing was removed, so a caller
+    /// (`ai-memory profile forget`) can tell a real deletion from a no-op
+    /// instead of always being told it succeeded (#2181).
     #[tokio::test]
     async fn delete_page_idempotent_for_missing_file_in_existing_scope() {
         let (_tmp, router) = read_page_test_router();
@@ -17464,7 +17466,7 @@ mod tests {
         let (status, json) =
             post_delete_page(&router, "default", "audit", "notes/never-existed.md").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["deleted"], true);
+        assert_eq!(json["deleted"], false);
     }
 
     #[tokio::test]
