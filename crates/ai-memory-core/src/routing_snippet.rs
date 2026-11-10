@@ -334,6 +334,28 @@ mod tests {
     }
 
     #[test]
+    fn find_delimited_block_skips_a_stray_start_for_any_markers() {
+        let (start_marker, end_marker) = ("<!-- a:start -->", "<!-- a:end -->");
+        let text = format!("x\n{start_marker}\nnotes\n{start_marker}\nbody\n{end_marker}\n");
+        let (start, end) = find_delimited_block(&text, start_marker, end_marker).unwrap();
+        assert_eq!(&text[..start], format!("x\n{start_marker}\nnotes\n"));
+        assert_eq!(
+            &text[start..end + end_marker.len()],
+            format!("{start_marker}\nbody\n{end_marker}")
+        );
+        assert!(
+            find_delimited_block(
+                &format!("{start_marker}\nno end\n"),
+                start_marker,
+                end_marker
+            )
+            .is_none()
+        );
+        // Other delimiters are not these: the routing block is no match.
+        assert!(find_delimited_block(&full_span("body"), start_marker, end_marker).is_none());
+    }
+
+    #[test]
     fn find_marker_line_absent_returns_none() {
         assert!(find_marker_line("no markers here\n", MARKER_END, 0).is_none());
     }
