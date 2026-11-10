@@ -1645,6 +1645,8 @@ impl Wiki {
     /// Delete a single page file. When an admission chain is attached, it is
     /// notified (`op=delete`) BEFORE the file is removed, so a mirror can
     /// `git rm` the same path. A `Reject`-policy webhook aborts the delete.
+    /// Idempotent; returns `true` when a page existed and was removed, `false`
+    /// when the path held no page (nothing was changed).
     ///
     /// # Errors
     /// Returns [`WikiError`] on a filesystem error or a rejecting webhook.
@@ -1655,7 +1657,7 @@ impl Wiki {
         path: &PagePath,
         admission_ctx: Option<AdmissionContext>,
         author_id: Option<ai_memory_core::UserId>,
-    ) -> WikiResult<()> {
+    ) -> WikiResult<bool> {
         self.confined_page_path(workspace_id, project_id, path, Prepare::Inspect)?;
         let _guard = self.mutation_lock.read().await;
         // Same-path writers hold this from file rename through upsert; without
@@ -1675,7 +1677,6 @@ impl Wiki {
             },
         )
         .await
-        .map(|_| ())
     }
 
     /// Delete a page only when `expected_latest_id` is still its latest
@@ -1911,8 +1912,7 @@ impl Wiki {
             } => self
                 .writer
                 .delete_page(workspace_id, project_id, path.clone(), author_id)
-                .await
-                .map(|()| true),
+                .await,
             PageStoreRemoval::Decay { expected_latest_id } => {
                 self.writer
                     .soft_delete_for_decay_if_latest(
@@ -9570,6 +9570,51 @@ mod tests {
             wiki.backfill_scope_manifests().await.unwrap(),
             0,
             "a later backfill finds nothing to write; the two emitters agree byte for byte"
+        );
+    }
+
+    /// `delete_page` reports whether a page actually existed, so the callers
+    /// that surface it (`/admin/delete-page`, `memory_delete_page`, `ai-memory
+    /// profile forget`) can tell the user the truth instead of always claiming
+    /// success. A no-op delete of an absent path returns `false`; removing a
+    /// real page returns `true` and the second delete of the same path is
+    /// again `false` (#2181).
+    #[tokio::test]
+    async fn delete_page_reports_whether_a_page_existed() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", Some("/repo/webapp".into()))
+            .await
+            .unwrap();
+
+        let absent = PagePath::new("profile/workflow/never-push.md").unwrap();
+        assert!(
+            !wiki.delete_page(ws, proj, &absent, None, None).await.unwrap(),
+            "deleting a path that holds no page must report nothing was removed"
+        );
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "profile/workflow/never-push.md",
+            "Never push.",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            wiki.delete_page(ws, proj, &absent, None, None).await.unwrap(),
+            "deleting an existing page must report it was removed"
+        );
+        assert!(
+            !wiki.delete_page(ws, proj, &absent, None, None).await.unwrap(),
+            "deleting the now-gone page again must report nothing was removed"
         );
     }
 

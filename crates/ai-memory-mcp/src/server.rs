@@ -6745,7 +6745,7 @@ impl AiMemoryServer {
             checkpoint_or_mcp(wiki, format!("pre-memory_delete_page: {}", path.as_str()))?;
 
         let author_id = crate::actor::author_id_from_parts(&parts);
-        match expected {
+        let deleted = match expected {
             None => wiki
                 .delete_page(ws, proj, &path, admission_ctx, author_id)
                 .await
@@ -6765,13 +6765,14 @@ impl AiMemoryServer {
                         current,
                     ));
                 }
+                deleted
             }
-        }
+        };
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_delete_page: {}", path.as_str()));
 
         ok_json(&serde_json::json!({
             "path": path.to_string(),
-            "deleted": true,
+            "deleted": deleted,
             "pre_checkpoint": pre_checkpoint,
             "checkpoint": checkpoint,
         }))

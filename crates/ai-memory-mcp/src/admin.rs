@@ -9408,7 +9408,7 @@ async fn handle_delete_page(
     };
 
     let author_id = author_ext.map(|axum::Extension(u)| u);
-    state
+    let deleted = state
         .wiki
         .delete_page(ws, proj, &path, admission_ctx, author_id)
         .await
@@ -9428,7 +9428,7 @@ async fn handle_delete_page(
         Json(
             serde_json::to_value(DeletePageResponse {
                 path: path.to_string(),
-                deleted: true,
+                deleted,
                 pre_checkpoint,
                 checkpoint,
             })

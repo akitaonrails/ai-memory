@@ -4899,15 +4899,16 @@ pub fn soft_delete_for_reconcile_if_latest(
 /// file deletions, so the derived rows must be dropped explicitly or the
 /// page keeps surfacing in search/recent with stale content. FK cascades
 /// drop outgoing links + embeddings; the `pages_fts_ad` trigger keeps FTS in
-/// sync; incoming links are set to NULL (unresolved). Idempotent.
+/// sync; incoming links are set to NULL (unresolved). Idempotent; returns
+/// `true` when a page existed and was removed, `false` for a no-op delete.
 pub fn delete_page(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     path: &PagePath,
     author_id: Option<ai_memory_core::UserId>,
-) -> StoreResult<()> {
-    delete_page_inner(conn, workspace_id, project_id, path, None, author_id).map(|_| ())
+) -> StoreResult<bool> {
+    delete_page_inner(conn, workspace_id, project_id, path, None, author_id)
 }
 
 /// Delete every version of `path` only when `expected_latest_id` is still its
