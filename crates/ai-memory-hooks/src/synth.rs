@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use ai_memory_core::{
     AgentKind, FAILED_TOOL_OUTCOME_LINE, NewPage, Observation, ObservationKind, PagePath,
     ProjectId, SessionId, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, Tier, WorkspaceId,
-    looks_like_markup_block, looks_like_scaffolding, truncate_for_title, truncate_utf8_bytes,
+    looks_like_machine_turn, looks_like_markup_block, looks_like_scaffolding, truncate_for_title,
+    truncate_utf8_bytes,
 };
 use ai_memory_store::{
     ObservationOrder, ReaderPool, SessionKindSummary, SessionLine, SessionObservationSnapshot,
@@ -360,19 +361,25 @@ fn micros_to_timestamp(micros: i64) -> StoreResult<Timestamp> {
 }
 
 /// The handoff prompt predicate: a user prompt whose text is not empty and not
-/// a harness block delivered as a user turn (`<task-notification>`).
+/// a harness turn delivered as a user prompt — a markup block
+/// (`<task-notification>`) or a machine turn (`<teammate-message …>`, #2149).
 fn handoff_prompt(obs: &Observation) -> Option<String> {
     if obs.kind != ObservationKind::UserPrompt {
         return None;
     }
     let text = prompt_text(obs);
-    (!text.is_empty() && !looks_like_markup_block(text)).then(|| text.to_string())
+    (!text.is_empty() && !looks_like_markup_block(text) && !looks_like_machine_turn(text))
+        .then(|| text.to_string())
 }
 
 /// The open-question prompt predicate: a user prompt that is not a harness
-/// block. An empty text still counts, as it always did.
+/// markup block or machine turn. An empty text still counts, as it always did.
 fn question_prompt(obs: &Observation) -> Option<PromptFact> {
-    if obs.kind != ObservationKind::UserPrompt || looks_like_markup_block(prompt_text(obs)) {
+    let text = prompt_text(obs);
+    if obs.kind != ObservationKind::UserPrompt
+        || looks_like_markup_block(text)
+        || looks_like_machine_turn(text)
+    {
         return None;
     }
     Some(PromptFact {
@@ -1019,10 +1026,13 @@ impl SessionDigest {
             .iter()
             .filter(|o| o.kind == ObservationKind::UserPrompt)
             .map(|o| o.title.clone())
+            .filter(|title| !looks_like_machine_turn(title))
             .collect();
-        // The store's bounded read keeps every title when the session fits in
-        // the cap and the first/last slice when it does not; mirror that here
-        // so the row-list digest and the database digest stay equal.
+        // The store drops machine turns from the `## Prompts` list and its
+        // count (other scaffolding stays), then keeps every remaining title
+        // when the session fits the cap and the first/last slice when it does
+        // not; mirror both here so the row-list digest and the database digest
+        // stay equal (#2149).
         let (prompt_count, prompt_titles) = if prompt_titles_all.len() <= PROMPT_TITLES_MAX {
             (prompt_titles_all.len(), prompt_titles_all)
         } else {
@@ -1647,6 +1657,42 @@ mod tests {
             body.contains("<ide_opened_file>noise"),
             "the skipped prompt is still session history and must be recorded"
         );
+    }
+
+    #[test]
+    fn claude_machine_turns_are_kept_out_of_the_title_and_the_prompts_list() {
+        // #2149: Claude Code delivers agent-team and cross-session traffic to
+        // the prompt channel. It must neither title the page nor appear in the
+        // `## Prompts` list, while the user's own prompt does both.
+        let obs = vec![
+            obs(
+                ObservationKind::UserPrompt,
+                "<teammate-message teammate_id=\"team-lead\" summary=\"heads up\">rollout note",
+            ),
+            obs(ObservationKind::UserPrompt, "fix the auth bug"),
+            obs(
+                ObservationKind::UserPrompt,
+                "Another Claude session sent a message. It is shown below.",
+            ),
+            obs(ObservationKind::UserPrompt, "<task-notification>\ndone"),
+        ];
+        let tally = tally_session(&obs);
+        assert_eq!(tally.title, "fix the auth bug");
+        assert_eq!(tally.prompt_count, 1, "only the user's prompt is counted");
+        assert_eq!(tally.prompt_titles, vec!["fix the auth bug".to_string()]);
+
+        let body = render_body(test_session_id(), &tally, &tally.title);
+        // The `## Prompts` list carries only the user's prompt. The machine
+        // turns are still real session history and remain in `## Raw
+        // observations`, which is the right home for them (#2149).
+        let prompts = body
+            .split("## Prompts\n\n")
+            .nth(1)
+            .expect("the page lists its prompts")
+            .split("\n## Raw observations")
+            .next()
+            .unwrap();
+        assert_eq!(prompts.trim(), "1. fix the auth bug");
     }
 
     #[test]

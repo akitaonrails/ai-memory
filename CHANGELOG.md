@@ -40,6 +40,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Claude Code machine turns that reach the prompt channel — an agent-team
+  `<teammate-message …>`, a `<cross-session-message …>`, a `<task-notification>`,
+  the "Another Claude session sent a message" envelope, and the post-compaction
+  summary — no longer title a session page or appear in its `## Prompts` list and
+  count. One `ai-memory-core` predicate now decides "the user wrote this" for the
+  session digest, the title picker and the profile harvest alike, extending the
+  profile-only fix in #1855/#2041. Ordinary scaffolding such as an IDE context
+  block stays listed as session history. Pages regenerate with the new rule on
+  the next consolidation. (#2149)
 - `ai-memory run` resuming a session whose checkout now resolves to a
   different project that already holds its own sessions or pages now prints the
   exact commands to reconcile it — the `merge-project` dry run, the `--confirm`

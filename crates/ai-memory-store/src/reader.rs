@@ -15424,70 +15424,53 @@ impl SessionObservationSnapshot<'_> {
     /// # Errors
     /// Propagates any SQL error.
     pub fn prompt_titles(&self, head: usize, tail: usize) -> StoreResult<SessionPromptTitles> {
-        let total = self.conn.query_row(
-            "SELECT COUNT(*) FROM observations \
-             WHERE session_id = ?1 AND kind = ?2 \
-               AND workspace_id = ?3 AND project_id = ?4",
-            params![
-                self.session_id,
-                ObservationKind::UserPrompt.as_str(),
-                self.workspace_id,
-                self.project_id,
-            ],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let total = usize::try_from(total).unwrap_or(usize::MAX);
-        if total <= head + tail {
-            return Ok(SessionPromptTitles {
-                total,
-                first: self.prompt_title_window(total, ObservationOrder::Asc)?,
-                last: Vec::new(),
-            });
-        }
-        let mut last = self.prompt_title_window(tail, ObservationOrder::Desc)?;
-        last.reverse();
-        Ok(SessionPromptTitles {
-            total,
-            first: self.prompt_title_window(head, ObservationOrder::Asc)?,
-            last,
-        })
-    }
-
-    /// The first `limit` user-prompt titles of the session in `order`.
-    ///
-    /// # Errors
-    /// Propagates any SQL error.
-    fn prompt_title_window(
-        &self,
-        limit: usize,
-        order: ObservationOrder,
-    ) -> StoreResult<Vec<String>> {
-        let direction = match order {
-            ObservationOrder::Asc => "ASC",
-            ObservationOrder::Desc => "DESC",
-        };
-        let sql = format!(
+        // Read every user-prompt title for the session, then drop the machine
+        // turns Claude Code routes through the prompt channel (`<task-notification>`,
+        // `<teammate-message …>`, the cross-session envelope, the post-compaction
+        // summary): they are not what the user asked, so they belong in neither
+        // the `## Prompts` list nor its count (#2149). Other scaffolding — an IDE
+        // context block, a shell prompt echoed into a paste — is still real
+        // session history and stays listed, as it always has. The filter is a
+        // leading-shape test, not SQL-expressible, and a session's titles are
+        // bounded and small, so windowing happens in Rust over the kept set.
+        let mut stmt = self.conn.prepare_cached(
             "SELECT title FROM observations \
              WHERE session_id = ?1 AND kind = ?2 \
-               AND workspace_id = ?4 AND project_id = ?5 \
-             ORDER BY created_at {direction}, rowid {direction} LIMIT ?3"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+               AND workspace_id = ?3 AND project_id = ?4 \
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
         let rows = stmt.query_map(
             params![
                 self.session_id,
                 ObservationKind::UserPrompt.as_str(),
-                i64::try_from(limit).unwrap_or(i64::MAX),
                 self.workspace_id,
                 self.project_id,
             ],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )?;
-        let mut out = Vec::with_capacity(limit);
+        let mut titles = Vec::new();
         for title in rows {
-            out.push(title?);
+            let title = title?;
+            if !ai_memory_core::looks_like_machine_turn(&title) {
+                titles.push(title);
+            }
         }
-        Ok(out)
+
+        let total = titles.len();
+        if total <= head + tail {
+            return Ok(SessionPromptTitles {
+                total,
+                first: titles,
+                last: Vec::new(),
+            });
+        }
+        let last = titles.split_off(total - tail);
+        titles.truncate(head);
+        Ok(SessionPromptTitles {
+            total,
+            first: titles,
+            last,
+        })
     }
 
     /// Walk the session's user prompts in capture order, one resident at a
