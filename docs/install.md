@@ -3980,6 +3980,9 @@ GitHub Release, refuses an unverified update, pulls the latest Docker
 image, refreshes the checksum-verified native host client, rewrites previously
 staged hook registrations to that native command when supported, and
 prints how to restart the server container so the new binary is used.
+If installing the native host client fails, the upgrade reports an error
+before refreshing hooks. The next host command that checks for updates can
+retry the client installation.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
 When a Compose file is found, the wrapper first verifies that its project owns
