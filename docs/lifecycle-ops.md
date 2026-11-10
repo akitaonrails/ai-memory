@@ -542,6 +542,15 @@ operation. Names may be replaced independently with `--from-project-id` and
 `--into-project-id`; each id is resolved inside `--workspace`, so an id from
 another workspace returns 404 and reaches no mutation.
 
+After `--confirm` the command also updates this client's own records, as
+`repair-split` does: the checkout link filed under the source's name moves to
+the target (a link the target already has wins), and every saved project
+binding that named the source now names the target. Without that, a checkout
+bound to the source keeps sending the removed project id, and `ai-memory run`
+and `ai-memory workstreams` get 404 from it. The update is local to the
+machine that ran the merge, and a failure there is reported as a warning
+after the merge has been applied.
+
 `--workspace` defaults to the nearest `.ai-memory.toml` marker's workspace, so
 the command goes where that marker routes. In a checkout whose marker selects
 a server profile (`server = "<name>"`, see [marker-file.md](marker-file.md)),
