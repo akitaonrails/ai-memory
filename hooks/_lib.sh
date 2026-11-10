@@ -1100,14 +1100,24 @@ ai_memory_get_handoff() {
         *'&cwd='*) ;;
         *) return 0 ;;
     esac
+    _amurl="$1"
+    # An external-capture run shares its project with the owner's own
+    # interactive sessions, so a handoff fetch must offer the baton, not consume
+    # it: send claim=0 and let the server announce it for an explicit
+    # memory_handoff_accept (#2148). /brief claims nothing, so it is untouched.
+    if ai_memory_capture_owned_externally; then
+        case "$_amurl" in
+            *'/handoff?'*) _amurl="$_amurl&claim=0" ;;
+        esac
+    fi
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" \
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN") || return $?
     elif [ -n "$_amhdr" ]; then
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" -H @"$_amhdr") || return $?
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl" -H @"$_amhdr") || return $?
     else
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1") || return $?
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl") || return $?
     fi
     # Appending the status preserves the body's final newlines in the command
     # substitution. Redirect and error bodies must never become agent context.

@@ -24,7 +24,7 @@ use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload, Role,
     complete_structured_with_operation_id,
 };
-use ai_memory_store::{DecayCandidate, ReaderPool};
+use ai_memory_store::{DecayCandidate, DecayParams, ReaderPool};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -145,9 +145,11 @@ pub struct LintOptions {
     /// When `false`, the LLM contradiction pass is skipped even if a
     /// provider was supplied.
     pub use_llm: bool,
-    /// The operator's `[decay] lambda`. The stale threshold is derived from
-    /// it — see [`stale_days_for`].
-    pub decay_lambda: f64,
+    /// The operator's decay settings. The stale rule only flags episodic
+    /// pages, so its threshold comes from the episodic λ (the
+    /// `[decay.half_life_days] episodic` override when set, else
+    /// `[decay] lambda`) — see [`stale_days_for`].
+    pub decay: DecayParams,
     /// The running embedder's `(provider, model, dim)` triple, or `None` when
     /// no embedder is configured. It drives the zero-LLM contradiction
     /// detector (A5): the detector loads already-stored vectors under this
@@ -172,7 +174,7 @@ impl Default for LintOptions {
         Self {
             dry_run: false,
             use_llm: true,
-            decay_lambda: 0.02,
+            decay: DecayParams::default(),
             embedding: None,
             contradiction_band_min: DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: DEFAULT_CONTRADICTION_SIM_HIGH,
@@ -184,8 +186,8 @@ impl Default for LintOptions {
 ///
 /// * `llm` — when `Some`, the contradiction pass runs; otherwise the
 ///   report contains only rule-based findings.
-/// * `decay_lambda` — the operator's `[decay] lambda`; the stale
-///   threshold is derived from it (see [`stale_days_for`]).
+/// * `decay` — the operator's decay settings; the stale threshold is
+///   derived from the episodic λ (see [`stale_days_for`]).
 /// * `dry_run` — when `true`, no file is written.
 /// * `use_llm` — when `false`, the contradiction pass is skipped even
 ///   if a provider is present. Lets operators run rule-based-only lint
@@ -204,13 +206,16 @@ pub async fn run_lint(
     let LintOptions {
         dry_run,
         use_llm,
-        decay_lambda,
+        decay,
         embedding,
         contradiction_band_min,
         contradiction_band_max,
     } = options;
     let candidates = reader.decay_candidates(workspace_id, project_id).await?;
-    let mut findings = rule_based_findings(&candidates, stale_days_for(decay_lambda));
+    let mut findings = rule_based_findings(
+        &candidates,
+        stale_days_for(decay.lambda_for(Tier::Episodic)),
+    );
 
     // Dangling cross-project links: a `[[project:path]]` dependency that does
     // not resolve. A broken inter-project edge is high-signal — surface it

@@ -220,6 +220,10 @@ main() {
         /*) ;;
         *) lib_dir="$(pwd -P)/$lib_dir" ;;
     esac
+    # The .new and .old paths must be siblings of the release directory.
+    while [ "$lib_dir" != / ] && [ "${lib_dir%/}" != "$lib_dir" ]; do
+        lib_dir="${lib_dir%/}"
+    done
 
     case "$bin_dir$lib_dir" in
         *"

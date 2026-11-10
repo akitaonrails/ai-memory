@@ -1046,6 +1046,110 @@ fn zcode_mcp_install_and_uninstall_round_trip_preserves_siblings() {
     );
 }
 
+/// GHSA-qmg7-f7fg-rg4x: `install-hooks --agent zcode` writes capture under
+/// `hooks.events` in `~/.zcode/cli/config.json`, and `uninstall --only hooks`
+/// must withdraw every ai-memory entry while the user's own hook, model and
+/// hook-level settings survive. Before the fix, uninstall skipped this shape
+/// entirely: it exited 0 reporting nothing to remove while all generated
+/// capture hooks stayed live.
+#[test]
+fn zcode_install_hooks_then_uninstall_withdraws_capture_and_keeps_user_config() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".zcode/cli/config.json");
+    // Seed a pre-existing third-party SessionStart hook plus hook-level
+    // settings the uninstall must not touch.
+    write_file(
+        &config,
+        r#"{
+            "model": "fixture-model",
+            "hooks": {
+                "enabled": true,
+                "maxOutputBytes": 65536,
+                "events": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": "printf unrelated", "statusMessage": "unrelated hook"}]}
+                    ]
+                }
+            }
+        }"#,
+    );
+
+    let install = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "zcode", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    // After install our capture hooks are present.
+    let count_ours = |path: &Path| -> usize {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let events = v["hooks"]["events"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        events
+            .values()
+            .filter_map(|slot| slot.as_array())
+            .flat_map(|groups| groups.iter())
+            .filter_map(|group| group["hooks"].as_array())
+            .flat_map(|hooks| hooks.iter())
+            .filter(|hook| {
+                hook["statusMessage"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("ai-memory"))
+            })
+            .count()
+    };
+    assert!(
+        count_ours(&config) > 0,
+        "install must write ai-memory capture hooks"
+    );
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+
+    // Every ai-memory capture hook is gone.
+    assert_eq!(
+        count_ours(&config),
+        0,
+        "uninstall --only hooks must withdraw every ai-memory ZCode hook"
+    );
+    // The user's own hook, model and hook-level settings survive.
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(after["model"], "fixture-model", "model must survive");
+    assert_eq!(
+        after["hooks"]["enabled"], true,
+        "hook-level settings must survive"
+    );
+    assert_eq!(after["hooks"]["maxOutputBytes"], 65536);
+    let session_start = after["hooks"]["events"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart must survive for the unrelated hook");
+    let unrelated_survives = session_start
+        .iter()
+        .filter_map(|group| group["hooks"].as_array())
+        .flat_map(|hooks| hooks.iter())
+        .any(|hook| hook["statusMessage"].as_str() == Some("unrelated hook"));
+    assert!(
+        unrelated_survives,
+        "the third-party hook must survive: {after}"
+    );
+}
+
 /// Factory Droid (#1240): `install-mcp` and `install-hooks` merge into
 /// `~/.factory/mcp.json` and the bare `~/.factory/hooks.json` event map
 /// around the user's own entries, and `uninstall` removes only ai-memory's.

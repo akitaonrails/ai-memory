@@ -274,9 +274,20 @@ pub fn find_marker_line(haystack: &str, marker: &str, from: usize) -> Option<usi
 /// or stripped.
 #[must_use]
 pub fn find_managed_block(haystack: &str) -> Option<(usize, usize)> {
-    let mut start = find_marker_line(haystack, MARKER_START, 0)?;
-    let end = find_marker_line(haystack, MARKER_END, start)?;
-    while let Some(next) = find_marker_line(haystack, MARKER_START, start + MARKER_START.len()) {
+    find_delimited_block(haystack, MARKER_START, MARKER_END)
+}
+
+/// [`find_managed_block`] for any pair of line-anchored delimiters: the
+/// first `end` after a `start`, paired with the last `start` before it, so a
+/// start line that lost its end never spans the text after it.
+pub(crate) fn find_delimited_block(
+    haystack: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> Option<(usize, usize)> {
+    let mut start = find_marker_line(haystack, start_marker, 0)?;
+    let end = find_marker_line(haystack, end_marker, start)?;
+    while let Some(next) = find_marker_line(haystack, start_marker, start + start_marker.len()) {
         if next >= end {
             break;
         }
@@ -320,6 +331,28 @@ mod tests {
 
     fn full_span(body: &str) -> String {
         format!("{MARKER_START}\n{body}\n{MARKER_END}")
+    }
+
+    #[test]
+    fn find_delimited_block_skips_a_stray_start_for_any_markers() {
+        let (start_marker, end_marker) = ("<!-- a:start -->", "<!-- a:end -->");
+        let text = format!("x\n{start_marker}\nnotes\n{start_marker}\nbody\n{end_marker}\n");
+        let (start, end) = find_delimited_block(&text, start_marker, end_marker).unwrap();
+        assert_eq!(&text[..start], format!("x\n{start_marker}\nnotes\n"));
+        assert_eq!(
+            &text[start..end + end_marker.len()],
+            format!("{start_marker}\nbody\n{end_marker}")
+        );
+        assert!(
+            find_delimited_block(
+                &format!("{start_marker}\nno end\n"),
+                start_marker,
+                end_marker
+            )
+            .is_none()
+        );
+        // Other delimiters are not these: the routing block is no match.
+        assert!(find_delimited_block(&full_span("body"), start_marker, end_marker).is_none());
     }
 
     #[test]

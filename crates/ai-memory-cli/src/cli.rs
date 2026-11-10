@@ -1083,17 +1083,18 @@ pub enum ProfileCommand {
     Status(ProfileScopeArgs),
     /// List the profile's entries.
     List(ProfileScopeArgs),
-    /// Print one entry (`profile/` prefix optional).
+    /// Print one entry (`profile/` prefix and `.md` suffix optional).
     Show {
-        /// Entry path, e.g. `tools/pnpm.md`.
+        /// Entry path, e.g. `tools/pnpm` or `tools/pnpm.md`.
         path: String,
         #[command(flatten)]
         scope: ProfileScopeArgs,
     },
-    /// Remove one entry (`profile/` prefix optional). Git keeps its history,
-    /// and the harvester leaves the topic alone until you state it again.
+    /// Remove one entry (`profile/` prefix and `.md` suffix optional). Git
+    /// keeps its history, and the harvester leaves the topic alone until you
+    /// state it again.
     Forget {
-        /// Entry path, e.g. `tools/pnpm.md`.
+        /// Entry path, e.g. `tools/pnpm` or `tools/pnpm.md`.
         path: String,
         #[command(flatten)]
         scope: ProfileScopeArgs,
