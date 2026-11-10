@@ -13,6 +13,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Preserved the longer LLM fallback cooldown across overlapping provider
+  failures, honoring the provider's retry hint when another in-flight call
+  reports a shorter wait. (#2187)
+- Fixed conditional page reads from configured cross-origin frontends by
+  exposing `ETag` and allowing `If-None-Match` on `/api/v1`. (#2175)
+- `backup` and `export-okf` now preserve the previous archive when a server
+  returns a successful response without a gzip signature, such as an HTML login
+  page or an empty response (#2138).
+- Fixed `profile show` and `profile forget` choosing a `.md` sibling over an
+  existing exact path. `profile forget` also reports a missing entry when
+  connected to an older server. (#2188)
 - A hook event larger than the 10 MiB spool-entry cap (typically a base64
   image in a `PostToolUse` `tool_response`) is no longer spooled whole. Such an
   entry could be written but never read back, so it sat in `hook-spool/`
