@@ -1401,4 +1401,21 @@ mod tests {
             "only the appended block is replaced"
         );
     }
+
+    #[test]
+    fn remove_keeps_text_after_a_start_marker_without_its_end() {
+        let block = render_profile_block(&["- use pnpm (`profile/tools/pnpm.md`)".into()], 0);
+        let existing = format!("# A\n{PROFILE_BLOCK_START}\nmy notes\n");
+        let applied = merge_profile_block(&existing, &block);
+        assert_eq!(
+            remove_profile_block(&applied).as_deref(),
+            Some(existing.as_str()),
+            "--remove takes out the appended block and restores the file"
+        );
+        assert_eq!(
+            remove_profile_block(&existing),
+            None,
+            "a start line alone is no block"
+        );
+    }
 }
