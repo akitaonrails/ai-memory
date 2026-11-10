@@ -33,7 +33,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `~/.workbuddy/skills` (global) or `.workbuddy/skills` (project). `setup`
   wires WorkBuddy when `~/.workbuddy` exists, `setup-agent --agent workbuddy`
   prints the hook block, and `uninstall` removes the entries. Transcript
-  backfill and managed workstreams are not part of this change.
+  backfill and managed workstreams are not part of this change (#2184).
 
 - The generated OpenCode plugins (V1 and V2) now capture a server-routed
   repository (`server = "<profile>"`, #992) through the native hook instead of
