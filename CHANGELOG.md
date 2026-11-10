@@ -13,9 +13,28 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- Preserved the longer LLM fallback cooldown across overlapping provider
-  failures, honoring the provider's retry hint when another in-flight call
-  reports a shorter wait. (#2187)
+- A hook event larger than the 10 MiB spool-entry cap (typically a base64
+  image in a `PostToolUse` `tool_response`) is no longer spooled whole. Such an
+  entry could be written but never read back, so it sat in `hook-spool/`
+  undeliverable forever — never sent, never charged an attempt, never aged out
+  — while `ai-memory doctor` kept counting it as waiting. It is now dropped as
+  one undelivered event at capture time, and an over-cap entry an older binary
+  already spooled is dropped (and counted) on the next drain instead of wedging
+  the queue. (#2179)
+- `ai-memory profile show` and `ai-memory profile forget` now accept an entry
+  the way `profile list` and the digest name it — with or without the `.md`
+  suffix — so `profile forget workflow/never-push` removes the entry instead
+  of targeting a non-existent `.md`-less sibling. `forget` also fails with a
+  non-zero exit when the entry was not there, because `/admin/delete-page` (and
+  the `memory_delete_page` tool) now report whether a page actually existed
+  rather than always claiming success. (#2181)
+- Fixed native install and reinstall with a trailing slash in
+  `AI_MEMORY_LIB_DIR`. (#2171)
+- Fixed conditional page reads returning a full response for a matching weak
+  ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
+- Fixed the container wrapper reporting success after a native host-client
+  extraction or install failure. The wrapper keeps the previous cached
+  archive and retries on the next host command that checks for updates. (#2174)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
@@ -44,6 +63,9 @@ version in [`docs/changelog/`](docs/changelog/):
   processes rather than leaving zombies under the container's PID 1. It
   forwards shutdown signals to the server so graceful draining still works.
   (#2163)
+- Preserved the longer LLM fallback cooldown across overlapping provider
+  failures, honoring the provider's retry hint when another in-flight call
+  reports a shorter wait. (#2187)
 - The `[retrieval] abstract_vectors` documentation now says the stream ranks
   only pages whose frontmatter carries an agent-written `abstract:`. Session
   consolidation, the dream pass and the forget sweep never add that line, so on

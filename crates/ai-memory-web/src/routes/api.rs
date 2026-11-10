@@ -9,7 +9,7 @@ use ai_memory_store::{
     resolve_many_existing_scopes_guarded,
 };
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -236,7 +236,7 @@ async fn pages_handler(
 async fn page_handler(
     State(state): State<Arc<WebState>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Path((workspace, project, path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     super::authorize_read(&state, viewer, &workspace, &project)
@@ -302,13 +302,7 @@ async fn page_handler(
     let etag_value = format!("\"{etag_hex}\"");
     let etag_header = HeaderValue::from_str(&etag_value).expect("sha256 hex is always valid ASCII");
 
-    // If-None-Match: if the client sends back the exact ETag we issued,
-    // return 304 with no body.
-    if let Some(inm) = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        && inm == etag_value
-    {
+    if matches_if_none_match(&headers, etag_header.as_bytes()) {
         let resp = axum::http::Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .body(axum::body::Body::empty())
@@ -330,6 +324,51 @@ async fn page_handler(
     );
     resp.headers_mut().insert(header::ETAG, etag_header);
     Ok(resp)
+}
+
+/// Conditional page reads use weak entity-tag comparison (RFC 9110 §13.1.2).
+fn matches_if_none_match(headers: &HeaderMap, etag: &[u8]) -> bool {
+    let values = headers.get_all(header::IF_NONE_MATCH);
+    let mut values = values.iter();
+    let Some(first) = values.next() else {
+        return false;
+    };
+    if first.as_bytes().trim_ascii() == b"*" {
+        return values.next().is_none();
+    }
+    std::iter::once(first)
+        .chain(values)
+        .try_fold(false, |matched, value| {
+            weak_etag_list_matches(value.as_bytes(), etag).map(|found| matched || found)
+        })
+        .unwrap_or(false)
+}
+
+fn weak_etag_list_matches(value: &[u8], etag: &[u8]) -> Option<bool> {
+    // A comma inside an opaque tag does not separate validators.
+    let mut quoted = false;
+    let mut matched = false;
+    for tag in value.split(|&byte| {
+        if byte == b'"' {
+            quoted = !quoted;
+        }
+        byte == b',' && !quoted
+    }) {
+        let tag = tag.trim_ascii();
+        if tag.is_empty() {
+            continue;
+        }
+        let tag = tag.strip_prefix(b"W/").unwrap_or(tag);
+        let opaque = tag.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+        if !opaque
+            .iter()
+            .all(|&byte| matches!(byte, b'!' | b'#'..=b'~' | 0x80..=0xff))
+        {
+            return None;
+        }
+        matched |= tag == etag;
+    }
+    Some(matched)
 }
 
 /// A page's stored versions, newest first, and a unified diff between two of

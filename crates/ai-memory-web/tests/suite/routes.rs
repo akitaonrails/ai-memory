@@ -3656,26 +3656,44 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         "a single-page read must be revalidated so authorize_read runs every time: {cc}"
     );
 
-    // Second request with the returned ETag: must return 304 with empty body.
-    let resp304 = app
-        .oneshot(
-            Request::builder()
-                .uri("/workspaces/default/projects/scratch/pages/etag-test.md")
-                .header(header::IF_NONE_MATCH, &etag)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        resp304.status(),
-        StatusCode::NOT_MODIFIED,
-        "matching ETag must yield 304"
-    );
-    let body_bytes = axum::body::to_bytes(resp304.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert!(body_bytes.is_empty(), "304 body must be empty");
+    for (validators, expected) in [
+        (vec![etag.clone()], StatusCode::NOT_MODIFIED),
+        (vec![format!("W/{etag}")], StatusCode::NOT_MODIFIED),
+        (
+            vec![format!(r#""other,tag", W/{etag}"#)],
+            StatusCode::NOT_MODIFIED,
+        ),
+        (
+            vec![r#""other""#.into(), format!("W/{etag}")],
+            StatusCode::NOT_MODIFIED,
+        ),
+        (vec!["*".into()], StatusCode::NOT_MODIFIED),
+        (vec![r#""other,tag""#.into()], StatusCode::OK),
+        (vec![format!("{etag}, invalid")], StatusCode::OK),
+        (vec!["*".into(), etag.clone()], StatusCode::OK),
+    ] {
+        let mut req =
+            Request::builder().uri("/workspaces/default/projects/scratch/pages/etag-test.md");
+        for validator in &validators {
+            req = req.header(header::IF_NONE_MATCH, validator);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "{validators:?}");
+        assert_eq!(resp.headers()[header::ETAG], etag, "{validators:?}");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-cache");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.is_empty(),
+            expected == StatusCode::NOT_MODIFIED,
+            "{validators:?}"
+        );
+    }
 }
 
 /// The ETag stands for the whole JSON page, not just its markdown. Pinning a
@@ -4637,6 +4655,24 @@ async fn web_reads_honour_grants_in_a_restricted_project() {
             "{uri}"
         );
         assert_eq!(get(app.clone(), uri, None).await.0, StatusCode::OK, "{uri}");
+    }
+
+    let conditional_get = |viewer: UserId, validator: &str| {
+        let req = Request::builder()
+            .uri("/workspaces/default/projects/alice-client-work/pages/secrets/rates.md")
+            .header(header::IF_NONE_MATCH, validator)
+            .extension(AuthorizedViewer(viewer))
+            .body(Body::empty())
+            .unwrap();
+        api.clone().oneshot(req)
+    };
+    let authorized = conditional_get(alice, "*").await.unwrap();
+    assert_eq!(authorized.status(), StatusCode::NOT_MODIFIED);
+    let weak_etag = format!("W/{}", authorized.headers()[header::ETAG].to_str().unwrap());
+    for validator in ["*", &weak_etag] {
+        let refused = conditional_get(bob, validator).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{validator}");
+        assert!(refused.headers().get(header::ETAG).is_none());
     }
 
     // Finding it, through the API's global search and the wiki search box.

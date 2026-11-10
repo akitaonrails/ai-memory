@@ -82,6 +82,21 @@ relative_version=$("${TMP_ROOT}/relative/bin dir/ai-memory" --version) \
   || fail "relative install reported success but left an unusable link"
 [ "${relative_version}" = "ai-memory 0.0.0-test" ] || fail "unexpected binary behind relative install link"
 
+# A slash-terminated lib dir must still stage releases beside the destination.
+trailing_lib="${TMP_ROOT}/trailing/home/lib dir"
+trailing_link="${TMP_ROOT}/trailing/home/.local/bin/ai-memory"
+run_install trailing "file://${base}" AI_MEMORY_LIB_DIR="${trailing_lib}/" \
+  || fail "trailing-slash install refused: $(cat "${TMP_ROOT}/trailing/out.log")"
+[ "$("${trailing_link}" --version)" = "ai-memory 0.0.0-test" ] \
+  || fail "trailing-slash install did not publish the first binary"
+plain_tree "${TMP_ROOT}/trailing-new-tree"
+printf '#!/bin/sh\necho "ai-memory 0.0.1-test"\n' >"${TMP_ROOT}/trailing-new-tree/ai-memory"
+trailing_base="$(publish trailing-new "${TMP_ROOT}/trailing-new-tree")"
+run_install trailing "file://${trailing_base}" AI_MEMORY_LIB_DIR="${trailing_lib}///" \
+  || fail "trailing-slash reinstall refused: $(cat "${TMP_ROOT}/trailing/out.log")"
+[ "$("${trailing_link}" --version)" = "ai-memory 0.0.1-test" ] \
+  || fail "trailing-slash reinstall did not publish the replacement binary"
+
 # A symlink member pointing outside the tree is refused, and nothing lands.
 plain_tree "${TMP_ROOT}/symlink-tree"
 ln -s /etc/passwd "${TMP_ROOT}/symlink-tree/hooks/escape"
