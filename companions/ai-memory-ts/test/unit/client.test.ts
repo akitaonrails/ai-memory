@@ -253,6 +253,33 @@ describe("pages", () => {
     assert.equal(server.requests.length, before);
   });
 
+  it("reads a page from a server that predates section metadata", async () => {
+    const { server, memory } = setup();
+    const { path, page_id, title, body } = payloads.read;
+    server.tools.set("memory_read_page", () => ({ path, page_id, title, body, frontmatter: {} }));
+    const page = await memory.pages.read({ path });
+    assert.equal(page.pageId, page_id);
+    assert.equal(page.body, body);
+    assert.deepEqual(page.sections, []);
+    assert.equal(page.sectionsTruncated, false);
+  });
+
+  it("rejects incomplete or invalid section metadata", async () => {
+    const { server, memory } = setup();
+    const { path, page_id, title, body } = payloads.read;
+    for (const metadata of [
+      { sections: payloads.read.sections },
+      { sections_truncated: false },
+      { sections: null, sections_truncated: false },
+      { sections: payloads.read.sections, sections_truncated: "false" },
+    ]) {
+      server.tools.set("memory_read_page", () => ({
+        path, page_id, title, body, frontmatter: {}, ...metadata,
+      }));
+      await assert.rejects(memory.pages.read({ path }), ProtocolError);
+    }
+  });
+
   it("delete decodes the checkpoints", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_delete_page", () => payloads.del);

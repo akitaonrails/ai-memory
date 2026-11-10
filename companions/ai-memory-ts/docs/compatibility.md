@@ -23,6 +23,10 @@ the current branch.
 `GET /identity` and incremental `/api/v1/.../recent` shipped in 2.6.0, so they
 are covered by the 3.0.0 floor.
 
+Anchored page patches and section metadata shipped in 3.3.0. On older
+supported servers, `pages.read` returns an empty `sections` list and
+`sectionsTruncated: false`. `pages.patch` still requires the patch tool.
+
 ## MCP protocol versions
 
 The client offers `2025-03-26` in `initialize` and accepts `2025-03-26` or

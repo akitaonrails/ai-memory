@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   work with `--http-stateful` without a preceding wrapped call. Raw calls
   still skip `tools/list` and schema checks. (#1816)
 
+- Restored `pages.read` and `pages.update` compatibility with servers that
+  predate the section metadata added in 3.3.0.
+
 ### Added
 
 - `briefing` takes `recentSessionsLimit` (default 5, max 50), matching the

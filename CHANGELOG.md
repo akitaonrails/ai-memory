@@ -95,6 +95,8 @@ version in [`docs/changelog/`](docs/changelog/):
   it does anything. It used to tell the `purge_session` admission webhook
   about the purge and commit a `pre-purge-session` checkpoint of the wiki
   first, and only then find that there was nothing to purge. (#2167)
+- Restored TypeScript SDK page reads and updates on supported servers that
+  predate the section metadata added in 3.3.0 (#2136).
 - The lint's `stale` rule now follows `[decay.half_life_days] episodic` when
   it is set. The rule only flags episodic pages, but every lint path (the
   `memory_lint` tool, `POST /admin/lint` and the scheduled lint) derived its
