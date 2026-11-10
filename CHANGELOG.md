@@ -41,6 +41,11 @@ version in [`docs/changelog/`](docs/changelog/):
   processes rather than leaving zombies under the container's PID 1. It
   forwards shutdown signals to the server so graceful draining still works.
   (#2163)
+- The `[retrieval] abstract_vectors` documentation now says the stream ranks
+  only pages whose frontmatter carries an agent-written `abstract:`. Session
+  consolidation, the dream pass and the forget sweep never add that line, so on
+  a default install the stream has almost nothing to rank until an agent writes
+  an abstract by hand. (#2161)
 
 ## [3.4.5] - 2026-11-10
 
