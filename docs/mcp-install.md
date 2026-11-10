@@ -1056,6 +1056,51 @@ Sources: [Qoder hooks](https://docs.qoder.com/cli/hooks) and
 
 ---
 
+## WorkBuddy
+
+**Status:** MCP and lifecycle hooks are supported. Managed workstreams and
+transcript backfill are not claimed.
+
+**Config file (MCP):** `~/.workbuddy/mcp.json`, servers under the root
+`mcpServers` map. **Config file (hooks):** `~/.workbuddy/settings.json`, under
+`hooks`. **Skills:** `~/.workbuddy/skills` (global) or `.workbuddy/skills`
+(project).
+
+```bash
+ai-memory install-mcp --client workbuddy --apply \
+    --server-url "https://memory.example/mcp" --auth-token "$TOKEN"
+ai-memory install-hooks --agent workbuddy --apply \
+    --server-url "https://memory.example" --auth-token "$TOKEN"
+ai-memory install-skills --scope global --agent workbuddy
+```
+
+The MCP entry uses Claude Code's shape: `type: "http"`, `url`, and an
+`Authorization: Bearer …` header when an explicit token is given. When the
+install's token lives in `[auth].bearer_token_file`, `install-mcp` writes the
+session-less `mcp-bridge` stdio entry instead, so the token never enters
+`mcp.json`; the bridge forwards no session id, so pass explicit `workspace`
+and `project` on project-scoped calls.
+
+The hook installer writes CodeBuddy's native commands (no script bundle) for
+six Claude Code-shaped events: `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`. Capture exclusions are
+enforced by the same closed parser that handles Claude Code, and
+`SessionStart` delivers a pending handoff through
+`hookSpecificOutput.additionalContext`.
+
+**WorkBuddy fires no `SessionEnd` event.** `Stop` marks the end of a turn, not
+of the session, so an idle session stays open until you close it:
+
+```bash
+ai-memory finalize-session --agent workbuddy
+```
+
+`ai-memory setup` detects WorkBuddy when `~/.workbuddy` exists, and
+`ai-memory uninstall` removes the hook entries. There is no `ai-memory run
+workbuddy` adapter and no native transcript backfill.
+
+---
+
 ## Antigravity CLI (`agy`)
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via

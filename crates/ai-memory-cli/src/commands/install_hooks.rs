@@ -451,6 +451,15 @@ pub(crate) fn codebuddy_settings_path() -> anyhow::Result<std::path::PathBuf> {
         .join("settings.json"))
 }
 
+/// `~/.workbuddy/settings.json` — Tencent WorkBuddy's user settings. The root
+/// `hooks` block is CodeBuddy's Claude Code nested shape.
+pub(crate) fn workbuddy_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(home_dir()
+        .context("could not locate $HOME for ~/.workbuddy/settings.json")?
+        .join(".workbuddy")
+        .join("settings.json"))
+}
+
 /// `~/.bob/settings/settings.json` — IBM Bob's global settings shared by the
 /// IDE and Bob Shell. The root `hooks` block uses nested event groups.
 pub(crate) fn ibm_bob_settings_path() -> anyhow::Result<std::path::PathBuf> {
@@ -1123,6 +1132,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                 };
                 apply_to_codebuddy_settings(&path, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::WorkBuddy => {
+                let path = match &args.config_file {
+                    Some(path) => path.clone(),
+                    None => workbuddy_settings_path()?,
+                };
+                apply_to_workbuddy_settings(&path, &server_url, auth, &config.data_dir, &args)
+            }
             AgentChoice::IbmBob => {
                 let path = match &args.config_file {
                     Some(path) => path.clone(),
@@ -1380,6 +1396,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
         AgentChoice::Droid => render_droid(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Muse => render_muse(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::CodeBuddy => render_codebuddy(&server_url, auth, &config.data_dir, strategy),
+        AgentChoice::WorkBuddy => render_workbuddy(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::IbmBob => render_ibm_bob(&server_url, auth, &config.data_dir, strategy),
         AgentChoice::Dsh => {
             let hooks_dir =
@@ -1609,6 +1626,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             // `run` resolves it into `args.config_file` before any caller.
             AgentChoice::Muse => return None,
             AgentChoice::CodeBuddy => codebuddy_settings_path().ok()?,
+            AgentChoice::WorkBuddy => workbuddy_settings_path().ok()?,
             AgentChoice::IbmBob => ibm_bob_settings_path().ok()?,
             // DSH's hook config is the generated `hooks.json` under the
             // data dir; it carries no baked strategy worth re-reading
@@ -1889,7 +1907,7 @@ fn infer_installed_mcp_config(
         return Ok(None);
     };
     match client {
-        McpClient::ClaudeCode => Ok(infer_json_mcp_config(
+        McpClient::ClaudeCode | McpClient::WorkBuddy => Ok(infer_json_mcp_config(
             &content,
             &["mcpServers", "ai-memory"],
             "url",
@@ -2089,6 +2107,7 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Muse => Some(McpClient::Muse),
         // No first-party CodeBuddy MCP installer in this change.
         AgentChoice::CodeBuddy => None,
+        AgentChoice::WorkBuddy => Some(McpClient::WorkBuddy),
         AgentChoice::IbmBob => Some(McpClient::IbmBob),
         // DSH has no fixed MCP config file to scrape a server URL or token
         // from (install-mcp --client dsh is print-only), so pass explicit
@@ -8240,6 +8259,93 @@ fn render_codebuddy(
     Ok(())
 }
 
+/// Merge ai-memory's entries into the `hooks` key of WorkBuddy's
+/// `settings.json`, keeping every other key and every other hook,
+/// idempotently.
+fn apply_to_workbuddy_settings(
+    path: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = super::render_shared::build_workbuddy_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .context("internal: build_workbuddy_hooks_payload didn't return a hooks object")?;
+    let outcome = apply_atomic(path, |existing| {
+        mutate_json(existing, |root| {
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in the WorkBuddy settings.json but not an object")?;
+            for (event, value) in our_hooks {
+                overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    print!("{WORKBUDDY_INSTALL_NOTES}");
+    Ok(())
+}
+
+const WORKBUDDY_INSTALL_NOTES: &str = "\
+# NOTE: WorkBuddy appends SessionStart stdout (`hookSpecificOutput.additionalContext`)
+#       to the session, so the prior session's handoff is delivered automatically.
+# NOTE: WorkBuddy fires no SessionEnd event, so close a finished session with
+#       `ai-memory finalize-session --agent workbuddy`.
+# NOTE: start a new workbuddy session for it to load the new hooks.
+";
+
+/// Print the `hooks` block for `~/.workbuddy/settings.json` (dry-run
+/// counterpart of [`apply_to_workbuddy_settings`]).
+fn render_workbuddy(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    project_strategy: Option<&str>,
+) -> Result<()> {
+    let payload = super::render_shared::build_workbuddy_hooks_payload(
+        server_url,
+        auth_token,
+        Some(data_dir),
+        project_strategy,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing workbuddy hook config")?;
+    println!("# WorkBuddy hook config — merge under the `hooks` key of");
+    println!("# ~/.workbuddy/settings.json, or re-run with --apply to merge it in");
+    println!("# place.");
+    println!("# AI-memory server URL: {server_url}");
+    if auth_token.is_some() {
+        println!("# Auth: this printed snippet embeds the token in each hook command —");
+        println!("#       treat settings.json as sensitive (chmod 600). `--apply` stores it");
+        println!("#       under the data dir instead.");
+    }
+    print!("{WORKBUDDY_INSTALL_NOTES}");
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 fn apply_to_qoder_settings(
     path: &Path,
     server_url: &str,
@@ -9988,6 +10094,80 @@ mod tests {
                 "{event}: no script bundle: {command}"
             );
         }
+        assert!(root["hooks"].get("SubagentStart").is_none());
+        assert!(root["hooks"].get("PostToolUseFailure").is_none());
+        let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
+    }
+
+    /// `install-hooks --agent workbuddy --apply` merges native `--agent
+    /// workbuddy` commands under the `hooks` key of `settings.json`, keeps
+    /// sibling keys and third-party hooks, changes nothing on a re-apply, and
+    /// wires no `SessionEnd` because WorkBuddy never fires one.
+    #[test]
+    fn workbuddy_apply_merges_native_hooks_and_omits_session_end() {
+        let home = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let settings = home.path().join("settings.json");
+        fs::write(
+            &settings,
+            serde_json::json!({
+                "model": "deepseek-v4.1-flash",
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "/usr/local/bin/guard.sh"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = InstallHooksArgs {
+            agent: AgentChoice::WorkBuddy,
+            config_file: Some(settings.clone()),
+            ..default_hook_args()
+        };
+
+        apply_to_workbuddy_settings(&settings, "http://memory:49374", None, data.path(), &args)
+            .unwrap();
+        let first = fs::read_to_string(&settings).unwrap();
+        apply_to_workbuddy_settings(&settings, "http://memory:49374", None, data.path(), &args)
+            .unwrap();
+        assert_eq!(
+            first,
+            fs::read_to_string(&settings).unwrap(),
+            "re-apply is a no-op"
+        );
+
+        let root: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(root["model"], "deepseek-v4.1-flash");
+        for (event, script) in super::super::render_shared::WORKBUDDY_EVENTS {
+            let entries = root["hooks"][event].as_array().unwrap();
+            let ours: Vec<_> = entries
+                .iter()
+                .filter(|entry| is_ai_memory_hook_entry(entry))
+                .collect();
+            assert_eq!(ours.len(), 1, "{event}: exactly one ai-memory entry");
+            assert_eq!(ours[0]["matcher"], "", "{event}");
+            let command = ours[0]["hooks"][0]["command"].as_str().unwrap();
+            let stem = script.trim_end_matches(".sh");
+            assert!(
+                command.contains(&format!(
+                    " hook --event {stem} --agent workbuddy --server-url "
+                )),
+                "{event}: {command}"
+            );
+            assert!(
+                !command.contains(".sh"),
+                "{event}: no script bundle: {command}"
+            );
+        }
+        assert!(
+            root["hooks"].get("SessionEnd").is_none(),
+            "WorkBuddy fires no SessionEnd"
+        );
         assert!(root["hooks"].get("SubagentStart").is_none());
         assert!(root["hooks"].get("PostToolUseFailure").is_none());
         let pre = root["hooks"]["PreToolUse"].as_array().unwrap();

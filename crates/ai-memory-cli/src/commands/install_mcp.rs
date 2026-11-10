@@ -227,6 +227,7 @@ fn preview_snippet(mut args: InstallMcpArgs) -> Result<String> {
         McpClient::GeminiCli => render_gemini_cli(&args)?,
         McpClient::QwenCode => render_qwen_code(&args)?,
         McpClient::Qoder => render_json_mcp_fragment(&args)?,
+        McpClient::WorkBuddy => render_json_mcp_fragment(&args)?,
         McpClient::Openclaw => render_openclaw(&args)?,
         McpClient::Pi => render_pi(&args)?,
         McpClient::Omp => render_omp(&args)?,
@@ -551,9 +552,11 @@ fn stdio_bridge_entry(args: &InstallMcpArgs) -> Option<serde_json::Value> {
             "args": bridge,
             "timeout": GEMINI_MCP_TIMEOUT_MS,
         }),
-        McpClient::Cursor | McpClient::VsCodeCopilot | McpClient::Swival | McpClient::Zero => {
-            typed("stdio")
-        }
+        McpClient::Cursor
+        | McpClient::VsCodeCopilot
+        | McpClient::Swival
+        | McpClient::Zero
+        | McpClient::WorkBuddy => typed("stdio"),
         McpClient::Freebuff => {
             let env = args
                 .auth_token
@@ -744,6 +747,9 @@ pub(crate) fn mcp_config_path_with(
     };
     Ok(match client {
         McpClient::ClaudeCode => claude_code_config_path_in(env("CLAUDE_CONFIG_DIR"))?,
+        // WorkBuddy keeps MCP servers in a dedicated mcp.json beside its
+        // settings.json, under the root `mcpServers` map.
+        McpClient::WorkBuddy => home()?.join(".workbuddy").join("mcp.json"),
         McpClient::Codex => codex_config_path_in(env("CODEX_HOME"))?,
         // Project scope is `.grok/config.toml` under cwd/repo; pass
         // --config-file for that case rather than inventing a second default.
@@ -1302,6 +1308,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::GeminiCli
         | McpClient::QwenCode
         | McpClient::Qoder
+        | McpClient::WorkBuddy
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::Devin
@@ -1807,8 +1814,8 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
     let server_url = flavored.as_str();
     let mut entry = serde_json::Map::new();
     match args.client {
-        McpClient::ClaudeCode => {
-            if args.session_aware {
+        McpClient::ClaudeCode | McpClient::WorkBuddy => {
+            if args.client == McpClient::ClaudeCode && args.session_aware {
                 entry.insert("type".into(), json!("stdio"));
                 entry.insert("command".into(), json!(bridge_command()));
                 let mut argv = vec![
@@ -4721,6 +4728,7 @@ mod tests {
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::QwenCode => render_qwen_code(&args).unwrap(),
             McpClient::Qoder => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::WorkBuddy => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),
@@ -4765,6 +4773,7 @@ mod tests {
             McpClient::GeminiCli,
             McpClient::QwenCode,
             McpClient::Qoder,
+            McpClient::WorkBuddy,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -4815,6 +4824,7 @@ mod tests {
             McpClient::GeminiCli,
             McpClient::QwenCode,
             McpClient::Qoder,
+            McpClient::WorkBuddy,
             McpClient::Openclaw,
             McpClient::Omp,
             McpClient::AntigravityCli,
@@ -4868,6 +4878,34 @@ mod tests {
         assert!(entry.get("url").is_none());
     }
 
+    /// WorkBuddy reads MCP servers from `~/.workbuddy/mcp.json` under the
+    /// root `mcpServers` map, in Claude Code's HTTP shape (`type: "http"`,
+    /// `url`, `headers`). A token from a file instead routes it to the
+    /// session-less stdio bridge.
+    #[test]
+    fn workbuddy_writes_claude_shaped_http_entry_and_bridges_a_file_token() {
+        let mut args = args_with_token(McpClient::WorkBuddy);
+        // `build_json_mcp_entry` takes the endpoint as given; the `/mcp`
+        // suffix is added by `effective_mcp_server_url` in `run`.
+        args.server_url = Some("http://memory:49374/mcp".into());
+        let entry = build_json_mcp_entry(&args).unwrap();
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://memory:49374/mcp");
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            "Bearer test-token-deadbeef"
+        );
+        assert!(matches!(
+            json_mcp_location(McpClient::WorkBuddy),
+            Some(JsonMcpLocation::RootMcpServers)
+        ));
+        assert!(
+            mcp_config_path(McpClient::WorkBuddy)
+                .unwrap()
+                .ends_with(".workbuddy/mcp.json")
+        );
+    }
+
     fn render_for_test(client: McpClient) -> String {
         let args = args_for(client);
         match args.client {
@@ -4883,6 +4921,7 @@ mod tests {
             McpClient::GeminiCli => render_gemini_cli(&args).unwrap(),
             McpClient::QwenCode => render_qwen_code(&args).unwrap(),
             McpClient::Qoder => render_json_mcp_fragment(&args).unwrap(),
+            McpClient::WorkBuddy => render_json_mcp_fragment(&args).unwrap(),
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::Omp => render_omp(&args).unwrap(),

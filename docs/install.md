@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, WorkBuddy, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -2204,6 +2204,55 @@ for CodeBuddy yet, no transcript backfill, no session close for headless
 CodeBuddy's hook documentation and the payloads reported on v2.164 to
 v2.167; the maintainers have not yet run it end to end. Start a new
 CodeBuddy session after installing so it loads the hooks.
+
+### WorkBuddy
+
+WorkBuddy (`workbuddy`), Tencent's coding agent, reads lifecycle hooks from
+the `hooks` key of `~/.workbuddy/settings.json` and MCP servers from the
+`mcpServers` map of `~/.workbuddy/mcp.json`. Both installers mimic their
+Tencent CodeBuddy and Claude Code counterparts:
+
+```bash
+ai-memory install-hooks --agent workbuddy --apply
+ai-memory install-mcp --client workbuddy --apply
+ai-memory install-skills --scope global --agent workbuddy
+```
+
+Without `--apply` each command prints the block to merge by hand, and
+`ai-memory setup-agent --agent workbuddy` prints the hook block for a host
+that runs WorkBuddy against a remote server. Running `--apply` again changes
+nothing.
+
+WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract: it sends
+`session_id`, `cwd`, `tool_name`, `tool_input` and `tool_response` on stdin
+with Claude Code's tool names, so each entry runs the native
+`ai-memory hook --event … --agent workbuddy` command with an empty matcher.
+There is no script bundle; the local spool, bearer auth and
+`[capture] ignore_paths` apply. Six events are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact` and `Stop`.
+
+The `SessionStart` hook delivers the prior session's handoff through
+`hookSpecificOutput.additionalContext`, which WorkBuddy appends to the
+session. With nothing to deliver, the `SessionStart` and `UserPromptSubmit`
+hooks print nothing, since WorkBuddy appends their output too.
+
+**WorkBuddy never fires a `SessionEnd` event.** `Stop` is a turn boundary,
+not a session end, so an idle WorkBuddy session stays open. Close it with
+`ai-memory finalize-session --agent workbuddy` after the final turn; that
+writes the summary page and hands the baton to the next session. There is no
+managed workstream and no transcript backfill.
+
+The MCP entry uses Claude Code's HTTP shape (`type: "http"`, `url`, optional
+`headers`) under `mcpServers`. When the install's bearer comes from
+`[auth].bearer_token_file`, `install-mcp` writes the session-less `mcp-bridge`
+stdio entry instead, so the token never enters `mcp.json`; a client with a
+session id of its own is not assumed, so pass explicit `workspace` and
+`project` on project-scoped MCP calls.
+
+Skills go into `~/.workbuddy/skills` (global) or `.workbuddy/skills`
+(project). `ai-memory setup` wires WorkBuddy when `~/.workbuddy` exists, and
+`ai-memory uninstall` removes the hook entries. Start a new WorkBuddy session
+after installing so it loads the hooks.
 
 ### Hermes Agent (Nous Research)
 

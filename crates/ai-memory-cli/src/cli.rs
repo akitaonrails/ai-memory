@@ -1960,6 +1960,9 @@ pub enum InstallSkillsAgent {
     /// `~/.gemini/antigravity-cli/skills` (CLI).
     #[value(alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+    /// Tencent WorkBuddy's `.workbuddy/skills` directory.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// Install into both Claude Code and `.agents` skill directories.
     Both,
 }
@@ -2702,6 +2705,15 @@ pub enum AgentChoice {
     /// stdout (`hookSpecificOutput.additionalContext`) carries the handoff.
     #[value(name = "codebuddy", alias = "code-buddy")]
     CodeBuddy,
+    /// Tencent WorkBuddy (`workbuddy`) — lifecycle hooks merged into the
+    /// `hooks` key of `~/.workbuddy/settings.json`. WorkBuddy takes CodeBuddy's
+    /// Claude Code-shaped hook payloads on stdin, so each entry runs
+    /// ai-memory's native `hook` command directly; there is no script bundle.
+    /// SessionStart stdout (`hookSpecificOutput.additionalContext`) carries
+    /// the handoff. WorkBuddy fires no `SessionEnd`, so a finished session
+    /// closes with `ai-memory finalize-session --agent workbuddy`.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// IBM Bob IDE — lifecycle hooks merged into the `hooks` key of
     /// `~/.bob/settings/settings.json`. Bob sends Claude Code-shaped payloads
     /// and injects plain `SessionStart` stdout into the model context.
@@ -2770,6 +2782,7 @@ impl AgentChoice {
             Self::Droid => AgentKind::Droid,
             Self::Muse => AgentKind::Muse,
             Self::CodeBuddy => AgentKind::CodeBuddy,
+            Self::WorkBuddy => AgentKind::WorkBuddy,
             Self::IbmBob => AgentKind::IbmBob,
             Self::Dsh => AgentKind::Dsh,
             Self::Cline => AgentKind::Cline,
@@ -2797,6 +2810,7 @@ impl AgentChoice {
             | Self::Droid
             | Self::Muse
             | Self::CodeBuddy
+            | Self::WorkBuddy
             | Self::IbmBob
             | Self::Cline
             | Self::QwenCode => None,
@@ -3005,6 +3019,12 @@ pub enum McpClient {
     /// Qoder CLI and IDE — user-level `~/.qoder/settings.json`, with a
     /// stdio `ai-memory mcp-bridge --no-session-id` entry under `mcpServers`.
     Qoder,
+    /// Tencent WorkBuddy (`workbuddy`) — user-level `~/.workbuddy/mcp.json`,
+    /// servers under the root `mcpServers` map with `type: "http"` + `url`
+    /// and an optional `headers` bearer, the shape Claude Code uses. Pair
+    /// with `install-hooks --agent workbuddy` for lifecycle capture.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
     /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
     /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
@@ -5333,6 +5353,27 @@ mod tests {
             assert_eq!(args.agent, AgentChoice::CodeBuddy);
             assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CodeBuddy);
             assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+    }
+
+    #[test]
+    fn workbuddy_install_hooks_and_mcp_parse_with_both_aliases() {
+        for alias in ["workbuddy", "work-buddy"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::WorkBuddy);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::WorkBuddy);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::WorkBuddy);
         }
     }
 

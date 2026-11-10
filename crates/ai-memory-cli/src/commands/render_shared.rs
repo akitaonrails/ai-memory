@@ -193,6 +193,24 @@ pub(crate) const CODEBUDDY_EVENTS: [(&str, &str); 7] = [
     ("SessionEnd", "session-end.sh"),
 ];
 
+/// Tencent WorkBuddy lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-~/.workbuddy/settings.json, native hook-event script
+/// stem)`; WorkBuddy has no script bundle, so the `.sh` name only carries the
+/// event token the native command is rendered with.
+///
+/// WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract, but it fires
+/// no `SessionEnd` event, so unlike [`CODEBUDDY_EVENTS`] that event is not
+/// wired and a finished session closes with
+/// `ai-memory finalize-session --agent workbuddy`.
+pub(crate) const WORKBUDDY_EVENTS: [(&str, &str); 6] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+];
+
 /// Qoder CLI/IDE events used for capture and handoff delivery. Qoder exposes
 /// additional policy and notification events that do not carry memory data.
 pub(crate) const QODER_EVENTS: [(&str, &str); 8] = [
@@ -1522,6 +1540,34 @@ pub(crate) fn build_codebuddy_hooks_payload(
         HookCommandContext::new(
             HookCommandPlatform::native(),
             "codebuddy",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
+/// `{"hooks": <event map>}` for Tencent WorkBuddy. The `hooks` key of
+/// `~/.workbuddy/settings.json` holds Claude Code's nested shape
+/// (`"Event": [{"matcher": "", "hooks": [{"type": "command", "command": …}]}]`).
+/// WorkBuddy runs each `command` with CodeBuddy's Claude Code-shaped event
+/// JSON on stdin, so every entry invokes the native `ai-memory hook` command;
+/// there is no script bundle. No `SessionEnd` is wired because WorkBuddy never
+/// fires one.
+pub(crate) fn build_workbuddy_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &WORKBUDDY_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "workbuddy",
             data_dir,
             project_strategy,
         ),

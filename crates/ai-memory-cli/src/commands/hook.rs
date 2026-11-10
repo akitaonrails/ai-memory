@@ -1201,14 +1201,15 @@ fn write_success_response<W: std::io::Write>(
         agent,
         AgentKind::Muse
             | AgentKind::CodeBuddy
+            | AgentKind::WorkBuddy
             | AgentKind::IbmBob
             | AgentKind::QwenCode
             | AgentKind::Qoder
     ) && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
     {
         // Muse and IBM Bob add SessionStart and UserPromptSubmit stdout to the
-        // turn as context, CodeBuddy appends exit-0 stdout of both to the
-        // session, and Qwen Code injects both as tagged model context, so a
+        // turn as context, CodeBuddy and WorkBuddy append exit-0 stdout of both
+        // to the session, and Qwen Code injects both as tagged model context, so a
         // capture-only reply stays empty rather than put `{}` in front of the
         // model on every prompt.
         Ok(())
@@ -3840,6 +3841,17 @@ mod tests {
                 HookEvent::PostToolUse,
                 b"{}\n".as_slice(),
             ),
+            (
+                AgentKind::WorkBuddy,
+                HookEvent::SessionStart,
+                b"".as_slice(),
+            ),
+            (AgentKind::WorkBuddy, HookEvent::UserPrompt, b"".as_slice()),
+            (
+                AgentKind::WorkBuddy,
+                HookEvent::PostToolUse,
+                b"{}\n".as_slice(),
+            ),
             (AgentKind::IbmBob, HookEvent::SessionStart, b"".as_slice()),
             (AgentKind::IbmBob, HookEvent::UserPrompt, b"".as_slice()),
             (
@@ -4201,6 +4213,7 @@ mod tests {
     async fn a_handoff_is_never_claimed_without_a_project_directory() {
         let cases = [
             ("codebuddy", "session-start", serde_json::json!({})),
+            ("workbuddy", "session-start", serde_json::json!({})),
             ("ibm-bob", "session-start", serde_json::json!({})),
             ("qwen-code", "session-start", serde_json::json!({})),
             ("claude-code", "session-start", serde_json::json!({})),

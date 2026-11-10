@@ -293,6 +293,10 @@ fn build_plan(
                 HookConfigShape::NestedHooksKey,
             ),
             (
+                install_hooks::workbuddy_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            (
                 install_hooks::ibm_bob_settings_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
@@ -1700,6 +1704,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::GeminiCli
         | McpClient::QwenCode
         | McpClient::Qoder
+        | McpClient::WorkBuddy
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::KimiCode
