@@ -50,6 +50,12 @@ version in [`docs/changelog/`](docs/changelog/):
   one older prompt does not fit its budget, instead of "1 earlier prompts
   omitted". The anchor's own "1 prompt between these was omitted" line already
   used the singular. (#2166)
+- `ai-memory uninstall` now keeps `~/.cursor/hooks.json` loadable by Cursor.
+  It removed ai-memory's entries and wrote the hooks you keep back with plain
+  `/`, so a hook with a URL such as `curl https://…` put a bare `//` in the
+  file and Cursor dropped every hook in it without a message. Uninstall now
+  writes the same `\/` escape that `install-hooks --agent cursor` writes.
+  (#2165)
 
 ### Security
 
