@@ -7,7 +7,7 @@ A repository whose `.ai-memory.toml` selects a named server profile
 hook`: the profile's URL and per-profile token live behind the native
 resolver, and no generated integration holds them. The three capture front
 doors enforce this by *dropping* a routed repository rather than delivering it
-to the install default — the shell bundles (`hooks/_lib.sh`
+to the install default: the shell bundles (`hooks/_lib.sh`
 `ai_memory_server_routed`), PowerShell (`Test-AiMemoryServerRouted`), and the
 generated TypeScript (`ts_capture_policy_v1`'s `captureServerRouted`, consumed
 as `disposition: "drop"`).
@@ -34,7 +34,7 @@ only the profile's server, authenticated only with the profile's token, and
 never fall back to the install default. A repository without a `server` key
 keeps its existing direct-HTTP capture unchanged.
 
-Scope: the generated OpenCode plugins, **both V1 and V2** — they share the
+Scope: the generated OpenCode plugins, **both V1 and V2**. They share the
 capture prelude, so the routed-native branch lands in the shared `postHook` /
 `fetchHandoff` and both inherit it.
 
@@ -107,19 +107,19 @@ default token cannot leak a profile repo to the default server.
 ### The fail-closed guard: `--expected-profile <name>`
 
 The TS plugin and the native binary each walk the marker tree independently.
-Without a cross-check, a divergence — a race that rewrites the marker, a
+Without a cross-check, a divergence (a race that rewrites the marker, a
 symlink the two resolve differently, a native walk that finds *no* `server`
-key where the TS walk found one — could let the native hook resolve to
+key where the TS walk found one) could let the native hook resolve to
 `InstallDefault` and deliver a profile repo's data to the install server. That
 is the exact #992 failure.
 
 `--expected-profile <name>` closes it. After `resolve_hook_route`, the native
 hook requires `HookRoute::Profile(resolved)` with `resolved.name == <name>`.
-Anything else — `InstallDefault`, `Rejected`, or a *different* profile name —
+Anything else (`InstallDefault`, `Rejected`, or a *different* profile name)
 prints a localized stderr diagnostic, captures nothing, spools nothing, fetches
 no handoff, and writes nothing to stdout (so no handoff is injected). It returns
 success (exit 0), the same emit-nothing posture the existing refused-profile
-`Rejected` branch takes — fail-closed means "deliver nothing", and the harness
+`Rejected` branch takes. Fail-closed means "deliver nothing", and the harness
 already cannot distinguish a refusal from an absent handoff. The guard applies
 to both capture and the handoff fetch and is additive: without the flag the
 native hook behaves exactly as today.
@@ -134,9 +134,8 @@ resolution.
 profile repo, independent of `--capture-assistant`. The plugin is generated per
 install, before any repo is known, so the exe path is baked unconditionally
 for OpenCode V1 and V2. If the binary is absent at runtime, a server-routed
-event
-falls back to **drop** (today's safe behavior), never to HTTP — the spawn-error
-handler for a routed event drops instead of calling `postHook`.
+event falls back to **drop** (today's safe behavior), never to HTTP: the
+spawn-error handler for a routed event drops instead of calling `postHook`.
 
 ### Event routing
 
@@ -171,7 +170,7 @@ profile and keep dropping.
 stop event), payload on stdin, env token, 5 s timeout, `unload` signal.
 
 Because server-routed events go native and all others go HTTP, an event is
-delivered by exactly one path — no deduplication is required.
+delivered by exactly one path, so no deduplication is required.
 
 ### Handoff
 
@@ -195,7 +194,7 @@ existing native session-start path.
 `session.moved`, `session.compaction.*` route through `postHook` and inherit
 the routed branch unchanged. A cross-profile session move stays unsupported:
 the move emits `session-start` with the new cwd, and if old and new resolve to
-different profiles the native guard refuses the mismatched one — the move is
+different profiles the native guard refuses the mismatched one, so the move is
 not silently rebased across profiles.
 
 ## Security boundary
@@ -208,7 +207,7 @@ adversarial tests are
 updated in the same change. The invariant the tests must keep biting on:
 
 - a profile repo's capture reaches only the profile server, with the profile
-  token, never the install default — including when the binary is missing
+  token, never the install default. This holds when the binary is missing
   (drop, not HTTP) and when the native walk diverges from the TS walk (guard
   refuses, not fallback);
 - `--expected-profile` refuses `InstallDefault`, `Rejected`, and a different

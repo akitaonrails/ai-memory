@@ -1088,8 +1088,11 @@ each server once with `ai-memory server add <name> --url <url> --root <dir>
 --auth-token-stdin`, then set `server = "<name>"` in each repository's
 `.ai-memory.toml`. Repositories without the key keep using the server
 `install-hooks` configured. A profile that does not resolve drops the event
-instead of falling back. Native hook commands route profiles; the generated
-TypeScript integrations and the script hooks drop routed repositories. See
+instead of falling back. Native hook commands route profiles, and the generated
+OpenCode plugins (`opencode`, `opencode2`) route a profile repository through
+that native hook (passing `--expected-profile`, so a divergent walk or a missing
+binary drops rather than falls back); the other generated integrations and the
+script hooks still drop routed repositories. See
 [`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 
 Some agent harnesses attach the assistant's final turn to their `Stop` event;

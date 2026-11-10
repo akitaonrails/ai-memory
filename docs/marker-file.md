@@ -536,15 +536,21 @@ names the profile; no URL, path or token is printed.
 
 **Supported integrations.** Native `ai-memory hook` commands route profiles,
 including the session-start handoff fetch, the spooled events drained later,
-and the one-time boot backfill. The generated TypeScript integrations
-(`opencode`, `opencode2`, `omp`, `pi`, `openclaw`) do not route yet: a
-repository whose marker selects a profile emits nothing from them and fetches
-no handoff. The script hooks (the `.sh` and `.ps1` bundles used by the
-`AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper and `setup-agent`
-snippets) cannot route either, and likewise drop a routed repository's events
-and handoff fetch. Clients older than this change ignore the key and deliver to
-their install default, so upgrade every client before adding `server` to a
-shared marker.
+and the one-time boot backfill. The generated OpenCode plugins (`opencode` and
+`opencode2`) route a profile repository through that native hook: its events and
+its session-start handoff are captured on the profile's server, with the
+profile's own token, never the install default. The plugin passes the profile
+name it read from the marker as `ai-memory hook --expected-profile`, and the
+native binary re-resolves the route from the directory and captures nothing
+unless it is exactly that profile, so a divergent walk or a missing binary drops
+rather than falling back. The other generated integrations (`omp`, `pi`,
+`openclaw`) do not route yet: a repository whose marker selects a profile emits
+nothing from them and fetches no handoff. The script hooks (the `.sh` and `.ps1`
+bundles used by the `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper
+and `setup-agent` snippets) cannot route either, and likewise drop a routed
+repository's events and handoff fetch. Clients older than this change ignore the
+key and deliver to their install default, so upgrade every client before adding
+`server` to a shared marker.
 
 **Known limits.**
 
@@ -560,6 +566,13 @@ shared marker.
   configured with, so in a routed repository it reaches the install default.
   Point that repository's MCP client at its own server with a per-repository
   `.mcp.json`.
+- **OpenCode routed handoff.** The native hook claims a handoff exactly once,
+  so a crash after it claims the profile repository's handoff but before the
+  OpenCode plugin injects it loses that handoff (the same window the native
+  session-start path already has). The plugin also leaves a routed same-profile
+  `session.moved` uncaptured: its session-start is owned by the handoff path,
+  which does not run for a mid-session move. A cross-profile move stays
+  unsupported, as before.
 
 Profiles use static tokens only. OIDC `auth.json` stays with the install
 default and is never presented to a profile's server.

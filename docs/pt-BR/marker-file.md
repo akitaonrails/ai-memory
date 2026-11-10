@@ -535,8 +535,14 @@ nomeia o perfil; nenhuma URL, caminho ou token é exibido.
 
 **Integrações compatíveis.** Comandos nativos `ai-memory hook` roteiam perfis,
 incluindo a busca de handoff de início de sessão, os eventos em spool escoados posteriormente
-e o preenchimento retroativo único de inicialização. As integrações geradas em TypeScript
-(`opencode`, `opencode2`, `omp`, `pi`, `openclaw`) ainda não realizam esse roteamento: um
+e o preenchimento retroativo único de inicialização. Os plugins gerados do OpenCode
+(`opencode` e `opencode2`) roteiam um repositório com perfil através desse hook nativo:
+seus eventos e seu handoff de início de sessão são capturados no servidor do perfil, com o
+token do próprio perfil, nunca o padrão de instalação. O plugin passa o nome do perfil que
+leu do marcador como `ai-memory hook --expected-profile`, e o binário nativo reresolve a rota
+a partir do diretório e não captura nada a menos que seja exatamente aquele perfil, de modo
+que uma caminhada divergente ou um binário ausente descartam em vez de recorrer ao padrão. As
+outras integrações geradas (`omp`, `pi`, `openclaw`) ainda não realizam esse roteamento: um
 repositório cujo marcador selecione um perfil não emite nada a partir delas e não busca
 handoff. Os hooks por script (os pacotes `.sh` e `.ps1` usados pela sobreposição
 `AI_MEMORY_HOOK_PLATFORM`, o wrapper de host do Docker e trechos de `setup-agent`)
@@ -559,6 +565,13 @@ marcador compartilhado.
   roteado eles alcançam o padrão da instalação. Aponte o cliente MCP daquele repositório
   para seu próprio servidor com um `.mcp.json` por repositório e evite
   `ai-memory run` lá até que ele suporte perfis.
+- **Handoff roteado do OpenCode.** O hook nativo reivindica um handoff exatamente
+  uma vez, então uma falha após ele reivindicar o handoff do repositório com perfil, mas
+  antes de o plugin do OpenCode injetá-lo, perde aquele handoff (a mesma janela que o
+  caminho nativo de início de sessão já tem). O plugin também deixa um `session.moved`
+  roteado no mesmo perfil sem captura: seu início de sessão pertence ao caminho do handoff,
+  que não é executado em uma mudança no meio da sessão. Uma mudança entre perfis permanece
+  sem suporte, como antes.
 
 Perfis usam apenas tokens estáticos. O `auth.json` do OIDC permanece com o padrão
 da instalação e nunca é apresentado ao servidor de um perfil.

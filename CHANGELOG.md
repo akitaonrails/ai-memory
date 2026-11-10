@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- The generated OpenCode plugins (V1 and V2) now capture a server-routed
+  repository (`server = "<profile>"`, #992) through the native hook instead of
+  dropping it. Its tool, prompt and lifecycle events, and its session-start
+  handoff, reach only the profile's server, authenticated with the profile's
+  own token; a new `ai-memory hook --expected-profile <name>` guard re-resolves
+  the route from the directory and emits nothing unless it is exactly that
+  profile, so a divergent walk or a missing binary drops rather than falling
+  back to the install default. A repository without a `server` key keeps its
+  existing direct capture. The native binary's path is now baked into both
+  OpenCode plugins regardless of assistant capture (#2122).
 - `ai-memory run --workstream NAME --or-new` selects the named workstream when
   it exists and creates it, as `--new NAME` would, when the server reports it
   does not — instead of failing with a 404 or a 409. The run line names the
