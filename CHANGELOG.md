@@ -21,6 +21,26 @@ version in [`docs/changelog/`](docs/changelog/):
   panel kept its warning and a #1692 watchdog re-ran sessions that were already
   consolidated (14 of 19 reported failures on one server). A failure newer than
   the session's last completed generation is still reported. (#2160)
+- Fixed `merge-project` dropping the source project's repository identity.
+  The git remote identity and its derived name keys sat on the project row the
+  merge deletes. After merging the remote-named half of a split into the
+  folder-named one, the direction `ai-memory run` prints for a split it cannot
+  repair by renaming, nothing routed the checkout to the merged project: the
+  next capture could open a new project under the remote's name, and
+  `ai-memory run`, still bound to the deleted project, had no candidate to
+  offer. The identity now moves to a target that carries none, and a target
+  that already belongs to another repository keeps its own. (#2156)
+- Fixed `merge-project` leaving this client's checkout link and saved project
+  binding on the source project it removed. A checkout bound to the source
+  kept sending the deleted project id, so `ai-memory run` and
+  `ai-memory workstreams` got 404 from it until `--project-id` or the project
+  picker replaced the binding. A confirmed merge now re-points both at the
+  target, as `repair-split` does, and the merge report names both project
+  ids, so a merge by project name is covered too. (#2158)
+- Docker images now run the server under `tini`, which reaps orphaned helper
+  processes rather than leaving zombies under the container's PID 1. It
+  forwards shutdown signals to the server so graceful draining still works.
+  (#2163)
 
 ## [3.4.5] - 2026-11-10
 
