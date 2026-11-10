@@ -11,6 +11,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
+  count or list a failed session consolidation that a newer consolidation of
+  the same session has since completed. A session that ends, resumes and ends
+  again queues a new generation; when the old one had given up and the new one
+  succeeded, the old failure stayed in `failed` and `failed_sessions`, so the
+  panel kept its warning and a #1692 watchdog re-ran sessions that were already
+  consolidated (14 of 19 reported failures on one server). A failure newer than
+  the session's last completed generation is still reported. (#2160)
+
 ## [3.4.5] - 2026-11-10
 
 ### Security
@@ -42,14 +53,6 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
-  count or list a failed session consolidation that a newer consolidation of
-  the same session has since completed. A session that ends, resumes and ends
-  again queues a new generation; when the old one had given up and the new one
-  succeeded, the old failure stayed in `failed` and `failed_sessions`, so the
-  panel kept its warning and a #1692 watchdog re-ran sessions that were already
-  consolidated (14 of 19 reported failures on one server). A failure newer than
-  the session's last completed generation is still reported. (#2160)
 - Claude Code machine turns that reach the prompt channel — an agent-team
   `<teammate-message …>`, a `<cross-session-message …>`, a `<task-notification>`,
   the "Another Claude session sent a message" envelope, and the post-compaction
