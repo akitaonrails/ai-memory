@@ -554,11 +554,11 @@ cli-help-root-profile-status-user-help = { "Operator whose private profile to in
 cli-help-root-profile-list-about = { "List the profile's entries" }
 cli-help-root-profile-list-workspace-help = { "Workspace whose profile to inspect when `[profile] share = \"workspace\"`" }
 cli-help-root-profile-list-user-help = { "Operator whose private profile to inspect when the profile is per user (`share = \"user\"`)" }
-cli-help-root-profile-show-about = { "Print one entry (`profile/` prefix optional)" }
+cli-help-root-profile-show-about = { "Print one entry (`profile/` prefix and `.md` suffix optional)" }
 cli-help-root-profile-show-path-help = { "Entry path, e.g. `tools/pnpm.md`" }
 cli-help-root-profile-show-workspace-help = { "Workspace whose profile to inspect when `[profile] share = \"workspace\"`" }
 cli-help-root-profile-show-user-help = { "Operator whose private profile to inspect when the profile is per user (`share = \"user\"`)" }
-cli-help-root-profile-forget-about = { "Remove one entry (`profile/` prefix optional). Git keeps its history, and the harvester leaves the topic alone until you state it again" }
+cli-help-root-profile-forget-about = { "Remove one entry (`profile/` prefix and `.md` suffix optional). Git keeps its history, and the harvester leaves the topic alone until you state it again" }
 cli-help-root-profile-forget-path-help = { "Entry path, e.g. `tools/pnpm.md`" }
 cli-help-root-profile-forget-workspace-help = { "Workspace whose profile to inspect when `[profile] share = \"workspace\"`" }
 cli-help-root-profile-forget-user-help = { "Operator whose private profile to inspect when the profile is per user (`share = \"user\"`)" }
