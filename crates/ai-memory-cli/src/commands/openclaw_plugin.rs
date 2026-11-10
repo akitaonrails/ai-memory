@@ -1071,7 +1071,7 @@ mod tests {
         let plugin = build_plugin("http://127.0.0.1:49374", None, None, "denylist");
         assert!(
             plugin.contains(
-                "if (captureServerRouted(cwd)) return { disposition: \"drop\", payload };"
+                "const serverRoute = captureServerRouted(cwd); if (serverRoute) return { disposition: \"drop\", ...(serverRoute.profile ? { serverRoutedProfile: serverRoute.profile } : {}), payload };"
             ),
             "{plugin}"
         );

@@ -15368,7 +15368,7 @@ model = "gpt-5"
         for (agent, plugin) in plugins {
             assert!(
                 plugin.contains(
-                    "if (captureServerRouted(cwd)) return { disposition: \"drop\", payload };"
+                    "const serverRoute = captureServerRouted(cwd); if (serverRoute) return { disposition: \"drop\", ...(serverRoute.profile ? { serverRoutedProfile: serverRoute.profile } : {}), payload };"
                 ),
                 "{agent}: capture must drop a server-routed repository"
             );
