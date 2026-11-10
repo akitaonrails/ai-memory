@@ -1910,9 +1910,11 @@ impl Wiki {
                 author_id,
                 expected_latest_id: None,
             } => {
+                // A hand-edited file can exist before the watcher indexes it.
                 self.writer
                     .delete_page(workspace_id, project_id, path.clone(), author_id)
                     .await
+                    .map(|deleted| deleted || quarantined.is_some())
             }
             PageStoreRemoval::Decay { expected_latest_id } => {
                 self.writer
@@ -9574,12 +9576,8 @@ mod tests {
         );
     }
 
-    /// `delete_page` reports whether a page actually existed, so the callers
-    /// that surface it (`/admin/delete-page`, `memory_delete_page`, `ai-memory
-    /// profile forget`) can tell the user the truth instead of always claiming
-    /// success. A no-op delete of an absent path returns `false`; removing a
-    /// real page returns `true` and the second delete of the same path is
-    /// again `false` (#2181).
+    /// `delete_page` reports whether it removed a page, even if the watcher
+    /// has not indexed the Markdown yet. An absent path returns `false`.
     #[tokio::test]
     async fn delete_page_reports_whether_a_page_existed() {
         let tmp = TempDir::new().unwrap();
@@ -9625,6 +9623,17 @@ mod tests {
                 .unwrap(),
             "deleting the now-gone page again must report nothing was removed"
         );
+
+        let unindexed = PagePath::new("profile/workflow/hand-edited.md").unwrap();
+        let file = wiki.abs_path(ws, proj, &unindexed);
+        std::fs::write(&file, "# Hand-edited\n").unwrap();
+        assert!(
+            wiki.delete_page(ws, proj, &unindexed, None, None)
+                .await
+                .unwrap(),
+            "deleting an unindexed Markdown page must report it was removed"
+        );
+        assert!(!file.exists());
     }
 
     /// #643 end-to-end: stop the server inside the window the issue
