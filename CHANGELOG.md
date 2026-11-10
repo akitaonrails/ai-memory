@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Preserved the longer LLM fallback cooldown across overlapping provider
   failures, honoring the provider's retry hint when another in-flight call
-  reports a shorter wait.
+  reports a shorter wait. (#2187)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
