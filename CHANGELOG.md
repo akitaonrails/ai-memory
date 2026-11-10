@@ -47,6 +47,17 @@ version in [`docs/changelog/`](docs/changelog/):
   a default install the stream has almost nothing to rank until an agent writes
   an abstract by hand. (#2161)
 
+### Security
+
+- `ai-memory uninstall --only hooks` now withdraws ZCode's capture hooks. ZCode
+  stores its wiring under `hooks.events` in `~/.zcode/cli/config.json`, a shape
+  the uninstall swept for no other agent, so it exited reporting that no
+  ai-memory wiring was found while all six generated capture hooks stayed
+  enabled. A user who trusted that result kept sending prompts and tool
+  activity under a capture they had asked to remove. The uninstall now strips
+  every ai-memory entry from that file while the user's own hooks, model and
+  hook-level settings survive. (GHSA-qmg7-f7fg-rg4x)
+
 ## [3.4.5] - 2026-11-10
 
 ### Security

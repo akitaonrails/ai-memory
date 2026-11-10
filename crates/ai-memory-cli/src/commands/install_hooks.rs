@@ -7368,7 +7368,7 @@ fn render_zero(
 /// wrote. Our entries carry a `statusMessage` starting with `ai-memory`
 /// — the only schema-documented free-form key, so ownership is marked
 /// without emitting keys ZCode would drop.
-fn is_our_zcode_hook(hook: &serde_json::Value) -> bool {
+pub(crate) fn is_our_zcode_hook(hook: &serde_json::Value) -> bool {
     hook.get("statusMessage")
         .and_then(|v| v.as_str())
         .is_some_and(|msg| msg.starts_with("ai-memory"))
