@@ -1094,20 +1094,31 @@ ai_memory_post_hook() {
 # to its default or the caller's last active project, and the claim could
 # consume another repository's handoff. Fetch nothing then; the handoff stays
 # open for memory_handoff_accept (parity with the native hook).
+# Under external capture (`AI_MEMORY_CAPTURE_OWNER`) the owner shares the
+# project with the captured harness, so the fetch sends `claim=0` to offer
+# the baton rather than consume it (parity with the native hook, #2148).
 ai_memory_get_handoff() {
     case "$1" in
         *"$AI_MEMORY_SERVER_ROUTED_QS"*|*'ai_memory_invalid_home_routes=1'*) return 0 ;;
         *'&cwd='*) ;;
         *) return 0 ;;
     esac
+    _amurl="$1"
+    if ai_memory_capture_owned_externally; then
+        case "$_amurl" in
+            *\?claim=* | *\&claim=*) ;;
+            *\?*) _amurl="${_amurl}&claim=0" ;;
+            *) _amurl="${_amurl}?claim=0" ;;
+        esac
+    fi
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" \
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN") || return $?
     elif [ -n "$_amhdr" ]; then
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" -H @"$_amhdr") || return $?
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl" -H @"$_amhdr") || return $?
     else
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1") || return $?
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl") || return $?
     fi
     # Appending the status preserves the body's final newlines in the command
     # substitution. Redirect and error bodies must never become agent context.

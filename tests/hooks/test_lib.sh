@@ -1178,6 +1178,7 @@ HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cu
 assert_eq "owner: handoff GET still delivered" "HANDOFF BODY" "$HANDOFF"
 assert_eq "owner: the GET is the only request" "1" "$(owner_requests)"
 assert_eq "owner: still no POST"               "0" "$(owner_posts)"
+assert_eq "owner: handoff GET carries claim=0" "1" "$(grep -c 'claim=0' "$CURL_LOG")"
 
 # 3. Standalone control: with no owner the same call POSTs as before.
 unset AI_MEMORY_CAPTURE_OWNER
@@ -1185,6 +1186,8 @@ owner_case control
 printf '%s' '{"e":"control"}' \
     | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
 assert_eq "no owner: post_hook POSTs" "1" "$(owner_posts)"
+HANDOFF_CTRL=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork")
+assert_eq "no owner: handoff GET delivers without claim=0" "0" "$(grep -c 'claim=0' "$CURL_LOG")"
 
 # 4. An exported-but-blank variable must not disable capture: empty and
 #    whitespace-only keep the default behaviour.

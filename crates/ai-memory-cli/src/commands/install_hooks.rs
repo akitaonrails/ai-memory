@@ -5595,6 +5595,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
   if (id) url.searchParams.set("session_id", id);
+  if (captureOwnedExternally()) url.searchParams.set("claim", "0");
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     // The body goes into the system prompt, so a redirect is refused: a
@@ -6510,6 +6511,7 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
   if (id) url.searchParams.set("session_id", id);
+  if (captureOwnedExternally()) url.searchParams.set("claim", "0");
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     // The body becomes the agent's context, so a redirect is refused: a
@@ -13806,6 +13808,7 @@ model = "gpt-5"
         assert!(plugin.contains("agent_id: info.parentID"));
         assert!(plugin.contains("typeof info.parentID === \"string\""));
         assert!(plugin.contains("fetchHandoff"));
+        assert!(plugin.contains("if (captureOwnedExternally()) url.searchParams.set(\"claim\", \"0\");"));
         assert!(plugin.contains("function applyMarkerParams"));
         assert!(plugin.contains("readFileSync(marker, \"utf8\")"));
         assert!(plugin.contains("text.split(/\\r?\\n/)"));
@@ -14368,6 +14371,7 @@ model = "gpt-5"
         assert!(extension.contains("postHook(\"session-start\""));
         assert!(extension.contains("postHook(\"user-prompt\""));
         assert!(extension.contains("fetchHandoff"));
+        assert!(extension.contains("if (captureOwnedExternally()) url.searchParams.set(\"claim\", \"0\");"));
         assert!(extension.contains("if (!process.env.AI_MEMORY_RUN_ID) {"));
         assert!(extension.contains("function applyMarkerParams"));
         assert!(extension.contains("readFileSync(marker, \"utf8\")"));

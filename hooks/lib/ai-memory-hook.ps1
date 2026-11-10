@@ -1316,12 +1316,13 @@ function Invoke-AiMemoryHook {
         if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
         }
+        $ClaimQS = if (Test-AiMemoryCaptureOwnedExternally) { "&claim=0" } else { "" }
         $NoProxy = Get-AiMemoryNoProxy
         try {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS$ClaimQS" `
                 -Headers $Headers
             $Status = Get-AiMemoryResponseStatus $Response
             if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {

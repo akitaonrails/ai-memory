@@ -57,6 +57,11 @@ version in [`docs/changelog/`](docs/changelog/):
   sends `claim=0` under external capture, and the server offers the handoff,
   naming it and how to accept, without marking it claimed. A normal run claims
   as before. (#2148)
+- Fixed POSIX shell hooks, PowerShell hooks, and generated TypeScript plugins
+  claiming a pending handoff under external capture (`AI_MEMORY_CAPTURE_OWNER`
+  set). Their `/handoff` fetches now carry `claim=0`, extending the offer-mode
+  fix from #2148 to script and plugin deliveries so the baton remains open for
+  an explicit `memory_handoff_accept`. (#2154)
 - `ai-memory run` resuming a session whose checkout now resolves to a
   different project that already holds its own sessions or pages now prints the
   exact commands to reconcile it — the `merge-project` dry run, the `--confirm`

@@ -158,6 +158,11 @@ Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff
             run.requests
         );
         assert!(
+            run.requests[0].contains("&claim=0"),
+            "the handoff GET under external capture must carry claim=0: {:?}",
+            run.requests
+        );
+        assert!(
             run.stdout.contains("HANDOFF FROM SERVER"),
             "the fetched context must still reach the agent: {:?}",
             run.stdout
@@ -193,6 +198,11 @@ Invoke-AiMemoryHook -Event 'session-start' -Agent 'claude-code' -FetchHandoff
             assert!(
                 run.requests[0].contains("/hook?event=session-start&agent=claude-code"),
                 "owner={owner:?} POST target: {:?}",
+                run.requests
+            );
+            assert!(
+                !run.requests[1].contains("claim=0"),
+                "owner={owner:?} must not carry claim=0: {:?}",
                 run.requests
             );
             assert!(
