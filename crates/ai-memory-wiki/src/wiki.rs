@@ -1911,10 +1911,13 @@ impl Wiki {
                 expected_latest_id: None,
             } => {
                 // A hand-edited file can exist before the watcher indexes it.
+                let had_file = quarantined.as_ref().is_some_and(|file| {
+                    std::fs::symlink_metadata(file).is_ok_and(|meta| meta.is_file())
+                });
                 self.writer
                     .delete_page(workspace_id, project_id, path.clone(), author_id)
                     .await
-                    .map(|deleted| deleted || quarantined.is_some())
+                    .map(|deleted| deleted || had_file)
             }
             PageStoreRemoval::Decay { expected_latest_id } => {
                 self.writer
@@ -9634,6 +9637,18 @@ mod tests {
             "deleting an unindexed Markdown page must report it was removed"
         );
         assert!(!file.exists());
+
+        let namespace = PagePath::new("profile/workflow").unwrap();
+        let child = wiki.abs_path(ws, proj, &namespace).join("keep.md");
+        std::fs::write(&child, "# Keep\n").unwrap();
+        assert!(
+            !wiki
+                .delete_page(ws, proj, &namespace, None, None)
+                .await
+                .unwrap(),
+            "a directory containing pages is not itself a page"
+        );
+        assert!(child.is_file(), "the child page must remain in place");
     }
 
     /// #643 end-to-end: stop the server inside the window the issue
