@@ -982,18 +982,17 @@ async fn run_once_with_wiring(
         }
     };
     if or_new {
-        let verb = if created_by_or_new {
-            "created workstream"
+        // Two full strings, not a `{verb}` interpolation, so each branch is a
+        // translatable diagnostic catalog line.
+        let message = if created_by_or_new {
+            format!("ai-memory: created workstream {}", prepared.workstream_name)
         } else {
-            "selected existing workstream"
-        };
-        eprintln!(
-            "{}",
-            diagnostic(
-                &config.i18n,
-                format!("ai-memory: {verb} {}", prepared.workstream_name)
+            format!(
+                "ai-memory: selected existing workstream {}",
+                prepared.workstream_name
             )
-        );
+        };
+        eprintln!("{}", diagnostic(&config.i18n, message));
     }
     // A workstream `--or-new` just created is as fresh as `--new`'s: it must
     // not adopt a native session that predates it.

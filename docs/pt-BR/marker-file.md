@@ -1329,6 +1329,45 @@ em vez de criar um projeto fantasma chamado `scratchpad` ou `data`.
 O hook do host resolve repo-root por conta própria, portanto uma sobreposição ausente já comprova
 que o cwd resolveu para nada.
 
+### Reinformar em uma mudança de projeto: `[routing] brief_on_project_change`
+
+`mid_session` decide onde as observações de uma sessão errante são *registradas*,
+mas o resumo da sessão — páginas fixadas, `_rules/`, `_slots/` — é injetado apenas
+uma vez, no início da sessão, para o projeto ao qual o cwd inicial resolveu. Uma
+sessão que começa um nível acima (digamos `~/projects`, que não tem marcador) e
+depois trabalha dentro de `~/projects/acme/site` (que tem seu próprio marcador)
+nunca vê as regras desse projeto.
+
+`[routing] brief_on_project_change = true` (padrão `false`) fecha essa lacuna para
+o Claude Code. Quando o cwd de um prompt resolve **através de um marcador** para um
+projeto diferente do da própria sessão, e esse projeto ainda não recebeu resumo
+nesta sessão, o servidor retorna seu resumo central — as mesmas páginas fixadas,
+`_rules/` e `_slots/` que um início de sessão injeta, dentro do mesmo orçamento —
+como contexto adicional naquele prompt.
+
+```toml
+[routing]
+brief_on_project_change = false   # padrão; true para optar por ativar
+```
+
+É deliberadamente restrito:
+
+- **Somente marcador.** Um cwd simples que resolve por raiz git ou nome de pasta
+  nunca reinforma, a mesma regra que `mid_session` aplica para reescopar. Apenas
+  um `.ai-memory.toml` que nomeia um projeto conta (`project_src=marker`).
+- **Somente um projeto diferente.** Um prompt que permanece no próprio projeto da
+  sessão não pede nada.
+- **Uma vez por projeto por sessão.** O servidor registra quais projetos uma
+  sessão já recebeu resumo (limitado e em memória, com um TTL de 12 horas);
+  perder esse registro só pode repetir um resumo, nunca pular o primeiro.
+- **Somente Claude Code.** Ele acompanha o `UserPromptSubmit` do Claude Code; um
+  payload do Cursor, que executa as mesmas configurações de hook, é excluído.
+
+A opção de ativação, o teste de diferença em relação à sessão e o registro de uma
+vez por projeto vivem todos no servidor. O hook só pergunta quando o roteamento
+por marcador de um prompt mudou desde o último sobre o qual perguntou, de modo que
+uma sessão que fica parada não envia requisição extra.
+
 ## Quem lê o marcador
 
 Ambos os pontos de entrada, a partir da v1.20:

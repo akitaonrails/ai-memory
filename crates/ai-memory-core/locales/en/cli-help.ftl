@@ -51,6 +51,7 @@ cli-help-root-run-project-help = { "Project override. Defaults to the current re
 cli-help-root-run-project-id-help = { "Select an existing project by ID and remember it for this checkout. Requires a server supporting managed project-ID selection" }
 cli-help-root-run-workstream-help = { "Select an existing named workstream instead of the current one" }
 cli-help-root-run-new-workstream-help = { "Create and select a fresh named workstream" }
+cli-help-root-run-or-new-help = { "With `--workstream NAME`: create NAME as `--new NAME` would when it does not exist yet, instead of failing. An existing NAME resumes as usual" }
 cli-help-root-run-executable-help = { "Override the native harness executable path" }
 cli-help-root-run-yolo-help = { "Disable native permission prompts using the selected harness's equivalent dangerous-mode option; for Claude also force `bypassPermissions` over a settings `defaultMode`" }
 cli-help-root-run-true-yolo-help = { "Deprecated alias of `--yolo`" }

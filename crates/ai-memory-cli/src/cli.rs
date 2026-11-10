@@ -5038,8 +5038,15 @@ mod tests {
     #[test]
     fn run_or_new_requires_workstream_and_conflicts_with_new() {
         // The happy path: `--or-new` rides on `--workstream NAME`.
-        let cli = Cli::try_parse_from(["ai-memory", "run", "--workstream", "401", "--or-new", "claude"])
-            .expect("--workstream NAME --or-new parses");
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--workstream",
+            "401",
+            "--or-new",
+            "claude",
+        ])
+        .expect("--workstream NAME --or-new parses");
         let Command::Run(args) = cli.command else {
             panic!("expected run command");
         };
@@ -5050,12 +5057,23 @@ mod tests {
         // `--or-new` alone has no workstream to fall back on.
         let error = Cli::try_parse_from(["ai-memory", "run", "--or-new", "claude"])
             .expect_err("--or-new without --workstream must be rejected");
-        assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
 
         // `--or-new` and `--new` name two different create intents.
-        let error =
-            Cli::try_parse_from(["ai-memory", "run", "--workstream", "401", "--or-new", "--new", "402", "claude"])
-                .expect_err("--or-new must conflict with --new");
+        let error = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--workstream",
+            "401",
+            "--or-new",
+            "--new",
+            "402",
+            "claude",
+        ])
+        .expect_err("--or-new must conflict with --new");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 

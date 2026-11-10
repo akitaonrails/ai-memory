@@ -51,6 +51,7 @@ cli-help-root-run-project-help = { "Substituir o projeto. Por padrão, usa o pro
 cli-help-root-run-project-id-help = { "Selecionar um projeto existente pelo ID e salvá-lo para este checkout. Exige servidor com suporte à seleção gerenciada de projeto por ID" }
 cli-help-root-run-workstream-help = { "Selecionar um workstream nomeado existente em vez do atual" }
 cli-help-root-run-new-workstream-help = { "Criar e selecionar um novo workstream nomeado" }
+cli-help-root-run-or-new-help = { "Com `--workstream NOME`: criar NOME como `--new NOME` faria quando ele ainda não existe, em vez de falhar. Um NOME já existente é retomado normalmente" }
 cli-help-root-run-executable-help = { "Substituir o caminho do executável nativo do cliente" }
 cli-help-root-run-yolo-help = { "Desabilitar solicitações nativas de permissão usando a opção equivalente de modo perigoso do cliente selecionado; no Claude, também forçar `bypassPermissions` sobre um `defaultMode` das configurações" }
 cli-help-root-run-true-yolo-help = { "Alias obsoleto de `--yolo`" }
