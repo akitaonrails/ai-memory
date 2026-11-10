@@ -11197,6 +11197,80 @@ mod tests {
         assert!(recap_requests(&seen).is_empty(), "{seen:?}");
     }
 
+    /// The client only re-asks for a mid-session project brief when the marker
+    /// routing changed, and never records an oversized routing (#2103).
+    #[test]
+    fn project_brief_state_tracks_the_last_marker_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = project_brief_state_path(tmp.path(), "claude-code", Some("s1"), Some("/w/api"));
+        let api = "&project=api&project_src=marker";
+        // Nothing recorded yet, so the first marker-routed prompt asks.
+        assert!(!project_brief_state_matches(&path, api));
+        record_project_brief_state(&path, api);
+        // The same routing on the next prompt matches: the client stays quiet.
+        assert!(project_brief_state_matches(&path, api));
+        // A move into another project changes the routing, so the client re-asks.
+        assert!(!project_brief_state_matches(
+            &path,
+            "&project=web&project_src=marker"
+        ));
+        // An oversized routing is refused, so the file keeps the old value and a
+        // hostile server cannot park unbounded text here.
+        let huge = "x".repeat(PROJECT_BRIEF_STATE_MAX_BYTES + 1);
+        record_project_brief_state(&path, &huge);
+        assert!(!project_brief_state_matches(&path, &huge));
+        assert!(project_brief_state_matches(&path, api));
+    }
+
+    /// A Claude Code prompt whose marker routes to a declared project asks for
+    /// that project's brief; a Cursor payload running the same Claude hook
+    /// settings asks nothing (#2103).
+    #[tokio::test]
+    async fn project_change_brief_skips_a_cursor_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join(".ai-memory.toml"), "project = \"other\"\n").unwrap();
+
+        // Claude Code: the marker routing triggers one project-change brief.
+        let (base, mut requests) = serve_requests("200 OK", "BRIEF-BODY").await;
+        let stdout = run_hook(
+            &tmp.path().join("data-claude"),
+            claude_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "claude-session",
+                "cwd": cwd,
+                "prompt": "hello"
+            }),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&stdout).contains("BRIEF-BODY"));
+        let seen = all_requests(&mut requests).await;
+        assert!(
+            seen.iter().any(|r| r.contains("project_change=1")),
+            "claude prompt must ask for the project brief: {seen:?}"
+        );
+
+        // Cursor runs the same Claude hook settings: it must not ask.
+        let (base2, mut requests2) = serve_requests("200 OK", "BRIEF-BODY").await;
+        let _ = run_hook(
+            &tmp.path().join("data-cursor"),
+            claude_args("user-prompt-submit", &base2),
+            serde_json::json!({
+                "session_id": "cursor-session",
+                "cwd": cwd,
+                "cursor_version": "2.0.0",
+                "prompt": "hello"
+            }),
+        )
+        .await;
+        let seen2 = all_requests(&mut requests2).await;
+        assert!(
+            !seen2.iter().any(|r| r.contains("project_change=1")),
+            "a Cursor payload must not ask for the project brief: {seen2:?}"
+        );
+    }
+
     #[tokio::test]
     async fn recap_server_down_leaves_the_prompt_alone() {
         let tmp = tempfile::tempdir().unwrap();
