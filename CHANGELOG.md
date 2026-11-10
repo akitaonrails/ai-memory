@@ -64,6 +64,13 @@ version in [`docs/changelog/`](docs/changelog/):
   exact commands to reconcile it — the `merge-project` dry run, the `--confirm`
   to apply, and the `.ai-memory.toml` marker alternative — instead of only
   pointing at `docs/lifecycle-ops.md`. (#1993)
+- Fixed `merge-project` leaving this client's checkout link and saved project
+  binding on the source project it removed. A checkout bound to the source
+  kept sending the deleted project id, so `ai-memory run` and
+  `ai-memory workstreams` got 404 from it until `--project-id` or the project
+  picker replaced the binding. A confirmed merge now re-points both at the
+  target, as `repair-split` does, and the merge report names both project
+  ids, so a merge by project name is covered too. (#2158)
 - Fixed DSH hooks failing to parse under PowerShell on Windows. The generated
   command now starts with the `&` call operator, so the quoted executable path is
   invoked rather than read as a string expression. (#2134)
