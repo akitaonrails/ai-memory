@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - The compaction recap now says "1 earlier prompt omitted to fit" when
   exactly one older prompt does not fit its budget, instead of "1 earlier
   prompts omitted". The anchor's own "1 prompt between these was omitted"
-  line already used the singular.
+  line already used the singular. (#2166)
 
 ## [3.4.5] - 2026-11-10
 
