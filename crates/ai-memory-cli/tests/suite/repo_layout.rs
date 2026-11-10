@@ -188,6 +188,57 @@ fn codeql_path_barriers_model_the_realized_return_node() {
     );
 }
 
+/// The shipped backup example rsyncs the data dir into a pushed git mirror. The
+/// data dir holds plaintext bearer tokens (`auth-tokens/`, `auth-token`,
+/// `auth-header`, all mode 0600) and a pre-delivery hook spool; the generic
+/// secret globs (`*.env`, `auth.json`, …) match none of them. Both the mirror
+/// `.gitignore` and the snapshot script must exclude every one, or a user
+/// following the guide leaks their root token to a remote (GHSA-w35v).
+#[test]
+fn backup_example_excludes_data_dir_secrets() {
+    let example = crates_dir()
+        .parent()
+        .expect("crates/ lives in the repository root")
+        .join("docs/examples/backup");
+    let gitignore = fs::read_to_string(example.join(".gitignore")).expect("read mirror .gitignore");
+    let script =
+        fs::read_to_string(example.join("ai-memory-snapshot.sh")).expect("read snapshot script");
+
+    // Entry under the data dir -> (gitignore line in the mirror, rsync exclude).
+    let secrets = [
+        (
+            "auth-tokens/",
+            "data/auth-tokens/",
+            "--exclude=auth-tokens/",
+        ),
+        ("auth-token", "data/auth-token", "--exclude=auth-token"),
+        ("auth-header", "data/auth-header", "--exclude=auth-header"),
+        ("hook-spool/", "data/hook-spool/", "--exclude=hook-spool/"),
+    ];
+    let mut problems = Vec::new();
+    for (entry, ignore_line, rsync_exclude) in secrets {
+        if !gitignore.lines().any(|line| line.trim() == ignore_line) {
+            problems.push(format!(
+                "mirror .gitignore does not ignore `{ignore_line}` ({entry})"
+            ));
+        }
+        if !script.contains(rsync_exclude) {
+            problems.push(format!("snapshot script does not rsync-exclude `{entry}`"));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+
+    // Control: durable memory must NOT be excluded, or the backup is useless.
+    assert!(
+        !gitignore.lines().any(|line| line.trim() == "data/wiki/"),
+        "the mirror must keep the wiki — it is the source of truth"
+    );
+    assert!(
+        !script.contains("--exclude=wiki/"),
+        "the snapshot must sync the wiki — it is the source of truth"
+    );
+}
+
 /// Advanced CodeQL setup does not reliably auto-load repository-local model
 /// packs. Keep the explicit Rust analysis path wired to the checked-in pack.
 #[test]

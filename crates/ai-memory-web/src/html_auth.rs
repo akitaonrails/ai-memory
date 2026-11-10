@@ -1,8 +1,10 @@
 //! HTML auth redirect helpers for the builtin wiki browser.
 //!
-//! After [`require_dual_auth`](ai_memory_mcp::require_dual_auth) returns
-//! JSON 401/403, navigational browser GETs to the wiki should land on the
-//! builtin login / change-password pages instead. `/api/v1` stays JSON, and
+//! After [`require_dual_auth`](ai_memory_mcp::require_dual_auth) returns a
+//! JSON 401, or the 403 it marks with [`ai_memory_core::PasswordChangeRequired`],
+//! navigational browser GETs to the wiki land on the builtin login /
+//! change-password pages instead. Every other 403 (a root-only page, a
+//! restricted project) reaches the browser as is. `/api/v1` stays JSON, and
 //! a Basic challenge (a bearer-only server with no human accounts) reaches
 //! the browser unchanged.
 
@@ -63,14 +65,6 @@ fn join_root(web_root: &str, leaf: &str) -> String {
     }
 }
 
-/// Response marker for a 403 that means "this page is root-only".
-///
-/// [`html_auth_redirect_mw`] sends every other HTML 403 to the
-/// change-password form; a signed-in non-root user must see the refusal
-/// instead.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct AdminRequired;
-
 /// Allow only same-origin relative paths under `web_root`.
 ///
 /// Rejects protocol-relative `//`, absolute URLs (`http:` / `https:`),
@@ -114,7 +108,8 @@ fn path_has_dot_segment(path: &str) -> bool {
     path.split('/').any(|s| s == "." || s == "..")
 }
 
-/// Map JSON 401/403 on HTML navigational wiki GETs to the builtin auth pages.
+/// Map a JSON 401, or a 403 marked [`ai_memory_core::PasswordChangeRequired`],
+/// on HTML navigational wiki GETs to the builtin auth pages.
 pub async fn html_auth_redirect_mw(
     State(cfg): State<Arc<HtmlAuthRedirectConfig>>,
     req: Request<axum::body::Body>,
@@ -157,7 +152,16 @@ pub async fn html_auth_redirect_mw(
                 urlencoding_encode(&sanitize_next(Some(&full_path_and_query), &cfg.web_root));
             Redirect::to(&format!("{}?next={next_q}", cfg.login_path)).into_response()
         }
-        StatusCode::FORBIDDEN if resp.extensions().get::<AdminRequired>().is_none() => {
+        // Only the must-change-password refusal goes to that form. Any other
+        // 403 (a root-only page, a restricted project) is the answer itself;
+        // redirecting it would tell a signed-in user their password is the
+        // problem.
+        StatusCode::FORBIDDEN
+            if resp
+                .extensions()
+                .get::<ai_memory_core::PasswordChangeRequired>()
+                .is_some() =>
+        {
             Redirect::to(&cfg.change_password_path).into_response()
         }
         _ => resp,
@@ -178,7 +182,7 @@ fn offers_basic_challenge(resp: &Response) -> bool {
         })
 }
 
-fn is_api_v1_path(path: &str) -> bool {
+pub(crate) fn is_api_v1_path(path: &str) -> bool {
     path == "/api/v1" || path.starts_with("/api/v1/")
 }
 
@@ -270,9 +274,15 @@ mod tests {
     }
 
     fn redirect_probe(status: StatusCode) -> Router {
+        redirect_probe_with(move || status.into_response())
+    }
+
+    fn redirect_probe_with(
+        respond: impl Fn() -> Response + Clone + Send + Sync + 'static,
+    ) -> Router {
         let cfg = Arc::new(HtmlAuthRedirectConfig::from_mount("", "/web"));
         Router::new()
-            .route("/wiki", get(move || async move { status.into_response() }))
+            .route("/wiki", get(move || std::future::ready(respond())))
             .route(
                 "/api/v1/projects",
                 get(move || async move { StatusCode::UNAUTHORIZED.into_response() }),
@@ -350,19 +360,26 @@ mod tests {
         assert!(challenge.starts_with("Basic "), "challenge: {challenge}");
     }
 
+    fn html_navigation() -> Request<Body> {
+        Request::builder()
+            .uri("/wiki")
+            .header(header::ACCEPT, "text/html")
+            .header("sec-fetch-dest", "document")
+            .body(Body::empty())
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn html_nav_forbidden_redirects_to_change_password() {
-        let resp = redirect_probe(StatusCode::FORBIDDEN)
-            .oneshot(
-                Request::builder()
-                    .uri("/wiki")
-                    .header(header::ACCEPT, "text/html")
-                    .header("sec-fetch-dest", "document")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    async fn html_nav_password_change_forbidden_redirects_to_change_password() {
+        let resp = redirect_probe_with(|| {
+            let mut resp = StatusCode::FORBIDDEN.into_response();
+            resp.extensions_mut()
+                .insert(ai_memory_core::PasswordChangeRequired);
+            resp
+        })
+        .oneshot(html_navigation())
+        .await
+        .unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         let location = resp
             .headers()
@@ -370,6 +387,25 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
         assert_eq!(location, "/web/change-password");
+    }
+
+    // A grant refusal or a root-only page is not a password problem: the
+    // signed-in user must read the refusal, not be sent to change a password
+    // that is fine.
+    #[tokio::test]
+    async fn html_nav_unmarked_forbidden_reaches_the_browser() {
+        let resp = redirect_probe_with(|| {
+            (StatusCode::FORBIDDEN, "not authorized for client-work").into_response()
+        })
+        .oneshot(html_navigation())
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"not authorized for client-work");
     }
 
     #[tokio::test]

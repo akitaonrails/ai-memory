@@ -77,7 +77,8 @@ pub async fn run(config: &Config, args: RenameProjectArgs) -> Result<()> {
     }
     println!(
         "{}",
-        i18n.format(
+        crate::localization::format(
+            i18n,
             "cli-rename-project-renamed-pages-now-under-the-new-name",
             &[
                 ("value0", workspace.to_string()),

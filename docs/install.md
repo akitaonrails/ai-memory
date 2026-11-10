@@ -77,9 +77,10 @@ drop to plain http); BusyBox wget is refused there. The release goes to
 `~/.local/lib/ai-memory`, and `~/.local/bin/ai-memory` becomes a link to the
 binary, so the bundled `hooks/` directory sits beside it and
 `ai-memory upgrade` can later replace both. An `ai-memory` at the link path that
-is not such a link (the Docker wrapper, a hand-built binary) is left alone and
-the script exits. The whole script runs from one function called on its last
-line, so a download cut short runs nothing. To read it before running it:
+is not such a link (the Docker wrapper, a hand-built binary, or a link to one of
+them) is left alone and the script exits. The whole script runs from one
+function called on its last line, so a download cut short runs nothing. To read
+it before running it:
 
 ```bash
 curl -fsSLO https://github.com/akitaonrails/ai-memory/releases/latest/download/install.sh
@@ -92,9 +93,24 @@ sh install.sh
 |---|---|---|
 | `AI_MEMORY_VERSION` | latest | Install this release, e.g. `3.0.0` |
 | `AI_MEMORY_BIN_DIR` | `~/.local/bin` | Where the `ai-memory` link goes |
-| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked |
+| `AI_MEMORY_LIB_DIR` | `~/.local/lib/ai-memory` | Where the release is unpacked; a directory of its own, since a rerun replaces it whole |
 | `AI_MEMORY_RELEASE_BASE_URL` | GitHub Releases | A mirror serving `latest/download/<asset>` and `download/v<version>/<asset>`; the same variable `ai-memory upgrade` reads. The checksum comes from the same origin as the archive, so use only a mirror you control. |
 | `AI_MEMORY_INSTALL_TARGET` | detected | Force `linux-x86_64`, `linux-aarch64`, `macos-x86_64` or `macos-aarch64` |
+
+Relative `AI_MEMORY_BIN_DIR` and `AI_MEMORY_LIB_DIR` paths are resolved from
+the directory where you start `install.sh`. A trailing slash on
+`AI_MEMORY_LIB_DIR` is optional.
+
+Running `install.sh` again replaces its own release in place, and it deletes
+the old lib dir to do so. Before downloading, it therefore refuses a lib dir
+that is the bin dir or a directory above it, and one that holds no release (the
+`ai-memory` binary itself, not a link, beside the `hooks/` bundle). Once the new
+release is unpacked, it also refuses a lib dir holding anything that release
+does not ship, apart from the `ai-memory.new`, `.hooks.new` and `.hooks.old` an
+interrupted `ai-memory upgrade` can leave there. The link is replaced only when
+it points at this install's binary. Each refusal names what it found; move that
+aside, or pick another directory with `AI_MEMORY_LIB_DIR` or
+`AI_MEMORY_BIN_DIR`.
 
 Native Windows has its own script, `install.ps1`, published next to
 `install.sh` with its own `install.ps1.sha256`. In PowerShell (no
@@ -110,8 +126,15 @@ unpacking when the checksum file is missing, names another asset, or does not
 match, and refuses an archive entry that is absolute or holds `..`. The
 release goes to `%LOCALAPPDATA%\Programs\ai-memory` (`AI_MEMORY_INSTALL_DIR`
 overrides it), which is added to your user `PATH` unless
-`AI_MEMORY_NO_MODIFY_PATH=1`. An existing install there is left alone; update it
-with `ai-memory upgrade`. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
+`AI_MEMORY_NO_MODIFY_PATH=1`. The destination must not exist: even an empty
+directory, an unrelated file, or a directory link is refused before download.
+Remove it if it is empty or left over from a failed install, choose a new
+dedicated directory, or update an existing installation with
+`ai-memory upgrade`. A validated release is copied to a new sibling staging
+directory and published only if the destination is still absent. On a copy or
+publication failure, the destination is never deleted; the error identifies
+the leftover staging directory for inspection and later cleanup. It is not a
+completed installation. `AI_MEMORY_VERSION` and `AI_MEMORY_RELEASE_BASE_URL`
 work as for `install.sh`. On Windows on Arm it installs the x86_64 build, which
 Windows 11 runs under emulation. Errors are thrown rather than exiting, so a
 failure under `iex` leaves your PowerShell window open. Details are in
@@ -1105,10 +1128,10 @@ failure: they POST first and write the event to the same
 `<data_dir>/hook-spool/` contract when the server is unreachable, answers
 5xx, or answers 408, 425 or 429 (a saturated server asks for a retry), then
 flush the backlog behind the next delivery that succeeds. Any other 4xx
-is a permanent rejection and is not retried. Script drains leave native OIDC
-entries untouched for `ai-memory hook-drain`, which resolves or refreshes their
-credentials from `auth.json`; they continue with other eligible entries within
-the same bounded scan. Session start
+is a permanent rejection and is not retried. POSIX, PowerShell, and generated
+TypeScript drains leave native OIDC entries untouched for `ai-memory hook-drain`
+to resolve or refresh credentials from `auth.json`. They continue with other
+eligible entries within the same bounded scan. Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
@@ -3340,6 +3363,23 @@ current ids. Keys are created in the
 [FutureInfra console](https://futureinfra.ai/console/?screen=ai-router). This
 example configures the LLM only; configure embeddings separately.
 
+[Standard Compute](https://standardcompute.com) is an OpenAI-compatible LLM
+gateway and also uses the existing `openai-compat` provider. Supply a
+Standard Compute API key:
+
+```bash
+-e AI_MEMORY_LLM_PROVIDER=openai-compat
+-e AI_MEMORY_LLM_BASE_URL=https://api.stdcmpt.com/v1
+-e AI_MEMORY_LLM_MODEL=standardcompute
+-e LLM_API_KEY="$STANDARDCOMPUTE_API_KEY"
+```
+
+The `standardcompute` model id is routed: each request goes to a capable model
+from those you've enabled. To pin a specific model instead, use an id from
+`GET https://api.stdcmpt.com/v1/models`. See the
+[Standard Compute docs](https://docs.standardcompute.com) for details. This
+example configures the LLM only; configure embeddings separately.
+
 OpenAI-compatible structured calls use the operation's JSON Schema by default:
 
 ```bash
@@ -3941,6 +3981,9 @@ GitHub Release, refuses an unverified update, pulls the latest Docker
 image, refreshes the checksum-verified native host client, rewrites previously
 staged hook registrations to that native command when supported, and
 prints how to restart the server container so the new binary is used.
+If installing the native host client fails, the upgrade reports an error
+before refreshing hooks. The next host command that checks for updates can
+retry the client installation.
 Re-running `install-hooks --apply` remains idempotent: ai-memory
 replaces only the hook entries it owns and leaves unrelated hooks alone.
 When a Compose file is found, the wrapper first verifies that its project owns

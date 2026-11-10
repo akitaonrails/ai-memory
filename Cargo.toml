@@ -35,7 +35,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "3.4.3"
+version = "3.4.5"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -45,16 +45,16 @@ authors = ["Fabio Akita <boss@akitaonrails.com>"]
 
 [workspace.dependencies]
 # Inter-crate dependencies.
-ai-memory-core = { path = "crates/ai-memory-core", version = "3.4.3" }
-ai-memory-store = { path = "crates/ai-memory-store", version = "3.4.3" }
-ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.4.3" }
-ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.4.3" }
-ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.4.3" }
-ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.4.3" }
-ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.4.3" }
-ai-memory-web = { path = "crates/ai-memory-web", version = "3.4.3" }
-ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.4.3" }
-ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.4.3" }
+ai-memory-core = { path = "crates/ai-memory-core", version = "3.4.5" }
+ai-memory-store = { path = "crates/ai-memory-store", version = "3.4.5" }
+ai-memory-wiki = { path = "crates/ai-memory-wiki", version = "3.4.5" }
+ai-memory-mcp = { path = "crates/ai-memory-mcp", version = "3.4.5" }
+ai-memory-hooks = { path = "crates/ai-memory-hooks", version = "3.4.5" }
+ai-memory-llm = { path = "crates/ai-memory-llm", version = "3.4.5" }
+ai-memory-consolidate = { path = "crates/ai-memory-consolidate", version = "3.4.5" }
+ai-memory-web = { path = "crates/ai-memory-web", version = "3.4.5" }
+ai-memory-workstream = { path = "crates/ai-memory-workstream", version = "3.4.5" }
+ai-memory-test-support = { path = "crates/ai-memory-test-support", version = "3.4.5" }
 
 # (Workspace shared deps follow below)
 
@@ -124,8 +124,8 @@ getrandom = "0.3"
 base64 = "0.22"
 
 # Storage.
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-refinery = { version = "0.8", features = ["rusqlite"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup", "fallible_uint"] }
+refinery = { version = "0.10", features = ["rusqlite"] }
 sha2 = "0.10"
 # Argon2id PHC for human passwords. Tokens stay SHA-256+pepper (hot-path
 # unique lookup); the slow KDF is reserved for the password class.
@@ -151,7 +151,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 # rmcp 3.x speaks the MCP 2026-07-28 revision (stateless `server/discover`,
 # per-request `_meta` negotiation) while keeping the legacy `initialize`
 # handshake, so both-era clients connect without a shim (#1924).
-rmcp = { version = "3.8", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "3.9", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
 schemars = "1"
 axum = "0.8"
 # Same `http` 1.x rmcp/axum use, so handlers can read the injected

@@ -32,7 +32,13 @@ Before these commands were added:
 | **Grok Build CLI** | `~/.grok/config.toml` | `~/.grok/skills/` | — | Grok instructions |
 | **Kiro CLI (AWS)** | `~/.kiro/settings/mcp.json` | `~/.kiro/agents/*.json` | — | — |
 | **OpenClaw** | `~/.openclaw/config.json` | — | `~/.openclaw/extensions/` | — |
+| **GitHub Copilot CLI** | — (MCP and hooks are not archived) | `$COPILOT_HOME/skills/` (default `~/.copilot/skills/`)<br>`.github/skills/` | — | — |
 | **VS Code Copilot** | `.vscode/mcp.json` | — | Extensions | Copilot instructions |
+
+Copilot CLI also reads `~/.agents/skills`, `.agents/skills` and
+`.claude/skills`; those roots are archived once, under Codex and Claude Code.
+`restore-agents` resolves `.copilot/` destinations against `COPILOT_HOME`
+when it is set, as it resolves `.claude/` against `CLAUDE_CONFIG_DIR`.
 
 Claude Desktop config paths use the same platform-aware resolver as
 `install-mcp`, including packaged Windows installs. OpenCode uses
@@ -128,6 +134,8 @@ Stored in the root of the generated tarball:
    - Restoring rejects traversal and permits only allowlisted agent destinations. Claude Desktop uses the same platform-specific path resolver as `install-mcp`.
    - Archive entries are regular UTF-8 paths only, and entry count, manifest,
      per-file, and total expanded sizes are bounded before content is staged.
+   - Restore checks the gzip checksum and size trailer before applying any
+     assets. It accepts up to 1 MiB of padding after the tar end marker.
    - Every manifest entry must have exactly one body and a well-formed SHA-256;
      duplicate paths/destinations, missing bodies, unmanifested bodies, and
      checksum mismatches are refused. Checksums detect corruption or internal

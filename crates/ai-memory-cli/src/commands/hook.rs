@@ -65,7 +65,6 @@ const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
 /// Per-execution opt-out of the automatic handoff (#1951): a falsy value
 /// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
 const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
-const CAPTURE_OWNER_ENV: &str = "AI_MEMORY_CAPTURE_OWNER";
 /// Backlog size at which `post-tool-use` does a mid-session catch-up drain, so a
 /// light session pays only a `read_dir`. Override via the env var above.
 const DEFAULT_INCREMENTAL_THRESHOLD: usize = 32;
@@ -215,8 +214,21 @@ fn compute_live_calls(
                 })
             }),
         _ => None,
-    };
-    path.and_then(|p| super::session_usage::extract_live_calls(&p, agent, data_dir, routing_key))
+    }?;
+    let batch = super::session_usage::extract_live_calls(&path, agent, data_dir, routing_key)?;
+    // Claude Code subagents write their own transcripts. Their responses ride
+    // only on the main conversation's events: `drop_subagent_captures` drops
+    // an event that carries `agent_id` (the router's `body_is_subagent`),
+    // usage included, after its cursor has moved. `agent_type` alone is a
+    // `claude --agent` main session, whose events keep them.
+    let subagent_event = json
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty());
+    if agent == AgentKind::ClaudeCode && !subagent_event {
+        return Some(batch.with_claude_subagents(&path, data_dir, routing_key));
+    }
+    Some(batch)
 }
 
 /// A stale interrupted-session candidate found in the session-start handoff
@@ -1568,8 +1580,17 @@ where
     let agent_kind = AgentKind::from_wire(&args.agent);
     let mut hook_event = HookEvent::parse(&args.event);
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
-    // than server configuration. Hooks deliberately bypass Config::load.
-    let external_capture = env_lookup(CAPTURE_OWNER_ENV).is_some_and(|v| !v.trim().is_empty());
+    // than server configuration. Hooks deliberately bypass Config::load, and
+    // the captured runtime env (not a fresh global read) makes it injectable
+    // for tests, matching invariant #1.
+    let external_capture = runtime_env.capture_owner_active();
+    // An external-capture run shares its project with the owner's own
+    // interactive sessions, so no handoff-delivery front door may consume the
+    // baton: every `/handoff` fetch that would otherwise claim (SessionStart,
+    // Kimi's UserPromptSubmit, Hermes' pre_llm_call, Grok's PostToolUse) sends
+    // `claim=0`, and the server announces the baton as an offer instead,
+    // leaving it for an explicit `memory_handoff_accept` (#2148).
+    let claim_qs = if external_capture { "&claim=0" } else { "" };
     let delivers_context = (hook_event == HookEvent::SessionStart
         && agent_kind.session_start_injects_handoff())
         || (hook_event == HookEvent::UserPrompt && agent_kind.user_prompt_injects_handoff())
@@ -1928,10 +1949,22 @@ where
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
     let mut live_batch = None;
+    // Claude Code runs hooks inside subagents too, tagging their events with
+    // `agent_id` while `transcript_path` still names the main session's
+    // transcript (<https://code.claude.com/docs/en/hooks>, "Hooks in
+    // subagents"). The router may drop such an event, so it must not move the
+    // main transcript's cursor: the main conversation's next event reads the
+    // same lines (#2034).
+    let claude_subagent_event = agent_kind == AgentKind::ClaudeCode
+        && json
+            .get("agent_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|id| !id.trim().is_empty());
     if matches!(
         args.event.as_str(),
         "post-tool-use" | "stop" | "pre-compact" | "session-end"
-    ) {
+    ) && !claude_subagent_event
+    {
         live_batch = compute_live_calls(
             agent_kind,
             &json,
@@ -2213,7 +2246,7 @@ where
                 |session_id| format!("&session_id={}", url_encode(session_id)),
             );
             let handoff_url = format!(
-                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}{claim_qs}",
                 args.agent
             );
             if let Some(handoff) =
@@ -2390,7 +2423,7 @@ where
             qs.clone()
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}{claim_qs}",
             args.agent
         );
         let handoff =
@@ -2504,7 +2537,7 @@ where
             "&profile_digest=0"
         };
         let handoff_url = format!(
-            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}",
+            "{base}/handoff?agent={}{handoff_qs}{managed_qs}{native_session_qs}{profile_qs}{claim_qs}",
             args.agent
         );
         if let Some(handoff) =
@@ -2551,7 +2584,7 @@ where
                         format!("&session_id={}", url_encode(session_id))
                     });
                 let handoff_url = format!(
-                    "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                    "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}{claim_qs}",
                     args.agent
                 );
                 // Only a real body consumes this session's one chance. An empty
@@ -3375,6 +3408,52 @@ mod tests {
     #[test]
     fn compute_backfill_usage_claude_code_without_cwd_is_none() {
         assert!(compute_backfill_usage(AgentKind::ClaudeCode, "some-session", None).is_none());
+    }
+
+    /// #2031: Claude Code subagent responses ride only on the main
+    /// conversation's events. `drop_subagent_captures` drops a subagent's own
+    /// event, and the responses it carried with it.
+    #[test]
+    fn live_calls_add_subagent_responses_only_to_main_conversation_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("session.jsonl");
+        let line = |id: &str| {
+            let value = serde_json::json!({
+                "type": "assistant",
+                "message": {"id": id, "usage": {"input_tokens": 1, "output_tokens": 2}}
+            });
+            format!("{value}\n")
+        };
+        std::fs::write(&transcript, line("main-1")).unwrap();
+        let subagents = tmp.path().join("session").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(subagents.join("agent-a1.jsonl"), line("sub-1")).unwrap();
+        let data_dir = tmp.path().join("data");
+        let path = transcript.to_str().unwrap();
+        let calls = |payload: serde_json::Value| {
+            compute_live_calls(
+                AgentKind::ClaudeCode,
+                &payload,
+                Some("session"),
+                &RuntimeEnv::default(),
+                None,
+                &data_dir,
+                "route",
+            )
+            .unwrap()
+            .calls
+            .into_iter()
+            .map(|call| call.call_id)
+            .collect::<Vec<_>>()
+        };
+
+        let subagent_event = serde_json::json!({"transcript_path": path, "agent_id": "a1"});
+        assert_eq!(calls(subagent_event), ["main-1"]);
+        let main_event = serde_json::json!({"transcript_path": path});
+        assert_eq!(calls(main_event), ["main-1", "sub-1"]);
+        // `claude --agent` sets `agent_type` on the main session's own events.
+        let agent_session = serde_json::json!({"transcript_path": path, "agent_type": "reviewer"});
+        assert_eq!(calls(agent_session), ["main-1", "sub-1"]);
     }
 
     #[test]
@@ -8290,6 +8369,111 @@ mod tests {
                     && request.contains("session_id=kiro-session")
             }),
             "{recorded:?}"
+        );
+    }
+
+    /// Under external capture (`AI_MEMORY_CAPTURE_OWNER` set) the owner's own
+    /// runs share the project with the captured harness, so EVERY handoff-
+    /// delivery front door must only *offer* the pending baton, never consume
+    /// it: each `/handoff` fetch carries `claim=0`. Covers all four doors that
+    /// would otherwise claim — SessionStart, Kimi's UserPromptSubmit, Hermes'
+    /// pre_llm_call and Grok's PostToolUse — so dropping `claim=0` from any one
+    /// bites here. A run without the variable claims as usual (#2148).
+    #[tokio::test]
+    async fn external_capture_offers_the_baton_at_every_handoff_front_door() {
+        // The recorded `GET /handoff` a hook sends for `agent`/`event` with a
+        // payload built against a per-case temp directory, under `runtime_env`.
+        async fn handoff_request(
+            agent: &str,
+            event: &str,
+            payload: impl FnOnce(&Path) -> String,
+            runtime_env: RuntimeEnv,
+        ) -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let (base, mut requests) = serve_requests("200 OK", "FRONT-DOOR-HANDOFF").await;
+            let args = HookArgs {
+                event: event.into(),
+                agent: agent.into(),
+                server_url: base.clone(),
+                auth_token: None,
+                project_strategy: None,
+                check_capture: false,
+                capture_assistant: false,
+                capture_mode: None,
+            };
+            let mut stdout = Vec::new();
+            run_with_payload_in_home(
+                Some(tmp.path().join("data")),
+                args,
+                payload(tmp.path()),
+                &mut stdout,
+                |_, _| Ok(()),
+                None,
+                runtime_env,
+            )
+            .await
+            .unwrap();
+            let mut recorded = Vec::new();
+            while let Some(request) = first_request(&mut requests).await {
+                recorded.push(request);
+            }
+            recorded
+                .into_iter()
+                .find(|request| request.starts_with("GET /handoff?"))
+                .unwrap_or_else(|| panic!("{agent}/{event} fetched no handoff"))
+        }
+
+        let capture = || {
+            RuntimeEnv::with_process_env_for_tests(&[("AI_MEMORY_CAPTURE_OWNER", "owner.robot")])
+        };
+        let session_payload =
+            |cwd: &Path| serde_json::json!({ "session_id": "owner", "cwd": cwd }).to_string();
+
+        let start =
+            handoff_request("claude-code", "session-start", session_payload, capture()).await;
+        assert!(start.contains("claim=0"), "SessionStart: {start}");
+
+        let kimi = handoff_request(
+            "kimi-code",
+            "user-prompt-submit",
+            session_payload,
+            capture(),
+        )
+        .await;
+        assert!(kimi.contains("claim=0"), "Kimi UserPromptSubmit: {kimi}");
+
+        let hermes = handoff_request(
+            "hermes",
+            "user-prompt-submit",
+            |cwd| hermes_payload("pre_llm_call", cwd, pre_llm_call_extra(true)),
+            capture(),
+        )
+        .await;
+        assert!(hermes.contains("claim=0"), "Hermes pre_llm_call: {hermes}");
+
+        let grok = handoff_request(
+            "grok",
+            "post-tool-use",
+            |cwd| {
+                serde_json::json!({ "session_id": "owner", "cwd": cwd, "tool_name": "read_file" })
+                    .to_string()
+            },
+            capture(),
+        )
+        .await;
+        assert!(grok.contains("claim=0"), "Grok PostToolUse: {grok}");
+
+        // Control: without external capture the same start claims (no claim=0).
+        let normal = handoff_request(
+            "claude-code",
+            "session-start",
+            session_payload,
+            RuntimeEnv::with_process_env_for_tests(&[]),
+        )
+        .await;
+        assert!(
+            !normal.contains("claim=0"),
+            "a non-captured start still claims the baton: {normal}"
         );
     }
 

@@ -3899,8 +3899,8 @@ pub struct IdleEndCandidate {
 /// Each candidate is stamped by its own guarded write. The substantive end
 /// is an `UPDATE … WHERE ended_at IS NULL` CAS that ALSO re-verifies what the
 /// summary page saw: the session's observation count (every row of the
-/// session, the digest's population) must still equal the
-/// count the digest was built from, and the latest page version must still
+/// session, whatever project each landed in) must still equal the
+/// count read in the digest's snapshot, and the latest page version must still
 /// be the one the tick wrote or kept. Any mismatch — a non-end observation,
 /// a checkpoint page, or a real `SessionEnd` landing after the tick's read —
 /// reports [`IdleEndResult::Lost`] and rolls the candidate's transaction
@@ -4899,15 +4899,16 @@ pub fn soft_delete_for_reconcile_if_latest(
 /// file deletions, so the derived rows must be dropped explicitly or the
 /// page keeps surfacing in search/recent with stale content. FK cascades
 /// drop outgoing links + embeddings; the `pages_fts_ad` trigger keeps FTS in
-/// sync; incoming links are set to NULL (unresolved). Idempotent.
+/// sync; incoming links are set to NULL (unresolved). Idempotent; returns
+/// `true` when a page existed and was removed, `false` for a no-op delete.
 pub fn delete_page(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     path: &PagePath,
     author_id: Option<ai_memory_core::UserId>,
-) -> StoreResult<()> {
-    delete_page_inner(conn, workspace_id, project_id, path, None, author_id).map(|_| ())
+) -> StoreResult<bool> {
+    delete_page_inner(conn, workspace_id, project_id, path, None, author_id)
 }
 
 /// Delete every version of `path` only when `expected_latest_id` is still its
@@ -5098,16 +5099,20 @@ pub struct ObservationPruneOutcome {
 
 /// Eligibility shared, byte for byte, by the observation prune and its dry-run
 /// count (`ReaderPool::prunable_observation_count`), applied once per distinct
-/// candidate session as alias `s`. `summary_page_id` names the heuristic page;
-/// a consolidation rewrite supersedes that row, so only the live head at its
-/// path says whether the distillation survives (decay eviction clears
-/// `is_latest`). A queued job still needs its raw capture, and an ended session
-/// whose observation count advanced has resumed but not yet reached the next
-/// consolidation enqueue.
+/// candidate session as alias `s`, with `?1` and `?2` naming the project being
+/// pruned. `summary_page_id` names the heuristic page; a consolidation rewrite
+/// supersedes that row, so only the live head at its path says whether the
+/// distillation survives (decay eviction clears `is_latest`). That head has to
+/// be in the project being pruned: a session that crossed repositories holds
+/// rows in more than one, each project's page is built only from its own rows,
+/// and a page elsewhere says nothing about these. A queued job still needs its
+/// raw capture, and an ended session whose observation count advanced has
+/// resumed but not yet reached the next consolidation enqueue.
 pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "EXISTS ( \
     SELECT 1 FROM pages pointer \
-    JOIN pages head USING (workspace_id, project_id, path) \
-    WHERE pointer.id = s.summary_page_id AND head.is_latest = 1 \
+    JOIN pages head ON head.path = pointer.path \
+    WHERE pointer.id = s.summary_page_id \
+      AND head.workspace_id = ?1 AND head.project_id = ?2 AND head.is_latest = 1 \
 ) AND NOT EXISTS ( \
     SELECT 1 FROM session_consolidation_jobs j \
     WHERE j.session_id = s.id \
@@ -5123,13 +5128,15 @@ pub(crate) const OBSERVATION_PRUNE_SESSION_GUARD_SQL: &str = "EXISTS ( \
 /// Raw capture is the store's growth driver, but it is also the only input
 /// consolidation, auto-improvement and the `raw_hits` fallback have. Deleting
 /// it is safe exactly when its durable distillation still exists, so the
-/// predicate requires a live head at the path `sessions.summary_page_id` — the
-/// marker [`end_session_row`] writes — names ([`OBSERVATION_PRUNE_SESSION_GUARD_SQL`]
-/// says why the pointer's own row is not enough). An evicted head means its
-/// session's raw capture is the last copy and must stay; a page hard-deleted
-/// by the same sweep is excluded for free, because the `ON DELETE SET NULL`
-/// foreign key has already cleared the pointer. A session with no `sessions`
-/// row, or one that never ended, matches nothing and can never be pruned.
+/// predicate requires a live head, in this project, at the path
+/// `sessions.summary_page_id` — the marker [`end_session_row`] writes — names
+/// ([`OBSERVATION_PRUNE_SESSION_GUARD_SQL`] says why the pointer's own row is
+/// not enough, and why another project's page does not count). An evicted
+/// head means its session's raw capture is the last copy and must stay; a
+/// page hard-deleted by the same sweep is excluded for free, because the
+/// `ON DELETE SET NULL` foreign key has already cleared the pointer. A session
+/// with no `sessions` row, or one that never ended, matches nothing and can
+/// never be pruned.
 ///
 /// A session with a consolidation job the worker can still claim is excluded
 /// by [`OBSERVATION_PRUNE_SESSION_GUARD_SQL`] even when every other predicate
@@ -8780,7 +8787,10 @@ pub fn move_project_workspace(
 /// change, so embeddings, evidence, access rows and graph edges follow their
 /// versions automatically. Same-path page collisions are represented by a
 /// new target version supplied by the wiki layer; both prior histories remain
-/// superseded and queryable.
+/// superseded and queryable. The source's repository identity and its derived
+/// name keys move to a target that carries no identity, so identity-based
+/// resolution reaches the merged project; a target that already has one keeps
+/// it.
 pub fn merge_project(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
@@ -9108,14 +9118,24 @@ pub fn merge_project(
         params![src],
     )?;
     tx.execute(
-        "INSERT INTO ingest_keys (project_id, key, seen_at, completed_at) \
-         SELECT ?1, key, seen_at, completed_at FROM ingest_keys WHERE project_id = ?2 \
+        "INSERT INTO ingest_keys ( \
+             project_id, key, seen_at, completed_at, session_id, \
+             agent_kind, observation_kind, event_identity, recovery_retained \
+         ) \
+         SELECT ?1, key, seen_at, completed_at, session_id, \
+                agent_kind, observation_kind, event_identity, recovery_retained \
+         FROM ingest_keys WHERE project_id = ?2 \
          ON CONFLICT(project_id, key) DO UPDATE SET \
            seen_at = max(seen_at, excluded.seen_at), \
            completed_at = CASE \
              WHEN completed_at IS NULL THEN excluded.completed_at \
              WHEN excluded.completed_at IS NULL THEN completed_at \
-             ELSE max(completed_at, excluded.completed_at) END",
+             ELSE max(completed_at, excluded.completed_at) END, \
+           session_id = COALESCE(session_id, excluded.session_id), \
+           agent_kind = COALESCE(agent_kind, excluded.agent_kind), \
+           observation_kind = COALESCE(observation_kind, excluded.observation_kind), \
+           event_identity = COALESCE(event_identity, excluded.event_identity), \
+           recovery_retained = max(recovery_retained, excluded.recovery_retained)",
         params![dst, src],
     )?;
     tx.execute(
@@ -9179,6 +9199,20 @@ pub fn merge_project(
         &serde_json::json!({"source_project_id": source_project.to_string()}).to_string(),
     )?;
 
+    // The repository identity routes a checkout's captures and managed runs
+    // to its project, and it lives on the row deleted below. Dropped with the
+    // source, nothing resolves that checkout to the merged project and its
+    // next capture can open a new one beside it (#2156). Read it now and hand
+    // it over once the unique identity index is free.
+    let source_identity: Option<(String, String, String, String)> = tx
+        .query_row(
+            "SELECT identity, identity_source, canonical_name, legacy_name \
+             FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![src, ws],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+
     let deleted = tx.execute(
         "DELETE FROM projects WHERE id = ?1 AND workspace_id = ?2",
         params![src, ws],
@@ -9187,6 +9221,25 @@ pub fn merge_project(
         return Err(StoreError::NotFound(
             "source project disappeared during merge".into(),
         ));
+    }
+    // An identity already on the target is never overwritten, the rule
+    // `adopt_project_identity` follows: one project routes one repository.
+    if let Some((identity, identity_source, canonical_name, legacy_name)) = source_identity
+        && !identity.is_empty()
+    {
+        tx.execute(
+            "UPDATE projects SET identity = ?1, identity_source = ?2, \
+             canonical_name = ?3, legacy_name = ?4 \
+             WHERE id = ?5 AND workspace_id = ?6 AND identity = ''",
+            params![
+                identity,
+                identity_source,
+                canonical_name,
+                legacy_name,
+                dst,
+                ws,
+            ],
+        )?;
     }
     if commit {
         tx.commit()?;
@@ -13560,7 +13613,8 @@ pub(crate) mod tests {
                     counter.fetch_add(1, Ordering::Relaxed);
                     false
                 }),
-            );
+            )
+            .unwrap();
             let summary = backfill_cjk_indexes_in_batches(&mut conn, 1).unwrap();
             assert_eq!(
                 (summary.pages, summary.observations),
@@ -16843,6 +16897,120 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn merge_project_preserves_ingest_keys_recovery_attributes_and_resolves_conflicts() {
+        let (_tmp, mut conn, ws, source) = fresh_db();
+        let target = get_or_create_project(&mut conn, &ws, "target", None).unwrap();
+        let sid_src = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid_src, ws, source, None)).unwrap();
+        end_session(&mut conn, &sid_src, None).unwrap();
+        let sid_dst = SessionId::new();
+        begin_session(&mut conn, &hook_session(sid_dst, ws, target, None)).unwrap();
+        end_session(&mut conn, &sid_dst, None).unwrap();
+
+        conn.execute(
+            "INSERT INTO ingest_keys ( \
+                 project_id, key, seen_at, completed_at, session_id, \
+                 agent_kind, observation_kind, event_identity, recovery_retained \
+             ) VALUES (?1, 'key-src-unique', 100, 200, ?2, 'test-agent', 'user-prompt', 'ident-src', 1)",
+            params![source.as_bytes(), sid_src.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys ( \
+                 project_id, key, seen_at, completed_at, session_id, \
+                 agent_kind, observation_kind, event_identity, recovery_retained \
+             ) VALUES (?1, 'key-conflict', 150, NULL, ?2, 'test-agent', 'user-prompt', 'ident-src', 1)",
+            params![source.as_bytes(), sid_src.as_bytes()],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO ingest_keys ( \
+                 project_id, key, seen_at, completed_at, session_id, \
+                 agent_kind, observation_kind, event_identity, recovery_retained \
+             ) VALUES (?1, 'key-conflict', 120, 180, NULL, NULL, NULL, NULL, 0)",
+            params![target.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ingest_keys ( \
+                 project_id, key, seen_at, completed_at, session_id, \
+                 agent_kind, observation_kind, event_identity, recovery_retained \
+             ) VALUES (?1, 'key-dst-unique', 90, 110, ?2, 'test-agent', 'tool-call', 'ident-dst', 0)",
+            params![target.as_bytes(), sid_dst.as_bytes()],
+        )
+        .unwrap();
+
+        merge_project(&mut conn, ws, source, target, &[], true).unwrap();
+
+        let src_keys: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ingest_keys WHERE project_id = ?1",
+                params![source.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(src_keys, 0);
+
+        type IngestKeyTuple = (
+            i64,
+            Option<i64>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
+        let query_key = |key: &str| -> IngestKeyTuple {
+            conn.query_row(
+                "SELECT seen_at, completed_at, session_id, agent_kind, observation_kind, \
+                        event_identity, recovery_retained \
+                 FROM ingest_keys WHERE project_id = ?1 AND key = ?2",
+                params![target.as_bytes(), key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+
+        let unique = query_key("key-src-unique");
+        assert_eq!(unique.0, 100);
+        assert_eq!(unique.1, Some(200));
+        assert_eq!(unique.2.as_deref(), Some(&sid_src.as_bytes()[..]));
+        assert_eq!(unique.3.as_deref(), Some("test-agent"));
+        assert_eq!(unique.4.as_deref(), Some("user-prompt"));
+        assert_eq!(unique.5.as_deref(), Some("ident-src"));
+        assert_eq!(unique.6, 1);
+
+        let conflict = query_key("key-conflict");
+        assert_eq!(conflict.0, 150);
+        assert_eq!(conflict.1, Some(180));
+        assert_eq!(conflict.2.as_deref(), Some(&sid_src.as_bytes()[..]));
+        assert_eq!(conflict.3.as_deref(), Some("test-agent"));
+        assert_eq!(conflict.4.as_deref(), Some("user-prompt"));
+        assert_eq!(conflict.5.as_deref(), Some("ident-src"));
+        assert_eq!(conflict.6, 1);
+
+        let dst_unique = query_key("key-dst-unique");
+        assert_eq!(dst_unique.0, 90);
+        assert_eq!(dst_unique.1, Some(110));
+        assert_eq!(dst_unique.2.as_deref(), Some(&sid_dst.as_bytes()[..]));
+        assert_eq!(dst_unique.3.as_deref(), Some("test-agent"));
+        assert_eq!(dst_unique.4.as_deref(), Some("tool-call"));
+        assert_eq!(dst_unique.5.as_deref(), Some("ident-dst"));
+        assert_eq!(dst_unique.6, 0);
+    }
+
     /// Seed one session in `(ws, proj)` with everything `move_session`
     /// re-stamps: two observations, one handoff it produced, one completed
     /// consolidation job, one auto-improve run, one scheduler claim, and two
@@ -19235,6 +19403,73 @@ pub(crate) mod tests {
             adopt_project_identity(&mut conn, &ws, &folder, &remote, None, None).unwrap_err();
         assert!(matches!(error, StoreError::InvalidState(_)), "{error:?}");
         assert_eq!(name_and_identity(&conn, &remote).1, "github.com/acme/api");
+    }
+
+    /// The split renaming cannot repair: both halves hold sessions, so the
+    /// operator merges the remote-named project into the folder-named one,
+    /// the direction `ai-memory run` prints. The repository identity sits on
+    /// the row the merge deletes. It has to end up on the survivor, or the
+    /// next capture from that checkout opens a third project.
+    #[test]
+    fn merge_project_hands_the_repository_identity_to_the_surviving_project() {
+        let coordinates = |conn: &Connection, id: &ProjectId| -> [String; 4] {
+            conn.query_row(
+                "SELECT identity, identity_source, canonical_name, legacy_name \
+                 FROM projects WHERE id = ?1",
+                [id.as_bytes()],
+                |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?]),
+            )
+            .unwrap()
+        };
+
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        let session = SessionId::new();
+        begin_session(&mut conn, &hook_session(session, ws, remote, None)).unwrap();
+        end_session(&mut conn, &session, None).unwrap();
+        let carried = coordinates(&conn, &remote);
+        assert_eq!(carried[0], "github.com/acme/api");
+        assert!(coordinates(&conn, &folder).iter().all(String::is_empty));
+
+        // A dry run leaves the identity where it was.
+        merge_project(&mut conn, ws, remote, folder, &[], false).unwrap();
+        assert_eq!(coordinates(&conn, &remote), carried);
+        assert!(coordinates(&conn, &folder).iter().all(String::is_empty));
+
+        merge_project(&mut conn, ws, remote, folder, &[], true).unwrap();
+        assert_eq!(coordinates(&conn, &folder), carried);
+        assert_eq!(name_and_identity(&conn, &folder).0, "api");
+        let (resolved, _) = resolve_project_by_identity(
+            &mut conn,
+            &ws,
+            &acme_api_identity(),
+            ai_memory_core::repository_identity::IdentityStyle::Path,
+            false,
+            "acme-api",
+            None,
+            None,
+            None,
+            crate::AccessMode::Open,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved, folder,
+            "identity-based resolution must reach the merged project"
+        );
+
+        // A target that already belongs to another repository keeps its own
+        // identity: one project routes one repository.
+        let (_tmp, mut conn, ws, _) = fresh_db();
+        let (folder, remote) = split_projects(&mut conn, &ws);
+        conn.execute(
+            "UPDATE projects SET identity = 'github.com/acme/other', \
+             identity_source = 'git_remote' WHERE id = ?1",
+            [folder.as_bytes()],
+        )
+        .unwrap();
+        merge_project(&mut conn, ws, remote, folder, &[], true).unwrap();
+        let (_, kept) = name_and_identity(&conn, &folder);
+        assert_eq!(kept, "github.com/acme/other");
     }
 
     #[test]

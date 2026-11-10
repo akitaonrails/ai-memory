@@ -185,6 +185,8 @@ impl RoutingFields {
 
 impl HomeRoutes {
     fn parse(text: &str, home: &Path) -> Result<Self, ()> {
+        // A BOM is not whitespace to `trim`, and would hide a first-line header.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let saw_route_syntax = text
             .lines()
             .any(|line| recognizable_route_syntax(line.trim()));
@@ -2597,6 +2599,25 @@ project = "infra" # this is fine
             parse_flag_in("\u{feff}default_global = true\n", "default_global").as_deref(),
             Some("true")
         );
+    }
+
+    /// The home marker's route tables need the same BOM handling: a BOM on a
+    /// first-line route header left its fields orphaned, and the whole home
+    /// routing file was refused as malformed.
+    #[test]
+    fn a_bom_cannot_hide_a_first_line_home_route_header() {
+        let home = Path::new("/home/operator");
+        let routes = HomeRoutes::parse(
+            "\u{feff}[routes.path.\"~/src/api\"]\nroute_workspace = \"acme\"\nroute_project = \"api\"\n",
+            home,
+        )
+        .unwrap();
+        let (route, _) = routes
+            .select("/home/operator/src/api", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.workspace, "acme");
+        assert_eq!(route.project, "api");
     }
 
     #[test]

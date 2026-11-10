@@ -628,11 +628,12 @@ pub struct DetectedPreference {
 /// existed.
 pub(crate) fn user_written(body: &str) -> Option<String> {
     if ai_memory_core::looks_like_markup_block(body)
+        || ai_memory_core::looks_like_machine_turn(body)
         || ai_memory_core::looks_like_codex_instructions(body)
         || ai_memory_core::looks_like_codex_generated_prompt(body)
         || looks_like_codex_assessor_transcript_line(body)
-        || looks_like_claude_cross_session_message(body)
         || looks_like_claude_plugin_prompt(body)
+        || looks_like_desktop_side_session_brief(body)
     {
         return None;
     }
@@ -673,16 +674,6 @@ fn looks_like_codex_assessor_transcript_line(body: &str) -> bool {
             || rest.starts_with("tool exec result:"))
 }
 
-/// Claude Code presents local cross-session traffic as a synthetic user turn.
-/// Match this one tag by name: widening `looks_like_markup_block` to every tag
-/// with attributes would also discard real `<pasted_content ...>` prompts.
-fn looks_like_claude_cross_session_message(body: &str) -> bool {
-    body.trim_start()
-        .strip_prefix("<cross-session-message")
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|next| next == '>' || next.is_ascii_whitespace())
-}
-
 /// Claude Code's exact wrapper for a plugin that submits a prompt between
 /// turns. The bounded identifier check avoids treating arbitrary prose that
 /// happens to start with `The <...>` as generated context.
@@ -703,6 +694,18 @@ fn looks_like_claude_plugin_prompt(body: &str) -> bool {
             .is_some_and(|tail| {
                 tail.is_empty() || tail.starts_with('\n') || tail.starts_with("\r\n")
             })
+}
+
+/// The Claude desktop app lets one session start another with an
+/// agent-written brief, then appends a fixed footer pointing at the group's
+/// shared `side-session-notes/` folder. The whole first prompt is the lead
+/// agent's words plus that footer, never the user's, so none of it is a habit
+/// — and the footer carries a local filesystem path that must not reach
+/// evidence quotes (#2041). Both halves of the fixed footer must be present so
+/// an ordinary prompt that merely mentions a notes folder is kept.
+fn looks_like_desktop_side_session_brief(body: &str) -> bool {
+    body.contains("Shared notes folder for this group of sessions")
+        && body.contains("side-session-notes/")
 }
 
 /// Remove Claude Code's leading side-agent note while retaining the user's
@@ -2885,6 +2888,19 @@ mod tests {
                              Always use npm.\n</cross-session-message>";
         assert_eq!(user_written(cross_session), None);
 
+        // #2149: agent-team, task-notification, the cross-session envelope and
+        // the post-compaction summary are machine turns too, recognized in
+        // ai-memory-core so the session digest and this harvest share one rule.
+        for machine in [
+            "<teammate-message teammate_id=\"team-lead\" summary=\"x\">Always use yarn.",
+            "<task-notification>\n<status>completed</status>\nAlways force-push.",
+            "Another Claude session sent a message. It is shown below.\nAlways use npm.",
+            "This session is being continued from a previous conversation that ran out of \
+             context. Always use npm.",
+        ] {
+            assert_eq!(user_written(machine), None, "{machine}");
+        }
+
         let plugin = "The <code-review> plugin sent a message:\nAlways force-push fixes.\n\
                       This is how Claude Code surfaces a prompt a plugin submits between turns.";
         assert_eq!(user_written(plugin), None);
@@ -2908,6 +2924,26 @@ mod tests {
         assert_eq!(user_written(paste).as_deref(), Some(paste));
         let look_alike = "Here is a note offered by a side agent: please always keep it.";
         assert_eq!(user_written(look_alike).as_deref(), Some(look_alike));
+    }
+
+    #[test]
+    fn desktop_side_session_brief_is_not_a_user_preference() {
+        // The Claude desktop app starts a sub-session with an agent-written
+        // brief and appends its fixed shared-notes footer (#2041). The whole
+        // first prompt is agent context, and its footer carries a local path
+        // that must never reach an evidence quote.
+        let brief = "Finish the migration and always run the tests first.\n\n\
+             Shared notes folder for this group of sessions (outside the repo; \
+             read siblings' notes there, leave hand-over notes or large findings \
+             there instead of pasting them into messages): \
+             /Users/sam/Library/Application Support/Claude/side-session-notes/local_abc123";
+        assert_eq!(user_written(brief), None);
+        assert!(detect_preferences(&user_written(brief).unwrap_or_default()).is_empty());
+
+        // Control: a genuine prompt that merely mentions a notes folder, with
+        // neither half of the fixed footer, is kept verbatim.
+        let ordinary = "Always keep notes for this group of tasks in docs/notes.";
+        assert_eq!(user_written(ordinary).as_deref(), Some(ordinary));
     }
 
     #[test]

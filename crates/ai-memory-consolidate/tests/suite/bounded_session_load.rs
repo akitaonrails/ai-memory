@@ -1368,12 +1368,14 @@ async fn stale_sessions_row_does_not_divert_the_write() {
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
-/// A hybrid session whose observations landed in two projects keeps exactly
-/// today's prompt: the bounded path reads every row regardless of the row's
-/// scope (the prompt is per-session, not per-project) and the page lands in
-/// the observations' majority project.
+/// A hybrid session whose observations landed in two projects is consolidated
+/// strictly within the project it is bound to: the bounded path reads only
+/// that project's rows, so project B's observations never reach a project-A
+/// consolidation's prompt (GHSA-xfgc-hc4c-wj7h). The oracle is built from
+/// project A's rows alone, and the dump's row count and project-B content
+/// prove the other scope is absent.
 #[tokio::test]
-async fn hybrid_two_project_session_prompt_is_unchanged() {
+async fn hybrid_two_project_session_prompt_is_scoped_to_its_project() {
     let tmp = TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
     let ws = store
@@ -1437,13 +1439,15 @@ async fn hybrid_two_project_session_prompt_is_unchanged() {
     let (current_body, instructions, titles) =
         builder_inputs(&wiki, &store.reader, ws, proj_a, sid).await;
 
-    // Old path: the full load covers every row of the session id, both
-    // projects, exactly as today.
-    let observations = store.reader.observations_for_session(sid).await.unwrap();
-    assert_eq!(observations.len(), COUNT_A + COUNT_B);
+    // The oracle is project A's rows alone: a consolidation bound to project
+    // A must read only those, never the session's project-B rows.
+    let all = store.reader.observations_for_session(sid).await.unwrap();
+    assert_eq!(all.len(), COUNT_A + COUNT_B);
+    let project_a_only: Vec<_> = all.into_iter().filter(|o| o.project_id == proj_a).collect();
+    assert_eq!(project_a_only.len(), COUNT_A);
     let oracle = oracle_single_request(
         sid,
-        &observations,
+        &project_a_only,
         &current_body,
         instructions.as_deref(),
         PromptBudgets::default(),
@@ -1451,8 +1455,7 @@ async fn hybrid_two_project_session_prompt_is_unchanged() {
         false,
     );
 
-    // New path: the bounded gate passes on the majority project and the
-    // projection reads every row.
+    // The bounded path gates on, and reads, only project A's rows.
     let requests = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn LlmProvider> = Arc::new(CapturingLlm {
         requests: requests.clone(),
@@ -1487,11 +1490,17 @@ async fn hybrid_two_project_session_prompt_is_unchanged() {
         )
     );
 
-    // Every row from both projects made it into the dump.
+    // Byte-equality with the project-A-only oracle already proves the prompt
+    // holds exactly project A's projection; the dump's row count confirms the
+    // hybrid session's project-B rows did not inflate it.
+    let dump = &captured[0].messages[0].content;
     assert!(
-        captured[0].messages[0]
-            .content
-            .contains(&format!("--- observation {}/300 ---", COUNT_A + COUNT_B))
+        dump.contains(&format!("--- observation {COUNT_A}/{COUNT_A} ---")),
+        "the dump is scoped to project A's row count"
+    );
+    assert!(
+        !dump.contains(&format!("/{} ---", COUNT_A + COUNT_B)),
+        "the hybrid session's project-B rows must not inflate the count"
     );
 }
 

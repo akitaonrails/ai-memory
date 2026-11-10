@@ -1,7 +1,7 @@
 //! Incremental, read-only extraction from native harness session stores.
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -740,12 +740,17 @@ pub fn claude_session_ran_in_background(
         return Ok(false);
     };
     let reader = BufReader::new(File::open(&path)?);
-    for line in reader.lines() {
+    // Split on bytes: a line that is not UTF-8 is one unreadable record, not
+    // a failed scan (`lines()` would end it with an error).
+    for line in reader.split(b'\n') {
         let line = line?;
+        let Ok(line) = std::str::from_utf8(&line) else {
+            continue;
+        };
         if !line.contains("\"sessionKind\"") {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if value.get("sessionKind").and_then(Value::as_str) == Some("bg")
@@ -874,13 +879,18 @@ pub fn claude_continued_sessions(
         let reader = BufReader::new(File::open(&path)?);
         let mut cleared = false;
         let mut cleared_in_checkout = false;
-        for line in reader.lines() {
+        // Other projects' live transcripts are read too: a line that is not
+        // UTF-8 (one cut mid-write) is skipped instead of failing the scan.
+        for line in reader.split(b'\n') {
             let line = line?;
+            let Ok(line) = std::str::from_utf8(&line) else {
+                continue;
+            };
             let clear_command = line.contains(CLAUDE_CLEAR_COMMAND);
             if !clear_command && !line.contains(&attached_marker) {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
             let Some(session) = value.get("sessionId").and_then(Value::as_str) else {
@@ -1282,6 +1292,13 @@ fn export_jsonl_range(
             "native transcript final cursor is past the current transcript end"
         ));
     }
+    // `occurrences` tracks how many times each content-hashed record identity
+    // has been seen so far in document order, so a rewrite-in-place harness's
+    // byte-identical records get distinct ids (#2053). It is seeded from the
+    // validated prefix so an incremental export numbers a repeated record the
+    // same way a full export does. Non-rewrite harnesses key records by their
+    // own source ids and never consult it.
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
     let (start, mut prefix_hasher) = if journal_rewrites_in_place(harness) {
         let validated = if let Some(cursor) = cursor.as_ref().filter(|cursor| cursor.offset <= len)
             && let Some(expected) = cursor.prefix_sha256.as_deref()
@@ -1292,7 +1309,13 @@ fn export_jsonl_range(
         } else {
             None
         };
-        validated.unwrap_or_else(|| (0, Sha256::new()))
+        match validated {
+            Some((offset, hasher)) => {
+                occurrences = count_prefix_record_occurrences(&mut file, offset)?;
+                (offset, hasher)
+            }
+            None => (0, Sha256::new()),
+        }
     } else {
         (
             cursor.map_or(0, |cursor| cursor.offset.min(len)),
@@ -1454,7 +1477,23 @@ fn export_jsonl_range(
             // exchange's Prompt/AssistantMessage/ToolResults records, so
             // the line hash is its unique record id as well.
             let raw = line.strip_suffix(b"\n").unwrap_or(&line);
-            format!("{:x}", Sha256::digest(raw))
+            let base = format!("{:x}", Sha256::digest(raw));
+            // The first occurrence keeps the bare content hash, so every unique
+            // record (and the first of any repeated set) stays byte-stable
+            // across a rewrite exactly as before; only a later byte-identical
+            // record gains a deterministic occurrence suffix so it no longer
+            // collides on one ingest key (#2053). A rewrite that drops an
+            // earlier identical record shifts later suffixes, which can
+            // re-import a retained duplicate but never drops a distinct turn —
+            // the same duplicate-over-loss trade the content-hash identity
+            // already makes.
+            let seen = occurrences.entry(base.clone()).or_insert(0);
+            *seen += 1;
+            if *seen == 1 {
+                base
+            } else {
+                format!("{base}#{seen}")
+            }
         } else {
             source_id(&value).unwrap_or_else(|| format!("byte-{}", offset - read as u64))
         };
@@ -1594,6 +1633,40 @@ fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
             metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
         }
     }
+}
+
+/// Count how many times each rewrite-in-place record identity (the SHA-256 of
+/// a raw JSONL line) occurs in the first `len` committed bytes. Seeds the
+/// occurrence tally so an incremental export after the cursor numbers a
+/// repeated record exactly as a full export does, keeping both byte-identical
+/// records distinct instead of colliding on one id (#2053).
+fn count_prefix_record_occurrences(file: &mut File, len: u64) -> Result<HashMap<String, usize>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(file);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut remaining = len;
+    let mut line = Vec::new();
+    while remaining > 0 {
+        line.clear();
+        let read = reader
+            .by_ref()
+            .take(remaining)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        remaining -= read as u64;
+        // Only a complete, newline-terminated record has a stable identity,
+        // matching the main scan's own record boundary.
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let raw = line.strip_suffix(b"\n").unwrap_or(&line);
+        *counts
+            .entry(format!("{:x}", Sha256::digest(raw)))
+            .or_insert(0) += 1;
+    }
+    Ok(counts)
 }
 
 fn hash_file_prefix(file: &mut File, len: u64) -> Result<Option<Sha256>> {
@@ -1782,6 +1855,36 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
+/// Codex writes a tool output as a plain string, or as an array of
+/// `input_text` / `input_image` / `input_audio` / `encrypted_content` items
+/// for MCP results and `view_image` (`FunctionCallOutputPayload` in
+/// https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs).
+/// The text items are joined the way Codex's own
+/// `function_call_output_content_items_to_text` joins them.
+fn codex_tool_output(payload: &Value, losses: &mut Vec<String>) -> String {
+    if let Some(text) = first_string(payload, &["output", "content", "text"]) {
+        return text.to_string();
+    }
+    let Some(items) = payload.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        match (
+            item.get("type").and_then(Value::as_str),
+            item.get("text").and_then(Value::as_str),
+        ) {
+            (Some("input_text"), Some(text)) => {
+                if !text.trim().is_empty() {
+                    texts.push(text);
+                }
+            }
+            _ => losses.push("Codex non-text tool-output items were intentionally excluded".into()),
+        }
+    }
+    texts.join("\n")
+}
+
 fn parse_codex(
     value: &Value,
     session: &str,
@@ -1862,7 +1965,7 @@ fn parse_codex(
             );
         }
         "function_call_output" | "custom_tool_call_output" | "tool_result" => {
-            let body = first_string(payload, &["output", "content", "text"]).unwrap_or("");
+            let body = codex_tool_output(payload, losses);
             push_event(
                 events,
                 AgentKind::Codex,
@@ -1871,7 +1974,7 @@ fn parse_codex(
                 0,
                 WorkstreamEventKind::ToolResult,
                 Some("tool"),
-                body,
+                &body,
                 timestamp(value),
                 with_tool_use_id(json!({}), first_string(payload, &["call_id"])),
             );
@@ -1942,7 +2045,7 @@ fn parse_pi_family(
                     losses,
                 ),
                 "tool" | "toolResult" | "tool_result" => {
-                    let body = message.get("content").map(value_text).unwrap_or_default();
+                    let body = tool_result_text(agent, message.get("content"), losses);
                     let tool = first_string(message, &["toolName", "tool", "name"]);
                     push_event(
                         events,
@@ -2090,7 +2193,7 @@ fn parse_kimi(
                             Some("assistant"),
                             &format!("{name}: {arguments}"),
                             occurred_at.clone(),
-                            json!({"tool": name}),
+                            with_tool_use_id(json!({"tool": name}), first_string(call, &["id"])),
                         );
                     }
                 }
@@ -2107,7 +2210,10 @@ fn parse_kimi(
                         Some("tool"),
                         &body,
                         occurred_at,
-                        json!({}),
+                        with_tool_use_id(
+                            json!({}),
+                            first_string(message, &["toolCallId", "tool_call_id"]),
+                        ),
                     );
                 }
                 _ => {}
@@ -2913,7 +3019,7 @@ fn parse_grok(
                     Some("assistant"),
                     &format!("{name}: {arguments}"),
                     timestamp(value),
-                    json!({"tool": name}),
+                    with_tool_use_id(json!({"tool": name}), first_string(call, &["id"])),
                 );
             }
         }
@@ -2929,7 +3035,10 @@ fn parse_grok(
                 Some("tool"),
                 &body,
                 timestamp(value),
-                json!({}),
+                with_tool_use_id(
+                    json!({}),
+                    first_string(value, &["tool_call_id", "toolCallId"]),
+                ),
             );
         }
         "backend_tool_call" => {
@@ -3181,7 +3290,7 @@ fn parse_content_blocks(
                 );
             }
             "tool_result" | "toolResult" => {
-                let body = block.get("content").map(value_text).unwrap_or_default();
+                let body = tool_result_text(agent, block.get("content"), losses);
                 if claude_managed_packet_echo(agent, &body) {
                     losses.push(
                         "Claude managed workstream delivery packets were intentionally excluded"
@@ -3214,9 +3323,44 @@ fn parse_content_blocks(
                     agent.as_str()
                 ));
             }
+            // Claude `image` / `document` blocks (https://docs.anthropic.com/en/api/messages)
+            // and Codex `input_image` items (`ContentItem` in
+            // https://github.com/openai/codex/blob/main/codex-rs/protocol/src/models.rs).
+            "image" | "document" | "input_image" => {
+                losses.push(format!(
+                    "{} message attachments were intentionally excluded",
+                    agent.as_str()
+                ));
+            }
             _ => {}
         }
     }
+}
+
+/// An image block in a tool result has no text field, so `value_text` would
+/// store the whole block, base64 data included, as the result's content.
+fn tool_result_text(agent: AgentKind, content: Option<&Value>, losses: &mut Vec<String>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    let Value::Array(items) = content else {
+        return value_text(content);
+    };
+    let mut texts = Vec::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) == Some("image") {
+            losses.push(format!(
+                "{} image tool results were intentionally excluded",
+                agent.as_str()
+            ));
+            continue;
+        }
+        let text = value_text(item);
+        if !text.is_empty() {
+            texts.push(text);
+        }
+    }
+    texts.join("\n")
 }
 
 fn claude_managed_packet_echo(agent: AgentKind, body: &str) -> bool {
@@ -3763,9 +3907,15 @@ fn push_event(
     if content.trim().is_empty() {
         return;
     }
-    let content = truncate_utf8(content, MAX_EVENT_BYTES);
+    // The id keeps the plain byte cut so an event read before this change
+    // replays with the same id; only the stored text drops a cut token.
+    let identity = truncate_utf8(content, MAX_EVENT_BYTES);
+    let content = truncate_utf8_whole_tokens(content, MAX_EVENT_BYTES);
+    if content.trim().is_empty() {
+        return;
+    }
     let seed = format!(
-        "{}\0{session}\0{record_id}\0{block}\0{}\0{content}",
+        "{}\0{session}\0{record_id}\0{block}\0{}\0{identity}",
         agent.as_str(),
         kind.as_str()
     );
@@ -5328,6 +5478,8 @@ fn percent_decode(value: &str) -> String {
     while index < bytes.len() {
         if bytes[index] == b'%'
             && let Some(hex) = bytes.get(index + 1..index + 3)
+            // `from_str_radix` also takes a sign: `%+5` must stay verbatim.
+            && hex.iter().all(u8::is_ascii_hexdigit)
             && let Ok(hex) = std::str::from_utf8(hex)
             && let Ok(byte) = u8::from_str_radix(hex, 16)
         {
@@ -6203,6 +6355,39 @@ fn truncate_utf8(value: &str, max: usize) -> &str {
     &value[..end]
 }
 
+/// [`truncate_utf8`] that also drops a token the cut lands inside.
+///
+/// This cut runs before the sanitizer, which only sees the text later in the
+/// hook. A credential whose tail is cut off can fall below every pattern's
+/// minimum length (`sk-` needs 16 characters after the prefix) and survive
+/// as a verbatim prefix; when an earlier secret is then redacted to a short
+/// marker, that prefix can move inside the later caps. So when the cut falls
+/// inside a run of credential characters, the whole run goes. A record that
+/// is one unbroken run longer than the cap keeps nothing.
+fn truncate_utf8_whole_tokens(value: &str, max: usize) -> &str {
+    let cut = truncate_utf8(value, max);
+    let rest = &value[cut.len()..];
+    let splits_token = rest.chars().next().is_some_and(is_credential_char)
+        && cut.chars().next_back().is_some_and(is_credential_char);
+    if !splits_token {
+        return cut;
+    }
+    match cut
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_credential_char(*c))
+    {
+        Some((at, c)) => &cut[..at + c.len_utf8()],
+        None => "",
+    }
+}
+
+/// Characters a credential the sanitizer recognizes can contain: key bodies,
+/// base64 and JWT segments, and percent-encoding.
+fn is_credential_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=' | '%')
+}
+
 fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
@@ -6235,6 +6420,84 @@ fn deduplicate_losses(losses: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_event_cut_drops_a_token_it_lands_inside() {
+        // (input, max, kept)
+        let cases = [
+            ("short", 64, "short"),
+            ("alpha beta", 7, "alpha "),
+            ("alpha beta", 6, "alpha "),
+            ("alpha beta", 5, "alpha"),
+            ("key=sk-ABCDEFGH tail", 10, ""),
+            ("note: key=sk-ABCDEFGH", 15, "note: "),
+            ("\"sk-ABC\",\"sk-DEF\"", 12, "\"sk-ABC\",\""),
+            ("é sk-ABCDEF", 6, "é "),
+            ("unbrokenrun", 4, ""),
+        ];
+        for (input, max, kept) in cases {
+            assert_eq!(
+                truncate_utf8_whole_tokens(input, max),
+                kept,
+                "{input:?} at {max}"
+            );
+        }
+    }
+
+    /// The audit construction: a long fake key fills the event up to the
+    /// 128 KiB cut, and a second fake key straddles it. The plain byte cut
+    /// left `sk-` plus 15 characters, below the `sk-` rule's 16; the sanitizer
+    /// then shrinks the first key to a marker, and the fragment fit inside
+    /// the hook's 64 KiB and the store's 16 KiB caps verbatim.
+    #[test]
+    fn a_key_straddling_the_event_cut_never_reaches_storage_as_a_fragment() {
+        let content = format!(
+            "sk-{} sk-{}",
+            "A".repeat(MAX_EVENT_BYTES - 22),
+            "B".repeat(40)
+        );
+        let mut events = Vec::new();
+        push_event(
+            &mut events,
+            AgentKind::ClaudeCode,
+            "session",
+            "record",
+            0,
+            WorkstreamEventKind::Annotation,
+            Some("user"),
+            &content,
+            None,
+            json!({}),
+        );
+        let [event] = events.as_slice() else {
+            panic!("one event expected, got {}", events.len());
+        };
+        // The hook (scrub, then 64 KiB) and the store (scrub, then 16 KiB).
+        let sanitizer = ai_memory_core::Sanitizer::default();
+        let hooked =
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&event.content), 64 * 1024);
+        let stored = ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&hooked), 16 * 1024);
+        assert!(
+            !stored.contains("sk-AAAA"),
+            "the full key is redacted: {stored}"
+        );
+        assert!(
+            !stored.contains("BBB"),
+            "a key fragment reached storage: {stored}"
+        );
+        // The id still comes from the plain byte cut, so an event read
+        // before this change replays under the same id.
+        let seed = format!(
+            "{}\0session\0record\00\0{}\0{}",
+            AgentKind::ClaudeCode.as_str(),
+            WorkstreamEventKind::Annotation.as_str(),
+            truncate_utf8(&content, MAX_EVENT_BYTES)
+        );
+        assert_eq!(
+            event.event_id,
+            format!("native:{:x}", Sha256::digest(seed.as_bytes()))
+        );
+    }
 
     #[test]
     fn checkout_path_comparison_fails_closed_when_canonicalization_fails() {
@@ -6761,6 +7024,88 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_images_are_excluded_not_stored_as_json() {
+        let claude = json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"t1","content":[
+                {"type":"text","text":"screenshot taken"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}}
+            ]},
+            {"type":"tool_result","tool_use_id":"t2","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}}
+            ]}
+        ]}});
+        let pi = json!({"type":"message","message":{"role":"toolResult","toolCallId":"t3","toolName":"read","content":[
+            {"type":"text","text":"read image"},
+            {"type":"image","data":"cHJpdmF0ZSBpbWFnZQ==","mimeType":"image/png"}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&claude, "session", "claude", &mut events, &mut losses);
+        parse_pi_family(
+            AgentKind::Pi,
+            &pi,
+            "session",
+            "pi",
+            &mut events,
+            &mut losses,
+        );
+
+        let results = events
+            .iter()
+            .map(|event| {
+                (
+                    event.metadata["tool_use_id"].as_str().unwrap(),
+                    event.content.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, [("t1", "screenshot taken"), ("t3", "read image")]);
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.content.contains("cHJpdmF0ZSBpbWFnZQ")),
+            "image data reached the ledger"
+        );
+        assert_eq!(losses.len(), 3);
+        assert!(
+            losses
+                .iter()
+                .all(|loss| loss.ends_with("image tool results were intentionally excluded"))
+        );
+    }
+
+    #[test]
+    fn message_attachments_are_recorded_as_losses() {
+        let claude = json!({"type":"user","uuid":"u","message":{"role":"user","content":[
+            {"type":"text","text":"what is wrong here?"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"cHJpdmF0ZSBpbWFnZQ=="}},
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"cHJpdmF0ZSBwZGY="}}
+        ]}});
+        let codex = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"compare with this"},
+            {"type":"input_image","image_url":"data:image/png;base64,cHJpdmF0ZSBpbWFnZQ=="}
+        ]}});
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_claude(&claude, "session", "claude", &mut events, &mut losses);
+        parse_codex(&codex, "session", "codex", &mut events, &mut losses);
+
+        let messages = events
+            .iter()
+            .map(|event| event.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["what is wrong here?", "compare with this"]);
+        assert_eq!(
+            losses,
+            [
+                "claude-code message attachments were intentionally excluded",
+                "claude-code message attachments were intentionally excluded",
+                "codex message attachments were intentionally excluded",
+            ]
+        );
+    }
+
+    #[test]
     fn claude_export_skips_an_oversized_record_and_keeps_its_neighbours() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session.jsonl");
@@ -6885,6 +7230,60 @@ mod tests {
         .unwrap();
         assert_eq!(rewritten.events.len(), 4);
         assert_eq!(rewritten.events[2].event_id, initial.events[1].event_id);
+    }
+
+    #[test]
+    fn grok_backfill_keeps_byte_identical_records_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let chat = temp.path().join("sessions/bucket/sess/chat_history.jsonl");
+        fs::create_dir_all(chat.parent().unwrap()).unwrap();
+        let user = r#"{"type":"user","content":"continue"}"#;
+        let assistant = r#"{"type":"assistant","content":"I completed the next step"}"#;
+        let journal = format!("{user}\n{assistant}\n{user}\n");
+        fs::write(&chat, &journal).unwrap();
+
+        let continues = |export: &ExportedTranscript| -> Vec<String> {
+            export
+                .events
+                .iter()
+                .filter(|event| event.content == "continue")
+                .map(|event| event.event_id.clone())
+                .collect()
+        };
+
+        // A full backfill keeps BOTH byte-identical user turns, with distinct
+        // ids (before the fix they shared one id and the server dropped one).
+        let full = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        let full_ids = continues(&full);
+        assert_eq!(full_ids.len(), 2, "both identical user turns are kept");
+        assert_ne!(full_ids[0], full_ids[1], "and they get distinct event ids");
+
+        // Re-backfilling the same file is idempotent.
+        let again = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        assert_eq!(continues(&again), full_ids);
+
+        // Incremental: export the first two records, then append the identical
+        // third. Its occurrence number agrees with the full export, so it lands
+        // as the distinct second turn instead of colliding with the first and
+        // being dropped on ingest.
+        fs::write(&chat, format!("{user}\n{assistant}\n")).unwrap();
+        let initial = export_jsonl(ManagedHarness::Grok, &chat, "sess", None).unwrap();
+        assert_eq!(continues(&initial), vec![full_ids[0].clone()]);
+        fs::write(&chat, &journal).unwrap();
+        let delta = export_jsonl(
+            ManagedHarness::Grok,
+            &chat,
+            "sess",
+            initial.source_cursor.as_deref(),
+        )
+        .unwrap();
+        let delta_ids = continues(&delta);
+        assert_eq!(delta_ids.len(), 1);
+        assert_eq!(
+            delta_ids[0], full_ids[1],
+            "the appended duplicate matches the full export's second id"
+        );
+        assert_ne!(delta_ids[0], full_ids[0]);
     }
 
     /// For a journal validated by its prefix hash, the baseline hashes a
@@ -8595,6 +8994,37 @@ mod tests {
         assert_eq!(find("unrelated"), None);
     }
 
+    /// The scan reads every Claude transcript written since the launch,
+    /// including other projects' live sessions. A line that is not UTF-8 (a
+    /// record cut inside a multibyte character while it is being written) is
+    /// one unreadable record, not a reason to stop following this launch's
+    /// `/clear`.
+    #[test]
+    fn claude_continued_session_skips_a_line_that_is_not_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let project = temp.path().join(".claude/projects/-repo");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(60);
+        let clear = json!({
+            "type": "user",
+            "sessionId": "cleared",
+            "cwd": cwd,
+            "message": {"role": "user", "content": CLAUDE_CLEAR_COMMAND},
+        });
+        let turn =
+            json!({"type": "user", "sessionId": "cleared", "session_id": "launch", "cwd": cwd});
+        fs::write(project.join("cleared.jsonl"), format!("{clear}\n{turn}\n")).unwrap();
+        let mut partial = b"{\"type\":\"user\",\"message\":\"caf".to_vec();
+        partial.push(0xc3);
+        fs::write(project.join("busy.jsonl"), partial).unwrap();
+
+        let found = claude_continued_session(temp.path(), &cwd, None, "launch", started_at)
+            .expect("an unreadable record does not fail the scan");
+        assert_eq!(found, Some(ClaudeContinuation::Cleared("cleared".into())));
+    }
+
     #[test]
     fn claude_continued_session_follows_only_this_launchs_clear() {
         let temp = tempfile::tempdir().unwrap();
@@ -8998,6 +9428,46 @@ mod tests {
             parse_codex(&value, "session", "record", &mut events, &mut losses);
             assert!(events.is_empty(), "{events:?}");
         }
+    }
+
+    #[test]
+    fn codex_adapter_reads_tool_output_content_items() {
+        let value = json!({
+            "type":"response_item",
+            "timestamp":"2026-01-01T00:00:00Z",
+            "payload":{
+                "type":"function_call_output",
+                "call_id":"call-1",
+                "output":[
+                    {"type":"input_text","text":"42 files"},
+                    {"type":"input_image","image_url":"data:image/png;base64,cHJpdmF0ZQ=="},
+                    {"type":"input_text","text":"  "},
+                    {"type":"input_text","text":"done"}
+                ]
+            }
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&value, "session", "record", &mut events, &mut losses);
+        assert_eq!(events.len(), 1, "array tool output must not be dropped");
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolResult);
+        assert_eq!(events[0].content, "42 files\ndone");
+        assert_eq!(events[0].metadata["tool_use_id"], "call-1");
+        assert!(!events[0].content.contains("base64"));
+        assert_eq!(
+            losses,
+            ["Codex non-text tool-output items were intentionally excluded"]
+        );
+
+        let string_form = json!({
+            "type":"response_item",
+            "payload":{"type":"custom_tool_call_output","call_id":"call-2","output":"plain"}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_codex(&string_form, "session", "record", &mut events, &mut losses);
+        assert_eq!(events[0].content, "plain");
+        assert!(losses.is_empty());
     }
 
     #[test]
@@ -10004,7 +10474,10 @@ mod tests {
         assert_eq!(export.events[1].content, "visible answer");
         assert_eq!(export.events[2].content, "bash: {\"cmd\":\"ls\"}");
         assert_eq!(export.events[2].metadata["tool"], "bash");
+        // The native id pairs the result with its call, as on the loop path.
+        assert_eq!(export.events[2].metadata["tool_use_id"], "call_1");
         assert_eq!(export.events[3].role.as_deref(), Some("tool"));
+        assert_eq!(export.events[3].metadata["tool_use_id"], "call_1");
         assert_eq!(export.events[4].content, "compact summary");
         assert_eq!(export.events[5].content, "loop visible answer");
         assert_eq!(export.events[6].content, "Read: {\"path\":\"README.md\"}");
@@ -10311,6 +10784,9 @@ mod tests {
                 ),
             ]
         );
+        // The native id pairs the result with its call.
+        assert_eq!(export.events[2].metadata["tool_use_id"], "call-1");
+        assert_eq!(export.events[3].metadata["tool_use_id"], "call-1");
         assert!(
             export
                 .losses
@@ -11834,6 +12310,11 @@ mod tests {
         assert_eq!(
             path_from_file_uri("file:///tmp/100%done"),
             Some(PathBuf::from("/tmp/100%done"))
+        );
+        // `u8::from_str_radix` accepts a leading `+`, but `%+5` is no escape.
+        assert_eq!(
+            path_from_file_uri("file:///tmp/a%+5b"),
+            Some(PathBuf::from("/tmp/a%+5b"))
         );
         assert_eq!(path_from_file_uri("https://example.com/x"), None);
         assert_eq!(path_from_file_uri("file://"), None);

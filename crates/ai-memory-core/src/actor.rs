@@ -114,6 +114,14 @@ pub struct AuthorizedViewer(pub crate::UserId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LegacyBrowserAuth;
 
+/// Marks a `403` response that refuses a browser session only because its user
+/// must change their password first. The HTML auth redirect sends a navigation
+/// that gets it to the change-password form; any other `403` (a root-only page,
+/// a project the viewer holds no grant in) reaches the browser as the refusal
+/// it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordChangeRequired;
+
 impl AuthorizedViewer {
     /// The user id inside.
     #[must_use]

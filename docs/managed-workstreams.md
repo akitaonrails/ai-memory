@@ -7,6 +7,14 @@ keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
 
+When `show` selects another checkout, the launch resolves that checkout's
+server profile before probing or opening a workstream. Local state and
+transcript writes use the same endpoint and profile token as its hooks.
+`AI_MEMORY_SERVER_URL` still takes precedence, and an invalid profile fails
+closed. `resume` and `continue` also check that a saved link still belongs to
+the checkout's selected server, including its mount path. If the route has
+changed, run `ai-memory run` in that checkout to establish the new link.
+
 On Linux, a jailed OpenCode session uses a private `--standalone` server by
 default. This keeps its server and tool processes inside ai-jail's PID
 namespace so they cannot survive the jail. An explicit native `--server`
@@ -846,6 +854,9 @@ journal entries; correlated entries are quarantined before that pass and can
 only be deleted after a later clean pass and exact transcript replay. If the
 server is still unreachable, `recover` exits successfully
 and prints the remaining spool/journal counts and startup guidance.
+When the server is reachable but the journal is unreadable, `recover` still
+drains the hook spool. It preserves the journal for repair, reports its error
+alongside the spool counts, and exits with status 1.
 
 To restore the strict behavior (fail with the usual "could not reach …"
 diagnosis and never start the agent), pass `--require-server`, set
@@ -1056,8 +1067,10 @@ Crush `--yolo`, Kimi Code `--yolo`, Command Code `--yolo`, Kiro CLI v2
 `--trust-all-tools`, Grok Build CLI `--yolo` (equivalent to its
 `--always-approve` option), Antigravity CLI
 `--dangerously-skip-permissions`, and GitHub Copilot CLI `--yolo` (equivalent
-to its `--allow-all` option). Kiro v3 replaced the trust-all flag with
-`permissions.yaml`, so ai-memory prints a notice and adds no unverified flag.
+to its `--allow-all` option). Kiro takes `--trust-all-tools` on both engines,
+but only as a `chat` option, so ai-memory places it right after `chat`, or
+starts the launch with `chat --trust-all-tools` when it has no subcommand. An
+`--agent-engine` other than v2 or v3 gets a notice and no unverified flag.
 OMP currently needs no added flag. ai-memory does not add a duplicate when the
 translated native flag is already present.
 
@@ -1156,10 +1169,10 @@ operations, malformed records, and unknown schema versions are not imported.
 The engines can never cross-resume: exact store metadata is checked before a
 linked `--resume-id` is injected, and the incompatible engine flavor is also
 stored in the opaque incremental cursor. Explicit `--v3`, v3-only `--mode`,
-or `--agent-engine v3` selects v3; explicit `--agent-engine v2` selects v2; an
-unknown engine value remains passthrough instead of being guessed. Once a v3
-session is linked, a later plain `ai-memory run kiro` recovers that engine
-transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
+or `--agent-engine v3` selects v3. Both `--v2` and `--agent-engine v2` select
+v2, even when the workstream last used v3. An unknown engine value remains
+passthrough. Once a v3 session is linked, a later plain `ai-memory run kiro`
+recovers that engine transparently. Kiro CLI 2.16.2 wrote v3 sessions below the default
 `~/.kiro/sessions` even when `KIRO_HOME` redirected other state, so ai-memory
 checks the configured v3 root first and that default root as a compatibility
 fallback. If a linked session exists only in the fallback, ai-memory removes
@@ -1168,10 +1181,12 @@ uses its default-home v3 settings/hooks for that process, and first-launch
 auto-wire wires that default home rather than `KIRO_HOME`. Fresh launches and
 versions that store the session below the configured root keep `KIRO_HOME`
 unchanged. Every candidate still needs exact id, schema, and checkout metadata.
-The v2 `--yolo` translation is `--trust-all-tools`; an explicit narrower
-`--trust-tools` choice is never widened. V3 documents no equivalent CLI flag.
-See Kiro's current
-[session management](https://kiro.dev/docs/cli/chat/session-management/) and
+The `--yolo` translation is `--trust-all-tools` after `chat` on both engines;
+v3 keeps applying `permissions.yaml` denies under it, and an explicit narrower
+`--trust-tools` choice is never widened. Other subcommands (`mcp`, `login`)
+and help or version requests get no trust flag. See Kiro's current
+[session management](https://kiro.dev/docs/cli/chat/session-management/),
+[CLI commands](https://kiro.dev/docs/reference/cli-commands/) and
 [v3 compatibility](https://kiro.dev/docs/cli/v3/) references.
 
 Grok needs no ai-memory hook installation for managed delivery either. Grok

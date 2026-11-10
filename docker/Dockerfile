@@ -10,8 +10,13 @@
 # The default final target builds the binary from source. Release automation and
 # CI can target the prebuilt runtime stages after downloading native release
 # artifacts, avoiding duplicate Rust compiles in Docker jobs.
+#
+# Both base images are pinned by the digest of their multi-arch index, so a
+# rebuild of the same commit gets the same OS and toolchain. Dependabot
+# (`.github/dependabot.yml`, `docker`) proposes digest refreshes; the Rust
+# tag follows `rust-toolchain.toml` and is bumped together with it.
 
-FROM rust:1.95-slim-bookworm AS builder
+FROM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS builder
 WORKDIR /work
 # Optional console; default builds retain the existing feature set.
 ARG AI_MEMORY_FEATURES=""
@@ -39,9 +44,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release -p ai-memory-cli --features "${AI_MEMORY_FEATURES}" \
  && cp target/release/ai-memory /usr/local/bin/ai-memory
 
-FROM debian:bookworm-slim AS runtime-base
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime-base
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates tini \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 1000 --user-group --home-dir /data \
          --shell /usr/sbin/nologin ai-memory \
@@ -71,7 +76,9 @@ WORKDIR /data
 EXPOSE 49374
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/ai-memory", "status"]
-ENTRYPOINT ["/usr/local/bin/ai-memory"]
+# Reap orphaned grandchildren of helper processes while forwarding shutdown
+# signals to the server (which handles SIGTERM and SIGINT itself).
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ai-memory"]
 CMD ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-web"]
 
 FROM runtime-base AS runtime-prebuilt-amd64

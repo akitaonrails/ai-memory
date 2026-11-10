@@ -45,7 +45,7 @@ jobs:
       # Pull requests only restore. Each run that saved its own target/ put about
       # 5 GB under the PR's ref, two runs filled the 10 GB quota, and main's
       # entries, the only ones a PR can restore, were evicted (#1965).
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -58,7 +58,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --features ai-memory-cli/management-ui -- -D warnings
@@ -86,7 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # On macOS, rustls-tls-native-roots otherwise enumerates Keychain every
@@ -154,11 +154,9 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: uv run --no-project python -m unittest discover -s docs/examples/auto-improve-eval -p 'test_*.py' -v
-      # The capture policy every generated OpenCode/OMP/Pi/OpenClaw plugin
-      # embeds is TypeScript; only Node can execute it against the shared
-      # capture-policy fixture. The test is ignored locally, where Node is not
-      # a build requirement.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      # Node executes the capture policy and spool drain emitted by the
+      # generated integrations. Node is not a build requirement.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: matrix.os == 'ubuntu-latest'
         with:
           node-version: "24"
@@ -172,11 +170,13 @@ jobs:
         env:
           AI_MEMORY_BIN: ${{ github.workspace }}/target/debug/ai-memory
         run: node tests/e2e/web_dashboard_mutations.mjs
-      - name: Generated capture-policy TypeScript runtime evidence
+      - name: Generated TypeScript runtime evidence
         if: matrix.os == 'ubuntu-latest'
         # `--workspace` reuses the test binaries built above instead of
         # re-resolving features for one package.
-        run: cargo test --workspace --lib -- --ignored --exact commands::render_shared::tests::generated_capture_policy_v1_node_runtime_evidence
+        run: |
+          cargo test --workspace --lib -- --ignored --exact commands::render_shared::tests::generated_capture_policy_v1_node_runtime_evidence
+          cargo test --workspace --lib -- --exact commands::render_shared::tests::generated_ts_spool_leaves_native_oidc_entries_for_the_native_drain
       # The optional TypeScript SDK (companions/ai-memory-ts) against the server
       # built above: integration tests, the MCP schema drift test and every
       # example. A pull request that changes an MCP tool schema fails here
@@ -204,7 +204,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: python3 scripts/check-dashboard-core-mutations.py
@@ -240,7 +240,7 @@ jobs:
         with:
           toolchain: "1.95"
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: windows-cross
@@ -269,7 +269,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: companions/${{ matrix.companion }}
@@ -315,7 +315,7 @@ jobs:
         working-directory: companions/ai-memory-ts
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
       # Install scripts stay off: the lockfile holds dev tooling only.
@@ -353,7 +353,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --bin ai-memory
@@ -373,7 +373,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.95
         with:
           toolchain: "1.95"
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install with a fresh dependency resolution
@@ -481,6 +481,21 @@ jobs:
         run: docker build --target runtime-prebuilt-amd64 -f docker/Dockerfile -t ai-memory:ci .
       - name: --version smoke
         run: docker run --rm ai-memory:ci --version
+      - name: container init reaps orphaned helpers
+        run: |
+          test "$(docker image inspect ai-memory:ci --format '{{json .Config.Entrypoint}}')" = '["/usr/bin/tini","--","/usr/local/bin/ai-memory"]'
+          container=$(docker run -d --rm --entrypoint /usr/bin/tini ai-memory:ci -- sh -c 'sh -c "sleep 0.1 & exit 0"; exec sleep 10')
+          trap 'docker kill "$container" >/dev/null 2>&1 || true' EXIT
+          sleep 0.5
+          docker exec "$container" sh -ec '
+            test "$(cat /proc/1/comm)" = tini
+            for status in /proc/[0-9]*/status; do
+              if grep -q "^State:.*Z" "$status" 2>/dev/null; then
+                echo "unreaped child: $status" >&2
+                exit 1
+              fi
+            done
+          '
       - name: bundled hooks present
         run: docker run --rm --entrypoint sh ai-memory:ci -c "ls /usr/local/share/ai-memory/hooks/"
       - name: --help lists the v0.3 subcommands
@@ -514,7 +529,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo install cargo-audit --locked

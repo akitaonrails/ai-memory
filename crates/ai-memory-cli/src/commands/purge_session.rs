@@ -138,12 +138,22 @@ pub async fn run(config: &Config, args: PurgeSessionArgs) -> Result<()> {
             compact: args.compact,
             dry_run: true,
         };
-        let outcome = run_preview(config, "/admin/purge-session", &request).await;
+        let outcome = run_preview(config, "/admin/purge-session", &request).await?;
         if let Some(line) = preview_message(&outcome, &label) {
             println!("{line}");
         }
         bail!(
-            "{}", i18n.format("cli-purge-session-purge-session-is-destructive-and-irreversible-re-run-with-confirm-to-proceed", &[("value0", workspace.to_string()), ("value1", project.to_string()), ("value2", session_id.to_string())]));
+            "{}",
+            crate::localization::format(
+                i18n,
+                "cli-purge-session-purge-session-is-destructive-and-irreversible-re-run-with-confirm-to-proceed",
+                &[
+                    ("value0", workspace.to_string()),
+                    ("value1", project.to_string()),
+                    ("value2", session_id.to_string())
+                ]
+            )
+        );
     }
 
     let endpoint = ServerEndpoint::for_checkout(config).await?;
@@ -323,10 +333,18 @@ mod tests {
     // above.
     // -----------------------------------------------------------------
 
+    /// The preview follows this checkout's marker (#2016), so the config pins
+    /// the directory and home to the temp dir: a marker above the developer's
+    /// checkout must not decide where these previews go.
     fn config_for(tmp: &tempfile::TempDir, server_url: String) -> Config {
+        let dir = tmp.path().to_string_lossy().into_owned();
         Config {
             data_dir: tmp.path().to_path_buf(),
             server_url,
+            runtime_env: crate::config::RuntimeEnv::with_host_cwd_and_home_for_tests(
+                dir.clone(),
+                dir,
+            ),
             ..Config::default()
         }
     }
@@ -372,7 +390,9 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-session", &preview_request())
+            .await
+            .unwrap();
         assert!(matches!(outcome, PreviewOutcome::OlderServer));
         assert!(preview_message(&outcome, "default/scratch").is_none());
     }
@@ -388,7 +408,9 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-session", &preview_request())
+            .await
+            .unwrap();
         match &outcome {
             PreviewOutcome::Refused { status, body } => {
                 assert_eq!(*status, 404);
@@ -418,7 +440,9 @@ mod tests {
         )
         .await;
         let config = config_for(&tmp, url);
-        let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-session", &preview_request())
+            .await
+            .unwrap();
         let msg = preview_message(&outcome, "default/scratch").expect("must print a line");
         assert!(msg.starts_with("Would purge session from default/scratch: 1063 observations"));
     }
@@ -441,7 +465,9 @@ mod tests {
             // Close after receiving the request, without an HTTP response.
         });
         let config = config_for(&tmp, format!("http://{addr}"));
-        let outcome = run_preview(&config, "/admin/purge-session", &preview_request()).await;
+        let outcome = run_preview(&config, "/admin/purge-session", &preview_request())
+            .await
+            .unwrap();
         assert!(matches!(outcome, PreviewOutcome::Unreachable));
         assert!(preview_message(&outcome, "default/scratch").is_none());
         tokio::time::timeout(std::time::Duration::from_secs(1), server)

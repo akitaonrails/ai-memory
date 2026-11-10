@@ -143,8 +143,8 @@ ai_memory_profile_flag() {
 # Whether "$1" (a marker file) declares anything beyond a `[capture]`
 # section: any root-level scope key (workspace/project/project_strategy), or
 # any of the other settings ai_memory_marker_qs / ai_memory_briefing_qs
-# forward (drop_subagent_captures, default_global, [briefing], [profile] and
-# [handoff] keys). Mirrors
+# forward (drop_subagent_captures, default_global, [briefing], [profile],
+# [handoff] and [messaging] keys). Mirrors
 # `declares_more_than_capture` in marker.rs. A marker with any of these is a
 # resolution boundary; only a marker whose only content is `[capture]` (e.g.
 # ignore_paths) is scope/settings-transparent (#668).
@@ -157,7 +157,7 @@ ai_memory_marker_declares_settings() {
     ai_memory_strip_utf8_bom <"$file" \
         | LC_ALL=C grep -Eq '^[[:space:]]*aliases[[:space:]]*=' && return 0
     ai_memory_marker_declares_server "$file" && return 0
-    for key in default_global inject_on_session_start inject_on_subagent_start max_chars contribute consume deliver_on_session_start; do
+    for key in default_global inject_on_session_start inject_on_subagent_start max_chars contribute consume deliver_on_session_start inbox_notice_on_prompt; do
         [ -n "$(ai_memory_parse_toml_flag "$file" "$key")" ] && return 0
     done
     return 1
@@ -540,7 +540,10 @@ ai_memory_home_route() {
     _ai_hr_file="$1"; _ai_hr_cwd="$2"; _ai_hr_identity="$3"
     [ -f "$_ai_hr_file" ] || return 0
     [ "$(wc -c <"$_ai_hr_file")" -le 65536 ] || { printf 'invalid'; return 0; }
-    LC_ALL=C awk -v cwd="$_ai_hr_cwd" -v home="$_amhome" -v identity="$_ai_hr_identity" '
+    # Through the environment, not `-v`: awk reads escape sequences in a `-v`
+    # value, so a Windows cwd's backslashes never reached `cleanpath`.
+    _AI_HR_CWD="$_ai_hr_cwd" _AI_HR_HOME="$_amhome" _AI_HR_IDENTITY="$_ai_hr_identity" \
+        LC_ALL=C awk '
         function invalid() { bad = 1 }
         function cleanpath(value,    n, raw, out, i, root, home_relative, rel_depth, j) {
             gsub(/\\/, "/", value)
@@ -605,7 +608,10 @@ ai_memory_home_route() {
             }
             kind=""; selector=""; route_workspace=""; route_project=""; route_identity_style=""; route_aliases=""; delete field_seen
         }
-        BEGIN { count=0; bad=0; best_depth=0; tie=0 }
+        BEGIN {
+            count=0; bad=0; best_depth=0; tie=0
+            cwd=ENVIRON["_AI_HR_CWD"]; home=ENVIRON["_AI_HR_HOME"]; identity=ENVIRON["_AI_HR_IDENTITY"]
+        }
         {
             line=$0; sub(/\r$/, "", line)
             if (match(line, /^[[:space:]]*\[routes\.(identity|path)\."[^"\\]+"\][[:space:]]*$/)) {
@@ -787,8 +793,12 @@ ai_memory_marker_qs() {
             return 0
         fi
         if [ -n "$route" ]; then
+            # Split without globbing: route_aliases is a raw `["a","b"]`
+            # value, a bracket pattern that a file in the cwd would match.
             old_ifs=$IFS; IFS=$(printf '\034')
+            set -f
             set -- $route
+            set +f
             IFS=$old_ifs
             ws=$1; pr=$2; isty=${3:-}; route_aliases=${4:-}; ps=marker; routed=1
             [ -n "$route_aliases" ] && aliases=$(ai_memory_aliases_json_value "$route_aliases")
@@ -1090,14 +1100,24 @@ ai_memory_get_handoff() {
         *'&cwd='*) ;;
         *) return 0 ;;
     esac
+    _amurl="$1"
+    # An external-capture run shares its project with the owner's own
+    # interactive sessions, so a handoff fetch must offer the baton, not consume
+    # it: send claim=0 and let the server announce it for an explicit
+    # memory_handoff_accept (#2148). /brief claims nothing, so it is untouched.
+    if ai_memory_capture_owned_externally; then
+        case "$_amurl" in
+            *'/handoff?'*) _amurl="$_amurl&claim=0" ;;
+        esac
+    fi
     _amhdr=$(ai_memory_auth_header_file)
     if [ -n "${AI_MEMORY_AUTH_TOKEN:-}" ]; then
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" \
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl" \
             -H "Authorization: Bearer $AI_MEMORY_AUTH_TOKEN") || return $?
     elif [ -n "$_amhdr" ]; then
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1" -H @"$_amhdr") || return $?
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl" -H @"$_amhdr") || return $?
     else
-        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$1") || return $?
+        _amhandoff=$(curl -s --noproxy '*' --max-time 1.0 -H "X-AI-Memory-Client: hook-sh" -w '\n%{http_code}' "$_amurl") || return $?
     fi
     # Appending the status preserves the body's final newlines in the command
     # substitution. Redirect and error bodies must never become agent context.

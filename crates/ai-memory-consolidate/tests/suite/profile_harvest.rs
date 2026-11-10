@@ -496,6 +496,46 @@ async fn injected_instructions_and_ai_memory_blocks_are_never_candidates() {
     );
 }
 
+/// A desktop app sub-session's agent-written brief, with its fixed shared-notes
+/// footer, is never the user's words, and its local filesystem path must not
+/// reach a candidate quote (#2041).
+#[tokio::test]
+async fn desktop_side_session_briefs_are_never_candidates() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let brief = "Finish the migration and always run the tests first in every project.\n\n\
+         Shared notes folder for this group of sessions (outside the repo; read siblings' \
+         notes there, leave hand-over notes or large findings there instead of pasting them \
+         into messages): /Users/sam/Library/Application Support/Claude/side-session-notes/local_abc123";
+    prompt(&fx, alpha, brief, 1).await;
+    // Control: a genuine user preference the pass must still keep.
+    prompt(
+        &fx,
+        alpha,
+        "Always use pnpm for installs in every project.",
+        2,
+    )
+    .await;
+
+    pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    assert!(
+        statements.iter().any(|s| s.contains("pnpm")),
+        "the user's own sentence was lost: {statements:?}"
+    );
+    assert_eq!(
+        statements.len(),
+        1,
+        "the agent-written brief became a candidate: {statements:?}"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.contains("side-session-notes") || s.contains("/Users/")),
+        "a local filesystem path reached a candidate: {statements:?}"
+    );
+}
+
 #[tokio::test]
 async fn claude_generated_prompt_wrappers_are_never_candidates() {
     let fx = fixture().await;

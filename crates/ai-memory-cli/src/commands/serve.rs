@@ -1949,17 +1949,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
                 .merge(internal_auth_router(auth_state.clone()))
-                .merge(
-                    web.protected
-                        .layer(axum::middleware::from_fn_with_state(
-                            auth_state.clone(),
-                            require_dual_auth,
-                        ))
-                        .layer(axum::middleware::from_fn_with_state(
-                            html_auth,
-                            html_auth_redirect_mw,
-                        )),
-                )
+                .merge(layer_protected_web(
+                    web.protected,
+                    auth_state.clone(),
+                    html_auth,
+                    web.api_cors,
+                ))
                 .merge(web.public.layer(axum::middleware::from_fn_with_state(
                     auth_state.clone(),
                     expire_legacy_cookie_mw,
@@ -2371,14 +2366,14 @@ async fn start_maintenance_scheduler(
                     let reader = reader.clone();
                     let wiki = wiki.clone();
                     let llm = llm.clone();
-                    let decay_lambda = decay.decay_params().lambda;
+                    let decay_params = decay.decay_params();
                     async move {
                         let started = std::time::Instant::now();
                         let outcome = run_scheduled_lint_tick(
                             &reader,
                             &wiki,
                             llm.as_ref(),
-                            decay_lambda,
+                            decay_params,
                             contradiction_band_min,
                             contradiction_band_max,
                         )
@@ -2890,7 +2885,7 @@ async fn run_scheduled_lint_tick(
     reader: &ReaderPool,
     wiki: &Wiki,
     llm: Option<&Arc<dyn LlmProvider>>,
-    decay_lambda: f64,
+    decay: ai_memory_store::DecayParams,
     contradiction_band_min: f32,
     contradiction_band_max: f32,
 ) -> Result<ScheduledLintTickOutcome> {
@@ -2910,7 +2905,7 @@ async fn run_scheduled_lint_tick(
             ai_memory_consolidate::LintOptions {
                 dry_run: false,
                 use_llm: false,
-                decay_lambda,
+                decay,
                 // The automatic scheduled lint stays rule-based: the A5
                 // contradiction detector is on for the user-invoked
                 // `memory_lint` / admin lint, not the background sweep.
@@ -3407,6 +3402,35 @@ async fn require_allowed_host(
     }
     tracing::warn!(host, allowed = ?allowed_hosts, "rejected request with disallowed Host header");
     (StatusCode::FORBIDDEN, "forbidden host\n").into_response()
+}
+
+/// Layer the dual-auth web surfaces (`/api/v1` and the builtin wiki) the way
+/// `serve` mounts them. Dual auth is innermost; the HTML login redirect wraps
+/// it so it sees the auth answers; the operator's `/api/v1` CORS policy is
+/// outermost, because a browser sends its CORS preflight without credentials
+/// and auth in front of the policy refused every one with 401.
+fn layer_protected_web(
+    protected: axum::Router,
+    auth_state: Arc<AuthState>,
+    html_auth: Arc<HtmlAuthRedirectConfig>,
+    api_cors: Option<ai_memory_web::ApiCors>,
+) -> axum::Router {
+    let router = protected
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            require_dual_auth,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            html_auth,
+            html_auth_redirect_mw,
+        ));
+    match api_cors {
+        Some(cors) => router.layer(axum::middleware::from_fn_with_state(
+            cors,
+            ai_memory_web::api_cors_mw,
+        )),
+        None => router,
+    }
 }
 
 /// Refuse browser requests from a foreign page on a server with no credential
@@ -6493,7 +6517,7 @@ mod tests {
             &store.reader,
             &wiki,
             Some(&panic_llm),
-            ai_memory_store::DecayParams::default().lambda,
+            ai_memory_store::DecayParams::default(),
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
         )
@@ -7245,6 +7269,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(absent_web.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A browser sends a CORS preflight without credentials. With dual auth
+    /// wrapping the `/api/v1` CORS policy, every preflight from an operator's
+    /// configured origin got 401 and no cross-origin client could call the
+    /// API at all. The policy must sit outside auth, scoped to `/api/v1`,
+    /// while every real request is still authenticated.
+    #[tokio::test]
+    async fn api_cors_preflight_is_answered_outside_auth_and_only_on_api_v1() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let origins = ["https://app.example.com".to_string()];
+        let web = split_web_routers(
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                enable_api: true,
+                web_ui_dir: None,
+                cors_origins: &origins,
+                web_slug: "/web",
+                base_href: "/web/",
+                base_path: "",
+                trusted_proxy_identity: false,
+                recall: ai_memory_web::Recall::default(),
+                runtime: None,
+                health: None,
+            },
+        )
+        .unwrap();
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let html_auth = web
+            .html_auth
+            .expect("builtin wiki mount must return html_auth");
+        let router = apply_host_layer(
+            layer_protected_web(web.protected, auth, html_auth, web.api_cors),
+            vec!["localhost".to_string()],
+        );
+        let send = |method: &str, uri: &str, origin: &str, bearer: bool| {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Host", "localhost")
+                .header(header::ORIGIN, origin);
+            if method == "OPTIONS" {
+                req = req
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization");
+            }
+            if bearer {
+                req = req.header(header::AUTHORIZATION, "Bearer secret");
+            }
+            router.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let allowed = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let app = "https://app.example.com";
+
+        let preflight = send("OPTIONS", "/api/v1/projects", app, false)
+            .await
+            .unwrap();
+        assert!(
+            preflight.status().is_success(),
+            "preflight refused: {}",
+            preflight.status()
+        );
+        assert_eq!(allowed(&preflight).as_deref(), Some(app));
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+            "true"
+        );
+
+        // The real request is still authenticated, and its refusal is
+        // readable by the calling page.
+        let anonymous = send("GET", "/api/v1/projects", app, false).await.unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(allowed(&anonymous).as_deref(), Some(app));
+        let signed = send("GET", "/api/v1/projects", app, true).await.unwrap();
+        assert_eq!(signed.status(), StatusCode::OK);
+        assert_eq!(allowed(&signed).as_deref(), Some(app));
+
+        // An unlisted origin gets no grant, before or after auth.
+        let foreign = "https://evil.example";
+        let preflight = send("OPTIONS", "/api/v1/projects", foreign, false)
+            .await
+            .unwrap();
+        assert_eq!(allowed(&preflight), None);
+        let signed = send("GET", "/api/v1/projects", foreign, true)
+            .await
+            .unwrap();
+        assert_eq!(allowed(&signed), None);
+
+        // `/web` stays CORS-free and behind auth.
+        let preflight = send("OPTIONS", "/web", app, false).await.unwrap();
+        assert_eq!(preflight.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(allowed(&preflight), None);
+        let signed = send("GET", "/web", app, true).await.unwrap();
+        assert_eq!(signed.status(), StatusCode::OK);
+        assert_eq!(allowed(&signed), None);
     }
 
     #[tokio::test]

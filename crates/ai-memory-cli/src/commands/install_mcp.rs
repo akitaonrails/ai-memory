@@ -27,7 +27,7 @@ use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
 use crate::commands::path_util::{claude_config_dir, home_dir};
 use crate::commands::render_shared::{
-    bearer_header_value, hook_embedded_exe_path, shell_quote, yaml_single_quote,
+    bearer_header_value, hook_embedded_exe_path, mask_secret, shell_quote, yaml_single_quote,
 };
 use crate::config::{Config, DEFAULT_MCP_URL};
 use crate::local_auth::HookCredential;
@@ -205,7 +205,18 @@ pub(crate) fn run_with_opencode_dialect(
         }
         return apply_to_config_file(i18n, &args);
     }
-    let snippet = match args.client {
+    println!("{}", preview_snippet(args)?);
+    Ok(())
+}
+
+/// Render the print-only preview snippet for a client. The snippet goes to the
+/// terminal, not to a config file, so the inline bearer is masked here — it
+/// would otherwise sit in the scrollback, a CI log or an agent transcript. The
+/// `--apply` path renders from the real token and never calls this
+/// (GHSA-6pmr-q79m-87vp item 1).
+fn preview_snippet(mut args: InstallMcpArgs) -> Result<String> {
+    args.auth_token = args.auth_token.as_deref().map(mask_secret);
+    Ok(match args.client {
         McpClient::ClaudeCode => render_claude_code(&args, &resolve_config_file(&args)?)?,
         McpClient::Codex => render_codex(&args)?,
         McpClient::Grok => render_grok(&args)?,
@@ -238,9 +249,7 @@ pub(crate) fn run_with_opencode_dialect(
         McpClient::PrimeAgent => render_prime_agent(&args)?,
         McpClient::Cline => render_json_mcp_fragment(&args)?,
         McpClient::Freebuff => render_json_mcp_fragment(&args)?,
-    };
-    println!("{snippet}");
-    Ok(())
+    })
 }
 
 /// Wire a client to a server whose bearer lives in `[auth].bearer_token_file`
@@ -2824,7 +2833,15 @@ fn pi_mcp_apply_guidance(args: &InstallMcpArgs) -> String {
 }
 
 fn hook_server_url_from_mcp_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
+    // Drop query/fragment before the `/mcp` peel, as `install_hooks`'s
+    // namesake does: a `?flavor=moonshot` marker would stop the suffix from
+    // matching and leak into the hook URL.
+    let trimmed = url
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/');
     trimmed.strip_suffix("/mcp").unwrap_or(trimmed).to_string()
 }
 
@@ -3046,6 +3063,33 @@ mod tests {
             stdio_bridge: false,
             bridge_data_dir: None,
         }
+    }
+
+    /// GHSA-6pmr item 1: the print-only preview masks the inline bearer so it
+    /// is not left in the terminal scrollback / CI log, for every client that
+    /// embeds it. Fails if `preview_snippet` renders from the raw token.
+    #[test]
+    fn preview_snippet_masks_the_inline_bearer() {
+        for client in [
+            McpClient::Cursor,
+            McpClient::ClaudeDesktop,
+            McpClient::Cline,
+            McpClient::GeminiCli,
+        ] {
+            let snippet = preview_snippet(args_with_token(client)).unwrap();
+            assert!(
+                !snippet.contains("test-token-deadbeef"),
+                "{client:?} leaked the token: {snippet}"
+            );
+            assert!(
+                snippet.contains("[REDACTED]"),
+                "{client:?} did not mask: {snippet}"
+            );
+        }
+        // Control: with no token, the snippet renders unchanged and carries no
+        // redaction marker.
+        let snippet = preview_snippet(args_for(McpClient::Cursor)).unwrap();
+        assert!(!snippet.contains("[REDACTED]"), "control masked: {snippet}");
     }
 
     #[test]
@@ -6027,6 +6071,26 @@ mod tests {
 
         assert!(guidance.contains("--server-url http://host:49374/base --auth-token <token>"));
         assert!(!guidance.contains("--server-url http://host:49374/base/mcp"));
+    }
+
+    /// A query or fragment on the MCP URL (Kimi's `?flavor=moonshot`) must not
+    /// stop the `/mcp` peel or leak into the hook URL, as in `install-hooks`.
+    #[test]
+    fn pi_guidance_drops_the_mcp_url_query_before_peeling() {
+        let mut args = args_for(McpClient::Pi);
+        args.server_url = Some("http://host:49374/base/mcp?flavor=moonshot".into());
+        args.auth_token = Some("tok".into());
+
+        let guidance = render_pi(&args).unwrap();
+
+        assert!(
+            guidance.contains("--server-url http://host:49374/base --auth-token <token>"),
+            "{guidance}"
+        );
+        assert!(
+            !guidance.contains("flavor=moonshot --auth-token"),
+            "{guidance}"
+        );
     }
 
     /// The Codex apply path must emit block-form `[mcp_servers.<name>]`

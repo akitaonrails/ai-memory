@@ -244,8 +244,10 @@ log_level = "info"
 # gigabytes a year), while the durable value is the compiled pages. Set
 # observation_retention_days to a positive number to let the sweep delete raw
 # observations older than that — but ONLY for sessions already consolidated into
-# a page that is still live. Unconsolidated sessions, and sessions whose page was
-# evicted by decay, keep every row. 0 (the default) disables the pass entirely.
+# a page that is still live in the project holding those observations.
+# Unconsolidated sessions, sessions whose page was evicted by decay, and the rows
+# a session left in a project with no page of it keep every row. 0 (the default)
+# disables the pass entirely.
 # Pruning is IRREVERSIBLE: observations are the input to consolidation, so a
 # pruned session can never be re-consolidated (a better model, a better prompt,
 # or a fixed consolidator bug make no difference) and its summary page becomes
@@ -744,7 +746,11 @@ mid_session = "follow-cwd"
 #
 # abstract_vectors adds the L0 abstract-embedding stream to the fusion. A page
 # gets an abstract vector when its frontmatter carries `abstract:` and the
-# embedding backfill runs.
+# embedding backfill runs. Only an agent passing the optional `abstract` field
+# to memory_write_page or memory_patch_page writes that line. Session
+# consolidation, the dream pass and the forget sweep never add it, so on a
+# default install the stream ranks only the pages whose abstract an agent wrote
+# by hand, and leaving it off loses nothing until abstracts exist.
 #
 # belief_authority_weight folds a page's evidence-derived confidence into its
 # authority factor. 0.0 is inert and negative values are clamped to 0.

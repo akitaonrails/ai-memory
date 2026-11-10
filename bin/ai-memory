@@ -548,8 +548,9 @@ native_host_binary() {
     fi
     if [ -n "${remote_sum}" ] && [ "${remote_sum}" != "${local_sum}" ]; then
       need_refresh=1
+    else
+      touch "${check_file}"
     fi
-    touch "${check_file}"
   fi
 
   if [ "${need_refresh}" -eq 1 ]; then
@@ -561,10 +562,28 @@ native_host_binary() {
     rm -rf "${tmp}"
     mkdir -p "${tmp}"
     echo "ai-memory: installing checksum-verified native host-launch client (${artifact})" >&2
-    curl -fsSL "${base}" -o "${tmp}/${artifact}.tar.gz"
-    curl -fsSL "${base}.sha256" -o "${tmp}/${artifact}.tar.gz.sha256"
+    # This function is called in command-substitution / `|| { … }` contexts
+    # where bash turns errexit off for the whole body, so a failing step here
+    # does NOT abort on its own. Every download and the checksum must be
+    # checked explicitly and clean up + `return 1` on failure; otherwise a
+    # mismatched archive would fall through to `tar`/`mv` and install an
+    # unverified binary (GHSA-f43g-26gw-x9pw).
+    curl -fsSL "${base}" -o "${tmp}/${artifact}.tar.gz" || {
+      echo "ai-memory: could not download the native host-launch client" >&2
+      rm -rf "${tmp}"
+      return 1
+    }
+    curl -fsSL "${base}.sha256" -o "${tmp}/${artifact}.tar.gz.sha256" || {
+      echo "ai-memory: could not download the native host-launch client checksum" >&2
+      rm -rf "${tmp}"
+      return 1
+    }
     if command -v sha256sum >/dev/null 2>&1; then
-      (cd "${tmp}" && sha256sum -c "${artifact}.tar.gz.sha256" >/dev/null)
+      (cd "${tmp}" && sha256sum -c "${artifact}.tar.gz.sha256" >/dev/null 2>&1) || {
+        echo "ai-memory: native host-launch client checksum mismatch" >&2
+        rm -rf "${tmp}"
+        return 1
+      }
     else
       remote_sum=$(awk 'NR == 1 { print $1 }' "${tmp}/${artifact}.tar.gz.sha256")
       local_sum=$(shasum -a 256 "${tmp}/${artifact}.tar.gz" | awk '{ print $1 }')
@@ -574,16 +593,38 @@ native_host_binary() {
         return 1
       }
     fi
-    tar -xzf "${tmp}/${artifact}.tar.gz" -C "${tmp}"
-    [ -x "${tmp}/ai-memory" ] || chmod +x "${tmp}/ai-memory"
-    mv "${tmp}/${artifact}.tar.gz" "${archive}"
-    mv "${tmp}/ai-memory" "${binary}"
+    tar -xzf "${tmp}/${artifact}.tar.gz" -C "${tmp}" || {
+      echo "ai-memory: could not extract the native host-launch client" >&2
+      rm -rf "${tmp}"
+      return 1
+    }
+    if [ ! -f "${tmp}/ai-memory" ] \
+       || { [ ! -x "${tmp}/ai-memory" ] && ! chmod +x "${tmp}/ai-memory"; }; then
+      echo "ai-memory: the native host-launch client archive did not provide a usable executable" >&2
+      rm -rf "${tmp}"
+      return 1
+    fi
+    if [ -d "${binary}" ] || ! mv "${tmp}/ai-memory" "${binary}"; then
+      echo "ai-memory: could not install the native host-launch executable" >&2
+      rm -rf "${tmp}"
+      return 1
+    fi
     # `run` auto-wires hooks through this client, and install-hooks looks for
     # its script bundle beside the binary. Without it, auto-wiring fails for
     # every script-based harness on a host where nothing was staged yet.
     if [ -d "${tmp}/hooks" ]; then
-      rm -rf "${native_dir}/hooks"
-      mv "${tmp}/hooks" "${native_dir}/hooks"
+      if ! rm -rf "${native_dir}/hooks" || ! mv "${tmp}/hooks" "${native_dir}/hooks"; then
+        echo "ai-memory: could not install the native host-launch hook bundle" >&2
+        rm -rf "${tmp}"
+        return 1
+      fi
+    fi
+    # The daily check compares the remote checksum with this archive. Keep
+    # the old archive and timestamp until the verified payload is installed.
+    if [ -d "${archive}" ] || ! mv "${tmp}/${artifact}.tar.gz" "${archive}"; then
+      echo "ai-memory: could not cache the native host-launch client archive" >&2
+      rm -rf "${tmp}"
+      return 1
     fi
     rm -rf "${tmp}"
     touch "${check_file}"

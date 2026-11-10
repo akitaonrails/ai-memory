@@ -849,10 +849,12 @@ pub fn render_profile_block(lines: &[String], omitted: usize) -> String {
 
 /// Byte range of the managed block in `text`: both delimiters plus the line
 /// break after the closing one. Only delimiters alone on their line count, so
-/// a quoted mention in prose is never mistaken for one.
+/// a quoted mention in prose is never mistaken for one, and a start line
+/// whose end was deleted by hand is skipped, so the user's text after it is
+/// never taken for part of the block.
 fn profile_block_range(text: &str) -> Option<(usize, usize)> {
-    let start = crate::find_marker_line(text, PROFILE_BLOCK_START, 0)?;
-    let end = crate::find_marker_line(text, PROFILE_BLOCK_END, start)?;
+    let (start, end) =
+        crate::routing_snippet::find_delimited_block(text, PROFILE_BLOCK_START, PROFILE_BLOCK_END)?;
     let mut after = end + PROFILE_BLOCK_END.len();
     if text[after..].starts_with("\r\n") {
         after += 2;
@@ -1378,6 +1380,42 @@ mod tests {
         assert_eq!(
             remove_profile_block(&merged).as_deref(),
             Some(prose.as_str())
+        );
+    }
+
+    #[test]
+    fn merge_keeps_text_after_a_start_marker_without_its_end() {
+        let block = render_profile_block(&["- use pnpm (`profile/tools/pnpm.md`)".into()], 0);
+        let existing = format!("# A\n{PROFILE_BLOCK_START}\nmy notes\n");
+        let first = merge_profile_block(&existing, &block);
+        assert_eq!(first, format!("{existing}\n{block}"));
+        assert_eq!(
+            merge_profile_block(&first, &block),
+            first,
+            "a re-run is a no-op and keeps my notes"
+        );
+        let newer = render_profile_block(&["- use bun (`profile/tools/bun.md`)".into()], 0);
+        assert_eq!(
+            merge_profile_block(&first, &newer),
+            format!("{existing}\n{newer}"),
+            "only the appended block is replaced"
+        );
+    }
+
+    #[test]
+    fn remove_keeps_text_after_a_start_marker_without_its_end() {
+        let block = render_profile_block(&["- use pnpm (`profile/tools/pnpm.md`)".into()], 0);
+        let existing = format!("# A\n{PROFILE_BLOCK_START}\nmy notes\n");
+        let applied = merge_profile_block(&existing, &block);
+        assert_eq!(
+            remove_profile_block(&applied).as_deref(),
+            Some(existing.as_str()),
+            "--remove takes out the appended block and restores the file"
+        );
+        assert_eq!(
+            remove_profile_block(&existing),
+            None,
+            "a start line alone is no block"
         );
     }
 }

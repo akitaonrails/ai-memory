@@ -75,6 +75,16 @@ impl ProjectSplit {
             self.archive_name(day)
         )
     }
+
+    /// The dry-run command that joins the two halves when both live in one
+    /// workspace. `--from` is the project this checkout now resolves to, so the
+    /// session's own project keeps its name; swapping the two reverses it.
+    fn merge_command(&self) -> String {
+        format!(
+            "  ai-memory merge-project --workspace {} --from-project-id {} --into-project-id {}",
+            self.run_workspace, self.run_project_id, self.session_project_id
+        )
+    }
 }
 
 impl fmt::Display for ProjectSplit {
@@ -91,11 +101,29 @@ impl fmt::Display for ProjectSplit {
                 ". Join them (nothing is deleted), then run again:\n{}",
                 self.command(&today())
             )
+        } else if self.workspace == self.run_workspace {
+            write!(
+                f,
+                ". {}/{} already holds its own sessions or pages, so joining them is not \
+                 automatic. Inspect both, then merge one into the other — a dry run changes \
+                 nothing, re-run with --confirm to apply:\n  ai-memory list-projects\n{}\n\
+                 That keeps {} as the project name; swap --from/--into to keep {} instead. Or \
+                 run this checkout against {} without merging by setting `project = \"{}\"` in \
+                 .ai-memory.toml. See docs/lifecycle-ops.md.",
+                self.run_workspace,
+                self.run_project,
+                self.merge_command(),
+                self.session_project,
+                self.run_project,
+                self.session_project,
+                self.session_project,
+            )
         } else {
             write!(
                 f,
-                ". {}/{} already holds its own sessions or pages, so it was not renamed \
-                 automatically; see docs/lifecycle-ops.md before merging the two",
+                ". {}/{} already holds its own sessions or pages and is in another workspace, \
+                 so it was not renamed automatically; see docs/lifecycle-ops.md before merging \
+                 the two",
                 self.run_workspace, self.run_project
             )
         }
@@ -151,8 +179,12 @@ pub(crate) fn confirm_repair(
 
 /// Join the projects on the server and point this checkout at the result
 /// ([`super::repair_split::adopt`]).
-pub(crate) async fn apply_repair(config: &Config, split: &ProjectSplit) -> Result<()> {
-    let endpoint = ServerEndpoint::for_checkout(config).await?;
+pub(crate) async fn apply_repair(
+    config: &Config,
+    split: &ProjectSplit,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    let endpoint = ServerEndpoint::for_checkout_at(config, cwd).await?;
     let adopted = super::repair_split::adopt(
         config,
         &endpoint,
@@ -297,6 +329,25 @@ mod tests {
         .to_string();
         assert!(!busy.contains("repair-split"));
         assert!(busy.contains("already holds its own sessions or pages"));
+        // The non-repairable message names the exact merge command (by id),
+        // the dry-run/--confirm flow, and the no-merge marker alternative.
+        assert!(busy.contains(
+            "ai-memory merge-project --workspace default \
+             --from-project-id 01a19da2-094f-7830-9807-1d32f2fdb464 \
+             --into-project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96"
+        ));
+        assert!(busy.contains("--confirm"));
+        assert!(busy.contains("project = \"api\""));
+        // Different workspaces: merge-project cannot name both, so the message
+        // points to docs instead of a command.
+        let cross = ProjectSplit {
+            run_sessions: 3,
+            workspace: "team".into(),
+            ..split()
+        }
+        .to_string();
+        assert!(!cross.contains("merge-project"));
+        assert!(cross.contains("in another workspace"));
     }
 
     #[test]

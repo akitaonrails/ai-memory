@@ -1102,6 +1102,9 @@ fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Opt
     let lower = target.to_ascii_lowercase();
     if target.is_empty()
         || target.contains("://")
+        // A `//host/path` destination is protocol-relative: it leaves the
+        // wiki for `host`, so it names no local page.
+        || (!wikilink && target.starts_with("//"))
         || target.contains('\\')
         || lower.starts_with("mailto:")
         || lower.starts_with("data:")
@@ -1392,6 +1395,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_links_protocol_relative_destination_is_external() {
+        // `//host/path` is a network-path reference (RFC 3986 §4.2): a
+        // renderer sends the reader to `host`, so it is no wiki page.
+        let links = extract_links("[x](//example.com/guide.md) [y](/notes/a.md)", &page());
+        let paths: Vec<_> = links.iter().map(|l| l.path.as_str()).collect();
+        assert_eq!(paths, ["notes/a.md"], "{links:?}");
+    }
+
+    #[test]
     fn extract_links_file_and_vbscript_schemes_are_not_scopes() {
         // `/web` already leaves these literal. Without the same prefixes
         // here, `[[file:notes/x.md]]` peels `file` as a project scope and
@@ -1575,6 +1587,41 @@ mod tests {
             body: "Hello\n".into(),
         };
         assert_eq!(emit(&md).unwrap(), "Hello\n");
+    }
+
+    /// Shapes serde_yaml 0.9 (libyaml, YAML 1.1) read and granit-parser
+    /// (YAML 1.2) reads otherwise. Pinned so a parser bump that changes one
+    /// is a red test, not a page that silently stops indexing.
+    #[test]
+    fn frontmatter_shapes_read_differently_since_serde_saphyr() {
+        let refused = |yaml: &str| {
+            let err = parse(&format!("---\n{yaml}\n---\nbody\n")).unwrap_err();
+            assert!(
+                matches!(err, crate::error::WikiError::Yaml(_)),
+                "{yaml:?}: {err:?}"
+            );
+        };
+        // A comment glued to a closing quote or a block indicator.
+        refused("title: 'Release notes'# reviewed");
+        refused("a: \"x\"# c");
+        refused(">#x");
+        // U+2028 was a line break under YAML 1.1.
+        refused(">+\u{2028}");
+        refused("a: x\u{2028}b: y");
+        // Kept as content now, folded to a space before.
+        assert_eq!(
+            frontmatter_of("a: \"x\u{85}y\""),
+            serde_json::json!({ "a": "x\u{85}y" })
+        );
+        assert_eq!(
+            frontmatter_of("a: |\n  x\u{2028}  y"),
+            serde_json::json!({ "a": "x\u{2028}  y" })
+        );
+        // Control: with a space before `#`, both parsers agree.
+        assert_eq!(
+            frontmatter_of("title: 'Release notes' # reviewed"),
+            serde_json::json!({ "title": "Release notes" })
+        );
     }
 
     fn frontmatter_of(yaml: &str) -> serde_json::Value {

@@ -105,6 +105,62 @@ class FilterTest(unittest.TestCase):
         lines = ["#[cfg(test)]", "fn helper() {}", "#[cfg(test)]", "mod tests {", "    x", "}"]
         self.assertEqual(f.test_module_ranges(lines), [(4, 6)])
 
+    def test_module_range_spans_a_fixture_with_a_column_zero_brace(self):
+        # Regression for code-scanning #250: a raw-string fixture inside the test
+        # module holds lines that are a bare `}` at column 0. The module must
+        # still extend past them to its real closing brace, so a later test line
+        # is recognised as test code.
+        lines = [
+            "#[cfg(test)]",
+            "mod tests {",
+            "    #[test]",
+            "    fn writes_a_fixture() {",
+            "        let script = r#\"",
+            "try {",
+            "  run();",
+            "} finally {",
+            "  server.close();",
+            "}",  # column-0 brace inside the raw string
+            "\"#;",
+            "        let _ = script;",
+            "    }",
+            "    #[test]",
+            "    fn logs_token() {",
+            "        let token = \"aim_x\";",
+            "        assert!(true, \"{token}\");",
+            "    }",
+            "}",
+        ]
+        ranges = f.test_module_ranges(lines)
+        self.assertEqual(ranges, [(2, 19)])
+        # The naive first-`}` scan stopped at line 10; the token assertion at 17
+        # must now fall inside the module.
+        self.assertTrue(any(start <= 17 <= end for start, end in ranges))
+
+    def test_matching_brace_line_ignores_braces_in_strings_and_comments(self):
+        lines = [
+            "mod tests {",
+            '    let a = "} not a close {";',
+            "    // } not a close either",
+            "    /* }",
+            "       still a comment } */",
+            "    let c = '}';",
+            "}",
+        ]
+        self.assertEqual(f.matching_brace_line(lines, 0), 6)
+
+    def test_inline_test_after_a_fixture_brace_is_dropped(self):
+        # End-to-end: an alert on a test line past a column-0 fixture brace drops.
+        root = Path(self.tmp.name)
+        src = (
+            "#[cfg(test)]\nmod tests {\n    fn fixture() {\n        let s = r#\"\n}\n\"#;\n"
+            "        let _ = s;\n    }\n    fn logs(session_id: &str) {\n"
+            '        eprintln!("{session_id}");\n    }\n}\n'
+        )
+        (root / "crates/x/src/lib.rs").write_text(src, encoding="utf-8")
+        code = f.TestCode(root)
+        self.assertTrue(code.contains("crates/x/src/lib.rs", 10))
+
     def test_out_of_line_module_paths_follow_rustc(self):
         from pathlib import PurePosixPath as P
 

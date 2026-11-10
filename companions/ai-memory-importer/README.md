@@ -202,6 +202,8 @@ DOCX carriage returns and formatted PPTX breaks, and DOCX tabs. Paired XML
 start/end tags and self-closing tags produce the same separators.
 Paragraph tab-stop definitions are formatting and do not insert text.
 
+XLSX extraction reads the base cell text and omits pronunciation annotations.
+
 VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
 between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep
 their cue text. WebVTT character references such as `&amp;` and `&#233;` are

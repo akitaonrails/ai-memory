@@ -4345,7 +4345,7 @@ impl AiMemoryServer {
             ai_memory_consolidate::LintOptions {
                 dry_run: args.dry_run.unwrap_or(false),
                 use_llm: !args.no_llm.unwrap_or(false),
-                decay_lambda: self.decay_params.lambda,
+                decay: self.decay_params,
                 // Drive the zero-LLM contradiction detector (A5) off the
                 // configured embedder's triple; `None` when no embedder is
                 // configured makes that pass a clean no-op.
@@ -4454,16 +4454,23 @@ impl AiMemoryServer {
         let dry = args.dry_run.unwrap_or(false);
         // A session id reaches a repository without naming it, so it never
         // passes through scope resolution and the grant check that comes with
-        // it (#708). Authorize the repository the page would land in — the
-        // consolidator's own target, not a guess — before anything runs,
-        // dry runs included: a dry run reports the resolved path and the
-        // admission verdict, which is itself information about that
-        // repository. Writing a page needs `write`.
+        // it (#708). Resolve the consolidator's own write target ONCE here,
+        // authorize the repository the page would land in, then bind the
+        // consolidation to that exact scope below (`*_in_scope`). Resolving
+        // twice — once to authorize, once inside the consolidator — left a
+        // window in which a concurrent observation in another project could
+        // flip the target between the grant check and the write, landing the
+        // page (built from that project's observations) in a repository the
+        // caller was never granted (GHSA-xfgc-hc4c-wj7h). Authorize even a
+        // dry run: it reports the resolved path and the admission verdict,
+        // itself information about that repository. Writing a page needs
+        // `write`.
+        let target = consolidator
+            .session_target(session_id)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         if let Some(viewer) = Self::viewer_from_parts(Some(&parts))
-            && let Some((workspace_id, project_id)) = consolidator
-                .session_target(session_id)
-                .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            && let Some((workspace_id, project_id)) = target
         {
             ai_memory_store::authorize_scope_for(
                 &self.reader,
@@ -4490,29 +4497,60 @@ impl AiMemoryServer {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         if args.multi_page.unwrap_or(false) {
-            let outcomes = consolidator
-                .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(
-                        ai_memory_consolidate::redacted_error_summary(&e),
-                        None,
-                    )
-                })?;
+            // Bind to the authorized target when there is one; a `None` target
+            // (no observations, no session row) falls through to the
+            // re-resolving path, which reports the unknown session as unknown.
+            let outcomes = match target {
+                Some((ws, proj)) => {
+                    consolidator
+                        .consolidate_session_multi_in_scope(
+                            ws,
+                            proj,
+                            session_id,
+                            dry,
+                            actor,
+                            author_id,
+                            instructions,
+                        )
+                        .await
+                }
+                None => {
+                    consolidator
+                        .consolidate_session_multi(session_id, dry, actor, author_id, instructions)
+                        .await
+                }
+            }
+            .map_err(|e| {
+                McpError::internal_error(ai_memory_consolidate::redacted_error_summary(&e), None)
+            })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
             ok_json(&serde_json::json!({ "outcomes": outcomes }))
         } else {
-            let outcome = consolidator
-                .consolidate_session(session_id, dry, actor, author_id, instructions)
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(
-                        ai_memory_consolidate::redacted_error_summary(&e),
-                        None,
-                    )
-                })?;
+            let outcome = match target {
+                Some((ws, proj)) => {
+                    consolidator
+                        .consolidate_session_in_scope(
+                            ws,
+                            proj,
+                            session_id,
+                            dry,
+                            actor,
+                            author_id,
+                            instructions,
+                        )
+                        .await
+                }
+                None => {
+                    consolidator
+                        .consolidate_session(session_id, dry, actor, author_id, instructions)
+                        .await
+                }
+            }
+            .map_err(|e| {
+                McpError::internal_error(ai_memory_consolidate::redacted_error_summary(&e), None)
+            })?;
             if !dry {
                 self.reconcile_consolidation_job(session_id).await;
             }
@@ -6707,7 +6745,7 @@ impl AiMemoryServer {
             checkpoint_or_mcp(wiki, format!("pre-memory_delete_page: {}", path.as_str()))?;
 
         let author_id = crate::actor::author_id_from_parts(&parts);
-        match expected {
+        let deleted = match expected {
             None => wiki
                 .delete_page(ws, proj, &path, admission_ctx, author_id)
                 .await
@@ -6727,13 +6765,14 @@ impl AiMemoryServer {
                         current,
                     ));
                 }
+                deleted
             }
-        }
+        };
         let checkpoint = checkpoint_or_warn(wiki, format!("memory_delete_page: {}", path.as_str()));
 
         ok_json(&serde_json::json!({
             "path": path.to_string(),
-            "deleted": true,
+            "deleted": deleted,
             "pre_checkpoint": pre_checkpoint,
             "checkpoint": checkpoint,
         }))
@@ -7068,7 +7107,9 @@ impl AiMemoryServer {
                 None => ai_memory_core::OwnerFilter::Unattributed,
             }
         };
-        let receiving_cwd = args.cwd;
+        // Blank means omitted, as for `handoff_id`: an empty path has no
+        // directory inside it, so it would hide every automatic handoff.
+        let receiving_cwd = args.cwd.filter(|cwd| !cwd.trim().is_empty());
         let requested_id = args
             .handoff_id
             .as_deref()
@@ -7369,6 +7410,14 @@ impl AiMemoryServer {
             "Pass from_workspace and from_project to name the sending project.",
         )
         .await?;
+        // Both recipient fields are required: a blank one would fall through
+        // to the caller's current project and deliver to the sender's inbox.
+        if args.to_workspace.trim().is_empty() || args.to_project.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "to_workspace and to_project are required: name the recipient project",
+                None,
+            ));
+        }
         // Recipient MUST already exist: resolved without creating it, so a typo
         // fails closed with a scope error naming the target instead of dropping
         // a message into a phantom inbox nobody reads. And it needs `write`:
@@ -12434,6 +12483,39 @@ mod tests {
             result.is_err(),
             "sending to a non-existent recipient project must fail closed, not create it"
         );
+    }
+
+    /// Both recipient fields are required. A blank one used to fall through
+    /// to the caller's current project, so the message landed in the
+    /// sender's own inbox instead of being refused.
+    #[tokio::test]
+    async fn message_send_with_a_blank_recipient_is_invalid_params() {
+        let (_tmp, _store, server, _ws, _proj) = setup_server().await;
+        for (to_workspace, to_project) in [("", "  "), ("", "scratch"), ("default", "")] {
+            let err = server
+                .memory_message_send(
+                    Parameters(MessageSendArgs {
+                        to_workspace: to_workspace.into(),
+                        to_project: to_project.into(),
+                        to_agent: None,
+                        body: "hello?".into(),
+                        subject: None,
+                        nature: ai_memory_core::MessageNature::Unknown,
+                        evidence: None,
+                        from_agent: None,
+                        from_project: Some("scratch".into()),
+                        from_workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{to_workspace:?}/{to_project:?}: {err:?}"
+            );
+        }
     }
 
     /// The design's open question 3 (#708): delivering into a restricted
@@ -25449,6 +25531,67 @@ mod tests {
         assert!(again_text.contains("\"handoff\": null"));
         // Taken by this server's own MCP call, not by a SessionStart hook.
         assert!(again_text.contains("\"status\": \"none_pending\""));
+    }
+
+    /// A blank `cwd` is an omitted one, as for `handoff_id`: clients that
+    /// fill every optional field send `""`, and no stored directory lies
+    /// within an empty path, so it used to hide every automatic handoff.
+    #[tokio::test]
+    async fn memory_handoff_accept_reads_a_blank_cwd_as_omitted() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: Some("/tmp/aim".into()),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: Some(session_id),
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: Some("/tmp/aim".into()),
+                summary: "automatic baton".into(),
+                open_questions: vec![],
+                next_steps: vec![],
+                files_touched: vec![],
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        let accept = server
+            .memory_handoff_accept(
+                Parameters(HandoffAcceptArgs {
+                    cwd: Some("  ".into()),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                    handoff_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = accept
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(text.contains("automatic baton"), "{text}");
+        assert!(text.contains("\"status\": \"claimed\""), "{text}");
     }
 
     /// `Handoff` is grouped internally into `HandoffScope`/`HandoffOrigin`/

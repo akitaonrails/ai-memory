@@ -744,3 +744,261 @@ fn checkout_commands_match_profile_roots_through_a_symlinked_checkout() {
         );
     }
 }
+
+/// The dry-run previews `purge-project` and `purge-session` print without
+/// `--confirm` ask the server the confirmed purge will reach. The install's
+/// server is dead and server B holds the checkout's only page, so a preview
+/// line can only come from B: one page counted, and B's own 404 for a session
+/// it does not hold. Before this, both previews went to the install's server,
+/// in this setup silently, and with a live one they showed its counts for a
+/// purge that `--confirm` then ran on B.
+#[tokio::test]
+async fn purge_previews_reach_the_marker_profile_server() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    let server_b = RealServer::start("TOKEN-B").await;
+    sb.run_ok(
+        &[
+            "server",
+            "add",
+            "team-b",
+            "--url",
+            &server_b.base,
+            "--root",
+            &sb.root(),
+            "--auth-token-stdin",
+        ],
+        Some("TOKEN-B\n"),
+    );
+    sb.write_marker("workspace = \"team-b\"\nproject = \"repo\"\nserver = \"team-b\"\n");
+    let out = in_repo(
+        &sb,
+        &[
+            "write-page",
+            "--path",
+            "notes/kept.md",
+            "--body",
+            "# Kept\n\nonly on server B",
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = in_repo(&sb, &["purge-project"], &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "no --confirm, no purge: {stderr}");
+    assert!(
+        stdout.contains("Would purge team-b/repo: 1 pages"),
+        "the project preview counts server B's page\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!stderr.contains(&dead), "{stderr}");
+
+    let out = in_repo(
+        &sb,
+        &[
+            "purge-session",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000000",
+        ],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "no --confirm, no purge: {stderr}");
+    assert!(
+        stdout.contains("Preview refused (404)"),
+        "server B answers the session preview\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!stderr.contains(&dead), "{stderr}");
+
+    // Control: AI_MEMORY_SERVER_URL still outranks the marker, so the same
+    // preview now goes to the dead server and falls back to the bare refusal.
+    let out = in_repo(&sb, &["purge-project"], &[("AI_MEMORY_SERVER_URL", &dead)]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(!stdout.contains("Would purge"), "{stdout}");
+
+    // Nothing was purged on B.
+    let read = in_repo(&sb, &["read-page", "--path", "notes/kept.md"], &[]);
+    assert!(String::from_utf8_lossy(&read.stdout).contains("only on server B"));
+}
+
+/// A marker selecting a profile that does not resolve fails both previews
+/// closed with the hook's reason, as it fails the confirmed purge: the
+/// checkout's names are never sent to the install's server instead.
+#[test]
+fn purge_previews_fail_closed_on_a_refused_profile() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    sb.write_marker("workspace = \"team-b\"\nproject = \"repo\"\nserver = \"nobody\"\n");
+    for args in [
+        &["purge-project"][..],
+        &[
+            "purge-session",
+            "--session-id",
+            "00000000-0000-4000-8000-000000000000",
+        ],
+    ] {
+        let out = in_repo(&sb, args, &[]);
+        assert!(!out.status.success(), "`{}`", args.join(" "));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("rejected-unknown-profile"),
+            "`{}`: {stderr}",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains(&dead),
+            "nothing dialed the install's server: {stderr}"
+        );
+    }
+}
+
+/// `merge-project` takes its default workspace from the checkout's marker, so
+/// it merges on the server that marker selects. The install's server is dead
+/// and server B refuses any other token, so the dry run and the confirmed
+/// merge can only have run on B. Before this, both went to the install's
+/// server: here that failed to connect, and a live one holding same-named
+/// projects was merged instead while B stayed untouched.
+#[tokio::test]
+async fn merge_project_merges_on_the_marker_profile_server() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    let server_b = RealServer::start("TOKEN-B").await;
+    sb.run_ok(
+        &[
+            "server",
+            "add",
+            "team-b",
+            "--url",
+            &server_b.base,
+            "--root",
+            &sb.root(),
+            "--auth-token-stdin",
+        ],
+        Some("TOKEN-B\n"),
+    );
+    sb.write_marker("workspace = \"team-b\"\nserver = \"team-b\"\n");
+    for project in ["src", "dst"] {
+        let path = format!("notes/{project}.md");
+        let body = format!("# {project}\n\nonly on server B, in {project}");
+        let out = in_repo(
+            &sb,
+            &[
+                "write-page",
+                "--project",
+                project,
+                "--path",
+                &path,
+                "--body",
+                &body,
+            ],
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let out = in_repo(
+        &sb,
+        &["merge-project", "--from", "src", "--into", "dst"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the dry run reached server B: {stderr}"
+    );
+    assert!(
+        stdout.contains("Would merge team-b/src -> team-b/dst: 1 page versions"),
+        "server B answers the dry run\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!stderr.contains(&dead), "{stderr}");
+
+    let out = in_repo(
+        &sb,
+        &[
+            "merge-project",
+            "--from",
+            "src",
+            "--into",
+            "dst",
+            "--confirm",
+        ],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the merge ran on server B: {stderr}");
+    assert!(
+        stdout.contains("Merged team-b/src -> team-b/dst: 1 page versions"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!stderr.contains(&dead), "{stderr}");
+
+    // The source's page now lives under the target on B.
+    let read = in_repo(
+        &sb,
+        &["read-page", "--project", "dst", "--path", "notes/src.md"],
+        &[],
+    );
+    assert!(
+        String::from_utf8_lossy(&read.stdout).contains("only on server B, in src"),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+
+    // Control: AI_MEMORY_SERVER_URL still outranks the marker, so the same
+    // command now dials the dead server.
+    let out = in_repo(
+        &sb,
+        &["merge-project", "--from", "dst", "--into", "src"],
+        &[("AI_MEMORY_SERVER_URL", &dead)],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&dead), "{stderr}");
+}
+
+/// A marker selecting a profile that does not resolve fails `merge-project`
+/// closed with the hook's reason, dry run and confirmed run alike: the
+/// checkout's workspace is never sent to the install's server instead.
+#[test]
+fn merge_project_fails_closed_on_a_refused_profile() {
+    let sb = Sandbox::new();
+    let dead = point_config_at_a_dead_server(&sb);
+    sb.write_marker("workspace = \"team-b\"\nserver = \"nobody\"\n");
+    for args in [
+        &["merge-project", "--from", "src", "--into", "dst"][..],
+        &[
+            "merge-project",
+            "--from",
+            "src",
+            "--into",
+            "dst",
+            "--confirm",
+        ],
+    ] {
+        let out = in_repo(&sb, args, &[]);
+        assert!(!out.status.success(), "`{}`", args.join(" "));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("rejected-unknown-profile"),
+            "`{}`: {stderr}",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains(&dead),
+            "nothing dialed the install's server: {stderr}"
+        );
+    }
+}

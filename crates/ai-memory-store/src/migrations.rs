@@ -10,7 +10,7 @@ refinery::embed_migrations!("migrations");
 /// `testdata/V62__page_ingestion_windows.pre776.sql`; a regression test
 /// derives this value through refinery's own checksum implementation.
 const ORIGINAL_V62_CHECKSUM: u64 = 16_518_128_245_137_964_566;
-const V62_VERSION: u32 = 62;
+const V62_VERSION: i32 = 62;
 const V62_NAME: &str = "page_ingestion_windows";
 
 /// Run all pending migrations against an open connection.
@@ -111,14 +111,14 @@ fn crlf_checksum(migration: &refinery::Migration) -> Option<u64> {
     ))
 }
 
-fn checksum_for_sql(version: u32, name: &str, sql: &str) -> u64 {
+fn checksum_for_sql(version: i32, name: &str, sql: &str) -> u64 {
     refinery::Migration::unapplied(&format!("V{version}__{name}"), sql)
         .expect("embedded migration identity must remain valid")
         .checksum()
 }
 
 /// Highest schema version baked into this binary (the max embedded migration).
-fn max_supported_version() -> u32 {
+fn max_supported_version() -> i32 {
     migrations::runner()
         .get_migrations()
         .iter()
@@ -141,7 +141,8 @@ fn classify_run_error(err: refinery::Error) -> StoreError {
         if migration.version() > supported {
             return StoreError::DataSchemaAhead {
                 applied: identity,
-                supported,
+                supported: u32::try_from(supported)
+                    .expect("embedded migration version is non-negative"),
             };
         }
     }
@@ -149,7 +150,7 @@ fn classify_run_error(err: refinery::Error) -> StoreError {
 }
 
 #[cfg(test)]
-pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: u32) -> Result<(), refinery::Error> {
+pub(crate) fn run_to(conn: &mut rusqlite::Connection, target: i32) -> Result<(), refinery::Error> {
     migrations::runner()
         .set_target(refinery::Target::Version(target))
         .run(conn)?;
@@ -407,7 +408,7 @@ mod tests {
             StoreError::DataSchemaAhead { applied, supported } => {
                 assert!(applied.contains(&format!("V{future}")), "applied={applied}");
                 assert!(applied.contains("future_feature"), "applied={applied}");
-                assert_eq!(supported, max_supported_version());
+                assert_eq!(i32::try_from(supported).unwrap(), max_supported_version());
             }
             other => panic!("expected DataSchemaAhead, got: {other:?}"),
         }

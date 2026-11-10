@@ -56,12 +56,52 @@ pub fn looks_like_scaffolding(candidate: &str) -> bool {
         return true;
     }
 
+    if looks_like_machine_turn(trimmed) {
+        return true;
+    }
+
     // A decorated shell prompt echoed into the paste.
     if trimmed.starts_with(PROMPT_DECORATION) {
         return true;
     }
 
     false
+}
+
+/// `true` when `candidate` is a turn the harness delivered to
+/// `UserPromptSubmit` as the prompt but the operator never typed — a Claude
+/// Code machine turn (#1855, #2041, #2149).
+///
+/// Claude Code routes several kinds of its own traffic through the prompt
+/// channel: agent-team and cross-session message blocks that carry attributes
+/// (so [`looks_like_markup_block`], which requires a bare tag name, does not
+/// catch them), a `<task-notification>` block, the plain-text envelope the
+/// harness wraps another session's message in, and the summary it injects when
+/// it continues a compacted conversation. None of these is what the user
+/// asked, so none may become a page title or a listed prompt. Recognized by a
+/// bounded leading shape, erring toward keeping text: a user who types one of
+/// these exact openers loses it as a title candidate, the same trade #1855
+/// made for the profile.
+#[must_use]
+pub fn looks_like_machine_turn(candidate: &str) -> bool {
+    let trimmed = candidate.trim_start();
+    opens_with_tag(trimmed, "teammate-message")
+        || opens_with_tag(trimmed, "cross-session-message")
+        || opens_with_tag(trimmed, "task-notification")
+        || trimmed.starts_with("Another Claude session sent a message.")
+        || trimmed.starts_with("This session is being continued from a previous conversation")
+}
+
+/// `true` when `trimmed` opens with the element `<{name}...>`: `<` then the
+/// exact tag name, then a character that ends the name — `>` (bare),
+/// whitespace (attributes follow), or `/` (self-close). The terminator check
+/// is what keeps `<teammate-message-draft>` from matching `teammate-message`.
+fn opens_with_tag(trimmed: &str, name: &str) -> bool {
+    trimmed
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_prefix(name))
+        .and_then(|after| after.chars().next())
+        .is_some_and(|c| c == '>' || c == '/' || c.is_ascii_whitespace())
 }
 
 /// `true` when `candidate` opens with a markup/context block:
@@ -276,6 +316,47 @@ mod tests {
     fn empty_or_blank_is_scaffolding() {
         assert!(looks_like_scaffolding(""));
         assert!(looks_like_scaffolding("   "));
+    }
+
+    #[test]
+    fn claude_code_machine_turns_are_recognized() {
+        // #2149: Claude Code routes these through the prompt channel. The
+        // attribute-bearing tags are the ones `looks_like_markup_block` lets
+        // through (it needs a bare tag name), so the title picker and the
+        // `## Prompts` list caught them only once this predicate existed.
+        for turn in [
+            "<teammate-message teammate_id=\"team-lead\" summary=\"x\">mensagem de aviso",
+            "<teammate-message>bare open",
+            "<cross-session-message from=\"abc\">hi",
+            "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>",
+            "Another Claude session sent a message. It is shown below.",
+            "This session is being continued from a previous conversation that ran out of context.",
+            "  \n<teammate-message foo=\"1\">leading blank lines",
+        ] {
+            assert!(looks_like_machine_turn(turn), "machine turn: {turn:?}");
+            assert!(looks_like_scaffolding(turn), "scaffolding: {turn:?}");
+        }
+    }
+
+    #[test]
+    fn machine_turn_shapes_do_not_swallow_user_prose() {
+        // Bite control: a real prompt that merely mentions this traffic by name
+        // stays user prose for both predicates.
+        for prompt in [
+            "send a teammate-message to the team-lead about the release",
+            "Another Claude session is faster than this one, why?",
+            "This session is being continued manually by me, not the harness",
+            "why did the cross-session-message handler drop the body?",
+        ] {
+            assert!(!looks_like_machine_turn(prompt), "kept machine: {prompt:?}");
+            assert!(!looks_like_scaffolding(prompt), "kept scaffold: {prompt:?}");
+        }
+        // A tag whose name only shares a prefix is not a machine turn. It is
+        // still a markup block, which `looks_like_scaffolding` catches as it
+        // always has — the terminator check only governs the machine-turn rule.
+        assert!(!looks_like_machine_turn(
+            "<teammate-message-draft> is the component I am editing"
+        ));
     }
 
     #[test]
