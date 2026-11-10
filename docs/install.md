@@ -2249,6 +2249,12 @@ stdio entry instead, so the token never enters `mcp.json`; a client with a
 session id of its own is not assumed, so pass explicit `workspace` and
 `project` on project-scoped MCP calls.
 
+**The new server is not usable until WorkBuddy trusts it.** After
+`install-mcp --apply`, open WorkBuddy's **custom connector** settings
+(自定义连接器) and approve the newly added `ai-memory` MCP server. Until it is
+trusted, the entry sits in `mcp.json` but ai-memory's tools do not appear in
+the session.
+
 Skills go into `~/.workbuddy/skills` (global) or `.workbuddy/skills`
 (project). `ai-memory setup` wires WorkBuddy when `~/.workbuddy` exists, and
 `ai-memory uninstall` removes the hook entries. Start a new WorkBuddy session

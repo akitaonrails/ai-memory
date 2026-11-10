@@ -27,7 +27,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `install-mcp --client workbuddy` writes Claude Code's HTTP entry
   (`type: "http"`, `url`, optional `headers`) under `mcpServers` in
   `~/.workbuddy/mcp.json` (a token-file install gets the session-less stdio
-  bridge). `install-skills --agent workbuddy` writes the managed skills to
+  bridge); WorkBuddy only activates the new server after you trust it in its
+  custom connector settings (自定义连接器), so approve `ai-memory` there after
+  the install. `install-skills --agent workbuddy` writes the managed skills to
   `~/.workbuddy/skills` (global) or `.workbuddy/skills` (project). `setup`
   wires WorkBuddy when `~/.workbuddy` exists, `setup-agent --agent workbuddy`
   prints the hook block, and `uninstall` removes the entries. Transcript

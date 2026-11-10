@@ -1081,6 +1081,11 @@ session-less `mcp-bridge` stdio entry instead, so the token never enters
 `mcp.json`; the bridge forwards no session id, so pass explicit `workspace`
 and `project` on project-scoped calls.
 
+**Trust the new server before using it.** WorkBuddy does not activate a
+newly written MCP entry on its own: open its **custom connector** settings
+(自定义连接器) and approve the added `ai-memory` server. The entry is present
+in `mcp.json` either way, but its tools stay unavailable until that approval.
+
 The hook installer writes CodeBuddy's native commands (no script bundle) for
 six Claude Code-shaped events: `SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`. Capture exclusions are
