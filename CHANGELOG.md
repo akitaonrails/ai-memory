@@ -25,9 +25,10 @@ version in [`docs/changelog/`](docs/changelog/):
   the way `profile list` and the digest name it — with or without the `.md`
   suffix — so `profile forget workflow/never-push` removes the entry instead
   of targeting a non-existent `.md`-less sibling. `forget` also fails with a
-  non-zero exit when the entry was not there, because `/admin/delete-page` (and
-  the `memory_delete_page` tool) now report whether a page actually existed
-  rather than always claiming success. (#2181)
+  non-zero exit when the entry was not there, because `/admin/delete-page`
+  reports whether it removed an entry, including Markdown the watcher has
+  not indexed yet. The `memory_delete_page` tool still acknowledges an
+  already-absent page with `deleted: true`. (#2181)
 - Fixed native install and reinstall with a trailing slash in
   `AI_MEMORY_LIB_DIR`. (#2171)
 - Fixed conditional page reads returning a full response for a matching weak
