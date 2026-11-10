@@ -389,6 +389,27 @@ The command calls `GET /admin/recent`, so on a multi-user server only the root
 operator can run it. `[recall] default_global` does not change this command;
 it stays project-scoped unless you pass `--global`.
 
+## Call any MCP tool from the terminal
+
+`ai-memory call` is a shell path to every MCP tool, for an agent that cannot or
+should not load MCP. It covers the tools the dedicated commands above do not,
+such as the hybrid `memory_query`, `memory_briefing`, `memory_patch_page` and
+`memory_handoff_begin`.
+
+```bash
+ai-memory call                                        # list the tools and their input schemas
+ai-memory call memory_query '{"query":"wal mode"}'
+ai-memory call memory_query '{"query":"wal mode","global":true}'
+```
+
+The call goes to the server's `/mcp` endpoint, resolved and authenticated like
+the other client commands. A call that names none of `workspace`, `project`,
+`project_id` or `global` gets the current directory's project filled in when
+the tool takes one, by the same rule as `mcp-bridge --no-session-id`. The tool's
+text result goes to stdout. The exit code is 1 when the tool reports an error
+(its text goes to stderr) or the server answers with a JSON-RPC error, and 2
+when the arguments are not one JSON object.
+
 ## Historical memory and live code intelligence
 
 ai-memory can run beside CodeGraph, an LSP-backed service, a SCIP/LSIF index,

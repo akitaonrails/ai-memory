@@ -15,6 +15,7 @@ mod backfill_member;
 mod backfill_oversized;
 mod backup_agents;
 mod backup_download;
+mod call_e2e;
 mod completions;
 mod credential_masking_e2e;
 mod cross_origin_e2e;

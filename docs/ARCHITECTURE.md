@@ -1058,7 +1058,7 @@ init                        status               list-projects
 run                         show                 continue
 resume                      workstreams          rename-workstream
 workstream-search           audit-contamination  search recent
-read-page                   write-page           delete-page
+read-page                   write-page           delete-page call
 serve                       reset                backup
 restore                     reindex              install-hooks
 hook                        install-mcp          commit
