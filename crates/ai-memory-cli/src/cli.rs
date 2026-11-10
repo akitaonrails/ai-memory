@@ -3453,6 +3453,15 @@ pub struct HookArgs {
     /// `capture_assistant`. No effect on other events (#196).
     #[arg(long)]
     pub capture_assistant: bool,
+    /// Fail closed unless this repository resolves to exactly this server
+    /// profile. A generated plugin that forwards a server-profile repository to
+    /// the native hook (rather than dropping it) passes the profile name it
+    /// read from the marker here; the native hook re-resolves the route from the
+    /// cwd and, if it is not exactly this profile, emits nothing rather than
+    /// delivering to the install default or a different profile (#2122, #992). A
+    /// value is a validated profile name, never a token.
+    #[arg(long)]
+    pub expected_profile: Option<String>,
 }
 
 /// Arguments for hidden `hook-drain`.

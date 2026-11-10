@@ -103,6 +103,7 @@ diag-ai-memory-hook-drain-warning-another-drainer = aviso do hook-drain do ai-me
 diag-ai-memory-hook-drain-warning-event-s = aviso do hook-drain do ai-memory: { $value0 } evento(s) confirmado(s) pelo servidor, { $value1 } ainda na fila, { $value2 } DESCARTADO(S) sem entrega (acima do limite de tentativas ou mais antigos que o TTL da fila)
 diag-ai-memory-hook-warning-could-not-parse = aviso do hook do ai-memory: não foi possível analisar o payload do evento como JSON; nada foi capturado
 diag-ai-memory-hook-warning-this-repository-s = aviso do hook do ai-memory: o marcador deste repositório seleciona o perfil de servidor { $value0 }, que foi recusado ({ $value1 }); o evento foi descartado
+diag-ai-memory-hook-expected-server-profile = hook do ai-memory: este repositório não resolveu para o perfil de servidor esperado `{ $value0 }`; nada foi capturado ou injetado
 diag-ai-memory-hook-warning-failed-to-spool-2 = aviso do hook do ai-memory: falha ao colocar um prompt do Antigravity na fila; ele será tentado de novo no próximo turno
 diag-ai-memory-hook-warning-failed-to-spool-3 = aviso do hook do ai-memory: falha ao colocar o evento de ciclo de vida na fila; a captura deste evento foi ignorada
 diag-ai-memory-hook-warning-the-event-named = aviso do hook do ai-memory: o evento não informou diretório de projeto, então nenhum handoff foi buscado; recupere um handoff pendente com memory_handoff_accept

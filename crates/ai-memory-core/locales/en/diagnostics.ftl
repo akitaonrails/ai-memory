@@ -114,6 +114,7 @@ diag-ai-memory-hook-drain-warning-another-drainer = ai-memory hook-drain warning
 diag-ai-memory-hook-drain-warning-event-s = ai-memory hook-drain warning: { $value0 } event(s) acknowledged by the server, { $value1 } still queued, { $value2 } DROPPED undelivered (past the retry cap or older than the spool TTL)
 diag-ai-memory-hook-warning-could-not-parse = ai-memory hook warning: could not parse event payload as JSON; nothing was captured
 diag-ai-memory-hook-warning-this-repository-s = ai-memory hook warning: this repository's marker selects server profile { $value0 }, which was refused ({ $value1 }); the event was dropped
+diag-ai-memory-hook-expected-server-profile = ai-memory hook: this repository did not resolve to the expected server profile `{ $value0 }`; nothing was captured or injected
 diag-ai-memory-hook-warning-failed-to-spool-2 = ai-memory hook warning: failed to spool an Antigravity prompt; it is retried on the next turn
 diag-ai-memory-hook-warning-failed-to-spool-3 = ai-memory hook warning: failed to spool lifecycle event; capture for this event was skipped
 diag-ai-memory-hook-warning-the-event-named = ai-memory hook warning: the event named no project directory, so no handoff was fetched; recover a pending one with memory_handoff_accept

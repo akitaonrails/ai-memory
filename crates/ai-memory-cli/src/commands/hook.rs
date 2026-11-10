@@ -1898,6 +1898,35 @@ where
         writeln!(stdout, "{output}")?;
         return Ok(());
     }
+    // #2122: a generated plugin that forwards a `server = "<profile>"`
+    // repository to the native hook (instead of dropping it) passes the profile
+    // name it read from the marker as `--expected-profile`. Our own route
+    // resolution must land on exactly that profile; anything else — the install
+    // default, a refusal, or a different profile — means the two marker walks
+    // diverged, so fail closed and emit nothing rather than deliver a routed
+    // repository to the wrong server (the same emit-nothing posture a refused
+    // profile below takes).
+    if let Some(expected_raw) = args.expected_profile.as_deref() {
+        let resolved_as_expected = matches!(
+            &route,
+            HookRoute::Profile(resolved)
+                if crate::server_profiles::ProfileName::parse(expected_raw)
+                    .is_some_and(|expected| expected == resolved.name)
+        );
+        if !resolved_as_expected {
+            eprintln!(
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook: this repository did not resolve to the expected \
+                     server profile `{expected_raw}`; nothing was captured or injected"
+                ))
+            );
+            // The agent's empty success envelope — never a handoff, never a
+            // capture — exactly as the refused-profile branch below emits.
+            write_success_response(stdout, agent_kind, hook_event)?;
+            return Ok(());
+        }
+    }
     // #992: a marker that selects a server profile which does not resolve
     // emits nothing — not the event, not a handoff fetch, not a backfill.
     // Delivering to the install default instead would hand one team's
@@ -3627,6 +3656,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -4700,6 +4730,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4743,6 +4774,7 @@ mod tests {
                 project_strategy: None,
                 check_capture: false,
                 capture_assistant: false,
+                expected_profile: None,
                 capture_mode: None,
             };
 
@@ -4798,6 +4830,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4831,6 +4864,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -4913,6 +4947,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4945,6 +4980,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -7577,6 +7613,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7619,6 +7656,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -7651,6 +7689,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7664,6 +7703,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7677,6 +7717,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7690,6 +7731,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -9080,6 +9122,118 @@ mod tests {
         );
         assert_eq!(entries[1].token.as_deref(), Some("tok-b"));
         assert_eq!(entries[1].profile.as_deref(), Some("team-b"));
+    }
+
+    /// `--expected-profile` (#2122): a generated plugin that forwards a routed
+    /// repository to the native hook passes the profile name it read from the
+    /// marker. The native hook captures only when its own route resolution is
+    /// exactly that profile, and emits nothing — no spool entry, no stdout —
+    /// when the two diverge: a different profile, the install default, a
+    /// refused profile, or a malformed name. The matching control proves the
+    /// guard is not a blanket deny. Fails closed if the guard is removed
+    /// (every divergent case would then deliver to some server).
+    #[tokio::test]
+    async fn expected_profile_captures_on_a_match_and_fails_closed_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let work = tmp.path().join("work");
+        let repo_a = repo_with_marker(&work, "a", "server = \"team-a\"\n");
+        let repo_b = repo_with_marker(&work, "b", "server = \"team-b\"\n");
+        let plain = repo_with_marker(&work, "plain", "workspace = \"w\"\n");
+        let unknown = repo_with_marker(&work, "unknown", "server = \"nobody\"\n");
+        register_profile(
+            &data_dir,
+            "team-a",
+            "https://a.example",
+            &[&repo_a],
+            Some("tok-a"),
+        );
+        register_profile(
+            &data_dir,
+            "team-b",
+            "https://b.example",
+            &[&repo_b],
+            Some("tok-b"),
+        );
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+        let spool = hook_spool::spool_dir(&data_dir);
+
+        let expecting = |profile: &str| {
+            let mut args = claude_args("user-prompt-submit", "https://default.example");
+            args.expected_profile = Some(profile.to_string());
+            args
+        };
+
+        // Control: the expected profile is exactly the one the marker resolves
+        // to, so the event is captured to the profile's server with its token.
+        let out = run_prompt(&data_dir, expecting("team-a"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1, "a matching expected-profile captures");
+        assert_eq!(entries[0].profile.as_deref(), Some("team-a"));
+        assert_eq!(entries[0].token.as_deref(), Some("tok-a"));
+        assert!(
+            entries[0].url.starts_with("https://a.example/hook?"),
+            "{}",
+            entries[0].url
+        );
+
+        // Mismatch: the marker resolves to team-a, but team-b was expected.
+        let out = run_prompt(&data_dir, expecting("team-b"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a mismatched profile name spools nothing"
+        );
+
+        // Install default: a repo with no `server` key resolves to the install
+        // default, which is never the expected profile — do not fall back.
+        let out = run_prompt(&data_dir, expecting("team-a"), &plain).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "the install default is not the expected profile"
+        );
+
+        // Refused: the marker selects an unregistered profile (Rejected route).
+        let out = run_prompt(&data_dir, expecting("nobody"), &unknown).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a refused profile route spools nothing"
+        );
+
+        // Malformed name can never equal a validated profile.
+        let out = run_prompt(&data_dir, expecting("Bad/Name"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a malformed expected name captures nothing"
+        );
     }
 
     /// Front door for Meta Muse Code's settings.json hooks (adversarial),
