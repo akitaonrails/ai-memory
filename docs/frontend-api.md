@@ -991,8 +991,9 @@ environment. The list is validated at startup:
 
 Invalid origins fail startup with a clear error rather than silently
 accepting wildcard. The layer allows `GET / POST / OPTIONS`,
-`Authorization` + `Content-Type` headers, and credentials, with a
-10-minute preflight cache.
+`Authorization`, `Content-Type`, `If-None-Match` and `X-CSRF-Token`
+headers, and credentials, with a 10-minute preflight cache. It exposes
+`ETag` so a cross-origin frontend can revalidate a page.
 
 The CORS layer sits outside authentication. A browser sends its preflight
 (`OPTIONS` with `Access-Control-Request-*`) without credentials, so the

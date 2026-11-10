@@ -11,7 +11,7 @@
 //! and can fall back to the stored OIDC device-flow token used by native hooks.
 
 use std::fmt;
-use std::io::{BufWriter, Write as _};
+use std::io::{BufWriter, Read as _, Seek as _, Write as _};
 use std::path::Path;
 use std::time::Duration;
 
@@ -403,8 +403,8 @@ pub(crate) fn is_loopback_url(url: &str) -> bool {
 
 /// Shared reqwest client for thin-client CLI subcommands. Redirects are
 /// disabled so a 3xx from an SSO portal or proxy cannot be followed: JSON
-/// GET/POST would otherwise consume a login page, a 307/308 would replay the
-/// body, and [`post_to_file`] would write that page as a backup tarball.
+/// GET/POST would otherwise consume a login page, and a 307/308 would replay
+/// the body.
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -657,17 +657,17 @@ async fn probe_server_with_timeout(endpoint: &ServerEndpoint, timeout: Duration)
 
 /// POST an empty body to `<endpoint>{path}`, streaming the response to `dest`.
 ///
-/// Intended for routes whose response is binary (e.g. `POST /admin/backup`
-/// returns an `application/gzip` tarball). On non-2xx the response body is
-/// consumed and returned as an error string. Returns bytes written. A completed
-/// download atomically replaces the destination path; a destination symlink is
-/// replaced rather than modifying the file it points to. Replacement symlinks
-/// and new destinations use private permissions; only existing regular files
-/// retain their permissions.
+/// Intended for routes returning gzip archives, such as `POST /admin/backup`.
+/// On non-2xx the response body is consumed and returned as an error string.
+/// A complete download starting with a gzip signature atomically replaces the
+/// destination path and returns the number of bytes written. A destination
+/// symlink is replaced rather than modifying the file it points to. Replacement
+/// symlinks and new destinations use private permissions; only existing regular
+/// files retain their permissions.
 ///
 /// # Errors
 /// Returns an error when the connection fails, the response is non-2xx,
-/// or the body cannot be read or written.
+/// the body cannot be read or written, or the gzip signature is missing.
 pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) -> Result<u64> {
     let client = http_client();
     let url = endpoint.build_url(path);
@@ -696,8 +696,21 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
         .flush()
         .with_context(|| format!("flushing {}", dest.display()))?;
     drop(writer);
-    // A failed response must leave the previous archive usable. The temporary
-    // file stays private until the entire response has arrived.
+    // A gateway can return a login page with a success status. Check the body
+    // because an intermediary may omit or rewrite the media type.
+    const GZIP_SIGNATURE: [u8; 3] = [0x1f, 0x8b, 0x08];
+    let mut signature = [0; GZIP_SIGNATURE.len()];
+    if written >= signature.len() as u64 {
+        let staged = temporary.as_file_mut();
+        staged
+            .rewind()
+            .and_then(|()| staged.read_exact(&mut signature))
+            .context(endpoint.i18n.text("cli-archive-download-reading-signature"))?;
+    }
+    if signature != GZIP_SIGNATURE {
+        anyhow::bail!("{}", endpoint.i18n.text("cli-archive-download-not-gzip"));
+    }
+    // Keep the staged file private until the complete response passes the check.
     if let Some(permissions) = permissions {
         temporary
             .as_file()

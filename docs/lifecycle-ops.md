@@ -1261,9 +1261,10 @@ What happens on the server:
 3. Response body IS the gzipped tarball
    (`Content-Type: application/gzip`).
 
-CLI writes the response body to `--to`. For a homelab user
-this is the standard "snapshot before doing something dangerous"
-move: `ai-memory backup` first, then proceed.
+The CLI replaces `--to` after receiving the full response and checking its gzip
+signature. An interrupted download or a body without that signature keeps the
+previous archive intact. Use `ai-memory backup` before making changes that may
+require restoring the snapshot.
 
 This tarball is an online **data snapshot**, not a complete host image. It
 intentionally excludes `auth-tokens/`, the hook-side `auth-token` and
