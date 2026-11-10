@@ -1851,7 +1851,15 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 axum::Router::new()
                     .nest_service("/mcp", mcp_service)
                     .merge(hooks)
-                    .merge(workstreams),
+                    .merge(workstreams)
+                    .merge(ai_memory_mcp::messages::router(
+                        ai_memory_mcp::messages::MessageState {
+                            reader: store.reader.clone(),
+                            writer: store.writer.clone(),
+                            wiki: wiki.clone(),
+                            trusted_proxy_identity: auth_state.actor_proxy_bearer().is_some(),
+                        },
+                    )),
                 store.reader.clone(),
                 auth_state.clone(),
             );
