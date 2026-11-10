@@ -63,6 +63,9 @@ enum HookConfigShape {
     NestedHooksKey,
     /// Devin `hooks.v1.json`: the file itself is `{ "Event": [...] }`.
     FlatHookFile,
+    /// Cursor `hooks.json`: the nested shape, written back with every `/`
+    /// escaped so Cursor's comment stripper keeps the file.
+    CursorHooksFile,
 }
 
 /// Generated files that uninstall may delete after content re-validation.
@@ -249,7 +252,7 @@ fn build_plan(
             ),
             (
                 install_hooks::cursor_hooks_path()?,
-                HookConfigShape::NestedHooksKey,
+                HookConfigShape::CursorHooksFile,
             ),
             (
                 install_hooks::gemini_settings_path()?,
@@ -314,6 +317,7 @@ fn build_plan(
             let removal = match shape {
                 HookConfigShape::NestedHooksKey => strip_ai_memory_hooks(&content)?,
                 HookConfigShape::FlatHookFile => strip_ai_memory_hooks_flat(&content)?,
+                HookConfigShape::CursorHooksFile => strip_cursor_hooks(&content)?,
             };
             push_rewrite(
                 &mut plan,
@@ -767,6 +771,9 @@ fn apply_change(
                         }
                         RewriteOp::HooksJson(HookConfigShape::FlatHookFile) => {
                             strip_ai_memory_hooks_flat(&out)?.new_content
+                        }
+                        RewriteOp::HooksJson(HookConfigShape::CursorHooksFile) => {
+                            strip_cursor_hooks(&out)?.new_content
                         }
                         RewriteOp::AntigravityHooksJson => {
                             strip_antigravity_hooks(&out)?.new_content
@@ -1409,6 +1416,15 @@ fn strip_ai_memory_hooks(content: &str) -> Result<HookRemoval> {
         new_content,
         removed_events,
     })
+}
+
+/// Strip ai-memory's entries from Cursor's `hooks.json` and keep the escaped
+/// `\/` form install writes, so a `//` in a hook the user keeps does not make
+/// Cursor drop the whole file.
+fn strip_cursor_hooks(content: &str) -> Result<HookRemoval> {
+    let mut removal = strip_ai_memory_hooks(content)?;
+    removal.new_content = install_hooks::escape_slashes_for_cursor_jsonc(&removal.new_content);
+    Ok(removal)
 }
 
 /// Remove ai-memory's entries from Zero's hooks.json `hooks` array. Zero
@@ -2606,6 +2622,30 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
         assert!(v["hooks"].get("stop").is_none());
         assert_eq!(v["version"], 1, "sibling top-level key preserved");
+    }
+
+    #[test]
+    fn strip_cursor_hooks_keeps_the_kept_hooks_loadable_by_cursor() {
+        let content = r#"{
+      "version": 1,
+      "hooks": {
+        "stop": [
+          {"type":"command","command":"AI_MEMORY_HOOK_URL=https:\/\/h \/x\/stop.sh"},
+          {"type":"command","command":"curl -s https:\/\/example.com\/ping"}
+        ]
+      }
+    }"#;
+        let out = strip_cursor_hooks(content).unwrap();
+        assert_eq!(out.removed_events, vec!["stop".to_string()]);
+        assert!(
+            !out.new_content.contains("//"),
+            "a bare // makes Cursor drop the file: {}",
+            out.new_content
+        );
+        let v: serde_json::Value = serde_json::from_str(&out.new_content).unwrap();
+        let stop = v["hooks"]["stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "only ours removed");
+        assert_eq!(stop[0]["command"], "curl -s https://example.com/ping");
     }
 
     #[test]

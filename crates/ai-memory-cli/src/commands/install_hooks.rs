@@ -3280,7 +3280,7 @@ fn path_needs_shell_quoting(path: &Path) -> bool {
 /// inside JSON string literals (never in structural tokens), so escaping the
 /// whole serialized text is safe and also repairs any `//` in a user's own
 /// preserved entries.
-fn escape_slashes_for_cursor_jsonc(json: &str) -> String {
+pub(crate) fn escape_slashes_for_cursor_jsonc(json: &str) -> String {
     json.replace('/', "\\/")
 }
 
