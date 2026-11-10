@@ -20,6 +20,15 @@ version in [`docs/changelog/`](docs/changelog/):
   NAME`). `--or-new` requires `--workstream` and conflicts with `--new`; if a
   racing caller creates the name first, it is selected rather than duplicated
   (#2045).
+- `[routing] brief_on_project_change` (default `false`) re-briefs the agent when
+  a session moves mid-session into another project. When a Claude Code prompt's
+  cwd resolves through a `.ai-memory.toml` marker to a project other than the
+  one the session started in, and that project has not been briefed in this
+  session yet, its core brief (pinned, `_rules/`, `_slots/`, within the brief
+  budget) is returned as additional context — once per project per session. A
+  bare cwd with no marker never triggers it; the server owns the opt-in, the
+  differs-from-session test and the once-per-session record, and a Cursor
+  payload (which runs the same hook settings) is excluded (#2103).
 - `[maintenance] lint_llm_interval_secs` (default `0`, off) runs the LLM
   contradiction pass across every project on its own persisted cadence, with
   one `lint` provider call per project that has enough semantic pages. With no
@@ -78,6 +87,13 @@ version in [`docs/changelog/`](docs/changelog/):
   sends up to 16 KiB of the scrubbed text and the server applies the cap, so
   a longer answer (about 600 CJK characters fit in 2,000 bytes) is no longer
   always cut in half. (#2118)
+- `ai-memory message send`, `list`, `pop` and `cancel` now work with a normal
+  API key on a multi-user server. They returned 403 because they called the
+  root-only `/admin/messages*` routes. The new `/messages*` routes apply the same
+  per-project grants as the `memory_message_*` MCP tools, and the CLI falls back
+  to the `/admin` routes on an older server. Those routes stay root-only. Admin
+  pop and cancel now also run the admission and observer webhooks, as the MCP
+  tools already did. (#2146)
 
 ### Changed
 
