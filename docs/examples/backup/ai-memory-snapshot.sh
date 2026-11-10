@@ -4,8 +4,8 @@
 # Daily snapshot of an ai-memory single-user install:
 #   1. rsync the mutable data dir into a git-tracked mirror checkout,
 #      excluding derived state and secrets (see .gitignore in this dir).
-#   2. commit + push the mirror to a remote git repository when anything
-#      changed.
+#   2. commit changes and push the mirror, including any earlier commits
+#      whose push failed.
 #   3. ask the running server for a consistent online backup (wiki + SQLite +
 #      data-dir config.toml) and write it to a second location.
 #
@@ -82,11 +82,15 @@ cd "$REPO_DIR"
 git add -A
 
 if git diff --cached --quiet; then
-    echo "no changes since last snapshot; skipping commit + push"
+    echo "no changes since last snapshot; skipping commit"
 else
     git commit -m "auto: snapshot $stamp" | tail -3
-    echo "--- push ---"
-    timeout 180 git push origin "$(git rev-parse --abbrev-ref HEAD)" 2>&1 | tail -10
+fi
+echo "--- push ---"
+push_status=0
+timeout 180 git push origin "$(git rev-parse --abbrev-ref HEAD)" 2>&1 | tail -10 || push_status=$?
+if (( push_status != 0 )); then
+    echo "mirror push failed (status $push_status); continuing with the online snapshot" >&2
 fi
 
 echo "--- online data snapshot to second location ---"
@@ -102,4 +106,8 @@ echo "--- rotate logs (retention: ${LOG_RETENTION_DAYS}d) ---"
 find "$LOG_DIR" -maxdepth 1 -name 'ai-memory-snapshot_*.log' -type f \
     -mtime "+${LOG_RETENTION_DAYS}" -delete -print
 
+if (( push_status != 0 )); then
+    echo "=== $(date -Iseconds) online snapshot done; mirror push failed ===" >&2
+    exit "$push_status"
+fi
 echo "=== $(date -Iseconds) ai-memory snapshot done ==="
