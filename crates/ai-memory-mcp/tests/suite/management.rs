@@ -160,6 +160,7 @@ async fn session(h: &Harness, owner: Option<&str>) -> SessionId {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: owner.map(|name| format!("user:{name}")),
+            origin: None,
         })
         .await
         .unwrap();
