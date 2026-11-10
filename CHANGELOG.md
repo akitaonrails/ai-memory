@@ -47,7 +47,7 @@ version in [`docs/changelog/`](docs/changelog/):
   a default install the stream has almost nothing to rank until an agent writes
   an abstract by hand. (#2161)
 - Fixed conditional page reads from configured cross-origin frontends by
-  exposing `ETag` and allowing `If-None-Match` on `/api/v1`.
+  exposing `ETag` and allowing `If-None-Match` on `/api/v1`. (#2175)
 
 ## [3.4.5] - 2026-11-10
 
