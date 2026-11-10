@@ -18,6 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `/`, so a hook with a URL such as `curl https://…` put a bare `//` in the
   file and Cursor dropped every hook in it without a message. Uninstall now
   writes the same `\/` escape that `install-hooks --agent cursor` writes.
+  (#2165)
 
 ## [3.4.5] - 2026-11-10
 
