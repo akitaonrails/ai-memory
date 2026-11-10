@@ -1316,12 +1316,18 @@ function Invoke-AiMemoryHook {
         if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
         }
+        # An external-capture run shares its project with the owner's own
+        # interactive sessions, so it offers the baton rather than consuming it
+        # (#2148): claim=0 makes the server announce the handoff for an explicit
+        # memory_handoff_accept. Parity with the native hook and the shell bundle.
+        $ClaimQS = ""
+        if (Test-AiMemoryCaptureOwnedExternally) { $ClaimQS = "&claim=0" }
         $NoProxy = Get-AiMemoryNoProxy
         try {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS$ClaimQS" `
                 -Headers $Headers
             $Status = Get-AiMemoryResponseStatus $Response
             if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {

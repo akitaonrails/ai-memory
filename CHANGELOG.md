@@ -52,11 +52,13 @@ version in [`docs/changelog/`](docs/changelog/):
 - A session run under external capture (`AI_MEMORY_CAPTURE_OWNER` set) no longer
   consumes a pending handoff. The owner's own interactive runs share the project
   with the captured harness, so claiming the baton stole it from the work it was
-  left for. Every handoff-delivery front door — SessionStart, Kimi's
-  `UserPromptSubmit`, Hermes' `pre_llm_call`, and Grok's `PostToolUse` — now
-  sends `claim=0` under external capture, and the server offers the handoff,
-  naming it and how to accept, without marking it claimed. A normal run claims
-  as before. (#2148)
+  left for. Every hook bundle now sends `claim=0` on the handoff fetch when
+  capture is externally owned — the native binary at all four of its delivery
+  doors (SessionStart, Kimi's `UserPromptSubmit`, Hermes' `pre_llm_call`, Grok's
+  `PostToolUse`), the POSIX shell bundle, the PowerShell bundle, and the
+  generated TypeScript integrations (OpenCode, OpenClaw and their siblings). The
+  server then offers the handoff, naming it and how to accept, without marking it
+  claimed. A normal run claims as before. (#2148)
 - `ai-memory run` resuming a session whose checkout now resolves to a
   different project that already holds its own sessions or pages now prints the
   exact commands to reconcile it — the `merge-project` dry run, the `--confirm`

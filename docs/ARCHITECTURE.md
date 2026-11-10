@@ -560,9 +560,11 @@ process to suppress its installed native capture while retaining supported
 handoff/briefing delivery and MCP. The producer uses `extension`/`source_event`
 for provenance and stable, namespaced `ingest_key` values for retries. Because
 the owner's own interactive runs share the project with the captured harness,
-every handoff-delivery front door (SessionStart, Kimi's `UserPromptSubmit`,
-Hermes' `pre_llm_call`, Grok's `PostToolUse`) forwards `claim=0` on its handoff
-fetch, so the server delivers the baton in offer mode — naming the handoff id
+every hook bundle forwards `claim=0` on its handoff fetch under external
+capture — the native binary at all four of its delivery doors (SessionStart,
+Kimi's `UserPromptSubmit`, Hermes' `pre_llm_call`, Grok's `PostToolUse`), the
+POSIX shell and PowerShell bundles, and the generated TypeScript integrations.
+The server then delivers the baton in offer mode — naming the handoff id
 and leaving the row open for an explicit `memory_handoff_accept` — rather than
 consuming a pending handoff left for other work (#2148). See the
 [external capture contract](external-lifecycle.md) for batching, identity and

@@ -1173,14 +1173,25 @@ printf '%s' '{"e":"owned"}' \
 assert_eq "owner: post_hook sends nothing" "0" "$(owner_requests)"
 assert_eq "owner: post_hook spools nothing and drains nothing" "$BACKLOG" "$(owner_spooled)"
 
-# 2. Delivery is untouched: the handoff GET still runs and still returns.
+# 2. Delivery is untouched: the handoff GET still runs and still returns, but
+#    it OFFERS the baton (claim=0) rather than consuming a handoff the owner's
+#    own interactive session left open (#2148).
 HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork")
 assert_eq "owner: handoff GET still delivered" "HANDOFF BODY" "$HANDOFF"
 assert_eq "owner: the GET is the only request" "1" "$(owner_requests)"
 assert_eq "owner: still no POST"               "0" "$(owner_posts)"
+assert_eq "owner: the handoff GET offers the baton (claim=0)" "1" \
+    "$(awk '/^GET .*\/handoff\?.*claim=0/{n++} END{print n+0}' "$CURL_LOG")"
+
+# 2b. Claim control: with no owner the same handoff GET claims (no claim=0).
+unset AI_MEMORY_CAPTURE_OWNER
+owner_case claim_control
+HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork")
+assert_eq "no owner: handoff GET still delivered" "HANDOFF BODY" "$HANDOFF"
+assert_eq "no owner: the handoff GET claims (no claim=0)" "0" \
+    "$(awk '/claim=0/{n++} END{print n+0}' "$CURL_LOG")"
 
 # 3. Standalone control: with no owner the same call POSTs as before.
-unset AI_MEMORY_CAPTURE_OWNER
 owner_case control
 printf '%s' '{"e":"control"}' \
     | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1
