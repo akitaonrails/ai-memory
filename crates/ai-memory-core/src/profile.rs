@@ -849,10 +849,12 @@ pub fn render_profile_block(lines: &[String], omitted: usize) -> String {
 
 /// Byte range of the managed block in `text`: both delimiters plus the line
 /// break after the closing one. Only delimiters alone on their line count, so
-/// a quoted mention in prose is never mistaken for one.
+/// a quoted mention in prose is never mistaken for one, and a start line
+/// whose end was deleted by hand is skipped, so the user's text after it is
+/// never taken for part of the block.
 fn profile_block_range(text: &str) -> Option<(usize, usize)> {
-    let start = crate::find_marker_line(text, PROFILE_BLOCK_START, 0)?;
-    let end = crate::find_marker_line(text, PROFILE_BLOCK_END, start)?;
+    let (start, end) =
+        crate::routing_snippet::find_delimited_block(text, PROFILE_BLOCK_START, PROFILE_BLOCK_END)?;
     let mut after = end + PROFILE_BLOCK_END.len();
     if text[after..].starts_with("\r\n") {
         after += 2;
