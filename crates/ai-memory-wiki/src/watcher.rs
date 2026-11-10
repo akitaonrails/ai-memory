@@ -3063,9 +3063,12 @@ mod tests {
         // failed as expected once this control page made the walk complete.
         write_and_index(&wiki, &tmp, ws, proj_b, "control.md", "always here").await;
 
-        // The from==to re-home: the wiki sees no scope change and skips the
-        // file step, but the store still sweeps the straggler page into
-        // proj_b (see `ops::move_session`'s `rehome` branch).
+        // The from==to re-home: the store sweeps the straggler page row into
+        // proj_b, and (since #2137) the wiki follows those swept rows and
+        // relocates the straggler file from proj_a into proj_b too, so the
+        // move no longer leaves an orphaned row behind (see
+        // `ops::move_session`'s `rehome` branch and
+        // `Wiki::plan_session_page_files`).
         let outcome = wiki
             .move_session_page(
                 sid,
@@ -3091,9 +3094,20 @@ mod tests {
             "precondition: the page row now lives in proj_b",
         );
         assert!(
-            !proj_dir(&tmp, ws, proj_b).join(&page_path).exists(),
-            "precondition: proj_b has no file for it — the pre-existing move-session bug",
+            proj_dir(&tmp, ws, proj_b).join(&page_path).exists(),
+            "precondition: #2137 relocated the straggler file into proj_b",
         );
+        assert!(
+            !proj_dir(&tmp, ws, proj_a).join(&page_path).exists(),
+            "precondition: the straggler file no longer lingers in proj_a",
+        );
+        // Delete proj_b's file on disk to reproduce the fileless session page
+        // this guard protects: whatever absents a session page's file (an
+        // external delete, a race, a crash mid-move), its row must still never
+        // become a reconcile-delete tombstone. The control page keeps proj_b's
+        // walk complete, so the sessions exclusion — not a partial-walk skip —
+        // is what spares it.
+        std::fs::remove_file(proj_dir(&tmp, ws, proj_b).join(&page_path)).unwrap();
 
         let mut streaks = MissingStreaks::new();
         for pass in 0..3 {

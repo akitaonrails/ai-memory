@@ -795,9 +795,9 @@ or `too_large`; `from` is `null` when `to` replaced nothing at this path.
   observation and page-history reads all use `Cache-Control: private,
   no-store`. The single-page read carries a SHA-256 `ETag` and uses
   `Cache-Control: private, no-cache`: the browser keeps the body but must
-  revalidate with `If-None-Match` every time, and because the server runs the
-  grant check before comparing the tag, a viewer without a grant receives `403`
-  rather than a `304` from the browser's copy. Search responses are not
+  revalidate with `If-None-Match` every time. The endpoint accepts weak tags,
+  tag lists and `*`. The server checks access before evaluating the
+  condition, so a viewer without a grant receives `403`. Search responses are not
   cacheable because the request body affects the result. The effect is that a
   browser cannot reuse Alice's response after credentials at the same URL
   switch to Bob.

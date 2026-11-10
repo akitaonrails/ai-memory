@@ -157,7 +157,10 @@ ai-memory profile apply --remove    # take it out again
   `<!-- ai-memory:start -->` routing block and your own rules. Re-running
   replaces only the block, and leaves the file byte-identical when the profile
   has not changed. `--remove` takes the block out and restores the file; a file
-  `apply` created for the block alone is deleted.
+  `apply` created for the block alone is deleted. A start delimiter whose end
+  line was deleted by hand stays where it is with the text after it: `apply`
+  writes a fresh block after it, and later runs and `--remove` act on that
+  block only.
 - **Backups.** The previous version of the file goes to
   `<data dir>/backups/profile-apply/`, never next to the file, so nothing extra
   shows up in `git status`.

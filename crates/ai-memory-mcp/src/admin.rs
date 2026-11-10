@@ -4386,7 +4386,7 @@ async fn handle_lint(
         ai_memory_consolidate::LintOptions {
             dry_run: req.dry_run,
             use_llm: !req.no_llm,
-            decay_lambda: state.decay_params.lambda,
+            decay: state.decay_params,
             // Zero-LLM contradiction detection (A5) off the configured
             // embedder's triple; `None` ⇒ clean no-op.
             embedding: state
@@ -5021,6 +5021,30 @@ async fn handle_purge_session(
             Ok(ids) => ids,
             Err(e) => return e,
         };
+
+    // A session absent from this scope answers 404 before the admission
+    // webhook hears of a purge and before the pre-purge checkpoint is written.
+    match state
+        .writer
+        .purge_session(
+            ws_id,
+            proj_id,
+            session_id,
+            author_id,
+            ai_memory_store::Compaction::Skip,
+            ai_memory_store::PurgeMode::Preview,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(e @ StoreError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    }
 
     // Admission runs before anything is deleted so a reject-policy webhook can
     // refuse while every row is still intact — same order as purge-project.
@@ -6688,6 +6712,10 @@ struct MergeProjectRequest {
 struct MergeProjectReport {
     from: String,
     into: String,
+    // The ids both sides resolved to. A merge named by project names gives
+    // the client no other way to re-point a checkout bound to the source.
+    from_project_id: String,
+    into_project_id: String,
     dry_run: bool,
     page_versions: u64,
     sessions: u64,
@@ -6897,6 +6925,8 @@ async fn handle_merge_project(
         Ok(MergeProjectReport {
             from: format!("{}/{}", req.workspace, source_name),
             into: format!("{}/{}", req.workspace, target_name),
+            from_project_id: source.to_string(),
+            into_project_id: target.to_string(),
             dry_run: !req.confirm,
             page_versions: summary.page_versions,
             sessions: summary.sessions,
@@ -7996,6 +8026,47 @@ fn move_session_page_label(
 /// Guards, then the dry run or the real move of one planned session. The
 /// caller wraps the call in the pre/post checkpoints so a batch takes one
 /// pair, not one per session.
+/// Live-session guards. An open session may still receive events, and a
+/// queued consolidation would write the page under the old scope; both
+/// are the operator's call with `force`. A re-home leaves the row where
+/// it is, so an open session is no reason to refuse gathering its strays.
+async fn refuse_live_session_move(
+    state: &Arc<AdminState>,
+    req: &MoveSessionRequest,
+    sid: SessionId,
+    rehome: bool,
+) -> Result<(), MoveErr> {
+    if req.force {
+        return Ok(());
+    }
+    let (open, pending_job) = session_move_blockers(&state.reader, sid)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    if open && !rehome {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "session {sid} is still open (no session end recorded); \
+                     finish it or force the move (--force / force: true)"
+                )
+            })),
+        ));
+    }
+    if pending_job {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "session {sid} has a pending or running consolidation job; \
+                     wait for it or force the move (--force / force: true)"
+                )
+            })),
+        ));
+    }
+    Ok(())
+}
+
 async fn move_planned_session(
     state: &Arc<AdminState>,
     req: &MoveSessionRequest,
@@ -8004,39 +8075,7 @@ async fn move_planned_session(
     actor: &ai_memory_core::ActorContext,
 ) -> Result<MoveSessionReport, MoveErr> {
     let sid = plan.session_id;
-    let rehome = plan.is_rehome();
-
-    // Live-session guards. An open session may still receive events, and a
-    // queued consolidation would write the page under the old scope; both
-    // are the operator's call with `force`. A re-home leaves the row where
-    // it is, so an open session is no reason to refuse gathering its strays.
-    let (open, pending_job) = session_move_blockers(&state.reader, sid)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-    if !req.force {
-        if open && !rehome {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "session {sid} is still open (no session end recorded); \
-                         finish it or force the move (--force / force: true)"
-                    )
-                })),
-            ));
-        }
-        if pending_job {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "session {sid} has a pending or running consolidation job; \
-                         wait for it or force the move (--force / force: true)"
-                    )
-                })),
-            ));
-        }
-    }
+    refuse_live_session_move(state, req, sid, plan.is_rehome()).await?;
 
     state
         .wiki
@@ -8084,25 +8123,20 @@ async fn move_planned_session(
         }
     };
 
-    // A page file already at the destination blocks a page move; checked here
-    // too so the dry run predicts what the wiki re-checks under its lock. When
-    // the source scope IS the destination (single-form re-home) there is no
-    // file to move and the wiki skips the file step too.
+    // A page file already at the destination blocks a page move; planned here
+    // too so the dry run predicts what the wiki re-checks under its lock. The
+    // plan follows the page rows the store sweeps: for a re-home that
+    // includes stray scopes other than `plan.from`.
     state
         .wiki
         .validate_project_tree(to.0, to.1)
         .map_err(move_session_wiki_err)?;
-    let dst_file = state
+    let file_moves = !state
         .wiki
-        .project_root(to.0, to.1)
-        .join("sessions")
-        .join(&file_name);
-    let file_moves = plan.from != to && src_file.is_file();
-    if req.pages == PagesMode::Move && file_moves && dst_file.exists() {
-        return Err(move_session_wiki_err(WikiError::DestinationPageExists(
-            dst_file.display().to_string(),
-        )));
-    }
+        .plan_session_page_files(sid, plan.from, to, req.pages)
+        .await
+        .map_err(move_session_wiki_err)?
+        .is_empty();
 
     if !req.confirm {
         let summary = state
@@ -8225,6 +8259,10 @@ async fn move_single_session(
         plan.to_label.project
     );
     let warning = plan.to.manifest_warning();
+    // Refuse a live session before the pre-move checkpoint is written.
+    refuse_live_session_move(state, req, session_id, plan.is_rehome())
+        .await
+        .map_err(|error| with_manifest_warning(error, warning.as_ref()))?;
     let pre_checkpoint = checkpoint_or_500(&state.wiki, format!("pre-{label}"))
         .map_err(|error| with_manifest_warning(error, warning.as_ref()))?;
     let mut report = move_planned_session(state, req, plan, author_id, &actor)
@@ -9370,7 +9408,7 @@ async fn handle_delete_page(
     };
 
     let author_id = author_ext.map(|axum::Extension(u)| u);
-    state
+    let deleted = state
         .wiki
         .delete_page(ws, proj, &path, admission_ctx, author_id)
         .await
@@ -9390,7 +9428,7 @@ async fn handle_delete_page(
         Json(
             serde_json::to_value(DeletePageResponse {
                 path: path.to_string(),
-                deleted: true,
+                deleted,
                 pre_checkpoint,
                 checkpoint,
             })
@@ -17414,8 +17452,10 @@ mod tests {
 
     /// `Wiki::delete_page` is idempotent for a path that doesn't exist
     /// inside an EXISTING (workspace, project) — the file is just not there
-    /// to quarantine. The handler reports `deleted: true` (i.e. "the call
-    /// succeeded") rather than 404, matching the documented MCP semantics.
+    /// to quarantine, so the call still succeeds with 200 rather than 404.
+    /// It reports `deleted: false` because nothing was removed, so a caller
+    /// (`ai-memory profile forget`) can tell a real deletion from a no-op
+    /// instead of always being told it succeeded (#2181).
     #[tokio::test]
     async fn delete_page_idempotent_for_missing_file_in_existing_scope() {
         let (_tmp, router) = read_page_test_router();
@@ -17426,7 +17466,7 @@ mod tests {
         let (status, json) =
             post_delete_page(&router, "default", "audit", "notes/never-existed.md").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["deleted"], true);
+        assert_eq!(json["deleted"], false);
     }
 
     #[tokio::test]

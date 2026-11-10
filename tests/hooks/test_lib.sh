@@ -758,6 +758,21 @@ else
         && printf 'ok' || printf 'missing')
     assert_eq "powershell delivers the subagent brief (static)" "ok" "$PS_SUB"
 fi
+# #2134: a hook installed without a baked token relies on the server's token
+# file; the wrapper must fall back to it when AI_MEMORY_AUTH_TOKEN is unset.
+PS_TOKEN_STATIC=$(grep -q 'function Get-AiMemoryStoredToken' hooks/lib/ai-memory-hook.ps1 \
+    && grep -Fq 'if (-not $BearerToken) { $BearerToken = Get-AiMemoryStoredToken }' hooks/lib/ai-memory-hook.ps1 \
+    && printf 'ok' || printf 'missing')
+assert_eq "powershell wrapper falls back to the stored token file (static)" "ok" "$PS_TOKEN_STATIC"
+if [ -n "$PSH" ]; then
+    mkdir -p "$TMP/ps-token/auth-tokens" "$TMP/ps-token-empty"
+    printf 'stored-secret\n' > "$TMP/ps-token/auth-tokens/default"
+    PS_TOKEN_DIR=$(host_path "$TMP/ps-token")
+    PS_TOKEN_EMPTY_DIR=$(host_path "$TMP/ps-token-empty")
+    PS_TOKEN_OUT=$("$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+        "\$env:AI_MEMORY_DATA_DIR='$PS_TOKEN_DIR'; . '$PS_LIB'; \$present = Get-AiMemoryStoredToken; \$env:AI_MEMORY_DATA_DIR='$PS_TOKEN_EMPTY_DIR'; \$absent = Get-AiMemoryStoredToken; \$present + '|' + \$absent")
+    assert_eq "powershell reads the stored token file, empty when absent" "stored-secret|" "$PS_TOKEN_OUT"
+fi
 
 # A capture-only marker with no scope-declaring ancestor: still transparent,
 # and resolution falls back exactly as it does with no marker at all.
@@ -1158,14 +1173,25 @@ printf '%s' '{"e":"owned"}' \
 assert_eq "owner: post_hook sends nothing" "0" "$(owner_requests)"
 assert_eq "owner: post_hook spools nothing and drains nothing" "$BACKLOG" "$(owner_spooled)"
 
-# 2. Delivery is untouched: the handoff GET still runs and still returns.
+# 2. Delivery is untouched: the handoff GET still runs and still returns, but
+#    it OFFERS the baton (claim=0) rather than consuming a handoff the owner's
+#    own interactive session left open (#2148).
 HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork")
 assert_eq "owner: handoff GET still delivered" "HANDOFF BODY" "$HANDOFF"
 assert_eq "owner: the GET is the only request" "1" "$(owner_requests)"
 assert_eq "owner: still no POST"               "0" "$(owner_posts)"
+assert_eq "owner: the handoff GET offers the baton (claim=0)" "1" \
+    "$(awk '/^GET .*\/handoff\?.*claim=0/{n++} END{print n+0}' "$CURL_LOG")"
+
+# 2b. Claim control: with no owner the same handoff GET claims (no claim=0).
+unset AI_MEMORY_CAPTURE_OWNER
+owner_case claim_control
+HANDOFF=$(set +e; ai_memory_get_handoff "http://127.0.0.1:49374/handoff?agent=cursor&cwd=%2Fwork")
+assert_eq "no owner: handoff GET still delivered" "HANDOFF BODY" "$HANDOFF"
+assert_eq "no owner: the handoff GET claims (no claim=0)" "0" \
+    "$(awk '/claim=0/{n++} END{print n+0}' "$CURL_LOG")"
 
 # 3. Standalone control: with no owner the same call POSTs as before.
-unset AI_MEMORY_CAPTURE_OWNER
 owner_case control
 printf '%s' '{"e":"control"}' \
     | ai_memory_post_hook "http://127.0.0.1:49374/hook?event=post-tool-use&agent=cursor" >/dev/null 2>&1

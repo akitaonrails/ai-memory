@@ -11,6 +11,125 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- A hook event larger than the 10 MiB spool-entry cap (typically a base64
+  image in a `PostToolUse` `tool_response`) is no longer spooled whole. Such an
+  entry could be written but never read back, so it sat in `hook-spool/`
+  undeliverable forever — never sent, never charged an attempt, never aged out
+  — while `ai-memory doctor` kept counting it as waiting. It is now dropped as
+  one undelivered event at capture time, and an over-cap entry an older binary
+  already spooled is dropped (and counted) on the next drain instead of wedging
+  the queue. (#2179)
+- `ai-memory profile show` and `ai-memory profile forget` now accept an entry
+  the way `profile list` and the digest name it — with or without the `.md`
+  suffix — so `profile forget workflow/never-push` removes the entry instead
+  of targeting a non-existent `.md`-less sibling. `forget` also fails with a
+  non-zero exit when the entry was not there, because `/admin/delete-page` (and
+  the `memory_delete_page` tool) now report whether a page actually existed
+  rather than always claiming success. (#2181)
+- Fixed native install and reinstall with a trailing slash in
+  `AI_MEMORY_LIB_DIR`. (#2171)
+- Fixed conditional page reads returning a full response for a matching weak
+  ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
+- Fixed the container wrapper reporting success after a native host-client
+  extraction or install failure. The wrapper keeps the previous cached
+  archive and retries on the next host command that checks for updates. (#2174)
+- `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
+  count or list a failed session consolidation that a newer consolidation of
+  the same session has since completed. A session that ends, resumes and ends
+  again queues a new generation; when the old one had given up and the new one
+  succeeded, the old failure stayed in `failed` and `failed_sessions`, so the
+  panel kept its warning and a #1692 watchdog re-ran sessions that were already
+  consolidated (14 of 19 reported failures on one server). A failure newer than
+  the session's last completed generation is still reported. (#2160)
+- Fixed `merge-project` dropping the source project's repository identity.
+  The git remote identity and its derived name keys sat on the project row the
+  merge deletes. After merging the remote-named half of a split into the
+  folder-named one, the direction `ai-memory run` prints for a split it cannot
+  repair by renaming, nothing routed the checkout to the merged project: the
+  next capture could open a new project under the remote's name, and
+  `ai-memory run`, still bound to the deleted project, had no candidate to
+  offer. The identity now moves to a target that carries none, and a target
+  that already belongs to another repository keeps its own. (#2156)
+- Fixed `merge-project` leaving this client's checkout link and saved project
+  binding on the source project it removed. A checkout bound to the source
+  kept sending the deleted project id, so `ai-memory run` and
+  `ai-memory workstreams` got 404 from it until `--project-id` or the project
+  picker replaced the binding. A confirmed merge now re-points both at the
+  target, as `repair-split` does, and the merge report names both project
+  ids, so a merge by project name is covered too. (#2158)
+- Docker images now run the server under `tini`, which reaps orphaned helper
+  processes rather than leaving zombies under the container's PID 1. It
+  forwards shutdown signals to the server so graceful draining still works.
+  (#2163)
+- The `[retrieval] abstract_vectors` documentation now says the stream ranks
+  only pages whose frontmatter carries an agent-written `abstract:`. Session
+  consolidation, the dream pass and the forget sweep never add that line, so on
+  a default install the stream has almost nothing to rank until an agent writes
+  an abstract by hand. (#2161)
+- The compaction recap now says "1 earlier prompt omitted to fit" when exactly
+  one older prompt does not fit its budget, instead of "1 earlier prompts
+  omitted". The anchor's own "1 prompt between these was omitted" line already
+  used the singular. (#2166)
+- `ai-memory uninstall` now keeps `~/.cursor/hooks.json` loadable by Cursor.
+  It removed ai-memory's entries and wrote the hooks you keep back with plain
+  `/`, so a hook with a URL such as `curl https://…` put a bare `//` in the
+  file and Cursor dropped every hook in it without a message. Uninstall now
+  writes the same `\/` escape that `install-hooks --agent cursor` writes.
+  (#2165)
+- `POST /admin/purge-session` (and `ai-memory purge-session --confirm`) for a
+  session that is not in the named workspace/project now answers 404 before
+  it does anything. It used to tell the `purge_session` admission webhook
+  about the purge and commit a `pre-purge-session` checkpoint of the wiki
+  first, and only then find that there was nothing to purge. (#2167)
+- The lint's `stale` rule now follows `[decay.half_life_days] episodic` when
+  it is set. The rule only flags episodic pages, but every lint path (the
+  `memory_lint` tool, `POST /admin/lint` and the scheduled lint) derived its
+  threshold from the scalar `[decay] lambda`, while the forget sweep scores
+  those same pages on the episodic curve. With `episodic = 180` an unread
+  session page was reported stale after about 30 days instead of about 156.
+  (#2168)
+- A native transcript export now records a loss when a message carries a
+  pasted image or attached document (Claude `image` / `document` blocks, Pi
+  `image` blocks, Codex `input_image` items). The text of the message was kept
+  and the attachment was dropped with nothing in the export's losses, unlike
+  images in tool results and every other excluded block type. (#2169)
+- `POST /admin/move-session` (and `ai-memory move-session --confirm`) now
+  refuses an open session, or one with a pending consolidation job, before it
+  writes its `pre-move-session` wiki checkpoint. The 409 used to come back
+  after that commit had already been added. (#2170)
+- On Windows, the hook commands generated for agents whose runner is
+  PowerShell (Codex, Grok, DSH, Copilot CLI, Gemini CLI) now single-quote the
+  executable, `--data-dir`, server URL, token and project strategy. They were
+  double-quoted, and PowerShell expands `$name` and backtick escapes inside
+  double quotes, so an install path or data dir containing either (`$` is legal
+  in Windows user and folder names) reached the hook rewritten: a `bin $HOME`
+  folder became `bin C:\Users\<you>` and no hook ran. cmd.exe agents and
+  Antigravity are unchanged, and existing entries are still recognized and
+  replaced on re-apply. (#2176)
+- Fixed the scheduled backup example skipping the online snapshot after a
+  failed mirror push, and skipping retries when the files were unchanged (#2135).
+- `restore --with-config` (and a restore into a data dir with no
+  `config.toml`) now checks that the backup's config, with the environment
+  applied, supplies the `[auth].token_pepper` its API keys were hashed with,
+  before anything live is replaced. It used to skip that check, report success,
+  and leave a server that refused to start; the refusal now points at the
+  original pepper instead of `--with-config`. (#2172)
+
+### Security
+
+- `ai-memory uninstall --only hooks` now withdraws ZCode's capture hooks. ZCode
+  stores its wiring under `hooks.events` in `~/.zcode/cli/config.json`, a shape
+  the uninstall swept for no other agent, so it exited reporting that no
+  ai-memory wiring was found while all six generated capture hooks stayed
+  enabled. A user who trusted that result kept sending prompts and tool
+  activity under a capture they had asked to remove. The uninstall now strips
+  every ai-memory entry from that file while the user's own hooks, model and
+  hook-level settings survive. (GHSA-qmg7-f7fg-rg4x)
+
+## [3.4.5] - 2026-11-10
+
 ### Security
 
 - On a server with authentication on, a browser app on an origin allowed with
@@ -31,11 +150,61 @@ version in [`docs/changelog/`](docs/changelog/):
   response bodies. (GHSA-c9f9-cp8h-jcj5) (#2140)
 - Updated the bundled SQLite in `ai-memory`, `ai-memory-importer`, and
   `ai-memory-relay` to address RUSTSEC-2026-0459 (CVE-2026-119375). (#2140)
+- Stopped the example backup script and its mirror `.gitignore` from syncing
+  the data dir's bearer tokens (`auth-tokens/`, `auth-token`, `auth-header`,
+  all plaintext mode 0600) and the pre-delivery hook spool (`hook-spool/`) to a
+  pushed git mirror. The generic secret globs matched none of them, so a user
+  following `docs/backup.md` leaked their root token to the remote. Both now
+  exclude every one, and `docs/backup.md` documents them. (GHSA-w35v)
 
 ### Fixed
 
-- Fixed the scheduled backup example skipping the online snapshot after a
-  failed mirror push, and skipping retries when the files were unchanged (#2135).
+- Claude Code machine turns that reach the prompt channel — an agent-team
+  `<teammate-message …>`, a `<cross-session-message …>`, a `<task-notification>`,
+  the "Another Claude session sent a message" envelope, and the post-compaction
+  summary — no longer title a session page or appear in its `## Prompts` list and
+  count. One `ai-memory-core` predicate now decides "the user wrote this" for the
+  session digest, the title picker and the profile harvest alike, extending the
+  profile-only fix in #1855/#2041. Ordinary scaffolding such as an IDE context
+  block stays listed as session history. Pages regenerate with the new rule on
+  the next consolidation. (#2149)
+- A session run under external capture (`AI_MEMORY_CAPTURE_OWNER` set) no longer
+  consumes a pending handoff. The owner's own interactive runs share the project
+  with the captured harness, so claiming the baton stole it from the work it was
+  left for. Every hook bundle now sends `claim=0` on the handoff fetch when
+  capture is externally owned — the native binary at all four of its delivery
+  doors (SessionStart, Kimi's `UserPromptSubmit`, Hermes' `pre_llm_call`, Grok's
+  `PostToolUse`), the POSIX shell bundle, the PowerShell bundle, and the
+  generated TypeScript integrations (OpenCode, OpenClaw and their siblings). The
+  server then offers the handoff, naming it and how to accept, without marking it
+  claimed. A normal run claims as before. (#2148)
+- `ai-memory run` resuming a session whose checkout now resolves to a
+  different project that already holds its own sessions or pages now prints the
+  exact commands to reconcile it — the `merge-project` dry run, the `--confirm`
+  to apply, and the `.ai-memory.toml` marker alternative — instead of only
+  pointing at `docs/lifecycle-ops.md`. (#1993)
+- Fixed DSH hooks failing to parse under PowerShell on Windows. The generated
+  command now starts with the `&` call operator, so the quoted executable path is
+  invoked rather than read as a string expression. (#2134)
+- Fixed the PowerShell hook wrapper not falling back to the stored bearer token
+  file (`<data_dir>/auth-tokens/default`) when `AI_MEMORY_AUTH_TOKEN` is unset;
+  its POSTs were rejected with 401 and dropped silently. (#2134)
+- Fixed `move-session` leaving the session summary's Markdown file in the
+  source project when the target already owned the session row. The route
+  reported `moved` or `regenerated` while only the SQLite rows changed, and
+  the watcher then recreated a live row in the stray project from the
+  orphaned file. The file step now follows every project holding a latest
+  page row for the session: `--pages move` relocates the file and
+  `--pages regenerate` removes it, with the same collision checks in the dry
+  run and the confirmed move, and a failed store step puts the files back.
+  (#2137)
+- `merge-project` run in a checkout whose `.ai-memory.toml` selects a server
+  profile now merges on that profile's server. It took its default workspace
+  from the marker but sent the dry run and the merge to the install's own
+  server with the config bearer, so a same-named workspace there was merged
+  while the profile's server was never asked. It now follows the marker like
+  `rename-project` and `move-project`, fails before sending anything when the
+  profile does not resolve, and still honours `AI_MEMORY_SERVER_URL` (#2150).
 - Fixed `restore` replacing the live wiki and database even when it failed
   to save the archived configuration as `config.toml.from-backup` (#2064).
 - Fixed `restore-agents` accepting backups with missing or invalid gzip
@@ -168,6 +337,12 @@ version in [`docs/changelog/`](docs/changelog/):
   rows, so those rows were the last copy of that work. They are now kept unless
   that project holds a live page of the session, as the sweep's dry run also
   reports. Rows already pruned cannot be recovered (#2124).
+- `ai-memory profile apply` no longer deletes the text after a profile start
+  delimiter whose end line was removed by hand. The first run appended a fresh
+  block after it, and the next run, or `--remove`, then treated everything from
+  the leftover start line to the new block's end as the block. The end
+  delimiter now pairs with the last start delimiter before it, as the routing
+  block's does since #2117 (#2152).
 
 
 ## [3.4.4] - 2026-11-08
@@ -4808,7 +4983,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.4...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.5...HEAD
+[3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
 [3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
 [3.4.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.3
 [3.4.2]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.2

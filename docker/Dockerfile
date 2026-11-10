@@ -46,7 +46,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime-base
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates tini \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 1000 --user-group --home-dir /data \
          --shell /usr/sbin/nologin ai-memory \
@@ -76,7 +76,9 @@ WORKDIR /data
 EXPOSE 49374
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/ai-memory", "status"]
-ENTRYPOINT ["/usr/local/bin/ai-memory"]
+# Reap orphaned grandchildren of helper processes while forwarding shutdown
+# signals to the server (which handles SIGTERM and SIGINT itself).
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ai-memory"]
 CMD ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-web"]
 
 FROM runtime-base AS runtime-prebuilt-amd64

@@ -1874,6 +1874,15 @@ pub struct HandoffQuery {
     /// unfinished-session recovery snapshot and its backfill marker. Absent or
     /// anything else delivers recovery as before.
     pub recovery: Option<String>,
+    /// Per-request claim suppression, sent falsy (`claim=0`) by an execution
+    /// that must not consume the pending baton — an external-capture run
+    /// (`AI_MEMORY_CAPTURE_OWNER`), whose orchestrator owns capture and can
+    /// claim explicitly with `memory_handoff_accept` (#2148). It forces the
+    /// same no-claim/offer path `[handoff] claim_on_session_start = false`
+    /// takes (design: #959): the handoff is read, announced as an offer and
+    /// left open, whatever the server's `claim_handoff_on_session_start` says.
+    /// Absent or anything else claims per the server config, as before.
+    pub claim: Option<String>,
     /// Truthy from the mid-session inbox notice clients (the Claude Code
     /// `UserPromptSubmit` notice and `mcp-bridge --channel inbox`, #1942).
     /// The response is then only the count-only inbox notice, whatever the
@@ -2126,14 +2135,19 @@ async fn fetch_and_accept_handoff_at(
     } else {
         None
     };
-    let handoff_notice = if state.claim_handoff_on_session_start {
+    // The server config decides claiming unless this request opts out
+    // (`claim=0`): an external-capture run must announce the baton, not consume
+    // it (#2148). Both take the same offer path #959 built for the config.
+    let claim_on_start = state.claim_handoff_on_session_start
+        && !crate::payload::query_flag_falsy(query.claim.as_deref());
+    let handoff_notice = if claim_on_start {
         None
     } else {
         handoff
             .as_ref()
             .map(|pending| render_handoff_notice(pending, now))
     };
-    let (handoff, admission_ctx) = if !state.claim_handoff_on_session_start {
+    let (handoff, admission_ctx) = if !claim_on_start {
         (None, None)
     } else {
         match handoff {
@@ -6669,6 +6683,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.to_string()),
@@ -19952,6 +19967,7 @@ pub(crate) mod tests {
                     profile_digest: None,
                     handoff: None,
                     recovery: None,
+                    claim: None,
                     inbox_only: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(tmp.path().to_string_lossy().into_owned()),
@@ -20575,6 +20591,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
@@ -20667,6 +20684,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.clone()),
@@ -20778,6 +20796,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd),
@@ -20976,6 +20995,7 @@ pub(crate) mod tests {
                     profile_digest: None,
                     handoff: handoff.map(str::to_string),
                     recovery: None,
+                    claim: None,
                     inbox_only: None,
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
@@ -21033,6 +21053,76 @@ pub(crate) mod tests {
         let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", Some("1")).await;
         assert!(body.contains("HANDOFF-MARKER"), "{body}");
         assert!(!open_handoff_exists(&state).await);
+    }
+
+    /// #2148: an external-capture run sends `claim=0` so its SessionStart
+    /// announces the pending baton as an offer and leaves it open — even though
+    /// the server claims by default — instead of consuming the user's handoff.
+    /// The same start without the flag still delivers and claims (bite control).
+    #[tokio::test]
+    async fn claim_zero_offers_the_baton_without_consuming_it() {
+        let tmp = TempDir::new().unwrap();
+        let state = state_with_pending_handoff(
+            &tmp,
+            ai_memory_wiki::AdmissionChain::new(Vec::new()).unwrap(),
+        )
+        .await;
+        assert!(
+            state.claim_handoff_on_session_start,
+            "the default config claims; the flag must override it"
+        );
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        let mut query = session_start_query(&cwd);
+        query.claim = Some("0".into());
+        let (status, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(query),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body.contains("HANDOFF-MARKER"),
+            "the offer must omit the stored summary: {body}"
+        );
+        assert!(
+            body.contains("memory_handoff_accept"),
+            "the offer must tell the orchestrator how to claim it explicitly: {body}"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "claim=0 must leave the baton open for the user's session"
+        );
+
+        // Bite control: the same start without `claim=0` claims it.
+        let query = session_start_query(&cwd);
+        let (_, body) = read_handoff_response(
+            handle_handoff(
+                State(state.clone()),
+                Query(query),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            body.contains("HANDOFF-MARKER"),
+            "a start without the flag still delivers and claims: {body}"
+        );
+        assert!(
+            !open_handoff_exists(&state).await,
+            "the control claim consumed the baton"
+        );
     }
 
     /// Adversarial: one project's opt-out must not hide or consume another
@@ -22074,6 +22164,7 @@ pub(crate) mod tests {
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
+                claim: None,
                 inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
@@ -22160,6 +22251,7 @@ pub(crate) mod tests {
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
+                claim: None,
                 inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some("/repo/api/src".into()),
@@ -22238,6 +22330,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("codex".into()),
             cwd: Some(cwd.clone()),
@@ -22397,6 +22490,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("codex".into()),
             cwd: Some(cwd),
@@ -22522,6 +22616,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
@@ -22609,6 +22704,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
@@ -23042,6 +23138,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("claude-code".into()),
             cwd: Some(cwd.into()),
@@ -23211,6 +23308,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some("kimi-code".into()),
             cwd: Some("/repo".into()),
@@ -24069,6 +24167,7 @@ pub(crate) mod tests {
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
+                claim: None,
                 inbox_only: None,
                 agent: Some("codex".into()),
                 cwd: Some(cwd.into()),
@@ -28269,6 +28368,7 @@ pub(crate) mod tests {
             profile_digest: None,
             handoff: None,
             recovery: None,
+            claim: None,
             inbox_only: None,
             agent: Some(agent.into()),
             cwd: Some(cwd.into()),

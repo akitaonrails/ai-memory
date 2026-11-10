@@ -50,6 +50,8 @@ Split by durability:
 | `logs/` | No. | Tracing output; nothing durable. |
 | `models/` | No. | Local embedder weights, sha256-pinned, redownloaded on first boot per [`local-embeddings.md`](local-embeddings.md). |
 | `.serve.lock` | No. | Server pidfile. |
+| `auth-tokens/`, `auth-token`, `auth-header` | **No — never.** | Plaintext bearer tokens and the hook `Authorization` header (mode `0600`). They grant full access to the server; a mirror push would leak them. The shipped `.gitignore` and `ai-memory-snapshot.sh` exclude them. |
+| `hook-spool/` | No. | Pre-delivery hook spool: transient, drained after delivery, and may hold un-sanitized payload text. Durable memory lives in `wiki/` and `raw/`. |
 | `config.toml` and env files under `~/.config/ai-memory/` | Yes, minus secrets. | Provider config is useful for reproducing an install; API-key env files (`*.env`), OAuth tokens (`auth.json`), and private CA bundles must never land in a mirror. |
 
 If you also need the SQLite index for near-instant recovery (rather than

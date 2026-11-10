@@ -558,7 +558,15 @@ backpressure, or single-writer SQLite actor.
 An external lifecycle producer can set `AI_MEMORY_CAPTURE_OWNER` on the harness
 process to suppress its installed native capture while retaining supported
 handoff/briefing delivery and MCP. The producer uses `extension`/`source_event`
-for provenance and stable, namespaced `ingest_key` values for retries. See the
+for provenance and stable, namespaced `ingest_key` values for retries. Because
+the owner's own interactive runs share the project with the captured harness,
+every hook bundle forwards `claim=0` on its handoff fetch under external
+capture — the native binary at all four of its delivery doors (SessionStart,
+Kimi's `UserPromptSubmit`, Hermes' `pre_llm_call`, Grok's `PostToolUse`), the
+POSIX shell and PowerShell bundles, and the generated TypeScript integrations.
+The server then delivers the baton in offer mode — naming the handoff id
+and leaving the row open for an explicit `memory_handoff_accept` — rather than
+consuming a pending handoff left for other work (#2148). See the
 [external capture contract](external-lifecycle.md) for batching, identity and
 the limits of this cooperative process-scoped mode.
 
@@ -1049,7 +1057,9 @@ page content and scope names never reach it.
 and the worker's bounded error through the privacy strip). The session id is
 what a re-consolidation needs after the cause is fixed, so it belongs on the
 operator surface and not on the health panel, whose "counts and timestamps
-only" contract is unchanged (#1692).
+only" contract is unchanged (#1692). Both the `failed` count and the list leave
+out a failure that a newer generation of the same session has since completed:
+that newer page already covers the failed run's observations.
 
 ## CLI subcommand surface
 
