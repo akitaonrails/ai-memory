@@ -4386,7 +4386,7 @@ async fn handle_lint(
         ai_memory_consolidate::LintOptions {
             dry_run: req.dry_run,
             use_llm: !req.no_llm,
-            decay_lambda: state.decay_params.lambda,
+            decay: state.decay_params,
             // Zero-LLM contradiction detection (A5) off the configured
             // embedder's triple; `None` ⇒ clean no-op.
             embedding: state

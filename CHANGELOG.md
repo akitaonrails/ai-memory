@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The lint's `stale` rule now follows `[decay.half_life_days] episodic` when
+  it is set. The rule only flags episodic pages, but every lint path (the
+  `memory_lint` tool, `POST /admin/lint` and the scheduled lint) derived its
+  threshold from the scalar `[decay] lambda`, while the forget sweep scores
+  those same pages on the episodic curve. With `episodic = 180` an unread
+  session page was reported stale after about 30 days instead of about 156.
+
 ## [3.4.5] - 2026-11-10
 
 ### Security
