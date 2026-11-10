@@ -5022,6 +5022,30 @@ async fn handle_purge_session(
             Err(e) => return e,
         };
 
+    // A session absent from this scope answers 404 before the admission
+    // webhook hears of a purge and before the pre-purge checkpoint is written.
+    match state
+        .writer
+        .purge_session(
+            ws_id,
+            proj_id,
+            session_id,
+            author_id,
+            ai_memory_store::Compaction::Skip,
+            ai_memory_store::PurgeMode::Preview,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(e @ StoreError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    }
+
     // Admission runs before anything is deleted so a reject-policy webhook can
     // refuse while every row is still intact — same order as purge-project.
     let actor = actor_ext
