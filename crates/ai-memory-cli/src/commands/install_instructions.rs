@@ -28,7 +28,9 @@ use crate::config::Config;
 // Markers + the snippet body live in `ai_memory_core::routing_snippet`
 // so the `memory_install_self_routing` MCP tool can return the same
 // block this subcommand writes. Single source of truth.
-use ai_memory_core::{MARKER_END, MARKER_START, compact_block, find_marker_line, full_block};
+use ai_memory_core::{
+    MARKER_END, MARKER_START, compact_block, find_managed_block, find_marker_line, full_block,
+};
 
 const LEGACY_ORPHAN_TAIL_LF: &str =
     "` markers without\ndisturbing the rest of the file.\n<!-- ai-memory:end -->\n";
@@ -625,9 +627,7 @@ fn merge_instructions_block(existing: &str, block: &str) -> String {
     // the marker strings (e.g. this block's own prose describing them)
     // cannot be mistaken for the real end delimiter — which would truncate
     // the block and leave an orphan tail on every refresh.
-    if let Some(start_idx) = find_marker_line(existing, MARKER_START, 0)
-        && let Some(end_pos) = find_marker_line(existing, MARKER_END, start_idx)
-    {
+    if let Some((start_idx, end_pos)) = find_managed_block(existing) {
         let end_idx = end_pos + MARKER_END.len();
         // Consume a trailing newline after the end marker if present
         // so we don't accumulate blank lines on every re-run.
@@ -996,6 +996,17 @@ mod tests {
         let first = merge_instructions_block("# Title\n", &block);
         let second = merge_instructions_block(&first, &block);
         assert_eq!(first, second, "second merge must be a no-op");
+    }
+
+    #[test]
+    fn merge_keeps_text_after_a_start_marker_without_its_end() {
+        let block = format!("{MARKER_START}\nBLOCK\n{MARKER_END}\n");
+        let existing = format!("# A\n{MARKER_START}\nmy notes\n");
+        let first = merge_instructions_block(&existing, &block);
+        assert_eq!(first, format!("{existing}\n{block}"));
+        let second = merge_instructions_block(&first, &block);
+        assert_eq!(first, second, "second merge must be a no-op");
+        assert!(second.contains("my notes"));
     }
 
     /// Regression: a block whose body *mentions* the end marker inline

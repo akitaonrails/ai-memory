@@ -433,6 +433,155 @@ async fn the_prune_requires_a_live_head_at_the_summary_path() {
     }
 }
 
+fn other_proj() -> ProjectId {
+    ProjectId::from_slice(&id(3)).unwrap()
+}
+
+/// Session 10 crosses into a second project: three more old rows land there,
+/// and its watermark covers all six so the resumed-capture guard is not what
+/// keeps them.
+fn cross_into_other_project(conn: &Connection) {
+    let (ws, other) = (id(1), id(3));
+    conn.execute(
+        "INSERT INTO projects (id, workspace_id, name, repo_path, created_at) \
+         VALUES (?1, ?2, 'other', '/w/other', ?3)",
+        params![&other[..], &ws[..], NOW],
+    )
+    .unwrap();
+    for i in 1..=OBSERVATIONS_PER_SESSION {
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, title, body, importance, \
+              created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'user-prompt', ?5, 'crossed capture', 7, ?6)",
+            params![
+                &id(60 + i as u8)[..],
+                &id(10)[..],
+                &ws[..],
+                &other[..],
+                format!("crossed {i}"),
+                NOW + i,
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE sessions SET ended_observation_count = 6 WHERE id = ?1",
+        params![&id(10)[..]],
+    )
+    .unwrap();
+}
+
+/// A session page at session 10's path in the second project, the way the
+/// consolidator leaves one when most of the session's rows landed there.
+fn page_in_other_project(conn: &Connection, latest: i64) {
+    conn.execute(
+        "INSERT INTO pages \
+         (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+          frontmatter_json, is_latest, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'sessions/s10.md', 'sessions/s10.md', 'episodic', \
+                 'distilled there', ?4, '{}', ?5, ?6, ?6)",
+        params![
+            &id(103)[..],
+            &id(1)[..],
+            &id(3)[..],
+            &[0u8; 32][..],
+            latest,
+            NOW + 60,
+        ],
+    )
+    .unwrap();
+}
+
+fn rows_in(conn: &Connection, project: ProjectId) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM observations WHERE project_id = ?1",
+        params![project.as_bytes()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// A session that crossed repositories left rows in a project where it has no
+/// page. Each project's page is built only from its own rows, so these are the
+/// last copy of that work: the prune and its dry run must leave them alone even
+/// though the session has a live page in its home project. Pruning the home
+/// project is the control that the session is otherwise eligible.
+#[tokio::test]
+async fn a_crossed_sessions_rows_stay_in_a_project_with_no_page_of_it() {
+    let (_tmp, store) = open_seeded(None);
+    let conn = Connection::open(store.db_path()).unwrap();
+    conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+    cross_into_other_project(&conn);
+
+    assert_eq!(
+        store
+            .reader
+            .prunable_observation_count(ws(), other_proj(), CUTOFF)
+            .await
+            .unwrap(),
+        0,
+        "the dry run must not offer rows no page in this project covers"
+    );
+    let outcome = store
+        .writer
+        .prune_consolidated_observations(ws(), other_proj(), CUTOFF, 100)
+        .await
+        .unwrap();
+    assert_eq!(outcome.deleted, 0, "the last copy of that work stays");
+    assert_eq!(rows_in(&conn, other_proj()), 3);
+
+    let m = measure(&store).await;
+    assert_eq!(m.deleted, 6, "the home project still prunes both sessions");
+    assert_eq!(m.s1_rows, 3, "only the other project's rows are left");
+    assert_eq!(
+        m.s1_watermark, 3,
+        "the watermark follows the surviving rows"
+    );
+    assert_eq!(rows_in(&conn, other_proj()), 3);
+}
+
+/// The consolidator writes a session's page where most of its rows landed, so
+/// the other project can hold the distillation of its own rows. A live head
+/// there makes those rows prunable; an evicted one does not. Without this
+/// control a guard that only accepts the session's home project would pass.
+#[tokio::test]
+async fn a_crossed_sessions_rows_prune_where_that_project_has_a_live_page() {
+    for (latest, prunable) in [(1, 3_usize), (0, 0)] {
+        let (_tmp, store) = open_seeded(None);
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.pragma_update(None, "busy_timeout", 5_000).unwrap();
+        cross_into_other_project(&conn);
+        page_in_other_project(&conn, latest);
+
+        assert_eq!(
+            store
+                .reader
+                .prunable_observation_count(ws(), other_proj(), CUTOFF)
+                .await
+                .unwrap(),
+            prunable,
+            "dry run with is_latest = {latest}"
+        );
+        let outcome = store
+            .writer
+            .prune_consolidated_observations(ws(), other_proj(), CUTOFF, 100)
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted, prunable, "prune with is_latest = {latest}");
+        assert_eq!(
+            rows_in(&conn, other_proj()),
+            3 - prunable as i64,
+            "rows left in the other project with is_latest = {latest}"
+        );
+        assert_eq!(
+            rows_in(&conn, proj()),
+            6,
+            "the prune of one project leaves the home project's rows alone"
+        );
+    }
+}
+
 /// #1843: the retention prune deletes a file index entry with its row, so a
 /// pruned session no longer answers a path query. Control: both sessions
 /// answer it before the prune.

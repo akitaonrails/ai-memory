@@ -333,7 +333,7 @@ mod tests {
     use ai_memory_core::{NewUser, UserId, UserRole};
     use rusqlite::{Connection, params};
 
-    fn open_to(version: u32) -> Connection {
+    fn open_to(version: i32) -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::migrations::run_to(&mut conn, version).unwrap();

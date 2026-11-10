@@ -85,6 +85,7 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 ]
             )
         );
+        let endpoint = endpoint_for_link(config, &link, &target).await?;
         let project_id = project_registry::project_binding(
             config,
             &endpoint,
@@ -169,6 +170,22 @@ fn newest_first(links: Vec<ProjectLink>) -> (Vec<ProjectLink>, Vec<ProjectLink>)
 
 fn linked_at(link: &ProjectLink) -> Option<jiff::Timestamp> {
     link.linked_at.parse().ok()
+}
+
+/// A registry entry and its workstream belong to one server. Recheck the
+/// selected checkout before reusing that server's project id or run name.
+pub(super) async fn endpoint_for_link(
+    config: &Config,
+    link: &ProjectLink,
+    target: &std::path::Path,
+) -> Result<ServerEndpoint> {
+    let endpoint = ServerEndpoint::for_checkout_at(config, target).await?;
+    if endpoint.identity() != link.server {
+        bail!(
+            "this checkout now selects a different server; run `ai-memory run` there to link it before resuming"
+        );
+    }
+    Ok(endpoint)
 }
 
 /// Revalidate a stored checkout before launching anything inside it.
@@ -311,6 +328,38 @@ mod tests {
             path,
             linked_at: "2026-08-01T09:00:00Z".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_retargeted_checkout_cannot_reuse_another_servers_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = make_project(tmp.path(), "app");
+        let mut config = config_at(&tmp.path().join("data"));
+        config.auth.bearer_token = Some("INSTALL-TOKEN".into());
+        let mut link = link_to(project.clone(), "default", "app");
+        assert!(endpoint_for_link(&config, &link, &project).await.is_ok());
+
+        crate::server_profiles::add(
+            &config.data_dir,
+            &crate::server_profiles::ProfileName::parse("selected").unwrap(),
+            "http://127.0.0.1:49375/memory",
+            &[project.to_string_lossy().into_owned()],
+            Some("PROFILE-TOKEN"),
+        )
+        .unwrap();
+        std::fs::write(project.join(".ai-memory.toml"), "server = \"selected\"\n").unwrap();
+        let error = endpoint_for_link(&config, &link, &project)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different server"), "{error}");
+        assert!(!error.contains("TOKEN"), "{error}");
+
+        link.server = "http://127.0.0.1:49375/memory".into();
+        let endpoint = endpoint_for_link(&config, &link, &project).await.unwrap();
+        assert_eq!(endpoint.auth_token.as_deref(), Some("PROFILE-TOKEN"));
+        link.server = "http://127.0.0.1:49375/another-mount".into();
+        assert!(endpoint_for_link(&config, &link, &project).await.is_err());
     }
 
     #[test]

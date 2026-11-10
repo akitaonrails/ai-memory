@@ -265,6 +265,266 @@ async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
     );
 }
 
+/// GHSA-xfgc-hc4c-wj7h: a session can cross repositories mid-flight, holding
+/// observations in more than one `(workspace_id, project_id)`. A snapshot
+/// bound to one scope must read only that scope's rows — the gate passes for
+/// either scope (both hold rows), so if the snapshot queries did not also
+/// filter by scope a consolidation resolved to project A would publish
+/// project B's prompts, tool names and bodies into A's page. This exercises
+/// every snapshot reader and asserts the restricted scope's content is
+/// invisible, with the restricted scope's own read as the legitimate control
+/// that proves the filter partitions rather than blanket-denies. Bites: with
+/// the `workspace_id`/`project_id` predicates removed from the snapshot
+/// queries, the `does not leak` assertions fail.
+#[tokio::test]
+async fn a_crossed_repository_session_snapshot_reads_only_its_scope() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+    use ai_memory_store::ObservationOrder;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(ws, "home", None)
+        .await
+        .unwrap();
+    let restricted = store
+        .writer
+        .get_or_create_project(ws, "restricted", None)
+        .await
+        .unwrap();
+    // The session row anchors in `home`; it crosses into `restricted`
+    // mid-flight, so both projects hold rows under one session id.
+    let session = open_session(&store, ws, home, AgentKind::Codex).await;
+    let sanitizer = Sanitizer::builtin();
+    let insert = |proj: ProjectId, kind: ObservationKind, title: &str, body: &str| {
+        let obs = Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: session,
+                workspace_id: ws,
+                project_id: proj,
+                kind,
+                extension: None,
+                source_event: None,
+                title: title.into(),
+                body: body.into(),
+                importance: 5,
+                file_path: None,
+            },
+            &sanitizer,
+        );
+        store.writer.insert_observation(obs)
+    };
+    insert(
+        home,
+        ObservationKind::UserPrompt,
+        "alpha prompt",
+        "alpha body",
+    )
+    .await
+    .unwrap();
+    insert(home, ObservationKind::PostToolUse, "alpha-tool", "tool ran")
+        .await
+        .unwrap();
+    insert(
+        restricted,
+        ObservationKind::UserPrompt,
+        "SECRET restricted prompt",
+        "restricted body must not leak",
+    )
+    .await
+    .unwrap();
+    insert(
+        restricted,
+        ObservationKind::PostToolUse,
+        "secret-tool",
+        "secret tool body",
+    )
+    .await
+    .unwrap();
+
+    // Read the whole snapshot through the `home` scope.
+    let home_view = store
+        .reader
+        .read_session_observations_in_scope(ws, home, session, |snap| {
+            let summary = snap.kind_summary()?;
+            let totals = snap.projection_totals()?;
+            let tools = snap.tool_titles()?;
+            let prompts = snap.prompt_titles(10, 10)?;
+            let first = snap.first_lines(10)?;
+            let mut scanned_titles = Vec::new();
+            let mut scanned_bodies = Vec::new();
+            snap.scan(ObservationOrder::Asc, &[], None, |o| {
+                scanned_titles.push(o.title.clone());
+                scanned_bodies.push(o.body.clone());
+                None::<()>
+            })?;
+            let mut rowid_titles = Vec::new();
+            snap.each_row_with_rowid(|_rowid, o| {
+                rowid_titles.push(o.title.clone());
+                true
+            })?;
+            Ok((
+                summary,
+                totals,
+                tools,
+                prompts,
+                first,
+                scanned_titles,
+                scanned_bodies,
+                rowid_titles,
+            ))
+        })
+        .await
+        .unwrap();
+    let (summary, totals, tools, prompts, first, scanned_titles, scanned_bodies, rowid_titles) =
+        home_view;
+
+    assert_eq!(
+        summary.total, 2,
+        "only the home scope's two rows are counted"
+    );
+    assert_eq!(
+        summary.prompts, 1,
+        "only the home scope's prompt is counted"
+    );
+    assert_eq!(totals.total, 2);
+    assert!(
+        tools.titles.iter().all(|t| t != "secret-tool"),
+        "a restricted-scope tool name must not leak: {tools:?}"
+    );
+    assert!(
+        tools.titles.contains(&"alpha-tool".to_string()),
+        "the home scope's own tool name is the control"
+    );
+    assert_eq!(prompts.total, 1);
+    assert_eq!(prompts.first, vec!["alpha prompt".to_string()]);
+    let everything: Vec<String> = scanned_titles
+        .iter()
+        .chain(scanned_bodies.iter())
+        .chain(first.iter().map(|l| &l.title))
+        .chain(rowid_titles.iter())
+        .cloned()
+        .collect();
+    assert!(
+        everything
+            .iter()
+            .all(|s| !s.contains("SECRET") && !s.contains("restricted body") && s != "secret-tool"),
+        "no restricted-scope title or body may surface through any snapshot reader: {everything:?}"
+    );
+    assert!(
+        scanned_bodies.contains(&"alpha body".to_string()),
+        "the home scope's own body is the control"
+    );
+
+    // Legitimate control: the restricted scope's own snapshot sees exactly its
+    // own rows — the filter partitions the session, it does not blanket-deny.
+    let restricted_view = store
+        .reader
+        .read_session_observations_in_scope(ws, restricted, session, |snap| {
+            let summary = snap.kind_summary()?;
+            let prompts = snap.prompt_titles(10, 10)?;
+            Ok((summary.total, summary.prompts, prompts.first))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        restricted_view.0, 2,
+        "the restricted scope sees its own rows"
+    );
+    assert_eq!(restricted_view.1, 1);
+    assert_eq!(
+        restricted_view.2,
+        vec!["SECRET restricted prompt".to_string()],
+        "the restricted scope reads its own prompt (and only through its own grant)"
+    );
+}
+
+/// The one thing a snapshot reports past its own scope is a number. A crossed
+/// session's digest holds only the snapshot's rows, but the idle end's stamp
+/// and `ended_observation_count` count every row of the session, so the stamp
+/// needs the whole session's count from the digest's own snapshot. The scoped
+/// summary is the control that the rows stay partitioned, and another
+/// session's row must not be counted.
+#[tokio::test]
+async fn a_crossed_session_snapshot_counts_the_whole_session_as_a_number_only() {
+    use ai_memory_core::{NewObservation, ObservationKind, Sanitized, Sanitizer};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+    let home = store
+        .writer
+        .get_or_create_project(ws, "home", None)
+        .await
+        .unwrap();
+    let elsewhere = store
+        .writer
+        .get_or_create_project(ws, "elsewhere", None)
+        .await
+        .unwrap();
+    let session = open_session(&store, ws, home, AgentKind::Codex).await;
+    let unrelated = open_session(&store, ws, home, AgentKind::Codex).await;
+    let sanitizer = Sanitizer::builtin();
+    for (sid, proj) in [
+        (session, home),
+        (session, home),
+        (session, elsewhere),
+        (unrelated, home),
+    ] {
+        let obs = Sanitized::new(
+            NewObservation {
+                occurred_at: None,
+                session_id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                extension: None,
+                source_event: None,
+                title: "prompt".into(),
+                body: "body".into(),
+                importance: 5,
+                file_path: None,
+            },
+            &sanitizer,
+        );
+        store.writer.insert_observation(obs).await.unwrap();
+    }
+
+    let from_home = store
+        .reader
+        .read_session_observations(ws, home, session, |snap| {
+            Ok((
+                snap.kind_summary()?.total,
+                snap.whole_session_observation_count()?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        from_home,
+        (2, 3),
+        "the summary stays in the snapshot's scope, the generation count does not"
+    );
+    let from_elsewhere = store
+        .reader
+        .read_session_observations_in_scope(ws, elsewhere, session, |snap| {
+            Ok((
+                snap.kind_summary()?.total,
+                snap.whole_session_observation_count()?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        from_elsewhere,
+        (1, 3),
+        "the same count from the other scope"
+    );
+}
+
 fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -> NewPage {
     NewPage {
         workspace_id: ws,

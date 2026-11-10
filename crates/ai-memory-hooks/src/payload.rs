@@ -981,6 +981,10 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // Claude's snake_case tool aliases.
             | AgentKind::Cursor
             | AgentKind::OpenCode
+            // The generated OpenClaw plugin posts OpenCode's `tool` /
+            // `callID` / `args` / `output` fields
+            // (https://docs.openclaw.ai/plugins/hooks/tool-policy).
+            | AgentKind::OpenClaw
             | AgentKind::Pi
             | AgentKind::Omp
             | AgentKind::AntigravityCli
@@ -1008,6 +1012,15 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             | AgentKind::GeminiCli
             | AgentKind::QwenCode
             | AgentKind::Qoder
+            // Kimi Code's PreToolUse / PostToolUse / PostToolUseFailure carry
+            // Claude Code's snake_case `tool_name` / `tool_input` plus
+            // `tool_call_id` (MoonshotAI/kimi-code hooks.md).
+            | AgentKind::KimiCode
+            // Devin CLI's PreToolUse / PostToolUse carry Claude Code's
+            // `tool_name` / `tool_input`, and PostToolUse adds
+            // `tool_response` `{success, output, error}`
+            // (https://docs.devin.ai/cli/extensibility/hooks/lifecycle-hooks).
+            | AgentKind::Devin
     )
 }
 
@@ -1031,6 +1044,9 @@ fn safe_tool_title(metadata: &ToolObservationMetadata) -> String {
 /// The distinction matters downstream: a family is a partition of the calls,
 /// not a name for what they did, so a reader gains nothing from being told a
 /// session spent itself "across tool non-file and tool unknown".
+// Only the `tool `-prefixed spelling: production filters use
+// `tool_family_from_title`, which also knows the bare reserved-protocol form.
+#[cfg(test)]
 pub(crate) fn is_safe_tool_title(title: &str) -> bool {
     title.starts_with("tool ") && split_tool_title(title).is_some()
 }
@@ -1168,6 +1184,14 @@ fn safe_tool_body(
                         raw.pointer("/tool_response/error/message")
                             .and_then(value_to_text)
                     })
+            } else if agent == AgentKind::Devin {
+                // Devin CLI's PostToolUse `tool_response` is
+                // `{success, output, error}` (docs.devin.ai lifecycle-hooks).
+                // Read only `output`, then `error`, so the success flag is
+                // not stringified into the body.
+                raw.pointer("/tool_response/output")
+                    .and_then(value_to_text)
+                    .or_else(|| raw.pointer("/tool_response/error").and_then(value_to_text))
             } else {
                 extract_content(raw, &["tool_response", "tool_output", "output", "result"])
                     .or_else(|| extract_content(raw, &["error"]))
@@ -2284,6 +2308,173 @@ mod tests {
         let env = HookEnvelope::from_query_and_body(q, raw);
 
         assert_eq!(env.cwd.as_deref(), Some("/native/from/body"));
+    }
+
+    /// Devin CLI's PreToolUse / PostToolUse carry `tool_name` / `tool_input`,
+    /// and PostToolUse adds `tool_response` `{success, output, error}`
+    /// (https://docs.devin.ai/cli/extensibility/hooks/lifecycle-hooks).
+    /// Devin was absent from `closed_tool_agent`, so its tool observations
+    /// were stored with no title or body, the failure mode Grok had in #931.
+    #[test]
+    fn devin_tool_events_keep_their_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("devin".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "bridge-session-123",
+                "tool_name": "exec",
+                "tool_input": {"command": "ls", "shell_id": "main"},
+                "tool_use_id": "call_c101a272288d400b831e1498",
+                "tool_response": {
+                    "success": true,
+                    "output": "MARKER_DEVIN_OUTPUT",
+                    "error": null
+                }
+            }),
+        );
+        assert_eq!(post.agent, AgentKind::Devin);
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("devin post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(
+            body.contains("tool_call_id: call_c101a272288d400b831e1498"),
+            "{body:?}"
+        );
+        assert!(body.contains("outcome: success"), "{body:?}");
+        assert!(body.contains("MARKER_DEVIN_OUTPUT"), "{body:?}");
+        assert!(!body.contains("\"success\""), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("devin".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "bridge-session-123",
+                "tool_name": "exec",
+                "tool_input": {"command": "ls", "shell_id": "main"},
+                "tool_use_id": "call_c101a272288d400b831e1498",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool non-file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+
+        let failure = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("devin".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "bridge-session-123",
+                "tool_name": "exec",
+                "tool_input": {"command": "npm test SENTINEL_COMMAND"},
+                "tool_use_id": "call_fail_1",
+                "tool_response": {
+                    "success": false,
+                    "output": "",
+                    "error": "MARKER_DEVIN_ERROR"
+                }
+            }),
+        );
+        assert_eq!(failure.title_hint.as_deref(), Some("tool non-file"));
+        let body = failure.body_excerpt.expect("devin failure body");
+        assert!(body.contains("outcome: error"), "{body:?}");
+        assert!(body.contains("MARKER_DEVIN_ERROR"), "{body:?}");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
+    }
+
+    /// The generated OpenClaw plugin posts `tool` / `callID` / `args` /
+    /// `output` / `error` (docs.openclaw.ai after_tool_call). OpenClaw was
+    /// absent from `closed_tool_agent`, so its tool observations were stored
+    /// with no title or body, the failure mode Grok had in #931.
+    #[test]
+    fn openclaw_tool_events_keep_their_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("openclaw".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "openclaw-session-1",
+                "cwd": "/workspace/project",
+                "tool": "exec",
+                "args": {"command": "ls"},
+                "callID": "call_openclaw_1",
+                "output": "MARKER_OPENCLAW_OUTPUT",
+            }),
+        );
+        assert_eq!(post.agent, AgentKind::OpenClaw);
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("openclaw post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("tool_call_id: call_openclaw_1"), "{body:?}");
+        assert!(body.contains("MARKER_OPENCLAW_OUTPUT"), "{body:?}");
+
+        let read = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("openclaw".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "openclaw-session-1",
+                "cwd": "/workspace/project",
+                "tool": "read",
+                "args": {"path": "/workspace/project/sample.txt"},
+                "callID": "call_openclaw_2",
+                "output": "MARKER_OPENCLAW_READ",
+            }),
+        );
+        assert_eq!(read.title_hint.as_deref(), Some("tool file"));
+        let body = read.body_excerpt.expect("openclaw read body");
+        assert!(body.contains("MARKER_OPENCLAW_READ"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("openclaw".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "openclaw-session-1",
+                "cwd": "/workspace/project",
+                "tool": "read",
+                "args": {"path": "/workspace/project/sample.txt"},
+                "callID": "call_openclaw_2",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+
+        let failure = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("openclaw".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "sessionID": "openclaw-session-1",
+                "cwd": "/workspace/project",
+                "tool": "exec",
+                "args": {"command": "npm test SENTINEL_COMMAND"},
+                "callID": "call_openclaw_3",
+                "error": "MARKER_OPENCLAW_ERROR",
+            }),
+        );
+        assert_eq!(failure.title_hint.as_deref(), Some("tool non-file"));
+        let body = failure.body_excerpt.expect("openclaw failure body");
+        assert!(body.contains("outcome: error"), "{body:?}");
+        assert!(body.contains("MARKER_OPENCLAW_ERROR"), "{body:?}");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
     }
 
     #[test]
@@ -3511,6 +3702,97 @@ mod tests {
         );
         assert_eq!(env.title_hint.as_deref(), Some("hello"));
         assert_eq!(env.body_excerpt.as_deref(), Some("hello"));
+    }
+
+    /// Kimi Code's PreToolUse / PostToolUse / PostToolUseFailure carry
+    /// Claude Code's `tool_name` / `tool_input` plus `tool_call_id` and, on
+    /// success, `tool_output` (MoonshotAI/kimi-code hooks.md). Kimi Code was
+    /// absent from `closed_tool_agent`, so its tool observations were stored
+    /// with no title or body, the failure mode Grok had in #931.
+    #[test]
+    fn kimi_code_tool_events_keep_their_family_title_and_output() {
+        let post = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kimi-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session_kimi-1",
+                "cwd": "/workspace/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_call_id": "call-kimi-1",
+                "tool_output": "MARKER_KIMI_OUTPUT",
+            }),
+        );
+        assert_eq!(post.agent, AgentKind::KimiCode);
+        assert_eq!(post.title_hint.as_deref(), Some("tool non-file"));
+        let body = post.body_excerpt.expect("kimi post-tool body");
+        assert!(body.contains("tool_family: non-file"), "{body:?}");
+        assert!(body.contains("tool_call_id: call-kimi-1"), "{body:?}");
+        assert!(body.contains("MARKER_KIMI_OUTPUT"), "{body:?}");
+
+        let read = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kimi-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUse",
+                "session_id": "session_kimi-1",
+                "cwd": "/workspace/project",
+                "tool_name": "Read",
+                "tool_input": {"path": "/workspace/project/sample.txt"},
+                "tool_call_id": "call-kimi-2",
+                "tool_output": "MARKER_KIMI_READ",
+            }),
+        );
+        assert_eq!(read.title_hint.as_deref(), Some("tool file"));
+        let body = read.body_excerpt.expect("kimi read body");
+        assert!(body.contains("MARKER_KIMI_READ"), "{body:?}");
+
+        let pre = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "pre-tool-use".into(),
+                agent: Some("kimi-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session_kimi-1",
+                "cwd": "/workspace/project",
+                "tool_name": "Read",
+                "tool_input": {"path": "/workspace/project/sample.txt"},
+                "tool_call_id": "call-kimi-2",
+            }),
+        );
+        assert_eq!(pre.title_hint.as_deref(), Some("tool file"));
+        assert!(pre.body_excerpt.is_some_and(|body| !body.is_empty()));
+
+        let failure = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("kimi-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "hook_event_name": "PostToolUseFailure",
+                "session_id": "session_kimi-1",
+                "cwd": "/workspace/project",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test SENTINEL_COMMAND"},
+                "tool_call_id": "call-kimi-3",
+                "error": "MARKER_KIMI_ERROR",
+            }),
+        );
+        assert_eq!(failure.title_hint.as_deref(), Some("tool non-file"));
+        let body = failure.body_excerpt.expect("kimi failure body");
+        assert!(body.contains("outcome: error"), "{body:?}");
+        assert!(body.contains("MARKER_KIMI_ERROR"), "{body:?}");
+        assert!(!body.contains("SENTINEL_COMMAND"), "{body:?}");
     }
 
     #[test]

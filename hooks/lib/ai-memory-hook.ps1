@@ -65,7 +65,7 @@ function Test-AiMemoryMarkerDeclaresSettings {
     }
     if ([regex]::IsMatch($text, '(?m)^\s*aliases\s*=')) { return $true }
     if ([regex]::IsMatch($text, '(?m)^[\s﻿]*server\s*=')) { return $true }
-    foreach ($key in @("default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start")) {
+    foreach ($key in @("default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start", "inbox_notice_on_prompt")) {
         if ([regex]::IsMatch($text, "(?m)^\s*$key\s*=")) { return $true }
     }
     return $false
@@ -708,6 +708,21 @@ function Get-AiMemoryStateDir {
 # bundle consume one another's entries on a shared data dir. A down server
 # then costs latency instead of the event.
 
+# Bearer token the server minted into `<data dir>/auth-tokens/default`
+# (`[auth].bearer_token_file`). A hook installed without a baked token relies
+# on it; the native exe reads it, so this wrapper must too or its POST is a
+# silent 401 (#2134). Empty when absent or unreadable.
+function Get-AiMemoryStoredToken {
+    try {
+        $path = Join-Path (Join-Path (Get-AiMemoryStateDir) "auth-tokens") "default"
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return "" }
+        $token = [IO.File]::ReadAllText($path).Trim()
+        return $token
+    } catch {
+        return ""
+    }
+}
+
 function Get-AiMemorySpoolDir {
     return (Join-Path (Get-AiMemoryStateDir) "hook-spool")
 }
@@ -1115,8 +1130,10 @@ function Invoke-AiMemoryHook {
     $Headers = @{}
     $Headers["X-AI-Memory-Client"] = "hook-ps"
 
-    if ($env:AI_MEMORY_AUTH_TOKEN) {
-        $Headers["Authorization"] = "Bearer $env:AI_MEMORY_AUTH_TOKEN"
+    $BearerToken = $env:AI_MEMORY_AUTH_TOKEN
+    if (-not $BearerToken) { $BearerToken = Get-AiMemoryStoredToken }
+    if ($BearerToken) {
+        $Headers["Authorization"] = "Bearer $BearerToken"
     }
 
     # Capture producer path, with the shell bundle's offline-spool parity
@@ -1299,12 +1316,18 @@ function Invoke-AiMemoryHook {
         if ($Event -eq "session-start" -and -not $BriefingOncePerSession) {
             $BriefQS = Get-AiMemoryBriefingQuery -Cwd $Cwd
         }
+        # An external-capture run shares its project with the owner's own
+        # interactive sessions, so it offers the baton rather than consuming it
+        # (#2148): claim=0 makes the server announce the handoff for an explicit
+        # memory_handoff_accept. Parity with the native hook and the shell bundle.
+        $ClaimQS = ""
+        if (Test-AiMemoryCaptureOwnedExternally) { $ClaimQS = "&claim=0" }
         $NoProxy = Get-AiMemoryNoProxy
         try {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS$ClaimQS" `
                 -Headers $Headers
             $Status = Get-AiMemoryResponseStatus $Response
             if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {

@@ -158,6 +158,14 @@ other unexpected status) prints the server's own error before the refusal
 instead, since the operator asked what would happen and the server has a
 real answer.
 
+The preview asks the server the confirmed purge will use. In a checkout whose
+`.ai-memory.toml` selects a server profile (`server = "<name>"`, see
+[marker-file.md](marker-file.md)), both go to that profile's URL with its
+stored token, never to the install's server with the config bearer. A profile
+that does not resolve fails the command before anything is sent, the same way
+the confirmed purge fails, and `AI_MEMORY_SERVER_URL` still picks the server
+for one command.
+
 A handoff this session only *accepted* (did not author) keeps its row and
 its text either way, confirmed or previewed, and loses only its
 `accepted_by_session` pointer (`ON DELETE SET NULL`) once the session row is
@@ -534,6 +542,23 @@ operation. Names may be replaced independently with `--from-project-id` and
 `--into-project-id`; each id is resolved inside `--workspace`, so an id from
 another workspace returns 404 and reaches no mutation.
 
+After `--confirm` the command also updates this client's own records, as
+`repair-split` does: the checkout link filed under the source's name moves to
+the target (a link the target already has wins), and every saved project
+binding that named the source now names the target. Without that, a checkout
+bound to the source keeps sending the removed project id, and `ai-memory run`
+and `ai-memory workstreams` get 404 from it. The update is local to the
+machine that ran the merge, and a failure there is reported as a warning
+after the merge has been applied.
+
+`--workspace` defaults to the nearest `.ai-memory.toml` marker's workspace, so
+the command goes where that marker routes. In a checkout whose marker selects
+a server profile (`server = "<name>"`, see [marker-file.md](marker-file.md)),
+the dry run and `--confirm` both go to that profile's URL with its stored
+token, never to the install's server with the config bearer. A profile that
+does not resolve fails the command before anything is sent, and
+`AI_MEMORY_SERVER_URL` still picks the server for one command.
+
 The writer verifies both latest-page sets under the transaction. It refuses if
 the source has an open session or an unexpired active managed-run lease. A
 same-path collision produces a new version whose body is the target body, a
@@ -551,6 +576,14 @@ transaction. The wiki mutation lock snapshots the target tree before installing
 the merged files and restores it if the transaction refuses; after a commit it
 removes the now-empty source tree, refreshes scope manifests and checkpoints
 the result.
+
+A repository identity on the source (the git remote a checkout routes by, with
+its derived name keys) moves to the target when the target has none, so later
+captures and `ai-memory run` from that checkout resolve to the merged project
+instead of opening a new one. A target that already belongs to another
+repository keeps its own identity and the source's is dropped. A checkout of
+the source's repository then needs `project = "<target>"` in its
+`.ai-memory.toml` to keep landing in the merged project.
 
 ### `move-project`
 
@@ -761,6 +794,15 @@ scope), the `handoffs` it produced (`from_session_id`), its
   disk with no latest row is re-indexed as a new latest page by the next
   reconciliation pass.
 
+The file step follows the page rows the store sweeps. For a re-home, every
+other project holding a latest `sessions/<id>.md` row has its file relocated
+(`move`) or removed (`regenerate`), whichever project the request named as
+the source; a file in a project with no latest row is left alone there,
+except in the source project the request names, whose file is always handled
+so the watcher cannot re-index it. More than one source file for one `move`
+destination is refused like an existing destination file, before anything
+moves.
+
 The audit row (`op = move_session`) carries the operator when the request
 was attributed. What does NOT move: `sessions.cwd` (historical truth; the
 response carries `cwd_warning` when its basename is not the destination
@@ -779,8 +821,8 @@ open-session guard does not apply to a re-home, whose row does not move),
 then, under the
 wiki's exclusive mutation gate, fire `op=move_session` admission webhooks
 (source names in `ctx.workspace`/`ctx.project`, destination names in
-`ctx.destination_*`), move the file, and re-stamp SQLite. Disk goes first
-and SQL last, as in `move-project`: a store failure renames the file back,
+`ctx.destination_*`), move the file(s), and re-stamp SQLite. Disk goes first
+and SQL last, as in `move-project`: a store failure renames the files back,
 so the move is all-or-nothing unless the filesystem also refuses the
 rollback, in which case the error names the manual repair. A `--confirm`
 run takes a wiki checkpoint before and after; a batch takes one pair for
@@ -1305,13 +1347,13 @@ Order of operations:
    configured pepper must match the one the keys were hashed with, or the
    restore stops here too. This also applies when the archive has no
    `config.toml`, even with `--with-config`.
-4. Swap: rename the live `wiki/` and `db/` aside, rename the staged copies
-   into place, then delete the previous data. Each move is a same-filesystem
-   rename; if one fails, the moves already made are reversed. The archive's
-   `config.toml`, when it carries one, replaces the live config only with
+4. Swap: rename the live `wiki/` and `db/` aside and move the staged copies
+   into place. The archive's `config.toml` replaces the live config only with
    `--with-config` or when the data dir has none. Otherwise the live config
    stays and the archived one is saved as `<data_dir>/config.toml.from-backup`
-   (`0600` on Unix), replacing an earlier copy there.
+   (`0600` on Unix), replacing an earlier copy there. If any rename fails,
+   including saving this copy, the earlier moves are reversed. The previous
+   data is deleted only after the swap and config placement succeed.
 5. Print a summary, including where the backup's config went.
 
 A backup's `config.toml` can run commands and redirect data. Restore it, with

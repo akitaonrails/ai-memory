@@ -425,3 +425,40 @@ fn characters_that_hide_text_or_split_a_credential_are_removed() {
     let out = sanitize_external_text("sk-leak-012345\u{0}6789abcdef0123");
     assert_eq!(out, "[REDACTED CREDENTIAL]");
 }
+
+/// Control characters are stripped before matching, so a word glued onto a key
+/// by a removed character used to keep the key whole: the `aim_`/`ams_` and
+/// `AKIA` rules required a left word boundary the removal had destroyed, and
+/// `amk_` had no rule (GHSA-6pmr-q79m-87vp, item 5, the client mirror). The
+/// own-prefix and GitHub rules are now left-unanchored; AWS accepts a
+/// percent-encoded byte.
+#[test]
+fn a_key_glued_onto_a_word_by_a_stripped_character_is_still_redacted() {
+    let tail = "FAKEfake0123-_xy".repeat(3); // 48 base64url chars, > the 40 floor
+    for prefix in ["aim_", "ams_", "amk_"] {
+        let key = format!("{prefix}{tail}");
+        for glued in [
+            format!("title\u{7}{key}"),      // a removed BEL
+            format!("title\u{1b}[32m{key}"), // a removed ANSI escape
+            format!("word{key}"),            // a letter directly before it
+        ] {
+            let out = sanitize_external_text(&glued);
+            assert!(
+                out.contains("[REDACTED CREDENTIAL]") && !out.contains(&tail),
+                "glued key must be redacted: {glued:?} -> {out:?}"
+            );
+        }
+    }
+    // A GitHub token glued onto a word by a removed BEL, and an AWS key behind
+    // a percent-encoded byte.
+    for (input, leaked) in [
+        ("word\u{7}ghp_FAKE0123456789ABCDEFGHIJ0123", "ghp_FAKE"),
+        ("url?k=%20AKIAFAKEFAKEFAKEFAKE", "FAKEFAKE"),
+    ] {
+        let out = sanitize_external_text(input);
+        assert!(
+            out.contains("[REDACTED CREDENTIAL]") && !out.contains(leaked),
+            "credential must be redacted: {input:?} -> {out:?}"
+        );
+    }
+}

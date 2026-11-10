@@ -24,5 +24,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Swift build (compile the app target)
+        # `swift test` only builds the test target and AIMemoryMenuCore, so it
+        # never compiles the SwiftUI/AppKit executable target (AppModel,
+        # SettingsView). Build the whole package so a compile error in the app
+        # is caught here rather than only in build.sh at release time.
+        run: swift build --package-path companions/ai-memory-macos
       - name: Swift tests
         run: swift test --package-path companions/ai-memory-macos

@@ -357,11 +357,18 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
         | AgentKind::IbmBob
         | AgentKind::Dsh
         | AgentKind::QwenCode
-        | AgentKind::Qoder => (
+        | AgentKind::Qoder
+        // Devin CLI's PreToolUse / PostToolUse carry `tool_name` /
+        // `tool_input`; an in-tree PostToolUse fixture also has
+        // `tool_use_id` (docs.devin.ai lifecycle-hooks).
+        | AgentKind::Devin => (
             object.get("tool_name")?.as_str()?,
             object.get("tool_use_id").and_then(Value::as_str),
         ),
-        AgentKind::OpenCode => (
+        // The generated OpenClaw plugin posts the same `tool` / `callID` /
+        // `args` shape as OpenCode (`openclaw_plugin.rs`; docs.openclaw.ai
+        // `before_tool_call` / `after_tool_call`).
+        AgentKind::OpenCode | AgentKind::OpenClaw => (
             object.get("tool")?.as_str()?,
             object.get("callID").and_then(Value::as_str),
         ),
@@ -401,6 +408,18 @@ pub(crate) fn tool_payload_fields(agent: AgentKind, raw: &Value) -> Option<(&str
             let (name, id, _) = cline_tool_fields(object)?;
             (name, id)
         }
+        // Kimi Code's PreToolUse / PostToolUse / PostToolUseFailure carry
+        // Claude Code's `tool_name` / `tool_input` plus `tool_call_id`
+        // (MoonshotAI/kimi-code docs/en/customization/hooks.md; the Bash
+        // example reads `payload.tool_input?.command`). Reconstructed
+        // transcript payloads still use `tool_use_id`.
+        AgentKind::KimiCode => (
+            object.get("tool_name")?.as_str()?,
+            object
+                .get("tool_call_id")
+                .or_else(|| object.get("tool_use_id"))
+                .and_then(Value::as_str),
+        ),
         _ => return None,
     };
     Some((name, id))
@@ -446,6 +465,8 @@ pub(crate) fn tool_observation_metadata(
                             | AgentKind::GeminiCli
                             | AgentKind::QwenCode
                             | AgentKind::Qoder
+                            | AgentKind::KimiCode
+                            | AgentKind::Devin
                     ) {
                         "tool_input"
                     } else {
@@ -500,7 +521,10 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
                 }
             }
         }
-        AgentKind::KiroCli => match raw
+        // Kiro v2 and Devin CLI PostToolUse `tool_response` carry a `success`
+        // boolean. Devin documents `{success, output, error}`
+        // (docs.devin.ai lifecycle-hooks).
+        AgentKind::KiroCli | AgentKind::Devin => match raw
             .get("tool_response")
             .and_then(|response| response.get("success"))
             .and_then(Value::as_bool)
@@ -539,12 +563,18 @@ pub(crate) fn tool_observation_outcome(agent: AgentKind, raw: &Value) -> ToolOut
         // Claude Code's `PostToolUseFailure` carries the same `error` string
         // (<https://code.claude.com/docs/en/hooks>); an aborted call
         // (`is_interrupt`) did not succeed either. Its `PostToolUse` fires
-        // only on success and has no `error` key.
+        // only on success and has no `error` key. Kimi Code's
+        // PostToolUseFailure carries the same `error` string
+        // (MoonshotAI/kimi-code hooks.md).
+        // OpenClaw's `after_tool_call` carries optional `error` (string);
+        // absence of error is not success (docs.openclaw.ai tool-policy).
         AgentKind::Zcode
         | AgentKind::Muse
         | AgentKind::QwenCode
         | AgentKind::Qoder
         | AgentKind::ClaudeCode
+        | AgentKind::KimiCode
+        | AgentKind::OpenClaw
             if raw
                 .get("error")
                 .and_then(Value::as_str)
@@ -1384,7 +1414,10 @@ fn extract(agent: AgentKind, raw: &Value) -> Extracted<'_> {
         // DSH's Claude Code hooks bridge forwards the same `tool_name` /
         // `tool_input` pair, so its file and shell calls read the ignore
         // paths exactly as Claude Code's do.
-        | AgentKind::Dsh => object
+        | AgentKind::Dsh
+        // Kimi Code sends the same `tool_name` / `tool_input` pair
+        // (MoonshotAI/kimi-code hooks.md); Read/Write/Edit take `path`.
+        | AgentKind::KimiCode => object
             .get("tool_name")
             .and_then(Value::as_str)
             .map(|name| (name, object.get("tool_input"))),
@@ -5292,6 +5325,7 @@ mod tests {
             AgentKind::CodeBuddy,
             AgentKind::QwenCode,
             AgentKind::Qoder,
+            AgentKind::KimiCode,
             AgentKind::OpenCode,
             AgentKind::Omp,
             AgentKind::Pi,
@@ -6707,6 +6741,165 @@ mod tests {
         assert_eq!(
             tool_observation_outcome(AgentKind::QwenCode, &json!({"tool_name": "write_file"})),
             ToolOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn kimi_code_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::KimiCode, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-kimi-1"));
+
+        // Reconstructed transcript payloads still use `tool_use_id`.
+        let rebuilt = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_use_id": "call-kimi-2",
+        });
+        let metadata = tool_observation_metadata(AgentKind::KimiCode, &rebuilt, true).unwrap();
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call-kimi-2"));
+
+        let no_input = json!({"tool_name": "Read", "tool_call_id": "call-kimi-1"});
+        assert!(tool_observation_metadata(AgentKind::KimiCode, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::KimiCode,
+                &json!({"tool_name": "Bash", "error": "disk full"})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::KimiCode,
+                &json!({"tool_name": "Bash", "tool_output": "ok"})
+            ),
+            ToolOutcome::Unknown
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let excluded = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "docs/adr/1.md"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let decision = policy.inspect(AgentKind::KimiCode, &excluded, "/repo");
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Drop);
+        assert_eq!(decision.protocol().tool_family(), ToolFamily::File);
+
+        let public = json!({
+            "tool_name": "Read",
+            "tool_input": {"path": "src/lib.rs"},
+            "tool_call_id": "call-kimi-1",
+        });
+        let decision = policy.inspect(AgentKind::KimiCode, &public, "/repo");
+        assert_eq!(decision.protocol().disposition(), CaptureDisposition::Keep);
+    }
+
+    #[test]
+    fn devin_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool_name": "exec",
+            "tool_input": {"command": "ls", "shell_id": "main"},
+            "tool_use_id": "call_devin_1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::Devin, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::NonFile);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call_devin_1"));
+
+        let no_input = json!({"tool_name": "exec", "tool_use_id": "call_devin_1"});
+        assert!(tool_observation_metadata(AgentKind::Devin, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::Devin,
+                &json!({"tool_response": {"success": true, "output": "ok", "error": null}})
+            ),
+            ToolOutcome::Success
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::Devin,
+                &json!({"tool_response": {"success": false, "output": "", "error": "nope"}})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(AgentKind::Devin, &json!({"tool_name": "exec"})),
+            ToolOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn openclaw_tool_metadata_uses_documented_fields() {
+        let pre = json!({
+            "tool": "read",
+            "args": {"path": "src/lib.rs"},
+            "callID": "call_openclaw_1",
+        });
+        let metadata = tool_observation_metadata(AgentKind::OpenClaw, &pre, true).unwrap();
+        assert_eq!(metadata.tool_family, ToolFamily::File);
+        assert_eq!(metadata.tool_call_id.as_deref(), Some("call_openclaw_1"));
+
+        let no_input = json!({"tool": "read", "callID": "call_openclaw_1"});
+        assert!(tool_observation_metadata(AgentKind::OpenClaw, &no_input, true).is_none());
+
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::OpenClaw,
+                &json!({"tool": "exec", "error": "MARKER_OPENCLAW_ERROR"})
+            ),
+            ToolOutcome::Error
+        );
+        assert_eq!(
+            tool_observation_outcome(
+                AgentKind::OpenClaw,
+                &json!({"tool": "exec", "output": "ok"})
+            ),
+            ToolOutcome::Unknown
+        );
+
+        let policy = CapturePolicy::resolve(
+            CaptureSource::Parsed(&CaptureConfig {
+                ignore_paths: vec!["docs/adr/**".into()],
+            }),
+            "/repo",
+            None,
+        );
+        let dropped = json!({
+            "tool": "read",
+            "args": {"path": "docs/adr/1.md"},
+            "callID": "call_openclaw_drop",
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::OpenClaw, &dropped, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Drop
+        );
+        let kept = json!({
+            "tool": "read",
+            "args": {"path": "src/lib.rs"},
+            "callID": "call_openclaw_keep",
+        });
+        assert_eq!(
+            policy
+                .inspect(AgentKind::OpenClaw, &kept, "/repo")
+                .protocol()
+                .disposition(),
+            CaptureDisposition::Keep
         );
     }
 

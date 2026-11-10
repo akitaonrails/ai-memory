@@ -16,6 +16,7 @@ mod backfill_oversized;
 mod backup_agents;
 mod backup_download;
 mod completions;
+mod credential_masking_e2e;
 mod cross_origin_e2e;
 mod doctor_e2e;
 mod e2e_support;
@@ -51,5 +52,6 @@ mod upgrade_e2e;
 mod windows_plain_paths;
 mod workstream_provenance;
 mod yolo_ai_jail;
+mod yolo_kiro;
 
 mod workstream_identity;

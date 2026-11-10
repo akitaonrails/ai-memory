@@ -270,10 +270,47 @@ impl Consolidator {
         instructions: Option<&str>,
     ) -> ConsolidatorResult<ConsolidationOutcome> {
         // Resolve the target from where the observations landed (see
-        // `resolve_target`): the bounded reads below gate on the session
-        // holding at least one observation in THAT scope — the (possibly
-        // stale) `sessions` row is not consulted.
+        // `resolve_target`), then consolidate bound to exactly that scope.
         let (ws, proj) = self.resolve_target(session_id).await?;
+        self.consolidate_session_in_scope(
+            ws,
+            proj,
+            session_id,
+            dry_run,
+            actor,
+            author_id,
+            instructions,
+        )
+        .await
+    }
+
+    /// [`Self::consolidate_session`] bound to a caller-supplied scope instead
+    /// of re-resolving it from the session.
+    ///
+    /// A session id reaches consolidation without naming a repository, so an
+    /// authorizing caller (`memory_consolidate`) resolves the write target
+    /// once, authorizes it, and passes it here. That closes the window in
+    /// which a concurrent observation landing in another project could flip
+    /// [`Self::resolve_target`] between the grant check and the write, so the
+    /// page lands in — and, with the scoped snapshot reads, is built only
+    /// from — the scope the caller was granted (GHSA-xfgc-hc4c-wj7h). The
+    /// bounded reads below still gate on the session holding at least one
+    /// observation in THAT scope.
+    ///
+    /// # Errors
+    /// Returns [`ConsolidatorError`] for any store, wiki, or LLM failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consolidate_session_in_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        dry_run: bool,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+        instructions: Option<&str>,
+    ) -> ConsolidatorResult<ConsolidationOutcome> {
+        let (ws, proj) = (workspace_id, project_id);
 
         // Bounded gate: count and span only, no row is materialised. A
         // session with no observations in its consolidation scope — a
@@ -780,10 +817,41 @@ impl Consolidator {
         instructions: Option<&str>,
     ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
         // Resolve the target from where the observations landed — see
-        // `resolve_target` / `consolidate_session` for the rationale. The
-        // bounded reads gate on the session holding at least one
-        // observation in that scope.
+        // `resolve_target` / `consolidate_session` for the rationale — then
+        // consolidate bound to exactly that scope.
         let (ws, proj) = self.resolve_target(session_id).await?;
+        self.consolidate_session_multi_in_scope(
+            ws,
+            proj,
+            session_id,
+            dry_run,
+            actor,
+            author_id,
+            instructions,
+        )
+        .await
+    }
+
+    /// [`Self::consolidate_session_multi`] bound to a caller-supplied scope
+    /// instead of re-resolving it. See [`Self::consolidate_session_in_scope`]
+    /// for why an authorizing caller resolves and authorizes the target once,
+    /// then passes it here (GHSA-xfgc-hc4c-wj7h).
+    ///
+    /// # Errors
+    /// Returns [`ConsolidatorError`] for any store, wiki, or LLM failure. On
+    /// error, no pages are written and no files moved.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn consolidate_session_multi_in_scope(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        dry_run: bool,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+        instructions: Option<&str>,
+    ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
+        let (ws, proj) = (workspace_id, project_id);
 
         // Bounded gate (see `consolidate_session`): count only, no row is
         // materialised; a session with no observations in its consolidation
@@ -2314,9 +2382,17 @@ fn fold_rule_slug(title: &str, digest_fold_loss: bool) -> String {
             out.pop();
         }
     }
-    match suffix {
+    let slug = match suffix {
         Some(suffix) => format!("{out}{suffix}"),
         None => out,
+    };
+    // A device stem (`con`, `nul`, `com1`) fails `ensure_portable`, which
+    // would abort the whole batch; a trailing `-` keeps it a plain name, as
+    // `make_component_portable` does for the non-rule paths.
+    if ai_memory_core::is_dos_device_name(&slug) {
+        format!("{slug}-")
+    } else {
+        slug
     }
 }
 
@@ -3990,6 +4066,20 @@ mod tests {
         assert_eq!(slugify_for_rule("---hyphenated---"), "hyphenated");
     }
 
+    /// A rule titled after a DOS device would land on `_rules/con.md`,
+    /// which `ensure_portable` refuses, and `Wiki::apply_batch` would then
+    /// abort every page in the batch (#848's class, for the rule branch).
+    #[test]
+    fn slugify_keeps_device_name_titles_portable() {
+        for title in ["CON", "nul", "Aux", "COM1", "lpt3"] {
+            let slug = slugify_for_rule(title);
+            let path = PagePath::new(format!("_rules/{slug}.md")).unwrap();
+            assert!(path.ensure_portable().is_ok(), "{title} -> {slug}");
+        }
+        assert_eq!(slugify_for_rule("CON"), "con-");
+        assert_eq!(slugify_for_rule("Console output"), "console-output");
+    }
+
     /// Empty and punctuation-only titles fall back to a static slug
     /// instead of producing an invalid PagePath.
     #[test]
@@ -5227,6 +5317,177 @@ mod tests {
         assert!(
             page_missing(&wiki, ws, proj, &format!("sessions/{session}.md")),
             "a failed consolidation must not write a page"
+        );
+    }
+
+    /// Captures each structured request's debug form so a test can assert
+    /// what the LLM was shown, and answers a fixed valid page.
+    struct PromptCapturingLlm {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl PromptCapturingLlm {
+        fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            (Self { seen: seen.clone() }, seen)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PromptCapturingLlm {
+        fn name(&self) -> &'static str {
+            "prompt-capturing"
+        }
+        fn model(&self) -> &str {
+            "prompt-capturing"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.seen.lock().unwrap().push(format!("{request:?}"));
+            Ok(scripted_page())
+        }
+    }
+
+    /// GHSA-xfgc-hc4c-wj7h at the consolidation seam: a session can cross
+    /// repositories mid-flight, holding observations in more than one
+    /// `(workspace_id, project_id)`. `memory_consolidate` resolves and
+    /// authorizes the write target once, then passes it to
+    /// `consolidate_session_in_scope`, which must build and write the page
+    /// strictly in that scope — never re-resolving to another project and
+    /// never pulling another project's observations into the prompt (which a
+    /// concurrent cross-project observation could otherwise cause between the
+    /// grant check and the write). Bites: with the snapshot scope filters
+    /// removed the `must not reach the prompt` assertion fails; if the bound
+    /// scope were ignored and re-resolved, the page would land in the wrong
+    /// project. Binds to each scope in turn, using a consolidator whose own
+    /// startup ids are the *other* project, so the binding cannot come from
+    /// the consolidator's defaults.
+    #[tokio::test]
+    async fn consolidate_in_scope_binds_the_write_and_prompt_to_one_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let home = store
+            .writer
+            .get_or_create_project(ws, "home", None)
+            .await
+            .unwrap();
+        let restricted = store
+            .writer
+            .get_or_create_project(ws, "restricted", None)
+            .await
+            .unwrap();
+        let session = SessionId::new();
+        // The session row anchors in `home`; a user prompt lands in each
+        // project under the one session id.
+        seed_session(store.db_path(), session, ws, home);
+        let insert = |proj: ProjectId, tag: u8, title: &str, body: &str| {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            let mut id = [0u8; 16];
+            id[15] = tag;
+            conn.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'user-prompt', ?5, ?6, 1700000000001)",
+                rusqlite::params![
+                    &id[..],
+                    session.as_bytes(),
+                    ws.as_bytes(),
+                    proj.as_bytes(),
+                    title,
+                    body
+                ],
+            )
+            .unwrap();
+        };
+        insert(home, 10, "home prompt", "HOMEBODY alpha");
+        insert(restricted, 20, "restricted prompt", "RESTRICTEDBODY secret");
+
+        let path = PagePath::new(format!("sessions/{session}.md")).unwrap();
+        let path_str = format!("sessions/{session}.md");
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        // Bind to `restricted`, with the consolidator's own startup ids set to
+        // `home`: the page lands in `restricted`, nothing is written into
+        // `home`, and no `home` observation reaches the prompt.
+        let (llm, seen) = PromptCapturingLlm::new();
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(llm),
+            ws,
+            home,
+        )
+        .consolidate_session_in_scope(
+            ws,
+            restricted,
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            wiki.read_page(ws, restricted, &path).is_ok(),
+            "the page lands in the bound scope"
+        );
+        assert!(
+            page_missing(&wiki, ws, home, &path_str),
+            "no page is written into the other scope"
+        );
+        let prompt = seen.lock().unwrap().concat();
+        assert!(
+            prompt.contains("RESTRICTEDBODY"),
+            "the bound scope's own observation is present"
+        );
+        assert!(
+            !prompt.contains("HOMEBODY"),
+            "the other scope's observation must not reach the prompt"
+        );
+
+        // The mirror: bind to `home`, startup ids `restricted`.
+        let (llm2, seen2) = PromptCapturingLlm::new();
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            Arc::new(llm2),
+            ws,
+            restricted,
+        )
+        .consolidate_session_in_scope(
+            ws,
+            home,
+            session,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(wiki.read_page(ws, home, &path).is_ok());
+        let prompt2 = seen2.lock().unwrap().concat();
+        assert!(prompt2.contains("HOMEBODY"));
+        assert!(
+            !prompt2.contains("RESTRICTEDBODY"),
+            "binding to home must not pull the restricted observation"
         );
     }
 

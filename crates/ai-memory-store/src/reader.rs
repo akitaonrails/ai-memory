@@ -2659,6 +2659,21 @@ pub struct PageSummary {
     pub updated_at: String,
 }
 
+impl PageSummary {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let updated_us: i64 = row.get(4)?;
+        Ok(Self {
+            path: row.get(0)?,
+            title: row.get(1)?,
+            kind: row.get(2)?,
+            tier: row.get(3)?,
+            updated_at: jiff::Timestamp::from_microsecond(updated_us)
+                .map(|ts| ts.to_string())
+                .unwrap_or_default(),
+        })
+    }
+}
+
 /// Page author surfaced alongside read responses (P1.7).
 /// JOINed from the `users` table when `pages.author_id IS NOT NULL`;
 /// `None` for anonymous + root writes (where attribution lives only in
@@ -5155,6 +5170,8 @@ impl ReaderPool {
             let snapshot = SessionObservationSnapshot {
                 conn: &tx,
                 session_id: session_id.as_bytes().to_vec(),
+                workspace_id: workspace_id.as_bytes().to_vec(),
+                project_id: project_id.as_bytes().to_vec(),
                 rows_read: std::cell::Cell::new(0),
             };
             read(&snapshot)
@@ -5206,6 +5223,8 @@ impl ReaderPool {
             let snapshot = SessionObservationSnapshot {
                 conn: &tx,
                 session_id: session_id.as_bytes().to_vec(),
+                workspace_id: workspace_id.as_bytes().to_vec(),
+                project_id: project_id.as_bytes().to_vec(),
                 rows_read: std::cell::Cell::new(0),
             };
             read(&snapshot)
@@ -6388,6 +6407,41 @@ impl ReaderPool {
                 ))),
                 None => Ok(None),
             }
+        })
+        .await
+    }
+
+    /// Scopes other than `(workspace_id, project_id)` that hold a LATEST
+    /// `sessions/<session_id>.md` page row. These are the scopes a re-home
+    /// (`move-session` of a session already rooted in the destination)
+    /// sweeps, so the wiki uses them to plan the matching file step.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn session_page_latest_scopes_outside(
+        &self,
+        session_id: SessionId,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Vec<(WorkspaceId, ProjectId)>> {
+        self.with_conn(move |conn| {
+            let path = format!("sessions/{session_id}.md");
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT workspace_id, project_id FROM pages \
+                 WHERE path = ?1 AND is_latest = 1 \
+                   AND NOT (workspace_id = ?2 AND project_id = ?3) \
+                 ORDER BY workspace_id, project_id",
+            )?;
+            let rows = stmt.query_map(
+                params![path, workspace_id.as_bytes(), project_id.as_bytes()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (ws, proj) = row?;
+                out.push((WorkspaceId::from_slice(&ws)?, ProjectId::from_slice(&proj)?));
+            }
+            Ok(out)
         })
         .await
     }
@@ -9797,7 +9851,7 @@ impl ReaderPool {
     /// Propagates any SQL or pool error.
     pub async fn snapshot_to(&self, dest_path: PathBuf) -> StoreResult<()> {
         self.with_conn(move |conn| {
-            conn.backup(rusqlite::DatabaseName::Main, &dest_path, None)
+            conn.backup(rusqlite::MAIN_DB, &dest_path, rusqlite::backup::NO_PROGRESS)
                 .map_err(StoreError::from)
         })
         .await
@@ -12133,29 +12187,72 @@ impl ReaderPool {
             if hide_expired {
                 bound.push(&now);
             }
-            let rows = stmt.query_map(params_from_iter(bound.iter()), |row| {
-                let path: String = row.get(0)?;
-                let title: String = row.get(1)?;
-                let kind: String = row.get(2)?;
-                let tier: String = row.get(3)?;
-                let updated_us: i64 = row.get(4)?;
-                Ok((path, title, kind, tier, updated_us))
-            })?;
-            let mut out = Vec::new();
-            for r in rows {
-                let (path, title, kind, tier, updated_us) = r?;
-                let updated_at = jiff::Timestamp::from_microsecond(updated_us)
-                    .map(|ts| ts.to_string())
-                    .unwrap_or_default();
-                out.push(PageSummary {
-                    path,
-                    title,
-                    kind,
-                    tier,
-                    updated_at,
+            let rows = stmt.query_map(params_from_iter(bound.iter()), PageSummary::from_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Latest unexpired page summaries for the legacy JSON recent route.
+    ///
+    /// The caller authorizes the scope IDs. Requiring the exact URL names
+    /// keeps the same name matching as [`Self::list_unexpired_pages`].
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn recent_unexpired_page_summaries(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        workspace: &str,
+        project: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<PageSummary>> {
+        let workspace = workspace.to_owned();
+        let project = project.to_owned();
+        let limit = limit.clamp(1, 100);
+        self.with_conn(move |conn| {
+            let kind_expr = page_kind_expr("pg.path", "pg.frontmatter_json");
+            let ttl = not_expired("pg", "?5");
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT pg.path, pg.title, {kind_expr}, pg.tier, pg.updated_at
+                 FROM pages pg
+                 WHERE pg.workspace_id = ?1 AND pg.project_id = ?2 AND pg.is_latest = 1{ttl}
+                   AND EXISTS (
+                       SELECT 1 FROM projects p JOIN workspaces w ON w.id = p.workspace_id
+                       WHERE w.id = ?1 AND p.id = ?2 AND w.name = ?3 AND p.name = ?4
+                   )
+                 ORDER BY pg.updated_at DESC, pg.path ASC LIMIT ?6"
+            ))?;
+            let now = now_us();
+            let mut fetch = |sql_limit| -> StoreResult<Vec<PageSummary>> {
+                let rows = stmt.query_map(
+                    params![
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes(),
+                        workspace,
+                        project,
+                        now,
+                        sql_limit,
+                    ],
+                    PageSummary::from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            };
+            let mut pages = fetch(limit as i64)?;
+            // An unrepresentable timestamp sorts last, regardless of the
+            // stored number. Re-sort only if one reached the SQL top N.
+            if pages.iter().any(|page| page.updated_at.is_empty()) {
+                pages = fetch(-1)?;
+                pages.sort_by_cached_key(|page| {
+                    (
+                        std::cmp::Reverse(page.updated_at.parse::<jiff::Timestamp>().ok()),
+                        page.path.clone(),
+                    )
                 });
+                pages.truncate(limit);
             }
-            Ok(out)
+            Ok(pages)
         })
         .await
     }
@@ -12195,18 +12292,7 @@ impl ReaderPool {
                     jiff::Timestamp::now().as_microsecond(),
                     limit.clamp(1, 100) as i64 + 1
                 ],
-                |row| {
-                    let updated_us: i64 = row.get(4)?;
-                    Ok(PageSummary {
-                        path: row.get(0)?,
-                        title: row.get(1)?,
-                        kind: row.get(2)?,
-                        tier: row.get(3)?,
-                        updated_at: jiff::Timestamp::from_microsecond(updated_us)
-                            .map(|ts| ts.to_string())
-                            .unwrap_or_default(),
-                    })
-                },
+                PageSummary::from_row,
             )?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
@@ -13902,6 +13988,10 @@ impl ReaderPool {
 
     /// Server-wide [`SessionConsolidationQueue`] state.
     ///
+    /// `failed` counts only the failures no newer generation of the same
+    /// session has completed since (see
+    /// [`UNRECOVERED_FAILED_CONSOLIDATION_JOB`]).
+    ///
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn session_consolidation_queue(&self) -> StoreResult<SessionConsolidationQueue> {
@@ -13919,10 +14009,18 @@ impl ReaderPool {
                     "pending" => queue.pending = n,
                     "running" => queue.running = n,
                     "completed" => queue.completed = n,
-                    "failed" => queue.failed = n,
                     _ => {}
                 }
             }
+            let failed: i64 = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM session_consolidation_jobs job \
+                     WHERE {UNRECOVERED_FAILED_CONSOLIDATION_JOB}"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            queue.failed = u64::try_from(failed).unwrap_or(0);
             queue.last_completed_at_us = conn.query_row(
                 "SELECT MAX(completed_at) FROM session_consolidation_jobs \
                  WHERE state = 'completed'",
@@ -13941,7 +14039,9 @@ impl ReaderPool {
     }
 
     /// The most recent consolidation jobs that gave up, newest first,
-    /// bounded to `limit`.
+    /// bounded to `limit`. A failure a newer generation of the same session
+    /// has since completed is left out (see
+    /// [`UNRECOVERED_FAILED_CONSOLIDATION_JOB`]).
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -13951,12 +14051,13 @@ impl ReaderPool {
     ) -> StoreResult<Vec<FailedConsolidationJob>> {
         let limit = i64::from(limit.clamp(1, 100));
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT session_id, attempts, COALESCE(completed_at, 0), \
-                        COALESCE(last_error, '') \
-                 FROM session_consolidation_jobs WHERE state = 'failed' \
-                 ORDER BY COALESCE(completed_at, 0) DESC LIMIT ?1",
-            )?;
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT job.session_id, job.attempts, COALESCE(job.completed_at, 0), \
+                        COALESCE(job.last_error, '') \
+                 FROM session_consolidation_jobs job \
+                 WHERE {UNRECOVERED_FAILED_CONSOLIDATION_JOB} \
+                 ORDER BY COALESCE(job.completed_at, 0) DESC LIMIT ?1"
+            ))?;
             let rows = stmt.query_map([limit], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
@@ -14964,6 +15065,22 @@ fn health_page_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HealthPage>
     })
 }
 
+/// SQL predicate over a `session_consolidation_jobs` row aliased `job`: a
+/// failed job that still needs an operator.
+///
+/// A failed generation stops mattering once a newer generation of the same
+/// session completes: consolidation reads the session's current observations,
+/// so the newer page already covers everything the failed run would have
+/// written. Counting it anyway kept `/admin/status`, `status --json` and the
+/// health panel reporting sessions that were consolidated, and sent a #1692
+/// watchdog to re-run them. A failure newer than the last completed
+/// generation is still listed. Generation is the primary key's second column,
+/// so the probe is an index lookup.
+const UNRECOVERED_FAILED_CONSOLIDATION_JOB: &str = "job.state = 'failed' \
+     AND NOT EXISTS (SELECT 1 FROM session_consolidation_jobs newer \
+     WHERE newer.session_id = job.session_id AND newer.state = 'completed' \
+     AND newer.generation > job.generation)";
+
 /// SQL for [`PageMeta::created_at`]: when the page itself first appeared.
 ///
 /// `pages.created_at` is per version, so the latest row alone would report the
@@ -15063,6 +15180,12 @@ fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<P
 pub struct SessionObservationSnapshot<'c> {
     conn: &'c Connection,
     session_id: Vec<u8>,
+    /// The scope this snapshot is bound to. A session can cross repositories
+    /// mid-flight, holding observations in more than one `(workspace_id,
+    /// project_id)`; every query here filters by this pair so a caller
+    /// resolved to one scope never reads another's rows (GHSA-xfgc-hc4c-wj7h).
+    workspace_id: Vec<u8>,
+    project_id: Vec<u8>,
     rows_read: std::cell::Cell<usize>,
 }
 
@@ -15117,8 +15240,9 @@ fn failed_tool_sql() -> String {
 /// before a single row is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationProjectionTotals {
-    /// Rows the session holds — every observation of it, regardless of the
-    /// scope the consolidation target was resolved from.
+    /// Rows the session holds in the snapshot's scope — observations in the
+    /// `(workspace_id, project_id)` the snapshot was bound to, not a
+    /// cross-repository session's rows in another scope.
     pub total: usize,
     /// Oldest `created_at` (microseconds since the epoch); `None` while the
     /// session holds no rows.
@@ -15206,7 +15330,8 @@ impl SessionObservationSnapshot<'_> {
                     MAX(CASE WHEN kind = ?2 THEN created_at END), \
                     COALESCE(SUM(kind = ?6 AND {failed}), 0), \
                     MAX(CASE WHEN kind = ?6 AND {failed} THEN created_at END) \
-             FROM observations WHERE session_id = ?1"
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?9 AND project_id = ?10"
         );
         let summary = self.conn.query_row(
             &sql,
@@ -15219,6 +15344,8 @@ impl SessionObservationSnapshot<'_> {
                 ObservationKind::PostToolUse.as_str(),
                 TOOL_BODY_SEPARATOR,
                 FAILED_TOOL_OUTCOME_LINE,
+                self.workspace_id,
+                self.project_id,
             ],
             |row| {
                 Ok(SessionKindSummary {
@@ -15239,6 +15366,24 @@ impl SessionObservationSnapshot<'_> {
         Ok(summary)
     }
 
+    /// Every observation of the session, whatever project each row landed in.
+    ///
+    /// The one read of this snapshot that is deliberately not bound to its
+    /// scope, and it returns a number, never a row. A digest is built only from
+    /// the snapshot's own scope, but `ended_observation_count` and the idle
+    /// end's stamp count the whole session, so the generation a digest is
+    /// stamped against has to be counted the same way, in the same snapshot.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn whole_session_observation_count(&self) -> StoreResult<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM observations WHERE session_id = ?1",
+            params![self.session_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Row count and the session's first and last `created_at` in one
     /// aggregate pass, without reading a row.
     ///
@@ -15247,8 +15392,9 @@ impl SessionObservationSnapshot<'_> {
     pub fn projection_totals(&self) -> StoreResult<ObservationProjectionTotals> {
         let (total, first, last): (i64, Option<i64>, Option<i64>) = self.conn.query_row(
             "SELECT COUNT(*), MIN(created_at), MAX(created_at) \
-             FROM observations WHERE session_id = ?1",
-            params![self.session_id],
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            params![self.session_id, self.workspace_id, self.project_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         Ok(ObservationProjectionTotals {
@@ -15266,6 +15412,7 @@ impl SessionObservationSnapshot<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT kind, title, COUNT(*) FROM observations \
              WHERE session_id = ?1 AND kind IN (?2, ?3) AND title <> '' \
+               AND workspace_id = ?4 AND project_id = ?5 \
              GROUP BY kind, title",
         )?;
         let rows = stmt.query_map(
@@ -15273,6 +15420,8 @@ impl SessionObservationSnapshot<'_> {
                 self.session_id,
                 ObservationKind::PreToolUse.as_str(),
                 ObservationKind::PostToolUse.as_str(),
+                self.workspace_id,
+                self.project_id,
             ],
             |row| {
                 Ok((
@@ -15306,61 +15455,53 @@ impl SessionObservationSnapshot<'_> {
     /// # Errors
     /// Propagates any SQL error.
     pub fn prompt_titles(&self, head: usize, tail: usize) -> StoreResult<SessionPromptTitles> {
-        let total = self.conn.query_row(
-            "SELECT COUNT(*) FROM observations \
-             WHERE session_id = ?1 AND kind = ?2",
-            params![self.session_id, ObservationKind::UserPrompt.as_str()],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let total = usize::try_from(total).unwrap_or(usize::MAX);
-        if total <= head + tail {
-            return Ok(SessionPromptTitles {
-                total,
-                first: self.prompt_title_window(total, ObservationOrder::Asc)?,
-                last: Vec::new(),
-            });
-        }
-        let mut last = self.prompt_title_window(tail, ObservationOrder::Desc)?;
-        last.reverse();
-        Ok(SessionPromptTitles {
-            total,
-            first: self.prompt_title_window(head, ObservationOrder::Asc)?,
-            last,
-        })
-    }
-
-    /// The first `limit` user-prompt titles of the session in `order`.
-    ///
-    /// # Errors
-    /// Propagates any SQL error.
-    fn prompt_title_window(
-        &self,
-        limit: usize,
-        order: ObservationOrder,
-    ) -> StoreResult<Vec<String>> {
-        let direction = match order {
-            ObservationOrder::Asc => "ASC",
-            ObservationOrder::Desc => "DESC",
-        };
-        let sql = format!(
+        // Read every user-prompt title for the session, then drop the machine
+        // turns Claude Code routes through the prompt channel (`<task-notification>`,
+        // `<teammate-message …>`, the cross-session envelope, the post-compaction
+        // summary): they are not what the user asked, so they belong in neither
+        // the `## Prompts` list nor its count (#2149). Other scaffolding — an IDE
+        // context block, a shell prompt echoed into a paste — is still real
+        // session history and stays listed, as it always has. The filter is a
+        // leading-shape test, not SQL-expressible, and a session's titles are
+        // bounded and small, so windowing happens in Rust over the kept set.
+        let mut stmt = self.conn.prepare_cached(
             "SELECT title FROM observations \
              WHERE session_id = ?1 AND kind = ?2 \
-             ORDER BY created_at {direction}, rowid {direction} LIMIT ?3"
-        );
-        let mut stmt = self.conn.prepare_cached(&sql)?;
+               AND workspace_id = ?3 AND project_id = ?4 \
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
         let rows = stmt.query_map(
             params![
                 self.session_id,
                 ObservationKind::UserPrompt.as_str(),
-                i64::try_from(limit).unwrap_or(i64::MAX),
+                self.workspace_id,
+                self.project_id,
             ],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )?;
-        let mut out = Vec::with_capacity(limit);
+        let mut titles = Vec::new();
         for title in rows {
-            out.push(title?);
+            let title = title?;
+            if !ai_memory_core::looks_like_machine_turn(&title) {
+                titles.push(title);
+            }
         }
-        Ok(out)
+
+        let total = titles.len();
+        if total <= head + tail {
+            return Ok(SessionPromptTitles {
+                total,
+                first: titles,
+                last: Vec::new(),
+            });
+        }
+        let last = titles.split_off(total - tail);
+        titles.truncate(head);
+        Ok(SessionPromptTitles {
+            total,
+            first: titles,
+            last,
+        })
     }
 
     /// Walk the session's user prompts in capture order, one resident at a
@@ -15381,12 +15522,15 @@ impl SessionObservationSnapshot<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT title, CASE WHEN instr(title, ?3) > 0 THEN body END \
              FROM observations WHERE session_id = ?1 AND kind = ?2 \
+               AND workspace_id = ?4 AND project_id = ?5 \
              ORDER BY created_at ASC, rowid ASC",
         )?;
         let mut rows = stmt.query(params![
             self.session_id,
             ObservationKind::UserPrompt.as_str(),
             body_for_titles_like,
+            self.workspace_id,
+            self.project_id,
         ])?;
         while let Some(row) = rows.next()? {
             let title: String = row.get(0)?;
@@ -15423,7 +15567,8 @@ impl SessionObservationSnapshot<'_> {
         };
         let sql = format!(
             "SELECT kind, extension, source_event, substr(title, 1, ?3), created_at \
-             FROM observations WHERE session_id = ?1 \
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?4 AND project_id = ?5 \
              ORDER BY created_at {direction}, rowid {direction} LIMIT ?2"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
@@ -15431,6 +15576,8 @@ impl SessionObservationSnapshot<'_> {
             self.session_id,
             i64::try_from(limit).unwrap_or(i64::MAX),
             i64::try_from(SESSION_LINE_TITLE_CHARS).unwrap_or(80),
+            self.workspace_id,
+            self.project_id,
         ])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -15481,9 +15628,14 @@ impl SessionObservationSnapshot<'_> {
         let mut sql = String::from(
             "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
                     title, body, importance, created_at \
-             FROM observations WHERE session_id = ?",
+             FROM observations \
+             WHERE session_id = ? AND workspace_id = ? AND project_id = ?",
         );
-        let mut sql_params: Vec<Value> = vec![Value::Blob(self.session_id.clone())];
+        let mut sql_params: Vec<Value> = vec![
+            Value::Blob(self.session_id.clone()),
+            Value::Blob(self.workspace_id.clone()),
+            Value::Blob(self.project_id.clone()),
+        ];
         if let Some(bound) = at_or_before {
             sql.push_str(" AND created_at <= ?");
             sql_params.push(Value::Integer(bound));
@@ -15532,10 +15684,11 @@ impl SessionObservationSnapshot<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT rowid, id, session_id, workspace_id, project_id, kind, extension, \
                     source_event, title, body, importance, created_at \
-             FROM observations WHERE session_id = ?1 \
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
              ORDER BY created_at ASC, rowid ASC",
         )?;
-        let mut rows = stmt.query(params![self.session_id])?;
+        let mut rows = stmt.query(params![self.session_id, self.workspace_id, self.project_id])?;
         while let Some(row) = rows.next()? {
             let rowid: i64 = row.get(0)?;
             let observation = row_to_observation_at(row, 1)??;
@@ -15549,7 +15702,7 @@ impl SessionObservationSnapshot<'_> {
 
     /// Materialise one row of the session by its `rowid` — the point fetch a
     /// streamed pass uses to re-read a body it chose to keep. One row, or
-    /// none when the `rowid` belongs to another session or is gone.
+    /// none when the `rowid` belongs to another session or scope, or is gone.
     ///
     /// # Errors
     /// Propagates any SQL error.
@@ -15557,9 +15710,16 @@ impl SessionObservationSnapshot<'_> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
                     title, body, importance, created_at \
-             FROM observations WHERE session_id = ?1 AND rowid = ?2",
+             FROM observations \
+             WHERE session_id = ?1 AND rowid = ?2 \
+               AND workspace_id = ?3 AND project_id = ?4",
         )?;
-        let mut rows = stmt.query(params![self.session_id, rowid])?;
+        let mut rows = stmt.query(params![
+            self.session_id,
+            rowid,
+            self.workspace_id,
+            self.project_id
+        ])?;
         match rows.next()? {
             Some(row) => {
                 let observation = row_to_observation(row)??;

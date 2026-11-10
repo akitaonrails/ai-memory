@@ -1019,6 +1019,12 @@ impl RuntimeEnv {
 
     #[cfg(test)]
     pub fn with_process_env_for_tests(pairs: &[(&str, &str)]) -> Self {
+        // Derive the typed capture-owner flag from the simulated process env
+        // exactly as `from_process` does, so a test that sets
+        // AI_MEMORY_CAPTURE_OWNER gets the same external-capture behavior.
+        let capture_owner_active = pairs
+            .iter()
+            .any(|(key, value)| *key == "AI_MEMORY_CAPTURE_OWNER" && !value.trim().is_empty());
         Self {
             process_env: CapturedProcessEnv(
                 pairs
@@ -1026,6 +1032,7 @@ impl RuntimeEnv {
                     .map(|(key, value)| (OsString::from(key), OsString::from(value)))
                     .collect(),
             ),
+            capture_owner_active,
             ..Self::default()
         }
     }

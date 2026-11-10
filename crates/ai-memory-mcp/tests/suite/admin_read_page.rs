@@ -3,7 +3,7 @@
 //! the handler serves the store's faithful copy instead of 404ing
 //! (gotchas/read-page-by-query-misses), while real parse errors still surface.
 
-use super::common::get;
+use super::common::{get, post};
 use ai_memory_core::{NewPage, PagePath, Tier};
 use ai_memory_mcp::AdminState;
 use ai_memory_store::{DecayParams, Store};
@@ -276,6 +276,81 @@ async fn read_page_does_not_fall_back_when_disk_frontmatter_is_malformed() {
 
 /// A genuinely-absent page (no DB row, no file) still 404s — the fallback
 /// must not mask a real miss.
+/// `POST /admin/delete-page` reports whether a page actually existed. It used
+/// to answer `deleted: true` for any path, so `ai-memory profile forget`
+/// printed "Forgot …" after removing nothing (the path was absent — often
+/// because the `.md`-less form the digest uses did not resolve). A delete of
+/// an absent path now reports `deleted: false`; removing a real page reports
+/// `deleted: true` (#2181).
+#[tokio::test]
+async fn delete_page_reports_whether_the_page_existed() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_string())
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch".to_string(), None)
+        .await
+        .unwrap();
+
+    let absent = post(
+        state.clone(),
+        "/admin/delete-page",
+        serde_json::json!({
+            "workspace": "default",
+            "project": "scratch",
+            "path": "profile/workflow/never-push.md",
+        }),
+    )
+    .await;
+    assert_eq!(absent.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(absent).await["deleted"],
+        serde_json::json!(false),
+        "deleting an absent page must report that nothing was removed"
+    );
+
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("profile/workflow/never-push.md").unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: "Never push.".to_string(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let removed = post(
+        state,
+        "/admin/delete-page",
+        serde_json::json!({
+            "workspace": "default",
+            "project": "scratch",
+            "path": "profile/workflow/never-push.md",
+        }),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(removed).await["deleted"],
+        serde_json::json!(true),
+        "removing a real page must report it was deleted"
+    );
+}
+
 #[tokio::test]
 async fn read_page_404_when_truly_absent() {
     let tmp = TempDir::new().unwrap();

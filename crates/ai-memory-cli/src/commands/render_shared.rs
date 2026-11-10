@@ -348,6 +348,100 @@ pub(crate) fn bearer_header_value(token: Option<&str>) -> Option<String> {
     token.map(|t| format!("Bearer {t}"))
 }
 
+/// The marker a masked secret shows in place of its value.
+pub(crate) const SECRET_MASK: &str = "[REDACTED]";
+
+/// Mask a secret for display: a short recognizable prefix of a long,
+/// high-entropy value, then [`SECRET_MASK`], so a credential printed in a
+/// preview, a fallback snippet, a parse error or a profile listing cannot be
+/// read back out of the terminal scrollback, a CI log or an agent transcript.
+///
+/// The person running the command already holds the value; the preview keeps
+/// its shape (it stays valid JSON/TOML/YAML) but no longer carries the live
+/// token. A short value shows nothing but the marker — there is no safe prefix
+/// of it to reveal.
+#[must_use]
+pub(crate) fn mask_secret(secret: &str) -> String {
+    // 12 is the minimum credential length ai-memory mints or accepts; below it
+    // a 4-character prefix is too much of the whole to reveal.
+    if secret.chars().count() < 12 {
+        SECRET_MASK.to_string()
+    } else {
+        let prefix: String = secret.chars().take(4).collect();
+        format!("{prefix}...{SECRET_MASK}")
+    }
+}
+
+/// Replace a URL's `user:password@` userinfo with [`SECRET_MASK`], so a
+/// credential embedded in a server-profile URL is not printed in a listing or
+/// echoed back in a validation error (GHSA-6pmr-q79m-87vp item 4). Works
+/// lexically — the userinfo is the span between `://` and the `@` that precedes
+/// the host — so it also strips the userinfo from a string that does not parse
+/// as a URL (the raw value an "is not a URL" error quotes). A URL with no
+/// userinfo is returned unchanged.
+#[must_use]
+pub(crate) fn mask_url_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let authority_start = scheme_end + "://".len();
+    let rest = &url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // Only the last `@` separates userinfo from host; a password may contain
+    // an escaped `@`, but the host never does.
+    match authority.rfind('@') {
+        Some(at) => format!(
+            "{}{SECRET_MASK}@{}",
+            &url[..authority_start],
+            &rest[at + 1..]
+        ),
+        None => url.to_owned(),
+    }
+}
+
+/// Redact credential values a configuration *parse error* echoes back from the
+/// offending source line (GHSA-6pmr-q79m-87vp item 3). A TOML syntax error on a
+/// line that holds `bearer_token = "…"` repeats that whole line, so the secret
+/// lands on the terminal; this keeps the key, the assignment and the error's
+/// shape and masks only the value. Also masks `user:password@` userinfo in any
+/// URL the text echoes (a bad `servers.toml` line, a profile URL).
+///
+/// Deliberately narrow — it only rewrites a known credential key's assignment
+/// or a URL's userinfo, never ordinary error prose — so it is safe to run over
+/// every failure report. Values below the assignment key stay; only the value
+/// to end of line is masked, which matches how a parser quotes the line.
+#[must_use]
+pub(crate) fn redact_config_echo(text: &str) -> String {
+    use std::sync::OnceLock;
+    static SECRET_ASSIGNMENT: OnceLock<regex::Regex> = OnceLock::new();
+    static URL_USERINFO: OnceLock<regex::Regex> = OnceLock::new();
+    let assignment = SECRET_ASSIGNMENT.get_or_init(|| {
+        // A credential key as a whole word (`\b` both sides, so `token_count`
+        // or `secrets_dir` is untouched), then a TOML `=` assignment, or a
+        // `:` assignment whose value opens with a quote (YAML) — the quote is
+        // consumed into `pre` (the `regex` crate has no look-ahead), which
+        // keeps ordinary error prose such as `invalid token: expired` out. The
+        // value runs to end of line, matching how a parser quotes the line.
+        regex::Regex::new(
+            r#"(?im)(?P<pre>\b(?:bearer_token|auth_token|access_token|api_key|apikey|password|passwd|secret|token)\b[ \t]*(?:=[ \t]*|:[ \t]*["']))(?P<val>\S.*)$"#,
+        )
+        .expect("config-echo secret-assignment pattern compiles")
+    });
+    let userinfo = URL_USERINFO.get_or_init(|| {
+        regex::Regex::new(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<userinfo>[^/@\s]+)@")
+            .expect("config-echo url-userinfo pattern compiles")
+    });
+    let masked = assignment.replace_all(text, |caps: &regex::Captures<'_>| {
+        format!("{}{SECRET_MASK}", &caps["pre"])
+    });
+    userinfo
+        .replace_all(&masked, |caps: &regex::Captures<'_>| {
+            format!("{}{SECRET_MASK}@", &caps["scheme"])
+        })
+        .into_owned()
+}
+
 /// Emit a TypeScript string literal containing `s`. Escapes
 /// backslashes, double quotes, and common control characters. This is
 /// sufficient for URL, auth-token, and path strings embedded into
@@ -2535,21 +2629,18 @@ fn windows_native_hook_command_with_exe(
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     // Antigravity's executor wraps the whole command in `cmd /c "…"` and
-    // does not strip inner quotes, so it needs the bare form (#611); every
-    // other Windows agent keeps the double-quoted form.
-    let bare = windows_hook_command_is_bare(context.agent);
-    let quote = if bare {
+    // does not strip inner quotes, so it needs the bare form (#611). A
+    // PowerShell runner expands `$name` and backtick escapes inside double
+    // quotes, so it gets single-quoted literals. Every other Windows agent
+    // keeps the double-quoted form.
+    let quote = if windows_hook_command_is_bare(context.agent) {
         NativeQuote::WindowsBare
-    } else {
+    } else if powershell_call_operator(context.agent).is_empty() {
         NativeQuote::Windows
+    } else {
+        NativeQuote::PowerShell
     };
-    let quote_field = |s: &str| {
-        if bare {
-            cmd_bare_escape(s)
-        } else {
-            win_double_quote(s)
-        }
-    };
+    let quote_field = |s: &str| quote.field(s);
     let mut cmd = format!(
         "{}{}{} hook --event {event} --agent {agent} --server-url {}",
         powershell_call_operator(context.agent),
@@ -2640,6 +2731,22 @@ enum NativeQuote {
     /// (#1767). A literal `"` is stripped so it cannot be written back into
     /// the command. `%` is left unchanged: caret does not stop percent expansion.
     WindowsBare,
+    /// Windows, for an agent whose runner is PowerShell (see
+    /// [`powershell_call_operator`]). Single quotes are PowerShell's literal
+    /// string: no `$name` expansion and no backtick escapes, both of which a
+    /// double-quoted path would undergo.
+    PowerShell,
+}
+
+impl NativeQuote {
+    fn field(self, s: &str) -> String {
+        match self {
+            Self::Posix => shell_quote(s),
+            Self::Windows => win_double_quote(s),
+            Self::WindowsBare => cmd_bare_escape(s),
+            Self::PowerShell => powershell_quote(s),
+        }
+    }
 }
 
 /// Whether an agent's Windows hook executor needs the command rendered
@@ -2658,11 +2765,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     // Render safe verbatim Windows data-dir forms as plain paths (#116).
     let lossy = data_dir.to_string_lossy();
     let path = strip_windows_verbatim_prefix(&lossy);
-    match quote {
-        NativeQuote::Posix => format!(" --data-dir {}", shell_quote(&path)),
-        NativeQuote::Windows => format!(" --data-dir {}", win_double_quote(&path)),
-        NativeQuote::WindowsBare => format!(" --data-dir {}", cmd_bare_escape(&path)),
-    }
+    format!(" --data-dir {}", quote.field(&path))
 }
 
 /// Append ` --project-strategy <value>` to a native hook command when an
@@ -2672,13 +2775,7 @@ fn native_project_strategy_arg(strategy: Option<&str>, quote: NativeQuote) -> St
     let Some(strategy) = strategy else {
         return String::new();
     };
-    match quote {
-        NativeQuote::Posix => format!(" --project-strategy {}", shell_quote(strategy)),
-        NativeQuote::Windows => format!(" --project-strategy {}", win_double_quote(strategy)),
-        NativeQuote::WindowsBare => {
-            format!(" --project-strategy {}", cmd_bare_escape(strategy))
-        }
-    }
+    format!(" --project-strategy {}", quote.field(strategy))
 }
 
 /// Convert a Windows path to Git Bash (MSYS2) format.
@@ -2770,7 +2867,13 @@ fn powershell_call_operator(agent: &str) -> &'static str {
     // spawns `getShellConfiguration()`). A command that fails to parse exits
     // 1, which Gemini treats as a non-blocking error, so the session runs on
     // and captures nothing (#1484).
-    if matches!(agent, "codex" | "grok" | "copilot-cli" | "gemini-cli") {
+    // DSH's `@deepseek-ai/dsh-hooks-claude-code` bridge runs each command
+    // through PowerShell `-NoLogo -NoProfile -NonInteractive -Command` on
+    // Windows; this extends the same allowlist to dsh (#2134).
+    if matches!(
+        agent,
+        "codex" | "grok" | "copilot-cli" | "gemini-cli" | "dsh"
+    ) {
         "& "
     } else {
         ""
@@ -2810,7 +2913,7 @@ fn cmd_bare_escape(field: &str) -> String {
 
 #[test]
 fn powershell_call_operator_is_limited_to_known_powershell_runners() {
-    for agent in ["codex", "grok", "copilot-cli", "gemini-cli"] {
+    for agent in ["codex", "grok", "copilot-cli", "gemini-cli", "dsh"] {
         assert_eq!(powershell_call_operator(agent), "& ", "agent: {agent}");
     }
 
@@ -2839,7 +2942,7 @@ fn codex_windows_command_invokes_rather_than_quotes() {
         HookCommandContext::new(HookCommandPlatform::WindowsNative, "codex", None, None),
     );
     assert!(
-        cmd.starts_with("& \""),
+        cmd.starts_with("& '"),
         "codex must use the call operator: {cmd}"
     );
 }
@@ -2855,8 +2958,24 @@ fn grok_windows_command_invokes_rather_than_quotes() {
         HookCommandContext::new(HookCommandPlatform::WindowsNative, "grok", None, None),
     );
     assert!(
-        cmd.starts_with("& \""),
+        cmd.starts_with("& '"),
         "grok must use the call operator: {cmd}"
+    );
+}
+
+/// DSH's Claude Code bridge runs hook commands through PowerShell `-Command`,
+/// so the quoted executable needs the call operator (#2134).
+#[test]
+fn dsh_windows_command_invokes_rather_than_quotes() {
+    let cmd = hook_command(
+        Path::new("stop.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(HookCommandPlatform::WindowsNative, "dsh", None, None),
+    );
+    assert!(
+        cmd.starts_with("& '"),
+        "dsh must use the call operator: {cmd}"
     );
 }
 
@@ -2878,7 +2997,7 @@ fn copilot_cli_windows_command_invokes_rather_than_quotes() {
         ),
     );
     assert!(
-        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        cmd.starts_with(r"& 'C:\Program Files\ai-memory\ai-memory.exe' --data-dir 'C:\Users\Alice Smith\ai-memory'"),
         "Copilot must invoke the quoted executable through PowerShell: {cmd}"
     );
 }
@@ -2926,6 +3045,55 @@ if (($args -join '|') -ne $expected) { exit 9 }
     );
 }
 
+/// A PowerShell runner expands `$name` and backtick escapes inside double
+/// quotes, so a Windows path holding either (a `$` is legal in user and folder
+/// names) reached the hook binary rewritten. The executable and every
+/// argument must arrive as literals.
+#[cfg(windows)]
+#[test]
+fn powershell_runner_passes_dollar_and_backtick_paths_literally() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = temp.path().join("bin $HOME `t");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let script = bin_dir.join("hook target.ps1");
+    std::fs::write(
+        &script,
+        r#"$expected = '--data-dir|C:\ana$x `n data|hook|--event|pre-tool-use|--agent|copilot-cli|--server-url|http://127.0.0.1:49374'
+if (($args -join '|') -ne $expected) { [Console]::Error.WriteLine($args -join '|'); exit 9 }
+"#,
+    )
+    .unwrap();
+    let command = windows_native_hook_command_with_exe(
+        &script,
+        Path::new("pre-tool-use.sh"),
+        "http://127.0.0.1:49374",
+        None,
+        HookCommandContext::new(
+            HookCommandPlatform::WindowsNative,
+            "copilot-cli",
+            Some(Path::new(r"C:\ana$x `n data")),
+            None,
+        ),
+    );
+    let output = std::process::Command::new(ai_memory_test_support::powershell_exe())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &command,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "hook command did not reach the binary with literal paths: {command}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Gemini CLI runs its Windows hook commands through PowerShell `-Command`,
 /// so a quoted executable needs the call operator, including when its path
 /// and data directory contain spaces.
@@ -2944,7 +3112,7 @@ fn gemini_cli_windows_command_invokes_rather_than_quotes() {
         ),
     );
     assert!(
-        cmd.starts_with(r#"& "C:\Program Files\ai-memory\ai-memory.exe" --data-dir "C:\Users\Alice Smith\ai-memory""#),
+        cmd.starts_with(r"& 'C:\Program Files\ai-memory\ai-memory.exe' --data-dir 'C:\Users\Alice Smith\ai-memory'"),
         "Gemini must invoke the quoted executable through PowerShell: {cmd}"
     );
 }
@@ -3181,12 +3349,15 @@ async function drainHookSpool(): Promise<void> {
   names.sort();
   for (const name of names.slice(0, 500)) {
     const file = join(hookSpoolDir(), name);
-    let entry: { url?: string; body?: string; token?: string };
+    let entry: { url?: string; body?: string; token?: string; auth_mode?: string };
     try {
       entry = JSON.parse(readMarkerText(file, "utf8"));
     } catch (_e) {
       continue; // torn or foreign file; leave it for the CLI drain
     }
+    // Native OIDC entries carry no inline bearer. The native drain resolves
+    // their credentials from auth.json, so leave these entries untouched.
+    if (entry.auth_mode === "oidc") continue;
     if (!entry.url || typeof entry.body !== "string") continue;
     try {
       const headers: Record<string, string> = {
@@ -3373,6 +3544,83 @@ mod tests {
     use std::process::Command;
     #[cfg(windows)]
     use std::process::Stdio;
+
+    #[test]
+    fn generated_ts_spool_leaves_native_oidc_entries_for_the_native_drain() {
+        let Some(()) = node_strip_types_available() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let module = temp.path().join("spool-oidc.mts");
+        const HARNESS: &str = r#"
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, readFileSync as readMarkerText, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import type { AddressInfo } from "node:net";
+
+const AGENT = "open-code";
+function resolveToken(): string | undefined { return undefined; }
+
+const requests: [string | undefined, string | undefined][] = [];
+const server = createServer((request, response) => {
+  requests.push([request.url, request.headers.authorization]);
+  request.resume();
+  response.writeHead(request.url === "/oidc" ? 401 : 202).end();
+});
+await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+try {
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const dir = hookSpoolDir();
+  mkdirSync(dir, { recursive: true });
+  const oidc = JSON.stringify({
+    url: `${base}/oidc`, body: "{}", created_ms: 1, auth_mode: "oidc", attempts: 0,
+  });
+  const oidcFile = join(dir, "0000000000001-1-0000000000000000.json");
+  writeFileSync(oidcFile, oidc);
+  for (const [index, path, auth] of [
+    [2, "static", { auth_mode: "static", token: "static-fixture" }],
+    [3, "anonymous", { auth_mode: "none" }],
+    [4, "legacy", { token: "legacy-fixture" }],
+  ] as const) {
+    const name = `${String(index).padStart(13, "0")}-1-0000000000000000.json`;
+    const body = JSON.stringify({ session_id: path, auth_mode: "oidc" });
+    writeFileSync(join(dir, name), JSON.stringify({
+      url: `${base}/${path}`, body, created_ms: index, attempts: 0, ...auth,
+    }));
+  }
+  await drainHookSpool();
+  assert.deepEqual({
+    requests,
+    oidc: existsSync(oidcFile) ? readMarkerText(oidcFile, "utf8") : undefined,
+    files: readdirSync(dir),
+  }, {
+    requests: [["/static", "Bearer static-fixture"], ["/anonymous", undefined], ["/legacy", "Bearer legacy-fixture"]],
+    oidc,
+    files: ["0000000000001-1-0000000000000000.json"],
+  });
+} finally {
+  server.close();
+}
+"#;
+        fs::write(
+            &module,
+            format!("{}{}\n{HARNESS}", ts_spool_runtime(), ts_timeout_signal()),
+        )
+        .unwrap();
+        let output = Command::new("node")
+            .arg("--experimental-strip-types")
+            .arg(&module)
+            .env("AI_MEMORY_DATA_DIR", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "spool runtime evidence failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn strip_deleted_suffix_removes_only_the_trailing_kernel_marker() {
@@ -4966,9 +5214,10 @@ if (inheritOnly) {
             "bare (unquoted) args expected: {cmd}"
         );
 
-        // Same renderer, a non-antigravity agent identity: the double quotes
-        // stay, so the fix is scoped to antigravity and does not regress the
-        // other Windows JSON-hook agents.
+        // Same renderer, a non-antigravity agent identity: the fields stay
+        // quoted (grok runs under PowerShell, so single-quoted literals), so
+        // the fix is scoped to antigravity and does not regress the other
+        // Windows JSON-hook agents.
         let other = build_antigravity_payload_for_platform(
             Path::new(r"C:\Users\me\.local\bin"),
             "https://memory.example.com",
@@ -4983,8 +5232,8 @@ if (inheritOnly) {
             .and_then(|v| v.as_str())
             .expect("command string");
         assert!(
-            other_cmd.contains('"'),
-            "non-antigravity Windows agents keep their double quotes: {other_cmd}"
+            other_cmd.contains(r"--data-dir 'C:\Users\me\AppData\Local\ai-memory'"),
+            "non-antigravity Windows agents keep their quotes: {other_cmd}"
         );
         assert!(
             !other_cmd.contains("^ "),
@@ -5126,7 +5375,7 @@ if (inheritOnly) {
                 .and_then(|v| v.as_str())
                 .expect(agent);
             assert!(
-                other_cmd.contains(r#"--data-dir "C:\Users\Felipe Leite\AppData""#),
+                other_cmd.contains(r"--data-dir 'C:\Users\Felipe Leite\AppData'"),
                 "{agent} must quote the spaced data-dir, not merely some other field: {other_cmd}"
             );
             assert!(!other_cmd.contains("^ "), "{agent}: {other_cmd}");
@@ -5900,5 +6149,61 @@ $payload = [Console]::In.ReadToEnd()
             cmd.contains("AI_MEMORY_AUTH_TOKEN=tok123"),
             "must inline token: {cmd}"
         );
+    }
+
+    // GHSA-6pmr-q79m-87vp: the display-masking helpers.
+
+    #[test]
+    fn mask_secret_shows_a_short_prefix_of_a_long_value_and_nothing_of_a_short_one() {
+        let token = "aim_SYNTHETICvalueAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let masked = mask_secret(token);
+        assert_eq!(masked, "aim_...[REDACTED]");
+        assert!(!masked.contains("SYNTHETIC"), "{masked}");
+        // Too short for a safe prefix: nothing of it is shown.
+        assert_eq!(mask_secret("short"), "[REDACTED]");
+    }
+
+    #[test]
+    fn mask_url_userinfo_strips_only_the_credential() {
+        assert_eq!(
+            mask_url_userinfo("http://alice:s3cr3tpass@host:49374/mcp"),
+            "http://[REDACTED]@host:49374/mcp"
+        );
+        // A bare user (token-as-username) is masked too.
+        assert_eq!(
+            mask_url_userinfo("https://tok_SYNTHETIC012345@host/"),
+            "https://[REDACTED]@host/"
+        );
+        // No userinfo: unchanged.
+        assert_eq!(
+            mask_url_userinfo("https://host:49374/mcp"),
+            "https://host:49374/mcp"
+        );
+        // A later `@` in the path never trips it.
+        assert_eq!(
+            mask_url_userinfo("https://host/path@tail"),
+            "https://host/path@tail"
+        );
+    }
+
+    #[test]
+    fn redact_config_echo_masks_a_toml_secret_line_and_a_url_but_not_prose() {
+        // A TOML parser echoes the offending line; the value is masked, the key
+        // and the error's shape kept.
+        let echo = "TOML parse error at line 2\n  |\n2 | bearer_token = \"aim_SYNTHETICsecretvalue\" trailing\n  |";
+        let out = redact_config_echo(echo);
+        assert!(!out.contains("aim_SYNTHETICsecretvalue"), "{out}");
+        assert!(out.contains("bearer_token = [REDACTED]"), "{out}");
+        assert!(out.contains("line 2") && out.contains("2 |"), "{out}");
+        // A `token = "…"` servers.toml line and a `user:pass@` URL are covered.
+        assert!(!redact_config_echo("token = \"leak-secret-value\"").contains("leak-secret-value"));
+        assert_eq!(
+            redact_config_echo("url = \"https://u:p4ssword-long@host\""),
+            "url = \"https://[REDACTED]@host\""
+        );
+        // Ordinary prose that merely mentions a word is left intact (`:` with no
+        // quoted value), so a real error stays readable.
+        let prose = "the token: expired before the request completed";
+        assert_eq!(redact_config_echo(prose), prose);
     }
 }

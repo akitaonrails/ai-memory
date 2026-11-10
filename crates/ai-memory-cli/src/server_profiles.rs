@@ -267,9 +267,12 @@ fn parse_profile(table: &dyn toml_edit::TableLike) -> Result<Profile> {
 /// slashes — rejected here rather than on every hook request.
 fn validate_url(raw: &str) -> Result<String> {
     let trimmed = raw.trim().trim_end_matches('/');
-    let parsed = reqwest::Url::parse(trimmed).with_context(|| format!("`{raw}` is not a URL"))?;
+    // A URL may carry `user:password@` userinfo; keep it out of the error text,
+    // which lands on stderr/stdout (GHSA-6pmr-q79m-87vp item 4).
+    let shown = crate::commands::render_shared::mask_url_userinfo(raw);
+    let parsed = reqwest::Url::parse(trimmed).with_context(|| format!("`{shown}` is not a URL"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none_or(str::is_empty) {
-        bail!("`{raw}` is not an http:// or https:// URL with a host");
+        bail!("`{shown}` is not an http:// or https:// URL with a host");
     }
     Ok(trimmed.to_owned())
 }

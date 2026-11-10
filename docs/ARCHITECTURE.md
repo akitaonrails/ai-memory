@@ -247,8 +247,9 @@ from hook paths.
    survive. A fourth pass, disabled unless `[decay] observation_retention_days`
    is positive, then deletes raw `observations` older than that age, but only
    for sessions already consolidated into a summary page whose path still has
-   a live head (a later rewrite of that page counts; an evicted or deleted
-   head does not), so raw capture is never removed while it is the last copy
+   a live head in the project holding those rows (a later rewrite of that page
+   counts; an evicted or deleted head, or a page only in another project, does
+   not), so raw capture is never removed while it is the last copy
    of that session's work, and never for a session that still has a `session_consolidation_jobs`
    row in `pending` or `running` — a queued (or lease-stale) consolidation
    still reads the raw capture — and never while the live observation count is
@@ -557,7 +558,15 @@ backpressure, or single-writer SQLite actor.
 An external lifecycle producer can set `AI_MEMORY_CAPTURE_OWNER` on the harness
 process to suppress its installed native capture while retaining supported
 handoff/briefing delivery and MCP. The producer uses `extension`/`source_event`
-for provenance and stable, namespaced `ingest_key` values for retries. See the
+for provenance and stable, namespaced `ingest_key` values for retries. Because
+the owner's own interactive runs share the project with the captured harness,
+every hook bundle forwards `claim=0` on its handoff fetch under external
+capture — the native binary at all four of its delivery doors (SessionStart,
+Kimi's `UserPromptSubmit`, Hermes' `pre_llm_call`, Grok's `PostToolUse`), the
+POSIX shell and PowerShell bundles, and the generated TypeScript integrations.
+The server then delivers the baton in offer mode — naming the handoff id
+and leaving the row open for an explicit `memory_handoff_accept` — rather than
+consuming a pending handoff left for other work (#2148). See the
 [external capture contract](external-lifecycle.md) for batching, identity and
 the limits of this cooperative process-scoped mode.
 
@@ -667,7 +676,7 @@ prunable rather than only after it ages in place.
 | `page_evidence` | V63 append-only record of what produced or reaffirmed each page version: consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Feeds a read-time, zero-LLM **belief-strength `confidence`** (`ai_memory_store::belief`, B1 / `docs/design-hindsight-borrowings.md` P2): a bounded `[0.0, 0.95]` function of distinct supporting sessions (breadth, not raw count), recency of the newest sighting, and live `contradicts` count. Exposed as `confidence` + `evidence_count` in `memory_query(explain=true)`, as `evidence_rows` in `memory_status`, and used to order the opt-in `settled_first` briefing, all **ranking-inert**. It folds into `PageAuthority` only behind `[retrieval] belief_authority_weight` (**default `0.0`/OFF, R2-gated**), as one bounded factor inside the `[0.55, 1.50]` clamp; a supersession always wins regardless of evidence (a superseded version is never boosted). |
 | `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`), extended by V90 with optional epistemic nature/evidence. Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
 | `pages.compacted_at` | V65 nullable A2 tier-down marker (`docs/design-memory-aging.md` §A2). Set when the forget-sweep extractively compacts a cold episodic page (opt-in `[decay] compact_cold_episodic`) instead of evicting it; derived at the single page-upsert choke point from a `compacted: true` frontmatter mirror, so the marker and compacted body land in one transaction. Additive `ADD COLUMN`, no backfill; the sweep populates it lazily. The sweep and curator skip a marked page so it is never re-compacted, re-evicted, or re-reported as cold. Reversible: the full pre-compaction body stays in git + the supersession chain. |
-| `session_usage` | V91 one row per session: cumulative input/output/cache-write/cache-read tokens the harness's own transcript reported at `session-end`, plus the last-seen model name. Written client-side (`ai-memory-cli`'s `session_usage` module reads the transcript; `hook.rs` splices it into the session-end body as `_ai_memory_usage`; the writer upserts with `MAX(existing, reported)` per column). Cascades with its session on purge/delete. Surfaced on the /web project page's Tokens stat and Sessions table; `None` (not zero) for a session whose harness never reported usage. |
+| `session_usage` | V91 one row per session: cumulative input/output/cache-write/cache-read tokens the harness's own transcript reported at `session-end` (for Claude Code, the session's transcript plus its subagents' under `<session>/subagents/`), plus the last-seen model name. Written client-side (`ai-memory-cli`'s `session_usage` module reads the transcript; `hook.rs` splices it into the session-end body as `_ai_memory_usage`; the writer upserts with `MAX(existing, reported)` per column). Cascades with its session on purge/delete. Surfaced on the /web project page's Tokens stat and Sessions table; `None` (not zero) for a session whose harness never reported usage. |
 | `token_calls` | V92 per-session native response identities with content-free input, output and cache counters. Live hooks merge partial/replayed responses with column-wise maxima in one writer transaction, then refresh cumulative session usage. Project reads authorize the project and apply session ownership before counting or ranking. V92 also converts historical Codex input totals to fresh input, excluding cache reads. |
 | `agent_messages.to_agent` | V93 optional registered harness recipient; NULL keeps the shared project inbox. Both claim guards enforce addressed delivery. |
 | `token_calls` context and `token_call_tools` | V94 nullable native turn/response coordinates and response time, plus bounded tool references keyed by session/response. One writer transaction persists counters, provenance and session totals; tools cascade with their response. Missing context stays unknown. Server-side UTC/model/harness/session/turn/tool filters run after scope/owner checks and before pagination. |
@@ -1048,7 +1057,9 @@ page content and scope names never reach it.
 and the worker's bounded error through the privacy strip). The session id is
 what a re-consolidation needs after the cause is fixed, so it belongs on the
 operator surface and not on the health panel, whose "counts and timestamps
-only" contract is unchanged (#1692).
+only" contract is unchanged (#1692). Both the `failed` count and the list leave
+out a failure that a newer generation of the same session has since completed:
+that newer page already covers the failed run's observations.
 
 ## CLI subcommand surface
 

@@ -229,6 +229,56 @@ fn native_hook_reports_live_usage_for_every_supported_event_and_harness() {
 }
 
 #[test]
+fn claude_code_subagent_event_leaves_the_main_transcript_lines_for_the_next_event() {
+    // The router drops a subagent event (`drop_subagent_captures`), so a
+    // subagent event that read the main transcript would advance the cursor
+    // past a response no later event reports.
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("transcript.jsonl");
+    let row = serde_json::json!({"type":"assistant","message":{"id":"response-1","model":"fixture-model","usage":{"input_tokens":100,"output_tokens":20}}});
+    // The last response stays pending until a later row closes it.
+    let next = serde_json::json!({"type":"user","message":{"role":"user","content":"next"}});
+    std::fs::write(&transcript, format!("{row}\n{next}\n")).unwrap();
+    let endpoint = ai_memory_test_support::dead_http_endpoint();
+    let send = |agent_id: Option<&str>| {
+        let mut payload = serde_json::json!({"session_id":"subagent-usage","cwd":tmp.path(),"transcript_path":transcript,"tool_name":"Bash","tool_input":{"command":"echo fixture"},"tool_response":"fixture"});
+        if let Some(id) = agent_id {
+            payload["agent_id"] = id.into();
+        }
+        let output = run_hook_at(
+            tmp.path(),
+            "claude-code",
+            "post-tool-use",
+            payload.to_string().as_bytes(),
+            false,
+            &endpoint,
+        );
+        assert!(output.status.success());
+    };
+    send(Some("agent-abc123"));
+    send(None);
+
+    let bodies: Vec<serde_json::Value> = spool_entries(tmp.path())
+        .iter()
+        .map(|entry| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap();
+            serde_json::from_str(v["body"].as_str().unwrap()).unwrap()
+        })
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    let reporting: Vec<_> = bodies
+        .iter()
+        .filter(|body| body.get("_ai_memory_usage_calls").is_some())
+        .collect();
+    assert_eq!(reporting.len(), 1, "the response is reported exactly once");
+    assert!(
+        reporting[0].get("agent_id").is_none(),
+        "the subagent event must not carry the main conversation's response"
+    );
+}
+
+#[test]
 fn native_hook_accepts_plain_and_bom_prefixed_json() {
     let payload = br#"{"session_id":"windows-test","cwd":"C:\\dev\\project","tool_name":"Read","tool_input":{"file_path":"README.md"}}"#;
 

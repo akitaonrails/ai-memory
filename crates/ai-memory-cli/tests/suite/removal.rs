@@ -306,7 +306,9 @@ fn project_scope_install_then_uninstall_round_trip_claude_hooks() {
 }
 
 /// A print-only preview of a project-scoped install must not hand the operator
-/// a bearer to paste into the checkout; the user-level preview still embeds it.
+/// a bearer to paste into the checkout, and since GHSA-6pmr-q79m-87vp item 1
+/// the user-level preview masks its inline bearer too (it used to embed it
+/// verbatim), so the live token is never left in the terminal scrollback.
 #[test]
 fn project_scope_preview_withholds_the_bearer_token() {
     let _guard = cli_test_lock();
@@ -343,8 +345,12 @@ fn project_scope_preview_withholds_the_bearer_token() {
 
     let global = preview("global");
     assert!(
-        global.contains("SEKRIT-PREVIEW"),
-        "control: the user-level preview embeds it as before: {global}"
+        !global.contains("SEKRIT-PREVIEW"),
+        "the user-level preview must not embed the raw bearer (GHSA-6pmr item 1): {global}"
+    );
+    assert!(
+        global.contains("[REDACTED]"),
+        "the user-level preview masks the bearer: {global}"
     );
     assert!(
         !home.path().join(".claude").exists() && !project.path().join(".claude").exists(),
@@ -1037,6 +1043,110 @@ fn zcode_mcp_install_and_uninstall_round_trip_preserves_siblings() {
     assert_eq!(
         removed["mcp"]["servers"]["other"]["url"], "https://other.example/mcp",
         "uninstall must preserve sibling servers"
+    );
+}
+
+/// GHSA-qmg7-f7fg-rg4x: `install-hooks --agent zcode` writes capture under
+/// `hooks.events` in `~/.zcode/cli/config.json`, and `uninstall --only hooks`
+/// must withdraw every ai-memory entry while the user's own hook, model and
+/// hook-level settings survive. Before the fix, uninstall skipped this shape
+/// entirely: it exited 0 reporting nothing to remove while all generated
+/// capture hooks stayed live.
+#[test]
+fn zcode_install_hooks_then_uninstall_withdraws_capture_and_keeps_user_config() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".zcode/cli/config.json");
+    // Seed a pre-existing third-party SessionStart hook plus hook-level
+    // settings the uninstall must not touch.
+    write_file(
+        &config,
+        r#"{
+            "model": "fixture-model",
+            "hooks": {
+                "enabled": true,
+                "maxOutputBytes": 65536,
+                "events": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": "printf unrelated", "statusMessage": "unrelated hook"}]}
+                    ]
+                }
+            }
+        }"#,
+    );
+
+    let install = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "zcode", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    // After install our capture hooks are present.
+    let count_ours = |path: &Path| -> usize {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let events = v["hooks"]["events"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        events
+            .values()
+            .filter_map(|slot| slot.as_array())
+            .flat_map(|groups| groups.iter())
+            .filter_map(|group| group["hooks"].as_array())
+            .flat_map(|hooks| hooks.iter())
+            .filter(|hook| {
+                hook["statusMessage"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("ai-memory"))
+            })
+            .count()
+    };
+    assert!(
+        count_ours(&config) > 0,
+        "install must write ai-memory capture hooks"
+    );
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+
+    // Every ai-memory capture hook is gone.
+    assert_eq!(
+        count_ours(&config),
+        0,
+        "uninstall --only hooks must withdraw every ai-memory ZCode hook"
+    );
+    // The user's own hook, model and hook-level settings survive.
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    assert_eq!(after["model"], "fixture-model", "model must survive");
+    assert_eq!(
+        after["hooks"]["enabled"], true,
+        "hook-level settings must survive"
+    );
+    assert_eq!(after["hooks"]["maxOutputBytes"], 65536);
+    let session_start = after["hooks"]["events"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart must survive for the unrelated hook");
+    let unrelated_survives = session_start
+        .iter()
+        .filter_map(|group| group["hooks"].as_array())
+        .flat_map(|hooks| hooks.iter())
+        .any(|hook| hook["statusMessage"].as_str() == Some("unrelated hook"));
+    assert!(
+        unrelated_survives,
+        "the third-party hook must survive: {after}"
     );
 }
 
@@ -2512,11 +2622,13 @@ fn an_explicit_freebuff_bridge_key_is_stored_outside_the_client_config() {
     );
 }
 
-/// Without `--apply` nothing is stored: a printed FreeBuff snippet is the
-/// operator's to place, so it still carries the key inline. This is the guard
-/// that keeps the redirect above from reaching the print path.
+/// Without `--apply` nothing is stored and nothing is written. Since
+/// GHSA-6pmr-q79m-87vp item 1 the printed snippet masks the inline bearer
+/// instead of carrying it verbatim, so the live key is not left in the
+/// terminal; `--apply` still stores the real key (the test above). This is the
+/// guard that keeps the store redirect above from reaching the print path.
 #[test]
-fn a_printed_freebuff_snippet_keeps_the_key_inline() {
+fn a_printed_freebuff_snippet_masks_the_key_and_stores_nothing() {
     const KEY: &str = "aim_freebuff_printed_0123456789";
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();
@@ -2533,8 +2645,12 @@ fn a_printed_freebuff_snippet_keeps_the_key_inline() {
     );
     let snippet = String::from_utf8_lossy(&output.stdout);
     assert!(
-        snippet.contains(KEY),
-        "the printed snippet dropped the key the operator has to place: {snippet}"
+        !snippet.contains(KEY),
+        "the printed snippet leaked the live bearer: {snippet}"
+    );
+    assert!(
+        snippet.contains("[REDACTED]"),
+        "the printed snippet did not mask the bearer: {snippet}"
     );
     assert!(
         !home

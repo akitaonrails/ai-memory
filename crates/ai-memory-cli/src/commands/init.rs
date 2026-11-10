@@ -202,16 +202,26 @@ pub(crate) fn initialize(
         // stable from install onwards: see comment in render_default_
         // auth_block. getrandom::Error doesn't impl `std::error::Error`
         // (anyhow's `with_context` would conflict), so map manually.
-        let pepper = generate_token_hex(TOKEN_PEPPER_BYTES).map_err(|e| {
-            anyhow::anyhow!(
-                "{}",
-                crate::localization::format(
-                    i18n,
-                    "cli-init-generating-auth-token-pepper-e",
-                    &[("value0", format!("{}", e))]
+        // A `--force` rewrite keeps the existing pepper: every native API key
+        // is hashed with it, so a new one would invalidate them all.
+        let existing_pepper = config
+            .auth
+            .token_pepper
+            .clone()
+            .filter(|pepper| cfg_path.exists() && !pepper.is_empty());
+        let pepper = match existing_pepper {
+            Some(pepper) => pepper,
+            None => generate_token_hex(TOKEN_PEPPER_BYTES).map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    crate::localization::format(
+                        i18n,
+                        "cli-init-generating-auth-token-pepper-e",
+                        &[("value0", format!("{}", e))]
+                    )
                 )
-            )
-        })?;
+            })?,
+        };
         let recorded = root_bearer_for_new_config(config, fresh)?;
         let bearer_line = recorded
             .as_ref()
@@ -516,6 +526,21 @@ mod tests {
             Some(first.clone())
         );
         assert_eq!(load(&root, None).auth.bearer_token, Some(first));
+    }
+
+    /// The pepper hashes every native API key, so a `--force` rewrite that
+    /// minted a new one silently invalidated them all.
+    #[test]
+    fn a_forced_rewrite_keeps_the_token_pepper() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("data");
+        run(&cfg_in(&root), InitArgs { force: false }, None).unwrap();
+        let first = load(&root, None).auth.token_pepper;
+        assert!(first.is_some());
+
+        run(&load(&root, None), InitArgs { force: true }, None).unwrap();
+
+        assert_eq!(load(&root, None).auth.token_pepper, first);
     }
 
     /// Control: a data dir that already holds a database is an existing

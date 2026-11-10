@@ -132,7 +132,7 @@ The defaults for `lambda` through `hard_delete_after_days` come from `ai_memory_
 | `cold_threshold` | `0.20` | `AI_MEMORY_DECAY__COLD_THRESHOLD` | Retention score below which a page is evicted. |
 | `hard_delete_after_days` | `180` | `AI_MEMORY_DECAY__HARD_DELETE_AFTER_DAYS` | Grace period before an evicted version chain is deleted permanently. |
 | `breadth_weight` | `0.0` | `AI_MEMORY_DECAY__BREADTH_WEIGHT` | Weight for the number of distinct authenticated readers of a page. |
-| `observation_retention_days` | `0` (off) | `AI_MEMORY_DECAY__OBSERVATION_RETENTION_DAYS` | Age past which a consolidated session's raw observations may be pruned. Irreversible. |
+| `observation_retention_days` | `0` (off) | `AI_MEMORY_DECAY__OBSERVATION_RETENTION_DAYS` | Age past which a consolidated session's raw observations may be pruned, in each project only while it holds a live page of that session. Irreversible. |
 | `observation_prune_batch` | `5000` (`DEFAULT_OBSERVATION_PRUNE_BATCH`) | `AI_MEMORY_DECAY__OBSERVATION_PRUNE_BATCH` | Observation rows deleted per prune transaction. |
 | `ledger_retention_months` | `0` (off) | `AI_MEMORY_DECAY__LEDGER_RETENTION_MONTHS` | Whole UTC months after a month ends before the sweep deletes its `log-YYYY-MM.md` ledger. |
 | `compact_cold_episodic` | `false` | `AI_MEMORY_DECAY__COMPACT_COLD_EPISODIC` | Compact a cold episodic page to its abstract, summary and keep-token set instead of evicting it. |
@@ -183,7 +183,7 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | --- | --- | --- | --- |
 | `query_intent` | `false` | `AI_MEMORY_RETRIEVAL__QUERY_INTENT` | Route queries that ask for a past session so session pages skip the kind and tier authority penalty they normally pay. |
 | `session_recall_bonus` | `0.25` | `AI_MEMORY_RETRIEVAL__SESSION_RECALL_BONUS` | Extra authority for session pages when the routing fires, on top of cancelling that penalty. |
-| `abstract_vectors` | `false` | `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS` | Add the L0 abstract embedding stream to the rank fusion. |
+| `abstract_vectors` | `false` | `AI_MEMORY_RETRIEVAL__ABSTRACT_VECTORS` | Add the L0 abstract embedding stream to the rank fusion. Only pages whose frontmatter carries an `abstract:` feed it, and only an agent writes that line (the optional `abstract` field to `memory_write_page`/`memory_patch_page`); consolidation, the dream pass and the forget sweep never add it, so on a default install the stream ranks only hand-written abstracts. |
 | `belief_authority_weight` | `0.0` | `AI_MEMORY_RETRIEVAL__BELIEF_AUTHORITY_WEIGHT` | Weight of a page's evidence-derived confidence in its authority. 0 is inert and negatives clamp to 0. |
 | `observation_stream` | `true` | `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM` | Add the observation evidence stream, where matching observation bodies vote for their session's page. |
 | `feedback_demotion` | `0.0` | `AI_MEMORY_RETRIEVAL__FEEDBACK_DEMOTION` | Authority subtracted from a page whose current version carries open `stale`/`wrong` feedback, until a rewrite clears it. 0 is inert and negatives clamp to 0. |

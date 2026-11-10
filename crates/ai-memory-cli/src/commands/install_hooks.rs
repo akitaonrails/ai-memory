@@ -38,8 +38,9 @@ use crate::commands::render_shared::{
     build_kiro_cli_v2_hooks_value, build_kiro_cli_v3_hooks_value,
     build_pool_settings_yaml_with_data_dir, build_profile_payload_for_agent,
     hook_embedded_exe_path, hook_script_for_claude_code, hook_script_for_current_platform,
-    kimi_code_hook_commands, local_hook_policy_v1_supported, shell_quote, ts_auth_headers_fn,
-    ts_capture_policy_v1, ts_string_literal, ts_timeout_signal, yaml_single_quote,
+    kimi_code_hook_commands, local_hook_policy_v1_supported, mask_secret, shell_quote,
+    ts_auth_headers_fn, ts_capture_policy_v1, ts_string_literal, ts_timeout_signal,
+    yaml_single_quote,
 };
 use crate::commands::uninstall::hook_command_is_ours;
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -783,6 +784,14 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     } else {
         renderable_token.as_deref()
     };
+    // The inline bearer masked for any path that PRINTS the rendered block to
+    // the terminal instead of writing it to a config file: every agent's
+    // preview (no `--apply`), and Hermes/Pool on `--apply` too — they have no
+    // file to write and print the ready-to-paste block, so a token embedded as
+    // the #552 store-failure fallback would otherwise land in the scrollback, a
+    // CI log or an agent transcript (GHSA-6pmr-q79m-87vp items 1 and 2).
+    let printed_auth_owned = auth.map(mask_secret);
+    let printed_auth = printed_auth_owned.as_deref();
     // P1.8 multi-user attribution: `--as-user` is metadata only — the
     // token stamped into the hook env block is whatever the operator
     // passed via `--auth-token` (typically a native key from
@@ -1009,7 +1018,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
             // block a preview does.
             AgentChoice::Hermes => render_hermes(
                 &server_url,
-                auth,
+                printed_auth,
                 &config.data_dir,
                 args.project_strategy.and_then(ProjectStrategyArg::baked),
                 hermes_plugin_dir(&config.runtime_env).as_deref(),
@@ -1072,7 +1081,7 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
                     &config.i18n,
                     &hooks_dir,
                     &server_url,
-                    auth,
+                    printed_auth,
                     &config.data_dir,
                     &args,
                 )
@@ -1156,6 +1165,10 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     // Preview must bake the same `CAPTURE_MODE` the next `--apply` would
     // persist (#661) — resolved read-only so a bare preview never writes.
     let preview_capture_mode = resolve_capture_mode(&config.data_dir, args.capture_mode);
+    // Every arm below renders to stdout, so the inline bearer is masked for the
+    // whole preview (GHSA-6pmr-q79m-87vp item 1); `--apply` returned above and
+    // renders the real token into the agent's config file.
+    let auth = printed_auth;
     match args.agent {
         AgentChoice::OpenCode => {
             render_opencode_plugin(&server_url, auth, strategy, &preview_capture_mode)
@@ -3253,6 +3266,24 @@ fn path_needs_shell_quoting(path: &Path) -> bool {
         .any(|segment| shell_quote(segment) != segment)
 }
 
+/// Escape every `/` as `\/` in a serialized JSON document.
+///
+/// Cursor strips `//` to end-of-line and `/* … */` comments *before* parsing
+/// `~/.cursor/hooks.json`, with a regex that ignores string boundaries
+/// (`parseJSONC(e){let t=e.replace(/\/\/.*$/gm,"");return
+/// t=t.replace(/\/\*[\s\S]*?\*\//g,""),JSON.parse(t)}`). A `--server-url
+/// https://…` baked into a command therefore truncates the line, `JSON.parse`
+/// fails, and Cursor drops the whole file silently — no Cursor session is ever
+/// captured (#2069). `\/` is valid JSON that decodes to `/`, and it leaves no
+/// `//` for the line-comment pass and no intact `*/` for the block pass, so the
+/// document survives both and parses to the same value. `/` only ever appears
+/// inside JSON string literals (never in structural tokens), so escaping the
+/// whole serialized text is safe and also repairs any `//` in a user's own
+/// preserved entries.
+pub(crate) fn escape_slashes_for_cursor_jsonc(json: &str) -> String {
+    json.replace('/', "\\/")
+}
+
 fn merge_cursor_hooks(
     staged: &Path,
     server_url: &str,
@@ -3277,7 +3308,7 @@ fn merge_cursor_hooks(
         .context("internal: payload builder didn't return a hooks object")?
         .clone();
     apply_atomic(config_path, |existing| {
-        mutate_json(existing, |root| {
+        let json = mutate_json(existing, |root| {
             // Cursor requires "version": 1 at the top level.
             // Overwrite unconditionally — the schema is versioned
             // so future Cursor releases can bump this; we'll bump
@@ -3292,7 +3323,10 @@ fn merge_cursor_hooks(
                 overlay_event_hooks(hooks, event, value);
             }
             Ok(())
-        })
+        })?;
+        // Cursor's comment stripper would otherwise drop the whole file over
+        // the `//` in a `https://` server URL (#2069).
+        Ok(escape_slashes_for_cursor_jsonc(&json))
     })
 }
 
@@ -4674,7 +4708,7 @@ pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(te
   }
   if (/^\s*aliases\s*=/m.test(text)) return true;
   if (/^\s*server\s*=/m.test(text)) return true;
-  for (const key of ["default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start"]) {
+  for (const key of ["default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start", "inbox_notice_on_prompt"]) {
     if (tomlFlag(text, key) !== undefined) return true;
   }
   return false;
@@ -5561,6 +5595,11 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
   if (id) url.searchParams.set("session_id", id);
+  // An external-capture run shares its project with the owner's own sessions,
+  // so it offers the baton rather than consuming it (#2148): claim=0 makes the
+  // server announce the handoff for an explicit memory_handoff_accept. Parity
+  // with the native hook and the shell/PowerShell bundles.
+  if (captureOwnedExternally()) url.searchParams.set("claim", "0");
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     // The body goes into the system prompt, so a redirect is refused: a
@@ -6476,6 +6515,11 @@ async function fetchHandoff(cwd: string, id: string | undefined): Promise<string
   url.searchParams.set("agent", AGENT);
   url.searchParams.set("cwd", cwd);
   if (id) url.searchParams.set("session_id", id);
+  // An external-capture run shares its project with the owner's own sessions,
+  // so it offers the baton rather than consuming it (#2148): claim=0 makes the
+  // server announce the handoff for an explicit memory_handoff_accept. Parity
+  // with the native hook and the shell/PowerShell bundles.
+  if (captureOwnedExternally()) url.searchParams.set("claim", "0");
   if (!applyMarkerParams(url, cwd)) return undefined;
   try {{
     // The body becomes the agent's context, so a redirect is refused: a
@@ -7324,7 +7368,7 @@ fn render_zero(
 /// wrote. Our entries carry a `statusMessage` starting with `ai-memory`
 /// — the only schema-documented free-form key, so ownership is marked
 /// without emitting keys ZCode would drop.
-fn is_our_zcode_hook(hook: &serde_json::Value) -> bool {
+pub(crate) fn is_our_zcode_hook(hook: &serde_json::Value) -> bool {
     hook.get("statusMessage")
         .and_then(|v| v.as_str())
         .is_some_and(|msg| msg.starts_with("ai-memory"))
@@ -8951,6 +8995,15 @@ fn write_private_dsh_config(path: &Path, content: &[u8]) -> Result<()> {
 /// and `setup-agent`.
 pub(crate) fn dsh_bridge_patch_fragment(command_dir: &Path) -> String {
     let config_path = command_dir.join("hooks.json");
+    // The bridge is a Node plugin that reads this path with
+    // `fs.readFileSync`, which cannot resolve a Windows `\\?\` verbatim
+    // prefix and fails ENOENT (it treats the path as relative, #2032).
+    // `command_dir` descends from the canonical data dir, which carries that
+    // prefix on Windows, so strip it the way `service_host` does for command
+    // lines. A plain `C:\...` drive path reads fine in Node.
+    let config_path =
+        super::path_util::strip_windows_verbatim_prefix(&config_path.to_string_lossy())
+            .into_owned();
     let mut out = String::new();
     out.push_str("# DeepSeek Harness (DSH) - merge the entry below into the DSH\n");
     out.push_str("# profile patch at $DSH_HOME/profiles/<profile>/cordis.patch.yml,\n");
@@ -8964,7 +9017,7 @@ pub(crate) fn dsh_bridge_patch_fragment(command_dir: &Path) -> String {
     out.push_str("      config:\n");
     out.push_str(&format!(
         "        configPath: {}\n",
-        yaml_single_quote(&config_path.to_string_lossy())
+        yaml_single_quote(&config_path)
     ));
     out
 }
@@ -11042,6 +11095,26 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(
             out.contains(&format!("configPath: '{expected}'")),
             "expected quoted configPath in: {out}"
+        );
+    }
+
+    #[test]
+    fn dsh_bridge_patch_fragment_strips_windows_verbatim_prefix() {
+        // `command_dir` descends from the canonical data dir, which carries a
+        // `\\?\` verbatim prefix on Windows. The Node bridge reads configPath
+        // with `fs.readFileSync`, which fails ENOENT on that prefix (#2032),
+        // so the emitted path must be a plain drive path. The strip is
+        // lexical, so this bites on any host.
+        let out = dsh_bridge_patch_fragment(Path::new(
+            r"\\?\C:\Users\me\AppData\Local\ai-memory\hooks\dsh",
+        ));
+        assert!(
+            !out.contains(r"\\?\"),
+            "verbatim prefix must not reach configPath: {out}"
+        );
+        assert!(
+            out.contains(r"configPath: 'C:\Users\me\AppData\Local\ai-memory\hooks\dsh"),
+            "expected a plain drive path in: {out}"
         );
     }
 
@@ -13773,7 +13846,7 @@ model = "gpt-5"
         ));
         assert!(plugin.contains("if (/^\\s*aliases\\s*=/m.test(text)) return true;"));
         assert!(plugin.contains(
-            "for (const key of [\"default_global\", \"inject_on_session_start\", \"inject_on_subagent_start\", \"max_chars\", \"contribute\", \"consume\", \"deliver_on_session_start\"])"
+            "for (const key of [\"default_global\", \"inject_on_session_start\", \"inject_on_subagent_start\", \"max_chars\", \"contribute\", \"consume\", \"deliver_on_session_start\", \"inbox_notice_on_prompt\"])"
         ));
         assert!(plugin.contains("if (declaresSettings(text)) return marker;"));
         assert!(plugin.contains(
@@ -16383,6 +16456,72 @@ process.exit(0);
         )
         .unwrap();
         assert_eq!(second, ApplyOutcome::NoOp, "second apply must be a no-op");
+    }
+
+    // Cursor strips comments before parsing hooks.json, with a regex that
+    // ignores string boundaries, so a `//` anywhere — including inside a
+    // `https://` server URL baked into a command — truncates the line,
+    // `JSON.parse` throws, and Cursor drops the whole file and captures
+    // nothing (#2069). Model Cursor's exact `parseJSONC` from the shipped
+    // cursor-agent bundle (2026.11.05 `6139.index.js`):
+    //   e.replace(/\/\/.*$/gm,"").replace(/\/\*[\s\S]*?\*\//g,"")
+    // and prove the rendered file carries no bare `//`, still parses after the
+    // strip, and keeps the full `https://` URL in an ai-memory command.
+    #[test]
+    fn cursor_hooks_survive_cursors_comment_stripper() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(
+            hooks_tmp.path(),
+            &[
+                "session-start.sh",
+                "session-end.sh",
+                "user-prompt-submit.sh",
+                "pre-tool-use.sh",
+                "post-tool-use.sh",
+                "pre-compact.sh",
+                "stop.sh",
+            ],
+        );
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("hooks.json");
+        let url = "https://memory.example.com:8443/mcp";
+        merge_cursor_hooks(
+            hooks_tmp.path(),
+            url,
+            None,
+            Some(config_tmp.path()),
+            None,
+            &config_path,
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.contains("//"),
+            "rendered hooks.json still carries a bare `//` Cursor would strip: {raw}"
+        );
+
+        // Cursor's parseJSONC, modeled from the shipped bundle.
+        let line = regex::Regex::new(r"(?m)//.*$").unwrap();
+        let block = regex::Regex::new(r"(?s)/\*.*?\*/").unwrap();
+        let stripped = block
+            .replace_all(&line.replace_all(&raw, ""), "")
+            .into_owned();
+        let parsed: serde_json::Value = serde_json::from_str(&stripped)
+            .expect("Cursor would drop a hooks.json it cannot parse after stripping comments");
+        assert!(
+            parsed
+                .get("hooks")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|hooks| !hooks.is_empty()),
+            "our hooks did not survive Cursor's comment strip: {stripped}"
+        );
+
+        let commands = cursor_ai_memory_commands(&config_path);
+        assert!(
+            commands.iter().any(|(_, command)| command.contains(url)),
+            "no ai-memory command kept the https:// server URL intact: {commands:?}"
+        );
     }
 
     // ----------------------------------------------------------------

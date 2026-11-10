@@ -534,6 +534,65 @@ async fn s1_per_tier_curves_differentiate_decay() {
 /// retention above `cold_threshold`, so it survives a sweep it would otherwise
 /// fail. The reinforcement touches only the access columns, never `updated_at`,
 /// so a genuinely old page stays old — it is the *reads* that keep it alive.
+/// The lint's stale rule only flags episodic pages, so its threshold follows
+/// the episodic half-life the sweep scores them with, not the scalar λ.
+#[tokio::test]
+async fn s1_lint_stale_follows_the_episodic_half_life() {
+    let fx = seed_fixture(false).await;
+    write(
+        &fx,
+        "sessions/unread.md",
+        Tier::Episodic,
+        false,
+        "a session nobody reopened",
+    )
+    .await;
+    backdate_latest(&fx, "sessions/unread.md", 60);
+
+    let stale_paths = |decay: DecayParams| {
+        let fx = &fx;
+        async move {
+            run_lint(
+                &fx.store.reader,
+                &fx.wiki,
+                None,
+                fx.ws,
+                fx.proj,
+                LintOptions {
+                    dry_run: true,
+                    use_llm: false,
+                    decay,
+                    ..LintOptions::default()
+                },
+            )
+            .await
+            .unwrap()
+            .findings
+            .into_iter()
+            .filter(|f| f.kind == "stale")
+            .count()
+        }
+    };
+
+    assert_eq!(
+        stale_paths(DecayParams::default()).await,
+        1,
+        "60 days unread is stale at the default 30-day threshold"
+    );
+    let slow_episodic = DecayParams {
+        tier_lambda: TierLambdas {
+            episodic: Some(lambda_from_half_life_days(180.0)),
+            ..TierLambdas::default()
+        },
+        ..DecayParams::default()
+    };
+    assert_eq!(
+        stale_paths(slow_episodic).await,
+        0,
+        "a 180-day episodic half-life puts the threshold near day 156"
+    );
+}
+
 #[tokio::test]
 async fn s1_access_reinforcement_saves_a_cold_page() {
     // Control: an identical un-reinforced page is evicted, proving the fixture
@@ -725,7 +784,7 @@ async fn s1_similarity_lint_flags_band_pair_without_deleting() {
         LintOptions {
             dry_run: true,
             use_llm: false,
-            decay_lambda: 0.02,
+            decay: ai_memory_store::DecayParams::default(),
             embedding: Some(EmbeddingCoord {
                 provider: PROVIDER.into(),
                 model: MODEL.into(),

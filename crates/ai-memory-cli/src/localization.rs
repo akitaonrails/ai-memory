@@ -96,6 +96,11 @@ pub fn failure_report(error: &anyhow::Error) -> String {
     let report = error
         .downcast_ref::<RenderedFailure>()
         .map_or_else(|| format!("Error: {error:?}"), ToString::to_string);
+    // A configuration parse error echoes the offending source line, which can
+    // hold `bearer_token = "…"` or a `user:password@` URL (GHSA-6pmr-q79m-87vp
+    // item 3). This is the one place every fatal failure leaves the process, so
+    // redact the credential out of any echoed assignment or URL here.
+    let report = crate::commands::render_shared::redact_config_echo(&report);
     crate::commands::show::terminal_body(&report)
 }
 
@@ -239,6 +244,27 @@ fn parse_error(error: &clap::Error, i18n: &Localizer) -> String {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// GHSA-6pmr item 3: a configuration parse error echoes the offending
+    /// source line, which can hold the bearer. `failure_report` is the single
+    /// place every fatal error leaves the process, so it must redact the
+    /// credential out of that echo. Fails if the redaction is removed.
+    #[test]
+    fn failure_report_redacts_a_credential_echoed_by_a_config_parse_error() {
+        let echoed = "TOML parse error at line 2, column 16\n  |\n2 | bearer_token = \"aim_SYNTHETICsecretvalue\" trailing\n  |                ^";
+        let error = anyhow::anyhow!("{echoed}").context("loading config.toml");
+        let report = failure_report(&error);
+        assert!(
+            !report.contains("aim_SYNTHETICsecretvalue"),
+            "leaked: {report}"
+        );
+        assert!(report.contains("bearer_token = [REDACTED]"), "{report}");
+        // The error's shape is kept.
+        assert!(
+            report.contains("line 2") && report.contains("2 |"),
+            "{report}"
+        );
+    }
 
     #[test]
     fn help_catalogs_track_the_command_tree() {
@@ -428,8 +454,9 @@ mod tests {
     /// `diagnostic` would flatten: each of its values is passed positionally
     /// and wrapped in `terminal_text`/`terminal_body` at the call. The
     /// commands around `ai-memory run` print catalog lines only through
-    /// [`format`], and anywhere else a catalog line that quotes an error or a
-    /// reason does too.
+    /// [`format`], and anywhere else a catalog line that quotes an error, a
+    /// reason, or a workspace or project name does too: those names come from
+    /// a marker the repository shipped or from the server.
     #[test]
     fn interpolated_cli_lines_use_the_neutralizing_helpers() {
         fn visit(path: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
@@ -508,6 +535,10 @@ mod tests {
         let placeholder = regex::Regex::new(r"\{[^{}]*\}").unwrap();
         let foreign =
             regex::Regex::new(r"\b(?:err|error|e|reason|problem|stderr|server_problem)\b").unwrap();
+        let scope_name = regex::Regex::new(
+            r"\b(?:workspace|project|from_workspace|from_project|to_workspace|to_project)\b",
+        )
+        .unwrap();
         let named = regex::Regex::new(r"\{[A-Za-z_][\w.]*(?::[^{}]*)?\}").unwrap();
         let test_module =
             regex::Regex::new(r"(?m)^\s*#\[cfg\(test\)\]\s*\n\s*(?:pub(?:\(crate\))? )?mod \w+")
@@ -564,8 +595,8 @@ mod tests {
                     raw.push(at(call.start()));
                     continue;
                 }
-                // Elsewhere a catalog line that quotes an error or a reason
-                // is the same mid-run shape as a diagnostic.
+                // Elsewhere a catalog line that quotes an error, a reason or
+                // a scope name is the same mid-run shape as a diagnostic.
                 let args = arguments(call_body(body, call.end()));
                 let values = args.get(1).map_or("", |values| {
                     values
@@ -577,7 +608,7 @@ mod tests {
                 let quotes_error = arguments(values).iter().any(|pair| {
                     let pair = pair.trim().trim_start_matches('(').trim_end_matches(')');
                     arguments(pair).get(1).is_some_and(|value| {
-                        foreign.is_match(value)
+                        (foreign.is_match(value) || scope_name.is_match(value))
                             && !["terminal_text(", "terminal_body(", "super::show::terminal_"]
                                 .iter()
                                 .any(|helper| value.starts_with(helper))

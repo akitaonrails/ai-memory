@@ -105,6 +105,7 @@ const directory = checkout ?? process.argv[3]!;
 const events: string[] = [];
 const files: unknown[] = [];
 let handoffs = 0;
+const handoffClaims: (string | null)[] = [];
 const unmarked: string[] = [];
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -126,6 +127,7 @@ const server = createServer((req, res) => {
   }
   if (url.pathname === "/handoff") {
     handoffs++;
+    handoffClaims.push(url.searchParams.get("claim"));
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("HANDOFF_SENTINEL");
     return;
@@ -150,7 +152,7 @@ const transformed: { system: string[] } = { system: [] };
 await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, transformed);
 await hooks.dispose();
 server.close();
-console.log(JSON.stringify({ events, files, handoffs, unmarked, system: transformed.system }));
+console.log(JSON.stringify({ events, files, handoffs, handoffClaims, unmarked, system: transformed.system }));
 "#;
 
     /// One plugin run. `hermetic` drops every ambient `AI_MEMORY_*` var, and
@@ -264,6 +266,13 @@ console.log(JSON.stringify({ events, files, handoffs, unmarked, system: transfor
         assert_eq!(spooled_entries(&dir), 0, "owned run must spool nothing new");
         // Context delivery is a separate path and must survive the handover.
         assert_eq!(owned["handoffs"], 1, "{owned}");
+        // The baton is offered, not claimed: under external capture the fetch
+        // forwards claim=0 so the server names the handoff without consuming it.
+        assert_eq!(
+            owned["handoffClaims"],
+            serde_json::json!(["0"]),
+            "owned run must fetch the handoff with claim=0: {owned}"
+        );
         assert_eq!(owned["unmarked"], serde_json::json!([]), "{owned}");
         assert_eq!(owned["system"][0], "HANDOFF_SENTINEL", "{owned}");
 
@@ -280,6 +289,12 @@ console.log(JSON.stringify({ events, files, handoffs, unmarked, system: transfor
                 );
             }
             assert_eq!(captured["handoffs"], 1, "{label}: {captured}");
+            // No external owner means a normal claiming fetch: no claim=0.
+            assert_eq!(
+                captured["handoffClaims"],
+                serde_json::json!([null]),
+                "{label}: non-owner fetch must not force claim=0: {captured}"
+            );
             // An unauthenticated server reached by a LAN name refuses a
             // handoff fetch without the client marker.
             assert_eq!(
