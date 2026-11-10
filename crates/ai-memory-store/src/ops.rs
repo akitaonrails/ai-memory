@@ -8786,7 +8786,10 @@ pub fn move_project_workspace(
 /// change, so embeddings, evidence, access rows and graph edges follow their
 /// versions automatically. Same-path page collisions are represented by a
 /// new target version supplied by the wiki layer; both prior histories remain
-/// superseded and queryable.
+/// superseded and queryable. The source's repository identity and its derived
+/// name keys move to a target that carries no identity, so identity-based
+/// resolution reaches the merged project; a target that already has one keeps
+/// it.
 pub fn merge_project(
     conn: &mut Connection,
     workspace_id: WorkspaceId,
@@ -9195,6 +9198,20 @@ pub fn merge_project(
         &serde_json::json!({"source_project_id": source_project.to_string()}).to_string(),
     )?;
 
+    // The repository identity routes a checkout's captures and managed runs
+    // to its project, and it lives on the row deleted below. Dropped with the
+    // source, nothing resolves that checkout to the merged project and its
+    // next capture can open a new one beside it (#2156). Read it now and hand
+    // it over once the unique identity index is free.
+    let source_identity: Option<(String, String, String, String)> = tx
+        .query_row(
+            "SELECT identity, identity_source, canonical_name, legacy_name \
+             FROM projects WHERE id = ?1 AND workspace_id = ?2",
+            params![src, ws],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+
     let deleted = tx.execute(
         "DELETE FROM projects WHERE id = ?1 AND workspace_id = ?2",
         params![src, ws],
@@ -9203,6 +9220,25 @@ pub fn merge_project(
         return Err(StoreError::NotFound(
             "source project disappeared during merge".into(),
         ));
+    }
+    // An identity already on the target is never overwritten, the rule
+    // `adopt_project_identity` follows: one project routes one repository.
+    if let Some((identity, identity_source, canonical_name, legacy_name)) = source_identity
+        && !identity.is_empty()
+    {
+        tx.execute(
+            "UPDATE projects SET identity = ?1, identity_source = ?2, \
+             canonical_name = ?3, legacy_name = ?4 \
+             WHERE id = ?5 AND workspace_id = ?6 AND identity = ''",
+            params![
+                identity,
+                identity_source,
+                canonical_name,
+                legacy_name,
+                dst,
+                ws,
+            ],
+        )?;
     }
     if commit {
         tx.commit()?;
