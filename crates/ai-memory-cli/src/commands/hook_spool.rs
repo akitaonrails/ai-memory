@@ -296,6 +296,24 @@ pub fn enqueue_with_config(
     let tmp = spool.join(format!("{name}.tmp"));
     let final_path = spool.join(&name);
     let bytes = serde_json::to_vec(entry)?;
+    // An entry past MAX_SPOOL_ENTRY_BYTES can be written but never read back,
+    // so once spooled it can never be sent or charged an attempt and the TTL /
+    // retry cap never reach it — it wedges the queue forever (#2179). The
+    // usual cause is a base64 image in `tool_response`; the server caps that to
+    // TOOL_EXCERPT_MAX_BYTES on receipt, so the multi-MB payload carries no
+    // excerpt worth keeping. Drop it here, as the at-capacity path drops one
+    // event, instead of writing megabytes that can only ever be skipped.
+    if bytes.len() as u64 > MAX_SPOOL_ENTRY_BYTES {
+        eprintln!(
+            "{}",
+            crate::localization::process_diagnostic(&format!(
+                "ai-memory: hook-spool event over {MAX_SPOOL_ENTRY_BYTES} bytes \
+                 ({} bytes); dropping one UNDELIVERED event",
+                bytes.len()
+            ))
+        );
+        return Ok(());
+    }
     write_private(&tmp, &bytes)?;
     // The capacity lock only serializes concurrent count-then-rename checks
     // so a burst cannot overshoot the cap. If another enqueuer holds it past
@@ -2241,6 +2259,13 @@ fn completed_tombstone_for_path(path: &Path) -> bool {
     matches == 1
 }
 
+/// Whether a spool file is larger than a drainable entry. Such an entry is
+/// undeliverable by construction — [`read_spool_entry_bytes`] refuses it — so
+/// the drain drops it instead of skipping it forever (#2179).
+fn file_exceeds_spool_cap(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_SPOOL_ENTRY_BYTES)
+}
+
 fn read_spool_entry_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let file = File::open(path)?;
@@ -2268,7 +2293,17 @@ fn load_live_entry(path: &Path, result: &mut DrainResult) -> Option<SpoolEntry> 
         return None;
     }
     let Ok(bytes) = read_spool_entry_bytes(path) else {
-        result.remaining += 1;
+        // An entry past MAX_SPOOL_ENTRY_BYTES can never be read back, so it can
+        // never be sent or charged an attempt and the TTL / retry cap never
+        // reach it. Drop it as undelivered rather than let it wedge the queue
+        // forever, and clean up entries an older binary already spooled whole
+        // (#2179). A transient read error (file busy) keeps the entry.
+        if file_exceeds_spool_cap(path) {
+            let _ = std::fs::remove_file(path);
+            result.dropped += 1;
+        } else {
+            result.remaining += 1;
+        }
         return None;
     };
     let Ok(mut entry) = serde_json::from_slice::<SpoolEntry>(&bytes) else {
@@ -3388,6 +3423,48 @@ mod tests {
         file.set_len(MAX_SPOOL_ENTRY_BYTES + 1).unwrap();
         let error = read_spool_entry_bytes(&path).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn enqueue_drops_an_oversize_event_instead_of_spooling_it() {
+        // A PostToolUse event whose tool_response carries a multi-MB base64
+        // image serializes past the spool cap. It must not be written: once
+        // spooled it could never be read back, so it would wait in the queue
+        // forever (#2179).
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        let huge = "a".repeat(MAX_SPOOL_ENTRY_BYTES as usize + 1);
+        let entry = entry_for(
+            "https://x/hook?event=post-tool-use&agent=codex".into(),
+            format!(r#"{{"session_id":"s","tool_response":"{huge}"}}"#),
+            None,
+            false,
+        );
+        enqueue(&spool, &entry).unwrap();
+        assert!(
+            list_entries(&spool).unwrap().0.is_empty(),
+            "an over-cap event must be dropped, not written to the spool"
+        );
+    }
+
+    #[test]
+    fn load_live_entry_drops_an_oversize_entry_instead_of_leaving_it() {
+        // An entry an older binary already spooled whole is undeliverable:
+        // read_spool_entry_bytes refuses it, so the drain used to skip it as
+        // "still queued" every pass forever. It must now be dropped as
+        // undelivered and removed from disk (#2179).
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = spool_dir(tmp.path());
+        create_spool_dir(&spool).unwrap();
+        let path = spool.join("0000000000001-1-0000000000000000-x.json");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_SPOOL_ENTRY_BYTES + 1).unwrap();
+
+        let mut result = DrainResult::default();
+        assert!(load_live_entry(&path, &mut result).is_none());
+        assert_eq!(result.dropped, 1, "an over-cap entry is an undelivered drop");
+        assert_eq!(result.remaining, 0, "it must not be left queued");
+        assert!(!path.exists(), "the undeliverable entry is removed from disk");
     }
 
     #[test]
