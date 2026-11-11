@@ -13004,6 +13004,36 @@ pub(crate) mod tests {
         .await;
     }
 
+    /// CodeBuddy Code reports a subagent's tool calls under the parent's
+    /// `session_id` with the subagent's `agent_id`. They drop; the main
+    /// session keeps its tail.
+    #[tokio::test]
+    async fn codebuddy_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "codebuddy",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Bump the dependency",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm install"},
+                "tool_use_id": "call_main",
+                "tool_response": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_id": "store-subagent-1",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "package.json"},
+                "tool_use_id": "call_sub",
+                "tool_response": "subagent output",
+            }),
+            &["pre-tool-use", "post-tool-use"],
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn malformed_aliases_are_rejected_before_subagent_scope_resolution() {
         let tmp = TempDir::new().unwrap();
