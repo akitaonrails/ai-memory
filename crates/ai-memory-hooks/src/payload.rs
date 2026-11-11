@@ -1945,6 +1945,35 @@ mod tests {
         ));
     }
 
+    /// Cline puts `agent_id` on every event, the root agent's included; only a
+    /// non-empty `parent_agent_id` marks a subagent.
+    #[test]
+    fn body_is_subagent_reads_a_cline_subagent_from_its_parent() {
+        let root = serde_json::json!({
+            "taskId": "task-1",
+            "agent_id": "agent_root_1",
+            "parent_agent_id": null,
+        });
+        assert!(!body_is_subagent(AgentKind::Cline, &root), "the root agent");
+        let subagent = serde_json::json!({
+            "taskId": "task-1",
+            "agent_id": "agent_sub_1",
+            "parent_agent_id": "agent_root_1",
+        });
+        assert!(body_is_subagent(AgentKind::Cline, &subagent), "a subagent");
+        for parent in [
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(7),
+        ] {
+            let mut raw = subagent.clone();
+            raw["parent_agent_id"] = parent;
+            assert!(!body_is_subagent(AgentKind::Cline, &raw), "{raw}");
+        }
+        // Another harness's `agent_id` still marks a subagent.
+        assert!(body_is_subagent(AgentKind::ClaudeCode, &root));
+    }
+
     #[test]
     fn parses_known_events() {
         assert_eq!(HookEvent::parse("session-start"), HookEvent::SessionStart);
