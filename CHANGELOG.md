@@ -172,6 +172,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A managed session start that cannot be bound to a single eligible run — two
+  live managed runs in the same checkout with a stale shared-daemon run id
+  matching neither — no longer falls through to the legacy project-wide handoff
+  path and accepts an unrelated task's handoff. Such a start is now refused with
+  a `403` the native hook reports on stderr, leaving every handoff open for an
+  explicit `memory_handoff_accept`; a plain session start, a stale id that
+  matches no run, and a safely bound managed start are all unaffected. Follow-up
+  to #987. (#2194)
 - `ai-memory checkpoints` and `ai-memory commit` now use the wiki of the server
   the checkout routes to, matching their paired command `restore-page`. From a
   checkout whose `.ai-memory.toml` selects a server profile, `checkpoints`
