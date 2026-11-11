@@ -41,7 +41,11 @@ pub const ASSISTANT_EXCERPT_MAX_BYTES: usize = 2_000;
 /// supported agents. The unconditional strip removes each of these; the closed
 /// per-agent table below decides which is a *candidate* for opt-in capture. The
 /// union is kept tiny on purpose — one entry per distinct wire spelling.
-const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message"];
+///
+/// Gemini CLI's `AfterAgent` names the model's final reply `prompt_response`
+/// (<https://github.com/google-gemini/gemini-cli/blob/5a5c7180ff3f0a02511f54b54db7f228d4982a30/docs/hooks/reference.md#L163-L175>).
+/// It is stripped like the rest and is no capture candidate.
+const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message", "prompt_response"];
 
 /// The raw field that carries the assistant's final message for `(agent, event)`,
 /// or `None` when the pair has no verified assistant-message field.
