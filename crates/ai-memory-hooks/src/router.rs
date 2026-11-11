@@ -1811,10 +1811,18 @@ async fn should_drop_subagent(
 /// - Kimi Code fires `SubagentStart` and `SubagentStop` with the main
 ///   session's `sessionId`
 ///   (<https://github.com/MoonshotAI/kimi-code/blob/5af9942e9fb789b6a1530830575b3768499932e9/packages/agent-core-v2/src/features/externalHooks/session/sessionExternalHooksService.ts#L156-L183>).
+/// - CodeBuddy Code reports a subagent session's hooks under its parent's id
+///   and adds the subagent's `agent_id` (`resolveHookSessionId` returns
+///   `meta.parentSessionId`, `buildAgentTrigger` sets `agent_id`;
+///   `@tencent-ai/codebuddy-code` 2.183.0, `dist/codebuddy.js`).
 fn subagent_event_seeds_session(agent: AgentKind) -> bool {
     !matches!(
         agent,
-        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::QwenCode | AgentKind::KimiCode
+        AgentKind::ClaudeCode
+            | AgentKind::Codex
+            | AgentKind::QwenCode
+            | AgentKind::KimiCode
+            | AgentKind::CodeBuddy
     )
 }
 
