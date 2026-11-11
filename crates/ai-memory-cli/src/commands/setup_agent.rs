@@ -1267,8 +1267,8 @@ mod tests {
         assert!(rendered.contains("post-tool-use"));
         assert!(rendered.contains("pre-compact"));
         assert!(
-            !rendered.contains("user-prompt-submit"),
-            "Gemini has no UserPromptSubmit hook; setup-agent must not print Claude-only scripts"
+            rendered.contains("user-prompt-submit"),
+            "Gemini's BeforeAgent runs the prompt script: {rendered}"
         );
         assert!(
             !rendered.contains("subagent-start") && !rendered.contains("subagent-stop"),

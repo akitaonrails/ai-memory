@@ -3339,8 +3339,9 @@ fn merge_cursor_hooks(
 ///
 ///   - `BeforeTool` / `AfterTool`  (ai-memory: `pre-tool-use` / `post-tool-use`)
 ///   - `PreCompress`               (ai-memory: `pre-compact`)
+///   - `BeforeAgent`               (ai-memory: `user-prompt-submit`)
 ///   - `SessionStart` / `SessionEnd` line up with Claude Code's
-///   - No `UserPromptSubmit` / `Stop` equivalents — skipped
+///   - No `Stop` equivalent — skipped
 ///
 /// Like Claude Code, Gemini doesn't honour an `env` field at the
 /// inner-hook level, so the env vars get inlined into the command
@@ -10805,10 +10806,9 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         );
         assert!(gemini.contains("session-start"));
         assert!(gemini.contains("session-end"));
+        assert!(gemini.contains("user-prompt-submit"), "{gemini}");
         assert!(
-            !gemini.contains("user-prompt-submit")
-                && !gemini.contains("subagent-start")
-                && !gemini.contains("subagent-stop"),
+            !gemini.contains("subagent-start") && !gemini.contains("subagent-stop"),
             "Gemini manual output must omit scripts outside Gemini's hook vocabulary: {gemini}"
         );
 

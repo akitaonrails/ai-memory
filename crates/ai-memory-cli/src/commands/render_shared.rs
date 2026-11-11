@@ -1761,11 +1761,14 @@ pub(crate) const CURSOR_EVENTS: [(&str, &str); 8] = [
 /// PascalCase. The vocab DIFFERS from Claude Code's:
 ///   - `BeforeTool` / `AfterTool` instead of `PreToolUse` / `PostToolUse`
 ///   - `PreCompress` instead of `PreCompact`
-///   - No `UserPromptSubmit` equivalent (skipped)
+///   - `BeforeAgent` instead of `UserPromptSubmit`: it fires once per user
+///     prompt, whose `prompt` also carries every `@`-referenced file that
+///     `ai_memory_hooks::strip_gemini_prompt_expansion` cuts
 ///   - No `Stop` event (SessionEnd covers it)
-pub(crate) const GEMINI_EVENTS: [(&str, &str); 5] = [
+pub(crate) const GEMINI_EVENTS: [(&str, &str); 6] = [
     ("SessionStart", "session-start.sh"),
     ("SessionEnd", "session-end.sh"),
+    ("BeforeAgent", "user-prompt-submit.sh"),
     ("BeforeTool", "pre-tool-use.sh"),
     ("AfterTool", "post-tool-use.sh"),
     ("PreCompress", "pre-compact.sh"),
