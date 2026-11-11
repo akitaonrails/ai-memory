@@ -49,3 +49,78 @@ pub fn strip_gemini_prompt_expansion(agent: AgentKind, raw: &mut serde_json::Val
     prompt.truncate(cut);
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What Gemini CLI hands `BeforeAgent` for `explain @src/main.rs` with the
+    /// `planner` agent picked: the user's words, the agent note, then the
+    /// referenced file.
+    fn expanded() -> String {
+        "explain @src/main.rs\n<system_note>\nThe user has explicitly selected the following \
+         agent(s): planner. Please use the following tool(s) to delegate the task: \
+         'planner'.\n</system_note>\n\n--- Content from referenced files ---\nContent from \
+         @src/main.rs:\nfn main() { SECRET_FILE_CONTENT }\n--- End of content ---"
+            .to_owned()
+    }
+
+    #[test]
+    fn strips_the_agent_note_and_the_referenced_files() {
+        let mut raw = serde_json::json!({
+            "session_id": "g1",
+            "hook_event_name": "BeforeAgent",
+            "prompt": expanded(),
+        });
+        assert!(strip_gemini_prompt_expansion(
+            AgentKind::GeminiCli,
+            &mut raw
+        ));
+        assert_eq!(raw["prompt"], "explain @src/main.rs");
+        assert_eq!(raw["session_id"], "g1");
+    }
+
+    #[test]
+    fn strips_referenced_files_without_an_agent_note() {
+        let mut raw = serde_json::json!({
+            "prompt": "summarize @notes.md\n--- Content from referenced files ---\n\
+                       Content from @notes.md:\nSECRET\n--- End of content ---",
+        });
+        assert!(strip_gemini_prompt_expansion(
+            AgentKind::GeminiCli,
+            &mut raw
+        ));
+        assert_eq!(raw["prompt"], "summarize @notes.md");
+    }
+
+    #[test]
+    fn leaves_a_prompt_gemini_did_not_expand() {
+        let mut raw = serde_json::json!({"prompt": "Refactor the auth middleware"});
+        assert!(!strip_gemini_prompt_expansion(
+            AgentKind::GeminiCli,
+            &mut raw
+        ));
+        assert_eq!(raw["prompt"], "Refactor the auth middleware");
+        let mut blocks = serde_json::json!({
+            "prompt": [{"text": "x\n--- Content from referenced files ---"}],
+        });
+        assert!(!strip_gemini_prompt_expansion(
+            AgentKind::GeminiCli,
+            &mut blocks
+        ));
+        assert!(!strip_gemini_prompt_expansion(
+            AgentKind::GeminiCli,
+            &mut serde_json::json!({})
+        ));
+    }
+
+    #[test]
+    fn leaves_another_agents_prompt_alone() {
+        let mut raw = serde_json::json!({"prompt": expanded()});
+        assert!(!strip_gemini_prompt_expansion(
+            AgentKind::ClaudeCode,
+            &mut raw
+        ));
+        assert_eq!(raw["prompt"], expanded());
+    }
+}

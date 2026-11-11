@@ -1870,6 +1870,29 @@ mod tests {
         assert_eq!(env.occurred_at_micros(), None);
     }
 
+    /// Gemini CLI's `BeforeAgent` `prompt` carries every `@`-referenced file
+    /// after the user's words. The envelope keeps only the words, and the
+    /// file contents are gone from the raw payload too.
+    #[test]
+    fn gemini_before_agent_prompt_keeps_only_the_users_words() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("gemini-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "g1",
+                "hook_event_name": "BeforeAgent",
+                "prompt": "explain @src/main.rs\n--- Content from referenced files ---\n\
+                           Content from @src/main.rs:\nSECRET_FILE_CONTENT\n--- End of content ---",
+            }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("explain @src/main.rs"));
+        assert_eq!(env.body_excerpt.as_deref(), Some("explain @src/main.rs"));
+        assert!(!env.raw.to_string().contains("SECRET_FILE_CONTENT"));
+    }
+
     #[test]
     fn body_is_subagent_detects_harness_markers() {
         // grok tags subagent tool-use events with `subagentType`.
