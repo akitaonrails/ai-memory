@@ -1776,7 +1776,7 @@ async fn should_drop_subagent(
     let marked = matches!(
         env.event,
         HookEvent::SubagentStart | HookEvent::SubagentStop
-    ) || body_is_subagent(&env.raw);
+    ) || body_is_subagent(env.agent, &env.raw);
 
     if marked {
         if subagent_event_seeds_session(env.agent) {
@@ -5579,7 +5579,7 @@ async fn process_authorized(
             _ => false,
         }
         && !managed
-        && !body_is_subagent(&env.raw);
+        && !body_is_subagent(env.agent, &env.raw);
     if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
         // Token-usage visibility (docs: session usage tracking): the native
         // hook spliced an optional `_ai_memory_usage` object into the
@@ -5750,7 +5750,7 @@ async fn process_authorized(
         let child_session = matches!(
             env.agent,
             AgentKind::OpenCode | AgentKind::Omp | AgentKind::Grok
-        ) && body_is_subagent(&env.raw);
+        ) && body_is_subagent(env.agent, &env.raw);
         // The opt-out covers both automatic batons: a session's end and a
         // turn checkpoint, which is OpenCode's only baton since a plugin
         // unload no longer ends its sessions, and Antigravity's since it has
