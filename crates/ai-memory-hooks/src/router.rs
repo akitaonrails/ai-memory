@@ -12968,6 +12968,34 @@ pub(crate) mod tests {
         .await;
     }
 
+    /// Kimi Code fires `SubagentStart` and `SubagentStop` with the main
+    /// session's `sessionId` and no subagent id of their own. They drop; the
+    /// main session keeps its tail.
+    #[tokio::test]
+    async fn kimi_code_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "kimi-code",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Add the retry",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+                "tool_call_id": "call_1",
+                "tool_output": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_name": "coder",
+                "prompt": "Write the retry helper",
+                "session_title": "Add the retry",
+            }),
+            &["subagent-start", "subagent-stop"],
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn malformed_aliases_are_rejected_before_subagent_scope_resolution() {
         let tmp = TempDir::new().unwrap();
