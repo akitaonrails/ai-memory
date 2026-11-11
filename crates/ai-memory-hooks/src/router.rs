@@ -1737,9 +1737,9 @@ fn is_harness_self_maintenance(env: &HookEnvelope) -> bool {
 /// (returns `false`) unless this event's project opted in via the per-event
 /// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
 ///
-/// Claude Code is the exception to seeding: its subagent events carry the
-/// parent's `session_id` and differ only by `agent_id`, so seeding would drop
-/// the main session's own tail. Its marked events still drop one by one.
+/// A harness that reports a subagent under its parent's `session_id` is the
+/// exception to seeding ([`subagent_event_seeds_session`]): seeding would drop
+/// the main session's own tail, so its marked events drop one by one.
 async fn should_drop_subagent(
     state: &HookState,
     env: &HookEnvelope,
@@ -1779,7 +1779,7 @@ async fn should_drop_subagent(
     ) || body_is_subagent(&env.raw);
 
     if marked {
-        if env.agent != AgentKind::ClaudeCode {
+        if subagent_event_seeds_session(env.agent) {
             state.subagent_sessions.lock().await.insert(key);
         }
         return true;
@@ -1790,6 +1790,18 @@ async fn should_drop_subagent(
         state.subagent_sessions.lock().await.remove(&key);
     }
     tracked
+}
+
+/// Whether a marked event from `agent` seeds the subagent-session set, so the
+/// rest of its session drops with it ([`should_drop_subagent`]). That is right
+/// for a harness that runs a subagent in a session of its own (Grok, DSH, the
+/// OMP extension, OpenCode) and wrong for the harnesses below. Their marked
+/// events still drop one by one, and the session they share keeps the rest:
+///
+/// - Claude Code reports a Task subagent under the parent's `session_id` and
+///   tells it apart only by `agent_id`.
+fn subagent_event_seeds_session(agent: AgentKind) -> bool {
+    !matches!(agent, AgentKind::ClaudeCode)
 }
 
 /// Parse the `?event=…&agent=…` query of a spooled hook URL into [`HookQuery`],
