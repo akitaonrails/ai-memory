@@ -1706,17 +1706,6 @@ fn is_cursor_draft_placeholder(env: &HookEnvelope) -> bool {
     env.agent == AgentKind::Cursor && env.session_id.as_deref() == Some(CURSOR_DRAFT_SESSION_ID)
 }
 
-/// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
-/// maintaining the subagent-session set. Returns `true` to drop. Seeds the
-/// session on `SubagentStart` and on any marker-bearing event; keeps it through
-/// `SubagentStop`; and drops the **unmarked tail** (`user_prompt_submit` /
-/// `stop` / `session_end`) of a session already known to be a subagent. No-op
-/// (returns `false`) unless this event's project opted in via the per-event
-/// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
-///
-/// Claude Code is the exception to seeding: its subagent events carry the
-/// parent's `session_id` and differ only by `agent_id`, so seeding would drop
-/// the main session's own tail. Its marked events still drop one by one.
 /// Whether the event belongs to a harness's own background work rather than
 /// the person: today, Codex's memory-writing agent (#1674).
 ///
@@ -1740,6 +1729,17 @@ fn is_harness_self_maintenance(env: &HookEnvelope) -> bool {
         .is_some_and(|prompt| ai_memory_core::looks_like_codex_memory_agent_prompt(&prompt))
 }
 
+/// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
+/// maintaining the subagent-session set. Returns `true` to drop. Seeds the
+/// session on `SubagentStart` and on any marker-bearing event; keeps it through
+/// `SubagentStop`; and drops the **unmarked tail** (`user_prompt_submit` /
+/// `stop` / `session_end`) of a session already known to be a subagent. No-op
+/// (returns `false`) unless this event's project opted in via the per-event
+/// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
+///
+/// Claude Code is the exception to seeding: its subagent events carry the
+/// parent's `session_id` and differ only by `agent_id`, so seeding would drop
+/// the main session's own tail. Its marked events still drop one by one.
 async fn should_drop_subagent(
     state: &HookState,
     env: &HookEnvelope,
