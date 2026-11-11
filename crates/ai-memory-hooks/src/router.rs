@@ -1800,8 +1800,13 @@ async fn should_drop_subagent(
 ///
 /// - Claude Code reports a Task subagent under the parent's `session_id` and
 ///   tells it apart only by `agent_id`.
+/// - Codex sends a spawned agent's hooks with the root thread's `session_id`,
+///   "the identity shared by the root thread and all descendant threads"
+///   (<https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/session/session.rs#L701-L704>),
+///   and adds the child thread's `agent_id`
+///   (<https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/hook_runtime.rs#L1083-L1102>).
 fn subagent_event_seeds_session(agent: AgentKind) -> bool {
-    !matches!(agent, AgentKind::ClaudeCode)
+    !matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex)
 }
 
 /// Parse the `?event=…&agent=…` query of a spooled hook URL into [`HookQuery`],
