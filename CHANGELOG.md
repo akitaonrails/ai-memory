@@ -18,11 +18,11 @@ version in [`docs/changelog/`](docs/changelog/):
   truncated batch is now halved and the halves classified again, within the
   pass's cap on classification calls, so verbose models and long sentences
   still get LLM verdicts. A single sentence that still truncates falls back as
-  before. (#PR)
+  before. (#2199)
 - The OpenAI-compatible providers now treat `finish_reason = "max_tokens"` as
   truncation, the Anthropic stop reason that some gateways in front of Claude
   pass through unchanged. A structured answer cut there now reports a
-  truncated response instead of a misleading parse or schema error. (#PR)
+  truncated response instead of a misleading parse or schema error. (#2199)
 - A managed session start that cannot be bound to a single eligible run — two
   live managed runs in the same checkout with a stale shared-daemon run id
   matching neither — no longer falls through to the legacy project-wide handoff
