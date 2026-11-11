@@ -4691,11 +4691,39 @@ if (inheritOnly) {
         );
     }
 
+    /// Gemini CLI's prompt and turn-end events run the shared prompt and stop
+    /// hooks. Rendered for an explicit platform, so every host sees the same
+    /// command.
+    #[test]
+    fn gemini_before_and_after_agent_run_the_prompt_and_stop_hooks() {
+        let v = build_hook_payload(
+            GEMINI_PROFILE.events,
+            Path::new("/host/hooks/gemini-cli"),
+            "http://localhost:49374",
+            None,
+            GEMINI_PROFILE.shape,
+            HookCommandContext::new(HookCommandPlatform::PosixNative, "gemini-cli", None, None),
+        );
+        for (event, hook) in [
+            ("BeforeAgent", "user-prompt-submit"),
+            ("AfterAgent", "stop"),
+        ] {
+            let command = v
+                .pointer(&format!("/hooks/{event}/0/hooks/0/command"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("no {event} hook in {v}"));
+            assert!(
+                command.contains(&format!(" hook --event {hook} --agent gemini-cli ")),
+                "{event} runs {command}"
+            );
+        }
+    }
+
     #[test]
     fn gemini_payload_uses_nested_shape_with_gemini_event_names() {
         // Same nested shape as Claude Code, but DIFFERENT event
-        // names (BeforeTool / AfterTool / PreCompress; no
-        // UserPromptSubmit, no Stop).
+        // names (BeforeAgent / AfterAgent / BeforeTool / AfterTool /
+        // PreCompress; no UserPromptSubmit, no Stop).
         let root = PathBuf::from("/host/hooks/gemini-cli");
         let v = build_profile_payload(
             &GEMINI_PROFILE,
@@ -4726,6 +4754,8 @@ if (inheritOnly) {
         for expected in [
             "SessionStart",
             "SessionEnd",
+            "BeforeAgent",
+            "AfterAgent",
             "BeforeTool",
             "AfterTool",
             "PreCompress",
