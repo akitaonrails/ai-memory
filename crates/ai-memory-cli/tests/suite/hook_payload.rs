@@ -388,6 +388,35 @@ fn gemini_prompt_is_spooled_without_referenced_file_contents() {
 }
 
 #[test]
+fn gemini_after_agent_is_spooled_without_the_reply_or_its_at_files() {
+    // AfterAgent repeats the expanded prompt and adds the model's reply as
+    // `prompt_response`. Neither the reply nor the referenced file reaches
+    // the spool while assistant capture is off.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"gemini-stop","cwd":"/tmp/project","hook_event_name":"AfterAgent","prompt":"explain @.env\n--- Content from referenced files ---\nAPI_KEY=SENTINEL_FILE_CONTENT\n--- End of content ---","prompt_response":"SENTINEL_ASSISTANT_MESSAGE","stop_hook_active":false}"#;
+
+    let output = run_hook_full_agent(tmp.path(), "gemini-cli", "stop", payload, false);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+
+    let body = spooled_body(tmp.path());
+    for leaked in [
+        "SENTINEL_ASSISTANT_MESSAGE",
+        "prompt_response",
+        "SENTINEL_FILE_CONTENT",
+    ] {
+        assert!(
+            !body.contains(leaked),
+            "spooled body still carries {leaked}: {body}"
+        );
+    }
+    assert!(
+        body.contains("gemini-stop"),
+        "session_id was dropped: {body}"
+    );
+}
+
+#[test]
 fn spool_files_never_leak_the_assistant_field_on_disk() {
     // Byte-level check across the whole spool file (not just the parsed body):
     // neither the value nor the raw key may survive anywhere in the entry.
