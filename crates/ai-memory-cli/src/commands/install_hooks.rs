@@ -16771,6 +16771,8 @@ process.exit(0);
             &[
                 "session-start.sh",
                 "session-end.sh",
+                "user-prompt-submit.sh",
+                "stop.sh",
                 "pre-tool-use.sh",
                 "post-tool-use.sh",
                 "pre-compact.sh",
@@ -16808,6 +16810,13 @@ process.exit(0);
             parsed["hooks"]["BeforeTool"].is_array(),
             "BeforeTool hook should be present"
         );
+        // Gemini's prompt and turn-end events are wired too.
+        for event in ["BeforeAgent", "AfterAgent"] {
+            assert!(
+                parsed["hooks"][event].is_array(),
+                "{event} hook should be present"
+            );
+        }
         // Claude-Code-only events must NOT appear.
         assert!(
             parsed["hooks"].get("PreToolUse").is_none(),
