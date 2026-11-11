@@ -355,6 +355,39 @@ fn stop_hook_strips_last_assistant_message_from_spool_and_stderr() {
 }
 
 #[test]
+fn gemini_prompt_is_spooled_without_referenced_file_contents() {
+    // Gemini CLI's BeforeAgent `prompt` carries the contents of every
+    // `@`-referenced file after the user's words. The native hook cuts them
+    // before it spools, so they reach neither the disk nor the wire.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"gemini-at","cwd":"/tmp/project","hook_event_name":"BeforeAgent","prompt":"explain @.env\n--- Content from referenced files ---\nContent from @.env:\nAPI_KEY=SENTINEL_FILE_CONTENT\n--- End of content ---"}"#;
+
+    let output = run_hook_full_agent(
+        tmp.path(),
+        "gemini-cli",
+        "user-prompt-submit",
+        payload,
+        false,
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("SENTINEL_FILE_CONTENT"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let body = spooled_body(tmp.path());
+    assert!(
+        !body.contains("SENTINEL_FILE_CONTENT"),
+        "spooled body still carries the referenced file: {body}"
+    );
+    let spooled: serde_json::Value = serde_json::from_str(&body).expect("spooled body is JSON");
+    assert_eq!(spooled["prompt"], "explain @.env");
+    assert_eq!(spooled["session_id"], "gemini-at");
+}
+
+#[test]
 fn spool_files_never_leak_the_assistant_field_on_disk() {
     // Byte-level check across the whole spool file (not just the parsed body):
     // neither the value nor the raw key may survive anywhere in the entry.
