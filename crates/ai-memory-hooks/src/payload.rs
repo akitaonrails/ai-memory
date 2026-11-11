@@ -489,7 +489,7 @@ impl HookEvent {
                 Self::SessionStart
             }
             "user-prompt" | "user_prompt" | "user-prompt-submit" | "user_prompt_submit"
-            | "UserPromptSubmit" | "beforeSubmitPrompt" => Self::UserPrompt,
+            | "UserPromptSubmit" | "beforeSubmitPrompt" | "BeforeAgent" => Self::UserPrompt,
             "pre-tool-use" | "pre_tool_use" | "PreToolUse" | "preToolUse" | "BeforeTool" => {
                 Self::PreToolUse
             }
@@ -500,7 +500,7 @@ impl HookEvent {
             }
             "post-compaction" | "post_compaction" | "PostCompaction" => Self::PostCompaction,
             "notification" | "Notification" => Self::Notification,
-            "stop" | "Stop" => Self::Stop,
+            "stop" | "Stop" | "AfterAgent" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
             "subagent-start" | "subagent_start" | "SubagentStart" | "subagentStart" => {
                 Self::SubagentStart
