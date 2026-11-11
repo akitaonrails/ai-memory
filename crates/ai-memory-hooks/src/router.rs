@@ -13041,6 +13041,45 @@ pub(crate) mod tests {
         .await;
     }
 
+    /// Cline puts the firing agent's `agent_id` on every event, the root
+    /// agent's included, so only a `parent_agent_id` marks a subagent. The root
+    /// agent's events are stored and a subagent under the same task drops
+    /// without taking the root tail with it.
+    #[tokio::test]
+    async fn cline_subagent_events_drop_without_dropping_the_root_agent() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "cline",
+            session,
+            serde_json::json!({
+                "clineVersion": "3.0.74",
+                "taskId": session.to_string(),
+                "agent_id": "agent_root_1",
+                "parent_agent_id": null,
+                "tool_result": {
+                    "id": "toolu_root",
+                    "name": "run_commands",
+                    "input": {"commands": ["cargo test"]},
+                    "output": "ok"
+                },
+            }),
+            serde_json::json!({
+                "clineVersion": "3.0.74",
+                "taskId": session.to_string(),
+                "agent_id": "agent_sub_1",
+                "parent_agent_id": "agent_root_1",
+                "tool_result": {
+                    "id": "toolu_sub",
+                    "name": "read_files",
+                    "input": {"paths": ["README.md"]},
+                    "output": "subagent output"
+                },
+            }),
+            &["pre-tool-use", "post-tool-use"],
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn malformed_aliases_are_rejected_before_subagent_scope_resolution() {
         let tmp = TempDir::new().unwrap();
