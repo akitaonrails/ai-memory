@@ -656,10 +656,16 @@ impl OpenAiProvider {
 
 /// `true` when the engine reports the output stopped at the token budget
 /// rather than at a natural end. OpenAI and the local engines spell it
-/// `length`; engines that omit the field report `None` and are never
-/// truncated by this classifier.
+/// `length`. Some OpenAI-compatible gateways in front of Claude (seen with
+/// 9router relaying Claude Haiku) pass Anthropic's own `max_tokens` stop
+/// reason through unchanged
+/// (<https://docs.anthropic.com/en/api/handling-stop-reasons>). Engines that
+/// omit the field report `None` and are never truncated by this classifier.
 pub(crate) fn is_length_truncated(finish_reason: Option<&str>) -> bool {
-    finish_reason.is_some_and(|reason| reason.trim().eq_ignore_ascii_case("length"))
+    finish_reason.is_some_and(|reason| {
+        let reason = reason.trim();
+        reason.eq_ignore_ascii_case("length") || reason.eq_ignore_ascii_case("max_tokens")
+    })
 }
 
 /// Recursively normalise a JSON schema for OpenAI Structured Outputs
@@ -1484,6 +1490,9 @@ mod tests {
         // still classify, and every other stop reason must not.
         assert!(is_length_truncated(Some(" length ")));
         assert!(is_length_truncated(Some("LENGTH")));
+        // Anthropic's spelling, relayed as-is by some compatible gateways.
+        assert!(is_length_truncated(Some("max_tokens")));
+        assert!(is_length_truncated(Some("MAX_TOKENS")));
         assert!(!is_length_truncated(None));
         assert!(!is_length_truncated(Some("stop")));
         assert!(!is_length_truncated(Some("tool_calls")));

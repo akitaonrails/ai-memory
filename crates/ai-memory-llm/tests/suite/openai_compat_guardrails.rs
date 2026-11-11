@@ -174,6 +174,44 @@ async fn tolerant_truncated_response_is_terminal_truncated_response() {
     );
 }
 
+/// A gateway that relays Claude's `max_tokens` stop reason is truncation too:
+/// without that, the cut-off JSON reaches the tolerant parser and fails as an
+/// unrelated shape or schema error, hiding that the budget ran out.
+#[tokio::test]
+async fn tolerant_relayed_max_tokens_stop_is_terminal_truncated_response() {
+    let server = MockServer::start().await;
+    body_mock(qwen_body(
+        Some("{\"items\":[{\"index\":0,\"keep\":false},{\"index\":1,"),
+        "max_tokens",
+        2000,
+    ))
+    .mount(&server)
+    .await;
+
+    let provider = tolerant_provider(server.uri());
+    let err = provider
+        .complete_structured_raw(tiny_request(), tiny_schema())
+        .await
+        .expect_err("a max_tokens stop must not parse");
+
+    assert!(
+        matches!(
+            err,
+            LlmError::TruncatedResponse {
+                completion_tokens: Some(2000),
+                ..
+            }
+        ),
+        "expected TruncatedResponse, got {err:?}"
+    );
+    let requests = server.received_requests().await.expect("requests recorded");
+    assert_eq!(
+        requests.len(),
+        1,
+        "a max_tokens stop must not trigger a second upstream call"
+    );
+}
+
 /// Strict path: the same `length` stop must NOT fall through to the
 /// tolerant parser — that would be a second HTTP call re-truncating the
 /// same output and doubling the spend.
