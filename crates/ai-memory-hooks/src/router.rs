@@ -12931,6 +12931,40 @@ pub(crate) mod tests {
         .await;
     }
 
+    /// Qwen Code stamps a subagent's hooks, `SubagentStart` and `SubagentStop`
+    /// included, with the invoking session's `session_id` and the subagent's
+    /// `agent_id`. The main session keeps its tail.
+    #[tokio::test]
+    async fn qwen_code_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "qwen-code",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Refactor the cache",
+                "tool_name": "run_shell_command",
+                "tool_input": {"command": "cargo test"},
+                "tool_response": {"llmContent": "ok"},
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_id": "subagent-explorer-1",
+                "agent_type": "Explorer",
+                "tool_name": "grep_search",
+                "tool_input": {"pattern": "cache"},
+                "tool_response": {"llmContent": "subagent output"},
+            }),
+            &[
+                "subagent-start",
+                "pre-tool-use",
+                "post-tool-use",
+                "subagent-stop",
+            ],
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn malformed_aliases_are_rejected_before_subagent_scope_resolution() {
         let tmp = TempDir::new().unwrap();
