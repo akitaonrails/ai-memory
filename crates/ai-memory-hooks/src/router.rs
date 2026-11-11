@@ -12811,6 +12811,120 @@ pub(crate) mod tests {
         );
     }
 
+    /// One batch of a parent session with a subagent's events in the middle,
+    /// under `drop_subagent_captures`: only the subagent's events may drop. The
+    /// parent keeps its prompt, tool call, Stop and SessionEnd, its summary
+    /// page and its baton.
+    async fn assert_subagent_drop_keeps_the_parent(
+        agent: &str,
+        session: SessionId,
+        parent: serde_json::Value,
+        subagent: serde_json::Value,
+        subagent_events: &[&str],
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let item = |event: &str, body: &serde_json::Value| HookBatchItem {
+            url: format!("http://h/hook?event={event}&agent={agent}&drop_subagent=1"),
+            body: body.clone(),
+        };
+        let mut items = vec![
+            item("session-start", &parent),
+            item("user-prompt-submit", &parent),
+        ];
+        items.extend(subagent_events.iter().map(|event| item(event, &subagent)));
+        for event in ["post-tool-use", "stop", "session-end"] {
+            items.push(item(event, &parent));
+        }
+        let total = items.len();
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "{agent}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], total,
+            "{agent}: stored and dropped events are acked"
+        );
+
+        let metrics = state.ingest_metrics.snapshot();
+        assert_eq!(
+            metrics.dropped_by_policy,
+            subagent_events.len() as u64,
+            "{agent}: only the subagent's events drop"
+        );
+        assert_eq!(
+            metrics.accepted, 5,
+            "{agent}: the parent's events, tail included"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap()
+                .len(),
+            5,
+            "{agent}"
+        );
+        assert_eq!(
+            session_pages(&state).await.len(),
+            1,
+            "{agent}: the parent session keeps its summary"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "{agent}: the parent session keeps its baton"
+        );
+    }
+
+    /// Codex sends a spawned agent's hooks with the root thread's `session_id`
+    /// and the child's `agent_id`. The child's events drop, but they must not
+    /// mark the shared session as a subagent's and take the root tail with it.
+    #[tokio::test]
+    async fn codex_subagent_events_drop_without_dropping_the_root_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "codex",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "turn_id": "turn-root",
+                "prompt": "Fix the parser",
+                "tool_name": "Bash",
+                "tool_input": {"command": "cargo test"},
+                "tool_response": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "turn_id": "turn-child",
+                "agent_id": "019a0000-0000-7000-8000-0000000000c1",
+                "agent_type": "worker",
+                "prompt": "child: do work",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_response": "child output",
+            }),
+            &[
+                "user-prompt-submit",
+                "pre-tool-use",
+                "post-tool-use",
+                "stop",
+            ],
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn malformed_aliases_are_rejected_before_subagent_scope_resolution() {
         let tmp = TempDir::new().unwrap();
