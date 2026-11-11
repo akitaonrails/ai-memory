@@ -1947,6 +1947,21 @@ mod tests {
         assert!(!body_is_subagent(&serde_json::json!({})));
     }
 
+    /// Gemini CLI names its events in its own vocabulary
+    /// (<https://github.com/google-gemini/gemini-cli/blob/5a5c7180ff3f0a02511f54b54db7f228d4982a30/docs/hooks/reference.md>).
+    #[test]
+    fn parses_gemini_cli_event_names() {
+        for (name, event) in [
+            ("BeforeAgent", HookEvent::UserPrompt),
+            ("AfterAgent", HookEvent::Stop),
+            ("BeforeTool", HookEvent::PreToolUse),
+            ("AfterTool", HookEvent::PostToolUse),
+            ("PreCompress", HookEvent::PreCompact),
+        ] {
+            assert_eq!(HookEvent::parse(name), event, "{name}");
+        }
+    }
+
     #[test]
     fn parses_known_events() {
         assert_eq!(HookEvent::parse("session-start"), HookEvent::SessionStart);
