@@ -1815,6 +1815,12 @@ async fn should_drop_subagent(
 ///   and adds the subagent's `agent_id` (`resolveHookSessionId` returns
 ///   `meta.parentSessionId`, `buildAgentTrigger` sets `agent_id`;
 ///   `@tencent-ai/codebuddy-code` 2.183.0, `dist/codebuddy.js`).
+/// - Cline marks every event of a subagent with its `parent_agent_id`
+///   ([`body_is_subagent`]), so there is no unmarked tail for the set to
+///   catch, and it builds a delegated agent with its parent runtime's
+///   `sessionId`
+///   (<https://github.com/cline/cline/blob/071e1b25b48f9ef5dff7fc32085e6a16f02bf02e/sdk/packages/core/src/extensions/tools/team/delegated-agent.ts#L120-L146>),
+///   so tracking it could only reach the root agent's events.
 fn subagent_event_seeds_session(agent: AgentKind) -> bool {
     !matches!(
         agent,
@@ -1823,6 +1829,7 @@ fn subagent_event_seeds_session(agent: AgentKind) -> bool {
             | AgentKind::QwenCode
             | AgentKind::KimiCode
             | AgentKind::CodeBuddy
+            | AgentKind::Cline
     )
 }
 
