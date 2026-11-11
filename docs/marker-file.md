@@ -385,12 +385,16 @@ pages stay reachable on demand through `memory_query`, which unions them.
 subagent captures stored as usual. Top-level (non-subagent) sessions are
 always stored regardless, including Claude Code sessions launched with
 `--agent`: `agent_type` alone describes the selected agent, while a non-empty
-`agent_id` identifies a subagent. Claude Code reports a subagent under the
-parent's `session_id`, so only the events carrying `agent_id` (plus
+`agent_id` identifies a subagent. Claude Code, Codex, Qwen Code, Kimi Code and
+CodeBuddy report a subagent under the parent's `session_id`, so only the
+subagent's own events (those carrying `agent_id`, plus
 `SubagentStart`/`SubagentStop`) are dropped and the parent session's own
-prompts, Stop, SessionEnd and summary are kept. Grok's `subagentType` marker
-still identifies subagent captures. The OMP extension posts every event of a
-subagent session with `agent_id`, so the whole subagent session is dropped,
+prompts, Stop, SessionEnd and summary are kept. Cline puts `agent_id` on every
+event, the root agent's included, so a Cline event is a subagent's only when
+it carries a non-empty `parent_agent_id`, and only those events are dropped.
+Grok's `subagentType` marker still identifies subagent captures. The OMP
+extension posts every event of a subagent session with `agent_id`, so the
+whole subagent session is dropped,
 while an advisor's tool calls stay with the session they advise. This is
 per-project on purpose: there is no server-global
 switch, so opting one noisy project in never sheds subagent captures for the
