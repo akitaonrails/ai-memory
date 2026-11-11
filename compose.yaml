@@ -1,0 +1,27 @@
+name: ai-memory
+
+services:
+  ai-memory:
+    image: akitaonrails/ai-memory:latest
+    container_name: ai-memory
+    restart: unless-stopped
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:49374:49374"
+    volumes:
+      - type: bind
+        source: ./.local-data
+        target: /data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AI_MEMORY_DATA_DIR: /data
+      RUST_LOG: ai_memory=info,ai_memory_store=info,ai_memory_wiki=info,ai_memory_mcp=info,tracing_appender=warn
+    command: ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-web"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ai-memory", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

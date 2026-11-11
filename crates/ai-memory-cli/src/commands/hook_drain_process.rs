@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::{Command, Stdio};
 
 /// Rotate `hook-drain.log` once it grows past this. The log only receives
@@ -172,6 +173,7 @@ pub fn spawn(data_dir: &Path, live_token: Option<&str>) -> io::Result<()> {
 
 /// Hand the child the current bearer in its environment, when there is one.
 /// Applied to every spawn path so the breakaway-retry cannot silently drop it.
+#[cfg(not(windows))]
 fn apply_live_token(command: &mut Command, spec: &DrainCommandSpec) {
     if let Some(token) = &spec.live_token {
         command.env(crate::commands::hook_spool::LIVE_TOKEN_ENV, token);
@@ -189,15 +191,8 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
         .append(true)
         .open(&config.stderr_file)?;
 
-    let mut command = command_for_spec(spec, &config.detach);
-    apply_live_token(&mut command, spec);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr));
-
-    match command.spawn() {
-        Ok(_child) => Ok(()),
+    match spawn_detached(spec, &config.detach, stderr) {
+        Ok(()) => Ok(()),
         Err(err) if should_retry_without_breakaway(&err) => {
             let mut log = OpenOptions::new()
                 .create(true)
@@ -215,16 +210,48 @@ fn spawn_spec(spec: &DrainCommandSpec) -> io::Result<()> {
                 .create(true)
                 .append(true)
                 .open(&config.stderr_file)?;
-            let mut retry = command_for_spec(spec, &config.detach);
-            apply_live_token(&mut retry, spec);
-            retry
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(stderr));
-            retry.spawn().map(|_| ())
+            spawn_detached(spec, &config.detach, stderr)
         }
         Err(err) => Err(err),
     }
+}
+
+#[cfg(not(windows))]
+fn spawn_detached(
+    spec: &DrainCommandSpec,
+    detach: &DetachConfig,
+    stderr: std::fs::File,
+) -> io::Result<()> {
+    let mut command = command_for_spec(spec, detach);
+    apply_live_token(&mut command, spec);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(windows)]
+fn spawn_detached(
+    spec: &DrainCommandSpec,
+    detach: &DetachConfig,
+    stderr: std::fs::File,
+) -> io::Result<()> {
+    // Redirecting stdio with std::process::Command still lets CreateProcess
+    // inherit unrelated handles, including the hook executor's output pipes.
+    // An explicit handle list keeps those pipes from living until this worker
+    // finishes a network request. Unset stdin/stdout are connected to NUL.
+    let DetachConfig::WindowsCreationFlags(flags) = detach;
+    let mut launch = win_custody::Launch::new(&spec.exe);
+    launch
+        .args(&spec.args)
+        .creation_flags(*flags)
+        .stderr(&stderr);
+    if let Some(token) = &spec.live_token {
+        launch.env(crate::commands::hook_spool::LIVE_TOKEN_ENV, token);
+    }
+    launch.spawn().map(|_| ())
 }
 
 #[cfg(unix)]
@@ -275,21 +302,6 @@ fn detach_config(try_breakaway: bool) -> DetachConfig {
         flags |= CREATE_BREAKAWAY_FROM_JOB;
     }
     DetachConfig::WindowsCreationFlags(flags)
-}
-
-#[cfg(windows)]
-fn apply_detach_flags(command: &mut Command, detach: &DetachConfig) {
-    use std::os::windows::process::CommandExt as _;
-    let DetachConfig::WindowsCreationFlags(flags) = detach;
-    command.creation_flags(*flags);
-}
-
-#[cfg(windows)]
-fn command_for_spec(spec: &DrainCommandSpec, detach: &DetachConfig) -> Command {
-    let mut command = Command::new(&spec.exe);
-    command.args(&spec.args);
-    apply_detach_flags(&mut command, detach);
-    command
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -481,5 +493,41 @@ mod tests {
         let DetachConfig::WindowsCreationFlags(without_breakaway) =
             spawn_config(&spec, false).detach;
         assert_ne!(with_breakaway, without_breakaway);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_worker_keeps_its_log_and_live_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("worker logs 日本語");
+        let spec = DrainCommandSpec {
+            exe: PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32")
+                .join("cmd.exe"),
+            args: vec![
+                "/d".into(),
+                "/c".into(),
+                format!(
+                    "echo %{}% 1>&2",
+                    crate::commands::hook_spool::LIVE_TOKEN_ENV
+                )
+                .into(),
+            ],
+            stderr_log: root.join("worker.log"),
+            live_token: Some("synthetic-worker-token".into()),
+        };
+        spawn_spec(&spec).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let log = std::fs::read_to_string(&spec.stderr_log).unwrap_or_default();
+            if log
+                .lines()
+                .any(|line| line.trim() == "synthetic-worker-token")
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "worker log: {log:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
