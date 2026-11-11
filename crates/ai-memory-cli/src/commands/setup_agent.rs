@@ -1271,6 +1271,10 @@ mod tests {
             "Gemini's BeforeAgent runs the prompt script: {rendered}"
         );
         assert!(
+            rendered.contains("/stop.sh"),
+            "Gemini's AfterAgent runs the stop script: {rendered}"
+        );
+        assert!(
             !rendered.contains("subagent-start") && !rendered.contains("subagent-stop"),
             "Gemini has no subagent hook events; setup-agent must not print nonexistent scripts"
         );

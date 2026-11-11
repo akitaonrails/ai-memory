@@ -1764,11 +1764,14 @@ pub(crate) const CURSOR_EVENTS: [(&str, &str); 8] = [
 ///   - `BeforeAgent` instead of `UserPromptSubmit`: it fires once per user
 ///     prompt, whose `prompt` also carries every `@`-referenced file that
 ///     `ai_memory_hooks::strip_gemini_prompt_expansion` cuts
-///   - No `Stop` event (SessionEnd covers it)
-pub(crate) const GEMINI_EVENTS: [(&str, &str); 6] = [
+///   - `AfterAgent` instead of `Stop`: it fires once per turn, after the
+///     final reply, which it carries as `prompt_response` and the
+///     assistant-message strip removes
+pub(crate) const GEMINI_EVENTS: [(&str, &str); 7] = [
     ("SessionStart", "session-start.sh"),
     ("SessionEnd", "session-end.sh"),
     ("BeforeAgent", "user-prompt-submit.sh"),
+    ("AfterAgent", "stop.sh"),
     ("BeforeTool", "pre-tool-use.sh"),
     ("AfterTool", "post-tool-use.sh"),
     ("PreCompress", "pre-compact.sh"),
