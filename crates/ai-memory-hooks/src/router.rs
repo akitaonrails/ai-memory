@@ -1805,8 +1805,14 @@ async fn should_drop_subagent(
 ///   (<https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/session/session.rs#L701-L704>),
 ///   and adds the child thread's `agent_id`
 ///   (<https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/hook_runtime.rs#L1083-L1102>).
+/// - Qwen Code stamps a subagent's hooks with the invoking session's
+///   `session_id` and adds the subagent's `agent_id`
+///   (<https://github.com/QwenLM/qwen-code/blob/f42fe0f3251172c1174d00382ece522eafb3c6c2/packages/core/src/hooks/hookEventHandler.ts#L1232-L1252>).
 fn subagent_event_seeds_session(agent: AgentKind) -> bool {
-    !matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex)
+    !matches!(
+        agent,
+        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::QwenCode
+    )
 }
 
 /// Parse the `?event=…&agent=…` query of a spooled hook URL into [`HookQuery`],
