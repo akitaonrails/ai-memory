@@ -144,6 +144,14 @@ version in [`docs/changelog/`](docs/changelog/):
   before anything live is replaced. It used to skip that check, report success,
   and leave a server that refused to start; the refusal now points at the
   original pepper instead of `--with-config`. (#2172)
+- Fixed `drop_subagent_captures` dropping the rest of a Codex, Qwen Code, Kimi
+  Code or CodeBuddy main session after its first subagent event. These
+  harnesses report a subagent under the parent's `session_id`, so, as for
+  Claude Code, only the subagent's own events are dropped now, and the main
+  session keeps its prompts, tool calls, Stop, SessionEnd, summary and
+  handoff. A Cline event counts as a subagent's only when it carries a
+  `parent_agent_id`, so an opted-in Cline project no longer stores nothing.
+  (#2195)
 
 ### Security
 
