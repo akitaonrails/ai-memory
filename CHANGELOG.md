@@ -138,6 +138,16 @@ version in [`docs/changelog/`](docs/changelog/):
   folder became `bin C:\Users\<you>` and no hook ran. cmd.exe agents and
   Antigravity are unchanged, and existing entries are still recognized and
   replaced on re-apply. (#2176)
+- Fixed Gemini CLI sessions never storing a user prompt or a turn end.
+  `install-hooks --agent gemini-cli` now wires Gemini's `BeforeAgent` to the
+  prompt hook and `AfterAgent` to the stop hook. Gemini appends the contents
+  of every `@`-referenced file to the prompt it hands both hooks; they are cut
+  in the native hook before it spools and on the server, and the model's
+  reply (`prompt_response`) is stripped like other assistant messages. The
+  shell and PowerShell script hooks, which cannot cut them, drop a prompt
+  carrying file contents and a turn end carrying the reply. Re-run
+  `ai-memory install-hooks --agent gemini-cli --apply` on an existing
+  install. (#2196)
 - `restore --with-config` (and a restore into a data dir with no
   `config.toml`) now checks that the backup's config, with the environment
   applied, supplies the `[auth].token_pepper` its API keys were hashed with,
