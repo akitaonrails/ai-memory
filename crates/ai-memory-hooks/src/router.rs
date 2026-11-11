@@ -1940,7 +1940,12 @@ async fn handle_handoff(
         Ok(None) => (StatusCode::OK, String::new()),
         // A refusal is the one failure that must not look like "no handoff":
         // it is a 403 carrying the reason, which the hook client reports on
-        // stderr and never injects as context (#708).
+        // stderr and never injects as context (#708). An ambiguous or
+        // boundary-mismatched managed startup takes the same channel so it
+        // cannot consume an unrelated task's handoff (#2194).
+        Err(e) if e.downcast_ref::<ManagedStartupRefused>().is_some() => {
+            (StatusCode::FORBIDDEN, e.to_string())
+        }
         Err(e) => match e.downcast_ref::<ai_memory_store::ScopeResolutionError>() {
             Some(refusal) if refusal.is_forbidden() => (StatusCode::FORBIDDEN, refusal.to_string()),
             _ => {
@@ -1999,7 +2004,17 @@ async fn fetch_and_accept_handoff_at(
     // authorize the request's repository before interpreting the run id: a
     // shared Codex daemon may carry a terminal id from another checkout, and
     // recovery must select only inside the current, authorized boundary.
-    let managed = fetch_managed_context(state, &query, agent, ws, proj, actor.as_ref()).await?;
+    let managed =
+        match fetch_managed_context(state, &query, agent, ws, proj, actor.as_ref()).await? {
+            // A managed startup we cannot bind to a single eligible run must not
+            // fall through to the legacy project-wide handoff/recovery path and
+            // consume an unrelated task's baton. Refuse the whole start before any
+            // read, claim or pointer publish; the handoff stays open for an
+            // explicit `memory_handoff_accept` (#2194).
+            ManagedStartup::Unresolved => return Err(ManagedStartupRefused.into()),
+            ManagedStartup::Resolved(context) => Some(context),
+            ManagedStartup::Absent => None,
+        };
     // Session-start handoff delivery is a foreground action. Publish it so
     // static MCP callers resolve to the directory that is opening now. The
     // query carries no recall preference; the main capture path publishes
@@ -2917,12 +2932,52 @@ struct PendingManagedContext {
     markdown: Option<String>,
 }
 
+/// Outcome of resolving a managed SessionStart's run for `/handoff`.
+enum ManagedStartup {
+    /// No managed run id, or a benign non-binding condition (bad id, no live
+    /// run for this scope, already delivered, agent mismatch). The caller
+    /// proceeds with the legacy pending-handoff path exactly as a plain
+    /// session start would.
+    Absent,
+    /// A managed run bound safely; deliver its ledger. The legacy handoff stays
+    /// additive alongside it, unchanged.
+    Resolved(PendingManagedContext),
+    /// A managed startup whose run could not be bound to a single eligible run
+    /// safely: more than one candidate (`Ambiguous`), or a boundary mismatch
+    /// (`Refused`). The whole start is refused so it cannot fall through and
+    /// consume another task's project-wide handoff or deliver its recovery
+    /// packet (#2194).
+    Unresolved,
+}
+
+/// A managed SessionStart whose run could not be bound to a single eligible
+/// run. Surfaced as a `403` so the native hook reports it on stderr and never
+/// injects or consumes unrelated context, the same channel a forbidden scope
+/// resolution uses (#2194).
+#[derive(Debug)]
+struct ManagedStartupRefused;
+
+impl std::fmt::Display for ManagedStartupRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "managed session start could not be bound to a single eligible run; \
+             refusing to deliver or consume another task's context. Re-run \
+             without a stale run id, or accept a handoff explicitly.",
+        )
+    }
+}
+
+impl std::error::Error for ManagedStartupRefused {}
+
 /// Render the managed-run ledger for this SessionStart, if there is one.
 ///
-/// Returns `None` — never an early exit for the caller — when the run is
-/// unusable (bad id, no active run, agent mismatch) or its context was
-/// already delivered. The pending handoff still has to reach the agent in
-/// every one of those cases.
+/// Returns [`ManagedStartup::Absent`] — never an early exit for the caller —
+/// when the run is unusable (bad id, no active run, agent mismatch) or its
+/// context was already delivered: the pending handoff still has to reach the
+/// agent in every one of those cases. Returns [`ManagedStartup::Unresolved`]
+/// only when a run id was supplied but could not be bound to a single eligible
+/// run safely, which the caller turns into a refusal rather than letting the
+/// start consume an unrelated handoff (#2194).
 async fn fetch_managed_context(
     state: &HookState,
     query: &HandoffQuery,
@@ -2930,13 +2985,13 @@ async fn fetch_managed_context(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     actor: Option<&IdentityKey>,
-) -> anyhow::Result<Option<PendingManagedContext>> {
+) -> anyhow::Result<ManagedStartup> {
     let Some(raw_run_id) = query.managed_run.as_deref() else {
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     let Ok(run_id) = ManagedRunId::from_str(raw_run_id) else {
         warn!(managed_run = %raw_run_id, "invalid managed run id on SessionStart");
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     let Some(native_session_id) = query
         .session_id
@@ -2944,7 +2999,7 @@ async fn fetch_managed_context(
         .filter(|value| !value.trim().is_empty())
     else {
         warn!(managed_run = %run_id, "managed SessionStart has no native session id");
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     let native_identity = match ai_memory_core::NativeSessionIdentity::parse(
         native_session_id,
@@ -2953,7 +3008,7 @@ async fn fetch_managed_context(
         Ok(id) => id,
         Err(_) => {
             warn!(managed_run = %run_id, "managed SessionStart native identity is UNKNOWN; binding refused");
-            return Ok(None);
+            return Ok(ManagedStartup::Absent);
         }
     };
     let Some(cwd) = query
@@ -2962,7 +3017,7 @@ async fn fetch_managed_context(
         .filter(|value| !value.trim().is_empty())
     else {
         warn!(managed_run = %run_id, "managed SessionStart has no checkout cwd");
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     let owner_user = crate::workstream::managed_run_owner_stamp(
         &state.reader,
@@ -2993,17 +3048,24 @@ async fn fetch_managed_context(
             );
             adopted
         }
+        // Both mean the run could not be bound to a single eligible run: more
+        // than one candidate, or a boundary the supplied id disagreed with.
+        // Refuse the whole start so it cannot fall through to the legacy
+        // project-wide handoff and consume another task's baton (#2194).
         ai_memory_store::ManagedRunSessionLink::Ambiguous => {
             warn!(managed_run = %run_id, "managed SessionStart recovery is ambiguous");
-            return Ok(None);
-        }
-        ai_memory_store::ManagedRunSessionLink::NoMatch => {
-            warn!(managed_run = %run_id, "managed SessionStart has no live scoped run");
-            return Ok(None);
+            return Ok(ManagedStartup::Unresolved);
         }
         ai_memory_store::ManagedRunSessionLink::Refused => {
             warn!(managed_run = %run_id, "managed SessionStart run boundary mismatch");
-            return Ok(None);
+            return Ok(ManagedStartup::Unresolved);
+        }
+        // No run matched this scope at all, so there is nothing to bind and no
+        // ambiguity: a stale env id on an otherwise plain session start. The
+        // legacy pending handoff still has to reach the agent.
+        ai_memory_store::ManagedRunSessionLink::NoMatch => {
+            warn!(managed_run = %run_id, "managed SessionStart has no live scoped run");
+            return Ok(ManagedStartup::Absent);
         }
     };
     let Some(context) = state
@@ -3012,7 +3074,7 @@ async fn fetch_managed_context(
         .await?
     else {
         warn!(managed_run = %selected_run_id, "managed SessionStart has no active run");
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     };
     if context.agent != agent {
         warn!(
@@ -3021,10 +3083,10 @@ async fn fetch_managed_context(
             actual = %agent.as_str(),
             "managed SessionStart agent mismatch"
         );
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     }
     if context.context_delivered {
-        return Ok(None);
+        return Ok(ManagedStartup::Absent);
     }
     let rendered = render_managed_context(
         &context.events,
@@ -3033,7 +3095,7 @@ async fn fetch_managed_context(
         context.sync_after,
         context.previous_native_session.as_ref(),
     );
-    Ok(Some(PendingManagedContext {
+    Ok(ManagedStartup::Resolved(PendingManagedContext {
         run_id: selected_run_id,
         markdown: rendered,
     }))
@@ -19710,6 +19772,107 @@ pub(crate) mod tests {
         );
     }
 
+    /// #2194: a managed SessionStart whose run cannot be bound to a single
+    /// eligible run — two live, undelivered Codex runs in the same checkout and
+    /// a stale daemon run id matching neither — must refuse the whole start, not
+    /// fall through to the legacy project-wide handoff and consume another
+    /// task's baton. The foreign handoff stays open; a later plain session start
+    /// still claims it, proving the baton was consumable and that plain delivery
+    /// is unchanged (control).
+    #[tokio::test]
+    async fn ambiguous_managed_start_refuses_and_never_consumes_a_foreign_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+
+        // A third task's project-wide baton, open in the same checkout.
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::Codex,
+                to_agent: None,
+                cwd: None,
+                summary: "FOREIGN-HANDOFF-734".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+
+        // Two live, undelivered, never-linked Codex runs in the same checkout.
+        // A stale daemon run id binds to neither, so recovery is ambiguous.
+        for fp in ["pink", "blue"] {
+            state
+                .writer
+                .prepare_workstream_run(PrepareWorkstreamRun {
+                    scope_by_id: false,
+                    workspace_id: state.workspace_id,
+                    project_id: state.project_id,
+                    repo_fingerprint: format!("ambiguous-repo-{fp}"),
+                    worktree_fingerprint: format!("ambiguous-worktree-{fp}"),
+                    cwd: "/tmp/scratch".into(),
+                    agent: AgentKind::Codex,
+                    automatic_harness: false,
+                    available_agents: Vec::new(),
+                    selection: WorkstreamSelection::Current,
+                    lease_owner: format!("test:{fp}"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let ambiguous = HandoffQuery {
+            managed_run: Some(ManagedRunId::new().to_string()),
+            agent: Some("codex".into()),
+            session_id: Some("blue-native".into()),
+            ..session_start_query("/tmp/scratch")
+        };
+        let refused = fetch_and_accept_handoff_at(
+            &state,
+            ambiguous,
+            None,
+            Vec::new(),
+            None,
+            Timestamp::now(),
+        )
+        .await
+        .expect_err("an ambiguous managed start must refuse, not deliver foreign context");
+        assert!(
+            refused.downcast_ref::<ManagedStartupRefused>().is_some(),
+            "the refusal must be the typed managed-startup refusal (a 403), got: {refused:?}"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "the ambiguous managed start must leave the foreign handoff open"
+        );
+
+        // Control: the baton was genuinely consumable, and a plain session start
+        // (no managed run) still claims it — the refusal is specific to the
+        // unresolvable managed startup, not a blanket suppression.
+        let plain = HandoffQuery {
+            session_id: Some("plain-native".into()),
+            ..session_start_query("/tmp/scratch")
+        };
+        let delivered =
+            fetch_and_accept_handoff_at(&state, plain, None, Vec::new(), None, Timestamp::now())
+                .await
+                .expect("a plain session start resolves normally");
+        assert!(
+            delivered
+                .as_deref()
+                .is_some_and(|md| md.contains("FOREIGN-HANDOFF-734")),
+            "a plain start still receives the project handoff: {delivered:?}"
+        );
+        assert!(
+            !open_handoff_exists(&state).await,
+            "the plain start consumed the handoff, proving it was consumable all along"
+        );
+    }
+
     async fn end_direct_codex_session(
         state: &HookState,
         tmp: &TempDir,
@@ -28302,18 +28465,21 @@ pub(crate) mod tests {
                     ..Default::default()
                 };
                 assert!(
-                    fetch_managed_context(
-                        &state,
-                        &query,
-                        AgentKind::ClaudeCode,
-                        state.workspace_id,
-                        state.project_id,
-                        None
-                    )
-                    .await
-                    .unwrap()
-                    .is_none(),
-                    "dirty original must not bind SessionStart"
+                    matches!(
+                        fetch_managed_context(
+                            &state,
+                            &query,
+                            AgentKind::ClaudeCode,
+                            state.workspace_id,
+                            state.project_id,
+                            None
+                        )
+                        .await
+                        .unwrap(),
+                        ManagedStartup::Absent
+                    ),
+                    "an UNKNOWN native identity must not bind SessionStart, and must \
+                     keep the legacy capture path rather than refuse the start"
                 );
             } else {
                 let mut env = session_envelope("user-prompt", "private-vendor", &cwd);
