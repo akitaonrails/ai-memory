@@ -1808,10 +1808,13 @@ async fn should_drop_subagent(
 /// - Qwen Code stamps a subagent's hooks with the invoking session's
 ///   `session_id` and adds the subagent's `agent_id`
 ///   (<https://github.com/QwenLM/qwen-code/blob/f42fe0f3251172c1174d00382ece522eafb3c6c2/packages/core/src/hooks/hookEventHandler.ts#L1232-L1252>).
+/// - Kimi Code fires `SubagentStart` and `SubagentStop` with the main
+///   session's `sessionId`
+///   (<https://github.com/MoonshotAI/kimi-code/blob/5af9942e9fb789b6a1530830575b3768499932e9/packages/agent-core-v2/src/features/externalHooks/session/sessionExternalHooksService.ts#L156-L183>).
 fn subagent_event_seeds_session(agent: AgentKind) -> bool {
     !matches!(
         agent,
-        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::QwenCode
+        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::QwenCode | AgentKind::KimiCode
     )
 }
 
