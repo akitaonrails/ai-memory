@@ -650,10 +650,13 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
+        // Gemini CLI appends `@`-referenced file contents to the user's words;
+        // nothing below may read them as the prompt.
+        crate::gemini::strip_gemini_prompt_expansion(agent, &mut raw);
         let context = hook_payload_context(&raw);
         let session_id = context
             .session_id
