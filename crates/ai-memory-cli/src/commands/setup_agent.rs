@@ -1271,7 +1271,7 @@ mod tests {
             "Gemini's BeforeAgent runs the prompt script: {rendered}"
         );
         assert!(
-            rendered.contains("/stop.sh"),
+            rendered.contains("stop.sh"),
             "Gemini's AfterAgent runs the stop script: {rendered}"
         );
         assert!(

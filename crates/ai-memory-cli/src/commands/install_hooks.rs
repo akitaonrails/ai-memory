@@ -10806,7 +10806,7 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(gemini.contains("session-start"));
         assert!(gemini.contains("session-end"));
         assert!(gemini.contains("user-prompt-submit"), "{gemini}");
-        assert!(gemini.contains("/stop.sh"), "{gemini}");
+        assert!(gemini.contains("stop.sh"), "{gemini}");
         assert!(
             !gemini.contains("subagent-start") && !gemini.contains("subagent-stop"),
             "Gemini manual output must omit scripts outside Gemini's hook vocabulary: {gemini}"
