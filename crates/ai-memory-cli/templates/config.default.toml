@@ -187,8 +187,9 @@ log_level = "info"
 # `["name=value","name2=value2"]`. A plain comma separated string is rejected.
 # llm_headers = []
 
-# Ordered fallback chain, tried after the primary provider only when a call
-# fails transiently. Empty by default. Each entry needs `provider` and `model`;
+# Ordered fallback chain, tried after the primary provider when a call fails
+# transiently or the provider reports exhausted credit, quota or billing (see
+# docs/llm-provider-fallback.md). Empty by default. Each entry needs `provider` and `model`;
 # `base_url` is required for openai-compat. `api_key_env` names the environment
 # variable holding that entry's key. Every provider without a native credential
 # source (OpenAI OAuth, Copilot) must set it, and it is never inherited from the
@@ -200,6 +201,12 @@ log_level = "info"
 #   model       = "poolside/laguna-s-2.1-free"
 #   base_url    = "http://127.0.0.1:49375/v1"
 #   api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"
+
+# How long a fallback chain (the default one or a task's) skips a candidate
+# that reported exhausted credit, quota or billing before the next call tries
+# it again, so a topped-up primary takes over without a restart. Default 900
+# seconds, accepted range 30 to 86400. Env: `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`.
+# llm_quota_cooldown_secs = 900
 
 # Run LLM consolidation on SessionEnd as well as writing the heuristic session
 # page, when an LLM provider is configured. Off by default. The provider call is
