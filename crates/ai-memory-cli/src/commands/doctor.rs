@@ -717,7 +717,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
     let muse = super::install_hooks::muse_settings_path(&config.runtime_env)
         .ok()
         .and_then(|path| muse_report(&path));
-    let hermes = hermes::hermes_root(config.runtime_env.var_os("HERMES_HOME"), Some(&home))
+    let hermes = hermes::hermes_root(&config.runtime_env, Some(&home))
         .map(|root| hermes::reports(&root))
         .unwrap_or_default();
 

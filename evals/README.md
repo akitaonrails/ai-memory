@@ -521,6 +521,13 @@ run directory or the file), pairs questions by id, and prints:
   first;
 - per question type, how many moved earlier and how many later.
 
+Runs that share questions must use the same `--ks` cutoffs. Paired questions
+used for optional `--fts` marking must use these cutoffs too. Every question in a
+report must carry the same complete hit/recall cutoff grid; incompatible or
+incomplete grids are refused before a comparison table is printed. Configs
+and question sets may differ, and older reports without later optional fields
+still load. Empty runs and runs with no shared questions remain supported.
+
 ```bash
 cargo run --release -p ai-memory-eval -- retrieval-compare \
     --baseline evals/runs/<previous release local run> \

@@ -103,6 +103,53 @@ pub(crate) fn agent_config_home(env_override: Option<std::ffi::OsString>) -> Opt
     ai_memory_workstream::env_dir_override(env_override)
 }
 
+/// Hermes Agent's home, as Hermes resolves it: `$HERMES_HOME` when set,
+/// else its platform default (`get_default_hermes_root` and
+/// `_platform_default_hermes_home` in `hermes_constants.py`).
+///
+/// The default is `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes`
+/// elsewhere, with `$HERMES_DATA_DIR_SUFFIX` appended to the name. The
+/// Windows default is not guesswork: the Windows installer puts the home
+/// under `%LOCALAPPDATA%`, and the launcher exports `HERMES_HOME` only into
+/// its own process tree, so a command that runs outside Hermes (doctor,
+/// install-skills) found no home at all when it looked at `~/.hermes`.
+pub(crate) fn hermes_home(env: &crate::config::RuntimeEnv, home: Option<&Path>) -> Option<PathBuf> {
+    hermes_home_in(
+        env.var_os("HERMES_HOME"),
+        env.var_os("LOCALAPPDATA"),
+        env.var_os("HERMES_DATA_DIR_SUFFIX"),
+        home,
+        cfg!(windows),
+    )
+}
+
+/// [`hermes_home`] with the environment passed in, so tests can exercise the
+/// Windows and POSIX defaults on either host.
+pub(crate) fn hermes_home_in(
+    env_home: Option<std::ffi::OsString>,
+    local_appdata: Option<std::ffi::OsString>,
+    data_dir_suffix: Option<std::ffi::OsString>,
+    home: Option<&Path>,
+    windows: bool,
+) -> Option<PathBuf> {
+    if let Some(home) = agent_config_home(env_home) {
+        return Some(home);
+    }
+    let suffix = data_dir_suffix
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_default();
+    if windows {
+        // Hermes reads `%LOCALAPPDATA%` and falls back to the user profile's
+        // `AppData\Local` when it is empty.
+        let base = local_appdata
+            .filter(|value| value.to_str().is_none_or(|text| !text.trim().is_empty()))
+            .map(PathBuf::from)
+            .or_else(|| home.map(|home| home.join("AppData").join("Local")))?;
+        return Some(base.join(format!("hermes{suffix}")));
+    }
+    home.map(|home| home.join(format!(".hermes{suffix}")))
+}
+
 /// Hermes profile ids follow `^[a-z0-9][a-z0-9_-]{0,63}$`.
 pub(crate) fn is_hermes_profile_id(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -238,6 +285,57 @@ mod tests {
         for env in [None, Some(OsString::new()), Some(OsString::from("   "))] {
             assert_eq!(claude_config_dir(env.clone()), None, "env {env:?}");
         }
+    }
+
+    /// The Windows setup puts Hermes under `%LOCALAPPDATA%\hermes` and does
+    /// not export `HERMES_HOME`, so the platform default is the only way an
+    /// out-of-process command finds it; POSIX keeps `~/.hermes`.
+    #[test]
+    fn hermes_home_models_the_platform_default() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            hermes_home_in(None, None, None, Some(home), false),
+            Some(home.join(".hermes"))
+        );
+        assert_eq!(
+            hermes_home_in(None, None, None, Some(home), true),
+            Some(home.join("AppData").join("Local").join("hermes"))
+        );
+        assert_eq!(
+            hermes_home_in(
+                None,
+                Some(r"C:\Users\alice\AppData\Local".into()),
+                None,
+                Some(home),
+                true
+            ),
+            Some(PathBuf::from(r"C:\Users\alice\AppData\Local").join("hermes"))
+        );
+        // Hermes appends the suffix to the default's name, never to
+        // `$HERMES_HOME`.
+        assert_eq!(
+            hermes_home_in(None, None, Some("_dev".into()), Some(home), false),
+            Some(home.join(".hermes_dev"))
+        );
+        assert_eq!(
+            hermes_home_in(
+                Some("/srv/hermes".into()),
+                None,
+                Some("_dev".into()),
+                Some(home),
+                true
+            ),
+            Some(PathBuf::from("/srv/hermes"))
+        );
+        // An exported-but-empty or whitespace value is an unset expansion.
+        for unset in [None, Some(std::ffi::OsString::new()), Some("  ".into())] {
+            assert_eq!(
+                hermes_home_in(unset, None, None, Some(home), false),
+                Some(home.join(".hermes"))
+            );
+        }
+        assert_eq!(hermes_home_in(None, None, None, None, false), None);
+        assert_eq!(hermes_home_in(None, None, None, None, true), None);
     }
 
     #[test]

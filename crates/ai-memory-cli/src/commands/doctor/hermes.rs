@@ -15,7 +15,6 @@
 //! <https://hermes-agent.nousresearch.com/docs/user-guide/features/hooks>.
 //! This only reads; approving a hook stays Hermes' own prompt.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -38,18 +37,22 @@ pub(crate) struct HermesProfileReport {
     pub(crate) auto_accept: bool,
 }
 
-/// The Hermes root, as Hermes resolves it: `$HERMES_HOME`, or `~/.hermes`.
-/// A `HERMES_HOME` that points at a profile (`<root>/profiles/<name>`) is
-/// walked back up to its root, so every profile is still found.
-pub(crate) fn hermes_root(hermes_home: Option<OsString>, home: Option<&Path>) -> Option<PathBuf> {
-    let Some(env_home) = crate::commands::path_util::agent_config_home(hermes_home) else {
-        return home.map(|home| home.join(".hermes"));
-    };
-    match env_home.parent() {
+/// The Hermes root, as Hermes resolves it: `$HERMES_HOME`, or the platform
+/// default (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes` elsewhere; see
+/// [`crate::commands::path_util::hermes_home`]). A `HERMES_HOME` that points
+/// at a profile (`<root>/profiles/<name>`) is walked back up to its root, so
+/// every profile is still found.
+pub(crate) fn hermes_root(env: &crate::config::RuntimeEnv, home: Option<&Path>) -> Option<PathBuf> {
+    hermes_root_from(crate::commands::path_util::hermes_home(env, home)?)
+}
+
+/// The root that holds `home`: its parent when `home` is `<root>/profiles/<name>`.
+fn hermes_root_from(home: PathBuf) -> Option<PathBuf> {
+    match home.parent() {
         Some(parent) if parent.file_name().is_some_and(|name| name == "profiles") => {
             parent.parent().map(Path::to_path_buf)
         }
-        _ => Some(env_home),
+        _ => Some(home),
     }
 }
 
@@ -445,18 +448,31 @@ mod tests {
     #[test]
     fn root_walks_up_from_a_profile_home() {
         assert_eq!(
-            hermes_root(None, Some(Path::new("/home/u"))),
+            hermes_root_from(PathBuf::from("/home/u/.hermes/profiles/bot")),
             Some(PathBuf::from("/home/u/.hermes"))
         );
         assert_eq!(
-            hermes_root(Some("/opt/data".into()), Some(Path::new("/home/u"))),
+            hermes_root_from(PathBuf::from("/opt/data")),
+            Some(PathBuf::from("/opt/data"))
+        );
+        let env =
+            |pairs: &[(&str, &str)]| crate::config::RuntimeEnv::with_process_env_for_tests(pairs);
+        assert_eq!(
+            hermes_root(
+                &env(&[("HERMES_HOME", "/opt/data")]),
+                Some(Path::new("/home/u"))
+            ),
             Some(PathBuf::from("/opt/data"))
         );
         assert_eq!(
-            hermes_root(Some("/home/u/.hermes/profiles/bot".into()), None),
+            hermes_root(
+                &env(&[("HERMES_HOME", "/home/u/.hermes/profiles/bot")]),
+                None
+            ),
             Some(PathBuf::from("/home/u/.hermes"))
         );
-        assert_eq!(hermes_root(Some("".into()), None), None);
+        // Blank is unset, and no home means no root.
+        assert_eq!(hermes_root(&env(&[("HERMES_HOME", "")]), None), None);
     }
 
     /// The failure this check exists for: a profile wired in config.yaml with

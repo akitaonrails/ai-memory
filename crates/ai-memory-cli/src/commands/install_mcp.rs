@@ -1363,7 +1363,7 @@ fn build_json_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             bail!("internal: DeepSeek Harness MCP config is a Cordis YAML patch, not JSON")
         }
         McpClient::Hermes => {
-            bail!("internal: Hermes Agent MCP config is ~/.hermes/config.yaml, not JSON")
+            bail!("internal: Hermes Agent MCP config is its home's config.yaml, not JSON")
         }
         _ => build_mcp_entry(args),
     }
@@ -2773,13 +2773,14 @@ fn render_hermes(args: &InstallMcpArgs) -> String {
     };
     format!(
         "# Hermes Agent - merge the entry below into the `mcp_servers:` map of\n\
-         # ~/.hermes/config.yaml ($HERMES_HOME/config.yaml), then restart\n\
+         # the Hermes home's config.yaml (`$HERMES_HOME`, else `~/.hermes` or\n\
+         # `%LOCALAPPDATA%\\hermes` on Windows), then restart\n\
          # Hermes; a running gateway reloads MCP servers within about a minute.\n\
          #\n\
          # Hermes does not read an MCP server's instructions, so the routing\n\
          # rules reach the model through the ai-memory skills\n\
          # (`ai-memory install-skills --scope global --agent hermes`, into\n\
-         # ~/.hermes/skills) and the handoff `install-hooks --agent hermes`\n\
+         # that home's skills/) and the handoff `install-hooks --agent hermes`\n\
          # brings into the next primary-session turn.\n\
          {token_note}\
          {snippet}\n",
@@ -2805,7 +2806,7 @@ fn render_hermes_snippet(args: &InstallMcpArgs) -> String {
 }
 
 /// Why `install-mcp --client hermes --apply` writes nothing, and what to do.
-const HERMES_MCP_APPLY_GUIDANCE: &str = "Hermes Agent keeps MCP servers in ~/.hermes/config.yaml, a YAML file ai-memory does not edit; refusing to write MCP config. Re-run without --apply to print the mcp_servers entry, then merge it into ~/.hermes/config.yaml ($HERMES_HOME/config.yaml).";
+const HERMES_MCP_APPLY_GUIDANCE: &str = "Hermes Agent keeps MCP servers in its home's config.yaml (`$HERMES_HOME`, else `~/.hermes`, or `%LOCALAPPDATA%\\hermes` on Windows), a YAML file ai-memory does not edit; refusing to write MCP config. Re-run without --apply to print the mcp_servers entry, then merge it into that config.yaml.";
 
 fn render_pi(args: &InstallMcpArgs) -> Result<String> {
     Ok(pi_mcp_render_guidance(args))
@@ -4078,7 +4079,7 @@ mod tests {
         // The model never sees ai-memory's MCP instructions in Hermes, so the
         // header points at what carries them instead.
         assert!(rendered.contains("does not read an MCP server's instructions"));
-        assert!(rendered.contains("~/.hermes/skills"));
+        assert!(rendered.contains("that home's skills/"));
         assert!(rendered.contains("next primary-session turn"));
     }
 
@@ -4101,11 +4102,11 @@ mod tests {
         let error = apply_to_config_file(&ai_memory_core::i18n::Localizer::default(), &args)
             .expect_err("apply must be refused");
         let message = format!("{error}");
-        assert!(message.contains("~/.hermes/config.yaml"), "{message}");
+        assert!(message.contains("config.yaml"), "{message}");
         assert!(message.contains("without --apply"), "{message}");
         assert!(!message.contains("test-token-deadbeef"), "{message}");
         let error = mcp_config_path(McpClient::Hermes).expect_err("no writable config");
-        assert!(format!("{error}").contains("~/.hermes/config.yaml"));
+        assert!(format!("{error}").contains("config.yaml"));
         assert!(json_mcp_location(McpClient::Hermes).is_none());
         assert!(build_json_mcp_entry(&args_for(McpClient::Hermes)).is_err());
     }
