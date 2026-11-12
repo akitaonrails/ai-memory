@@ -50,7 +50,8 @@ A marker whose only content is a `[capture]` section (see
 [Capture exclusions](#capture-exclusions) below) is **transparent** to this
 walk: `workspace`, `project`, `project_strategy`, and the other forwarded
 settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`,
-`[profile]`, `[retrieval] default_result_limit`, `[handoff]` and `[recovery]`
+`[profile]`, `[retrieval] default_result_limit`, `[retrieval] min_relevance`,
+`[handoff]` and `[recovery]`
 keys) are resolved from the nearest
 ancestor marker that declares at least one of them, skipping past any nearer
 marker that declares nothing but `[capture]`. A subdirectory marker added only
@@ -64,7 +65,7 @@ generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 `project_strategy`, `drop_subagent`, `default_global`, `briefing`,
 `briefing_budget`, `profile_contribute`, `profile_consume`,
-`default_result_limit`, `handoff`, and
+`default_result_limit`, `min_relevance`, `handoff`, and
 `recovery` query params to the server as applicable;
 handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently. Every client also sends
@@ -252,8 +253,17 @@ consume = false
 # start and recorded on the project; removing the key clears it back to the
 # global `[retrieval] default_result_limit`, then the built-in 10. An explicit
 # per-call `limit` always wins. An out-of-range value is ignored.
+#
+# Optional. This project's default relevance floor for `memory_query` when a
+# call gives no explicit `min_relevance` (0.0..=1.0): hits scoring below it are
+# excluded before the count limit. Forwarded and recorded the same way; removing
+# the key clears it back to the global `[retrieval] min_relevance`, then no
+# floor. A per-call `min_relevance` always wins, and an out-of-range value is
+# ignored. It needs a configured reranker — a query that resolves a floor with
+# none available is rejected.
 [retrieval]
 default_result_limit = 25
+min_relevance = 0.2
 ```
 
 **Naming** for `workspace` and `project`: the server stores both names

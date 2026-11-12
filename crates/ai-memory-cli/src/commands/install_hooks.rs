@@ -4812,7 +4812,7 @@ pub(crate) const TS_FIND_SETTINGS_MARKER: &str = r#"function declaresSettings(te
   }
   if (/^\s*aliases\s*=/m.test(text)) return true;
   if (/^\s*server\s*=/m.test(text)) return true;
-  for (const key of ["default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start", "inbox_notice_on_prompt", "default_result_limit"]) {
+  for (const key of ["default_global", "inject_on_session_start", "inject_on_subagent_start", "max_chars", "contribute", "consume", "deliver_on_session_start", "inbox_notice_on_prompt", "default_result_limit", "min_relevance"]) {
     if (tomlFlag(text, key) !== undefined) return true;
   }
   return false;
@@ -4908,6 +4908,7 @@ pub(crate) fn ts_apply_marker_params(
   let profileContribute: string | undefined;
   let profileConsume: string | undefined;
   let defaultResultLimit: string | undefined;
+  let minRelevance: string | undefined;
   let handoffOff = false;
   let recoveryOff = false;
   let explicitIdentity: string | undefined;
@@ -4964,6 +4965,7 @@ pub(crate) fn ts_apply_marker_params(
       profileContribute = profileFlag(tomlFlag(body, "contribute"));
       profileConsume = profileFlag(tomlFlag(body, "consume"));
       defaultResultLimit = tomlFlag(body, "default_result_limit") ?? "";
+      minRelevance = tomlFlag(body, "min_relevance") ?? "";
       handoffOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true)) === "0";
       recoveryOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false)) === "0";
       explicitIdentity = tomlKey(body, "identity");
@@ -4998,6 +5000,7 @@ pub(crate) fn ts_apply_marker_params(
   if (profileContribute) url.searchParams.set("profile_contribute", profileContribute);
   if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
   if (defaultResultLimit !== undefined) url.searchParams.set("default_result_limit", defaultResultLimit);
+  if (minRelevance !== undefined) url.searchParams.set("min_relevance", minRelevance);
   if (handoffOff) url.searchParams.set("handoff", "0");
   if (recoveryOff) url.searchParams.set("recovery", "0");
   return true;
@@ -14363,6 +14366,7 @@ model = "gpt-5"
         assert!(
             plugin.contains("url.searchParams.set(\"default_result_limit\", defaultResultLimit)")
         );
+        assert!(plugin.contains("url.searchParams.set(\"min_relevance\", minRelevance)"));
         assert!(
             plugin
                 .contains("tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)")
@@ -14379,7 +14383,7 @@ model = "gpt-5"
         ));
         assert!(plugin.contains("if (/^\\s*aliases\\s*=/m.test(text)) return true;"));
         assert!(plugin.contains(
-            "for (const key of [\"default_global\", \"inject_on_session_start\", \"inject_on_subagent_start\", \"max_chars\", \"contribute\", \"consume\", \"deliver_on_session_start\", \"inbox_notice_on_prompt\", \"default_result_limit\"])"
+            "for (const key of [\"default_global\", \"inject_on_session_start\", \"inject_on_subagent_start\", \"max_chars\", \"contribute\", \"consume\", \"deliver_on_session_start\", \"inbox_notice_on_prompt\", \"default_result_limit\", \"min_relevance\"])"
         ));
         assert!(plugin.contains("if (declaresSettings(text)) return marker;"));
         assert!(plugin.contains(

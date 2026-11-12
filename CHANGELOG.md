@@ -22,6 +22,20 @@ version in [`docs/changelog/`](docs/changelog/):
   is an explicit per-call `limit`, then the project's value, then the global
   config, then the built-in 10; every layer is clamped to `1..=100`. Unset
   everywhere, behavior is unchanged. (#2038)
+- A minimum relevance threshold for `memory_query`. A new per-call
+  `min_relevance` argument (`0.0..=1.0`) excludes hits scoring below it before
+  the count limit applies, so a query can ask for only confidently relevant
+  results. A project can set a default floor with `[retrieval] min_relevance` in
+  its `.ai-memory.toml` (forwarded at session start, recorded on the project via
+  migration V106), and the global `[retrieval] min_relevance` config key sets one
+  server-wide; precedence is the call value, then the project's, then the global
+  config, then no floor. The threshold keys off the reranker's calibrated score
+  only — a query that resolves a floor with no reranker configured is rejected
+  rather than applied to the uncalibrated fusion rank, and it is rejected on
+  `global` and `as_of` queries, which do not rerank. When the reranker scores no
+  hit for a query (a transient failure, or too few candidates), the hits are
+  returned unfiltered with a `relevance_filter_unavailable` note instead of being
+  dropped. Unset everywhere, behavior is unchanged. (#2038)
 - `[consolidation] output_language` fixes the natural language of generated
   memory prose — session summaries, cross-session lessons, dream merges, and
   auto-improvement proposals — regardless of the input's language (for example

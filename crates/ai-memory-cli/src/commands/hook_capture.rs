@@ -776,6 +776,7 @@ fn build_marker_query_suffix(
     let (mut briefing, mut briefing_budget) = (None, None);
     let (mut profile_contribute, mut profile_consume) = (None, None);
     let mut default_result_limit = None;
+    let mut min_relevance = None;
     let mut handoff_off = false;
     let mut recovery_off = false;
     // The nearest marker that declares more than `[capture]` (#668): a
@@ -806,6 +807,11 @@ fn build_marker_query_suffix(
         // to the global default. The server validates and clamps the integer.
         default_result_limit =
             Some(parse_toml_flag(&marker, "default_result_limit").unwrap_or_default());
+        // `[retrieval] min_relevance = F` — this project's calibrated relevance
+        // floor for `memory_query`. Forwarded with the same resolved-marker
+        // semantics as the limit: an absent key sends empty, clearing the stored
+        // floor. The server validates the `0.0..=1.0` range.
+        min_relevance = Some(parse_toml_flag(&marker, "min_relevance").unwrap_or_default());
         // The delivery keys share a name but not a table. Keep legacy handoff
         // parsing outside `[recovery]`; recovery itself is section-scoped.
         handoff_off = crate::marker::parse_toml_flag_outside_section(
@@ -871,6 +877,11 @@ fn build_marker_query_suffix(
     // `limit`. An empty value (marker resolved, key absent) clears it.
     if let Some(val) = default_result_limit {
         qs.push_str(&format!("&default_result_limit={}", url_encode(&val)));
+    }
+    // Per-project `[retrieval] min_relevance`: same resolved-marker semantics as
+    // the limit above — an empty value clears the stored floor.
+    if let Some(val) = min_relevance {
+        qs.push_str(&format!("&min_relevance={}", url_encode(&val)));
     }
     if delivery_opt_outs == DeliveryOptOuts::Forward {
         if handoff_off {
@@ -2212,6 +2223,41 @@ drop_subagent_captures = "true"
         assert!(!none.contains("default_result_limit"), "{none}");
     }
 
+    /// `[retrieval] min_relevance` is forwarded as written for the server to
+    /// validate; a resolved marker without the key sends it empty (clearing the
+    /// stored floor), and no marker forwards nothing (#2038).
+    #[test]
+    fn marker_query_suffix_forwards_the_retrieval_min_relevance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = tmp.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(
+            tmp.path().join(".ai-memory.toml"),
+            "workspace = \"outer\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            inner.join(".ai-memory.toml"),
+            "[retrieval]\nmin_relevance = 0.35\n",
+        )
+        .unwrap();
+        let qs = marker_query_suffix(inner.to_str().unwrap(), None);
+        assert!(qs.contains("&min_relevance=0.35"), "{qs}");
+        assert!(
+            !qs.contains("workspace=outer"),
+            "a [retrieval] marker is a settings boundary: {qs}"
+        );
+        // A resolved marker without the key states it empty, clearing the stored
+        // floor back to the global default.
+        let outer = marker_query_suffix(tmp.path().to_str().unwrap(), None);
+        assert!(outer.contains("&min_relevance="), "{outer}");
+        assert!(!outer.contains("&min_relevance=0"), "{outer}");
+        // No marker at all: nothing is forwarded.
+        let bare = tempfile::TempDir::new().unwrap();
+        let none = marker_query_suffix(bare.path().to_str().unwrap(), None);
+        assert!(!none.contains("min_relevance"), "{none}");
+    }
+
     /// `[handoff] deliver_on_session_start` is forwarded as `&handoff=0` only
     /// when explicitly falsy; every other shape leaves the request unchanged,
     /// and a `[handoff]`-only marker is a settings boundary.
@@ -2268,7 +2314,7 @@ drop_subagent_captures = "true"
         .unwrap();
         let marker = inner.join(".ai-memory.toml");
         let unchanged = format!(
-            "&cwd={}&profile_contribute=1&profile_consume=1&default_result_limit=",
+            "&cwd={}&profile_contribute=1&profile_consume=1&default_result_limit=&min_relevance=",
             url_encode(inner.to_str().unwrap())
         );
 

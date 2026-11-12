@@ -1991,6 +1991,11 @@ pub struct HandoffQuery {
     /// `memory_query` hit count; an empty value (marker resolved, key absent)
     /// clears it back to the global default; anything else is ignored.
     pub default_result_limit: Option<String>,
+    /// The marker's `[retrieval] min_relevance`, forwarded at session start
+    /// (#2038). A valid `0.0..=1.0` number becomes the project's default
+    /// relevance floor; an empty value (marker resolved, key absent) clears it
+    /// back to the global default; anything else is ignored.
+    pub min_relevance: Option<String>,
     /// Set falsy by a client that re-fetches on every prompt (Kimi Code) once
     /// the session already received the digest, so it is delivered once.
     pub profile_digest: Option<String>,
@@ -3456,11 +3461,28 @@ fn forwarded_result_limit(raw: Option<&str>) -> Option<Option<u32>> {
     }
 }
 
-/// Record the project's forwarded `[retrieval] default_result_limit` at session
-/// start, mirroring [`persist_profile_flags`]: it is a project-wide setting, so
-/// it writes only with Write access and only when the explicit value changes
-/// what is stored. Never fails the session start — an unreadable or unwritable
-/// value is logged and skipped.
+/// Interpret the forwarded `[retrieval] min_relevance` marker value (#2038),
+/// with the same three-state contract as [`forwarded_result_limit`]: `None` is
+/// no directive, `Some(None)` is an explicit clear, and `Some(Some(v))` sets a
+/// valid finite `0.0..=1.0` floor. A non-empty but invalid value is ignored
+/// rather than applied, since a fire-and-forget session start cannot reject it.
+fn forwarded_min_relevance(raw: Option<&str>) -> Option<Option<f32>> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return Some(None);
+    }
+    match trimmed.parse::<f32>() {
+        Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => Some(Some(v)),
+        _ => None,
+    }
+}
+
+/// Record the project's forwarded `[retrieval]` criteria at session start,
+/// mirroring [`persist_profile_flags`]: it is a project-wide setting, so it
+/// writes only with Write access and only when an explicit value changes what
+/// is stored. Each field is applied independently — a directive-less field
+/// keeps its stored value. Never fails the session start — an unreadable or
+/// unwritable value is logged and skipped.
 async fn persist_retrieval_criteria(
     state: &HookState,
     query: &HandoffQuery,
@@ -3468,9 +3490,11 @@ async fn persist_retrieval_criteria(
     project_id: ProjectId,
     may_write: bool,
 ) {
-    let Some(wanted_limit) = forwarded_result_limit(query.default_result_limit.as_deref()) else {
+    let limit_directive = forwarded_result_limit(query.default_result_limit.as_deref());
+    let relevance_directive = forwarded_min_relevance(query.min_relevance.as_deref());
+    if limit_directive.is_none() && relevance_directive.is_none() {
         return;
-    };
+    }
     if !may_write {
         return;
     }
@@ -3485,9 +3509,13 @@ async fn persist_retrieval_criteria(
             return;
         }
     };
-    let wanted = ai_memory_store::RetrievalCriteria {
-        default_result_limit: wanted_limit,
-    };
+    let mut wanted = stored;
+    if let Some(limit) = limit_directive {
+        wanted.default_result_limit = limit;
+    }
+    if let Some(relevance) = relevance_directive {
+        wanted.min_relevance = relevance;
+    }
     if wanted != stored
         && let Err(e) = state
             .writer
@@ -7042,6 +7070,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -8261,6 +8290,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -9204,6 +9234,24 @@ pub(crate) mod tests {
         assert_eq!(forwarded_result_limit(Some("abc")), None);
     }
 
+    #[test]
+    fn forwarded_min_relevance_interprets_the_marker_value() {
+        // No param: no directive. Resolved-but-absent (empty): explicit clear.
+        assert_eq!(forwarded_min_relevance(None), None);
+        assert_eq!(forwarded_min_relevance(Some("")), Some(None));
+        assert_eq!(forwarded_min_relevance(Some("  ")), Some(None));
+        // Valid `0.0..=1.0` values set, edges included.
+        assert_eq!(forwarded_min_relevance(Some("0")), Some(Some(0.0)));
+        assert_eq!(forwarded_min_relevance(Some("0.35")), Some(Some(0.35)));
+        assert_eq!(forwarded_min_relevance(Some("1")), Some(Some(1.0)));
+        // Out of range, non-finite, or non-numeric: ignored, never clamped.
+        assert_eq!(forwarded_min_relevance(Some("-0.1")), None);
+        assert_eq!(forwarded_min_relevance(Some("1.1")), None);
+        assert_eq!(forwarded_min_relevance(Some("nan")), None);
+        assert_eq!(forwarded_min_relevance(Some("inf")), None);
+        assert_eq!(forwarded_min_relevance(Some("abc")), None);
+    }
+
     /// Session start records the forwarded `[retrieval]` default only with Write
     /// access (it is a project-wide setting), an empty value clears it, and an
     /// absent param leaves the stored value untouched (#2038).
@@ -9253,6 +9301,69 @@ pub(crate) mod tests {
         // An out-of-range forwarded value is ignored, not clamped.
         persist_retrieval_criteria(&state, &limit("500"), ws, proj, true).await;
         assert_eq!(stored(&state).await, Some(50));
+    }
+
+    /// The two `[retrieval]` fields forward independently: a marker that carries
+    /// one and leaves the other's param absent updates only the field it names,
+    /// and each field gates on Write and clears on empty like the limit (#2038).
+    #[tokio::test]
+    async fn persist_retrieval_criteria_records_min_relevance_independently() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let ws = state.workspace_id;
+        let proj = state.project_id;
+        let criteria = |state: &HookState| {
+            let (reader, ws, proj) = (state.reader.clone(), ws, proj);
+            async move { reader.project_retrieval_criteria(ws, proj).await.unwrap() }
+        };
+
+        // A marker carrying only min_relevance (limit param absent) sets just
+        // the threshold, leaving the limit at inherit.
+        let relevance = |value: &str| HandoffQuery {
+            min_relevance: Some(value.to_owned()),
+            ..Default::default()
+        };
+        persist_retrieval_criteria(&state, &relevance("0.4"), ws, proj, true).await;
+        assert_eq!(
+            criteria(&state).await,
+            ai_memory_store::RetrievalCriteria {
+                default_result_limit: None,
+                min_relevance: Some(0.4),
+            }
+        );
+
+        // A later marker carrying only the limit leaves the stored threshold in
+        // place — an absent param is no directive.
+        persist_retrieval_criteria(
+            &state,
+            &HandoffQuery {
+                default_result_limit: Some("12".to_owned()),
+                ..Default::default()
+            },
+            ws,
+            proj,
+            true,
+        )
+        .await;
+        assert_eq!(
+            criteria(&state).await,
+            ai_memory_store::RetrievalCriteria {
+                default_result_limit: Some(12),
+                min_relevance: Some(0.4),
+            }
+        );
+
+        // Write gate: a read-only viewer cannot change the threshold.
+        persist_retrieval_criteria(&state, &relevance("0.9"), ws, proj, false).await;
+        assert_eq!(criteria(&state).await.min_relevance, Some(0.4));
+
+        // An empty value clears the threshold back to inherit.
+        persist_retrieval_criteria(&state, &relevance(""), ws, proj, true).await;
+        assert_eq!(criteria(&state).await.min_relevance, None);
+
+        // An out-of-range forwarded threshold is ignored, not clamped.
+        persist_retrieval_criteria(&state, &relevance("5.0"), ws, proj, true).await;
+        assert_eq!(criteria(&state).await.min_relevance, None);
     }
 
     pub(crate) async fn make_state(tmp: &TempDir) -> HookState {
@@ -18766,6 +18877,7 @@ pub(crate) mod tests {
                 profile_contribute: None,
                 profile_consume: None,
                 default_result_limit: None,
+                min_relevance: None,
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
@@ -18852,6 +18964,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -19089,6 +19202,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -19283,6 +19397,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -20876,6 +20991,7 @@ pub(crate) mod tests {
                     profile_contribute: None,
                     profile_consume: None,
                     default_result_limit: None,
+                    min_relevance: None,
                     profile_digest: None,
                     handoff: None,
                     recovery: None,
@@ -21508,6 +21624,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -21603,6 +21720,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -21717,6 +21835,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -21918,6 +22037,7 @@ pub(crate) mod tests {
                     profile_contribute: None,
                     profile_consume: None,
                     default_result_limit: None,
+                    min_relevance: None,
                     profile_digest: None,
                     handoff: handoff.map(str::to_string),
                     recovery: None,
@@ -23098,6 +23218,7 @@ pub(crate) mod tests {
                 profile_contribute: None,
                 profile_consume: None,
                 default_result_limit: None,
+                min_relevance: None,
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
@@ -23188,6 +23309,7 @@ pub(crate) mod tests {
                 profile_contribute: None,
                 profile_consume: None,
                 default_result_limit: None,
+                min_relevance: None,
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
@@ -23269,6 +23391,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -23431,6 +23554,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -23559,6 +23683,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -23649,6 +23774,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -24355,6 +24481,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -24527,6 +24654,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -25388,6 +25516,7 @@ pub(crate) mod tests {
                 profile_contribute: None,
                 profile_consume: None,
                 default_result_limit: None,
+                min_relevance: None,
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
@@ -29600,6 +29729,7 @@ pub(crate) mod tests {
                     profile_contribute: None,
                     profile_consume: None,
                     default_result_limit: None,
+                    min_relevance: None,
                     profile_digest: None,
                     handoff: None,
                     recovery: None,
@@ -29678,6 +29808,7 @@ pub(crate) mod tests {
             profile_contribute: None,
             profile_consume: None,
             default_result_limit: None,
+            min_relevance: None,
             profile_digest: None,
             handoff: None,
             recovery: None,

@@ -829,6 +829,15 @@ brief_on_project_change = false
 # keeps the built-in 10. A project can override it for itself with
 # `[retrieval] default_result_limit` in its .ai-memory.toml, and an explicit
 # per-call `limit` overrides both.
+#
+# min_relevance is the lowest calibrated reranker relevance (0.0..=1.0; out of
+# range is rejected at startup) a memory_query hit may have when a call gives no
+# explicit `min_relevance`; lower-scoring hits are excluded before the count
+# limit applies. Unset applies no floor. It needs a configured reranker — a
+# query that resolves a floor with none available is rejected, since the fused
+# ranking is not a calibrated relevance score. A project can override it with
+# `[retrieval] min_relevance` in its .ai-memory.toml, and a per-call
+# `min_relevance` overrides both.
 # [retrieval]
 # query_intent = false
 # session_recall_bonus = 0.25
@@ -838,6 +847,7 @@ brief_on_project_change = false
 # feedback_demotion = 0.0
 # query_signal_weight = 0.0
 # default_result_limit = 10
+# min_relevance = 0.2
 
 # Words dropped from a bare natural-language FTS query before the terms are
 # OR-joined. Unset uses the built-in English list. `[]` turns the filter off. A

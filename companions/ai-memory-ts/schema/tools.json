@@ -670,6 +670,12 @@
           "null"
         ]
       },
+      "min_relevance": {
+        "type": [
+          "null",
+          "number"
+        ]
+      },
       "path_prefix": {
         "type": [
           "null",
