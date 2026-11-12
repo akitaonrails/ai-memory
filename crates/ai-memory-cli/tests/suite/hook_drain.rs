@@ -90,6 +90,14 @@ mod windows {
                     Err(error) => panic!("accept upload: {error}"),
                 }
             };
+            // `accept()` inherits the listener's non-blocking mode on Windows,
+            // and Winsock ignores `SO_RCVTIMEO` (set_read_timeout) while a socket
+            // is non-blocking, so `read_line` would return `WouldBlock` the moment
+            // the detached drainer has connected but not yet written its request.
+            // Put the socket back into blocking mode so the read timeout governs.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking accepted socket");
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("read timeout");
