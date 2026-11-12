@@ -163,6 +163,8 @@ cli-reset-dry-run-pass-confirm-to-wipe = (dry-run; pass --confirm to wipe)
 cli-restore-source-tarball-not-found = source tarball { $value0 } not found
 cli-restore-restored = restored { $value0 } -> { $value1 }
 cli-restore-restored-the-backup-s-config-toml = restored the backup's config.toml
+cli-restore-reading-backup-config = reading the backup's config.toml
+cli-restore-backup-config-invalid-toml = the backup's config.toml is not valid TOML; the live data was not changed
 cli-restore-kept-the-live-config-toml-the-backup-s-copy-is-at-a-config-can-run-commands = kept the live config.toml; the backup's copy is at { $value0 }. A config can run commands and redirect data: review it before adopting it, or rerun with --with-config to restore it in place.
 cli-restore-page-path-was-passed-empty-specify-the-wiki-page-path-to-restore = --path was passed empty; specify the wiki page path to restore
 cli-restore-page-restored-under-from-page-id = restored { $value0 } under { $value1 }/{ $value2 } from { $value3 } (page_id={ $value4 })
