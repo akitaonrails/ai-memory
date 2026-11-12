@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- The interface-language picker in the top bar now follows the dashboard's
+  control style instead of the browser's native grey select: the same border,
+  radius, surface colors and height as the search box beside it, its own
+  arrow, and the accent focus ring, in both the light and dark themes and on
+  narrow screens. Switching language still works through the
+  `ai_memory_language` cookie.
+
 ### Fixed
 
 - `adopt-project-identity` now drops the hook router's cached resolution for
