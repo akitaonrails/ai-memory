@@ -14733,6 +14733,23 @@ impl ReaderPool {
         .await
     }
 
+    /// The `[retrieval]` criteria stored on a project (all-inherit when it has
+    /// none). The query path layers this over the global default and the call
+    /// argument; see [`crate::RetrievalCriteria`].
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn project_retrieval_criteria(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<crate::RetrievalCriteria> {
+        self.with_conn(move |conn| {
+            crate::retrieval_criteria::project_retrieval_criteria(conn, workspace_id, project_id)
+        })
+        .await
+    }
+
     /// Projects whose marker keeps them out of the profile.
     ///
     /// # Errors

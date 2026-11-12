@@ -1986,6 +1986,11 @@ pub struct HandoffQuery {
     /// profile digest out of this session and the profile out of the
     /// project's query union.
     pub profile_consume: Option<String>,
+    /// The marker's `[retrieval] default_result_limit`, forwarded at session
+    /// start (#2038). A valid `1..=100` integer becomes the project's default
+    /// `memory_query` hit count; an empty value (marker resolved, key absent)
+    /// clears it back to the global default; anything else is ignored.
+    pub default_result_limit: Option<String>,
     /// Set falsy by a client that re-fetches on every prompt (Kimi Code) once
     /// the session already received the digest, so it is delivered once.
     pub profile_digest: Option<String>,
@@ -2233,6 +2238,9 @@ async fn fetch_and_accept_handoff_at(
         }
     };
     let profile_flags = persist_profile_flags(state, &query, ws, proj, may_write_profile).await;
+    // The `[retrieval]` criteria are project-wide too, so the same Write
+    // authorization gates recording them (#2038).
+    persist_retrieval_criteria(state, &query, ws, proj, may_write_profile).await;
     let profile_md = render_requested_profile_digest(
         state,
         &query,
@@ -3428,6 +3436,66 @@ async fn persist_profile_flags(
         warn!(error = %e, "could not record the project's [profile] flags");
     }
     wanted
+}
+
+/// Interpret the forwarded `[retrieval] default_result_limit` marker value
+/// (#2038). `None` (no param) means no directive — leave the stored value
+/// alone. `Some(None)` is an explicit clear (marker resolved, key absent),
+/// restoring the global default. `Some(Some(n))` sets a valid `1..=100` limit.
+/// A non-empty but invalid or out-of-range value yields `None`: a fire-and-
+/// forget session start cannot reject it loudly, so it is ignored rather than
+/// clamped into a count the operator did not write.
+fn forwarded_result_limit(raw: Option<&str>) -> Option<Option<u32>> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return Some(None);
+    }
+    match trimmed.parse::<u32>() {
+        Ok(n) if (1..=100).contains(&n) => Some(Some(n)),
+        _ => None,
+    }
+}
+
+/// Record the project's forwarded `[retrieval] default_result_limit` at session
+/// start, mirroring [`persist_profile_flags`]: it is a project-wide setting, so
+/// it writes only with Write access and only when the explicit value changes
+/// what is stored. Never fails the session start — an unreadable or unwritable
+/// value is logged and skipped.
+async fn persist_retrieval_criteria(
+    state: &HookState,
+    query: &HandoffQuery,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    may_write: bool,
+) {
+    let Some(wanted_limit) = forwarded_result_limit(query.default_result_limit.as_deref()) else {
+        return;
+    };
+    if !may_write {
+        return;
+    }
+    let stored = match state
+        .reader
+        .project_retrieval_criteria(workspace_id, project_id)
+        .await
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            warn!(error = %e, "could not read the project's [retrieval] criteria");
+            return;
+        }
+    };
+    let wanted = ai_memory_store::RetrievalCriteria {
+        default_result_limit: wanted_limit,
+    };
+    if wanted != stored
+        && let Err(e) = state
+            .writer
+            .set_project_retrieval_criteria(project_id, wanted)
+            .await
+    {
+        warn!(error = %e, "could not record the project's [retrieval] criteria");
+    }
 }
 
 /// Render the cross-project profile digest for a session in `(workspace_id,
@@ -6973,6 +7041,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -8191,6 +8260,7 @@ pub(crate) mod tests {
         let query = |identity: &str, source: &str| HandoffQuery {
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -9114,6 +9184,75 @@ pub(crate) mod tests {
                 .unwrap();
         }
         id
+    }
+
+    #[test]
+    fn forwarded_result_limit_interprets_the_marker_value() {
+        // No param at all: no directive, leave the stored value alone.
+        assert_eq!(forwarded_result_limit(None), None);
+        // A resolved marker without the key sends empty: explicit clear.
+        assert_eq!(forwarded_result_limit(Some("")), Some(None));
+        assert_eq!(forwarded_result_limit(Some("   ")), Some(None));
+        // Valid `1..=100` values set, edges included.
+        assert_eq!(forwarded_result_limit(Some("25")), Some(Some(25)));
+        assert_eq!(forwarded_result_limit(Some("1")), Some(Some(1)));
+        assert_eq!(forwarded_result_limit(Some("100")), Some(Some(100)));
+        // Out of range or non-numeric: ignored (left stored), never clamped.
+        assert_eq!(forwarded_result_limit(Some("0")), None);
+        assert_eq!(forwarded_result_limit(Some("101")), None);
+        assert_eq!(forwarded_result_limit(Some("-1")), None);
+        assert_eq!(forwarded_result_limit(Some("abc")), None);
+    }
+
+    /// Session start records the forwarded `[retrieval]` default only with Write
+    /// access (it is a project-wide setting), an empty value clears it, and an
+    /// absent param leaves the stored value untouched (#2038).
+    #[tokio::test]
+    async fn persist_retrieval_criteria_round_trips_and_gates_on_write() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let ws = state.workspace_id;
+        let proj = state.project_id;
+        let limit = |value: &str| HandoffQuery {
+            default_result_limit: Some(value.to_owned()),
+            ..Default::default()
+        };
+        let stored = |state: &HookState| {
+            let (reader, ws, proj) = (state.reader.clone(), ws, proj);
+            async move {
+                reader
+                    .project_retrieval_criteria(ws, proj)
+                    .await
+                    .unwrap()
+                    .default_result_limit
+            }
+        };
+
+        // Explicit valid value persists under Write.
+        persist_retrieval_criteria(&state, &limit("25"), ws, proj, true).await;
+        assert_eq!(stored(&state).await, Some(25));
+
+        // Without Write access, an explicit value is refused — the guard that
+        // keeps a read-only viewer from changing a project-wide default.
+        persist_retrieval_criteria(&state, &limit("7"), ws, proj, false).await;
+        assert_eq!(
+            stored(&state).await,
+            Some(25),
+            "a read-only viewer must not change the project retrieval default"
+        );
+
+        // An empty value clears back to inherit.
+        persist_retrieval_criteria(&state, &limit(""), ws, proj, true).await;
+        assert_eq!(stored(&state).await, None);
+
+        // An absent param is no directive, so it leaves a stored value alone.
+        persist_retrieval_criteria(&state, &limit("50"), ws, proj, true).await;
+        persist_retrieval_criteria(&state, &HandoffQuery::default(), ws, proj, true).await;
+        assert_eq!(stored(&state).await, Some(50));
+
+        // An out-of-range forwarded value is ignored, not clamped.
+        persist_retrieval_criteria(&state, &limit("500"), ws, proj, true).await;
+        assert_eq!(stored(&state).await, Some(50));
     }
 
     pub(crate) async fn make_state(tmp: &TempDir) -> HookState {
@@ -18626,6 +18765,7 @@ pub(crate) mod tests {
             let query = HandoffQuery {
                 profile_contribute: None,
                 profile_consume: None,
+                default_result_limit: None,
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
@@ -18711,6 +18851,7 @@ pub(crate) mod tests {
         let receiver = || HandoffQuery {
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -18947,6 +19088,7 @@ pub(crate) mod tests {
         let receiver = |agent: &str, session_id: String| HandoffQuery {
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -19140,6 +19282,7 @@ pub(crate) mod tests {
         let receiver = || HandoffQuery {
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -20732,6 +20875,7 @@ pub(crate) mod tests {
                     project_change: None,
                     profile_contribute: None,
                     profile_consume: None,
+                    default_result_limit: None,
                     profile_digest: None,
                     handoff: None,
                     recovery: None,
@@ -21363,6 +21507,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -21457,6 +21602,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -21570,6 +21716,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -21770,6 +21917,7 @@ pub(crate) mod tests {
                     project_change: None,
                     profile_contribute: None,
                     profile_consume: None,
+                    default_result_limit: None,
                     profile_digest: None,
                     handoff: handoff.map(str::to_string),
                     recovery: None,
@@ -22949,6 +23097,7 @@ pub(crate) mod tests {
                 project_change: None,
                 profile_contribute: None,
                 profile_consume: None,
+                default_result_limit: None,
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
@@ -23038,6 +23187,7 @@ pub(crate) mod tests {
                 project_change: None,
                 profile_contribute: None,
                 profile_consume: None,
+                default_result_limit: None,
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
@@ -23118,6 +23268,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -23279,6 +23430,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -23406,6 +23558,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -23495,6 +23648,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -24200,6 +24354,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -24371,6 +24526,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,
@@ -25231,6 +25387,7 @@ pub(crate) mod tests {
                 project_change: None,
                 profile_contribute: None,
                 profile_consume: None,
+                default_result_limit: None,
                 profile_digest: None,
                 handoff: None,
                 recovery: None,
@@ -29442,6 +29599,7 @@ pub(crate) mod tests {
                 let query = HandoffQuery {
                     profile_contribute: None,
                     profile_consume: None,
+                    default_result_limit: None,
                     profile_digest: None,
                     handoff: None,
                     recovery: None,
@@ -29519,6 +29677,7 @@ pub(crate) mod tests {
             project_change: None,
             profile_contribute: None,
             profile_consume: None,
+            default_result_limit: None,
             profile_digest: None,
             handoff: None,
             recovery: None,

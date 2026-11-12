@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- A per-project default result count for `memory_query`. A project can set
+  `[retrieval] default_result_limit = N` (`1..=100`) in its `.ai-memory.toml`;
+  the hook clients forward it at session start and the server records it on the
+  project (migration V105), so a `memory_query` with no explicit `limit`
+  returns `N` hits for that project. The global `[retrieval]
+  default_result_limit` config key sets the same default server-wide. Precedence
+  is an explicit per-call `limit`, then the project's value, then the global
+  config, then the built-in 10; every layer is clamped to `1..=100`. Unset
+  everywhere, behavior is unchanged. (#2038)
 - `[consolidation] output_language` fixes the natural language of generated
   memory prose — session summaries, cross-session lessons, dream merges, and
   auto-improvement proposals — regardless of the input's language (for example

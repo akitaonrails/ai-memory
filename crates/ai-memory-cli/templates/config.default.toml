@@ -823,6 +823,12 @@ brief_on_project_change = false
 # page up to `weight * similarity` in authority, similarity-capped, so an
 # unrelated query gains nothing. 0.0 (the default) also stops the capture: no
 # queries are stored while the boost is off.
+#
+# default_result_limit is how many hits memory_query returns when a call gives
+# no explicit `limit` (1..=100; out of range is rejected at startup). Unset
+# keeps the built-in 10. A project can override it for itself with
+# `[retrieval] default_result_limit` in its .ai-memory.toml, and an explicit
+# per-call `limit` overrides both.
 # [retrieval]
 # query_intent = false
 # session_recall_bonus = 0.25
@@ -831,6 +837,7 @@ brief_on_project_change = false
 # observation_stream = true
 # feedback_demotion = 0.0
 # query_signal_weight = 0.0
+# default_result_limit = 10
 
 # Words dropped from a bare natural-language FTS query before the terms are
 # OR-joined. Unset uses the built-in English list. `[]` turns the filter off. A

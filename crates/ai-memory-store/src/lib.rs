@@ -28,6 +28,7 @@ mod ops;
 pub mod password;
 mod profile;
 mod provenance;
+mod retrieval_criteria;
 pub use provenance::{PageDisagreement, PageProvenance, PageSource};
 mod project_authz;
 mod project_coordinates;
@@ -116,6 +117,7 @@ pub use reader::{
     WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
     project_name_fold_key,
 };
+pub use retrieval_criteria::{MAX_RESULT_LIMIT, RetrievalCriteria};
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
     PRIVATE_PROFILE_NEEDS_USER, ResolvedScope, ResolvedWriteScope, ScopeName, ScopeResolutionError,

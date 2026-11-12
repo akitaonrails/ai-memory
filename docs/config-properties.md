@@ -195,6 +195,7 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | `observation_stream` | `true` | `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM` | Add the observation evidence stream, where matching observation bodies vote for their session's page. |
 | `feedback_demotion` | `0.0` | `AI_MEMORY_RETRIEVAL__FEEDBACK_DEMOTION` | Authority subtracted from a page whose current version carries open `stale`/`wrong` feedback, until a rewrite clears it. 0 is inert and negatives clamp to 0. |
 | `query_signal_weight` | `0.0` | `AI_MEMORY_RETRIEVAL__QUERY_SIGNAL_WEIGHT` | Similarity-capped authority boost from (query → page) associations captured when a session-aware caller with write access read a query hit or marked it helpful; `not_helpful` withdraws one and a session purge deletes its rows. 0 disables both capture and boost. |
+| `default_result_limit` | _unset_ | `AI_MEMORY_RETRIEVAL__DEFAULT_RESULT_LIMIT` | Default number of hits `memory_query` returns when a call gives no explicit `limit`. `1..=100`; rejected at startup if out of range. Unset keeps the built-in 10. A project's own `[retrieval] default_result_limit` marker value overrides this, and an explicit per-call `limit` overrides both. |
 
 ## `[search.fts]`
 

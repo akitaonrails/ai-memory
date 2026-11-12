@@ -36,6 +36,7 @@ mod llm_request_subject;
 mod mcp_stateless_http;
 mod message_routes;
 mod query_answer;
+mod query_default_limit;
 mod query_observation_stream;
 mod query_pin_first;
 mod query_reasoning;

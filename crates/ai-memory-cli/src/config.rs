@@ -2249,6 +2249,12 @@ pub struct RetrievalSettings {
     /// to `weight * similarity` in authority. `0.0` (the default) is inert —
     /// nothing is captured and nothing is boosted.
     pub query_signal_weight: f64,
+    /// Default number of hits `memory_query` returns when a call gives no
+    /// explicit `limit` and the queried project carries no stored
+    /// `default_result_limit` of its own (#2038). `None` (the default) keeps
+    /// the built-in default of 10. A per-project marker value and an explicit
+    /// per-call `limit` both override this; all three are clamped to `1..=100`.
+    pub default_result_limit: Option<usize>,
 }
 
 impl Default for RetrievalSettings {
@@ -2262,6 +2268,7 @@ impl Default for RetrievalSettings {
             observation_stream: base.observation_stream,
             feedback_demotion: base.feedback_demotion,
             query_signal_weight: base.query_signal_weight,
+            default_result_limit: None,
         }
     }
 }
@@ -2792,6 +2799,18 @@ impl Config {
         // silently-inert filter into every search.
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
+        }
+        // The default result count is the same `1..=100` window `memory_query`
+        // clamps a per-call `limit` to (#2038). Reject an out-of-range global
+        // default at startup rather than silently clamping a `0` to `1` or a
+        // `500` to `100` and running queries no one asked for.
+        if let Some(limit) = config.retrieval.default_result_limit
+            && !(1..=100).contains(&limit)
+        {
+            anyhow::bail!(
+                "retrieval.default_result_limit must be between 1 and 100 (got {limit}); it sets \
+                 how many hits memory_query returns when a call gives no explicit limit"
+            );
         }
         config.ingest.drop_list = Box::new(
             ai_memory_hooks::IngestDropList::new(
@@ -4759,6 +4778,48 @@ mod tests {
         std::fs::write(&config_path, "[retrieval]\nabstract_vectors = false\n").unwrap();
         let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert!(config.retrieval.tuning().observation_stream);
+    }
+
+    #[test]
+    fn retrieval_default_result_limit_defaults_unset_and_loads_from_toml() {
+        // Unset by default, so the server keeps its built-in 10.
+        assert_eq!(Config::default().retrieval.default_result_limit, None);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[retrieval]\ndefault_result_limit = 25\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.retrieval.default_result_limit, Some(25));
+    }
+
+    #[test]
+    fn load_rejects_out_of_range_default_result_limit() {
+        for value in ["0", "101", "1000"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[retrieval]\ndefault_result_limit = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err(&format!("default_result_limit = {value} must fail closed"));
+            assert!(
+                error.to_string().contains("default_result_limit"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+        // The `1..=100` edges load.
+        for value in ["1", "100"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[retrieval]\ndefault_result_limit = {value}\n"),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .unwrap_or_else(|e| panic!("default_result_limit = {value} must load: {e:#}"));
+        }
     }
 
     #[test]

@@ -2318,6 +2318,46 @@ impl AiMemoryServer {
         self
     }
 
+    /// Set the server-wide default number of hits `memory_query` returns when a
+    /// call gives no explicit `limit` and the queried project carries no stored
+    /// `[retrieval] default_result_limit` of its own (#2038). `None` keeps the
+    /// built-in default of 10. The value is clamped to `1..=100`, matching the
+    /// per-call clamp, so a misconfigured global cannot widen or empty a query.
+    #[must_use]
+    pub fn with_default_limit(mut self, default_limit: Option<usize>) -> Self {
+        if let Some(limit) = default_limit {
+            self.default_limit = limit.clamp(1, 100);
+        }
+        self
+    }
+
+    /// Effective result limit for a single-project query under #2038's
+    /// precedence: an explicit per-call `limit` wins; otherwise the queried
+    /// project's stored `[retrieval] default_result_limit`; otherwise the
+    /// server-wide default (itself the global config value, else the built-in
+    /// 10). Always clamped to `1..=100`, so no layer can widen or empty a
+    /// query. A read error falls back to the server-wide default rather than
+    /// failing the query.
+    async fn effective_query_limit(
+        &self,
+        explicit: Option<usize>,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> usize {
+        if let Some(explicit) = explicit {
+            return explicit.clamp(1, 100);
+        }
+        let project_default = self
+            .reader
+            .project_retrieval_criteria(workspace_id, project_id)
+            .await
+            .ok()
+            .and_then(|criteria| criteria.default_result_limit);
+        project_default
+            .map_or(self.default_limit, |value| value as usize)
+            .clamp(1, 100)
+    }
+
     /// Declare that a trusted proxy may assert end-user identities — mirror of
     /// `AuthState::with_trusted_proxy_bearer`, which owns the credential.
     ///
@@ -3364,6 +3404,9 @@ impl AiMemoryServer {
                     Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
+            // This is a single-project read, so the project's own stored
+            // default applies when the call gave no explicit `limit` (#2038).
+            let limit = self.effective_query_limit(args.limit, ws, proj).await;
             let fused = self
                 .reader
                 .search_pages_for_project_at_filtered(
@@ -3404,6 +3447,31 @@ impl AiMemoryServer {
         }
 
         let query = args.query.clone();
+        // Resolve the single-project coordinate up-front for the default path
+        // (absent on the `scopes` path, which spans several projects). Doing it
+        // here lets the project's own stored `default_result_limit` set the
+        // effective limit before the fetch width is derived, and the resolved
+        // pair is reused by the search below instead of being resolved twice.
+        let single_project = if args.scopes.is_empty() {
+            Some(
+                self.effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        // #2038 precedence: explicit call `limit` → project default → global
+        // default. The `scopes` path has no single project, so it keeps the
+        // server-wide default computed above.
+        let limit = match &single_project {
+            Some((ws, proj)) => self.effective_query_limit(args.limit, *ws, *proj).await,
+            None => limit,
+        };
         let query_vec = self.embed_query(&args.query).await;
         let candidate_limit = self.rerank_fetch_limit(limit);
         let resolved_scopes = if args.scopes.is_empty() {
@@ -3440,14 +3508,9 @@ impl AiMemoryServer {
         let hits = if let Some(scopes) = &resolved_scopes {
             self.search_scopes(scopes, options).await
         } else {
-            let (ws, proj) = self
-                .effective_ids_for_read_args_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?;
+            // `scopes` empty ⇒ `single_project` was resolved above.
+            let (ws, proj) =
+                single_project.expect("single_project is Some whenever scopes is empty");
             query_signal_scope = Some((ws, proj));
             self.search_project(ws, proj, options).await
         }
