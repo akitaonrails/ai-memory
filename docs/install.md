@@ -4044,6 +4044,14 @@ the binary is genuine. Point it only at origins you control. Prefer an
 on-path attacker can substitute both the archive and its matching checksum.
 Each response body is capped at 128 MiB.
 
+When no `server_url` or `AI_MEMORY_SERVER_URL` is set, the Claude Code
+refresh reuses the endpoint shared by its installed native hooks and leaves
+the hook credential files alone. If the hook commands use different URLs,
+contain inline credentials, or cannot be safely re-rendered as native hooks,
+upgrade refreshes the staged scripts and keeps the existing settings. To
+update those hooks, re-run `ai-memory install-hooks --apply --agent claude-code`
+with the original connection options.
+
 ### Server container you run yourself, native client on the host
 
 Some installs split the two halves by hand: the server runs in a container you

@@ -1123,15 +1123,8 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
     {
         println!(
             "{}", i18n.format("cli-upgrade-no-ai-memory-hooks-in-skipping-the-user-level-re-apply-the-staged-scripts-ar", &[("value0", format!("{}", settings.display())), ("value1", name.to_string())]));
-        match install_hooks::restage_claude_code_scripts(&config.i18n, &config.data_dir, None) {
-            Ok(staged) => println!(
-                "{}",
-                i18n.format(
-                    "cli-upgrade-restaged",
-                    &[("value0", format!("{}", staged.display()))]
-                )
-            ),
-            Err(err) => println!(
+        if let Err(err) = restage_claude_scripts(config) {
+            println!(
                 "{}",
                 crate::localization::format(
                     i18n,
@@ -1141,18 +1134,32 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
                         ("value1", name.to_string())
                     ]
                 )
-            ),
+            );
         }
         return;
     }
-    println!(
-        "{}",
-        crate::localization::diagnostic(
-            i18n,
-            format!("    ai-memory install-hooks --agent {name} --apply")
-        )
-    );
-    if let Err(err) = install_hooks::run(config, apply_hooks_args(agent)) {
+    let args = apply_hooks_args(agent);
+    let result = if agent == AgentChoice::ClaudeCode && !config.server_url_configured() {
+        if let Some(url) = install_hooks::installed_claude_hook_url(&args, &config.data_dir) {
+            install_hooks::run_with_preserved_claude_hook_url(config, args, &url)
+        } else {
+            println!(
+                "{}",
+                i18n.text("cli-upgrade-claude-connection-not-recovered")
+            );
+            restage_claude_scripts(config)
+        }
+    } else {
+        println!(
+            "{}",
+            crate::localization::diagnostic(
+                i18n,
+                format!("    ai-memory install-hooks --agent {name} --apply")
+            )
+        );
+        install_hooks::run(config, args)
+    };
+    if let Err(err) = result {
         println!(
             "{}",
             crate::localization::format(
@@ -1164,14 +1171,27 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
     }
 }
 
+fn restage_claude_scripts(config: &Config) -> Result<()> {
+    let i18n = &config.i18n;
+    let staged = install_hooks::restage_claude_code_scripts(i18n, &config.data_dir, None)?;
+    println!(
+        "{}",
+        i18n.format(
+            "cli-upgrade-restaged",
+            &[("value0", format!("{}", staged.display()))]
+        )
+    );
+    Ok(())
+}
+
 /// The user-level Claude Code settings path when that file provably holds no
 /// ai-memory install: it is missing, or parses without one of our hooks. A
 /// `--scope project` install stages the same scripts without touching that
 /// file, so a staged `claude-code` dir alone no longer proves a user-level
 /// install exists — and a bare re-apply would create one the operator never
 /// asked for. `None` when the file carries our hooks, and also when it cannot
-/// be read or parsed: the re-apply then runs and reports that error, as it
-/// did before project scope existed.
+/// be read or parsed. An unreadable file must not be treated as a project-only
+/// installation.
 fn claude_user_level_install_absent() -> Option<PathBuf> {
     claude_user_level_install_absent_at(install_hooks::claude_settings_path().ok()?)
 }
@@ -2161,7 +2181,7 @@ mod tests {
     /// The claude-code refresh guard: a missing or third-party-only user-level
     /// settings file means the hooks live in a `--scope project` file, and the
     /// refresh must not create a user-level install. A file that exists but
-    /// does not parse is not "absent": the re-apply must run and report it.
+    /// does not parse is not "absent": the user-level refresh handles it.
     #[test]
     fn claude_refresh_skips_only_a_provably_absent_user_level_install() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2188,7 +2208,7 @@ mod tests {
         .unwrap();
         absent("a third-party hook is not an ai-memory install");
         fs::write(&settings, "{ not json").unwrap();
-        present("an unparsable file must reach install_hooks::run so the error surfaces");
+        present("an unparsable file must reach the user-level refresh");
         fs::write(
             &settings,
             r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"AI_MEMORY_HOOK_URL=http://127.0.0.1:49374 /h/.local/share/ai-memory/hooks/claude-code/stop.sh"}]}]}}"#,

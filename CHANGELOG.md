@@ -203,6 +203,8 @@ version in [`docs/changelog/`](docs/changelog/):
   before anything live is replaced. It used to skip that check, report success,
   and leave a server that refused to start; the refusal now points at the
   original pepper instead of `--with-config`. (#2172)
+- Preserved the installed Claude Code native hook URL and stored credentials
+  during `ai-memory upgrade` when no server URL is configured. (#2204)
 
 ### Security
 

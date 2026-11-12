@@ -234,6 +234,7 @@ cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-apply = { "   
 cli-upgrade-updating-the-ai-memory-claude-code-plugin = → atualizando o plugin ai-memory do Claude Code
 cli-upgrade-the-ai-memory-codex-plugin-is-installed-run-codex-plugin-marketplace-upgrade = → o plugin ai-memory do Codex está instalado: execute `codex plugin marketplace upgrade ai-memory` e `codex plugin add { $value0 }` para atualizá-lo
 cli-upgrade-refreshing-staged-hook-scripts-for = → atualizando scripts de hooks preparados para: { $value0 }
+cli-upgrade-claude-connection-not-recovered = A configuração dos hooks do Claude Code foi mantida porque não foi possível recuperar um único endereço nativo sem credenciais embutidas. Execute novamente ai-memory install-hooks --agent claude-code --apply com as opções de conexão originais.
 cli-upgrade-no-ai-memory-hooks-in-skipping-the-user-level-re-apply-the-staged-scripts-ar = { "    " }(nenhum hook ai-memory em { $value0 } — ignorando a reaplicação no nível do usuário; os scripts preparados são atualizados, mas arquivos `--scope project` não são reescritos: execute `ai-memory install-hooks --agent { $value1 } --scope project --apply` em cada checkout para receber as alterações nos comandos dos hooks)
 cli-upgrade-restaged = { "    " }preparado novamente { $value0 }
 cli-upgrade-skipped-err-re-run-ai-memory-install-hooks-agent-name-scope-project-apply-in = { "      " }(ignorado — { $value0 }; execute `ai-memory install-hooks --agent { $value1 } --scope project --apply` novamente em cada checkout)
