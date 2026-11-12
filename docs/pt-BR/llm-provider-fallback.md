@@ -40,7 +40,9 @@ Quando uma tarefa não possui perfil, ela compartilha a mesma instância de prov
 cadeia de fallback. O perfil de uma tarefa substitui essa cadeia por seu próprio primário e seus
 fallbacks ordenados; fallbacks globais não são anexados. Perfis de tarefas funcionam quando
 o provedor global não está definido, sem habilitar outras tarefas. Configurações existentes de timeout,
-compatibilidade, cabeçalhos e raciocínio se aplicam globalmente.
+compatibilidade, cabeçalhos e raciocínio se aplicam globalmente, assim como
+`llm_quota_cooldown_secs` (veja
+[Exaustão de crédito e cota](#exaustão-de-crédito-e-cota)).
 
 Campos escalares possuem formas aninhadas de variáveis de ambiente, como
 `AI_MEMORY_LLM__BOOTSTRAP__PROVIDER` e `AI_MEMORY_LLM__BOOTSTRAP__MODEL`.
@@ -55,7 +57,8 @@ O texto a seguir descreve a cadeia global de fallback original.
 ## Objetivos
 
 - Fazer failover apenas após uma falha transitória do provedor, usando a política
-  estabelecida em `LlmError::is_transient()`.
+  estabelecida em `LlmError::is_transient()`, ou após o provedor informar que a
+  conta está sem crédito, cota ou faturamento (`LlmError::is_quota_exhausted()`).
 - Preservar a requisição original, o esquema JSON e o ID lógico da operação em cada
   tentativa de candidato.
 - Manter credenciais no carregamento de configuração único existente e fora de logs,
@@ -146,7 +149,8 @@ o wrapper, enquanto os chamadores continuam recebendo `Option<Arc<dyn LlmProvide
 | 429 | Sim | Política transitória existente. |
 | 5xx | Sim | Política transitória existente. |
 | timeout / erro de conexão | Sim | Política transitória existente. |
-| 400 / 401 / 403 / 404 / 422 | Não | Geralmente configuração de requisição, funcionalidade, modelo ou credencial. |
+| crédito / cota / faturamento esgotado, conta desativada (qualquer status, veja abaixo) | Sim | A mesma requisição tem sucesso em outro lugar; este provedor falha até alguém recarregar ou a cota reiniciar. |
+| 400 / 401 / 403 / 404 / 422 sem sinal de crédito ou cota | Não | Geralmente configuração de requisição, funcionalidade, modelo ou credencial. |
 | esquema / formato de resposta / erro de desserialização | Não | A mesma entrada falharia determinísticamente de novo. |
 
 A mesma regra cobre as trocas de credenciais à frente de um provedor: a
@@ -165,7 +169,82 @@ não usa estado de circuito durável nem prazo de requisição forçado separado
 
 Se todos os candidatos elegíveis falharem, o wrapper retorna um erro agregado delimitado
 contendo rótulos de provedor/modelo e classes de erro, nunca corpos de resposta
-ou segredos.
+ou segredos. Um candidato ignorado porque seu circuito está aberto aparece como
+`provider/model: skipped (circuit open: quota-exhausted)` (ou `transient`), de
+modo que o erro diz por que um candidato não foi tentado.
+
+## Exaustão de crédito e cota
+
+Quando uma conta fica sem crédito, o status HTTP sozinho se parece com uma
+requisição malformada ou um limite de taxa curto: a Anthropic envia
+`400 invalid_request_error`, a OpenAI `429 insufficient_quota` e o OpenRouter
+`402`. Antes, só o `429` avançava a cadeia, então um primário Anthropic com
+saldo zerado falhava toda consolidação e o fallback configurado nunca rodava.
+
+`LlmError::failover_class()` retorna `Transient`, `QuotaExhausted` ou
+`Permanent`, e `is_transient()`, `is_quota_exhausted()` e
+`should_fail_over()` derivam dele. A verificação de cota fica em
+`crates/ai-memory-llm/src/quota.rs`. Ela lê apenas o corpo de erro delimitado que
+`LlmError::Provider` já carrega (no máximo 1 KiB, com segredos removidos),
+retorna um booleano e não registra nenhuma parte do corpo.
+
+| Provedor | Sinal tratado como `QuotaExhausted` |
+| --- | --- |
+| `anthropic`, `anthropic-oauth` | `credit balance is too low` (HTTP 400), `billing_error` (402), `reached your specified API usage limits` (limite mensal de gasto), `organization has been disabled` (403) |
+| `openai` | `insufficient_quota` (429), `billing_hard_limit_reached`, `billing_not_active`, `account_deactivated` (401) |
+| `openai-compat` (OpenRouter, DeepSeek e gateways similares) | qualquer `402`; `insufficient credits`, `insufficient balance`, `out of credits`, `requires more credits`, `key limit exceeded` |
+| `gemini` | `429 RESOURCE_EXHAUSTED` cuja cota violada seja diária (`PerDay`) ou tenha `limit: 0`; `spending cap`; `credits are depleted` |
+| `openai-oauth`, `codex` | `usage_limit_reached` / `usage limit has been reached` (também quando chega como erro terminal de SSE, reportado como 502) |
+| `copilot` | `quota_exceeded`, `monthly quota` |
+| `opencode` | qualquer `402`; `insufficient balance`, `out of credits` |
+
+Os marcadores são comparados sem diferenciar maiúsculas de minúsculas contra o
+corpo de cada provedor, porque gateways repassam os erros uns dos outros. Um
+limite de taxa por minuto continua transitório. O Gemini reutiliza o texto
+"exceeded your current quota" da OpenAI para seu limite por minuto, então essa
+frase não é um marcador.
+
+Um `401` comum (uma chave inválida, revogada ou digitada errada) nunca faz
+failover. O operador precisa corrigir a chave, e mover toda chamada para o
+fallback esconderia o problema. Um `401` ou `403` só faz failover quando seu
+corpo carrega um marcador explícito de faturamento, cota, crédito ou conta
+desativada da tabela, como `account_deactivated` da OpenAI ou a organização
+desativada da Anthropic.
+
+Os laços de nova tentativa da consolidação e do bootstrap não reenviam um erro
+de cota esgotada dois segundos depois, mesmo quando ele chega como um `429`,
+porque ele não é transitório. A fila de consolidação do SessionEnd mantém esse
+trabalho em seu backoff delimitado em vez de marcá-lo como terminal: uma
+recarga ou reinício de cota pode resolvê-lo dentro dessa janela, como sempre
+pôde para um `429`.
+
+Uma falha de cota abre o circuito do candidato por `llm_quota_cooldown_secs`
+(padrão 900, faixa aceita de 30 a 86400, env
+`AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`). Uma dica de nova tentativa mais longa do
+provedor, como um horário de reinício da cota, estende a janela até uma hora ou
+o valor configurado, o que for maior. Uma falha transitória que chega enquanto
+a janela está aberta não a encurta nem muda seu motivo. O candidato não recebe
+tráfego enquanto seu circuito está aberto. A primeira chamada real após a
+janela o tenta de novo: se ele responder, volta a assumir e seu circuito fecha;
+se ainda estiver esgotado, essa chamada custa uma requisição rejeitada e a
+janela recomeça. Nada sonda em segundo plano, e um reinício limpa o estado.
+
+Exemplo, Anthropic como primário com a OpenAI assumindo quando o saldo da
+Anthropic acaba:
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-sonnet-4-6"
+llm_quota_cooldown_secs = 900
+
+[[llm_fallbacks]]
+provider = "openai"
+model = "gpt-5.4-mini"
+api_key_env = "OPENAI_API_KEY"
+```
+
+`ANTHROPIC_API_KEY` e `OPENAI_API_KEY` precisam estar ambos no ambiente do
+servidor.
 
 ## Relatório de integridade
 
@@ -178,8 +257,16 @@ O estado por candidato contém:
 - provedor e modelo;
 - estado configurado / selecionado por último;
 - timestamp do último sucesso ou erro;
-- classe de erro ofuscada e status HTTP quando disponíveis;
-- timestamp de circuito-aberto-até.
+- classe de erro ofuscada (`quota-exhausted` para uma falha de crédito ou cota)
+  e status HTTP quando disponíveis;
+- timestamp de circuito-aberto-até e `circuit_reason` (`transient` ou
+  `quota-exhausted`) enquanto está aberto.
+
+`ai-memory status` imprime uma manchete quando o primário está sem crédito ou
+cota, por exemplo
+`primary anthropic/claude-sonnet-4-6 exhausted (credit/quota); using fallback openai/gpt-5.4-mini`,
+e marca aquele candidato como `out of credit/quota; skipped until <time>, then
+probed again`.
 
 O status registra apenas chamadas que o servidor já fez. Ele não sonda fallbacks
 nem dispara tráfego de recuperação em segundo plano.
@@ -189,7 +276,9 @@ campos ofuscados e nunca um corpo de resposta. Uma falha transitória registra u
 o provedor, modelo, posição na cadeia, classe de erro, status HTTP
 e tempo de espera do candidato com falha; esse é o único lugar onde o modelo com falha aparece,
 porque chamadores como o reranker rotulam a cadeia com seu primeiro
-candidato. Uma falha determinística é registrada em nível de debug, já que o próprio chamador
+candidato. Uma falha de cota registra seu próprio aviso (`out of credit or
+quota`) com os mesmos campos ofuscados e o tempo de espera de cota. Uma falha
+determinística é registrada em nível de debug, já que o próprio chamador
 relata o erro retornado. Uma linha de info registra cada mudança do
 candidato que responde, portanto um primário que permanece inativo gera uma linha, e não uma
 por chamada.
@@ -199,7 +288,11 @@ por chamada.
 1. Testar em unidade a ordem da cadeia com instâncias simuladas de `LlmProvider`.
 2. Verificar se todos os quatro métodos da trait preservam requisição/esquema/id de operação.
 3. Verificar se falhas de `429`, `5xx`, timeout e conexão avançam; verificar se
-   erros determinísticos param no primeiro candidato.
+   erros determinísticos param no primeiro candidato. Verificar que o corpo de
+   crédito/cota de cada provedor avança (fixtures de unidade em `quota.rs`,
+   provedores reais contra um mock local em `tests/suite/fallback_provider.rs`),
+   que o candidato esgotado é ignorado durante a janela de cota e sondado depois
+   dela, e que um `401` de chave inválida comum não avança.
 4. Verificar se um circuito aberto ignora apenas seu candidato `(provider, model)` e se um
    sucesso o fecha.
 5. Testar a validação de configuração, incluindo perfis ausentes/vazios e credenciais

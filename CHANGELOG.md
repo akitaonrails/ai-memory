@@ -227,8 +227,7 @@ version in [`docs/changelog/`](docs/changelog/):
   bounded, scrubbed error body, and a plain invalid-key `401` still does not
   fall back. The consolidation and bootstrap loops no longer retry exhausted
   quota in place; the SessionEnd queue keeps such a job on its backoff. See
-  [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md#credit-and-quota-exhaustion).
-  (#2227)
+  [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md). (#2227)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
