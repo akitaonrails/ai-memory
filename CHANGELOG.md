@@ -21,7 +21,7 @@ version in [`docs/changelog/`](docs/changelog/):
   the project the command had just emptied and archived. (#2216)
 - Fixed Gemini structured replies stopped at `MAX_TOKENS` being accepted or
   reported as unrelated JSON errors. They now report truncation before parsing,
-  allowing profile classification to split the batch and recover its verdicts.
+  allowing profile classification to split the batch and recover its verdicts. (#2218)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
