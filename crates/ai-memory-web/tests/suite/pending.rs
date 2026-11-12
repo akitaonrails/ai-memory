@@ -626,3 +626,39 @@ async fn pending_page_counts_and_filters_projects_beyond_the_read_cap() {
     );
     assert!(!body.contains("only the oldest 500"));
 }
+
+#[tokio::test]
+async fn pending_page_is_never_cached() {
+    // The queue changes the moment an operator approves or rejects, so a
+    // decided proposal must not come back from a cache as still pending.
+    let f = fixture().await;
+    let (_, _, id) = stage(
+        &f.store,
+        "alpha",
+        "notes/a.md",
+        "Alpha",
+        AutoImproveProposalOperation::Create,
+    )
+    .await;
+    add_db_user(&f.store).await;
+
+    let response = app(&f, AuthLevel::Root)
+        .oneshot(
+            Request::builder()
+                .uri("/pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains(&format!("data-id=\"{id}\"")), "{body}");
+}

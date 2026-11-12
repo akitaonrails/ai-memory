@@ -150,8 +150,9 @@ ai-memory's canonical events when possible:
 ### Hermes Agent
 
 ai-memory ships a first-party Hermes integration: lifecycle hooks and an MCP
-entry, both printed for you to merge into `~/.hermes/config.yaml`
-(`$HERMES_HOME/config.yaml`), which ai-memory never writes.
+entry, both printed for you to merge into the Hermes home's `config.yaml`
+(`$HERMES_HOME`, else `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes`
+elsewhere), which ai-memory never writes.
 
 ```bash
 ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
@@ -179,8 +180,8 @@ install's own, which matters because Hermes passes MCP servers a filtered
 environment without `AI_MEMORY_AUTH_TOKEN`. Hermes is a static client, so the
 model passes `workspace` and `project` on project-scoped calls. `--apply` is
 refused. Hermes does not read MCP server instructions, so the routing rules
-reach the model only through the skills in `~/.hermes/skills` and the handoff
-in the next primary-session turn.
+reach the model only through the skills in the Hermes home's `skills/` and the
+handoff in the next primary-session turn.
 
 The community-maintained
 [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin)

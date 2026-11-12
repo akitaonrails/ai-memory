@@ -13,15 +13,29 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed Gemini structured replies stopped at `MAX_TOKENS` being accepted or
+  reported as unrelated JSON errors. They now report truncation before parsing,
+  allowing profile classification to split the batch and recover its verdicts. (#2218)
+- The root-only `/pending` triage page now sends `Cache-Control: no-store`,
+  like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
+  cached copy could list a proposal an operator had already approved or
+  rejected as still pending, with its no-longer-actionable review id and CLI
+  commands, until the page was force-reloaded. (#2225)
 - `adopt-project-identity` now drops the hook router's cached resolution for
   the project that gave the identity away, so the checkout's hooks reach the
   project that took it. That cache keys entries on the repository identity, and
   the move left the pre-adoption entry in place: until the server restarted or
   the entry aged out, new sessions, prompts and observations kept landing in
   the project the command had just emptied and archived. (#2216)
-- Fixed Gemini structured replies stopped at `MAX_TOKENS` being accepted or
-  reported as unrelated JSON errors. They now report truncation before parsing,
-  allowing profile classification to split the batch and recover its verdicts. (#2218)
+- `POST /admin/rename-project` now invalidates the hook router's scope cache
+  for the renamed project, as `rename-workspace` already did for a renamed
+  workspace. A repository whose `.ai-memory.toml` declares `project = "<old
+  name>"` routes by that name, so after a rename its warm cache slot kept
+  sending captures into the renamed project while a freshly started server
+  re-resolved the same marker and created an empty project under the old name
+  — which of the two a capture landed in depended on whether the cache
+  happened to be warm. Other projects' cached slots are left untouched.
+  (#2221)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
@@ -59,6 +73,9 @@ version in [`docs/changelog/`](docs/changelog/):
   truncation, the Anthropic stop reason that some gateways in front of Claude
   pass through unchanged. A structured answer cut there now reports a
   truncated response instead of a misleading parse or schema error. (#2199)
+- Fixed OpenCode Responses structured replies stopped at `max_output_tokens`
+  being accepted or reported as JSON or empty-content errors. They now report
+  truncation so profile classification can split the batch and recover. (#2219)
 - A managed session start that cannot be bound to a single eligible run — two
   live managed runs in the same checkout with a stale shared-daemon run id
   matching neither — no longer falls through to the legacy project-wide handoff
@@ -100,6 +117,8 @@ version in [`docs/changelog/`](docs/changelog/):
   reports a shorter wait. (#2187)
 - Fixed conditional page reads from configured cross-origin frontends by
   exposing `ETag` and allowing `If-None-Match` on `/api/v1`. (#2175)
+- The TypeScript SDK's `api.page` reads stored paths with literal percent
+  escapes such as `notes/%2e/example.md`. (#2217)
 - `backup` and `export-okf` now preserve the previous archive when a server
   returns a successful response without a gzip signature, such as an HTML login
   page or an empty response (#2138).
@@ -124,6 +143,8 @@ version in [`docs/changelog/`](docs/changelog/):
   already-absent page with `deleted: true`. (#2181)
 - Fixed native install and reinstall with a trailing slash in
   `AI_MEMORY_LIB_DIR`. (#2171)
+- Preserved the installed Claude Code native hook URL and stored credentials
+  during `ai-memory upgrade` when no server URL is configured. (#2210)
 - Fixed conditional page reads returning a full response for a matching weak
   ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
 - Fixed the container wrapper reporting success after a native host-client
@@ -133,6 +154,17 @@ version in [`docs/changelog/`](docs/changelog/):
   Background uploads and startup backfills now inherit only their own standard
   streams, so waiting for hook output no longer waits for a worker's HTTP
   request. (#2193)
+- `ai-memory doctor` now finds a Windows Hermes install, and
+  `install-skills --scope global --agent hermes` writes where Hermes reads
+  skills. Hermes' Windows setup keeps its home at `%LOCALAPPDATA%\hermes` and
+  exports `HERMES_HOME` only into its own process tree, while ai-memory looked
+  at `~/.hermes` alone. `doctor` therefore printed no Hermes profile even with
+  a configured `config.yaml` (its JSON `hermes` array stayed empty), and the
+  global skills went to a directory Hermes never reads. One resolver now
+  follows Hermes (`$HERMES_HOME`, else the platform default with
+  `$HERMES_DATA_DIR_SUFFIX` appended) for the doctor scan, the community
+  plugin check, a named profile's marker routing and the skill root, and the
+  `install-hooks` and `setup-agent` guidance names the platform path. (#2211)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
@@ -212,6 +244,13 @@ version in [`docs/changelog/`](docs/changelog/):
   before anything live is replaced. It used to skip that check, report success,
   and leave a server that refused to start; the refusal now points at the
   original pepper instead of `--with-config`. (#2172)
+- Fixed `restore` replacing live data and installing a backup's malformed
+  `config.toml`, which prevented the restored server from starting. (#2209)
+
+- Fixed `retrieval-compare` treating unmeasured cutoffs as zero, which could
+  invent accuracy gains or losses and first-hit ranking moves between runs
+  with different `--ks`. Incompatible or incomplete hit/recall grids are now
+  refused before a comparison is printed. (#2220)
 
 ### Security
 

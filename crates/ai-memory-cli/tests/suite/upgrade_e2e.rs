@@ -8,6 +8,156 @@
 //!
 //! Covers Unix `.tar.gz` and Windows `.zip` release layouts.
 
+#[test]
+fn replacement_refresh_preserves_claude_hook_endpoint_and_auth() -> anyhow::Result<()> {
+    use std::fs;
+    use std::path::Path;
+
+    use crate::e2e_support::hermetic;
+
+    const BIN: &str = env!("CARGO_BIN_EXE_ai-memory");
+    const HOOK_URL: &str = "https://memory.example.invalid/team";
+    const CONFIG_URL: &str = "https://configured.example.invalid";
+    const HOOK_TOKEN: &str = "aim_test_installed_hook_token";
+    const MCP_TOKEN: &str = "aim_test_unrelated_mcp_token";
+    const CONFIG_TOKEN: &str = "aim_test_configured_token";
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path();
+    let data = home.join("data");
+    let claude = home.join(".claude");
+    let settings = claude.join("settings.json");
+    let hooks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+    let command = || {
+        let mut cmd = hermetic(BIN);
+        cmd.arg("--data-dir")
+            .arg(&data)
+            .args(["--language", "en"])
+            .env("HOME", home)
+            .env("AI_MEMORY_HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("APPDATA", home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", home.join("AppData/Local"))
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .current_dir(home);
+        cmd
+    };
+    let output = command()
+        .args([
+            "install-hooks",
+            "--agent",
+            "claude-code",
+            "--capture-assistant",
+            "--no-capture-prompts",
+            "--server-url",
+            HOOK_URL,
+            "--auth-token",
+            HOOK_TOKEN,
+            "--hooks-dir",
+        ])
+        .arg(hooks)
+        .arg("--apply")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "initial hook install failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let original = fs::read_to_string(&settings)?;
+    let installed_hooks = original.matches(HOOK_URL).count();
+    assert!(installed_hooks > 1);
+    assert!(original.contains("--capture-assistant"));
+    assert!(!original.contains("UserPromptSubmit"));
+    assert!(!original.contains(HOOK_TOKEN));
+    assert!(!data.join("config.toml").exists());
+    let mut stale: serde_json::Value = serde_json::from_str(&original)?;
+    let stop = &mut stale["hooks"]["Stop"][0]["hooks"][0];
+    let command_key = stop["command"].as_str().expect("native Stop hook command");
+    let stale_command = match command_key.split_once(" --data-dir ") {
+        Some((_, args)) => format!("stale-ai-memory --data-dir {args}"),
+        None => "stale-ai-memory.exe".to_string(),
+    };
+    stop["command"] = serde_json::Value::String(stale_command);
+    fs::write(&settings, serde_json::to_vec(&stale)?)?;
+    let token_file = data.join("auth-token");
+    let header_file = data.join("auth-header");
+    let original_token = fs::read(&token_file)?;
+    let original_header = fs::read(&header_file)?;
+
+    // Neither an unrelated MCP token nor a newly configured bearer should
+    // replace the token that was installed for the preserved hook URL.
+    fs::write(
+        claude.join(".claude.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "mcpServers": {"ai-memory": {
+                "type": "http",
+                "url": "https://mcp.example.invalid/mcp",
+                "headers": {"Authorization": format!("Bearer {MCP_TOKEN}")}
+            }}
+        }))?,
+    )?;
+    for token in [None, Some(CONFIG_TOKEN)] {
+        let mut refresh = command();
+        refresh.arg("upgrade-refresh-hooks");
+        if let Some(token) = token {
+            refresh.env("AI_MEMORY_AUTH_TOKEN", token);
+        }
+        let output = refresh.output()?;
+        assert!(
+            output.status.success(),
+            "hook refresh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let refreshed = fs::read_to_string(&settings)?;
+        assert_eq!(refreshed.matches(HOOK_URL).count(), installed_hooks);
+        assert!(!refreshed.contains("stale-ai-memory"));
+        assert!(refreshed.contains("--capture-assistant"));
+        assert!(!refreshed.contains("UserPromptSubmit"));
+        assert!(!refreshed.contains(HOOK_TOKEN));
+        assert_eq!(fs::read(&token_file)?, original_token);
+        assert_eq!(fs::read(&header_file)?, original_header);
+    }
+
+    let mixed = original.replacen(HOOK_URL, CONFIG_URL, 1);
+    fs::write(&settings, &mixed)?;
+    let output = command()
+        .arg("upgrade-refresh-hooks")
+        .env("AI_MEMORY_AUTH_TOKEN", CONFIG_TOKEN)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "mixed-endpoint hook refresh failed"
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Kept the Claude Code hook settings"));
+    assert_eq!(fs::read_to_string(&settings)?, mixed);
+    assert_eq!(fs::read(&token_file)?, original_token);
+    assert_eq!(fs::read(&header_file)?, original_header);
+
+    fs::write(&settings, &original)?;
+    let output = command()
+        .arg("upgrade-refresh-hooks")
+        .env("AI_MEMORY_HOOK_PLATFORM", "posix")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "script-platform hook refresh failed"
+    );
+    assert_eq!(fs::read_to_string(&settings)?, original);
+
+    let output = command()
+        .arg("upgrade-refresh-hooks")
+        .env("AI_MEMORY_SERVER_URL", CONFIG_URL)
+        .env("AI_MEMORY_AUTH_TOKEN", CONFIG_TOKEN)
+        .output()?;
+    assert!(output.status.success(), "configured hook refresh failed");
+    let refreshed = fs::read_to_string(&settings)?;
+    assert_eq!(refreshed.matches(CONFIG_URL).count(), installed_hooks);
+    assert!(!refreshed.contains(HOOK_URL));
+    assert_eq!(fs::read_to_string(&token_file)?.trim(), CONFIG_TOKEN);
+    Ok(())
+}
+
 /// Spawns a loopback release fixture and a real CLI subprocess: seconds,
 /// not milliseconds — slow tier (`cargo tf` / CI), not the everyday loop.
 mod slow {

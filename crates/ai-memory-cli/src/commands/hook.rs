@@ -1465,7 +1465,8 @@ fn hermes_in_gateway(runtime_env: &RuntimeEnv) -> bool {
 /// (`PROFILE_ID_RE` in `hermes_constants.py`) before it becomes a path
 /// component. Profiles live in `<root>/profiles/<name>` (`get_profile_dir` in
 /// `hermes_cli/profiles.py`), where the root is the gateway's `HERMES_HOME`,
-/// else `~/.hermes`; a standalone gateway of a named profile runs with that
+/// else the platform default (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes`
+/// elsewhere); a standalone gateway of a named profile runs with that
 /// profile's directory as its `HERMES_HOME`.
 fn hermes_profile_marker_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) -> Option<String> {
     if !hermes_in_gateway(runtime_env) || runtime_env.ignore_marker() {
@@ -1475,14 +1476,10 @@ fn hermes_profile_marker_cwd(runtime_env: &RuntimeEnv, profile: Option<&str>) ->
         *name != HERMES_GATEWAY_HOST_PROFILE
             && crate::commands::path_util::is_hermes_profile_id(name)
     })?;
-    let hermes_home = crate::commands::path_util::agent_config_home(
-        runtime_env.var_os("HERMES_HOME"),
-    )
-    .or_else(|| {
-        runtime_env
-            .home_dir()
-            .map(|home| Path::new(home).join(".hermes"))
-    })?;
+    let hermes_home = crate::commands::path_util::hermes_home(
+        runtime_env,
+        runtime_env.home_dir().map(Path::new),
+    )?;
     let standalone = hermes_home.file_name() == Some(std::ffi::OsStr::new(profile))
         && hermes_home
             .parent()

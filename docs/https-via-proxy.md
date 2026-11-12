@@ -541,6 +541,10 @@ because your host already trusts that root; the container does not.
 - `ai-memory mcp-bridge` is the exception: on Windows and macOS it ignores
   `SSL_CERT_FILE` / `SSL_CERT_DIR`, so a root the bridge must trust has to be
   in the OS store. See the bridge section below.
+- A local security suite can also corrupt the responses it intercepts,
+  including on plain `http://`, and no root certificate fixes that. See
+  [Windows → Security suites that rewrite AI-tool
+  traffic](windows.md#security-suites-that-rewrite-ai-tool-traffic).
 
 ## What ai-memory does to support being behind a proxy
 

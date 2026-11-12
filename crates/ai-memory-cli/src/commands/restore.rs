@@ -345,6 +345,15 @@ async fn stage_then_swap(
         ConfigPlacement::Divert
     };
 
+    if placement == ConfigPlacement::Install {
+        let source = std::fs::read_to_string(staging.join(CONFIG_FILE))
+            .context(i18n.text("cli-restore-reading-backup-config"))?;
+        // Parser errors can include the input line and its credentials.
+        source
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|_| anyhow::anyhow!(i18n.text("cli-restore-backup-config-invalid-toml")))?;
+    }
+
     // 2. Open + drop the staged store so refinery applies any pending
     //    migrations and the SQLite file is validated — still before anything
     //    live is touched. Dropping the store joins the writer thread and
@@ -1454,6 +1463,56 @@ mod tests {
         );
         // The swapped-in store is the migrated one and opens cleanly in place.
         drop(Store::open(data.path()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_invalid_toml_only_when_installing_the_archived_config() {
+        let data = tempfile::TempDir::new().unwrap();
+        seed_live_data(data.path());
+        let scratch = tempfile::TempDir::new().unwrap();
+        let db = migrated_sqlite_bytes();
+        let archived = b"llm_headers = [\"archive-config-canary\"\n";
+        let from = write_tarball(
+            scratch.path(),
+            "invalid-config.tar.gz",
+            &gz_tarball(&[
+                ("wiki/default/project/notes/new.md", b"new page"),
+                ("db/memory.sqlite", db.as_slice()),
+                ("config.toml", archived),
+            ]),
+        );
+        let i18n = ai_memory_core::i18n::Localizer::default();
+        let fresh = scratch.path().join("fresh");
+        for (target, force, with_config) in
+            [(data.path(), true, true), (fresh.as_path(), false, false)]
+        {
+            let error = restore_data_dir(&i18n, target, &from, force, with_config)
+                .await
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("the backup's config.toml is not valid TOML"));
+            assert!(!message.contains("archive-config-canary"));
+        }
+        assert_live_data_untouched(data.path());
+        assert!(!fresh.join("wiki").exists());
+        assert!(!fresh.join("db").exists());
+        assert!(!fresh.join(CONFIG_FILE).exists());
+        assert!(restore_scratch_dirs(&fresh).is_empty());
+
+        let outcome = restore_data_dir(&i18n, data.path(), &from, true, false)
+            .await
+            .unwrap();
+        let beside = data.path().join(CONFIG_FROM_BACKUP_FILE);
+        assert_eq!(outcome, ConfigOutcome::SavedBeside(beside.clone()));
+        assert_eq!(std::fs::read(beside).unwrap(), archived);
+        assert_eq!(
+            std::fs::read(data.path().join(CONFIG_FILE)).unwrap(),
+            b"# old config\n"
+        );
+        assert_eq!(
+            std::fs::read(data.path().join("wiki/default/project/notes/new.md")).unwrap(),
+            b"new page"
+        );
     }
 
     /// A backup's config can run commands, so by default the live one stays
