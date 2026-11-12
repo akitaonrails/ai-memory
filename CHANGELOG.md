@@ -188,6 +188,16 @@ version in [`docs/changelog/`](docs/changelog/):
   `restore-page` targets. An explicit `AI_MEMORY_SERVER_URL` still uses the
   install-default wiki, and a marker that selects an unresolvable profile now
   fails closed rather than acting on another server's wiki. (#2186)
+- Fixed a profile-routed checkout failing closed on Windows when its server
+  profile's root was registered as a verbatim path (`\\?\C:\...`, the spelling
+  `fs::canonicalize` and some harnesses produce). The root was read as a UNC
+  path and matched no checkout, so `checkpoints` and `commit` refused rather
+  than reaching the profile server. Verbatim and plain spellings of a path now
+  compare equal. (#2186)
+- Fixed page deletion moving a directory out of the wiki. Child pages stay
+  accessible even when the directory replaced an indexed page. (#2190)
+- Kept usage calls from an oversized native tool result available for the next
+  hook by preserving the transcript cursor on a spool size refusal. (#2179)
 - Restored TypeScript SDK page reads and updates on supported servers that
   predate the section metadata added in 3.3.0 (#2136).
 - The TypeScript SDK's `pages.update` loads the complete body before applying
@@ -232,6 +242,10 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed the container wrapper reporting success after a native host-client
   extraction or install failure. The wrapper keeps the previous cached
   archive and retries on the next host command that checks for updates. (#2174)
+- Fixed Windows hook workers inheriting the hook executor's output pipes.
+  Background uploads and startup backfills now inherit only their own standard
+  streams, so waiting for hook output no longer waits for a worker's HTTP
+  request. (#2193)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
