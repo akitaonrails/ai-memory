@@ -100,6 +100,8 @@ version in [`docs/changelog/`](docs/changelog/):
   reports a shorter wait. (#2187)
 - Fixed conditional page reads from configured cross-origin frontends by
   exposing `ETag` and allowing `If-None-Match` on `/api/v1`. (#2175)
+- The TypeScript SDK's `api.page` reads stored paths with literal percent
+  escapes such as `notes/%2e/example.md`. (#2217)
 - `backup` and `export-okf` now preserve the previous archive when a server
   returns a successful response without a gzip signature, such as an HTML login
   page or an empty response (#2138).

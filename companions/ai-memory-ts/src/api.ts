@@ -52,10 +52,11 @@ const DEFAULT_MAX_ROUNDS = 1_000;
 
 /**
  * One URL path segment. Dot segments are refused: the URL parser would
- * resolve them and send the request to a different route.
+ * resolve them and send the request to a different route. A literal percent
+ * sign is escaped before the URL parser sees it.
  */
 function segment(value: string, name: string, where: string): string {
-  if (value === "" || value === "." || value === ".." || /^%2e(%2e)?$/i.test(value)) {
+  if (value === "" || value === "." || value === "..") {
     throw new ArgumentError(`${where}: ${name} must not be empty or a dot segment`);
   }
   return encodeURIComponent(value);
