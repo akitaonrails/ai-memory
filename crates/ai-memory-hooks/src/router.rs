@@ -1706,17 +1706,6 @@ fn is_cursor_draft_placeholder(env: &HookEnvelope) -> bool {
     env.agent == AgentKind::Cursor && env.session_id.as_deref() == Some(CURSOR_DRAFT_SESSION_ID)
 }
 
-/// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
-/// maintaining the subagent-session set. Returns `true` to drop. Seeds the
-/// session on `SubagentStart` and on any marker-bearing event; keeps it through
-/// `SubagentStop`; and drops the **unmarked tail** (`user_prompt_submit` /
-/// `stop` / `session_end`) of a session already known to be a subagent. No-op
-/// (returns `false`) unless this event's project opted in via the per-event
-/// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
-///
-/// Claude Code is the exception to seeding: its subagent events carry the
-/// parent's `session_id` and differ only by `agent_id`, so seeding would drop
-/// the main session's own tail. Its marked events still drop one by one.
 /// Whether the event belongs to a harness's own background work rather than
 /// the person: today, Codex's memory-writing agent (#1674).
 ///
@@ -1740,6 +1729,17 @@ fn is_harness_self_maintenance(env: &HookEnvelope) -> bool {
         .is_some_and(|prompt| ai_memory_core::looks_like_codex_memory_agent_prompt(&prompt))
 }
 
+/// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
+/// maintaining the subagent-session set. Returns `true` to drop. Seeds the
+/// session on `SubagentStart` and on any marker-bearing event; keeps it through
+/// `SubagentStop`; and drops the **unmarked tail** (`user_prompt_submit` /
+/// `stop` / `session_end`) of a session already known to be a subagent. No-op
+/// (returns `false`) unless this event's project opted in via the per-event
+/// `drop_subagent` flag (sourced from its `.ai-memory.toml`).
+///
+/// A harness that reports a subagent under its parent's `session_id` is the
+/// exception to seeding ([`subagent_event_seeds_session`]): seeding would drop
+/// the main session's own tail, so its marked events drop one by one.
 async fn should_drop_subagent(
     state: &HookState,
     env: &HookEnvelope,
@@ -1776,10 +1776,10 @@ async fn should_drop_subagent(
     let marked = matches!(
         env.event,
         HookEvent::SubagentStart | HookEvent::SubagentStop
-    ) || body_is_subagent(&env.raw);
+    ) || body_is_subagent(env.agent, &env.raw);
 
     if marked {
-        if env.agent != AgentKind::ClaudeCode {
+        if subagent_event_seeds_session(env.agent) {
             state.subagent_sessions.lock().await.insert(key);
         }
         return true;
@@ -1790,6 +1790,47 @@ async fn should_drop_subagent(
         state.subagent_sessions.lock().await.remove(&key);
     }
     tracked
+}
+
+/// Whether a marked event from `agent` seeds the subagent-session set, so the
+/// rest of its session drops with it ([`should_drop_subagent`]). That is right
+/// for a harness that runs a subagent in a session of its own (Grok, DSH, the
+/// OMP extension, OpenCode) and wrong for the harnesses below. Their marked
+/// events still drop one by one, and the session they share keeps the rest:
+///
+/// - Claude Code reports a Task subagent under the parent's `session_id` and
+///   tells it apart only by `agent_id`.
+/// - Codex sends a spawned agent's hooks with the root thread's `session_id`,
+///   "the identity shared by the root thread and all descendant threads"
+///   (<https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/session/session.rs#L701-L704>),
+///   and adds the child thread's `agent_id`
+///   (<https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/hook_runtime.rs#L1083-L1102>).
+/// - Qwen Code stamps a subagent's hooks with the invoking session's
+///   `session_id` and adds the subagent's `agent_id`
+///   (<https://github.com/QwenLM/qwen-code/blob/f42fe0f3251172c1174d00382ece522eafb3c6c2/packages/core/src/hooks/hookEventHandler.ts#L1232-L1252>).
+/// - Kimi Code fires `SubagentStart` and `SubagentStop` with the main
+///   session's `sessionId`
+///   (<https://github.com/MoonshotAI/kimi-code/blob/5af9942e9fb789b6a1530830575b3768499932e9/packages/agent-core-v2/src/features/externalHooks/session/sessionExternalHooksService.ts#L156-L183>).
+/// - CodeBuddy Code reports a subagent session's hooks under its parent's id
+///   and adds the subagent's `agent_id` (`resolveHookSessionId` returns
+///   `meta.parentSessionId`, `buildAgentTrigger` sets `agent_id`;
+///   `@tencent-ai/codebuddy-code` 2.183.0, `dist/codebuddy.js`).
+/// - Cline marks every event of a subagent with its `parent_agent_id`
+///   ([`body_is_subagent`]), so there is no unmarked tail for the set to
+///   catch, and it builds a delegated agent with its parent runtime's
+///   `sessionId`
+///   (<https://github.com/cline/cline/blob/071e1b25b48f9ef5dff7fc32085e6a16f02bf02e/sdk/packages/core/src/extensions/tools/team/delegated-agent.ts#L120-L146>),
+///   so tracking it could only reach the root agent's events.
+fn subagent_event_seeds_session(agent: AgentKind) -> bool {
+    !matches!(
+        agent,
+        AgentKind::ClaudeCode
+            | AgentKind::Codex
+            | AgentKind::QwenCode
+            | AgentKind::KimiCode
+            | AgentKind::CodeBuddy
+            | AgentKind::Cline
+    )
 }
 
 /// Parse the `?event=…&agent=…` query of a spooled hook URL into [`HookQuery`],
@@ -5607,7 +5648,7 @@ async fn process_authorized(
             _ => false,
         }
         && !managed
-        && !body_is_subagent(&env.raw);
+        && !body_is_subagent(env.agent, &env.raw);
     if matches!(env.event, HookEvent::SessionEnd) || turn_checkpoint {
         // Token-usage visibility (docs: session usage tracking): the native
         // hook spliced an optional `_ai_memory_usage` object into the
@@ -5778,7 +5819,7 @@ async fn process_authorized(
         let child_session = matches!(
             env.agent,
             AgentKind::OpenCode | AgentKind::Omp | AgentKind::Grok
-        ) && body_is_subagent(&env.raw);
+        ) && body_is_subagent(env.agent, &env.raw);
         // The opt-out covers both automatic batons: a session's end and a
         // turn checkpoint, which is OpenCode's only baton since a plugin
         // unload no longer ends its sessions, and Antigravity's since it has
@@ -12854,6 +12895,251 @@ pub(crate) mod tests {
             open_handoff_exists(&state).await,
             "the parent session keeps its baton"
         );
+    }
+
+    /// One batch of a parent session with a subagent's events in the middle,
+    /// under `drop_subagent_captures`: only the subagent's events may drop. The
+    /// parent keeps its prompt, tool call, Stop and SessionEnd, its summary
+    /// page and its baton.
+    async fn assert_subagent_drop_keeps_the_parent(
+        agent: &str,
+        session: SessionId,
+        parent: serde_json::Value,
+        subagent: serde_json::Value,
+        subagent_events: &[&str],
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let item = |event: &str, body: &serde_json::Value| HookBatchItem {
+            url: format!("http://h/hook?event={event}&agent={agent}&drop_subagent=1"),
+            body: body.clone(),
+        };
+        let mut items = vec![
+            item("session-start", &parent),
+            item("user-prompt-submit", &parent),
+        ];
+        items.extend(subagent_events.iter().map(|event| item(event, &subagent)));
+        for event in ["post-tool-use", "stop", "session-end"] {
+            items.push(item(event, &parent));
+        }
+        let total = items.len();
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(items),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK, "{agent}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            ack["accepted"], total,
+            "{agent}: stored and dropped events are acked"
+        );
+
+        let metrics = state.ingest_metrics.snapshot();
+        assert_eq!(
+            metrics.dropped_by_policy,
+            subagent_events.len() as u64,
+            "{agent}: only the subagent's events drop"
+        );
+        assert_eq!(
+            metrics.accepted, 5,
+            "{agent}: the parent's events, tail included"
+        );
+        assert_eq!(
+            state
+                .reader
+                .observations_for_session(session)
+                .await
+                .unwrap()
+                .len(),
+            5,
+            "{agent}"
+        );
+        assert_eq!(
+            session_pages(&state).await.len(),
+            1,
+            "{agent}: the parent session keeps its summary"
+        );
+        assert!(
+            open_handoff_exists(&state).await,
+            "{agent}: the parent session keeps its baton"
+        );
+    }
+
+    /// Codex sends a spawned agent's hooks with the root thread's `session_id`
+    /// and the child's `agent_id`. The child's events drop, but they must not
+    /// mark the shared session as a subagent's and take the root tail with it.
+    #[tokio::test]
+    async fn codex_subagent_events_drop_without_dropping_the_root_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "codex",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "turn_id": "turn-root",
+                "prompt": "Fix the parser",
+                "tool_name": "Bash",
+                "tool_input": {"command": "cargo test"},
+                "tool_response": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "turn_id": "turn-child",
+                "agent_id": "019a0000-0000-7000-8000-0000000000c1",
+                "agent_type": "worker",
+                "prompt": "child: do work",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_response": "child output",
+            }),
+            &[
+                "user-prompt-submit",
+                "pre-tool-use",
+                "post-tool-use",
+                "stop",
+            ],
+        )
+        .await;
+    }
+
+    /// Qwen Code stamps a subagent's hooks, `SubagentStart` and `SubagentStop`
+    /// included, with the invoking session's `session_id` and the subagent's
+    /// `agent_id`. The main session keeps its tail.
+    #[tokio::test]
+    async fn qwen_code_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "qwen-code",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Refactor the cache",
+                "tool_name": "run_shell_command",
+                "tool_input": {"command": "cargo test"},
+                "tool_response": {"llmContent": "ok"},
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_id": "subagent-explorer-1",
+                "agent_type": "Explorer",
+                "tool_name": "grep_search",
+                "tool_input": {"pattern": "cache"},
+                "tool_response": {"llmContent": "subagent output"},
+            }),
+            &[
+                "subagent-start",
+                "pre-tool-use",
+                "post-tool-use",
+                "subagent-stop",
+            ],
+        )
+        .await;
+    }
+
+    /// Kimi Code fires `SubagentStart` and `SubagentStop` with the main
+    /// session's `sessionId` and no subagent id of their own. They drop; the
+    /// main session keeps its tail.
+    #[tokio::test]
+    async fn kimi_code_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "kimi-code",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Add the retry",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm test"},
+                "tool_call_id": "call_1",
+                "tool_output": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_name": "coder",
+                "prompt": "Write the retry helper",
+                "session_title": "Add the retry",
+            }),
+            &["subagent-start", "subagent-stop"],
+        )
+        .await;
+    }
+
+    /// CodeBuddy Code reports a subagent's tool calls under the parent's
+    /// `session_id` with the subagent's `agent_id`. They drop; the main
+    /// session keeps its tail.
+    #[tokio::test]
+    async fn codebuddy_subagent_events_drop_without_dropping_the_main_tail() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "codebuddy",
+            session,
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "prompt": "Bump the dependency",
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm install"},
+                "tool_use_id": "call_main",
+                "tool_response": "ok",
+            }),
+            serde_json::json!({
+                "session_id": session.to_string(),
+                "agent_id": "store-subagent-1",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "package.json"},
+                "tool_use_id": "call_sub",
+                "tool_response": "subagent output",
+            }),
+            &["pre-tool-use", "post-tool-use"],
+        )
+        .await;
+    }
+
+    /// Cline puts the firing agent's `agent_id` on every event, the root
+    /// agent's included, so only a `parent_agent_id` marks a subagent. The root
+    /// agent's events are stored and a subagent under the same task drops
+    /// without taking the root tail with it.
+    #[tokio::test]
+    async fn cline_subagent_events_drop_without_dropping_the_root_agent() {
+        let session = SessionId::new();
+        assert_subagent_drop_keeps_the_parent(
+            "cline",
+            session,
+            serde_json::json!({
+                "clineVersion": "3.0.74",
+                "taskId": session.to_string(),
+                "agent_id": "agent_root_1",
+                "parent_agent_id": null,
+                "tool_result": {
+                    "id": "toolu_root",
+                    "name": "run_commands",
+                    "input": {"commands": ["cargo test"]},
+                    "output": "ok"
+                },
+            }),
+            serde_json::json!({
+                "clineVersion": "3.0.74",
+                "taskId": session.to_string(),
+                "agent_id": "agent_sub_1",
+                "parent_agent_id": "agent_root_1",
+                "tool_result": {
+                    "id": "toolu_sub",
+                    "name": "read_files",
+                    "input": {"paths": ["README.md"]},
+                    "output": "subagent output"
+                },
+            }),
+            &["pre-tool-use", "post-tool-use"],
+        )
+        .await;
     }
 
     #[tokio::test]
