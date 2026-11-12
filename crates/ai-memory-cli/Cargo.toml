@@ -124,4 +124,5 @@ workspace = true
 windows-registry = "0.100.0"
 # Stable, safe process creation with an explicit inherited-handle list. std's
 # corresponding Windows APIs are still unstable at our minimum Rust version.
-win-custody = "0.1.2"
+# Pinned exact: a new 0.1.x is vetted before it ships in a release.
+win-custody = "=0.1.2"

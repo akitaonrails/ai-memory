@@ -83,6 +83,10 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed the container wrapper reporting success after a native host-client
   extraction or install failure. The wrapper keeps the previous cached
   archive and retries on the next host command that checks for updates. (#2174)
+- Fixed Windows hook workers inheriting the hook executor's output pipes.
+  Background uploads and startup backfills now inherit only their own standard
+  streams, so waiting for hook output no longer waits for a worker's HTTP
+  request. (#2193)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
