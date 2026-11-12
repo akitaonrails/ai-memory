@@ -16,7 +16,7 @@
     <p class="nav-label">{{ i18n.text("web-workspace") }}</p>
     <nav aria-label="{{ i18n.text("web-main") }}" class="app-nav">
       <a href="." data-nav="projects"><span aria-hidden="true">▦</span>{{ i18n.text("web-projects") }}</a>
-      <a href="inbox" data-nav="inbox"><span aria-hidden="true">✉</span>{{ i18n.text("web-inbox") }} <span id="inbox-pending-count" class="nav-message-count" hidden aria-hidden="true"></span></a>
+      <a href="inbox" data-nav="inbox"><span aria-hidden="true">{% include "_icon_envelope.html" %}</span>{{ i18n.text("web-inbox") }} <span id="inbox-pending-count" class="nav-message-count" hidden aria-hidden="true"></span></a>
       <div id="inbox-notifications" class="nav-inbox-notifications" hidden><p id="inbox-notification-summary"></p><ul id="inbox-notification-projects" aria-label="{{ i18n.text("web-projects-with-pending-messages") }}"></ul></div>
       <span id="inbox-notification-status" class="sr-only" role="status" aria-live="polite"></span>
       <a href="workstreams" data-nav="workstreams" {% block nav_workstreams_current %}{% endblock %}><span aria-hidden="true">⑂</span>{{ i18n.text("web-workstreams") }}</a>
