@@ -52,7 +52,7 @@ version in [`docs/changelog/`](docs/changelog/):
   truncated response instead of a misleading parse or schema error. (#2199)
 - Fixed OpenCode Responses structured replies stopped at `max_output_tokens`
   being accepted or reported as JSON or empty-content errors. They now report
-  truncation so profile classification can split the batch and recover.
+  truncation so profile classification can split the batch and recover. (#2219)
 - A managed session start that cannot be bound to a single eligible run — two
   live managed runs in the same checkout with a stale shared-daemon run id
   matching neither — no longer falls through to the legacy project-wide handoff
