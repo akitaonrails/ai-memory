@@ -41,7 +41,11 @@ pub const ASSISTANT_EXCERPT_MAX_BYTES: usize = 2_000;
 /// supported agents. The unconditional strip removes each of these; the closed
 /// per-agent table below decides which is a *candidate* for opt-in capture. The
 /// union is kept tiny on purpose — one entry per distinct wire spelling.
-const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message"];
+///
+/// Gemini CLI's `AfterAgent` names the model's final reply `prompt_response`
+/// (<https://github.com/google-gemini/gemini-cli/blob/5a5c7180ff3f0a02511f54b54db7f228d4982a30/docs/hooks/reference.md#L163-L175>).
+/// It is stripped like the rest and is no capture candidate.
+const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message", "prompt_response"];
 
 /// The raw field that carries the assistant's final message for `(agent, event)`,
 /// or `None` when the pair has no verified assistant-message field.
@@ -298,6 +302,22 @@ mod tests {
         assert!(strip_assistant_message_raw(&mut raw));
         assert!(raw.get("last_assistant_message").is_none());
         assert_eq!(raw.get("session_id").and_then(|v| v.as_str()), Some("s1"));
+    }
+
+    /// Gemini CLI's `AfterAgent` reply goes the same way as Claude Code's.
+    #[test]
+    fn strip_removes_geminis_prompt_response() {
+        let mut raw = serde_json::json!({
+            "session_id": "g1",
+            "hook_event_name": "AfterAgent",
+            "prompt": "explain the parser",
+            "prompt_response": "SENTINEL_ASSISTANT_MESSAGE",
+            "stop_hook_active": false,
+        });
+        assert!(strip_assistant_message_raw(&mut raw));
+        assert!(raw.get("prompt_response").is_none());
+        assert_eq!(raw["prompt"], "explain the parser");
+        assert_eq!(raw["stop_hook_active"], false);
     }
 
     #[test]

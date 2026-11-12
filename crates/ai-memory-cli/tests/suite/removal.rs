@@ -660,6 +660,66 @@ fn only_hooks_preserves_mcp_in_same_file() {
     );
 }
 
+/// install-hooks wires Gemini CLI's BeforeAgent and AfterAgent beside a hook
+/// of the user's own, and uninstall takes ours out of both and leaves theirs.
+#[test]
+fn gemini_round_trip_wires_and_removes_before_and_after_agent() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let settings = home.path().join(".gemini/settings.json");
+    write_file(
+        &settings,
+        r#"{"mcpServers":{"other":{"httpUrl":"https://other.example/mcp"}},"hooks":{"BeforeAgent":[{"matcher":"","hooks":[{"type":"command","command":"/usr/local/bin/prompt-guard.sh"}]}]}}"#,
+    );
+
+    let install = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "gemini-cli", "--apply"])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "install-hooks failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let wired: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let before = wired["hooks"]["BeforeAgent"].as_array().unwrap();
+    assert_eq!(before.len(), 2, "{wired}");
+    let prompt = before[1]["hooks"][0]["command"].as_str().unwrap();
+    assert!(
+        prompt.contains("--event user-prompt-submit") && prompt.contains("--agent gemini-cli"),
+        "{wired}"
+    );
+    let stop = wired["hooks"]["AfterAgent"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert!(
+        stop.contains("--event stop") && stop.contains("--agent gemini-cli"),
+        "{wired}"
+    );
+
+    let uninstall = command_with_home(home.path())
+        .args(["uninstall", "--apply", "--only", "hooks", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let unwired = std::fs::read_to_string(&settings).unwrap();
+    assert!(!unwired.contains("--agent gemini-cli"), "{unwired}");
+    let unwired: serde_json::Value = serde_json::from_str(&unwired).unwrap();
+    assert_eq!(
+        unwired["hooks"]["BeforeAgent"][0]["hooks"][0]["command"],
+        "/usr/local/bin/prompt-guard.sh"
+    );
+    assert_eq!(
+        unwired["mcpServers"]["other"]["httpUrl"],
+        "https://other.example/mcp"
+    );
+}
+
 #[test]
 fn uninstall_preserves_user_opencode_plugin_at_ai_memory_path() {
     let _guard = cli_test_lock();

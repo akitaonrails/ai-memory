@@ -7,6 +7,15 @@ _lib_dir="$(dirname "$0")"
 
 SERVER="${AI_MEMORY_HOOK_URL:-http://127.0.0.1:49374}"
 PAYLOAD=$(cat)
+# Gemini CLI appends the contents of every @-referenced file to the prompt it
+# hands BeforeAgent. The script fallback cannot cut them out of the JSON, so a
+# prompt carrying them is dropped rather than posted or spooled with them; the
+# native `ai-memory hook` keeps the user's words and drops only the files.
+case "$PAYLOAD" in
+    *'--- Content from referenced files ---'*)
+        exit 0
+        ;;
+esac
 CWD=$(ai_memory_extract_cwd "$PAYLOAD")
 QS=$(ai_memory_marker_qs "$CWD")
 

@@ -1736,6 +1736,13 @@ where
         }
         false
     };
+    // Gemini CLI appends the contents of every `@`-referenced file to the
+    // prompt it hands BeforeAgent and AfterAgent. Cut them here, so they never
+    // reach the spool, the wire or a log, whatever `ignore_paths` says about
+    // those files.
+    if ai_memory_hooks::strip_gemini_prompt_expansion(agent_kind, &mut json) {
+        payload = serde_json::to_string(&json)?;
+    }
     if ai_memory_hooks::cap_lifecycle_body_for_client(&mut json, hook_event) {
         payload = serde_json::to_string(&json)?;
     }

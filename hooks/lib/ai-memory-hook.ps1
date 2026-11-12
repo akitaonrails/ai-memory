@@ -1102,6 +1102,16 @@ function Invoke-AiMemoryHook {
     if (($Agent -eq "claude-code" -or $Agent -eq "dsh") -and $Event -eq "stop" -and $Payload -and $Payload.Contains('"last_assistant_message"')) {
         return
     }
+    # Gemini CLI's AfterAgent carries the reply as prompt_response.
+    if ($Agent -eq "gemini-cli" -and $Event -eq "stop" -and $Payload -and $Payload.Contains('"prompt_response"')) {
+        return
+    }
+    # Gemini CLI appends the contents of every @-referenced file to the prompt
+    # it hands BeforeAgent, and the fallback cannot cut them out of the JSON, so
+    # such a prompt is dropped rather than posted or spooled with them.
+    if ($Agent -eq "gemini-cli" -and $Event -eq "user-prompt" -and $Payload -and $Payload.Contains('--- Content from referenced files ---')) {
+        return
+    }
     $Cwd = Resolve-AiMemoryCwd -Payload $Payload -Agent $Agent
     if (Test-AiMemoryServerRouted -Cwd $Cwd) {
         if ($AntigravityStartOutput) { [Console]::Out.Write("{}") }

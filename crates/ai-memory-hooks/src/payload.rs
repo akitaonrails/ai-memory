@@ -500,7 +500,7 @@ impl HookEvent {
                 Self::SessionStart
             }
             "user-prompt" | "user_prompt" | "user-prompt-submit" | "user_prompt_submit"
-            | "UserPromptSubmit" | "beforeSubmitPrompt" => Self::UserPrompt,
+            | "UserPromptSubmit" | "beforeSubmitPrompt" | "BeforeAgent" => Self::UserPrompt,
             "pre-tool-use" | "pre_tool_use" | "PreToolUse" | "preToolUse" | "BeforeTool" => {
                 Self::PreToolUse
             }
@@ -511,7 +511,7 @@ impl HookEvent {
             }
             "post-compaction" | "post_compaction" | "PostCompaction" => Self::PostCompaction,
             "notification" | "Notification" => Self::Notification,
-            "stop" | "Stop" => Self::Stop,
+            "stop" | "Stop" | "AfterAgent" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
             "subagent-start" | "subagent_start" | "SubagentStart" | "subagentStart" => {
                 Self::SubagentStart
@@ -661,10 +661,13 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
+        // Gemini CLI appends `@`-referenced file contents to the user's words;
+        // nothing below may read them as the prompt.
+        crate::gemini::strip_gemini_prompt_expansion(agent, &mut raw);
         let context = hook_payload_context(&raw);
         let session_id = context
             .session_id
@@ -1878,6 +1881,29 @@ mod tests {
         assert_eq!(env.occurred_at_micros(), None);
     }
 
+    /// Gemini CLI's `BeforeAgent` `prompt` carries every `@`-referenced file
+    /// after the user's words. The envelope keeps only the words, and the
+    /// file contents are gone from the raw payload too.
+    #[test]
+    fn gemini_before_agent_prompt_keeps_only_the_users_words() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("gemini-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "g1",
+                "hook_event_name": "BeforeAgent",
+                "prompt": "explain @src/main.rs\n--- Content from referenced files ---\n\
+                           Content from @src/main.rs:\nSECRET_FILE_CONTENT\n--- End of content ---",
+            }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("explain @src/main.rs"));
+        assert_eq!(env.body_excerpt.as_deref(), Some("explain @src/main.rs"));
+        assert!(!env.raw.to_string().contains("SECRET_FILE_CONTENT"));
+    }
+
     #[test]
     fn body_is_subagent_detects_harness_markers() {
         // grok tags subagent tool-use events with `subagentType`.
@@ -1972,6 +1998,21 @@ mod tests {
         }
         // Another harness's `agent_id` still marks a subagent.
         assert!(body_is_subagent(AgentKind::ClaudeCode, &root));
+    }
+
+    /// Gemini CLI names its events in its own vocabulary
+    /// (<https://github.com/google-gemini/gemini-cli/blob/5a5c7180ff3f0a02511f54b54db7f228d4982a30/docs/hooks/reference.md>).
+    #[test]
+    fn parses_gemini_cli_event_names() {
+        for (name, event) in [
+            ("BeforeAgent", HookEvent::UserPrompt),
+            ("AfterAgent", HookEvent::Stop),
+            ("BeforeTool", HookEvent::PreToolUse),
+            ("AfterTool", HookEvent::PostToolUse),
+            ("PreCompress", HookEvent::PreCompact),
+        ] {
+            assert_eq!(HookEvent::parse(name), event, "{name}");
+        }
     }
 
     #[test]
