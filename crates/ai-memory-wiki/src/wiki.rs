@@ -4401,6 +4401,10 @@ fn rollback_or_inconsistent<E: std::fmt::Display>(
 }
 
 fn quarantine_file(git: &GitAdapter, path: &Path) -> WikiResult<Option<PathBuf>> {
+    // A path with no page at it can still be the parent of other pages.
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Ok(None);
+    }
     let Some(parent) = path.parent() else {
         return Err(WikiError::Io(std::io::Error::other(
             "page path has no parent (cannot quarantine delete)",
@@ -4412,7 +4416,15 @@ fn quarantine_file(git: &GitAdapter, path: &Path) -> WikiResult<Option<PathBuf>>
     let (_file, quarantine) = tmp.keep().map_err(|e| e.error)?;
     git.remove_file_checked(&quarantine)?;
     match git.rename_checked(path, &quarantine) {
-        Ok(()) => Ok(Some(quarantine)),
+        Ok(()) => match std::fs::symlink_metadata(&quarantine) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(quarantine)),
+            metadata => {
+                // An external edit can change the file type during the rename.
+                git.rename_checked(&quarantine, path)?;
+                metadata?;
+                Ok(None)
+            }
+        },
         Err(e) => {
             let _ = git.remove_file_checked(&quarantine);
             Err(e)
@@ -9634,6 +9646,46 @@ mod tests {
             "deleting an unindexed Markdown page must report it was removed"
         );
         assert!(!file.exists());
+
+        let namespace = PagePath::new("profile/workflow").unwrap();
+        let child = wiki.abs_path(ws, proj, &namespace).join("keep.md");
+        std::fs::write(&child, "# Keep\n").unwrap();
+        assert!(
+            !wiki
+                .delete_page(ws, proj, &namespace, None, None)
+                .await
+                .unwrap(),
+            "a directory containing pages is not itself a page"
+        );
+        assert!(child.is_file(), "the child page must remain in place");
+
+        let former_page = PagePath::new("profile/workflow/former-page").unwrap();
+        let latest = wiki
+            .write_page(req(
+                ws,
+                proj,
+                former_page.as_str(),
+                "A page replaced by a directory.",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        let former_file = wiki.abs_path(ws, proj, &former_page);
+        std::fs::remove_file(&former_file).unwrap();
+        std::fs::create_dir(&former_file).unwrap();
+        let child = former_file.join("keep.md");
+        std::fs::write(&child, "# Keep\n").unwrap();
+
+        assert!(
+            wiki.delete_page_if_latest(ws, proj, &former_page, latest, None, None)
+                .await
+                .unwrap(),
+            "the indexed page still existed"
+        );
+        assert!(
+            child.is_file(),
+            "deleting the index entry preserves its children"
+        );
     }
 
     /// #643 end-to-end: stop the server inside the window the issue
