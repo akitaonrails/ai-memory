@@ -41,6 +41,8 @@ const GLOBAL_DEFAULT_LIMIT: usize = 50;
 const SCOPED_DEFAULT_LIMIT: usize = 20;
 /// Upper bound on `limit`, the same clamp `memory_query` applies.
 const MAX_LIMIT: usize = 100;
+/// Recently updated pages listed when the request carries no search term.
+const RECENT_LIMIT: usize = 10;
 
 /// Query-string parameters for the search endpoint.
 #[derive(Debug, Deserialize)]
@@ -178,7 +180,32 @@ pub(crate) async fn handler(
                 Ok(None) => return super::page::not_found_response(&i18n),
                 Err(error) => return internal(error),
             };
-            if !query.is_empty() {
+            if query.is_empty() {
+                let recent = match state
+                    .reader
+                    .recent_pages_for_project(
+                        resolved.workspace_id,
+                        resolved.project_id,
+                        RECENT_LIMIT,
+                    )
+                    .await
+                {
+                    Ok(recent) => recent,
+                    Err(error) => return internal(error),
+                };
+                for hit in recent {
+                    let path = hit.path.as_str().to_owned();
+                    hits.push(SearchHit {
+                        href: page_href(workspace, project, &path),
+                        workspace: workspace.clone(),
+                        project: project.clone(),
+                        path,
+                        title: hit.title,
+                        snippet: markdown::escape_snippet(&hit.snippet),
+                        trace: None,
+                    });
+                }
+            } else {
                 let limit = params
                     .limit
                     .unwrap_or(SCOPED_DEFAULT_LIMIT)
@@ -264,7 +291,24 @@ pub(crate) async fn handler(
                 });
             }
         }
-        None => {}
+        None => {
+            let recent = match state.reader.recent_pages_global(RECENT_LIMIT, viewer).await {
+                Ok(recent) => recent,
+                Err(error) => return internal(error),
+            };
+            for h in recent {
+                let path = h.path.as_str().to_owned();
+                hits.push(SearchHit {
+                    href: page_href(&h.workspace_name, &h.project_name, &path),
+                    workspace: h.workspace_name,
+                    project: h.project_name,
+                    path,
+                    title: h.title,
+                    snippet: markdown::escape_snippet(&h.snippet),
+                    trace: None,
+                });
+            }
+        }
     }
 
     let (workspace, project) = scope.unwrap_or_default();

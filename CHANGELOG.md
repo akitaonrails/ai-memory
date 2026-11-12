@@ -205,6 +205,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `AI_MEMORY_HOOK_ABSOLUTE_PATHS=1`, to keep absolute paths. Hermes and
   Pool, which do not run hooks through a shell, keep absolute paths (#2035)
 - Returned to the workstream picker after a harness launched by `ai-memory resume` exits, including on Ctrl+C.
+- `/web/search` with no search term lists the ten most recently updated
+  pages, from the selected project or from every project the viewer can read.
+  It used to show only an empty prompt.
 
 ### Fixed
 
