@@ -59,8 +59,16 @@ pub(crate) async fn handler(
         Ok(derived) => derived,
         Err(error) => return internal(error),
     };
-    // Pragma reads; a failure must not take the whole page down.
-    let storage = state.reader.storage_status().await.unwrap_or_default();
+    // Pragma reads; a failure must not take the whole page down. It must not
+    // be rendered as a measurement either: `None` keeps the page up and the
+    // figures unknown.
+    let storage = match state.reader.storage_status().await {
+        Ok(storage) => Some(storage),
+        Err(error) => {
+            tracing::warn!(%error, "web health storage status read failed");
+            None
+        }
+    };
     let consolidation = match state.reader.session_consolidation_queue().await {
         Ok(queue) => queue,
         Err(error) => return internal(error),
@@ -451,15 +459,91 @@ fn sections(
             row(
                 i18n,
                 "web-health-label-database",
-                i18n.format(
-                    "web-health-detail-bytes-reclaimable",
-                    &[
-                        ("value0", format!("{}", s.storage.database_bytes)),
-                        ("value1", format!("{}", s.storage.reclaimable_bytes)),
-                    ],
+                s.storage.map_or_else(
+                    || i18n.text("web-health-detail-unknown"),
+                    |storage| {
+                        i18n.format(
+                            "web-health-detail-bytes-reclaimable",
+                            &[
+                                ("value0", format!("{}", storage.database_bytes)),
+                                ("value1", format!("{}", storage.reclaimable_bytes)),
+                            ],
+                        )
+                    },
                 ),
             ),
         ],
     };
     vec![hooks, local, consolidation, models, index]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_memory_store::StorageStatus;
+
+    /// The handler's own view assembly, so a test exercises the same
+    /// `sections` + `localized_checks` + template composition a request does
+    /// rather than either half alone.
+    fn render(storage: Option<StorageStatus>) -> String {
+        let i18n = ai_memory_core::i18n::Localizer::default();
+        let snapshot = HealthSnapshot {
+            ingest: IngestMetrics::default().snapshot(),
+            providers: ProviderHealthSnapshot::default(),
+            process: ProcessState::default(),
+            derived: ai_memory_store::DerivedIndexStatus::default(),
+            storage,
+            consolidation: ai_memory_store::SessionConsolidationQueue::default(),
+            embedder: None,
+        };
+        HealthView {
+            i18n: i18n.clone(),
+            wired: true,
+            checks: localized_checks(&i18n, &snapshot)
+                .into_iter()
+                .map(|check| HealthCheckRow {
+                    id: check.id,
+                    status: check.status.label(),
+                    detail: check.detail,
+                    fix: check.fix,
+                })
+                .collect(),
+            sections: sections(&i18n, &snapshot, false),
+        }
+        .render()
+        .expect("the health page renders")
+    }
+
+    /// An unreadable pragma read used to reach the page as a zeroed
+    /// `StorageStatus`, which the database row printed as a real measurement
+    /// of an empty store and the reclaim check read as "nothing to compact".
+    /// Both consumers must tell the two apart.
+    #[test]
+    fn unreadable_storage_is_not_rendered_as_an_empty_database() {
+        let unknown = render(None);
+        assert!(
+            !unknown.contains("0 bytes, 0 reclaimable"),
+            "an unreadable read must not claim a measurement: {unknown}"
+        );
+        assert!(
+            unknown.contains("unknown"),
+            "the database row must say the figures are unknown: {unknown}"
+        );
+        assert!(
+            unknown.contains("could not be read"),
+            "the reclaim advice must not be silently suppressed: {unknown}"
+        );
+
+        // The same page for a database that really is empty: the zeroes are a
+        // measurement there, and there is nothing to warn about.
+        let empty = render(Some(StorageStatus::default()));
+        assert!(
+            empty.contains("0 bytes, 0 reclaimable"),
+            "a real empty measurement still renders its figures: {empty}"
+        );
+        assert!(
+            !empty.contains("could not be read"),
+            "an empty database is not an unreadable one: {empty}"
+        );
+    }
 }

@@ -19,6 +19,13 @@ version in [`docs/changelog/`](docs/changelog/):
   the move left the pre-adoption entry in place: until the server restarted or
   the entry aged out, new sessions, prompts and observations kept landing in
   the project the command had just emptied and archived. (#2216)
+- The `/health` page no longer reports a database it could not measure as an
+  empty one. When the storage pragma reads failed, the database row rendered
+  `0 bytes, 0 reclaimable` — indistinguishable from a real measurement of an
+  empty store — and the reclaim advice was suppressed as if there were
+  nothing to compact. The figures now read `unknown` and a check reports that
+  they could not be read. A failed read still never takes the page down.
+  (#2215)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
