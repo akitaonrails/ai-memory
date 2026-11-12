@@ -99,6 +99,10 @@ export interface PageMetadata {
   relations?: Partial<Record<RelationName, string[]>>;
   /** TTL: an RFC 3339 instant or a bare `YYYY-MM-DD` date. Expired pages are hidden. */
   expiresAt?: string;
+  /** Profile entries only: stack tags that limit where the rule applies. */
+  appliesTo?: string[];
+  /** Profile entries only: what enforces the rule and keeps it out of the digest. */
+  enforcedBy?: string;
   /**
    * Up to 16 repository files the page describes. The server stores them and
    * never reads the files; compare each with your checkout and record `stale`
@@ -153,8 +157,8 @@ export interface ResolvedWriteTarget {
   readonly raw: Raw;
 }
 
-/** One complete, conditional page version in an atomic batch. */
-export type BatchWritePage = PageMetadata & {
+/** One complete, conditional page version in a batch, which excludes profile metadata. */
+export type BatchWritePage = Omit<PageMetadata, "appliesTo" | "enforcedBy"> & {
   /** Relative wiki path. */
   path: string;
   /** Complete Markdown body for this version. */

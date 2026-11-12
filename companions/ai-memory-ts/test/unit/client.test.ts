@@ -325,6 +325,27 @@ describe("pages", () => {
     });
   });
 
+  it("update carries a scalar profile stack tag and clears explicit enforcement", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_read_page", () => ({
+      ...payloads.read,
+      path: "profile/style/types.md",
+      frontmatter: { applies_to: "typescript", enforced_by: "eslint rule" },
+    }));
+    server.tools.set("memory_write_page", () => payloads.write);
+    await memory.pages.update("profile/style/types.md", () => ({ enforcedBy: null }), {
+      scope: { workspace: "default", project: "_global" },
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "default",
+      project: "_global",
+      path: "profile/style/types.md",
+      body: payloads.read.body,
+      applies_to: ["typescript"],
+      expected_page_id: payloads.PAGE_ID,
+    });
+  });
+
   it("update rereads a truncated page and guards on the complete version", async () => {
     const { server, memory } = setup();
     const complete = "x".repeat(12_344) + "!";
@@ -873,6 +894,8 @@ describe("wire names", () => {
         abstract: "a",
         relations: { fixes: ["x"] },
         expiresAt: "2099-01-01",
+        appliesTo: ["typescript"],
+        enforcedBy: "eslint rule",
         sourceFiles: [{ path: "p", commit: "3f2a9c1" }],
         expectedPageId: "v",
       }),
