@@ -461,6 +461,13 @@ pub(crate) enum WriteCmd {
         session: Option<String>,
         reply: oneshot::Sender<StoreResult<u32>>,
     },
+    /// Record one opt-in per-session retrieval call and its hits, then prune
+    /// the session's history to the newest `retention_cap` records (#2038).
+    RecordRetrievalHistory {
+        record: Box<crate::retrieval_history::NewRetrievalHistory>,
+        retention_cap: u32,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     /// Drop one implicit (query → page) association (#1941).
     ForgetQuerySignal {
         workspace_id: WorkspaceId,
@@ -2473,6 +2480,27 @@ impl WriterHandle {
             page_id,
             query_text,
             session,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record one opt-in per-session retrieval call and its returned hits,
+    /// pruning the session's history to the newest `retention_cap` records. See
+    /// [`crate::retrieval_history::record_retrieval_history`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_retrieval_history(
+        &self,
+        record: crate::retrieval_history::NewRetrievalHistory,
+        retention_cap: u32,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordRetrievalHistory {
+            record: Box::new(record),
+            retention_cap,
             reply: tx,
         })
         .await?;
@@ -4797,6 +4825,18 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     session.as_deref(),
                 );
                 send_or_warn(reply, result, "record_query_page_signal");
+            }
+            WriteCmd::RecordRetrievalHistory {
+                record,
+                retention_cap,
+                reply,
+            } => {
+                let result = crate::retrieval_history::record_retrieval_history(
+                    &mut conn,
+                    &record,
+                    retention_cap,
+                );
+                send_or_warn(reply, result, "record_retrieval_history");
             }
             WriteCmd::ForgetQuerySignal {
                 workspace_id,

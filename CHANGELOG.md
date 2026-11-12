@@ -36,6 +36,19 @@ version in [`docs/changelog/`](docs/changelog/):
   hit for a query (a transient failure, or too few candidates), the hits are
   returned unfiltered with a `relevance_filter_unavailable` note instead of being
   dropped. Unset everywhere, behavior is unchanged. (#2038)
+- An opt-in per-session retrieval-history dashboard. With `[retrieval]
+  record_history = true`, each single-project `memory_query` call records what it
+  returned — the scrubbed query, resolved scope, active streams, effective filter
+  settings, duration, result count, any soft notice, and every returned page's
+  path, version, relevance score and ranking explanation — to a new table
+  (migration V107), pruned to `[retrieval] history_retention_per_session` records
+  per session (default 500). A read-only page at
+  `/w/<ws>/<proj>/s/<session>/retrievals`, linked from the session timeline,
+  renders it behind the same per-project authorization and session-owner filter,
+  so an operator can inspect retrieval accuracy and debug noisy results.
+  Recording is best-effort (a query never fails on it) and off by default;
+  turning it off never disables retrieval, and a session that ran before it was
+  enabled honestly shows nothing. (#2038)
 - `[consolidation] output_language` fixes the natural language of generated
   memory prose — session summaries, cross-session lessons, dream merges, and
   auto-improvement proposals — regardless of the input's language (for example

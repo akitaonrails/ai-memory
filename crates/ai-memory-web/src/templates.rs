@@ -56,6 +56,16 @@ pub(crate) fn session_href(workspace: &str, project: &str, session_id: &str) -> 
     )
 }
 
+/// Build a session retrieval-history URL (`w/{ws}/{proj}/s/{id}/retrievals`),
+/// percent-encoded (#2038).
+#[must_use]
+pub(crate) fn retrievals_href(workspace: &str, project: &str, session_id: &str) -> String {
+    format!(
+        "{}/retrievals",
+        session_href(workspace, project, session_id)
+    )
+}
+
 /// Build a project link-graph URL (`w/{ws}/{proj}/graph`), percent-encoded.
 #[must_use]
 pub(crate) fn graph_href(workspace: &str, project: &str) -> String {
@@ -744,6 +754,8 @@ pub(crate) struct SessionView {
     pub project_href: String,
     /// This route, without a query string (the jump form's action).
     pub session_href: String,
+    /// Link to this session's opt-in retrieval history (#2038).
+    pub retrievals_href: String,
     /// Session id.
     pub session_id: String,
     /// Agent kind as stored.
@@ -774,6 +786,89 @@ pub(crate) struct SessionView {
     pub jump_value: usize,
     /// This page's observations.
     pub observations: Vec<SessionObservationRow>,
+}
+
+// ---------------------------------------------------------------------------
+// retrievals.html
+// ---------------------------------------------------------------------------
+
+/// One returned hit of a recorded retrieval; untrusted recorded text, escaped
+/// by the template (#2038).
+pub(crate) struct RetrievalHistoryHitRow {
+    /// 0-based rank in the returned order.
+    pub position: u32,
+    /// Project-relative page path.
+    pub page_path: String,
+    /// Link to the page (its current version).
+    pub page_href: String,
+    /// The recorded page version id, or empty.
+    pub page_version: String,
+    /// Calibrated relevance, pre-formatted, or `—`.
+    pub relevance: String,
+    /// Ranking explanation JSON, or empty.
+    pub explanation: String,
+}
+
+/// One recorded retrieval call; every text field is untrusted recorded text and
+/// is escaped by the template (#2038).
+pub(crate) struct RetrievalRecordRow {
+    /// ISO-8601 record instant.
+    pub created_at: String,
+    /// Humanised record instant.
+    pub created_relative: String,
+    /// Scrubbed query expression.
+    pub query: String,
+    /// Resolved scope shape.
+    pub scope_kind: String,
+    /// Active retrieval streams, comma-separated.
+    pub source: String,
+    /// Effective result limit, or `—`.
+    pub result_limit: String,
+    /// Effective relevance floor, or `—`.
+    pub min_relevance: String,
+    /// Active filters JSON, or empty.
+    pub filters: String,
+    /// Wall time in milliseconds, pre-formatted.
+    pub duration_ms: String,
+    /// Hits returned.
+    pub result_count: u32,
+    /// Soft notice, or empty.
+    pub notice: String,
+    /// Returned hits in order.
+    pub hits: Vec<RetrievalHistoryHitRow>,
+}
+
+/// View-model for `GET /w/:workspace/:project/s/:session_id/retrievals`.
+#[derive(Template)]
+#[template(path = "retrievals.html")]
+pub(crate) struct RetrievalHistoryView {
+    pub i18n: ai_memory_core::i18n::Localizer,
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Link to the project.
+    pub project_href: String,
+    /// Link to the session timeline.
+    pub session_href: String,
+    /// Session id.
+    pub session_id: String,
+    /// Total recorded retrievals for the session.
+    pub total: u64,
+    /// 1-based position of the first shown record (0 when none).
+    pub shown_start: usize,
+    /// 1-based position of the last shown record.
+    pub shown_end: usize,
+    /// Link to the first page, or empty on it.
+    pub first_href: String,
+    /// Link to the previous page, or empty.
+    pub prev_href: String,
+    /// Link to the next page, or empty.
+    pub next_href: String,
+    /// Link to the last page, or empty on it.
+    pub last_href: String,
+    /// This page's records.
+    pub records: Vec<RetrievalRecordRow>,
 }
 
 // ---------------------------------------------------------------------------

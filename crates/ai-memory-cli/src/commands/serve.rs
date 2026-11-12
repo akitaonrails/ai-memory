@@ -1468,6 +1468,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_answer_context_budget(config.query_answer.max_context_tokens)
         .with_default_limit(config.retrieval.default_result_limit)
         .with_default_min_relevance(config.retrieval.min_relevance)
+        .with_retrieval_history_recording(
+            config.retrieval.record_history,
+            config.retrieval.history_retention_per_session,
+        )
         .with_strip_root_combinators(config.strip_root_combinators)
         .with_gemini_safe_schemas(config.gemini_safe_schemas);
     if let Some(e) = embedder.clone() {

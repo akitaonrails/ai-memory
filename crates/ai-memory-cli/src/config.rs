@@ -2263,6 +2263,15 @@ pub struct RetrievalSettings {
     /// The threshold needs a configured reranker — a query that sets it with
     /// none available is rejected, never silently applied to the RRF rank.
     pub min_relevance: Option<f32>,
+    /// Record each single-project `memory_query` call to a per-session
+    /// retrieval history a read-only `/web` dashboard renders, so retrieval
+    /// accuracy can be inspected and noisy results debugged (#2038). `false`
+    /// (the default) records nothing; turning it off never disables retrieval.
+    pub record_history: bool,
+    /// Newest-N retrieval records kept per `(workspace, project, session)` when
+    /// `record_history` is on (#2038). `None` (the default) keeps the built-in
+    /// cap; a value is floored to 1 so recording is never silently inert.
+    pub history_retention_per_session: Option<usize>,
 }
 
 impl Default for RetrievalSettings {
@@ -2278,6 +2287,8 @@ impl Default for RetrievalSettings {
             query_signal_weight: base.query_signal_weight,
             default_result_limit: None,
             min_relevance: None,
+            record_history: false,
+            history_retention_per_session: None,
         }
     }
 }
@@ -2832,6 +2843,15 @@ impl Config {
                 "retrieval.min_relevance must be between 0 and 1 (got {min_relevance}); it sets the \
                  lowest calibrated reranker relevance a memory_query hit may have when a call gives \
                  no explicit min_relevance"
+            );
+        }
+        // A zero retention cap would delete every record the moment it was
+        // written, making an opted-in dashboard silently empty. Reject it loudly
+        // rather than ship a feature that looks on but keeps nothing (#2038).
+        if let Some(0) = config.retrieval.history_retention_per_session {
+            anyhow::bail!(
+                "retrieval.history_retention_per_session must be at least 1 (got 0); it caps how \
+                 many retrieval records are kept per session when retrieval.record_history is on"
             );
         }
         config.ingest.drop_list = Box::new(
@@ -4884,6 +4904,43 @@ mod tests {
             Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
                 .unwrap_or_else(|e| panic!("min_relevance = {value} must load: {e:#}"));
         }
+    }
+
+    #[test]
+    fn retrieval_record_history_defaults_off_and_loads_from_toml() {
+        // Off by default, with no retention cap set (the built-in applies).
+        assert!(!Config::default().retrieval.record_history);
+        assert_eq!(
+            Config::default().retrieval.history_retention_per_session,
+            None
+        );
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[retrieval]\nrecord_history = true\nhistory_retention_per_session = 50\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.retrieval.record_history);
+        assert_eq!(config.retrieval.history_retention_per_session, Some(50));
+    }
+
+    #[test]
+    fn load_rejects_zero_history_retention() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[retrieval]\nhistory_retention_per_session = 0\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a zero retention cap must fail closed");
+        assert!(
+            error.to_string().contains("history_retention_per_session"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

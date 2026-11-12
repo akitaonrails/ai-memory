@@ -13,7 +13,7 @@
   <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-mono text-xs truncate max-w-xs">{{ i18n.text("web-session") }} {{ session_id }}</span>
 </nav>
 
-<p class="section-note"><a href="{{ project_href }}/agents/{{ agent_kind }}">{{ i18n.one("web-session-all-agent-sessions", agent_kind) }}</a></p>
+<p class="section-note"><a href="{{ project_href }}/agents/{{ agent_kind }}">{{ i18n.one("web-session-all-agent-sessions", agent_kind) }}</a> · <a href="{{ retrievals_href }}">{{ i18n.text("web-retrievals") }}</a></p>
 <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">{{ i18n.text("web-session-timeline") }}</h1>
 <p class="mb-1 text-sm text-slate-500 dark:text-slate-400">
   <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ agent_kind }}</span>

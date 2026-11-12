@@ -9,6 +9,7 @@ mod history_replay;
 mod operations;
 mod pending;
 mod recall_trace;
+mod retrievals;
 mod routes;
 mod workstreams;
 

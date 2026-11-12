@@ -838,6 +838,13 @@ brief_on_project_change = false
 # ranking is not a calibrated relevance score. A project can override it with
 # `[retrieval] min_relevance` in its .ai-memory.toml, and a per-call
 # `min_relevance` overrides both.
+#
+# record_history records each single-project memory_query call to a per-session
+# retrieval history the read-only /web dashboard renders, so retrieval accuracy
+# can be inspected and noisy results debugged. Off by default; turning it off
+# never disables retrieval. history_retention_per_session caps how many records
+# are kept per (workspace, project, session); unset keeps the built-in default,
+# and a value must be at least 1 (0 is rejected at startup).
 # [retrieval]
 # query_intent = false
 # session_recall_bonus = 0.25
@@ -848,6 +855,8 @@ brief_on_project_change = false
 # query_signal_weight = 0.0
 # default_result_limit = 10
 # min_relevance = 0.2
+# record_history = false
+# history_retention_per_session = 500
 
 # Words dropped from a bare natural-language FTS query before the terms are
 # OR-joined. Unset uses the built-in English list. `[]` turns the filter off. A
