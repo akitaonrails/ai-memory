@@ -147,7 +147,7 @@ version in [`docs/changelog/`](docs/changelog/):
   follows Hermes (`$HERMES_HOME`, else the platform default with
   `$HERMES_DATA_DIR_SUFFIX` appended) for the doctor scan, the community
   plugin check, a named profile's marker routing and the skill root, and the
-  `install-hooks` and `setup-agent` guidance names the platform path.
+  `install-hooks` and `setup-agent` guidance names the platform path. (#2211)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
