@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed the web inbox refusing to load when a project name was also another
+  project's legacy key. The default mailbox now opens through the project id.
+  A request that names the clashing project keeps the page and shows a warning
+  pointing to `merge-project`, where it used to return a bare 400. (#2224)
 - `adopt-project-identity` now drops the hook router's cached resolution for
   the project that gave the identity away, so the checkout's hooks reach the
   project that took it. That cache keys entries on the repository identity, and
