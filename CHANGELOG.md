@@ -35,6 +35,8 @@ version in [`docs/changelog/`](docs/changelog/):
   path and matched no checkout, so `checkpoints` and `commit` refused rather
   than reaching the profile server. Verbatim and plain spellings of a path now
   compare equal. (#2186)
+- Fixed page deletion moving a directory out of the wiki. Child pages stay
+  accessible even when the directory replaced an indexed page. (#2190)
 - Restored TypeScript SDK page reads and updates on supported servers that
   predate the section metadata added in 3.3.0 (#2136).
 - The TypeScript SDK's `pages.update` loads the complete body before applying
