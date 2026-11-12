@@ -204,7 +204,7 @@ version in [`docs/changelog/`](docs/changelog/):
   and leave a server that refused to start; the refusal now points at the
   original pepper instead of `--with-config`. (#2172)
 - Fixed `restore` replacing live data and installing a backup's malformed
-  `config.toml`, which prevented the restored server from starting.
+  `config.toml`, which prevented the restored server from starting. (#2209)
 
 ### Security
 
