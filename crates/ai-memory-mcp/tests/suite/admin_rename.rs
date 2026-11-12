@@ -811,3 +811,119 @@ async fn adopt_project_identity_joins_a_split_and_refuses_with_409() {
     .await;
     assert_eq!(again.status(), StatusCode::OK, "a repeat is a no-op");
 }
+
+/// `POST /admin/adopt-project-identity` drops the hook router's project-cache
+/// entries that still resolve the moved identity to the project it came from
+/// (#1993). Those slots are keyed on the repository identity, so without the
+/// eviction the next hook keeps writing the checkout's work into the emptied
+/// project. Entries for an unrelated project must survive: the eviction is
+/// targeted, not a cache wipe.
+#[tokio::test]
+async fn adopt_project_identity_evicts_the_identity_keyed_scope_cache() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+    use ai_memory_mcp::ScopeInvalidation;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    // Mirrors `ai_memory_hooks::ProjectCacheKey`, which the hooks crate keeps
+    // private to its router module.
+    type ProjectCacheKey = (String, String, String, String, String);
+
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    seed_page(&store, &state.wiki, "api").await;
+    let folder = store
+        .writer
+        .get_or_create_project(ws, "api", None)
+        .await
+        .unwrap();
+    let unrelated = store
+        .writer
+        .get_or_create_project(ws, "docs", None)
+        .await
+        .unwrap();
+    let (remote, _) = store
+        .writer
+        .resolve_project_by_identity(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/api".into(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::Path,
+            "acme-api",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(folder, remote);
+
+    // Two slots shaped like `cache_key_for`'s output: the fifth element is
+    // what carries the repository identity into the key.
+    let identity_slot: ProjectCacheKey = (
+        "/src/api".to_string(),
+        String::new(),
+        String::new(),
+        "identity".to_string(),
+        "git_remote:github.com/acme/api:path::identity:write".to_string(),
+    );
+    let unrelated_slot: ProjectCacheKey = (
+        "/src/docs".to_string(),
+        String::new(),
+        "docs".to_string(),
+        "folder".to_string(),
+        ":::folder:write".to_string(),
+    );
+    let cache = Arc::new(tokio::sync::Mutex::new(HashMap::from([
+        (identity_slot.clone(), (ws, remote)),
+        (unrelated_slot.clone(), (ws, unrelated)),
+    ])));
+    state.scope_invalidator = Some({
+        let cache = cache.clone();
+        Arc::new(
+            move |target: ScopeInvalidation| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = ()> + Send + 'static>,
+            > {
+                let cache = cache.clone();
+                // The predicate the serve command installs over the real
+                // `ProjectCacheStore`.
+                Box::pin(async move {
+                    cache.lock().await.retain(|_, v| match target {
+                        ScopeInvalidation::Project(proj) => v.1 != proj,
+                        ScopeInvalidation::Workspace(workspace) => v.0 != workspace,
+                    });
+                })
+            },
+        )
+    });
+
+    let joined = post(
+        state,
+        "/admin/adopt-project-identity",
+        json!({
+            "workspace": "default",
+            "project_id": folder.to_string(),
+            "from_project_id": remote.to_string(),
+            "archive_name": "acme-api-split-20261105",
+        }),
+    )
+    .await;
+    assert_eq!(joined.status(), StatusCode::OK);
+
+    let cache = cache.lock().await;
+    assert!(
+        !cache.contains_key(&identity_slot),
+        "the slot keyed on the moved identity still resolves to the emptied project"
+    );
+    assert!(
+        cache.contains_key(&unrelated_slot),
+        "an unrelated project's slot must survive the adoption"
+    );
+}

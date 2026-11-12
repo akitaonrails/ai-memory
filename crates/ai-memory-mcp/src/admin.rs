@@ -6663,6 +6663,12 @@ async fn handle_adopt_project_identity(
             return (status, Json(serde_json::json!({ "error": e.to_string() })));
         }
     };
+    // The hook router's project cache keys entries on the repository identity,
+    // so a slot resolved before the move still answers with `from` — the next
+    // hook would write the checkout's work into the project that just gave the
+    // identity away. `into` keeps its project id across the move, so entries
+    // already pointing there stay correct (as for `rename-project`).
+    invalidate_scope_cache(&state, ScopeInvalidation::Project(from)).await;
     let mut manifest_warning = None;
     for project_id in [into, from] {
         if let Err(error) = state.wiki.refresh_renamed_scope(ws_id, project_id).await {
