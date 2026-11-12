@@ -29,6 +29,12 @@ version in [`docs/changelog/`](docs/changelog/):
   `restore-page` targets. An explicit `AI_MEMORY_SERVER_URL` still uses the
   install-default wiki, and a marker that selects an unresolvable profile now
   fails closed rather than acting on another server's wiki. (#2186)
+- Fixed a profile-routed checkout failing closed on Windows when its server
+  profile's root was registered as a verbatim path (`\\?\C:\...`, the spelling
+  `fs::canonicalize` and some harnesses produce). The root was read as a UNC
+  path and matched no checkout, so `checkpoints` and `commit` refused rather
+  than reaching the profile server. Verbatim and plain spellings of a path now
+  compare equal. (#2186)
 - Restored TypeScript SDK page reads and updates on supported servers that
   predate the section metadata added in 3.3.0 (#2136).
 - The TypeScript SDK's `pages.update` loads the complete body before applying
