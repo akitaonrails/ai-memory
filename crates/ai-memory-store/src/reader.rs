@@ -14750,6 +14750,34 @@ impl ReaderPool {
         .await
     }
 
+    /// One page of a session's opt-in retrieval history (#2038), newest first,
+    /// strictly scoped to `(workspace_id, project_id, session_id)`. The caller
+    /// must have already passed the session-visibility (owner) gate the session
+    /// timeline uses; this read enforces only the project/session isolation.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn retrieval_history_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        offset: i64,
+        limit: i64,
+    ) -> StoreResult<crate::RetrievalHistoryPage> {
+        self.with_conn(move |conn| {
+            crate::retrieval_history::retrieval_history_page(
+                conn,
+                workspace_id,
+                project_id,
+                session_id,
+                offset,
+                limit,
+            )
+        })
+        .await
+    }
+
     /// Projects whose marker keeps them out of the profile.
     ///
     /// # Errors

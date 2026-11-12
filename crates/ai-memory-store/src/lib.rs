@@ -29,6 +29,7 @@ pub mod password;
 mod profile;
 mod provenance;
 mod retrieval_criteria;
+mod retrieval_history;
 pub use provenance::{PageDisagreement, PageProvenance, PageSource};
 mod project_authz;
 mod project_coordinates;
@@ -118,6 +119,11 @@ pub use reader::{
     project_name_fold_key,
 };
 pub use retrieval_criteria::{MAX_RESULT_LIMIT, RetrievalCriteria};
+pub use retrieval_history::{
+    DEFAULT_RETRIEVAL_HISTORY_RETENTION, NewRetrievalHistory, NewRetrievalHistoryHit,
+    RETRIEVAL_HISTORY_QUERY_MAX_CHARS, RetrievalHistoryHitRow, RetrievalHistoryPage,
+    RetrievalHistoryRow,
+};
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
     PRIVATE_PROFILE_NEEDS_USER, ResolvedScope, ResolvedWriteScope, ScopeName, ScopeResolutionError,

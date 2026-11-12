@@ -591,6 +591,14 @@ pub struct AiMemoryServer {
     /// applies no floor. The threshold needs the configured reranker; a query
     /// that resolves a floor with none available is rejected.
     default_min_relevance: Option<f32>,
+    /// Opt-in per-session retrieval-history recording (#2038). When `true`,
+    /// each single-project `memory_query` call records what it returned to the
+    /// read-only `/web` dashboard, best-effort (a query never fails on it).
+    /// `false` (the default) records nothing.
+    record_retrieval_history: bool,
+    /// Newest-N retrieval records kept per `(workspace, project, session)` when
+    /// recording is on; floored to 1 so the feature is never silently inert.
+    retrieval_history_retention: u32,
     answer_max_context_tokens: Option<usize>,
     /// Optional LLM consolidator. When `None`, `memory_consolidate`
     /// returns a "not configured" error.
@@ -983,6 +991,43 @@ fn bounded_query_filter<'a>(
         ));
     }
     Ok(Some(value))
+}
+
+/// Compact JSON of the active pre-ranking filters for the opt-in retrieval
+/// history (#2038), or `None` when a call set none. Records what narrowed the
+/// search so the dashboard can show why a query returned what it did; the raw
+/// values were already length-validated by [`query_page_filter`].
+fn retrieval_filters_json(
+    args: &QueryArgs,
+    include_expired: bool,
+    include_superseded: bool,
+) -> Option<String> {
+    let mut map = serde_json::Map::new();
+    let mut set = |key: &str, value: Option<&str>| {
+        if let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    };
+    set("kind", args.kind.as_deref());
+    set("tier", args.tier.as_deref());
+    set("path_prefix", args.path_prefix.as_deref());
+    set("tag", args.tag.as_deref());
+    if include_expired {
+        map.insert("include_expired".to_string(), serde_json::Value::Bool(true));
+    }
+    if include_superseded {
+        map.insert(
+            "include_superseded".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if map.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).ok()
 }
 
 fn query_page_filter(args: &QueryArgs) -> Result<ai_memory_store::PageFilter<'_>, McpError> {
@@ -2315,6 +2360,8 @@ impl AiMemoryServer {
             active_project: ActiveProject::new(),
             default_limit: 10,
             default_min_relevance: None,
+            record_retrieval_history: false,
+            retrieval_history_retention: ai_memory_store::DEFAULT_RETRIEVAL_HISTORY_RETENTION,
             answer_max_context_tokens: None,
             consolidator: None,
             llm_providers: LlmProviders::default(),
@@ -2386,6 +2433,24 @@ impl AiMemoryServer {
     pub fn with_default_min_relevance(mut self, min_relevance: Option<f32>) -> Self {
         self.default_min_relevance =
             min_relevance.filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+        self
+    }
+
+    /// Enable opt-in per-session retrieval-history recording (#2038) and set the
+    /// per-session retention cap. `enabled = false` (the default) records
+    /// nothing. The cap is floored to 1 so an enabled dashboard never keeps zero
+    /// records; `None` keeps the built-in default. The CLI validates the cap at
+    /// startup, this is defence in depth.
+    #[must_use]
+    pub fn with_retrieval_history_recording(
+        mut self,
+        enabled: bool,
+        retention_per_session: Option<usize>,
+    ) -> Self {
+        self.record_retrieval_history = enabled;
+        if let Some(cap) = retention_per_session {
+            self.retrieval_history_retention = u32::try_from(cap).unwrap_or(u32::MAX).max(1);
+        }
         self
     }
 
@@ -3412,6 +3477,9 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         // Dropped on every return path, so errors are timed too.
         let _latency = self.mcp_metrics.query_latency().start();
+        // Wall clock for the opt-in retrieval-history duration (#2038). Read
+        // only when recording is on and the normal single-project path records.
+        let query_started = std::time::Instant::now();
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let include_expired = args.include_expired.unwrap_or(false);
@@ -3708,6 +3776,15 @@ impl AiMemoryServer {
         // error, or too few candidates to rank — the floor cannot be applied, so
         // the fused order is returned unfiltered and the response says so rather
         // than silently dropping every hit.
+        // Per-hit calibrated score, kept before the filter consumes
+        // `rerank_scores`, so the opt-in retrieval history can record each
+        // returned hit's relevance (#2038). Unscored hits (the fused tail, a
+        // pinned page) are simply absent → recorded as no score.
+        let rerank_score_by_id: std::collections::HashMap<PageId, f32> = hits
+            .iter()
+            .zip(rerank_scores.iter())
+            .filter_map(|((hit, _), score)| score.map(|value| (hit.id, value)))
+            .collect();
         let mut relevance_filter_unavailable = None;
         if let Some(floor) = min_relevance {
             let scored_count = rerank_scores.iter().filter(|s| s.is_some()).count();
@@ -3937,7 +4014,10 @@ impl AiMemoryServer {
                 }
             }
         }
-        let streams_active = explain.then(|| self.reader.active_streams(query_vec.is_some()));
+        // Computed once: `explain` returns it to the caller, and the opt-in
+        // retrieval history records it as the call's `source` (#2038).
+        let active_streams = self.reader.active_streams(query_vec.is_some());
+        let streams_active = explain.then(|| active_streams.clone());
         let hits: Vec<QueryHit> = hits
             .into_iter()
             .map(|(hit, score_details)| QueryHit {
@@ -4105,6 +4185,54 @@ impl AiMemoryServer {
             streams_active,
             timings,
         };
+        // Opt-in per-session retrieval history (#2038): record the single-
+        // project path best-effort, never failing the query. Off by default;
+        // the scopes/global/as_of paths return earlier and are out of v1 scope.
+        // `query_signal_scope` is `Some` only on the single-project path, and a
+        // session id is needed to attribute the record to a dashboard session.
+        if self.record_retrieval_history
+            && let Some((ws, proj)) = query_signal_scope
+            && let Some(session_raw) = Self::caller_hook_session_id(&parts)
+        {
+            let query: String = self
+                .sanitizer
+                .scrub(&args.query)
+                .chars()
+                .take(ai_memory_store::RETRIEVAL_HISTORY_QUERY_MAX_CHARS)
+                .collect();
+            if !query.trim().is_empty() {
+                let hits = response
+                    .hits
+                    .iter()
+                    .map(|qh| ai_memory_store::NewRetrievalHistoryHit {
+                        page_path: qh.hit.path.to_string(),
+                        page_version: Some(qh.hit.id.to_string()),
+                        relevance: rerank_score_by_id.get(&qh.hit.id).copied(),
+                        explanation: qh
+                            .score_details
+                            .as_ref()
+                            .and_then(|details| serde_json::to_string(details).ok()),
+                    })
+                    .collect::<Vec<_>>();
+                let record = ai_memory_store::NewRetrievalHistory {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id: ai_memory_core::SessionId::from_native(&session_raw),
+                    query,
+                    scope_kind: "project".to_string(),
+                    source: active_streams.join(","),
+                    result_limit: u32::try_from(limit).ok(),
+                    min_relevance,
+                    filters: retrieval_filters_json(&args, include_expired, include_superseded),
+                    duration_us: i64::try_from(query_started.elapsed().as_micros())
+                        .unwrap_or(i64::MAX),
+                    result_count: u32::try_from(response.hits.len()).unwrap_or(u32::MAX),
+                    notice: response.relevance_filter_unavailable.clone(),
+                    hits,
+                };
+                self.spawn_retrieval_history_record(record);
+            }
+        }
         ok_json(&response)
     }
 
@@ -9203,6 +9331,19 @@ impl AiMemoryServer {
         tokio::spawn(async move {
             if let Err(e) = writer.bump_access_for_actor(fresh, actor).await {
                 tracing::warn!(error = %e, "access bump failed");
+            }
+        });
+    }
+
+    /// Fire-and-forget one opt-in retrieval-history record (#2038). Detached
+    /// from the query so recording never adds latency to, or fails, the query;
+    /// a write error is logged and dropped.
+    fn spawn_retrieval_history_record(&self, record: ai_memory_store::NewRetrievalHistory) {
+        let writer = self.writer.clone();
+        let retention = self.retrieval_history_retention;
+        tokio::spawn(async move {
+            if let Err(e) = writer.record_retrieval_history(record, retention).await {
+                tracing::warn!(error = %e, "recording retrieval history failed");
             }
         });
     }

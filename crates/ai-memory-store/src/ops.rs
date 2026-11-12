@@ -7874,6 +7874,16 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![session_id.to_string()],
     )?;
 
+    // Opt-in retrieval history (#2038) this session recorded. Scoped to this
+    // project because the row is keyed by `(workspace, project, session)` and a
+    // session recorded its retrievals only in the project it queried; the
+    // per-hit rows cascade from the `retrieval_history` delete.
+    tx.execute(
+        "DELETE FROM retrieval_history \
+          WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        rusqlite::params![&sid[..], &wid[..], &pid[..]],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).

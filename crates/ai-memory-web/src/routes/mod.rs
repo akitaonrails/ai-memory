@@ -21,6 +21,7 @@ mod notifications;
 mod page;
 mod pending;
 mod project;
+mod retrievals;
 pub(crate) mod search;
 mod session;
 pub(crate) mod statics;
@@ -141,6 +142,10 @@ pub(crate) fn build(state: Arc<WebState>) -> Router {
             .route(
                 "/w/{workspace}/{project}/s/{session_id}",
                 get(session::handler),
+            )
+            .route(
+                "/w/{workspace}/{project}/s/{session_id}/retrievals",
+                get(retrievals::handler),
             )
             .route("/search", get(search::handler))
             .route("/pending", get(pending::handler))

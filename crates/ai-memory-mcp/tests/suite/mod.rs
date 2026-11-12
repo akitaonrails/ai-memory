@@ -41,6 +41,7 @@ mod query_min_relevance;
 mod query_observation_stream;
 mod query_pin_first;
 mod query_reasoning;
+mod query_retrieval_history;
 mod query_superseded;
 mod read_page_related;
 mod recap_identity;

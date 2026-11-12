@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block title %}{{ i18n.text("web-retrieval-history") }} {{ session_id }} {{ i18n.text("web-ai-memory") }}{% endblock %}
+
+{% block header_search %}{% include "_header_search_scoped.html" %}{% endblock %}
+
+{% block content %}
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
+  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
+  <span aria-hidden="true">/</span>
+  <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
+  <span aria-hidden="true">/</span>
+  <a href="{{ session_href }}" class="hover:text-blue-600 dark:hover:text-blue-400 font-mono text-xs truncate max-w-xs">{{ i18n.text("web-session") }} {{ session_id }}</a>
+  <span aria-hidden="true">/</span>
+  <span aria-current="page" class="text-slate-700 dark:text-slate-200">{{ i18n.text("web-retrievals") }}</span>
+</nav>
+
+<p class="section-note"><a href="{{ session_href }}">{{ i18n.text("web-retrieval-view-timeline") }}</a></p>
+<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-1">{{ i18n.text("web-retrieval-history") }}</h1>
+<p class="mb-6 text-xs text-slate-500 dark:text-slate-400">{{ i18n.text("web-retrieval-history-intro") }}</p>
+
+{% if records.is_empty() %}
+<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-retrieval-history-none") }}</p>
+{% else %}
+<nav aria-label="{{ i18n.text("web-retrievals") }}" class="mb-6 flex flex-wrap items-center gap-3 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 px-3 py-2 text-sm">
+  {% if first_href != "" %}<a href="{{ first_href }}" class="text-blue-600 dark:text-blue-400" rel="first">{{ i18n.text("web-first") }}</a>{% else %}<span class="text-slate-300 dark:text-slate-700">{{ i18n.text("web-first") }}</span>{% endif %}
+  {% if prev_href != "" %}<a href="{{ prev_href }}" class="text-blue-600 dark:text-blue-400" rel="prev">{{ i18n.text("web-prev") }}</a>{% else %}<span class="text-slate-300 dark:text-slate-700">{{ i18n.text("web-prev") }}</span>{% endif %}
+  <span class="text-slate-500 dark:text-slate-400">{{ i18n.three("web-range-of-total", shown_start, shown_end, total) }}</span>
+  {% if next_href != "" %}<a href="{{ next_href }}" class="text-blue-600 dark:text-blue-400" rel="next">{{ i18n.text("web-next-session") }}</a>{% else %}<span class="text-slate-300 dark:text-slate-700">{{ i18n.text("web-next-session") }}</span>{% endif %}
+  {% if last_href != "" %}<a href="{{ last_href }}" class="text-blue-600 dark:text-blue-400" rel="last">{{ i18n.text("web-last") }}</a>{% else %}<span class="text-slate-300 dark:text-slate-700">{{ i18n.text("web-last") }}</span>{% endif %}
+</nav>
+
+<ol class="space-y-4">
+  {% for record in records %}
+  <li class="rounded border border-slate-200 dark:border-slate-800 p-3">
+    <div class="flex flex-wrap items-center gap-2 mb-2 text-xs text-slate-500 dark:text-slate-400">
+      <span class="inline-flex items-center rounded px-1.5 py-0.5 font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ record.scope_kind }}</span>
+      <span class="ml-auto whitespace-nowrap" title="{{ record.created_at }}">{{ record.created_relative }}</span>
+    </div>
+    <p class="mb-2 font-mono text-sm text-slate-800 dark:text-slate-200 break-words">{{ record.query }}</p>
+    <dl class="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1 text-xs text-slate-600 dark:text-slate-400 mb-2">
+      <div><dt class="inline font-medium">{{ i18n.text("web-retrieval-results") }}:</dt> <dd class="inline">{{ record.result_count }}</dd></div>
+      <div><dt class="inline font-medium">{{ i18n.text("web-retrieval-limit") }}:</dt> <dd class="inline">{{ record.result_limit }}</dd></div>
+      <div><dt class="inline font-medium">{{ i18n.text("web-retrieval-floor") }}:</dt> <dd class="inline">{{ record.min_relevance }}</dd></div>
+      <div><dt class="inline font-medium">{{ i18n.text("web-retrieval-duration-ms") }}:</dt> <dd class="inline">{{ record.duration_ms }}</dd></div>
+      <div class="col-span-2"><dt class="inline font-medium">{{ i18n.text("web-retrieval-streams") }}:</dt> <dd class="inline font-mono">{{ record.source }}</dd></div>
+      {% if record.filters != "" %}<div class="col-span-2 sm:col-span-3"><dt class="inline font-medium">{{ i18n.text("web-retrieval-filters") }}:</dt> <dd class="inline font-mono break-words">{{ record.filters }}</dd></div>{% endif %}
+    </dl>
+    {% if record.notice != "" %}<p class="mb-2 text-xs text-amber-700 dark:text-amber-400">{{ record.notice }}</p>{% endif %}
+    {% if record.hits.is_empty() %}
+    <p class="text-xs text-slate-400 dark:text-slate-500">{{ i18n.text("web-retrieval-no-hits") }}</p>
+    {% else %}
+    <ol class="space-y-1">
+      {% for hit in record.hits %}
+      <li class="flex flex-wrap items-baseline gap-2 text-xs">
+        <span class="font-mono text-slate-400 dark:text-slate-500 w-6 text-right">{{ hit.position }}</span>
+        <a href="{{ hit.page_href }}" class="font-mono text-blue-600 dark:text-blue-400 break-all">{{ hit.page_path }}</a>
+        {% if hit.page_version != "" %}<span class="font-mono text-slate-400 dark:text-slate-500">@{{ hit.page_version }}</span>{% endif %}
+        <span class="text-slate-500 dark:text-slate-400">{{ i18n.text("web-retrieval-relevance") }} {{ hit.relevance }}</span>
+        {% if hit.explanation != "" %}<details class="w-full"><summary class="cursor-pointer text-slate-400 dark:text-slate-500">{{ i18n.text("web-retrieval-explain") }}</summary><pre class="mt-1 whitespace-pre-wrap break-words font-mono text-slate-600 dark:text-slate-400">{{ hit.explanation }}</pre></details>{% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ol>
+{% endif %}
+{% endblock %}
