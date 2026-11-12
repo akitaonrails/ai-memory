@@ -738,6 +738,10 @@ fn xlsx_sheet_target(target: &str) -> Result<String> {
         .strip_prefix("worksheets/")
         .or_else(|| target.strip_prefix("/xl/worksheets/"))
         .ok_or_else(|| anyhow!("unsafe XLSX worksheet relationship target"))?;
+    // The Open XML SDK uses an unnumbered part name for its first worksheet.
+    if filename == "sheet.xml" {
+        return Ok("xl/worksheets/sheet.xml".into());
+    }
     let number = numbered_part(filename, "sheet", ".xml")?;
     Ok(format!("xl/worksheets/sheet{number}.xml"))
 }
@@ -1742,6 +1746,47 @@ mod tests {
         write_pdf(&file, &"x".repeat(4_096));
         let bytes = fs::read(file).unwrap();
         assert!(extract_pdf_inner_with_limit(&bytes, 64).is_err());
+    }
+
+    #[test]
+    fn xlsx_reads_the_open_xml_sdk_worksheet_name() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("workbook.xlsx");
+        for target in ["/xl/worksheets/sheet.xml", "worksheets/sheet.xml"] {
+            let relationships = format!(
+                r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{target}"/></Relationships>"#
+            );
+            write_zip(
+                &file,
+                &[
+                    (
+                        "[Content_Types].xml",
+                        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+                    ),
+                    (
+                        "_rels/.rels",
+                        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+                    ),
+                    (
+                        "xl/workbook.xml",
+                        r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets><sheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" name="Totals" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+                    ),
+                    ("xl/_rels/workbook.xml.rels", &relationships),
+                    (
+                        "xl/worksheets/sheet.xml",
+                        r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData></worksheet>"#,
+                    ),
+                ],
+            );
+            let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+            assert!(
+                plan.body.contains("## Sheet: Totals\n\n    42"),
+                "{}",
+                plan.body
+            );
+        }
+        assert!(xlsx_sheet_target("worksheets/../sheet.xml").is_err());
+        assert!(xlsx_sheet_target("https://example.invalid/xl/worksheets/sheet.xml").is_err());
     }
 
     #[test]
