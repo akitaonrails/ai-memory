@@ -2362,7 +2362,12 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
             .bridge_data_dir
             .as_ref()
             .map_or_else(String::new, |path| {
-                format!(" --data-dir {}", shell_quote(&path.to_string_lossy()))
+                // The canonical data dir carries the Windows `\\?\` verbatim
+                // prefix; strip it as `bridge_data_dir_args` does so the
+                // `claude mcp add` snippet names the plain drive path, not the
+                // prefix Hermes mangled into `C:\?\C:\...` (#2203).
+                let data_dir = strip_windows_verbatim_prefix(&path.to_string_lossy()).into_owned();
+                format!(" --data-dir {}", shell_quote(&data_dir))
             });
         format!(
             "claude mcp add --transport stdio{env} {name} -- \\\n    {command} mcp-bridge --server-url {url}{data_dir}",
@@ -4611,6 +4616,29 @@ mod tests {
         assert!(
             !out.contains("~/.claude.json"),
             "render must not hardcode ~/.claude.json when the resolved path differs:\n{out}"
+        );
+    }
+
+    #[test]
+    fn claude_code_session_aware_render_strips_the_windows_verbatim_data_dir() {
+        // The `claude mcp add` snippet renders `args.bridge_data_dir` directly,
+        // not through `bridge_data_dir_args`, so it is a second site of the
+        // same bug: the canonical dir carries the Windows `\\?\` prefix Hermes
+        // mangled into `C:\?\C:\...` (#2203). The snippet must name the plain
+        // drive path, as the bridge entry does. The strip is lexical, so this
+        // runs on any host.
+        let mut args = args_for(McpClient::ClaudeCode);
+        args.session_aware = true;
+        args.bridge_data_dir = Some(PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory"));
+        let out =
+            render_claude_code(&args, std::path::Path::new("/stores/claude/.claude.json")).unwrap();
+        assert!(
+            out.contains(r"C:\Users\me\AppData\Local\ai-memory"),
+            "the snippet must name the data dir:\n{out}"
+        );
+        assert!(
+            !out.contains(r"\\?\"),
+            "the snippet must not carry the verbatim prefix:\n{out}"
         );
     }
 
