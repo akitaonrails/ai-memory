@@ -2702,6 +2702,10 @@ fn begin_session_row(conn: &Connection, session: &NewSession) -> StoreResult<()>
         .cwd
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    // `begin_session` creates interactive and system sessions (MCP `begin`,
+    // backfill, maintenance), which never carry a launcher origin, so this path
+    // leaves `sessions.origin` at its NULL default (#2180). The hook ingest path
+    // (`admit_hook_session_event`) is the only writer of a non-NULL origin.
     conn.execute(
         "INSERT INTO sessions \
          (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) \
@@ -3475,6 +3479,7 @@ pub fn admit_hook_session_event(
     owner_filter: &OwnerFilter,
     ingest_key: Option<&str>,
     moved_from_cwd: Option<&str>,
+    display_name: Option<&ai_memory_core::SessionDisplayName>,
 ) -> StoreResult<HookSessionAdmission> {
     if obs.session_id != session.id
         || obs.workspace_id != session.workspace_id
@@ -3495,14 +3500,15 @@ pub fn admit_hook_session_event(
         Option<i64>,
         u64,
         Option<String>,
+        Option<String>,
     );
     let existing: Option<Row> = tx.query_row(
-        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count, cwd FROM sessions WHERE id = ?1",
+        "SELECT workspace_id, project_id, agent_kind, actor_user, ended_at, ended_observation_count, cwd, origin FROM sessions WHERE id = ?1",
         params![session.id.as_bytes()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
     ).optional()?;
     let (owner, ended_at, ended_count, stored_cwd, scope) = match existing {
-        Some((ws, project, agent, owner, ended_at, ended_count, cwd)) => {
+        Some((ws, project, agent, owner, ended_at, ended_count, cwd, stored_origin)) => {
             // Corrupt owners fail closed, including for Any recovery. Owner
             // and agent identify WHO the session belongs to, so a mismatch
             // there is a genuine UUID collision and is terminal. The owner is
@@ -3548,6 +3554,20 @@ pub fn admit_hook_session_event(
                 tx.commit()?;
                 return Ok(HookSessionAdmission::InvalidScopedEnd);
             }
+            // A session row can be created by the handoff-accept path before
+            // this automation-tagged capture event arrives (#2180). Stamp the
+            // origin the first time an automation event meets a row that has
+            // none, so the profile harvester's origin filter is reliable no
+            // matter which path created the row. The `origin IS NULL` guard
+            // bounds this to one effective write per session.
+            if let Some(origin) = session.origin
+                && stored_origin.is_none()
+            {
+                tx.execute(
+                    "UPDATE sessions SET origin = ?2 WHERE id = ?1 AND origin IS NULL",
+                    params![session.id.as_bytes(), origin.as_str()],
+                )?;
+            }
             let scope = if session_end {
                 (
                     WorkspaceId::from_slice(&ws)?,
@@ -3579,8 +3599,8 @@ pub fn admit_hook_session_event(
             // back to it when absent (live capture).
             let started_at = session.occurred_at.unwrap_or(now);
             tx.execute(
-                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), started_at, session.actor_user.as_deref()],
+                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at, actor_user, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![session.id.as_bytes(), session.workspace_id.as_bytes(), session.project_id.as_bytes(), session.agent_kind.as_str(), session.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()), started_at, session.actor_user.as_deref(), session.origin.map(|o| o.as_str())],
             )?;
             (
                 session.actor_user.clone(),
@@ -3700,6 +3720,24 @@ pub fn admit_hook_session_event(
                 session.project_id.as_bytes(),
                 target.to_string_lossy(),
                 session.id.as_bytes()
+            ],
+        )?;
+    }
+    if let Some(label) = display_name
+        && matches!(ingest, IngestObservationOutcome::Inserted(_))
+    {
+        // An observation can follow cwd into another project. Only the owning
+        // scope may rename this row, even when a foreign observation is valid.
+        tx.execute(
+            "UPDATE sessions SET display_name = ?1, display_name_updated_ns = ?2 \
+             WHERE id = ?3 AND workspace_id = ?4 AND project_id = ?5 \
+             AND (display_name_updated_ns IS NULL OR display_name_updated_ns < ?2)",
+            params![
+                label.name,
+                label.updated_ns,
+                session.id.as_bytes(),
+                session.workspace_id.as_bytes(),
+                session.project_id.as_bytes()
             ],
         )?;
     }
@@ -7836,6 +7874,16 @@ pub(crate) fn purge_session_with_owner(
         rusqlite::params![session_id.to_string()],
     )?;
 
+    // Opt-in retrieval history (#2038) this session recorded. Scoped to this
+    // project because the row is keyed by `(workspace, project, session)` and a
+    // session recorded its retrievals only in the project it queried; the
+    // per-hit rows cascade from the `retrieval_history` delete.
+    tx.execute(
+        "DELETE FROM retrieval_history \
+          WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+        rusqlite::params![&sid[..], &wid[..], &pid[..]],
+    )?;
+
     // Tombstone before the row goes, in the same transaction: a purge that
     // committed the deletion but not the tombstone would be undone by the
     // next spool drain (#387).
@@ -9970,6 +10018,7 @@ pub(crate) mod tests {
                 agent_kind: kind,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             };
             begin_session(&mut conn, &session).unwrap_or_else(|e| {
                 panic!(
@@ -10269,6 +10318,7 @@ pub(crate) mod tests {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: owner.map(str::to_owned),
+            origin: None,
         }
     }
 
@@ -11978,6 +12028,7 @@ pub(crate) mod tests {
                     &owner,
                     None,
                     None,
+                    None,
                 )
                 .unwrap(),
             )
@@ -12999,6 +13050,7 @@ pub(crate) mod tests {
                 session,
                 &hook_observation(session),
                 &OwnerFilter::Any,
+                None,
                 None,
                 None,
             )
@@ -14802,6 +14854,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -14902,6 +14955,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -14984,6 +15038,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15032,6 +15087,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15094,6 +15150,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 },
             )
             .unwrap();
@@ -15144,6 +15201,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15350,6 +15408,7 @@ pub(crate) mod tests {
                     agent_kind,
                     cwd: Some(std::path::PathBuf::from(r"C:\GIT\ai-memory")),
                     actor_user: None,
+                    origin: None,
                 },
             )
             .unwrap();
@@ -15381,6 +15440,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15425,6 +15485,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15456,6 +15517,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15486,6 +15548,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15520,6 +15583,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15551,6 +15615,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -15597,6 +15662,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -16381,6 +16447,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -17029,6 +17096,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/repo/src".into()),
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -18298,6 +18366,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -18366,6 +18435,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -19168,6 +19238,7 @@ pub(crate) mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 },
             )
             .is_err(),
@@ -19185,6 +19256,7 @@ pub(crate) mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
@@ -20125,6 +20197,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User(bob.into()),
                 Some("fresh-key"),
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20143,6 +20216,7 @@ pub(crate) mod tests {
                 &bob_event,
                 &OwnerFilter::User(alice.into()),
                 Some("fresh-key"),
+                None,
                 None,
             )
             .unwrap(),
@@ -20177,6 +20251,7 @@ pub(crate) mod tests {
                 &moved,
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -20281,7 +20356,15 @@ pub(crate) mod tests {
             let owner = OwnerFilter::User(owner.into());
             assert!(
                 matches!(
-                    admit_hook_session_event(&mut conn, &moved, &start, &owner, key, Some(from)),
+                    admit_hook_session_event(
+                        &mut conn,
+                        &moved,
+                        &start,
+                        &owner,
+                        key,
+                        Some(from),
+                        None
+                    ),
                     Ok(HookSessionAdmission::Observation {
                         ingest: IngestObservationOutcome::Inserted(_),
                         ..
@@ -20309,6 +20392,66 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn session_display_name_resets_only_on_a_scope_transfer() {
+        let (_tmp, mut conn, ws, source) = fresh_db();
+        let target = get_or_create_project(&mut conn, &ws, "beta", None).unwrap();
+        let id = SessionId::new();
+        let event = |conn: &mut Connection, project, cwd: &str, from, key: &str, name| {
+            let mut session = hook_session(id, ws, project, Some("user:alice"));
+            session.agent_kind = AgentKind::OpenCode;
+            session.cwd = Some(cwd.into());
+            let mut start = hook_observation(&session);
+            start.kind = ObservationKind::SessionStart;
+            admit_hook_session_event(
+                conn,
+                &session,
+                &start,
+                &OwnerFilter::User("user:alice".into()),
+                Some(key),
+                from,
+                name,
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT display_name, display_name_updated_ns FROM sessions WHERE id = ?1",
+                [id.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let a = ai_memory_core::SessionDisplayName {
+            name: "Source only".into(),
+            updated_ns: 20,
+        };
+        let b = ai_memory_core::SessionDisplayName {
+            name: "Target only".into(),
+            updated_ns: 10,
+        };
+        event(&mut conn, source, "/alpha", None, "start", Some(&a));
+        assert_eq!(
+            event(&mut conn, source, "/nested", Some("/alpha"), "within", None),
+            (Some(a.name.clone()), Some(20))
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", Some("/nested"), "move", None),
+            (None, None)
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", None, "rename", Some(&b)),
+            (Some(b.name.clone()), Some(10))
+        );
+        assert_eq!(
+            event(&mut conn, target, "/beta", Some("/nested"), "move", None),
+            (Some(b.name.clone()), Some(10))
+        );
+    }
+
     // Identity still wins over a move: a foreign operator's move is refused
     // before anything is written, and a completed move replayed after the
     // session moved back never rebinds it to the stale target.
@@ -20332,7 +20475,8 @@ pub(crate) mod tests {
                 &start,
                 &OwnerFilter::User("user:bob".into()),
                 Some("move"),
-                Some("/repo/alpha")
+                Some("/repo/alpha"),
+                None
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20349,6 +20493,7 @@ pub(crate) mod tests {
             &owner,
             Some("move"),
             Some("/repo/alpha"),
+            None,
         )
         .unwrap();
         complete_observation_ingest(&mut conn, &target, "move").unwrap();
@@ -20361,6 +20506,7 @@ pub(crate) mod tests {
             &owner,
             Some("return"),
             Some("/repo/beta"),
+            None,
         )
         .unwrap();
         complete_observation_ingest(&mut conn, &proj, "return").unwrap();
@@ -20371,7 +20517,8 @@ pub(crate) mod tests {
                 &start,
                 &owner,
                 Some("move"),
-                Some("/repo/alpha")
+                Some("/repo/alpha"),
+                None
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -20412,6 +20559,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:bob".into()),
                 None,
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20425,6 +20573,7 @@ pub(crate) mod tests {
                 &other_agent,
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             ),
@@ -20458,6 +20607,7 @@ pub(crate) mod tests {
                 &moved,
                 &end,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -20581,7 +20731,7 @@ pub(crate) mod tests {
             let end = session_end_observation(&drifted);
 
             let result =
-                admit_hook_session_event(&mut conn, &drifted, &end, owner, Some("end"), None);
+                admit_hook_session_event(&mut conn, &drifted, &end, owner, Some("end"), None, None);
             let ended: Option<i64> = conn
                 .query_row(
                     "SELECT ended_at FROM sessions WHERE id = ?1",
@@ -20648,7 +20798,7 @@ pub(crate) mod tests {
         drifted.agent_kind = AgentKind::ClaudeCode;
         let end = session_end_observation(&drifted);
         assert!(matches!(
-            admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None),
+            admit_hook_session_event(&mut conn, &drifted, &end, &alice, None, None, None),
             Err(StoreError::SessionAgentMismatch {
                 bound: AgentKind::OpenCode
             })
@@ -20676,6 +20826,7 @@ pub(crate) mod tests {
                     &hook_observation(&session),
                     &OwnerFilter::User(owner.into()),
                     Some(key),
+                    None,
                     None,
                 )
             })
@@ -20714,6 +20865,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("tuple-key"),
                 None,
+                None,
             ),
             Err(StoreError::InvalidState(_))
         ));
@@ -20738,6 +20890,7 @@ pub(crate) mod tests {
                 &observation,
                 &OwnerFilter::User("user:alice".into()),
                 Some("agent-key"),
+                None,
                 None,
             ),
             Err(StoreError::SessionAgentMismatch {
@@ -20766,6 +20919,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:bob".into()),
                 Some("denied-owner"),
                 None,
+                None,
             ),
             Err(StoreError::SessionCollision)
         ));
@@ -20780,6 +20934,7 @@ pub(crate) mod tests {
             &shared,
             &hook_observation(&shared),
             &OwnerFilter::User("user:alice".into()),
+            None,
             None,
             None,
         )
@@ -20801,6 +20956,7 @@ pub(crate) mod tests {
                 &hook_observation(&shared),
                 &OwnerFilter::User("user:bob".into()),
                 Some("shared-bob"),
+                None,
                 None,
             )
             .unwrap(),
@@ -20835,6 +20991,7 @@ pub(crate) mod tests {
                 &session_end_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
                 Some(key),
+                None,
                 None,
             )
             .unwrap();
@@ -20875,6 +21032,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some(key),
                 None,
+                None,
             )
             .unwrap();
             match admission {
@@ -20904,6 +21062,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("missing-end"),
                 None,
+                None,
             )
             .unwrap(),
             HookSessionAdmission::InvalidMissingEnd
@@ -20932,6 +21091,7 @@ pub(crate) mod tests {
                 &OwnerFilter::User("user:alice".into()),
                 Some("ordinary-complete"),
                 None,
+                None,
             )
             .unwrap(),
             HookSessionAdmission::Observation {
@@ -20951,6 +21111,7 @@ pub(crate) mod tests {
                 &session,
                 &hook_observation(&session),
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )
@@ -21002,6 +21163,7 @@ pub(crate) mod tests {
                 &receiver,
                 &lifecycle_observation,
                 &OwnerFilter::User("user:alice".into()),
+                None,
                 None,
                 None,
             )

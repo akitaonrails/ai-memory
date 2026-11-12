@@ -71,6 +71,10 @@ The server records reports as they arrive; the session need not end. A Claude
 Code session's responses include its subagents', which Claude Code keeps in
 their own transcripts beside the session's; they arrive with the main
 conversation's next response.
+Pi also reports cumulative session totals through its updated generated
+extension, but not individual response records. See
+[Pi capture and accounting limits](usage.md#investigate-token-usage-in-the-dashboard)
+for setup, included history and fork behavior.
 
 The Token usage form filters the complete authorized response ledger on the
 server before selecting a 50-row page. From is inclusive and Until is exclusive,
@@ -105,6 +109,14 @@ readable history in bounded batches on later events, so a large backlog may need
 several hooks before all responses appear. Large-context, long-output and
 above-average signals are investigation hints, not confirmed failures or
 monetary costs. See [dashboard usage](usage.md#investigate-token-usage-in-the-dashboard).
+
+The agent's Sessions table shows a harness name beside the short ID when available.
+At the end of a turn the native Codex hook checks the last 64 KiB of its session
+index for that thread's latest name. Other adapters can send
+`"_ai_memory_session_name": {"name": "Fix webhook retries", "updated_at": "2026-01-02T12:00:00Z"}`
+on an existing event. Use the name's original RFC 3339 timestamp. An omitted
+name or an older revision leaves the stored label alone. If the session moves
+into another project or workspace, its previous scope's label is cleared.
 
 ## Themes and responsive navigation
 

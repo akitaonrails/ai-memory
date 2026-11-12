@@ -397,6 +397,7 @@ async fn consumed_by_hook_is_reported_only_to_the_session_that_claimed_it() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: Some(owner.clone()),
+            origin: None,
         })
         .await
         .expect("receiving session");
@@ -487,6 +488,7 @@ async fn claude_session(
             agent_kind: ai_memory_core::AgentKind::ClaudeCode,
             cwd: Some("/repo".into()),
             actor_user: Some(owner.to_owned()),
+            origin: None,
         })
         .await
         .expect("session");

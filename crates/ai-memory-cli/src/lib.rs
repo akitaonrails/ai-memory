@@ -191,6 +191,13 @@ async fn dispatch(
         Command::Search(args) => commands::search::run(&config, args).await,
         Command::Recent(args) => commands::recent::run(&config, args).await,
         Command::ReadPage(args) => commands::read_page::run(&config, args).await,
+        Command::Call(args) => {
+            let exit_code = commands::call::run(&config, args).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         Command::WritePage(args) => commands::write_page::run(&config, args).await,
         Command::DeletePage(args) => commands::delete_page::run(&config, args).await,
         Command::Serve(args) => commands::serve::run(&config, args).await,

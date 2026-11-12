@@ -22,10 +22,12 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `hook_rate_per_sec` | `0.0` | `AI_MEMORY_HOOK_RATE_PER_SEC` | Hook ingest tokens per second per actor and session source. 0 disables the limiter. |
 | `hook_rate_burst` | `0.0` (falls back to the rate, minimum one token, when the limiter is on) | `AI_MEMORY_HOOK_RATE_BURST` | Burst size of the hook ingest limiter. |
 | `capture_assistant` | `false` | `AI_MEMORY_CAPTURE_ASSISTANT` | Server side half of the assistant turn capture opt-in on Claude Code `Stop` events. |
+| `assistant_excerpt_max_bytes` | `2000` | `AI_MEMORY_ASSISTANT_EXCERPT_MAX_BYTES` | Byte cap on the stored assistant excerpt when `capture_assistant` is on. Clamped to 16 KiB. |
 | `consolidate_on_session_end` | `false` | `AI_MEMORY_CONSOLIDATE_ON_SESSION_END` | Queue LLM consolidation on SessionEnd when an LLM provider is configured. |
 | `backfill_on_start` | `true` | `AI_MEMORY_BACKFILL_ON_START` | Import a project's existing local harness history once, when SessionStart finds its store empty. |
 | `run_autowire` | `true` | `AI_MEMORY_RUN_AUTOWIRE` | Install a harness's hooks and MCP server on the first `ai-memory run` launch when they are missing. |
 | `claude_true_yolo` | `false` | `AI_MEMORY_CLAUDE_TRUE_YOLO` | Deprecated and ignored since 3.4.3: `ai-memory run --yolo` on Claude always forces `bypassPermissions` now. Still loads; `ai-memory run` asks you to remove it. |
+| `pi_tool_exposure` | `"direct"` | `AI_MEMORY_PI_TOOL_EXPOSURE` | How the generated Pi extension registers ai-memory's MCP tools: `direct` (declared to the model) or `codemode` (reached through Pi's codemode tool). |
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
 | `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`. The only value is `llm`, which needs an LLM provider. |
@@ -37,6 +39,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `llm_compat_disable_thinking` | `false` | `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` | Send `chat_template_kwargs: {"enable_thinking": false}` on every `openai-compat` chat request. |
 | `llm_compat_stream` | unset | `AI_MEMORY_LLM_COMPAT_STREAM` | Set `false` to request non-streaming JSON from `openai-compat`; `true` is rejected because SSE is unsupported. |
 | `llm_timeout_secs` | `300` (`ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS`) | `AI_MEMORY_LLM_TIMEOUT_SECS` | Per-request timeout for chat completions and the Copilot token exchange. The openai-oauth token refresh keeps its own ceiling. |
+| `llm_request_metadata_headers` | `false` | `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` | Add `x-ai-memory-workload` (`consolidation`, `profile`, `dream`, `lint`, ...) to every `openai-compat` chat attempt, plus `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when the operation reads one scope or acts for one user. Values are names, never page content. Other providers never send them. |
 | `bootstrap_max_concurrent` | `1` | `AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT` | How many live `bootstrap` runs may call the LLM at once across projects. Runs for the same project always wait for each other. Must be at least 1. |
 | `llm_reasoning_effort` | unset (the model default applies) | `AI_MEMORY_LLM_REASONING_EFFORT` | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` or `persistent`. |
 | `llm_headers` | `[]` | `AI_MEMORY_LLM_HEADERS` | Extra HTTP headers on every LLM chat request, as `Name: Value` or `Name=Value` entries. |
@@ -65,8 +68,9 @@ An array of tables. Each entry is tried in order after the primary provider, onl
 Each optional task profile selects a separate provider chain. The task keys are
 `consolidation`, `bootstrap`, `auto_improve`, `experience`, `dream`, `lint`,
 `profile`, `rerank` and `query_answer`. The last covers both
-`memory_query(answer=true)` and `memory_explore`. Scheduled lint remains
-rule-only.
+`memory_query(answer=true)` and `memory_explore`. Scheduled lint is
+rule-only unless `[maintenance] lint_llm_interval_secs` turns on the LLM pass,
+which uses the `lint` provider.
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
@@ -100,6 +104,8 @@ An array of tables, defined by `WebhookConfig` in `ai-memory-wiki`. The default 
 | `failure_policy` | `ignore` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `ignore` logs a warning and continues. `reject` aborts the write. |
 | `events` | required | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | Operations the webhook subscribes to. An empty list means it never fires. |
 | `blocking` | `true` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `true` runs inside the write path and can change the page. `false` fires after the page lands and ignores the response. |
+| `projects` | `[]` (every project) | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | `workspace/project` entries the webhook is told about. A workspace-wide event matches by workspace. A malformed entry stops the server. |
+| `headers` | `[]` | `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` | Extra request headers, each `{ name, value_file }`. The file is read once at server start (relative paths resolve against the data dir) and its value is never logged. Reserved names (`Content-Type`, `Content-Length`, `Host`, `X-Memory-Op`) and a missing or empty file stop the server. |
 
 `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` takes a JSON array of these entries and replaces the list from the file. Valid `events` are `write_page`, `consolidate`, `delete`, `delete_event_ledger`, `purge_project`, `purge_session`, `purge_workspace`, `move_project`, `move_session`, `handoff_begin`, `handoff_accept`, `handoff_cancel`, `message_send`, `message_pop` and `message_cancel`.
 
@@ -158,6 +164,7 @@ Per-tier half-lives in days. A tier that sets one decays at `ln(2) / days`. A ti
 | `enabled` | `true` | `AI_MEMORY_MAINTENANCE__ENABLED` | Master switch for scheduled server jobs. |
 | `forget_sweep_interval_secs` | `86400` | `AI_MEMORY_MAINTENANCE__FORGET_SWEEP_INTERVAL_SECS` | Interval of the retention forget sweep. 0 disables the job. |
 | `lint_interval_secs` | `86400` | `AI_MEMORY_MAINTENANCE__LINT_INTERVAL_SECS` | Interval of rule-based wiki lint. 0 disables the job. |
+| `lint_llm_interval_secs` | `0` (off) | `AI_MEMORY_MAINTENANCE__LINT_LLM_INTERVAL_SECS` | Interval of lint with the LLM contradiction pass across every project. Off by default because it calls the `lint` provider; skipped with one warning when no provider is configured. |
 | `embedding_backfill_interval_secs` | `0` (off) | `AI_MEMORY_MAINTENANCE__EMBEDDING_BACKFILL_INTERVAL_SECS` | Interval of embedding backfill. Off by default because it may call a paid provider. |
 | `reconcile_tombstones_deleted_pages` | `false` | `AI_MEMORY_MAINTENANCE__RECONCILE_TOMBSTONES_DELETED_PAGES` | Let the watcher tombstone an OKF-imported page whose file stayed missing on two consecutive passes. |
 
@@ -188,6 +195,10 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | `observation_stream` | `true` | `AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM` | Add the observation evidence stream, where matching observation bodies vote for their session's page. |
 | `feedback_demotion` | `0.0` | `AI_MEMORY_RETRIEVAL__FEEDBACK_DEMOTION` | Authority subtracted from a page whose current version carries open `stale`/`wrong` feedback, until a rewrite clears it. 0 is inert and negatives clamp to 0. |
 | `query_signal_weight` | `0.0` | `AI_MEMORY_RETRIEVAL__QUERY_SIGNAL_WEIGHT` | Similarity-capped authority boost from (query → page) associations captured when a session-aware caller with write access read a query hit or marked it helpful; `not_helpful` withdraws one and a session purge deletes its rows. 0 disables both capture and boost. |
+| `default_result_limit` | _unset_ | `AI_MEMORY_RETRIEVAL__DEFAULT_RESULT_LIMIT` | Default number of hits `memory_query` returns when a call gives no explicit `limit`. `1..=100`; rejected at startup if out of range. Unset keeps the built-in 10. A project's own `[retrieval] default_result_limit` marker value overrides this, and an explicit per-call `limit` overrides both. |
+| `min_relevance` | _unset_ | `AI_MEMORY_RETRIEVAL__MIN_RELEVANCE` | Lowest calibrated reranker relevance a `memory_query` hit may have when a call gives no explicit `min_relevance`; lower-scoring hits are excluded before the count limit. `0.0..=1.0`; rejected at startup if out of range. Unset applies no floor. Needs a configured reranker — a query that resolves a floor with none available is rejected. A project's own `[retrieval] min_relevance` marker value overrides this, and an explicit per-call `min_relevance` overrides both. |
+| `record_history` | `false` | `AI_MEMORY_RETRIEVAL__RECORD_HISTORY` | Record each single-project `memory_query` call to a per-session retrieval history the read-only `/web` dashboard renders (query, scope, streams, effective filters, duration, result count, and each returned page's path/version/relevance/explanation). Off by default; turning it off never disables retrieval. |
+| `history_retention_per_session` | _unset_ | `AI_MEMORY_RETRIEVAL__HISTORY_RETENTION_PER_SESSION` | Newest-N retrieval records kept per `(workspace, project, session)` when `record_history` is on. Unset keeps the built-in default (500); a value must be at least 1 (0 is rejected at startup). |
 
 ## `[search.fts]`
 
@@ -215,6 +226,7 @@ The defaults come from `ai_memory_store::RetrievalTuning::default()`.
 | `max_input_tokens` | `100000` (`DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS`) | `AI_MEMORY_CONSOLIDATION__MAX_INPUT_TOKENS` | Approximate token target for the whole consolidation prompt. |
 | `max_output_tokens` | `32000` (`DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS`) | `AI_MEMORY_CONSOLIDATION__MAX_OUTPUT_TOKENS` | Maximum tokens the provider may generate for one consolidation response. |
 | `input_token_safety_margin` | `0.8` (`DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN`) | `AI_MEMORY_CONSOLIDATION__INPUT_TOKEN_SAFETY_MARGIN` | Multiplier on the input budget, above 0 and at most 1. |
+| `output_language` | unset (follows the input's dominant language) | `AI_MEMORY_CONSOLIDATION__OUTPUT_LANGUAGE` | Force the natural language of generated memory prose (for example `English`); evidence, code and paths stay verbatim. At most 40 characters, single line. |
 
 ## `[auto_improve]`
 
@@ -301,6 +313,7 @@ Defined by `ProfileSettings` in `ai-memory-core`.
 | `apply_max_lines` | `40` (`DEFAULT_APPLY_MAX_LINES`) | `AI_MEMORY_PROFILE__APPLY_MAX_LINES` | Most lines `ai-memory profile apply` writes into a rules file. |
 | `max_output_tokens` | `2000` (`DEFAULT_MAX_OUTPUT_TOKENS`) | `AI_MEMORY_PROFILE__MAX_OUTPUT_TOKENS` | Output-token allowance for one profile LLM call (classification and merge). Raise it when the provider spends part of the budget before the structured JSON, e.g. a thinking model, and the call fails with `finish_reason=length`. A truncated classification is halved and retried, so a large enough budget saves those extra calls. |
 | `llm` | `true` | `AI_MEMORY_PROFILE__LLM` | Use the configured LLM provider for the profile when there is one. An [`[llm.profile]`](#llmtask) table gives the classify and merge calls their own provider and model. |
+| `harvest_prompts` | `all` | `AI_MEMORY_PROFILE__HARVEST_PROMPTS` | `all` harvests every session's prompts; `interactive` skips prompts from sessions a launcher stamped as automation (an orchestrator sets `AI_MEMORY_SESSION_ORIGIN=automation`), so a generated brief is not harvested as the operator's own preference. Capture, handoff and recall are unaffected. |
 
 ## `[sanitize]`
 
@@ -332,6 +345,7 @@ Defined by `SanitizeConfig` in `ai-memory-core`. Built-in redaction patterns alw
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
 | `mid_session` | `follow-cwd` | `AI_MEMORY_ROUTING__MID_SESSION` | Attribution of a mid-session event after the cwd moved: `follow-cwd` or `sticky`. |
+| `brief_on_project_change` | `false` | `AI_MEMORY_ROUTING__BRIEF_ON_PROJECT_CHANGE` | Brief the agent with a project's pinned, `_rules/` and `_slots/` pages, once per project per session, when a mid-session event resolves through a marker to a project other than the session's own. |
 
 ## `[auto_scope]`
 

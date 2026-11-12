@@ -1,7 +1,6 @@
-//! On-demand end-to-end smoke for the retrieval harness (mirrors the
-//! `writer_throughput` pattern: `#[ignore]`d, run deliberately).
+//! Offline CLI guards plus on-demand end-to-end retrieval smoke tests.
 //!
-//! Requirements, both intentionally not provisioned by the test:
+//! Requirements for the ignored server tests, not provisioned by the tests:
 //! - `target/release/ai-memory` (`cargo build --release -p ai-memory-cli`)
 //! - `evals/datasets/longmemeval_s.json` (run once with `--fetch`)
 //!
@@ -11,6 +10,149 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+
+#[test]
+fn raw_rag_rejects_invalid_windows_before_loading_models() {
+    let out = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-memory-eval"))
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."))
+        .args([
+            "retrieval",
+            "--engine",
+            "raw-rag",
+            "--dataset-variant",
+            "coding-v1",
+            "--raw-rag-chunk-tokens",
+            "0",
+            "--out",
+        ])
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("chunk tokens must be"), "{stderr}");
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn raw_rag_model_downloads_are_explicit_and_do_not_need_a_server() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let out = tempfile::tempdir().unwrap();
+    let models = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-memory-eval"))
+        .current_dir(root)
+        .args([
+            "retrieval",
+            "--engine",
+            "raw-rag",
+            "--dataset-variant",
+            "coding-v1",
+            "--server-bin",
+            "does-not-exist",
+            "--raw-rag-models",
+        ])
+        .arg(models.path())
+        .arg("--out")
+        .arg(out.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("--raw-rag-fetch-models"), "{stderr}");
+    assert!(!stderr.contains("server binary"), "{stderr}");
+    assert_eq!(std::fs::read_dir(models.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn raw_rag_rejects_misleading_or_incompatible_run_settings() {
+    for (extra, expected) in [
+        (vec!["--candidate"], "runs alone"),
+        (vec!["--ingest", "whole-session"], "runs alone"),
+        (vec!["--raw-rag-top-k", "0"], "1 <= top-k"),
+        (vec!["--ks", "0"], "--ks must be"),
+        (vec!["--ks", "16"], "--ks must be"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ai-memory-eval"))
+            .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."))
+            .args([
+                "retrieval",
+                "--engine",
+                "raw-rag",
+                "--dataset-variant",
+                "coding-v1",
+            ])
+            .args(extra)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-memory-eval"))
+        .args(["retrieval", "--raw-rag-fetch-models"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require --engine raw-rag"));
+}
+
+#[test]
+#[ignore = "needs both explicitly downloaded, pinned local models"]
+fn raw_rag_scores_a_fixture_without_a_server_and_records_its_protocol() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let out = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-memory-eval"))
+        .current_dir(root)
+        .args([
+            "retrieval",
+            "--engine",
+            "raw-rag",
+            "--dataset-variant",
+            "coding-v1",
+            "--sample",
+            "1",
+            "--server-bin",
+            "does-not-exist",
+            "--out",
+        ])
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = std::fs::read_dir(out.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["mode"], "raw-rag");
+    assert_eq!(report["questions_scored"], 1);
+    assert_eq!(report["raw_rag"]["chunk_tokens"], 256);
+    assert_eq!(report["raw_rag"]["overlap_tokens"], 32);
+    assert_eq!(report["raw_rag"]["candidates"], 128);
+    assert_eq!(report["raw_rag"]["top_k"], 15);
+    assert_eq!(report["raw_rag"]["turn_expansion"], true);
+    assert!(
+        report["raw_rag"]["per_question"][0]["selected_windows"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 15
+    );
+    assert!(report["per_question"][0]["hit_at"]["5"].is_number());
+    let markdown = std::fs::read_to_string(run.join("report.md")).unwrap();
+    assert!(markdown.contains("not paper-score reproduction"));
+    assert!(!markdown.contains("MCP round trip"));
+    assert!(!markdown.contains("Capture is production-shaped"));
+}
 
 #[test]
 #[ignore = "needs the release server binary and the downloaded dataset"]

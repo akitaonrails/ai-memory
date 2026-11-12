@@ -17,6 +17,7 @@ mod entropy_experience;
 mod eval_results;
 mod ledger_sweep;
 mod lifecycle;
+mod lint_report_state;
 mod local_embeddings;
 mod multi_machine;
 mod observation_retention;

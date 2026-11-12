@@ -22,13 +22,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ai_memory_consolidate::{DreamCancel, DreamConfig, EmbeddingCoord, run_dream_pass};
 use ai_memory_core::{ActorContext, PageId, PagePath, ProjectId, Tier, WorkspaceId};
 use ai_memory_llm::{
-    ChatRequest, ChatResponse, Embedder, LlmProvider, LlmResult, SyntheticEmbedder,
+    ChatRequest, ChatResponse, Embedder, LlmOperationId, LlmProvider, LlmResult, LlmSubject,
+    LlmWorkload, SyntheticEmbedder,
 };
 use ai_memory_store::{DecayParams, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -50,6 +51,8 @@ struct FakeMergeLlm {
     edit_during_merge: Option<(Wiki, WorkspaceId, ProjectId, String)>,
     /// Replaces the echoed prompt, to model a rewrite that drops a fact.
     fixed_body: Option<&'static str>,
+    /// Every operation id the merges were made under.
+    operations: Arc<Mutex<Vec<LlmOperationId>>>,
 }
 
 impl FakeMergeLlm {
@@ -60,6 +63,7 @@ impl FakeMergeLlm {
             cancel_after_first: None,
             edit_during_merge: None,
             fixed_body: None,
+            operations: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -152,6 +156,19 @@ impl LlmProvider for FakeMergeLlm {
                 "body_markdown": body,
             }))
         })
+    }
+    fn complete_structured_raw_with_operation_id<'life0, 'async_trait>(
+        &'life0 self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.operations.lock().unwrap().push(operation_id);
+        self.complete_structured_raw(request, schema)
     }
 }
 
@@ -371,6 +388,7 @@ fn dream_on() -> DreamConfig {
         max_clusters_per_run: 0,
         min_cold_pages: 0,
         idle_window_secs: 0,
+        output_language: None,
     }
 }
 
@@ -584,6 +602,48 @@ async fn flag_on_merges_cluster_via_llm() {
 /// B2 shares A3's `adaptive_eps`, so it shares the pair fix: a cold set of
 /// exactly two near-duplicates, with no third page to give the k-distance
 /// elbow a neighbour, still forms one cluster and reaches the LLM merge.
+/// A dream pass reads one project and acts for nobody: its merges carry the
+/// project's scope and no user in the request metadata.
+#[tokio::test]
+async fn the_merge_operation_names_the_project_it_reads() {
+    let fx = seed_fixture(true).await;
+    write(&fx, "sessions/a.md", DUP_A).await;
+    write(&fx, "sessions/b.md", DUP_B).await;
+    for p in ["sessions/a.md", "sessions/b.md"] {
+        backdate_latest(&fx, p, COLD_DAYS);
+    }
+
+    let llm = FakeMergeLlm::new();
+    let operations = llm.operations.clone();
+    let report = run_dream_pass(
+        &fx.store.reader,
+        &fx.wiki,
+        Some(&llm),
+        fx.ws,
+        fx.proj,
+        &DecayParams::default(),
+        0.0,
+        &dream_on(),
+        &DreamCancel::new(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.clusters_merged, 1, "the merge applied: {report:?}");
+    let operations = operations.lock().unwrap();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].workload(), LlmWorkload::Dream);
+    assert_eq!(
+        operations[0].subject(),
+        Some(&LlmSubject {
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            user: None,
+        })
+    );
+}
+
 #[tokio::test]
 async fn flag_on_merges_a_pair_with_no_other_cold_page() {
     let fx = seed_fixture(true).await;

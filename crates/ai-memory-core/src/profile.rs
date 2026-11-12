@@ -248,6 +248,22 @@ pub const DEFAULT_APPLY_MAX_LINES: usize = 40;
 /// Default output-token allowance for one profile LLM call.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2_000;
 
+/// Which sessions' prompts the harvester reads into the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarvestPrompts {
+    /// Harvest every project's `user-prompt` observations, regardless of how
+    /// the session was launched. The historical behaviour and the default.
+    #[default]
+    All,
+    /// Skip prompts from sessions a launcher stamped
+    /// [`crate::SessionOrigin::Automation`] (via
+    /// `AI_MEMORY_SESSION_ORIGIN=automation`), so a generated orchestrator
+    /// brief is not harvested as the operator's own preference (#2180).
+    /// Curated pages and stack signals of those projects still contribute.
+    Interactive,
+}
+
 /// `[profile]` server settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -274,6 +290,10 @@ pub struct ProfileSettings {
     pub max_output_tokens: u32,
     /// Use the configured LLM provider, when there is one.
     pub llm: bool,
+    /// Which sessions' prompts the harvester reads. `all` (default) keeps the
+    /// historical behaviour; `interactive` skips prompts from sessions a
+    /// launcher stamped as automation (#2180).
+    pub harvest_prompts: HarvestPrompts,
 }
 
 impl Default for ProfileSettings {
@@ -288,6 +308,7 @@ impl Default for ProfileSettings {
             apply_max_lines: DEFAULT_APPLY_MAX_LINES,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             llm: true,
+            harvest_prompts: HarvestPrompts::All,
         }
     }
 }

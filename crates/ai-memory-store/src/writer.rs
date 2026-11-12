@@ -14,7 +14,7 @@ use ai_memory_core::{
     AgentKind, AgentMessage, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey,
     ManagedRunId, MessageClaim, MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage,
     NewSession, NewSessionUsage, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
-    Sanitized, SessionId, UserId, UserRole, WorkspaceId,
+    Sanitized, SessionDisplayName, SessionId, UserId, UserRole, WorkspaceId,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -82,6 +82,11 @@ pub(crate) enum WriteCmd {
     SetProjectProfileFlags {
         project_id: ProjectId,
         flags: crate::ProjectProfileFlags,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
+    SetProjectRetrievalCriteria {
+        project_id: ProjectId,
+        criteria: crate::RetrievalCriteria,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     RecordProfileHarvest {
@@ -276,6 +281,7 @@ pub(crate) enum WriteCmd {
         owner_filter: OwnerFilter,
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
+        display_name: Option<SessionDisplayName>,
         reply: oneshot::Sender<StoreResult<HookSessionAdmission>>,
     },
     EndAdmittedSession {
@@ -454,6 +460,13 @@ pub(crate) enum WriteCmd {
         query_text: String,
         session: Option<String>,
         reply: oneshot::Sender<StoreResult<u32>>,
+    },
+    /// Record one opt-in per-session retrieval call and its hits, then prune
+    /// the session's history to the newest `retention_cap` records (#2038).
+    RecordRetrievalHistory {
+        record: Box<crate::retrieval_history::NewRetrievalHistory>,
+        retention_cap: u32,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     /// Drop one implicit (query → page) association (#1941).
     ForgetQuerySignal {
@@ -1112,6 +1125,28 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Persist a project's `[retrieval]` criteria (forwarded from its marker at
+    /// session start). A no-op when they already match; a `None` field clears
+    /// the column back to "inherit the global default".
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn set_project_retrieval_criteria(
+        &self,
+        project_id: ProjectId,
+        criteria: crate::RetrievalCriteria,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetProjectRetrievalCriteria {
+            project_id,
+            criteria,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Record one project's profile candidates and advance its harvest marks
     /// in one transaction. Re-recording a candidate is a no-op; returns how
     /// many were new.
@@ -1745,6 +1780,27 @@ impl WriterHandle {
         ingest_key: Option<String>,
         moved_from_cwd: Option<String>,
     ) -> StoreResult<HookSessionAdmission> {
+        self.admit_hook_session_event_with_name(
+            session,
+            obs,
+            owner_filter,
+            ingest_key,
+            moved_from_cwd,
+            None,
+        )
+        .await
+    }
+
+    /// Admit an event and apply its optional harness rename in the same transaction.
+    pub async fn admit_hook_session_event_with_name(
+        &self,
+        session: NewSession,
+        obs: Sanitized<NewObservation>,
+        owner_filter: OwnerFilter,
+        ingest_key: Option<String>,
+        moved_from_cwd: Option<String>,
+        display_name: Option<SessionDisplayName>,
+    ) -> StoreResult<HookSessionAdmission> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::AdmitHookSessionEvent {
             session,
@@ -1752,6 +1808,7 @@ impl WriterHandle {
             owner_filter,
             ingest_key,
             moved_from_cwd,
+            display_name,
             reply: tx,
         })
         .await?;
@@ -2423,6 +2480,27 @@ impl WriterHandle {
             page_id,
             query_text,
             session,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record one opt-in per-session retrieval call and its returned hits,
+    /// pruning the session's history to the newest `retention_cap` records. See
+    /// [`crate::retrieval_history::record_retrieval_history`].
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] or propagates SQL errors.
+    pub async fn record_retrieval_history(
+        &self,
+        record: crate::retrieval_history::NewRetrievalHistory,
+        retention_cap: u32,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RecordRetrievalHistory {
+            record: Box::new(record),
+            retention_cap,
             reply: tx,
         })
         .await?;
@@ -4055,6 +4133,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = crate::profile::set_project_profile_flags(&conn, project_id, flags);
                 send_or_warn(reply, result, "set_project_profile_flags");
             }
+            WriteCmd::SetProjectRetrievalCriteria {
+                project_id,
+                criteria,
+                reply,
+            } => {
+                let result = crate::retrieval_criteria::set_project_retrieval_criteria(
+                    &conn, project_id, criteria,
+                );
+                send_or_warn(reply, result, "set_project_retrieval_criteria");
+            }
             WriteCmd::RecordProfileHarvest {
                 workspace_id,
                 project_id,
@@ -4440,6 +4528,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 owner_filter,
                 ingest_key,
                 moved_from_cwd,
+                display_name,
                 reply,
             } => {
                 let result = ops::admit_hook_session_event(
@@ -4449,6 +4538,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &owner_filter,
                     ingest_key.as_deref(),
                     moved_from_cwd.as_deref(),
+                    display_name.as_ref(),
                 );
                 send_or_warn(reply, result, "admit_hook_session_event");
             }
@@ -4735,6 +4825,18 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     session.as_deref(),
                 );
                 send_or_warn(reply, result, "record_query_page_signal");
+            }
+            WriteCmd::RecordRetrievalHistory {
+                record,
+                retention_cap,
+                reply,
+            } => {
+                let result = crate::retrieval_history::record_retrieval_history(
+                    &mut conn,
+                    &record,
+                    retention_cap,
+                );
+                send_or_warn(reply, result, "record_retrieval_history");
             }
             WriteCmd::ForgetQuerySignal {
                 workspace_id,
@@ -5876,6 +5978,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

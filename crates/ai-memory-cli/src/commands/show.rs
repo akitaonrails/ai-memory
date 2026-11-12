@@ -250,6 +250,7 @@ pub async fn run(config: &Config, args: ShowArgs) -> Result<i32> {
             project: Some(project),
             workstream: None,
             new_workstream: None,
+            or_new: false,
             executable: None,
             yolo: args.yolo,
             true_yolo: args.true_yolo,

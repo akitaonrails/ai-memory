@@ -127,6 +127,7 @@ impl Fixture {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: owner.map(|name| IdentityKey::User(name.into()).storage_key()),
+                origin: None,
             })
             .await
             .unwrap();

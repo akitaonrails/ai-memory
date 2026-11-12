@@ -62,6 +62,11 @@ const BACKGROUND_DRAIN_BUDGET_ENV: &str = "AI_MEMORY_HOOK_BACKGROUND_DRAIN_BUDGE
 
 const INCREMENTAL_THRESHOLD_ENV: &str = "AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD";
 const MANAGED_RUN_ENV: &str = "AI_MEMORY_RUN_ID";
+/// How a launcher started this session (#2180). An orchestrator sets
+/// `AI_MEMORY_SESSION_ORIGIN=automation` so the server can stamp the session
+/// and the profile harvester can skip its prompts. Inherited execution
+/// context, like `AI_MEMORY_RUN_ID`; only a recognised token is forwarded.
+const SESSION_ORIGIN_ENV: &str = "AI_MEMORY_SESSION_ORIGIN";
 /// Per-execution opt-out of the automatic handoff (#1951): a falsy value
 /// (`off`, `0`, `false`, `no`) keeps this session from leaving a baton.
 const AUTO_HANDOFF_ENV: &str = "AI_MEMORY_AUTO_HANDOFF";
@@ -505,6 +510,39 @@ fn sanitize_briefed_key(raw: &str) -> String {
         .collect()
 }
 
+/// `<data_dir>/project-brief/<key>` — the routing query of the last cwd this
+/// session sent for its mid-session project brief (#2103), keyed like the
+/// briefed markers. Session start records the starting query, so a prompt that
+/// stays in the starting project asks nothing, and a later prompt asks only
+/// when the marker routing changed. Bounded; losing it costs one extra
+/// request, which the server answers once per project per session anyway.
+fn project_brief_state_path(
+    data_dir: &Path,
+    agent: &str,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> PathBuf {
+    data_dir
+        .join("project-brief")
+        .join(briefed_session_key(agent, session_id, cwd))
+}
+
+const PROJECT_BRIEF_STATE_MAX_BYTES: usize = 2048;
+
+fn project_brief_state_matches(path: &Path, routing_qs: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|seen| seen == routing_qs)
+}
+
+fn record_project_brief_state(path: &Path, routing_qs: &str) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if routing_qs.len() > PROJECT_BRIEF_STATE_MAX_BYTES || fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let _ = fs::write(path, routing_qs);
+}
+
 /// `<data_dir>/inbox-notice/<key>` — the last mid-session inbox notice this
 /// session was shown (#1942), keyed like the briefed markers (native session
 /// id when the payload carries one, else a stable hash of agent+cwd, so a
@@ -810,6 +848,22 @@ fn managed_run_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<Stri
 
 fn managed_run_query_suffix() -> String {
     managed_run_query_suffix_with(env_lookup)
+}
+
+/// `&session_origin=<token>` when the launcher declared a recognised origin via
+/// `AI_MEMORY_SESSION_ORIGIN` (#2180). Validated against the closed set here so
+/// an unknown value never reaches the wire; absent sends nothing, matching an
+/// ordinary interactive session.
+fn session_origin_query_suffix_with(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
+    env_lookup(SESSION_ORIGIN_ENV)
+        .and_then(|value| ai_memory_core::SessionOrigin::parse_wire(&value))
+        .map_or_else(String::new, |origin| {
+            format!("&session_origin={}", url_encode(origin.as_str()))
+        })
+}
+
+fn session_origin_query_suffix() -> String {
+    session_origin_query_suffix_with(env_lookup)
 }
 
 /// `&auto_handoff=0` when `AI_MEMORY_AUTO_HANDOFF` turns the automatic
@@ -1167,14 +1221,15 @@ fn write_success_response<W: std::io::Write>(
         agent,
         AgentKind::Muse
             | AgentKind::CodeBuddy
+            | AgentKind::WorkBuddy
             | AgentKind::IbmBob
             | AgentKind::QwenCode
             | AgentKind::Qoder
     ) && matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt)
     {
         // Muse and IBM Bob add SessionStart and UserPromptSubmit stdout to the
-        // turn as context, CodeBuddy appends exit-0 stdout of both to the
-        // session, and Qwen Code injects both as tagged model context, so a
+        // turn as context, CodeBuddy and WorkBuddy append exit-0 stdout of both
+        // to the session, and Qwen Code injects both as tagged model context, so a
         // capture-only reply stays empty rather than put `{}` in front of the
         // model on every prompt.
         Ok(())
@@ -1751,6 +1806,15 @@ where
     {
         payload = serde_json::to_string(&json)?;
     }
+    // The Codex hook supplies the label from the local index, never from stdin.
+    if agent_kind == AgentKind::Codex
+        && json
+            .as_object_mut()
+            .and_then(|body| body.remove(ai_memory_hooks::session_name::MARKER))
+            .is_some()
+    {
+        payload = serde_json::to_string(&json)?;
+    }
     let (payload_cwd, canonical_session_id) = hook_context(&args.agent, &json);
     // Hermes reports its own process cwd on every event, which for a gateway
     // is wherever the gateway started. The session's working directory is
@@ -1871,6 +1935,35 @@ where
         writeln!(stdout, "{output}")?;
         return Ok(());
     }
+    // #2122: a generated plugin that forwards a `server = "<profile>"`
+    // repository to the native hook (instead of dropping it) passes the profile
+    // name it read from the marker as `--expected-profile`. Our own route
+    // resolution must land on exactly that profile; anything else — the install
+    // default, a refusal, or a different profile — means the two marker walks
+    // diverged, so fail closed and emit nothing rather than deliver a routed
+    // repository to the wrong server (the same emit-nothing posture a refused
+    // profile below takes).
+    if let Some(expected_raw) = args.expected_profile.as_deref() {
+        let resolved_as_expected = matches!(
+            &route,
+            HookRoute::Profile(resolved)
+                if crate::server_profiles::ProfileName::parse(expected_raw)
+                    .is_some_and(|expected| expected == resolved.name)
+        );
+        if !resolved_as_expected {
+            eprintln!(
+                "{}",
+                crate::localization::process_diagnostic(&format!(
+                    "ai-memory hook: this repository did not resolve to the expected \
+                     server profile `{expected_raw}`; nothing was captured or injected"
+                ))
+            );
+            // The agent's empty success envelope — never a handoff, never a
+            // capture — exactly as the refused-profile branch below emits.
+            write_success_response(stdout, agent_kind, hook_event)?;
+            return Ok(());
+        }
+    }
     // #992: a marker that selects a server profile which does not resolve
     // emits nothing — not the event, not a handoff fetch, not a backfill.
     // Delivering to the install default instead would hand one team's
@@ -1955,6 +2048,22 @@ where
         },
         |cwd| marker_query_suffix(cwd, args.project_strategy.and_then(|s| s.baked())),
     );
+    if !external_capture
+        && agent_kind == AgentKind::Codex
+        && hook_event == HookEvent::Stop
+        && json.get("_ai_memory_capture").is_none()
+        && let Some(home) = home.as_deref()
+        && let Some(session_id) = json.get("session_id").and_then(serde_json::Value::as_str)
+        && Some(session_id) == canonical_session_id.as_deref()
+        && let Some(name) = ai_memory_hooks::session_name::codex_marker(
+            &super::agent_plugins::codex_home(home, &|key| runtime_env.var_os(key)),
+            session_id,
+            &spool_policy.sanitize,
+        )
+    {
+        json[ai_memory_hooks::session_name::MARKER] = name;
+        payload = serde_json::to_string(&json)?;
+    }
     let mut live_batch = None;
     // Claude Code runs hooks inside subagents too, tagging their events with
     // `agent_id` while `transcript_path` still names the main session's
@@ -2034,8 +2143,9 @@ where
     let mut incremental_background_drain = false;
     let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
     let managed_qs = managed_run_query_suffix();
+    let session_origin_qs = session_origin_query_suffix();
     let auto_handoff_qs = auto_handoff_query_suffix_with(env_lookup);
-    let hook_qs = format!("{qs}{session_qs}{managed_qs}{auto_handoff_qs}");
+    let hook_qs = format!("{qs}{session_qs}{managed_qs}{session_origin_qs}{auto_handoff_qs}");
 
     // Spool THIS event — an instant local write, never the network. The auth
     // mode is decided without a round-trip: an explicit `--auth-token` is
@@ -2246,6 +2356,22 @@ where
                 )
             );
         } else if agent_kind.session_start_injects_handoff() && handoff_scoped {
+            if agent_kind == AgentKind::ClaudeCode
+                && let Some(cwd) = policy_cwd.as_deref()
+            {
+                record_project_brief_state(
+                    &project_brief_state_path(
+                        &dd,
+                        &args.agent,
+                        canonical_session_id.as_deref(),
+                        policy_cwd.as_deref(),
+                    ),
+                    &marker_query_suffix_without_briefing(
+                        cwd,
+                        args.project_strategy.and_then(|s| s.baked()),
+                    ),
+                );
+            }
             let client = build_client();
             let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
             let native_session_qs = canonical_session_id.as_deref().map_or_else(
@@ -2452,6 +2578,46 @@ where
         // text. Empty handoff or any fetch error means print nothing at all
         // (kimi ignores empty stdout; warnings go to stderr).
         return Ok(());
+    }
+
+    // user-prompt, Claude Code only: `[routing] brief_on_project_change`
+    // (#2103). A prompt whose marker routes somewhere the session has not
+    // asked about asks `GET /brief` for that project's core brief. The server
+    // owns the opt-in, the "differs from the session's project" test and the
+    // once-per-project record; this side only avoids a request per prompt by
+    // asking when the marker routing changed since the last ask, and only for
+    // a marker-declared project (`project_src=marker`). The envelope is the one
+    // the inbox notice below uses. Cursor runs these hook settings too, so a
+    // Cursor payload gets nothing.
+    if hook_event == HookEvent::UserPrompt
+        && agent_kind == AgentKind::ClaudeCode
+        && ai_memory_hooks::agent_from_payload(&json) != Some(AgentKind::Cursor)
+        && let Some(cwd) = policy_cwd.as_deref()
+        && let Some(session_id) = canonical_session_id.as_deref()
+    {
+        let routing_qs = marker_query_suffix_without_briefing(
+            cwd,
+            args.project_strategy.and_then(|s| s.baked()),
+        );
+        let asked = project_brief_state_path(&dd, &args.agent, Some(session_id), Some(cwd));
+        if routing_qs.contains("&project_src=marker")
+            && !project_brief_state_matches(&asked, &routing_qs)
+        {
+            let client = build_client();
+            let bearer = hook_spool::resolve_bearer(&client, &dd, effective_token).await;
+            let brief_url = format!(
+                "{base}/brief?agent={}{routing_qs}&session_id={}&project_change=1",
+                args.agent,
+                url_encode(session_id),
+            );
+            let brief =
+                get_handoff(&client, &brief_url, bearer.as_deref(), handoff_timeout()).await;
+            record_project_brief_state(&asked, &routing_qs);
+            if let Some(brief) = brief {
+                writeln!(stdout, "{}", user_prompt_context_envelope(&brief))?;
+                return Ok(());
+            }
+        }
     }
 
     // user-prompt, Claude Code only: a repository that opted into
@@ -3340,6 +3506,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_origin_env_forwards_only_the_recognised_token() {
+        let lookup = |value: Option<&'static str>| {
+            move |name: &str| {
+                (name == SESSION_ORIGIN_ENV)
+                    .then_some(value)
+                    .flatten()
+                    .map(str::to_owned)
+            }
+        };
+        assert_eq!(
+            session_origin_query_suffix_with(lookup(Some("automation"))),
+            "&session_origin=automation",
+        );
+        assert_eq!(
+            session_origin_query_suffix_with(lookup(Some(" automation "))),
+            "&session_origin=automation",
+        );
+        // An unknown or absent origin forwards nothing, so the server sees an
+        // ordinary interactive session (#2180).
+        for none in [
+            None,
+            Some(""),
+            Some("auto"),
+            Some("Automation"),
+            Some("batch"),
+        ] {
+            assert_eq!(
+                session_origin_query_suffix_with(lookup(none)),
+                "",
+                "{none:?}"
+            );
+        }
+    }
+
     /// The regression this whole change exists for. `inspect` runs only for
     /// tool events, so a gate expressed through `CaptureDisposition` would
     /// leave prompt bodies spooling from a repository that never opted in —
@@ -3528,6 +3729,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -3708,6 +3910,17 @@ mod tests {
             (AgentKind::CodeBuddy, HookEvent::UserPrompt, b"".as_slice()),
             (
                 AgentKind::CodeBuddy,
+                HookEvent::PostToolUse,
+                b"{}\n".as_slice(),
+            ),
+            (
+                AgentKind::WorkBuddy,
+                HookEvent::SessionStart,
+                b"".as_slice(),
+            ),
+            (AgentKind::WorkBuddy, HookEvent::UserPrompt, b"".as_slice()),
+            (
+                AgentKind::WorkBuddy,
                 HookEvent::PostToolUse,
                 b"{}\n".as_slice(),
             ),
@@ -4072,6 +4285,7 @@ mod tests {
     async fn a_handoff_is_never_claimed_without_a_project_directory() {
         let cases = [
             ("codebuddy", "session-start", serde_json::json!({})),
+            ("workbuddy", "session-start", serde_json::json!({})),
             ("ibm-bob", "session-start", serde_json::json!({})),
             ("qwen-code", "session-start", serde_json::json!({})),
             ("claude-code", "session-start", serde_json::json!({})),
@@ -4601,6 +4815,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4644,6 +4859,7 @@ mod tests {
                 project_strategy: None,
                 check_capture: false,
                 capture_assistant: false,
+                expected_profile: None,
                 capture_mode: None,
             };
 
@@ -4699,6 +4915,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4732,6 +4949,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -4814,6 +5032,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -4846,6 +5065,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -7478,6 +7698,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7520,6 +7741,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         };
 
@@ -7552,6 +7774,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7565,6 +7788,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7578,6 +7802,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -7591,6 +7816,7 @@ mod tests {
             project_strategy: None,
             check_capture: false,
             capture_assistant: false,
+            expected_profile: None,
             capture_mode: None,
         }
     }
@@ -8407,6 +8633,7 @@ mod tests {
                 check_capture: false,
                 capture_assistant: false,
                 capture_mode: None,
+                expected_profile: None,
             };
             let mut stdout = Vec::new();
             run_with_payload_in_home(
@@ -9086,6 +9313,118 @@ mod tests {
         );
         assert_eq!(entries[1].token.as_deref(), Some("tok-b"));
         assert_eq!(entries[1].profile.as_deref(), Some("team-b"));
+    }
+
+    /// `--expected-profile` (#2122): a generated plugin that forwards a routed
+    /// repository to the native hook passes the profile name it read from the
+    /// marker. The native hook captures only when its own route resolution is
+    /// exactly that profile, and emits nothing — no spool entry, no stdout —
+    /// when the two diverge: a different profile, the install default, a
+    /// refused profile, or a malformed name. The matching control proves the
+    /// guard is not a blanket deny. Fails closed if the guard is removed
+    /// (every divergent case would then deliver to some server).
+    #[tokio::test]
+    async fn expected_profile_captures_on_a_match_and_fails_closed_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let work = tmp.path().join("work");
+        let repo_a = repo_with_marker(&work, "a", "server = \"team-a\"\n");
+        let repo_b = repo_with_marker(&work, "b", "server = \"team-b\"\n");
+        let plain = repo_with_marker(&work, "plain", "workspace = \"w\"\n");
+        let unknown = repo_with_marker(&work, "unknown", "server = \"nobody\"\n");
+        register_profile(
+            &data_dir,
+            "team-a",
+            "https://a.example",
+            &[&repo_a],
+            Some("tok-a"),
+        );
+        register_profile(
+            &data_dir,
+            "team-b",
+            "https://b.example",
+            &[&repo_b],
+            Some("tok-b"),
+        );
+        crate::config::store_hook_auth_token(&data_dir, "INSTALL-TOKEN").unwrap();
+        let spool = hook_spool::spool_dir(&data_dir);
+
+        let expecting = |profile: &str| {
+            let mut args = claude_args("user-prompt-submit", "https://default.example");
+            args.expected_profile = Some(profile.to_string());
+            args
+        };
+
+        // Control: the expected profile is exactly the one the marker resolves
+        // to, so the event is captured to the profile's server with its token.
+        let out = run_prompt(&data_dir, expecting("team-a"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        let entries = read_spooled_entries(&spool);
+        assert_eq!(entries.len(), 1, "a matching expected-profile captures");
+        assert_eq!(entries[0].profile.as_deref(), Some("team-a"));
+        assert_eq!(entries[0].token.as_deref(), Some("tok-a"));
+        assert!(
+            entries[0].url.starts_with("https://a.example/hook?"),
+            "{}",
+            entries[0].url
+        );
+
+        // Mismatch: the marker resolves to team-a, but team-b was expected.
+        let out = run_prompt(&data_dir, expecting("team-b"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a mismatched profile name spools nothing"
+        );
+
+        // Install default: a repo with no `server` key resolves to the install
+        // default, which is never the expected profile — do not fall back.
+        let out = run_prompt(&data_dir, expecting("team-a"), &plain).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "the install default is not the expected profile"
+        );
+
+        // Refused: the marker selects an unregistered profile (Rejected route).
+        let out = run_prompt(&data_dir, expecting("nobody"), &unknown).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a refused profile route spools nothing"
+        );
+
+        // Malformed name can never equal a validated profile.
+        let out = run_prompt(&data_dir, expecting("Bad/Name"), &repo_a).await;
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "{}\n",
+            "the empty success envelope, never a handoff"
+        );
+        assert_eq!(
+            read_spooled_entries(&spool).len(),
+            1,
+            "a malformed expected name captures nothing"
+        );
     }
 
     /// Front door for Meta Muse Code's settings.json hooks (adversarial),
@@ -11201,6 +11540,80 @@ mod tests {
         assert!(!String::from_utf8_lossy(&stdout).contains("RECAP-BODY"));
         let seen = all_requests(&mut requests).await;
         assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+    }
+
+    /// The client only re-asks for a mid-session project brief when the marker
+    /// routing changed, and never records an oversized routing (#2103).
+    #[test]
+    fn project_brief_state_tracks_the_last_marker_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = project_brief_state_path(tmp.path(), "claude-code", Some("s1"), Some("/w/api"));
+        let api = "&project=api&project_src=marker";
+        // Nothing recorded yet, so the first marker-routed prompt asks.
+        assert!(!project_brief_state_matches(&path, api));
+        record_project_brief_state(&path, api);
+        // The same routing on the next prompt matches: the client stays quiet.
+        assert!(project_brief_state_matches(&path, api));
+        // A move into another project changes the routing, so the client re-asks.
+        assert!(!project_brief_state_matches(
+            &path,
+            "&project=web&project_src=marker"
+        ));
+        // An oversized routing is refused, so the file keeps the old value and a
+        // hostile server cannot park unbounded text here.
+        let huge = "x".repeat(PROJECT_BRIEF_STATE_MAX_BYTES + 1);
+        record_project_brief_state(&path, &huge);
+        assert!(!project_brief_state_matches(&path, &huge));
+        assert!(project_brief_state_matches(&path, api));
+    }
+
+    /// A Claude Code prompt whose marker routes to a declared project asks for
+    /// that project's brief; a Cursor payload running the same Claude hook
+    /// settings asks nothing (#2103).
+    #[tokio::test]
+    async fn project_change_brief_skips_a_cursor_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join(".ai-memory.toml"), "project = \"other\"\n").unwrap();
+
+        // Claude Code: the marker routing triggers one project-change brief.
+        let (base, mut requests) = serve_requests("200 OK", "BRIEF-BODY").await;
+        let stdout = run_hook(
+            &tmp.path().join("data-claude"),
+            claude_args("user-prompt-submit", &base),
+            serde_json::json!({
+                "session_id": "claude-session",
+                "cwd": cwd,
+                "prompt": "hello"
+            }),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&stdout).contains("BRIEF-BODY"));
+        let seen = all_requests(&mut requests).await;
+        assert!(
+            seen.iter().any(|r| r.contains("project_change=1")),
+            "claude prompt must ask for the project brief: {seen:?}"
+        );
+
+        // Cursor runs the same Claude hook settings: it must not ask.
+        let (base2, mut requests2) = serve_requests("200 OK", "BRIEF-BODY").await;
+        let _ = run_hook(
+            &tmp.path().join("data-cursor"),
+            claude_args("user-prompt-submit", &base2),
+            serde_json::json!({
+                "session_id": "cursor-session",
+                "cwd": cwd,
+                "cursor_version": "2.0.0",
+                "prompt": "hello"
+            }),
+        )
+        .await;
+        let seen2 = all_requests(&mut requests2).await;
+        assert!(
+            !seen2.iter().any(|r| r.contains("project_change=1")),
+            "a Cursor payload must not ask for the project brief: {seen2:?}"
+        );
     }
 
     #[tokio::test]

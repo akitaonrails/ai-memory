@@ -70,13 +70,19 @@ log_level = "info"
 
 # Server-side half of the assistant/Stop capture opt-in (#196). When true, the
 # server persists a Claude Code Stop event's final assistant turn (sanitized and
-# capped at 2 KB) as the Stop body. OFF by default: assistant text is privacy-
-# sensitive — it can quote code, secrets, or content from paths ai-memory never
-# sees, and it flows into consolidation/reviewer prompts (and out to a cloud LLM
+# capped by `assistant_excerpt_max_bytes`, 2 KB by default) as the Stop body.
+# OFF by default: assistant text is privacy-sensitive — it can quote code,
+# secrets, or content from paths ai-memory never sees, and it flows into
+# consolidation/reviewer prompts (and out to a cloud LLM
 # provider if one is configured). This is a DOUBLE opt-in: the client must also
 # be installed with `ai-memory install-hooks --agent claude-code
 # --capture-assistant`. Env equivalent: `AI_MEMORY_CAPTURE_ASSISTANT=true`.
 # capture_assistant = false
+
+# Byte cap on that stored assistant excerpt (#2118). Raise it when long answers
+# lose their second half (2 KB is about 600 CJK characters). Clamped to 16 KiB.
+# Env equivalent: `AI_MEMORY_ASSISTANT_EXCERPT_MAX_BYTES`.
+# assistant_excerpt_max_bytes = 2000
 
 # Strip root-level anyOf/oneOf/allOf from MCP tool input schemas on every
 # tools/list, even without a `?flavor=moonshot` / `?flavor=bedrock` marker.
@@ -148,6 +154,15 @@ log_level = "info"
 # tiers). Env equivalent: `AI_MEMORY_LLM_TIMEOUT_SECS`.
 # llm_timeout_secs = 300
 
+# openai-compat only: add request metadata headers to every chat attempt, so a
+# gateway can attribute and limit traffic. `x-ai-memory-workload` names the
+# workload (consolidation, profile, dream, lint, ...); `x-ai-memory-workspace`
+# and `x-ai-memory-project` name the scope, and `x-ai-memory-user` the
+# username, only when the operation has exactly one. Values are names, never
+# page content. Other providers never send them. Off by default. Env
+# equivalent: `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`.
+# llm_request_metadata_headers = false
+
 # How many live `bootstrap` runs may call the LLM at once, across projects. A
 # second run for the same project always waits for the first. The default runs
 # one at a time; raise it when the provider batches concurrent requests (a local
@@ -165,7 +180,9 @@ log_level = "info"
 # `Name=Value` entries. Empty by default. Use it for a gateway that wants a
 # caller-identifying header; OpenCode asks for `x-opencode-session` and a
 # specific `User-Agent`. Headers ai-memory sets itself (`authorization`,
-# `content-type`, `x-api-key`, ...) are refused at startup. Values are never
+# `content-type`, `x-api-key`, ...) are refused at startup, and so are
+# `x-request-id` and the `x-ai-memory-*` metadata names for openai-compat,
+# which sends them itself. Values are never
 # logged. Env equivalent: `AI_MEMORY_LLM_HEADERS`, set as an array such as
 # `["name=value","name2=value2"]`. A plain comma separated string is rejected.
 # llm_headers = []
@@ -210,6 +227,15 @@ log_level = "info"
 # `claude_true_yolo` is deprecated and ignored since 3.4.3: `ai-memory run
 # --yolo` on Claude now always forces `bypassPermissions` over any settings
 # `defaultMode`. An older config that sets it still loads; remove the line.
+
+# How the generated Pi extension registers ai-memory's MCP tools. `direct`
+# declares every tool to the model, as before. `codemode` registers them with
+# Pi's `exposure: "codemode"`: Pi's codemode tool lists and calls them, and
+# their schemas are no longer sent to the model on every request. Tool names,
+# session headers and lifecycle capture do not change. Re-run
+# `ai-memory install-hooks --agent pi --apply` and restart Pi after changing
+# it. Env equivalent: `AI_MEMORY_PI_TOOL_EXPOSURE`.
+# pi_tool_exposure = "direct"
 
 # Cosine-similarity band `memory_lint` uses to flag two cold pages as a likely
 # contradiction: same topic without being a near-duplicate. Pages at or above
@@ -517,6 +543,12 @@ max_output_tokens = 32000
 # than English and can overshoot a provider's real input limit by about 40%.
 # Lower the margin for a corpus that is mostly non-English or code (#884).
 # input_token_safety_margin = 0.8
+#
+# Natural language for generated memory prose (session summaries, lessons, dream
+# merges, auto-improvement proposals). Unset by default: prose follows the
+# dominant language of the input. Evidence quotes, code, identifiers and paths
+# always stay verbatim. A short single-line language name, at most 40 characters.
+# output_language = "English"
 
 # Auto-improvement reviewer.
 #
@@ -630,8 +662,16 @@ min_session_age_secs = 600
 #               (`sessions.project_id` is single-valued, and consolidation
 #               writes one page in the session's project). Recommended when
 #               one agent session means one project.
+#
+# brief_on_project_change: when true, a mid-session event that resolves through a
+# `.ai-memory.toml` marker to a project other than the session's own gets that
+# project's core brief (pinned, `_rules/`, `_slots/`, within the brief budget)
+# as additional context, once per project per session. Delivered on Claude Code's
+# UserPromptSubmit. A bare cwd with no marker never triggers it. Off by default.
+# Env equivalent: `AI_MEMORY_ROUTING__BRIEF_ON_PROJECT_CHANGE`.
 [routing]
 mid_session = "follow-cwd"
+brief_on_project_change = false
 
 # How the "currently active project" pointer is keyed. Unscoped MCP calls —
 # the normal case, since the tools default to the current project — resolve
@@ -700,6 +740,13 @@ mid_session = "follow-cwd"
 # delay. Embedding backfill is off by default because it may call a paid
 # provider.
 #
+# lint_llm_interval_secs adds the LLM contradiction pass to scheduled lint, on
+# its own cadence (604800 is weekly). It makes one `lint` provider call per
+# project that has at least two semantic or procedural pages, with at most 20
+# pages of 400 characters each. Off by default; with no provider configured it
+# is skipped with one warning. While it is on, the daily rule-based run keeps
+# the last LLM findings in `_lint/report.md` instead of dropping them.
+#
 # reconcile_tombstones_deleted_pages (#929, docs/okf.md) lets the watcher's 30s
 # reconcile pass tombstone an OKF-imported content page whose file was missing
 # on two consecutive passes. Session summary pages are excluded. A circuit
@@ -713,6 +760,7 @@ mid_session = "follow-cwd"
 # enabled = true
 # forget_sweep_interval_secs = 86400
 # lint_interval_secs = 86400
+# lint_llm_interval_secs = 0
 # embedding_backfill_interval_secs = 0
 # reconcile_tombstones_deleted_pages = false
 
@@ -775,6 +823,28 @@ mid_session = "follow-cwd"
 # page up to `weight * similarity` in authority, similarity-capped, so an
 # unrelated query gains nothing. 0.0 (the default) also stops the capture: no
 # queries are stored while the boost is off.
+#
+# default_result_limit is how many hits memory_query returns when a call gives
+# no explicit `limit` (1..=100; out of range is rejected at startup). Unset
+# keeps the built-in 10. A project can override it for itself with
+# `[retrieval] default_result_limit` in its .ai-memory.toml, and an explicit
+# per-call `limit` overrides both.
+#
+# min_relevance is the lowest calibrated reranker relevance (0.0..=1.0; out of
+# range is rejected at startup) a memory_query hit may have when a call gives no
+# explicit `min_relevance`; lower-scoring hits are excluded before the count
+# limit applies. Unset applies no floor. It needs a configured reranker — a
+# query that resolves a floor with none available is rejected, since the fused
+# ranking is not a calibrated relevance score. A project can override it with
+# `[retrieval] min_relevance` in its .ai-memory.toml, and a per-call
+# `min_relevance` overrides both.
+#
+# record_history records each single-project memory_query call to a per-session
+# retrieval history the read-only /web dashboard renders, so retrieval accuracy
+# can be inspected and noisy results debugged. Off by default; turning it off
+# never disables retrieval. history_retention_per_session caps how many records
+# are kept per (workspace, project, session); unset keeps the built-in default,
+# and a value must be at least 1 (0 is rejected at startup).
 # [retrieval]
 # query_intent = false
 # session_recall_bonus = 0.25
@@ -783,6 +853,10 @@ mid_session = "follow-cwd"
 # observation_stream = true
 # feedback_demotion = 0.0
 # query_signal_weight = 0.0
+# default_result_limit = 10
+# min_relevance = 0.2
+# record_history = false
+# history_retention_per_session = 500
 
 # Words dropped from a bare natural-language FTS query before the terms are
 # OR-joined. Unset uses the built-in English list. `[]` turns the filter off. A
@@ -824,6 +898,12 @@ mid_session = "follow-cwd"
 # through 20000). apply_max_lines is the most lines `ai-memory profile apply`
 # writes into a rules file. llm lets the profile use the configured LLM
 # provider when there is one.
+#
+# harvest_prompts is "all" (the default) or "interactive". "interactive" skips
+# prompts from sessions a launcher stamped as automation (an orchestrator sets
+# `AI_MEMORY_SESSION_ORIGIN=automation` in the harness environment), so a
+# generated brief is not harvested as your own preference. Those sessions are
+# still captured, and their curated pages and stack signals still contribute.
 # [profile]
 # enabled = "auto"
 # share = "auto"
@@ -834,6 +914,7 @@ mid_session = "follow-cwd"
 # apply_max_lines = 40
 # max_output_tokens = 2000
 # llm = true
+# harvest_prompts = "all"
 
 # Admission webhooks: synchronous HTTP hooks the server calls just before it
 # persists a page (docs/admission-webhooks.md). Empty by default, so no chain is
@@ -850,8 +931,15 @@ mid_session = "follow-cwd"
 # webhook inside the write path, where it can change the page and a rejection
 # aborts the write. With blocking = false the webhook is called after the page
 # lands, its response is ignored, and a slow or down mirror adds no latency to
-# writes. `AI_MEMORY_ADMISSION_WEBHOOKS_JSON` takes a JSON array of the same
-# fields and replaces the list from this file.
+# writes. projects (default: every project) limits the webhook to the listed
+# "workspace/project" entries; a workspace-wide event matches by workspace.
+# headers adds request headers whose values are read from files, once, when the
+# server starts: a relative value_file resolves against the data dir, a missing
+# or empty file stops the server, and the value never reaches a log. Together
+# they let a bot's endpoint be woken on message_send with no relay in between;
+# the message_send context names the message id, the addressed harness and the
+# sending project, never the message text. `AI_MEMORY_ADMISSION_WEBHOOKS_JSON`
+# takes a JSON array of the same fields and replaces the list from this file.
 #   [[admission_webhooks]]
 #   name           = "contributors"
 #   url            = "http://contributors-webhook.memory.svc.cluster.local/enrich"
@@ -859,6 +947,14 @@ mid_session = "follow-cwd"
 #   failure_policy = "ignore"
 #   blocking       = true
 #   events         = ["write_page", "consolidate"]
+#
+#   [[admission_webhooks]]
+#   name     = "bot-wake"
+#   url      = "https://bot.example.test/wake"
+#   blocking = false
+#   events   = ["message_send"]
+#   projects = ["default/ops-bot"]
+#   headers  = [{ name = "Authorization", value_file = "secrets/bot-wake" }]
 
 # NOTE: `[auth]` must remain the LAST section in this template.
 # `ai-memory init` appends further `[auth]` keys (token_pepper, root_username,

@@ -10,8 +10,9 @@ can also select their own provider and fallback chain.
 Configure an optional `[llm.<task>]` table for any of these tasks:
 `consolidation`, `bootstrap`, `auto_improve`, `experience`, `dream`, `lint`,
 `profile`, `rerank`, and `query_answer`. The `query_answer` provider handles
-both `memory_query(answer=true)` and `memory_explore`. Scheduled lint remains
-rule-only.
+both `memory_query(answer=true)` and `memory_explore`. Scheduled lint is
+rule-only unless `[maintenance] lint_llm_interval_secs` turns on the LLM pass,
+which uses the `lint` provider.
 
 ```toml
 [llm.bootstrap]

@@ -138,6 +138,11 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         emit_codebuddy(&args)?;
         return Ok(());
     }
+    // WorkBuddy too: ~/.workbuddy/settings.json runs the native `hook` command.
+    if matches!(args.agent, AgentChoice::WorkBuddy) {
+        emit_workbuddy(&args)?;
+        return Ok(());
+    }
     // IBM Bob's settings run the native hook command directly too.
     if matches!(args.agent, AgentChoice::IbmBob) {
         emit_ibm_bob(&args)?;
@@ -304,6 +309,7 @@ pub fn run(config: &Config, mut args: SetupAgentArgs) -> Result<()> {
         | AgentChoice::Droid
         | AgentChoice::Muse
         | AgentChoice::CodeBuddy
+        | AgentChoice::WorkBuddy
         | AgentChoice::IbmBob
         | AgentChoice::Cline
         | AgentChoice::QwenCode
@@ -533,6 +539,32 @@ fn emit_qwen_code(args: &SetupAgentArgs) -> Result<()> {
     Ok(())
 }
 
+/// Print the `hooks` block for `~/.workbuddy/settings.json`. No scripts are
+/// staged: each entry runs the ai-memory binary's native `hook` command with
+/// WorkBuddy's event JSON on stdin. WorkBuddy fires no `SessionEnd`.
+fn emit_workbuddy(args: &SetupAgentArgs) -> Result<()> {
+    let payload = crate::commands::render_shared::build_workbuddy_hooks_payload(
+        &args.server_url,
+        args.auth_token.as_deref(),
+        None,
+        None,
+    );
+    let serialized = serde_json::to_string_pretty(&payload["hooks"])
+        .context("serializing WorkBuddy hook config")?;
+    println!("# WorkBuddy — merge under the `hooks` key of");
+    println!("# ~/.workbuddy/settings.json. The `command` must be an ai-memory");
+    println!("# binary reachable on the host that runs WorkBuddy; prefer");
+    println!("# `ai-memory install-hooks --agent workbuddy --apply` from that host.");
+    println!("# WorkBuddy fires no SessionEnd, so close a finished session with");
+    println!("# `ai-memory finalize-session --agent workbuddy`.");
+    if args.auth_token.is_some() {
+        println!("#       Treat settings.json as sensitive (chmod 600).");
+    }
+    println!();
+    println!("{serialized}");
+    Ok(())
+}
+
 fn normalise_hook_server_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
@@ -602,6 +634,7 @@ fn emit_extension_setup_hint(config: &Config, args: &SetupAgentArgs) -> Result<(
         install_hooks::run_with_opencode_dialect(
             config,
             InstallHooksArgs {
+                absolute_paths: false,
                 agent: AgentChoice::OpenCode,
                 hooks_dir: None,
                 server_url: Some(args.server_url.clone()),
@@ -765,6 +798,7 @@ fn emit_dsh(emit_root: &Path, args: &SetupAgentArgs) {
         args.auth_token.as_deref(),
         None,
         None,
+        false,
     );
     println!("# DeepSeek Harness (DSH) — DSH has no fixed agent config file.");
     println!("# Hook scripts (must be reachable from the host that runs DSH):");

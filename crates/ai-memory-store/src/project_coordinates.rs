@@ -529,6 +529,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();

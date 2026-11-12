@@ -363,6 +363,20 @@ mod tests {
             serde_json::json!({ "session_id": "s", "tool_name": "Read", "tool_use_id": "toolu_4" }),
         );
         assert!(!list.matches(&codebuddy_kept));
+        // WorkBuddy takes CodeBuddy's Claude Code-shaped `tool_name` /
+        // `tool_use_id` contract.
+        let workbuddy = agent_event(
+            "workbuddy",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "Read", "tool_input": { "file_path": "a" }, "tool_use_id": "plugin-5" }),
+        );
+        assert!(list.matches(&workbuddy));
+        let workbuddy_kept = agent_event(
+            "workbuddy",
+            "post-tool-use",
+            serde_json::json!({ "session_id": "s", "tool_name": "Read", "tool_use_id": "toolu_5" }),
+        );
+        assert!(!list.matches(&workbuddy_kept));
         // Qwen Code sends the same Claude-shaped `tool_name` / `tool_use_id`.
         let qwen = agent_event(
             "qwen-code",

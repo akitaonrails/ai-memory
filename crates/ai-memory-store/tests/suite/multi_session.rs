@@ -64,6 +64,7 @@ async fn open_session(
             agent_kind,
             cwd: Some("/repo".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4606,6 +4607,7 @@ async fn another_operators_observations_lift_their_session_page_in_a_shared_proj
             agent_kind: AgentKind::Codex,
             cwd: Some("/repo".into()),
             actor_user: Some(operator("operator-b")),
+            origin: None,
         })
         .await
         .unwrap();
@@ -4658,6 +4660,7 @@ async fn owned_session(
             agent_kind: AgentKind::Codex,
             cwd: Some("/repo".into()),
             actor_user: owner,
+            origin: None,
         })
         .await
         .unwrap();
@@ -4841,6 +4844,7 @@ async fn owned_session_purge_refuses_foreign_shared_and_wrong_scope_sessions() {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: owner.map(str::to_string),
+                origin: None,
             })
             .await
             .unwrap();
@@ -4991,6 +4995,7 @@ async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control()
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: Some("user:cascade-alice".into()),
+            origin: None,
         })
         .await
         .unwrap();
@@ -5737,6 +5742,7 @@ async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_cont
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: Some(operator(owner)),
+                origin: None,
             })
             .await
             .unwrap();
@@ -6179,6 +6185,7 @@ async fn a_refused_link_names_the_holder_only_for_the_runs_own_operator_and_harn
                 agent_kind,
                 cwd: Some("/repo".into()),
                 actor_user: actor_user.map(operator),
+                origin: None,
             })
             .await
             .unwrap();
@@ -6256,6 +6263,7 @@ async fn agent_mismatch_names_the_bound_agent_only_to_an_admitted_owner() {
         agent_kind,
         cwd: Some("/repo".into()),
         actor_user: owner.map(str::to_owned),
+        origin: None,
     };
     let event = |id: SessionId| {
         Sanitized::new(

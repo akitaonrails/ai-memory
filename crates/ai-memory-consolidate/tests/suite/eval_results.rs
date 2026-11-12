@@ -73,6 +73,7 @@ async fn eval_reason_is_sanitized_before_pending_storage_with_legitimate_control
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

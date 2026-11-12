@@ -35,7 +35,7 @@ use ai_memory_core::{
     find_marker_line,
 };
 use ai_memory_llm::{
-    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload,
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmSubject, LlmWorkload,
     complete_structured_with_operation_id,
 };
 use ai_memory_store::{
@@ -1943,10 +1943,27 @@ struct PendingSentence {
     contributor: Option<String>,
 }
 
+/// The project a classification batch was harvested from, and its author
+/// when every sentence in the batch has the same one. A batch mixing
+/// operators, or holding an unattributed sentence, names no user.
+fn classify_subject(project: &ProfileHarvestProject, batch: &[PendingSentence]) -> LlmSubject {
+    let mut contributors = batch.iter().map(|p| p.contributor.as_deref());
+    let first = contributors.next().flatten();
+    let user = first
+        .filter(|first| contributors.all(|c| c == Some(*first)))
+        .and_then(crate::llm_subject::username_of);
+    LlmSubject {
+        workspace: Some(project.workspace.clone()),
+        project: Some(project.project.clone()),
+        user,
+    }
+}
+
 async fn classify_batch(
     llm: &(dyn LlmProvider + 'static),
     sanitizer: &ai_memory_core::Sanitizer,
     batch: &[PendingSentence],
+    subject: LlmSubject,
     max_tokens: u32,
 ) -> Result<Vec<Option<DetectedPreference>>, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
@@ -1971,7 +1988,7 @@ async fn classify_batch(
     let response: ClassifyResponse = complete_structured_with_operation_id(
         llm,
         request,
-        LlmOperationId::for_workload(LlmWorkload::Profile),
+        LlmOperationId::for_workload(LlmWorkload::Profile).with_subject(subject),
     )
     .await?;
     let mut out: Vec<Option<DetectedPreference>> = vec![None; batch.len()];
@@ -2016,6 +2033,7 @@ async fn merge_entry(
     sanitizer: &ai_memory_core::Sanitizer,
     current: Option<&str>,
     entry: &EntryPlan,
+    subject: &LlmSubject,
     max_tokens: u32,
 ) -> Result<MergeResponse, ai_memory_llm::LlmError> {
     let payload = serde_json::json!({
@@ -2042,7 +2060,7 @@ async fn merge_entry(
     complete_structured_with_operation_id(
         llm,
         request,
-        LlmOperationId::for_workload(LlmWorkload::Profile),
+        LlmOperationId::for_workload(LlmWorkload::Profile).with_subject(subject.clone()),
     )
     .await
 }
@@ -2118,6 +2136,8 @@ pub async fn run_profile_pass(
     report.share = Some(share.as_str());
     let llm = llm.filter(|_| config.settings.llm);
     let max_tokens = config.settings.max_output_tokens;
+    let skip_automation =
+        config.settings.harvest_prompts == ai_memory_core::profile::HarvestPrompts::Interactive;
     let mut classify_budget = MAX_CLASSIFY_CALLS;
 
     for project in reader.profile_harvest_projects().await? {
@@ -2129,6 +2149,7 @@ pub async fn run_profile_pass(
             &project,
             &mut classify_budget,
             max_tokens,
+            skip_automation,
         )
         .await
         {
@@ -2180,6 +2201,7 @@ pub async fn run_profile_pass(
 async fn classify_splitting(
     llm: &(dyn LlmProvider + 'static),
     sanitizer: &ai_memory_core::Sanitizer,
+    project: &ProfileHarvestProject,
     batch: &[PendingSentence],
     max_tokens: u32,
     budget: &mut usize,
@@ -2203,7 +2225,15 @@ async fn classify_splitting(
         }
         *budget -= 1;
         let part = &batch[range.clone()];
-        match classify_batch(llm, sanitizer, part, max_tokens).await {
+        match classify_batch(
+            llm,
+            sanitizer,
+            part,
+            classify_subject(project, part),
+            max_tokens,
+        )
+        .await
+        {
             Ok(classified) => {
                 calls += 1;
                 for (slot, verdict) in out[range].iter_mut().zip(classified) {
@@ -2232,6 +2262,7 @@ async fn classify_splitting(
 
 /// Harvest one project from its marks. Returns new candidates, LLM calls and
 /// LLM fallbacks.
+#[allow(clippy::too_many_arguments)]
 async fn harvest_project(
     reader: &ReaderPool,
     writer: &WriterHandle,
@@ -2240,6 +2271,7 @@ async fn harvest_project(
     project: &ProfileHarvestProject,
     classify_budget: &mut usize,
     max_tokens: u32,
+    skip_automation: bool,
 ) -> Result<(usize, usize, usize), ai_memory_store::StoreError> {
     let (prompts, pages, tags) = reader
         .profile_harvest_inputs(
@@ -2247,6 +2279,7 @@ async fn harvest_project(
             project.project_id,
             project.mark,
             PROFILE_HARVEST_BATCH,
+            skip_automation,
         )
         .await?;
     // A page stamped from an auto-improve proposal the scheduler
@@ -2300,6 +2333,7 @@ async fn harvest_project(
             let (classified, answered, failed) = classify_splitting(
                 llm.as_ref(),
                 wiki.sanitizer(),
+                project,
                 batch,
                 max_tokens,
                 classify_budget,
@@ -2440,6 +2474,10 @@ struct Target {
     workspace_id: WorkspaceId,
     viewer: Option<UserId>,
     candidates: Vec<ProfileCandidateRow>,
+    /// What the merge reads and whom it acts for: the workspace of a
+    /// workspace profile, the operator of a private one, nothing for the
+    /// global profile, whose evidence spans every scope and operator.
+    subject: LlmSubject,
 }
 
 async fn convergence_targets(
@@ -2467,6 +2505,7 @@ async fn convergence_targets(
                 workspace_id: default_ws,
                 viewer: None,
                 candidates: candidates.iter().filter(shared_ok).cloned().collect(),
+                subject: LlmSubject::default(),
             }])
         }
         EffectiveProfileShare::Workspace => {
@@ -2487,6 +2526,10 @@ async fn convergence_targets(
                         workspace_id,
                         viewer: None,
                         candidates: rows,
+                        subject: LlmSubject {
+                            workspace: Some(name),
+                            ..LlmSubject::default()
+                        },
                     })
                 })
                 .collect())
@@ -2541,6 +2584,10 @@ async fn convergence_targets(
                     workspace_id: default_ws,
                     viewer: Some(user.id),
                     candidates: own,
+                    subject: LlmSubject {
+                        user: Some(user.username.clone()),
+                        ..LlmSubject::default()
+                    },
                 });
             }
             Ok(targets)
@@ -2620,6 +2667,7 @@ async fn converge_target(
                 wiki.sanitizer(),
                 current,
                 &entry,
+                &target.subject,
                 config.settings.max_output_tokens,
             )
             .await

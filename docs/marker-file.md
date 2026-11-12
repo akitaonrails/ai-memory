@@ -50,7 +50,9 @@ A marker whose only content is a `[capture]` section (see
 [Capture exclusions](#capture-exclusions) below) is **transparent** to this
 walk: `workspace`, `project`, `project_strategy`, and the other forwarded
 settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`,
-`[profile]`, `[handoff]` and `[recovery]` keys) are resolved from the nearest
+`[profile]`, `[retrieval] default_result_limit`, `[retrieval] min_relevance`,
+`[handoff]` and `[recovery]`
+keys) are resolved from the nearest
 ancestor marker that declares at least one of them, skipping past any nearer
 marker that declares nothing but `[capture]`. A subdirectory marker added only
 to exclude some paths from capture therefore no longer resets scope to
@@ -62,7 +64,8 @@ The marker path is shared by the POSIX/PowerShell hook scripts and the
 generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 `project_strategy`, `drop_subagent`, `default_global`, `briefing`,
-`briefing_budget`, `profile_contribute`, `profile_consume`, `handoff`, and
+`briefing_budget`, `profile_contribute`, `profile_consume`,
+`default_result_limit`, `min_relevance`, `handoff`, and
 `recovery` query params to the server as applicable;
 handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently. Every client also sends
@@ -244,6 +247,23 @@ inbox_notice_on_prompt = "true"
 [profile]
 contribute = false
 consume = false
+
+# Optional. This project's default result count for `memory_query` when a call
+# gives no explicit `limit` (1..=100). Forwarded by every hook client at session
+# start and recorded on the project; removing the key clears it back to the
+# global `[retrieval] default_result_limit`, then the built-in 10. An explicit
+# per-call `limit` always wins. An out-of-range value is ignored.
+#
+# Optional. This project's default relevance floor for `memory_query` when a
+# call gives no explicit `min_relevance` (0.0..=1.0): hits scoring below it are
+# excluded before the count limit. Forwarded and recorded the same way; removing
+# the key clears it back to the global `[retrieval] min_relevance`, then no
+# floor. A per-call `min_relevance` always wins, and an out-of-range value is
+# ignored. It needs a configured reranker — a query that resolves a floor with
+# none available is rejected.
+[retrieval]
+default_result_limit = 25
+min_relevance = 0.2
 ```
 
 **Naming** for `workspace` and `project`: the server stores both names
@@ -540,15 +560,21 @@ names the profile; no URL, path or token is printed.
 
 **Supported integrations.** Native `ai-memory hook` commands route profiles,
 including the session-start handoff fetch, the spooled events drained later,
-and the one-time boot backfill. The generated TypeScript integrations
-(`opencode`, `opencode2`, `omp`, `pi`, `openclaw`) do not route yet: a
-repository whose marker selects a profile emits nothing from them and fetches
-no handoff. The script hooks (the `.sh` and `.ps1` bundles used by the
-`AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper and `setup-agent`
-snippets) cannot route either, and likewise drop a routed repository's events
-and handoff fetch. Clients older than this change ignore the key and deliver to
-their install default, so upgrade every client before adding `server` to a
-shared marker.
+and the one-time boot backfill. The generated OpenCode plugins (`opencode` and
+`opencode2`) route a profile repository through that native hook: its events and
+its session-start handoff are captured on the profile's server, with the
+profile's own token, never the install default. The plugin passes the profile
+name it read from the marker as `ai-memory hook --expected-profile`, and the
+native binary re-resolves the route from the directory and captures nothing
+unless it is exactly that profile, so a divergent walk or a missing binary drops
+rather than falling back. The other generated integrations (`omp`, `pi`,
+`openclaw`) do not route yet: a repository whose marker selects a profile emits
+nothing from them and fetches no handoff. The script hooks (the `.sh` and `.ps1`
+bundles used by the `AI_MEMORY_HOOK_PLATFORM` override, the Docker host wrapper
+and `setup-agent` snippets) cannot route either, and likewise drop a routed
+repository's events and handoff fetch. Clients older than this change ignore the
+key and deliver to their install default, so upgrade every client before adding
+`server` to a shared marker.
 
 **Known limits.**
 
@@ -564,6 +590,13 @@ shared marker.
   configured with, so in a routed repository it reaches the install default.
   Point that repository's MCP client at its own server with a per-repository
   `.mcp.json`.
+- **OpenCode routed handoff.** The native hook claims a handoff exactly once,
+  so a crash after it claims the profile repository's handoff but before the
+  OpenCode plugin injects it loses that handoff (the same window the native
+  session-start path already has). The plugin also leaves a routed same-profile
+  `session.moved` uncaptured: its session-start is owned by the handoff path,
+  which does not run for a mid-session move. A cross-profile move stays
+  unsupported, as before.
 
 Profiles use static tokens only. OIDC `auth.json` stays with the install
 default and is never presented to a profile's server.
@@ -1333,6 +1366,45 @@ scratch directories, `/tmp`, data folders) already inherits the session's
 project rather than minting a phantom project named `scratchpad` or `data`.
 The host hook resolves repo-root itself, so a missing override already proves
 the cwd resolved to nothing.
+
+### Re-briefing on a project change: `[routing] brief_on_project_change`
+
+`mid_session` decides where a wandering session's observations are *recorded*,
+but the session brief — pinned pages, `_rules/`, `_slots/` — is injected only
+once, at session start, for the project the starting cwd resolved to. A session
+that starts one level up (say `~/projects`, which has no marker) and then works
+inside `~/projects/acme/site` (which has its own marker) never sees that
+project's rules.
+
+`[routing] brief_on_project_change = true` (default `false`) closes that gap for
+Claude Code. When a prompt's cwd resolves **through a marker** to a project
+other than the session's own, and that project has not been briefed in this
+session yet, the server returns its core brief — the same pinned, `_rules/` and
+`_slots/` pages a session start injects, within the same budget — as additional
+context on that prompt.
+
+```toml
+[routing]
+brief_on_project_change = false   # default; true to opt in
+```
+
+It is deliberately narrow:
+
+- **Marker only.** A bare cwd that resolves by git-root or folder name never
+  re-briefs, the same rule `mid_session` applies to rescoping. Only a
+  `.ai-memory.toml` that names a project counts (`project_src=marker`).
+- **A different project only.** A prompt that stays in the session's own project
+  asks for nothing.
+- **Once per project per session.** The server records which projects a session
+  has already been briefed into (bounded and in memory, with a 12-hour TTL);
+  losing that record can only repeat a brief, never skip the first one.
+- **Claude Code only.** It rides Claude Code's `UserPromptSubmit`; a Cursor
+  payload, which runs the same hook settings, is excluded.
+
+The opt-in, the differs-from-the-session test and the once-per-project record
+all live on the server. The hook only asks when a prompt's marker routing
+changed since the last one it asked about, so a session that stays put sends no
+extra request.
 
 ## Who reads the marker
 

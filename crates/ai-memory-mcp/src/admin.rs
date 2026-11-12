@@ -548,35 +548,6 @@ const fn default_open_handoffs_limit() -> usize {
     50
 }
 
-/// Query for `GET /admin/messages` (cross-project agent messaging, V64).
-#[derive(Debug, Deserialize)]
-struct ListMessagesQuery {
-    workspace: String,
-    project: String,
-    #[serde(rename = "box", default = "default_message_box")]
-    mailbox: String,
-    #[serde(default = "default_list_messages_limit")]
-    limit: usize,
-}
-
-fn default_message_box() -> String {
-    "inbox".into()
-}
-
-const fn default_list_messages_limit() -> usize {
-    50
-}
-
-/// Body cap for `POST /admin/messages/send` (V64). The body crosses a
-/// project-isolation boundary and is untrusted input on the receiving side;
-/// capped the same way handoff text fields are, after secret-scrubbing.
-const MESSAGE_BODY_MAX_CHARS: usize = 8000;
-
-/// Subject cap for `POST /admin/messages/send` (V64).
-const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
-/// Supporting evidence cap for cross-project messages (#1428).
-const MESSAGE_EVIDENCE_MAX_CHARS: usize = 1_000;
-
 #[derive(Debug, Deserialize)]
 struct PendingWritesQuery {
     workspace: String,
@@ -767,10 +738,10 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/curator", post(handle_curator))
         .route("/admin/handoffs", get(handle_open_handoffs_list))
         .route("/admin/handoffs/expire", post(handle_expire_handoffs))
-        .route("/admin/messages", get(handle_list_messages))
-        .route("/admin/messages/send", post(handle_send_message))
-        .route("/admin/messages/pop", post(handle_pop_message))
-        .route("/admin/messages/cancel", post(handle_cancel_messages))
+        .route("/admin/messages", get(crate::messages::list))
+        .route("/admin/messages/send", post(crate::messages::send))
+        .route("/admin/messages/pop", post(crate::messages::pop))
+        .route("/admin/messages/cancel", post(crate::messages::cancel))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -878,6 +849,17 @@ pub fn admin_router_with_sweep_tuning(
             ledger_retention,
             compact_cold_episodic,
         }))
+}
+
+impl axum::extract::FromRef<Arc<AdminState>> for crate::messages::MessageState {
+    fn from_ref(state: &Arc<AdminState>) -> Self {
+        Self {
+            reader: state.reader.clone(),
+            writer: state.writer.clone(),
+            wiki: state.wiki.clone(),
+            trusted_proxy_identity: state.trusted_proxy_identity,
+        }
+    }
 }
 
 async fn require_root_for_multiuser_admin(
@@ -2370,7 +2352,7 @@ async fn handle_read_page(
 // ---------------------------------------------------------------------
 
 /// Build a 500 response carrying the given message.
-fn internal_err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn internal_err(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": msg.into() })),
@@ -2570,7 +2552,7 @@ fn with_manifest_warning(
     (status, Json(body))
 }
 
-fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
     let status = if err.is_bad_request() {
         StatusCode::BAD_REQUEST
     } else if err.is_forbidden() {
@@ -2586,7 +2568,7 @@ fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>)
     )
 }
 
-fn skip_webhooks_for_admin_request(
+pub(crate) fn skip_webhooks_for_admin_request(
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     headers: &HeaderMap,
 ) -> Vec<String> {
@@ -2666,6 +2648,9 @@ async fn handle_bootstrap(
         dry_run: req.dry_run,
         force: req.force,
         resume: req.resume,
+        // `[consolidation] output_language` rides on the server-configured
+        // review config; AppState holds no other consolidation settings.
+        output_language: state.auto_improve_review_config.output_language.clone(),
     };
 
     let bootstrap = Bootstrap {
@@ -2845,6 +2830,7 @@ async fn handle_auto_improve(
         max_rule_page_tokens: req.max_rule_page_tokens,
         max_procedure_page_tokens: req.max_procedure_page_tokens,
         eval: state.auto_improve_review_config.eval.clone(),
+        output_language: state.auto_improve_review_config.output_language.clone(),
     };
 
     let report =
@@ -3546,315 +3532,6 @@ async fn handle_expire_handoffs(
 /// (default) is mail addressed to it, `box=outbox` is mail it has sent and
 /// can still cancel. Oldest first, capped at `limit`. See
 /// `docs/agent-messaging.md`.
-async fn handle_list_messages(
-    State(state): State<Arc<AdminState>>,
-    Query(query): Query<ListMessagesQuery>,
-) -> impl IntoResponse {
-    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
-    {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
-    let mailbox = match query.mailbox.as_str() {
-        "inbox" => ai_memory_core::MessageBox::Inbox,
-        "outbox" => ai_memory_core::MessageBox::Outbox,
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("box must be \"inbox\" or \"outbox\", got {other:?}")
-                })),
-            );
-        }
-    };
-    let limit = query.limit.clamp(1, 200);
-    match state.reader.list_messages(ws, proj, mailbox, limit).await {
-        Ok(messages) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "messages": messages })),
-        ),
-        Err(e) => internal_err(e.to_string()),
-    }
-}
-
-/// `POST /admin/messages/send` request body (V64).
-#[derive(Debug, Deserialize)]
-struct SendMessageRequest {
-    from_workspace: String,
-    from_project: String,
-    to_workspace: String,
-    to_project: String,
-    #[serde(default)]
-    subject: Option<String>,
-    #[serde(default)]
-    nature: ai_memory_core::MessageNature,
-    #[serde(default)]
-    evidence: Option<String>,
-    body: String,
-}
-
-/// Map a message-store failure to a response. `InvalidState` is the
-/// full-inbox rejection (`ops::MAX_PENDING_INBOX_MESSAGES`) — a caller error,
-/// not a server fault, so it surfaces as 409 rather than 500 (mirrors
-/// [`map_user_store_err`]).
-fn map_message_store_err(e: StoreError) -> (StatusCode, Json<serde_json::Value>) {
-    match e {
-        StoreError::InvalidState(msg) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": msg })),
-        ),
-        other => internal_err(other.to_string()),
-    }
-}
-
-/// `POST /admin/messages/send` — drop a message into another project's
-/// inbox (V64). Both scopes are resolved with the no-create lookup: sending
-/// to a typo'd project must fail closed rather than silently creating it.
-///
-/// Security: `body` and `subject` are secret-scrubbed with the same
-/// [`ai_memory_core::Sanitizer`] the hook ingress uses before they are
-/// capped and stored — this endpoint is not a path around redaction.
-async fn handle_send_message(
-    State(state): State<Arc<AdminState>>,
-    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
-    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
-    headers: HeaderMap,
-    Json(req): Json<SendMessageRequest>,
-) -> impl IntoResponse {
-    let (from_ws, from_proj) =
-        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.from_project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
-    let (to_ws, to_proj) =
-        match lookup_ws_proj_no_create(&state, &req.to_workspace, &req.to_project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
-
-    let sanitizer = ai_memory_core::Sanitizer::builtin();
-    let body =
-        ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
-    let subject = req
-        .subject
-        .as_deref()
-        .map(|s| {
-            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS)
-        })
-        .filter(|s| !s.is_empty());
-    let evidence = req
-        .evidence
-        .as_deref()
-        .map(|value| {
-            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(value), MESSAGE_EVIDENCE_MAX_CHARS)
-        })
-        .filter(|value| !value.trim().is_empty());
-    if req.nature == ai_memory_core::MessageNature::Measured && evidence.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "evidence_required: measured messages require non-empty evidence"
-            })),
-        );
-    }
-
-    let distinguishes = match state
-        .reader
-        .distinguishes_operators(state.trusted_proxy_identity)
-        .await
-    {
-        Ok(d) => d,
-        Err(e) => return internal_err(e.to_string()),
-    };
-    // Owner is the sender's storage key, same as `handoff_begin` — attribution
-    // only (never a read filter), and `None` when the actor is anonymous or
-    // the deployment doesn't tell its operators apart.
-    let from_owner_user = ai_memory_core::owner_stamp(
-        actor_ext
-            .as_ref()
-            .and_then(|axum::Extension(actor)| actor.identity_key())
-            .as_ref(),
-        distinguishes,
-    );
-
-    let message = ai_memory_core::NewAgentMessage {
-        from_workspace_id: from_ws,
-        from_project_id: from_proj,
-        from_agent: AgentKind::Other,
-        from_session_id: None,
-        from_owner_user,
-        to_workspace_id: to_ws,
-        to_project_id: to_proj,
-        to_agent: None,
-        subject,
-        body,
-        nature: req.nature,
-        evidence,
-    };
-
-    // Match MCP's crossing-point admission and post-commit observer ordering.
-    // CLI sends must not silently bypass a configured message_send subscriber.
-    let actor = actor_ext
-        .map(|axum::Extension(actor)| actor)
-        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
-    let admission = match state
-        .wiki
-        .authorize_operation(
-            to_ws,
-            to_proj,
-            AdmissionOp::MessageSend,
-            actor,
-            skip_webhooks_for_admin_request(level_ext, &headers),
-        )
-        .await
-    {
-        Ok(ctx) => ctx,
-        // A refusal by policy, as on the MCP path — not a server fault.
-        Err(e) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": format!("message send refused by admission: {e}")
-                })),
-            );
-        }
-    };
-    match state.writer.insert_message(message).await {
-        Ok(id) => {
-            if let Some(ctx) = admission.as_ref() {
-                state.wiki.notify_operation_observers(ctx);
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "message_id": id.to_string() })),
-            )
-        }
-        Err(e) => map_message_store_err(e),
-    }
-}
-
-/// `POST /admin/messages/pop` request body (V64).
-#[derive(Debug, Deserialize)]
-struct PopMessageRequest {
-    #[serde(default)]
-    agent: Option<AgentKind>,
-    workspace: String,
-    project: String,
-    #[serde(default)]
-    message_id: Option<String>,
-}
-
-fn parse_optional_message_id(
-    raw: Option<&str>,
-) -> Result<Option<ai_memory_core::MessageId>, (StatusCode, Json<serde_json::Value>)> {
-    raw.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::parse::<ai_memory_core::MessageId>)
-        .transpose()
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "message_id must be a full UUID" })),
-            )
-        })
-}
-
-/// `POST /admin/messages/pop` — claim exactly one pending message from this
-/// project's inbox (V64). With `message_id`, pops that one; otherwise the
-/// oldest pending. Returns `{"message": null}` when nothing matched.
-async fn handle_pop_message(
-    State(state): State<Arc<AdminState>>,
-    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
-    Json(req): Json<PopMessageRequest>,
-) -> impl IntoResponse {
-    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
-    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    let distinguishes = match state
-        .reader
-        .distinguishes_operators(state.trusted_proxy_identity)
-        .await
-    {
-        Ok(d) => d,
-        Err(e) => return internal_err(e.to_string()),
-    };
-    let claiming_user = ai_memory_core::owner_stamp(
-        actor_ext
-            .as_ref()
-            .and_then(|axum::Extension(actor)| actor.identity_key())
-            .as_ref(),
-        distinguishes,
-    );
-
-    let claim = ai_memory_core::MessageClaim {
-        workspace_id: ws,
-        project_id: proj,
-        claiming_agent: req
-            .agent
-            .or_else(|| {
-                actor_ext
-                    .as_ref()
-                    .and_then(|a| a.0.agent.as_deref())
-                    .map(AgentKind::from_wire)
-            })
-            .unwrap_or(AgentKind::Other),
-        claiming_session: None,
-        claiming_user,
-    };
-
-    match state.writer.pop_message(claim, specific_id).await {
-        Ok(Some(message)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "message": message,
-                "security_notice": ai_memory_core::UNTRUSTED_MESSAGE_NOTICE,
-            })),
-        ),
-        Ok(None) => (StatusCode::OK, Json(serde_json::json!({ "message": null }))),
-        Err(e) => internal_err(e.to_string()),
-    }
-}
-
-/// `POST /admin/messages/cancel` request body (V64).
-#[derive(Debug, Deserialize)]
-struct CancelMessagesRequest {
-    workspace: String,
-    project: String,
-    #[serde(default)]
-    message_id: Option<String>,
-}
-
-/// `POST /admin/messages/cancel` — retract still-pending outbox messages
-/// this project sent (V64). With `message_id`, cancels just that one;
-/// otherwise every pending message the project has sent.
-async fn handle_cancel_messages(
-    State(state): State<Arc<AdminState>>,
-    Json(req): Json<CancelMessagesRequest>,
-) -> impl IntoResponse {
-    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
-    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
-        Ok(id) => id,
-        Err(e) => return e,
-    };
-
-    match state.writer.cancel_messages(ws, proj, specific_id).await {
-        Ok(cancelled) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "cancelled": cancelled })),
-        ),
-        Err(e) => internal_err(e.to_string()),
-    }
-}
-
 async fn handle_pending_writes_list(
     State(state): State<Arc<AdminState>>,
     Query(query): Query<PendingWritesQuery>,
@@ -4399,6 +4076,7 @@ async fn handle_lint(
                 }),
             contradiction_band_min: state.contradiction_band_min,
             contradiction_band_max: state.contradiction_band_max,
+            keep_llm_findings: false,
         },
     )
     .await
@@ -10301,6 +9979,8 @@ mod tests {
             },
             events: vec![AdmissionOp::MessageSend],
             blocking: reject,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -10362,6 +10042,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_message_send_webhook_ctx_names_the_message() {
+        let (_tmp, _store, router, _ws, _recipient, mut rx, release, server) =
+            message_send_fixture(false).await;
+        let response = router.oneshot(message_send_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let (payload, _) = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ctx = &payload["ctx"];
+        assert_eq!(
+            ctx["message_id"], sent["message_id"],
+            "the id the send returned"
+        );
+        assert_eq!(ctx["from_workspace"], "default");
+        assert_eq!(ctx["from_project"], "sender");
+        assert!(ctx["to_agent"].is_null(), "admin sends shared mail: {ctx}");
+        assert!(
+            !payload.to_string().contains("Synthetic result"),
+            "observer must not copy message text"
+        );
+        release.notify_one();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn admin_message_send_reject_leaves_inbox_empty() {
         let (_tmp, store, router, ws, recipient, mut rx, _release, server) =
             message_send_fixture(true).await;
@@ -10369,6 +10079,53 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let (_, committed_count) = rx.recv().await.unwrap();
         assert_eq!(committed_count, 0);
+        assert!(
+            store
+                .reader
+                .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    /// `/messages*` opened mail to database users; `/admin/messages*` must not
+    /// follow, because every `/admin/*` route is root-only in multi-user mode.
+    #[tokio::test]
+    async fn admin_message_routes_stay_root_only_for_a_database_user() {
+        let (_tmp, store, router, ws, recipient, _rx, _release, server) =
+            message_send_fixture(false).await;
+        store
+            .writer
+            .create_human_user(
+                ai_memory_core::NewUser {
+                    username: "alice".into(),
+                    name: None,
+                    email: None,
+                },
+                ai_memory_core::UserRole::User,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        for (method, uri) in [
+            ("GET", "/admin/messages?workspace=default&project=recipient"),
+            ("POST", "/admin/messages/send"),
+            ("POST", "/admin/messages/pop"),
+            ("POST", "/admin/messages/cancel"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .extension(ai_memory_core::AuthLevel::User)
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
         assert!(
             store
                 .reader
@@ -10743,6 +10500,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -10758,6 +10516,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: None,
                     actor_user: Some(IdentityKey::User(owner.into()).storage_key()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -10981,6 +10740,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -10997,6 +10757,7 @@ mod tests {
                     agent_kind: AgentKind::Codex,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: Some(IdentityKey::User(user.into()).storage_key()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -11194,6 +10955,7 @@ mod tests {
                     agent_kind,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -12663,6 +12425,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12822,6 +12585,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12965,6 +12729,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13086,6 +12851,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13190,6 +12956,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -13347,6 +13114,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -14308,6 +14076,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -14421,6 +14191,8 @@ mod tests {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -14527,6 +14299,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -14639,6 +14413,8 @@ mod tests {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage, AdmissionOp::PurgeProject],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())

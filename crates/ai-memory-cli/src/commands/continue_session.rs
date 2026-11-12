@@ -102,6 +102,7 @@ pub async fn run(config: &Config, args: ContinueArgs) -> Result<i32> {
                 project_id,
                 workstream: None,
                 new_workstream: None,
+                or_new: false,
                 executable: None,
                 yolo: args.yolo,
                 true_yolo: args.true_yolo,

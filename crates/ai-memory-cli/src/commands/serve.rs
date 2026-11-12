@@ -1458,6 +1458,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
+            config.consolidation.output_language.clone(),
         ))
         .with_active_project(active_project.clone())
         .with_sanitizer(sanitizer.clone())
@@ -1465,6 +1466,12 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_per_user_slots(config.slots.per_user)
         .with_profile(config.profile.clone())
         .with_answer_context_budget(config.query_answer.max_context_tokens)
+        .with_default_limit(config.retrieval.default_result_limit)
+        .with_default_min_relevance(config.retrieval.min_relevance)
+        .with_retrieval_history_recording(
+            config.retrieval.record_history,
+            config.retrieval.history_retention_per_session,
+        )
         .with_strip_root_combinators(config.strip_root_combinators)
         .with_gemini_safe_schemas(config.gemini_safe_schemas);
     if let Some(e) = embedder.clone() {
@@ -1497,6 +1504,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         config.contradiction_band_max,
         config.consolidate_on_session_end,
         consolidator.is_some(),
+        config.consolidation.output_language.clone(),
     )
     .await;
 
@@ -1668,11 +1676,15 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 )),
                 ingest_gates: ai_memory_hooks::IngestGates::default(),
                 session_agents: ai_memory_hooks::SessionAgents::default(),
+                project_briefs: ai_memory_hooks::ProjectBriefs::new(
+                    config.routing.brief_on_project_change,
+                ),
                 cwd_probes: ai_memory_hooks::CwdProbes::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
                 session_consolidation_notify,
                 profile_notify: Some(profile_notify.clone()),
                 capture_assistant_enabled: config.capture_assistant,
+                assistant_excerpt_max_bytes: config.assistant_excerpt_max_bytes,
                 claim_handoff_on_session_start: config.handoff.claim_on_session_start,
                 create_handoff_on_session_end: config.handoff.create_on_session_end,
                 per_user_slots: config.slots.per_user,
@@ -1722,6 +1734,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     auto_improve_require_approval: config.auto_improve.require_approval,
                     auto_improve_review_config: auto_improve_review_config_from_settings(
                         &config.auto_improve,
+                        config.consolidation.output_language.clone(),
                     ),
                     embedder: embedder.clone(),
                     provider_health: provider_health.clone(),
@@ -1847,7 +1860,15 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 axum::Router::new()
                     .nest_service("/mcp", mcp_service)
                     .merge(hooks)
-                    .merge(workstreams),
+                    .merge(workstreams)
+                    .merge(ai_memory_mcp::messages::router(
+                        ai_memory_mcp::messages::MessageState {
+                            reader: store.reader.clone(),
+                            writer: store.writer.clone(),
+                            wiki: wiki.clone(),
+                            trusted_proxy_identity: auth_state.actor_proxy_bearer().is_some(),
+                        },
+                    )),
                 store.reader.clone(),
                 auth_state.clone(),
             );
@@ -2201,6 +2222,7 @@ async fn start_maintenance_scheduler(
     contradiction_band_max: f32,
     consolidate_on_session_end: bool,
     has_session_consolidator: bool,
+    output_language: Option<String>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -2209,6 +2231,13 @@ async fn start_maintenance_scheduler(
 
     let forget_sweep_interval_secs = settings.forget_sweep_interval_secs;
     let lint_interval_secs = settings.lint_interval_secs;
+    let lint_llm = llm_providers.get(LlmWorkload::Lint).cloned();
+    let lint_llm_interval_secs = scheduled_llm_lint_interval(
+        maintenance_enabled,
+        settings.lint_llm_interval_secs,
+        lint_llm.is_some(),
+    );
+    let lint_turn = Arc::new(tokio::sync::Mutex::new(()));
     let embedding_backfill_interval_secs = settings.embedding_backfill_interval_secs;
 
     // A3 cold-cluster dedup targets the running server's configured embedder
@@ -2337,28 +2366,28 @@ async fn start_maintenance_scheduler(
         }));
     }
 
-    if maintenance_enabled && lint_interval_secs > 0 {
+    let lint_jobs = if maintenance_enabled {
+        scheduled_lint_jobs(lint_interval_secs, lint_llm_interval_secs)
+    } else {
+        Vec::new()
+    };
+    for (interval_secs, job, pass) in lint_jobs {
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
-        let llm = llm_providers.get(LlmWorkload::Lint).cloned();
+        let llm = lint_llm.clone();
+        let lint_turn = lint_turn.clone();
         tasks.push(tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(lint_interval_secs);
+            let interval = std::time::Duration::from_secs(interval_secs);
             run_persisted_maintenance_job(
                 writer,
-                ai_memory_store::MaintenanceJob::RuleLint,
+                job,
                 interval,
                 {
                     let reader = reader.clone();
                     move || {
                         let reader = reader.clone();
-                        async move {
-                            Ok(reader
-                                .maintenance_job_last_success(
-                                    ai_memory_store::MaintenanceJob::RuleLint,
-                                )
-                                .await?)
-                        }
+                        async move { Ok(reader.maintenance_job_last_success(job).await?) }
                     }
                 },
                 || jiff::Timestamp::now().as_microsecond(),
@@ -2366,6 +2395,7 @@ async fn start_maintenance_scheduler(
                     let reader = reader.clone();
                     let wiki = wiki.clone();
                     let llm = llm.clone();
+                    let lint_turn = lint_turn.clone();
                     let decay_params = decay.decay_params();
                     async move {
                         let started = std::time::Instant::now();
@@ -2376,20 +2406,29 @@ async fn start_maintenance_scheduler(
                             decay_params,
                             contradiction_band_min,
                             contradiction_band_max,
+                            pass,
+                            &lint_turn,
                         )
                         .await?;
                         if outcome.errors > 0 {
-                            anyhow::bail!(
-                                "scheduled rule-based lint had {} scope errors",
-                                outcome.errors
-                            );
+                            match pass {
+                                ScheduledLintPass::Rules { .. } => anyhow::bail!(
+                                    "scheduled rule-based lint had {} scope errors",
+                                    outcome.errors
+                                ),
+                                ScheduledLintPass::Llm => anyhow::bail!(
+                                    "scheduled LLM lint had {} scope errors",
+                                    outcome.errors
+                                ),
+                            }
                         }
                         info!(
                             scopes = outcome.scopes,
                             findings = outcome.findings,
                             errors = outcome.errors,
                             elapsed_ms = started.elapsed().as_millis(),
-                            "scheduled rule-based lint completed"
+                            "scheduled {} completed",
+                            pass.label()
                         );
                         Ok(())
                     }
@@ -2476,7 +2515,10 @@ async fn start_maintenance_scheduler(
         let writer = writer.clone();
         let wiki = wiki.clone();
         let scheduler_settings = ScheduledAutoImproveSettings {
-            review: auto_improve_review_config_from_settings(&auto_improve),
+            review: auto_improve_review_config_from_settings(
+                &auto_improve,
+                output_language.clone(),
+            ),
             require_approval: auto_improve.require_approval,
             min_session_age_secs: scheduler.min_session_age_secs,
             max_sessions_per_tick: scheduler.max_sessions_per_tick,
@@ -2485,6 +2527,7 @@ async fn start_maintenance_scheduler(
                     sessions: scheduler.experience_sessions.max(1),
                     min_new_sessions: scheduler.experience_every_sessions,
                     entropy_filter: scheduler.experience_entropy_filter,
+                    output_language: output_language.clone(),
                     ..ai_memory_consolidate::ExperienceConfig::default()
                 }
             }),
@@ -2553,6 +2596,7 @@ async fn start_maintenance_scheduler(
                 let wiki = wiki.clone();
                 let activity_clock = activity_clock.clone();
                 let interval = std::time::Duration::from_secs(dream.effective_interval_secs());
+                let dream_output_language = output_language.clone();
                 tasks.push(tokio::spawn(async move {
                     run_dream_scheduler_loop(
                         reader,
@@ -2563,6 +2607,7 @@ async fn start_maintenance_scheduler(
                         embedding,
                         activity_clock,
                         interval,
+                        dream_output_language,
                     )
                     .await;
                 }));
@@ -2686,10 +2731,11 @@ async fn run_dream_scheduler_loop(
     embedding: ai_memory_consolidate::EmbeddingCoord,
     activity_clock: ai_memory_consolidate::ActivityClock,
     interval: std::time::Duration,
+    output_language: Option<String>,
 ) {
     /// How often the cancel watcher samples the activity clock during a run.
     const DREAM_ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
-    let cfg = dream.dream_config(Some(embedding));
+    let cfg = dream.dream_config(Some(embedding), output_language);
     let decay_params = decay.decay_params();
     loop {
         tokio::time::sleep(interval).await;
@@ -2881,6 +2927,72 @@ struct ScheduledLintTickOutcome {
     errors: usize,
 }
 
+/// The interval of the scheduled LLM lint pass (#2021), or 0 when it does not
+/// run. It is opt-in, and without a lint provider it is skipped with one
+/// warning, so a zero-LLM server keeps exactly the rule-based schedule
+/// (invariant #13).
+fn scheduled_llm_lint_interval(maintenance_enabled: bool, secs: u64, has_provider: bool) -> u64 {
+    if !maintenance_enabled || secs == 0 {
+        return 0;
+    }
+    if !has_provider {
+        tracing::warn!(
+            "[maintenance] lint_llm_interval_secs is set but no LLM provider serves lint; \
+             the scheduled LLM lint pass is skipped"
+        );
+        return 0;
+    }
+    secs
+}
+
+/// The scheduled lint jobs to start: `(interval_secs, job, pass)` for each
+/// interval that is not 0. While the LLM pass runs, the rule pass keeps its
+/// findings in the report instead of dropping them a day later.
+fn scheduled_lint_jobs(
+    rule_secs: u64,
+    llm_secs: u64,
+) -> Vec<(u64, ai_memory_store::MaintenanceJob, ScheduledLintPass)> {
+    [
+        (
+            rule_secs,
+            ai_memory_store::MaintenanceJob::RuleLint,
+            ScheduledLintPass::Rules {
+                keep_llm_findings: llm_secs > 0,
+            },
+        ),
+        (
+            llm_secs,
+            ai_memory_store::MaintenanceJob::LlmLint,
+            ScheduledLintPass::Llm,
+        ),
+    ]
+    .into_iter()
+    .filter(|(secs, _, _)| *secs > 0)
+    .collect()
+}
+
+/// Which lint a scheduled tick runs over every scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledLintPass {
+    /// Rule-based findings only (`[maintenance] lint_interval_secs`).
+    /// `keep_llm_findings` copies the last LLM pass's findings into the new
+    /// report while the scheduled LLM pass is on.
+    Rules { keep_llm_findings: bool },
+    /// Rule-based findings plus the LLM contradiction pass
+    /// (`[maintenance] lint_llm_interval_secs`, #2021).
+    Llm,
+}
+
+impl ScheduledLintPass {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rules { .. } => "rule-based lint",
+            Self::Llm => "LLM lint",
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_scheduled_lint_tick(
     reader: &ReaderPool,
     wiki: &Wiki,
@@ -2888,7 +3000,12 @@ async fn run_scheduled_lint_tick(
     decay: ai_memory_store::DecayParams,
     contradiction_band_min: f32,
     contradiction_band_max: f32,
+    pass: ScheduledLintPass,
+    turn: &tokio::sync::Mutex<()>,
 ) -> Result<ScheduledLintTickOutcome> {
+    // Both scheduled lint jobs rewrite each project's `_lint/report.md`, and
+    // the rule pass copies the LLM pass's findings from it: they take turns.
+    let _turn = turn.lock().await;
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledLintTickOutcome {
         scopes: scopes.len(),
@@ -2904,14 +3021,18 @@ async fn run_scheduled_lint_tick(
             scope.project_id,
             ai_memory_consolidate::LintOptions {
                 dry_run: false,
-                use_llm: false,
+                use_llm: pass == ScheduledLintPass::Llm,
                 decay,
-                // The automatic scheduled lint stays rule-based: the A5
-                // contradiction detector is on for the user-invoked
-                // `memory_lint` / admin lint, not the background sweep.
+                // The A5 embedding-band detector stays on the user-invoked
+                // `memory_lint` / admin lint, not the background passes.
                 embedding: None,
                 contradiction_band_min,
                 contradiction_band_max,
+                keep_llm_findings: match pass {
+                    ScheduledLintPass::Rules { keep_llm_findings } => keep_llm_findings,
+                    // A scope whose LLM call fails keeps its last findings.
+                    ScheduledLintPass::Llm => true,
+                },
             },
         )
         .await
@@ -2990,6 +3111,7 @@ async fn run_scheduled_embedding_backfill_tick(
 
 fn auto_improve_review_config_from_settings(
     settings: &AutoImproveSettings,
+    output_language: Option<String>,
 ) -> AutoImproveReviewConfig {
     AutoImproveReviewConfig {
         min_observations: settings.min_observations,
@@ -3020,6 +3142,7 @@ fn auto_improve_review_config_from_settings(
             targets: settings.eval.targets.clone(),
             min_delta: settings.eval.min_delta,
         },
+        output_language,
     }
 }
 
@@ -3225,6 +3348,7 @@ fn configure_consolidator(
             )
             .with_per_user_slots(config.slots.per_user)
             .with_verbatim_residue(config.consolidation.verbatim_residue)
+            .with_output_language(config.consolidation.output_language.clone())
             .with_prompt_limits(
                 config.consolidation.max_input_tokens,
                 config.consolidation.max_output_tokens,
@@ -4628,6 +4752,7 @@ mod tests {
                 enabled: false,
                 forget_sweep_interval_secs: 1,
                 lint_interval_secs: 1,
+                lint_llm_interval_secs: 0,
                 embedding_backfill_interval_secs: 1,
                 reconcile_tombstones_deleted_pages: false,
             },
@@ -4645,6 +4770,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4700,6 +4826,7 @@ mod tests {
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
                 false,
                 false,
+                None,
             )
             .await;
             assert_eq!(
@@ -4721,6 +4848,7 @@ mod tests {
                 enabled: true,
                 forget_sweep_interval_secs: 0,
                 lint_interval_secs: 60,
+                lint_llm_interval_secs: 0,
                 embedding_backfill_interval_secs: 0,
                 reconcile_tombstones_deleted_pages: false,
             },
@@ -4728,6 +4856,7 @@ mod tests {
                 enabled: true,
                 forget_sweep_interval_secs: 60,
                 lint_interval_secs: 0,
+                lint_llm_interval_secs: 0,
                 embedding_backfill_interval_secs: 0,
                 reconcile_tombstones_deleted_pages: false,
             },
@@ -4749,6 +4878,7 @@ mod tests {
                 ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
                 false,
                 false,
+                None,
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -4768,6 +4898,7 @@ mod tests {
             enabled: true,
             forget_sweep_interval_secs: 0,
             lint_interval_secs: 60,
+            lint_llm_interval_secs: 0,
             embedding_backfill_interval_secs: 0,
             reconcile_tombstones_deleted_pages: false,
         };
@@ -4789,6 +4920,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert_eq!(tasks.len(), 2);
@@ -4816,6 +4948,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             false,
             false,
+            None,
         )
         .await;
         assert_eq!(tasks.len(), 3);
@@ -4846,6 +4979,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             true,
             true,
+            None,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4872,6 +5006,7 @@ mod tests {
                 cwd: Some("/repo".into()),
                 actor_user: None,
                 occurred_at: Some(last_activity),
+                origin: None,
             })
             .await
             .unwrap();
@@ -4901,6 +5036,7 @@ mod tests {
                 enabled: true,
                 forget_sweep_interval_secs: 0,
                 lint_interval_secs: 0,
+                lint_llm_interval_secs: 0,
                 embedding_backfill_interval_secs: 0,
                 reconcile_tombstones_deleted_pages: false,
             },
@@ -4920,6 +5056,7 @@ mod tests {
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             true,
             true,
+            None,
         )
         .await;
 
@@ -5343,6 +5480,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5447,6 +5585,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5512,6 +5651,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5620,6 +5760,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5726,6 +5867,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: Some("user:alice".into()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -5827,6 +5969,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5968,6 +6111,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -6173,6 +6317,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -6520,6 +6665,10 @@ mod tests {
             ai_memory_store::DecayParams::default(),
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            ScheduledLintPass::Rules {
+                keep_llm_findings: false,
+            },
+            &tokio::sync::Mutex::new(()),
         )
         .await
         .unwrap();
@@ -6543,6 +6692,244 @@ mod tests {
                 .count();
             assert_eq!(lint_pages, 1, "lint should write one report per project");
         }
+    }
+
+    /// Reports one contradiction per structured call and counts the calls.
+    struct ContradictingLlm(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl LlmProvider for ContradictingLlm {
+        fn name(&self) -> &'static str {
+            "contradicting"
+        }
+
+        fn model(&self) -> &str {
+            "contradicting"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { unreachable!("lint asks for structured output") })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(serde_json::json!({ "findings": [{
+                    "kind": "contradiction",
+                    "severity": "warning",
+                    "message": "scheduled contradiction",
+                    "pages": ["notes/a.md", "notes/b.md"],
+                }]}))
+            })
+        }
+    }
+
+    async fn two_projects_with_knowledge() -> (TempDir, Store, Wiki, WorkspaceId, [ProjectId; 2]) {
+        let (tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for project in [first, second] {
+            for (path, title) in [("notes/a.md", "A"), ("notes/b.md", "B")] {
+                write_test_page(&wiki, ws, project, path, title, Tier::Semantic).await;
+            }
+        }
+        (tmp, store, wiki, ws, [first, second])
+    }
+
+    fn report_of(wiki: &Wiki, ws: WorkspaceId, project: ProjectId) -> String {
+        wiki.read_page(ws, project, &PagePath::new("_lint/report.md").unwrap())
+            .map(|page| page.body)
+            .unwrap_or_default()
+    }
+
+    /// #2021: the LLM tick runs the contradiction pass once per project, and
+    /// the rule tick that runs while it is on keeps those findings.
+    #[tokio::test]
+    async fn scheduled_llm_lint_tick_covers_all_projects_and_the_rule_tick_keeps_it() {
+        let (_tmp, store, wiki, ws, projects) = two_projects_with_knowledge().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm: Arc<dyn LlmProvider> = Arc::new(ContradictingLlm(calls.clone()));
+        let turn = tokio::sync::Mutex::new(());
+        let tick = |pass| {
+            run_scheduled_lint_tick(
+                &store.reader,
+                &wiki,
+                Some(&llm),
+                ai_memory_store::DecayParams::default(),
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                pass,
+                &turn,
+            )
+        };
+
+        // A tick waits while the other lint job holds the turn.
+        let held = turn.lock().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), tick(ScheduledLintPass::Llm))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(held);
+
+        let outcome = tick(ScheduledLintPass::Llm).await.unwrap();
+        assert_eq!(
+            (outcome.scopes, outcome.errors, outcome.findings),
+            (2, 0, 2)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let kept = tick(ScheduledLintPass::Rules {
+            keep_llm_findings: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(kept.findings, 2);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the rule tick never calls the provider"
+        );
+        for project in projects {
+            assert!(report_of(&wiki, ws, project).contains("scheduled contradiction"));
+        }
+
+        let rules_only = tick(ScheduledLintPass::Rules {
+            keep_llm_findings: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(rules_only.findings, 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn scheduled_lint_jobs_follow_both_intervals() {
+        use ai_memory_store::MaintenanceJob::{LlmLint, RuleLint};
+        let rules = |keep_llm_findings| ScheduledLintPass::Rules { keep_llm_findings };
+        assert_eq!(
+            scheduled_lint_jobs(86_400, 0),
+            [(86_400, RuleLint, rules(false))]
+        );
+        assert_eq!(
+            scheduled_lint_jobs(86_400, 604_800),
+            [
+                (86_400, RuleLint, rules(true)),
+                (604_800, LlmLint, ScheduledLintPass::Llm)
+            ]
+        );
+        assert_eq!(
+            scheduled_lint_jobs(0, 604_800),
+            [(604_800, LlmLint, ScheduledLintPass::Llm)]
+        );
+        assert!(scheduled_lint_jobs(0, 0).is_empty());
+    }
+
+    /// The LLM pass is opt-in and needs a lint provider; a zero-LLM server
+    /// keeps the rule-based schedule (invariant #13).
+    #[test]
+    fn scheduled_llm_lint_needs_the_key_maintenance_and_a_provider() {
+        assert_eq!(scheduled_llm_lint_interval(true, 604_800, true), 604_800);
+        assert_eq!(scheduled_llm_lint_interval(true, 604_800, false), 0);
+        assert_eq!(scheduled_llm_lint_interval(false, 604_800, true), 0);
+        assert_eq!(scheduled_llm_lint_interval(true, 0, true), 0);
+    }
+
+    /// End to end through the scheduler: the LLM job persists its own
+    /// cadence row, and the rule job is untouched when its interval is 0.
+    /// Without a provider the same settings start no lint task at all.
+    #[tokio::test(start_paused = true)]
+    async fn scheduler_runs_the_llm_lint_job_only_with_a_provider() {
+        let settings = MaintenanceSettings {
+            enabled: true,
+            forget_sweep_interval_secs: 0,
+            lint_interval_secs: 0,
+            lint_llm_interval_secs: 1,
+            embedding_backfill_interval_secs: 0,
+            reconcile_tombstones_deleted_pages: false,
+        };
+        let start = |store: &Store, wiki: Wiki, providers: LlmProviders| {
+            start_maintenance_scheduler(
+                settings.clone(),
+                AutoImproveSettings::default(),
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki,
+                None,
+                providers,
+                crate::config::DecaySettings::default(),
+                crate::config::SessionsSettings::default(),
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+                ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+                false,
+                false,
+                None,
+            )
+        };
+
+        let (_tmp, store, wiki, _ws, _projects) = two_projects_with_knowledge().await;
+        let tasks = start(&store, wiki, LlmProviders::default()).await;
+        // Only the hollow-project sweep.
+        assert_eq!(tasks.len(), 1);
+        for task in tasks {
+            task.abort();
+        }
+
+        let (_tmp, store, wiki, ws, projects) = two_projects_with_knowledge().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut providers = LlmProviders::default();
+        providers
+            .overrides
+            .insert(LlmWorkload::Lint, Arc::new(ContradictingLlm(calls.clone())));
+        let tasks = start(&store, wiki.clone(), providers).await;
+        assert_eq!(tasks.len(), 2);
+        // Step paused time past the startup delay (the 1s interval) until the
+        // job's real store and wiki work completes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while store
+            .reader
+            .maintenance_job_last_success(ai_memory_store::MaintenanceJob::LlmLint)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "LLM lint never succeeded"
+            );
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        for task in tasks {
+            task.abort();
+        }
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        for project in projects {
+            assert!(report_of(&wiki, ws, project).contains("scheduled contradiction"));
+        }
+        assert_eq!(
+            store
+                .reader
+                .maintenance_job_last_success(ai_memory_store::MaintenanceJob::RuleLint)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

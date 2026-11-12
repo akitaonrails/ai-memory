@@ -104,6 +104,12 @@ pub struct HookQuery {
     /// Invocation-scoped `ai-memory run` lease. Absent for every direct
     /// harness launch, preserving legacy capture and handoff behavior.
     pub managed_run: Option<String>,
+    /// How a launcher started this session, forwarded from
+    /// `AI_MEMORY_SESSION_ORIGIN` (#2180). Only a recognised token
+    /// (`automation`) is honored; anything else is ignored. Absent for an
+    /// ordinary interactive session. Stamped on the session row so the profile
+    /// harvester can be told to skip automation sessions' prompts.
+    pub session_origin: Option<String>,
     /// Invocation-scoped opt-out of the automatic handoff, forwarded by the
     /// host hook from `AI_MEMORY_AUTO_HANDOFF` (#1951). An explicit falsy
     /// value keeps this session's end or turn checkpoint from leaving a
@@ -197,6 +203,10 @@ pub struct HookEnvelope {
     pub all_owners_requested: bool,
     /// Invocation-scoped managed-run id forwarded by the host hook.
     pub managed_run: Option<String>,
+    /// Validated session origin forwarded by the launcher, or `None` for an
+    /// ordinary interactive session (#2180). Stamped on the session row so the
+    /// profile harvester can skip automation sessions' prompts.
+    pub session_origin: Option<ai_memory_core::SessionOrigin>,
     /// Whether this execution opted out of the automatic handoff (the
     /// `auto_handoff=0` query flag, from `AI_MEMORY_AUTO_HANDOFF`, #1951).
     pub auto_handoff_off: bool,
@@ -262,6 +272,7 @@ impl std::fmt::Debug for HookEnvelope {
                 &self.recall_default_global_requested,
             )
             .field("managed_run", &self.managed_run)
+            .field("session_origin", &self.session_origin)
             .field("auto_handoff_off", &self.auto_handoff_off)
             .field(
                 "capture_assistant_requested",
@@ -714,6 +725,10 @@ impl HookEnvelope {
         let recall_default_global_requested = query_flag_truthy(query.default_global.as_deref());
         let all_owners_requested = query_flag_truthy(query.all_owners.as_deref());
         let managed_run = query.managed_run.filter(|value| !value.trim().is_empty());
+        let session_origin = query
+            .session_origin
+            .as_deref()
+            .and_then(ai_memory_core::SessionOrigin::parse_wire);
         let auto_handoff_off = query_flag_falsy(query.auto_handoff.as_deref());
         let capture_assistant_requested = query_flag_truthy(query.capture_assistant.as_deref());
         let extension = normalize_extension_name(query.extension.as_deref());
@@ -809,6 +824,7 @@ impl HookEnvelope {
             recall_default_global_requested,
             all_owners_requested,
             managed_run,
+            session_origin,
             auto_handoff_off,
             capture_assistant_requested,
             ingest_key,
@@ -923,19 +939,16 @@ impl HookEnvelope {
     /// fire-and-forget, so this never errors.
     #[must_use]
     pub fn occurred_at_micros(&self) -> Option<i64> {
-        let parsed = self
-            .occurred_at
-            .as_deref()?
-            .parse::<jiff::Timestamp>()
-            .ok()?
-            .as_microsecond();
-        let now = jiff::Timestamp::now().as_microsecond();
-        if parsed > 0 && parsed <= now.saturating_add(MAX_OCCURRED_AT_FUTURE_SKEW_MICROS) {
-            Some(parsed)
-        } else {
-            None
-        }
+        bounded_hook_timestamp(self.occurred_at.as_deref()?).map(|ts| ts.as_microsecond())
     }
+}
+
+/// Accept a native timestamp only within the hook clock-skew allowance.
+pub(crate) fn bounded_hook_timestamp(raw: &str) -> Option<jiff::Timestamp> {
+    let ts = raw.parse::<jiff::Timestamp>().ok()?;
+    let micros = ts.as_microsecond();
+    let now = jiff::Timestamp::now().as_microsecond();
+    (micros > 0 && micros <= now.saturating_add(MAX_OCCURRED_AT_FUTURE_SKEW_MICROS)).then_some(ts)
 }
 
 /// How far ahead of server time a client-supplied `occurred_at` may sit
@@ -1015,6 +1028,8 @@ const fn closed_tool_agent(agent: AgentKind) -> bool {
             // (#1299). Unknown values stay `Other` and keep the capture-only
             // path.
             | AgentKind::CodeBuddy
+            // WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract.
+            | AgentKind::WorkBuddy
             | AgentKind::IbmBob
             // DSH's Claude Code hooks bridge (`@deepseek-ai/dsh-hooks-claude-code`)
             // forwards Claude Code's snake_case tool fields for PreToolUse /
@@ -2767,6 +2782,8 @@ mod tests {
         assert_eq!(parse_agent("poolside"), AgentKind::Pool);
         assert_eq!(parse_agent("codebuddy"), AgentKind::CodeBuddy);
         assert_eq!(parse_agent("code-buddy"), AgentKind::CodeBuddy);
+        assert_eq!(parse_agent("workbuddy"), AgentKind::WorkBuddy);
+        assert_eq!(parse_agent("work-buddy"), AgentKind::WorkBuddy);
         assert_eq!(parse_agent("qwen-code"), AgentKind::QwenCode);
         assert_eq!(parse_agent("qwen"), AgentKind::QwenCode);
         assert_eq!(parse_agent("qwencode"), AgentKind::QwenCode);
@@ -2871,6 +2888,54 @@ mod tests {
             HookQuery {
                 event: "post-tool-use".into(),
                 agent: Some("codebuddy-2".into()),
+                ..Default::default()
+            },
+            raw,
+        );
+        assert_eq!(unknown.agent, AgentKind::Other);
+        assert!(unknown.title_hint.is_none());
+        assert!(unknown.body_excerpt.is_none());
+    }
+
+    /// WorkBuddy takes CodeBuddy's Claude Code-shaped tool payload. The same
+    /// body under `agent=workbuddy` is a closed tool observation; under an
+    /// unknown agent it stays capture-only (`title` empty, no tool family).
+    #[test]
+    fn workbuddy_post_tool_use_uses_the_claude_shaped_parser() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "cwd": "/repo",
+            "tool_name": "Read",
+            "tool_use_id": "toolu_workbuddy",
+            "tool_input": {"file_path": "src/lib.rs"},
+            "tool_response": "file contents"
+        });
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("workbuddy".into()),
+                ..Default::default()
+            },
+            raw.clone(),
+        );
+        assert_eq!(env.agent, AgentKind::WorkBuddy);
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/repo"));
+        assert_eq!(env.title_hint.as_deref(), Some("tool file"));
+        let body = env.body_excerpt.expect("structured tool body");
+        assert!(body.starts_with("tool_family: file\n"), "{body}");
+        assert!(body.contains("outcome: unknown"), "{body}");
+        assert!(body.contains("tool_call_id: toolu_workbuddy"), "{body}");
+        assert!(body.contains("\n---\nfile contents"), "{body}");
+
+        let unknown = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "post-tool-use".into(),
+                agent: Some("workbuddy-2".into()),
                 ..Default::default()
             },
             raw,

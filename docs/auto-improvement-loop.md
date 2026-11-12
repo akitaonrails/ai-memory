@@ -267,6 +267,36 @@ the exact digest and provenance limits.
 Do not create new session pages from the auto-improvement loop. Session pages
 already come from session-end consolidation.
 
+## User Corrections
+
+A user who rejects, corrects, interrupts or undoes the agent's work and says
+why has shown exactly the mistake the next agent is likely to repeat. The
+reviewer turns that into a page. A standing preference or prohibition goes to
+`_rules/`, as a patch when a `_rules/` page on the topic already exists. An
+approach that failed for a technical reason goes to `gotchas/`. Either way the
+page says what to avoid, the user's reason and what to do instead, and its
+evidence quotes the user verbatim.
+
+The reviewer is told to recognize a correction by what it means, not by a
+keyword list, so the language the user writes in does not matter. Only the
+user's own words count, and those come from `user-prompt` observations. Agent
+text, tool output, file contents and commit messages never count, even when
+they claim to quote the user, and the agent correcting itself does not count
+either. A refusal with no reason is skipped, and so is a one-off choice such
+as a single rename.
+
+Limits:
+
+- Zero-LLM installs never run the reviewer, so no correction is learned there.
+- With the default `require_approval = false`, a misread correction that
+  passes validation (`min_confidence` and the optional eval gate) is written
+  straight to `_rules/`, and a project that turns on the on-start brief loads
+  it into every new session until someone reverts it. Shared servers should
+  keep `require_approval = true`.
+- An auto-approved page does not feed the cross-project profile; a
+  human-approved one does, in any language. The profile's own reading of
+  prompts still pre-filters sentences with English and Portuguese markers.
+
 ## Negative Filters
 
 The review prompt should explicitly reject these as durable learning:
@@ -279,6 +309,7 @@ The review prompt should explicitly reject these as durable learning:
 | Transient missing binaries, credentials, or setup state | These become stale false constraints. |
 | Broad negative tool claims | `tool X is broken` hardens into future refusals after the tool is fixed. |
 | One-off task narratives | Session pages already preserve chronology. |
+| Corrections with no reason that generalizes | A bare "no" or a single rename is task detail, not a rule. |
 | Resolved transient failures | Capture the retry or fix pattern, not the temporary failure. |
 | User-visible status only | Use handoff or `_slots/current-focus.md`, not durable semantic pages. |
 

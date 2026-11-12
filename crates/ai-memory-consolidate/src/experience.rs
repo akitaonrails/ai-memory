@@ -45,6 +45,10 @@ pub struct ExperienceConfig {
     /// unchanged. Advisory (invariant #16): a skipped page is not consolidated,
     /// never deleted.
     pub entropy_filter: crate::entropy_filter::EntropyFilterConfig,
+    /// Optional operator override fixing the output language of generated
+    /// prose (`[consolidation] output_language`). `None` keeps the dominant
+    /// input-language behavior; evidence stays verbatim either way. (#2185)
+    pub output_language: Option<String>,
 }
 
 impl Default for ExperienceConfig {
@@ -54,6 +58,7 @@ impl Default for ExperienceConfig {
             min_new_sessions: 5,
             max_session_page_chars: 6_000,
             entropy_filter: crate::entropy_filter::EntropyFilterConfig::default(),
+            output_language: None,
         }
     }
 }
@@ -216,7 +221,10 @@ pub async fn run_experience_review(
     let existing_index = ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable);
     let estimated_input_tokens = estimate_tokens(&prompt);
     let request = ChatRequest {
-        system: Some(EXPERIENCE_SYSTEM_PROMPT.to_string()),
+        system: Some(crate::with_output_language(
+            EXPERIENCE_SYSTEM_PROMPT,
+            experience.output_language.as_deref(),
+        )),
         messages: vec![ChatMessage {
             role: Role::User,
             content: prompt,
@@ -227,7 +235,8 @@ pub async fn run_experience_review(
     let raw: AutoImproveLlmResponse = complete_structured_with_operation_id(
         llm,
         request,
-        LlmOperationId::for_workload(LlmWorkload::Experience),
+        LlmOperationId::for_workload(LlmWorkload::Experience)
+            .with_subject(crate::llm_subject::scope(reader, workspace_id, Some(project_id)).await),
     )
     .await
     .map_err(AutoImproveError::from)?;
@@ -314,6 +323,19 @@ mod tests {
         );
         assert!(EXPERIENCE_SYSTEM_PROMPT.contains("do not make English the output language"));
         assert!(EXPERIENCE_SYSTEM_PROMPT.contains("evidence quotes verbatim"));
+    }
+
+    #[test]
+    fn output_language_override_extends_the_experience_prompt() {
+        assert_eq!(
+            crate::with_output_language(EXPERIENCE_SYSTEM_PROMPT, None),
+            EXPERIENCE_SYSTEM_PROMPT,
+            "default leaves the prompt unchanged"
+        );
+        let out = crate::with_output_language(EXPERIENCE_SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(EXPERIENCE_SYSTEM_PROMPT));
+        assert!(out.contains("## OUTPUT LANGUAGE — OPERATOR OVERRIDE"));
+        assert!(out.contains("rationale in English"));
     }
 
     #[test]

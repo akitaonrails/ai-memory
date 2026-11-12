@@ -399,7 +399,11 @@ The design enforces this on several levels:
   outbox/cancel by the sender coordinate.
 
 On a shared/multi-user server, sending requires the normal write capability, and
-each message records who sent it for audit.
+each message records who sent it for audit. The CLI and the MCP tools apply the
+same per-project grants: `ai-memory message` calls `/messages*` with the
+operator's own key. Listing needs read access to the project. Popping,
+cancelling and receiving a message need write access. Naming a project as the
+sender needs read access to it. The `/admin/messages*` routes remain root-only.
 
 ## On-start "hot context" and the inbox notice
 
@@ -484,3 +488,15 @@ Both notice clients need a server with this release. An older server ignores
 `inbox_only` and still returns only the notice (the clients also send
 `handoff=0&recovery=0&profile_digest=0`), but it republishes the active
 project on each fetch.
+
+### Waking a long-running bot
+
+A bot or other long-running agent that is not a Claude Code session can be
+woken by an observer webhook on `message_send` ([admission
+webhooks](admission-webhooks.md)). Limit the webhook to the bot's project with
+`projects`, and give the bot's endpoint its credential with `headers`, whose
+value the server reads from a file at startup. The webhook's context names the
+queued message (`message_id`), the addressed harness and the sending project,
+never the text, so the bot pops exactly that message with
+`memory_message_pop` and `message_id`. Delivery is best effort: keep a periodic
+`memory_message_list` as the fallback for a dropped event.

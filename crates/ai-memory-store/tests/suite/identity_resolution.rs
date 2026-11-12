@@ -1208,6 +1208,7 @@ async fn authorized_write_promotes_in_place_and_preserves_dependents_and_legacy_
             agent_kind: AgentKind::Codex,
             cwd: Some("/clone/api".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1485,6 +1486,7 @@ async fn audit_failure_rolls_back_promotion_and_keeps_the_writer_alive() {
             cwd: Some("/rollback/api".into()),
             actor_user: None,
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1977,6 +1979,7 @@ async fn a_twin_with_data_or_a_restricted_candidate_stays_ambiguous_with_a_way_f
             agent_kind: ai_memory_core::AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

@@ -230,6 +230,7 @@ fn dream_on() -> DreamConfig {
         max_clusters_per_run: 0,
         min_cold_pages: 0,
         idle_window_secs: 0,
+        output_language: None,
     }
 }
 
@@ -792,6 +793,7 @@ async fn s1_similarity_lint_flags_band_pair_without_deleting() {
             }),
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            keep_llm_findings: false,
         },
     )
     .await

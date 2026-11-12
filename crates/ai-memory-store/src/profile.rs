@@ -414,32 +414,44 @@ pub(crate) fn profile_prompts_since(
     project_id: ProjectId,
     since: i64,
     limit: usize,
+    skip_automation: bool,
 ) -> StoreResult<Vec<ProfilePromptRow>> {
     let limit = i64::try_from(limit.clamp(1, PROFILE_HARVEST_BATCH)).unwrap_or(1);
-    let mut stmt = conn.prepare_cached(
+    // `[profile] harvest_prompts = "interactive"` drops prompts from sessions a
+    // launcher stamped as automation (#2180), so a generated orchestrator brief
+    // is not harvested as the operator's own preference. A row with no session
+    // (NULL-joined) or a NULL origin is an ordinary session and stays in.
+    let origin_filter = if skip_automation {
+        "AND (s.origin IS NULL OR s.origin != ?6) "
+    } else {
+        ""
+    };
+    let sql = format!(
         "SELECT o.session_id, o.created_at, o.body, s.actor_user \
          FROM observations o LEFT JOIN sessions s ON s.id = o.session_id \
          WHERE o.workspace_id = ?1 AND o.project_id = ?2 AND o.kind = ?3 \
-           AND o.created_at > ?4 \
-         ORDER BY o.created_at ASC LIMIT ?5",
-    )?;
-    let rows = stmt.query_map(
-        params![
-            workspace_id.as_bytes(),
-            project_id.as_bytes(),
-            ai_memory_core::ObservationKind::UserPrompt.as_str(),
-            since,
-            limit
-        ],
-        |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        },
-    )?;
+           AND o.created_at > ?4 {origin_filter}\
+         ORDER BY o.created_at ASC LIMIT ?5"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(workspace_id.as_bytes().to_vec()),
+        Box::new(project_id.as_bytes().to_vec()),
+        Box::new(ai_memory_core::ObservationKind::UserPrompt.as_str()),
+        Box::new(since),
+        Box::new(limit),
+    ];
+    if skip_automation {
+        binds.push(Box::new(ai_memory_core::SessionOrigin::Automation.as_str()));
+    }
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
     let mut prompts = Vec::new();
     for row in rows {
         let (session, created_at, body, contributor) = row?;

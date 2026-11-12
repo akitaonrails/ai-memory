@@ -90,6 +90,7 @@ async fn seed_session(
             agent_kind: AgentKind::ClaudeCode,
             cwd: Some("/repo".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .expect("session");

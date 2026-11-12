@@ -284,6 +284,34 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > startup for that provider; the dynamic value must not be shadowed or
 > duplicated.
 
+> [!TIP]
+> **`openai-compat` can also say what each operation is.** With
+> `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS=true` (`llm_request_metadata_headers
+> = true`), every chat attempt carries, next to `X-Request-Id`:
+>
+> | Header | Value | Sent when |
+> | --- | --- | --- |
+> | `x-ai-memory-workload` | `consolidation`, `profile`, `dream`, `lint`, `auto-improve`, `experience`, `bootstrap`, `query-answer`, `rerank` or `unspecified` | always |
+> | `x-ai-memory-workspace` | workspace name | the operation reads one workspace |
+> | `x-ai-memory-project` | project name | the operation reads one project |
+> | `x-ai-memory-user` | username | the operation acts for one user |
+>
+> A gateway can use them to attribute cost or apply a limit per workload,
+> project or user. A header the operation cannot name with one value is left
+> out, never guessed: a profile classification batch mixing several
+> operators' sentences sends no user, a `memory_query` answer (whose
+> evidence spans projects) sends no scope, and the rerank call sends only the
+> workload. A value that is not a valid HTTP header value (a non-ASCII
+> project name, for example) is also left out. The values are identifiers,
+> never page content. The setting is off by default, only `openai-compat`
+> sends these headers (the official providers, `opencode`, and a fallback to
+> another provider never do), and the four names are refused in
+> `AI_MEMORY_LLM_HEADERS` for `openai-compat` whether or not the setting is
+> on. The setting is server-wide: an `openai-compat` entry in
+> `llm_fallbacks` sends the headers to its own endpoint too, so turn it on
+> only when every `openai-compat` endpoint you configure may see your
+> workspace, project and user names.
+
 ### Probing the server's own provider
 
 `ai-memory llm-test` builds a provider from the shell it runs in. That is the

@@ -11,6 +11,182 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- A per-project default result count for `memory_query`. A project can set
+  `[retrieval] default_result_limit = N` (`1..=100`) in its `.ai-memory.toml`;
+  the hook clients forward it at session start and the server records it on the
+  project (migration V105), so a `memory_query` with no explicit `limit`
+  returns `N` hits for that project. The global `[retrieval]
+  default_result_limit` config key sets the same default server-wide. Precedence
+  is an explicit per-call `limit`, then the project's value, then the global
+  config, then the built-in 10; every layer is clamped to `1..=100`. Unset
+  everywhere, behavior is unchanged. (#2038)
+- A minimum relevance threshold for `memory_query`. A new per-call
+  `min_relevance` argument (`0.0..=1.0`) excludes hits scoring below it before
+  the count limit applies, so a query can ask for only confidently relevant
+  results. A project can set a default floor with `[retrieval] min_relevance` in
+  its `.ai-memory.toml` (forwarded at session start, recorded on the project via
+  migration V106), and the global `[retrieval] min_relevance` config key sets one
+  server-wide; precedence is the call value, then the project's, then the global
+  config, then no floor. The threshold keys off the reranker's calibrated score
+  only — a query that resolves a floor with no reranker configured is rejected
+  rather than applied to the uncalibrated fusion rank, and it is rejected on
+  `global` and `as_of` queries, which do not rerank. When the reranker scores no
+  hit for a query (a transient failure, or too few candidates), the hits are
+  returned unfiltered with a `relevance_filter_unavailable` note instead of being
+  dropped. Unset everywhere, behavior is unchanged. (#2038)
+- An opt-in per-session retrieval-history dashboard. With `[retrieval]
+  record_history = true`, each single-project `memory_query` call records what it
+  returned — the scrubbed query, resolved scope, active streams, effective filter
+  settings, duration, result count, any soft notice, and every returned page's
+  path, version, relevance score and ranking explanation — to a new table
+  (migration V107), pruned to `[retrieval] history_retention_per_session` records
+  per session (default 500). A read-only page at
+  `/w/<ws>/<proj>/s/<session>/retrievals`, linked from the session timeline,
+  renders it behind the same per-project authorization and session-owner filter,
+  so an operator can inspect retrieval accuracy and debug noisy results.
+  Recording is best-effort (a query never fails on it) and off by default;
+  turning it off never disables retrieval, and a session that ran before it was
+  enabled honestly shows nothing. (#2038)
+- `[consolidation] output_language` fixes the natural language of generated
+  memory prose — session summaries, cross-session lessons, dream merges, and
+  auto-improvement proposals — regardless of the input's language (for example
+  `output_language = "English"`). Unset by default, so prose keeps following the
+  dominant language of the input. Evidence quotes, code, identifiers, file paths,
+  and raw session history always stay verbatim in their original language.
+  (#2185)
+- `[profile] harvest_prompts = "interactive"` keeps an orchestrator's generated
+  session briefs out of the cross-project profile. A launcher sets
+  `AI_MEMORY_SESSION_ORIGIN=automation` in the harness environment; the hook
+  clients forward it, the server stamps a new `sessions.origin` column
+  (migration V104), and the profile harvester skips `user-prompt` observations
+  from those sessions. Capture, handoff and recall are unchanged, and the
+  automated sessions' curated pages and stack signals still contribute. The
+  default, `all`, harvests every session's prompts exactly as before (#2180).
+- `ai-memory call <tool> [json-arguments]` is a shell path to every MCP
+  tool for agents that cannot or should not load MCP (`memory_query`,
+  `memory_briefing`, `memory_patch_page`, `memory_handoff_begin`, and the rest).
+  It posts the call to the configured server's `/mcp` endpoint the way the
+  other thin-client commands reach the server and prints the tool's text
+  result. With no tool name it lists the server's tools and their input
+  schemas. A call that names no `workspace`, `project`, `project_id` or
+  `global` gets the current directory's project filled in, by the same rule as
+  the session-less `mcp-bridge` (#1979). It exits non-zero on a tool error or
+  a JSON-RPC error, and 2 on arguments that are not one JSON object (#2182).
+- Added first-party Tencent WorkBuddy support. `workbuddy` (alias
+  `work-buddy`) is an `AgentKind` (migration V103), so hook events are
+  attributed to it and a Claude Code-shaped tool payload (`tool_name`,
+  `tool_input`, `tool_response`) is stored as a closed tool observation
+  instead of an empty `other` capture. `install-hooks --agent workbuddy`
+  merges native `ai-memory hook --event … --agent workbuddy` commands for six
+  events (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  `PreCompact`, `Stop`) into the `hooks` key of `~/.workbuddy/settings.json`,
+  keeps sibling settings and your own hooks, and changes nothing on a re-run.
+  There is no script bundle. WorkBuddy fires no `SessionEnd`, so a finished
+  session closes with `ai-memory finalize-session --agent workbuddy`.
+  `install-mcp --client workbuddy` writes Claude Code's HTTP entry
+  (`type: "http"`, `url`, optional `headers`) under `mcpServers` in
+  `~/.workbuddy/mcp.json` (a token-file install gets the session-less stdio
+  bridge); WorkBuddy only activates the new server after you trust it in its
+  custom connector settings (自定义连接器), so approve `ai-memory` there after
+  the install. `install-skills --agent workbuddy` writes the managed skills to
+  `~/.workbuddy/skills` (global) or `.workbuddy/skills` (project). `setup`
+  wires WorkBuddy when `~/.workbuddy` exists, `setup-agent --agent workbuddy`
+  prints the hook block, and `uninstall` removes the entries. Transcript
+  backfill and managed workstreams are not part of this change (#2184).
+- The generated OpenCode plugins (V1 and V2) now capture a server-routed
+  repository (`server = "<profile>"`, #992) through the native hook instead of
+  dropping it. Its tool, prompt and lifecycle events, and its session-start
+  handoff, reach only the profile's server, authenticated with the profile's
+  own token; a new `ai-memory hook --expected-profile <name>` guard re-resolves
+  the route from the directory and emits nothing unless it is exactly that
+  profile, so a divergent walk or a missing binary drops rather than falling
+  back to the install default. A repository without a `server` key keeps its
+  existing direct capture. The native binary's path is now baked into both
+  OpenCode plugins regardless of assistant capture (#2122).
+- `ai-memory run --workstream NAME --or-new` selects the named workstream when
+  it exists and creates it, as `--new NAME` would, when the server reports it
+  does not — instead of failing with a 404 or a 409. The run line names the
+  branch taken (`selected existing workstream NAME` / `created workstream
+  NAME`). `--or-new` requires `--workstream` and conflicts with `--new`; if a
+  racing caller creates the name first, it is selected rather than duplicated
+  (#2045).
+- `[routing] brief_on_project_change` (default `false`) re-briefs the agent when
+  a session moves mid-session into another project. When a Claude Code prompt's
+  cwd resolves through a `.ai-memory.toml` marker to a project other than the
+  one the session started in, and that project has not been briefed in this
+  session yet, its core brief (pinned, `_rules/`, `_slots/`, within the brief
+  budget) is returned as additional context — once per project per session. A
+  bare cwd with no marker never triggers it; the server owns the opt-in, the
+  differs-from-session test and the once-per-session record, and a Cursor
+  payload (which runs the same hook settings) is excluded (#2103).
+- `[maintenance] lint_llm_interval_secs` (default `0`, off) runs the LLM
+  contradiction pass across every project on its own persisted cadence, with
+  one `lint` provider call per project that has enough semantic pages. With no
+  provider it is skipped with one warning. While it is on, the daily rule-based
+  lint keeps the last LLM findings in `_lint/report.md`, and the two scheduled
+  jobs never run at the same time. `memory_briefing` and the `/api/v1` briefing
+  now carry `lint`, the warning and finding counts of the project's latest
+  report, and a session start in a project whose report lists warnings gets one
+  count-only line pointing at it (#2021).
+- `pi_tool_exposure` (`AI_MEMORY_PI_TOOL_EXPOSURE`) chooses how the generated
+  Pi extension registers ai-memory's MCP tools. `direct`, the default, keeps
+  today's behavior. `codemode` registers each tool with Pi's
+  `exposure: "codemode"`, so Pi's codemode tool lists and calls them without
+  their schemas being declared to the model. Preview, `--apply` and the
+  `ai-memory upgrade` refresh all read the setting; tool names, session
+  headers and lifecycle capture are unchanged (#1988).
+- Added an opt-in, development-only Raw-RAG retrieval baseline to
+  `ai-memory-eval`: overlapping source windows, local dense retrieval and
+  cross-encoder reranking, with pinned models and per-window provenance.
+  The shipped server, capture pipeline and retrieval defaults are unchanged (#2017).
+- Added Pi session token totals from saved usage at agent stops and shutdown.
+  Reloads, resumes and repeated reports preserve cumulative input, output and
+  cache counts; missing usage stays unknown. Totals follow Pi's session history,
+  including copied fork history. Per-response Pi ledger records remain
+  unsupported; update the server and reinstall the Pi extension to enable
+  session reporting (#1984, #1985).
+- `llm_request_metadata_headers` (`AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`),
+  off by default, makes the `openai-compat` provider tell a gateway what each
+  call is for: every chat attempt carries `x-ai-memory-workload`
+  (`consolidation`, `profile`, `dream`, `lint`, ...), and
+  `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when
+  the operation reads one scope or acts for one user, such as the session
+  owner in consolidation or the operator of a private profile. A value that is
+  not known as one name is left out, never guessed, and page content is never
+  sent. Other providers never send these headers, and `AI_MEMORY_LLM_HEADERS`
+  now refuses the four names for `openai-compat` at startup (#2001, #2004).
+- Added `projects` and `headers` to `[[admission_webhooks]]`, so a bot can be
+  woken straight from an observer webhook with no relay. `projects` limits a
+  webhook to `workspace/project` entries; `headers` sends request headers whose
+  values the server reads once from files at startup and never logs. A
+  `message_send` webhook now also receives the message id, the addressed
+  harness and the sending project (never the subject or body), on the MCP,
+  admin, `/web` composer and `/web` edit paths, so the bot can pop exactly the
+  message that woke it. Configs without the new keys behave as before (#2008, #2009).
+- Showed the harness's session name beside its short ID in the agent dashboard.
+  Codex reports names and renames at the end of a turn (#1948).
+- Added Brazilian Portuguese translations of 24 product guides under
+  `docs/pt-BR/`. The built-in documentation page serves them when the interface
+  language is pt-BR, including the Markdown view and guide search, and falls back
+  to English for guides without a translation (the changelog). The
+  installation-state cards link to the matching translated section. The
+  authenticated `/api/v1/docs` catalog keeps returning the English text (#2027).
+- `assistant_excerpt_max_bytes` (`AI_MEMORY_ASSISTANT_EXCERPT_MAX_BYTES`) sets
+  the byte cap on the assistant excerpt stored when `capture_assistant` is on.
+  The default stays 2,000 and the value is clamped to 16 KiB. The client now
+  sends up to 16 KiB of the scrubbed text and the server applies the cap, so
+  a longer answer (about 600 CJK characters fit in 2,000 bytes) is no longer
+  always cut in half. (#2118)
+- `ai-memory message send`, `list`, `pop` and `cancel` now work with a normal
+  API key on a multi-user server. They returned 403 because they called the
+  root-only `/admin/messages*` routes. The new `/messages*` routes apply the same
+  per-project grants as the `memory_message_*` MCP tools, and the CLI falls back
+  to the `/admin` routes on an older server. Those routes stay root-only. Admin
+  pop and cancel now also run the admission and observer webhooks, as the MCP
+  tools already did. (#2146)
+
 ### Changed
 
 - The interface-language picker in the top bar now follows the dashboard's
@@ -19,15 +195,28 @@ version in [`docs/changelog/`](docs/changelog/):
   arrow, and the accent focus ring, in both the light and dark themes and on
   narrow screens. Switching language still works through the
   `ai_memory_language` cookie. (#2228)
+- The auto-improvement reviewer now has explicit instructions for user
+  corrections. When the user rejects, corrects, interrupts or undoes the
+  agent's work and gives a reason, it proposes a `_rules/` page, or a patch to
+  the one already on that topic, saying what to avoid, why and what to do
+  instead, and quotes the user verbatim as evidence. An approach that failed
+  for a technical reason goes to `gotchas/`. It recognizes a correction by
+  meaning rather than by keywords, so the language does not matter, counts
+  only `user-prompt` observations, and skips a refusal with no reason or a
+  one-off rename. Proposals still follow the approval policy. (#1992)
+- `install-hooks` and `setup` now write native POSIX hook commands with
+  the binary and data dir as `"$HOME/..."` when they sit under your home,
+  so a hook file kept in dotfiles works for other users and machines and a
+  re-apply leaves it byte-identical. Pass `--absolute-paths`, or set
+  `AI_MEMORY_HOOK_ABSOLUTE_PATHS=1`, to keep absolute paths. Hermes and
+  Pool, which do not run hooks through a shell, keep absolute paths (#2035)
+- Returned to the workstream picker after a harness launched by `ai-memory resume` exits, including on Ctrl+C.
+- `/web/search` with no search term lists the ten most recently updated
+  pages, from the selected project or from every project the viewer can read.
+  It used to show only an empty prompt. (#2226)
 
 ### Fixed
 
-- `adopt-project-identity` now drops the hook router's cached resolution for
-  the project that gave the identity away, so the checkout's hooks reach the
-  project that took it. That cache keys entries on the repository identity, and
-  the move left the pre-adoption entry in place: until the server restarted or
-  the entry aged out, new sessions, prompts and observations kept landing in
-  the project the command had just emptied and archived. (#2216)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
@@ -229,6 +418,7 @@ version in [`docs/changelog/`](docs/changelog/):
   activity under a capture they had asked to remove. The uninstall now strips
   every ai-memory entry from that file while the user's own hooks, model and
   hook-level settings survive. (GHSA-qmg7-f7fg-rg4x)
+
 
 ## [3.4.5] - 2026-11-10
 
@@ -445,7 +635,6 @@ version in [`docs/changelog/`](docs/changelog/):
   the leftover start line to the new block's end as the block. The end
   delimiter now pairs with the last start delimiter before it, as the routing
   block's does since #2117 (#2152).
-
 
 ## [3.4.4] - 2026-11-08
 

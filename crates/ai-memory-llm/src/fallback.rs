@@ -272,7 +272,7 @@ impl LlmProvider for FallbackLlmProvider {
             match entry
                 .candidate
                 .inner
-                .complete_with_operation_id(request.clone(), operation_id)
+                .complete_with_operation_id(request.clone(), operation_id.clone())
                 .await
             {
                 Ok(response) => {
@@ -346,7 +346,7 @@ impl LlmProvider for FallbackLlmProvider {
                 .complete_structured_raw_with_operation_id(
                     request.clone(),
                     schema.clone(),
-                    operation_id,
+                    operation_id.clone(),
                 )
                 .await
             {
@@ -581,7 +581,7 @@ mod tests {
 
         chain.complete(request.clone()).await.unwrap();
         chain
-            .complete_with_operation_id(request.clone(), op_id)
+            .complete_with_operation_id(request.clone(), op_id.clone())
             .await
             .unwrap();
         chain
@@ -589,7 +589,11 @@ mod tests {
             .await
             .unwrap();
         chain
-            .complete_structured_raw_with_operation_id(request.clone(), schema.clone(), op_id)
+            .complete_structured_raw_with_operation_id(
+                request.clone(),
+                schema.clone(),
+                op_id.clone(),
+            )
             .await
             .unwrap();
 
@@ -608,7 +612,10 @@ mod tests {
         let seen_ops = second.seen_operation_ids.lock().unwrap();
         // complete/complete_structured_raw pass None; the *_with_operation_id
         // calls pass the same op_id every time.
-        assert_eq!(*seen_ops, vec![None, Some(op_id), None, Some(op_id)]);
+        assert_eq!(
+            *seen_ops,
+            vec![None, Some(op_id.clone()), None, Some(op_id)]
+        );
     }
 
     #[tokio::test]

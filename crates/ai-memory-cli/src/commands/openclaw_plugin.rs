@@ -598,6 +598,10 @@ mod tests {
         assert!(plugin.contains("tomlKey(body, \"project_strategy\")"));
         assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        assert!(
+            plugin.contains("url.searchParams.set(\"default_result_limit\", defaultResultLimit)")
+        );
+        assert!(plugin.contains("url.searchParams.set(\"min_relevance\", minRelevance)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         assert!(plugin.contains("function tomlFlag"));
@@ -1076,7 +1080,7 @@ mod tests {
         let plugin = build_plugin("http://127.0.0.1:49374", None, None, "denylist");
         assert!(
             plugin.contains(
-                "if (captureServerRouted(cwd)) return { disposition: \"drop\", payload };"
+                "const serverRoute = captureServerRouted(cwd); if (serverRoute) return { disposition: \"drop\", ...(serverRoute.profile ? { serverRoutedProfile: serverRoute.profile } : {}), payload };"
             ),
             "{plugin}"
         );

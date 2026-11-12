@@ -297,6 +297,14 @@ pub enum AgentKind {
     /// is appended to the session (#1299).
     #[serde(rename = "codebuddy", alias = "code-buddy")]
     CodeBuddy,
+    /// Tencent WorkBuddy (`workbuddy`). Hooks are Claude Code-shaped
+    /// (PascalCase events; `session_id`, `cwd`, `tool_name` and `tool_input`
+    /// on stdin), and `SessionStart` stdout's
+    /// `hookSpecificOutput.additionalContext` carries the handoff. WorkBuddy
+    /// fires no `SessionEnd` event, so a finished session closes with
+    /// `ai-memory finalize-session --agent workbuddy`.
+    #[serde(rename = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// IBM Bob IDE, whose lifecycle hooks send Claude Code-shaped payloads
     /// but consume `SessionStart` stdout as plain context text.
     #[serde(rename = "ibm-bob", alias = "bob")]
@@ -327,7 +335,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -353,6 +361,7 @@ impl AgentKind {
         Self::Droid,
         Self::Muse,
         Self::CodeBuddy,
+        Self::WorkBuddy,
         Self::IbmBob,
         Self::Dsh,
         Self::Cline,
@@ -390,6 +399,7 @@ impl AgentKind {
             Self::Droid => "droid",
             Self::Muse => "muse",
             Self::CodeBuddy => "codebuddy",
+            Self::WorkBuddy => "workbuddy",
             Self::IbmBob => "ibm-bob",
             Self::Dsh => "dsh",
             Self::Cline => "cline",
@@ -430,6 +440,7 @@ impl AgentKind {
             "droid" | "factory-droid" | "factory_droid" => Self::Droid,
             "muse" | "muse-code" | "musecode" => Self::Muse,
             "codebuddy" | "code-buddy" => Self::CodeBuddy,
+            "workbuddy" | "work-buddy" => Self::WorkBuddy,
             "ibm-bob" | "bob" => Self::IbmBob,
             "dsh" | "deepseek-harness" | "deepseek_harness" => Self::Dsh,
             "cline" | "cline-cli" => Self::Cline,
@@ -492,6 +503,9 @@ impl AgentKind {
     /// against v2.164.0–v2.167.0, #1299), so the native hook fetches the
     /// handoff for it. The fetch stays the built-in SessionStart path; a
     /// separate `GET /handoff` client is not part of the installer.
+    ///
+    /// WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract, so the
+    /// native hook fetches the handoff for it the same way.
     ///
     /// Qwen Code injects `hookSpecificOutput.additionalContext` from
     /// `SessionStart` stdout into the session (Qwen Code hooks reference:
@@ -907,6 +921,35 @@ mod tests {
         assert!(!AgentKind::CodeBuddy.user_prompt_injects_handoff());
         assert!(!AgentKind::CodeBuddy.post_tool_injects_handoff());
         assert!(!AgentKind::CodeBuddy.reuses_session_id_after_end());
+    }
+
+    #[test]
+    fn agent_kind_workbuddy_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::WorkBuddy.as_str(), "workbuddy");
+        for alias in ["workbuddy", "work-buddy"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::WorkBuddy, "{alias}");
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::WorkBuddy).unwrap(),
+            "\"workbuddy\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"workbuddy\"").unwrap(),
+            AgentKind::WorkBuddy
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"work-buddy\"").unwrap(),
+            AgentKind::WorkBuddy
+        );
+        assert_eq!(AgentKind::from_wire("workbuddy-2"), AgentKind::Other);
+        assert_eq!(AgentKind::from_wire("tencent"), AgentKind::Other);
+        // WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract, so
+        // the built-in SessionStart fetch is the delivery path. It fires no
+        // SessionEnd, so a session closes with `finalize-session`.
+        assert!(AgentKind::WorkBuddy.session_start_injects_handoff());
+        assert!(!AgentKind::WorkBuddy.user_prompt_injects_handoff());
+        assert!(!AgentKind::WorkBuddy.post_tool_injects_handoff());
+        assert!(!AgentKind::WorkBuddy.reuses_session_id_after_end());
     }
 
     #[test]

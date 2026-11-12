@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, WorkBuddy, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -528,6 +528,19 @@ project files from the checkout, not from the config dir. The
 Docker wrapper forwards the variable for config roots under its existing
 `$HOME` bind mount; use the native binary when the relocated root is outside
 `$HOME`.
+
+On macOS and Linux the native hook commands name the binary and the data dir
+relative to your home when they sit under it, as
+`"$HOME/.local/share/ai-memory/native-runner/ai-memory" --data-dir "$HOME/..."`,
+so a settings file kept in a dotfiles repo works for another user or machine
+with the same layout, and re-applying leaves it unchanged. A path outside
+`$HOME`, or one with `"`, `$`, `` ` `` or `\` in it, stays absolute. Pass
+`--absolute-paths` to `install-hooks` or `setup`, or set
+`AI_MEMORY_HOOK_ABSOLUTE_PATHS=1` (which `upgrade` also honours), to keep
+absolute paths everywhere. The agent must run the hook with `HOME` set, because
+the `"$HOME/..."` form expands it in the shell; if the agent cannot provide `HOME`,
+use `--absolute-paths`. Hermes and Pool always get absolute paths, because
+they do not run the command through a shell.
 
 The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,
 `curator`, `pending-writes`, etc.) inherit the two env vars automatically. So do
@@ -1081,8 +1094,11 @@ each server once with `ai-memory server add <name> --url <url> --root <dir>
 --auth-token-stdin`, then set `server = "<name>"` in each repository's
 `.ai-memory.toml`. Repositories without the key keep using the server
 `install-hooks` configured. A profile that does not resolve drops the event
-instead of falling back. Native hook commands route profiles; the generated
-TypeScript integrations and the script hooks drop routed repositories. See
+instead of falling back. Native hook commands route profiles, and the generated
+OpenCode plugins (`opencode`, `opencode2`) route a profile repository through
+that native hook (passing `--expected-profile`, so a divergent walk or a missing
+binary drops rather than falls back); the other generated integrations and the
+script hooks still drop routed repositories. See
 [`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 
 Some agent harnesses attach the assistant's final turn to their `Stop` event;
@@ -2195,6 +2211,61 @@ CodeBuddy's hook documentation and the payloads reported on v2.164 to
 v2.167; the maintainers have not yet run it end to end. Start a new
 CodeBuddy session after installing so it loads the hooks.
 
+### WorkBuddy
+
+WorkBuddy (`workbuddy`), Tencent's coding agent, reads lifecycle hooks from
+the `hooks` key of `~/.workbuddy/settings.json` and MCP servers from the
+`mcpServers` map of `~/.workbuddy/mcp.json`. Both installers mimic their
+Tencent CodeBuddy and Claude Code counterparts:
+
+```bash
+ai-memory install-hooks --agent workbuddy --apply
+ai-memory install-mcp --client workbuddy --apply
+ai-memory install-skills --scope global --agent workbuddy
+```
+
+Without `--apply` each command prints the block to merge by hand, and
+`ai-memory setup-agent --agent workbuddy` prints the hook block for a host
+that runs WorkBuddy against a remote server. Running `--apply` again changes
+nothing.
+
+WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract: it sends
+`session_id`, `cwd`, `tool_name`, `tool_input` and `tool_response` on stdin
+with Claude Code's tool names, so each entry runs the native
+`ai-memory hook --event … --agent workbuddy` command with an empty matcher.
+There is no script bundle; the local spool, bearer auth and
+`[capture] ignore_paths` apply. Six events are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact` and `Stop`.
+
+The `SessionStart` hook delivers the prior session's handoff through
+`hookSpecificOutput.additionalContext`, which WorkBuddy appends to the
+session. With nothing to deliver, the `SessionStart` and `UserPromptSubmit`
+hooks print nothing, since WorkBuddy appends their output too.
+
+**WorkBuddy never fires a `SessionEnd` event.** `Stop` is a turn boundary,
+not a session end, so an idle WorkBuddy session stays open. Close it with
+`ai-memory finalize-session --agent workbuddy` after the final turn; that
+writes the summary page and hands the baton to the next session. There is no
+managed workstream and no transcript backfill.
+
+The MCP entry uses Claude Code's HTTP shape (`type: "http"`, `url`, optional
+`headers`) under `mcpServers`. When the install's bearer comes from
+`[auth].bearer_token_file`, `install-mcp` writes the session-less `mcp-bridge`
+stdio entry instead, so the token never enters `mcp.json`; a client with a
+session id of its own is not assumed, so pass explicit `workspace` and
+`project` on project-scoped MCP calls.
+
+**The new server is not usable until WorkBuddy trusts it.** After
+`install-mcp --apply`, open WorkBuddy's **custom connector** settings
+(自定义连接器) and approve the newly added `ai-memory` MCP server. Until it is
+trusted, the entry sits in `mcp.json` but ai-memory's tools do not appear in
+the session.
+
+Skills go into `~/.workbuddy/skills` (global) or `.workbuddy/skills`
+(project). `ai-memory setup` wires WorkBuddy when `~/.workbuddy` exists, and
+`ai-memory uninstall` removes the hook entries. Start a new WorkBuddy session
+after installing so it loads the hooks.
+
 ### Hermes Agent (Nous Research)
 
 Hermes declares lifecycle hooks in the `hooks:` block of
@@ -2509,6 +2580,30 @@ ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
 
 Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
 separate and continues to use `.omp` paths.
+
+#### Pi codemode
+
+By default the extension declares every ai-memory tool to the model, schema
+included. To reach them through Pi's `codemode` tool instead, set this in
+ai-memory's `config.toml` (or `AI_MEMORY_PI_TOOL_EXPOSURE=codemode`) and
+regenerate the extension:
+
+```toml
+pi_tool_exposure = "codemode"
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Each tool is then registered with Pi's
+[`exposure: "codemode"`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure):
+codemode scripts can list and call it, and the model no longer receives its
+schema unless you activate the tool yourself. Tool names, the session headers
+that route each call to the current project, and lifecycle capture stay the
+same. Preview output and every later `--apply` (including the refresh that
+`ai-memory upgrade` runs) read the same setting, so regenerating keeps your
+choice. Set it back to `direct`, or remove it, to return to the default.
 
 ### Bind mounts vs docker cp
 
@@ -3524,6 +3619,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `workstreams [--workspace NAME] [--project NAME] [--limit N] [--json]` | host wrapper or native binary | List recent workstreams selectable from the current checkout, including current selection and linked harnesses, without exposing paths or native session ids |
 | `rename-workstream (--from NAME \| --workstream-id ID) --to NAME [--workspace NAME] [--project NAME] [--json]` | host wrapper or native binary | Retitle one workstream selectable from the current checkout; metadata only, so the stable id, the ledger, the listing order, and the current selection are unaffected |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
+| `call [tool] [json-arguments]` | thin HTTP client or native binary | Call any MCP tool of the configured server from a shell (`call memory_query '{"query":"wal mode"}'`), or list the tools and their input schemas when no tool is named |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |

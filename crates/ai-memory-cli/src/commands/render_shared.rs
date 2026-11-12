@@ -193,6 +193,24 @@ pub(crate) const CODEBUDDY_EVENTS: [(&str, &str); 7] = [
     ("SessionEnd", "session-end.sh"),
 ];
 
+/// Tencent WorkBuddy lifecycle events ai-memory hooks. Each pair is
+/// `(event-name-in-~/.workbuddy/settings.json, native hook-event script
+/// stem)`; WorkBuddy has no script bundle, so the `.sh` name only carries the
+/// event token the native command is rendered with.
+///
+/// WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract, but it fires
+/// no `SessionEnd` event, so unlike [`CODEBUDDY_EVENTS`] that event is not
+/// wired and a finished session closes with
+/// `ai-memory finalize-session --agent workbuddy`.
+pub(crate) const WORKBUDDY_EVENTS: [(&str, &str); 6] = [
+    ("SessionStart", "session-start.sh"),
+    ("UserPromptSubmit", "user-prompt-submit.sh"),
+    ("PreToolUse", "pre-tool-use.sh"),
+    ("PostToolUse", "post-tool-use.sh"),
+    ("PreCompact", "pre-compact.sh"),
+    ("Stop", "stop.sh"),
+];
+
 /// Qoder CLI/IDE events used for capture and handoff delivery. Qoder exposes
 /// additional policy and notification events that do not carry memory data.
 pub(crate) const QODER_EVENTS: [(&str, &str); 8] = [
@@ -809,12 +827,16 @@ function captureExistingDirWithin(path: string, memo: CaptureMarkerMemo, budget:
 // path that stays live.
 function captureOwnedExternally(): boolean { const owner = typeof process === "undefined" ? undefined : process.env?.AI_MEMORY_CAPTURE_OWNER; return typeof owner === "string" && owner.trim() !== ""; }
 // Server profiles (`server = "<name>"`, #992) are routed only by the native
-// hook. Any marker up the tree that selects one makes this integration emit
-// nothing rather than deliver that repository's capture to the install default.
-// Mirrors the native walk: no payload cwd falls back to the process cwd; inside
-// home the walk stops at home, outside it continues past the checkout root to an
-// organisation-level marker; an unreadable marker counts as a selection.
-function captureServerRouted(cwd: string | undefined): boolean { let dir = resolve(cwd ?? process.cwd()); const home = homedir(); let boundary: string | undefined; for (let probe = dir; ; probe = dirname(probe)) { if (probe === home) { boundary = home; break; } if (probe === dirname(probe)) break; } for (;;) { try { if (/^\s*server\s*=/m.test(readFileSync(join(dir, ".ai-memory.toml"), "utf8"))) return true; } catch (e) { if (!["ENOENT", "ENOTDIR", "EISDIR"].includes((e as { code?: string })?.code ?? "")) return true; } if (dir === boundary || dir === dirname(dir)) return false; dir = dirname(dir); } }
+// hook. A marker up the tree that selects one makes this integration drop the
+// event rather than deliver that repository's capture to the install default,
+// and reports the selected profile name (`{ profile }`) so a caller able to
+// route natively (the OpenCode spawn, #2122) knows which profile to demand. An
+// unreadable marker or an unquoted value is still a selection, but with no name
+// to recover (`{}`); no selection at all is `undefined`. Mirrors the native
+// walk: no payload cwd falls back to the process cwd; inside home the walk stops
+// at home, outside it continues past the checkout root to an organisation-level
+// marker.
+function captureServerRouted(cwd: string | undefined): { profile?: string } | undefined { let dir = resolve(cwd ?? process.cwd()); const home = homedir(); let boundary: string | undefined; for (let probe = dir; ; probe = dirname(probe)) { if (probe === home) { boundary = home; break; } if (probe === dirname(probe)) break; } for (;;) { try { const text = readFileSync(join(dir, ".ai-memory.toml"), "utf8"); if (/^\s*server\s*=/m.test(text)) { const named = /^\s*server\s*=\s*["']([^"'\r\n]+)["']/m.exec(text); return named ? { profile: named[1] } : {}; } } catch (e) { if (!["ENOENT", "ENOTDIR", "EISDIR"].includes((e as { code?: string })?.code ?? "")) return {}; } if (dir === boundary || dir === dirname(dir)) return undefined; dir = dirname(dir); } }
 type CaptureTool = ReturnType<typeof captureTool>;
 // One policy's disposition for one call, shared by the event's own marker and every other marker it reaches.
 function captureDecide(tool: CaptureTool, config: CaptureConfig): CaptureDisposition { if (config.state === "invalid" && (tool.family === "file" || tool.family === "search-list" || tool.shell || tool.reader)) return "metadata-only"; if (config.state !== "active") return "keep"; if (tool.reader) return "metadata-only"; if (tool.family === "search-list") return "drop"; if (tool.family === "file") { if (!tool.paths) return "metadata-only"; const parsed = [...tool.paths, ...(tool.readings ?? [])].map((p) => { const resolved = captureResolve(p, config.base, config.windowsHost); const normalized = resolved?.map((path) => captureNormalize(path, config.windowsHost)); return normalized?.every(Boolean) ? normalized as { path: string; windows: boolean }[] : undefined; }); if (parsed.some((p) => !p)) return "metadata-only"; const candidates = (parsed as { path: string; windows: boolean }[][]).flat(); const spoolBudget = { work: 0 }; if (tool.globs) { const match = captureMatchGlobs(tool.paths, config); if (match !== false) return match ? "drop" : "metadata-only"; for (const p of tool.paths) { const readings = captureAllReadings(captureResolve(p, config.base, config.windowsHost), config.windowsHost); if (!readings) continue; for (const candidate of readings) if (captureOutputSpool(candidate.path, spoolBudget) !== false) return "metadata-only"; } return "keep"; } const budget = { work: 0 }; for (const raw of candidates) { const candidate = { path: captureFold(raw.path), windows: raw.windows }; for (const pattern of config.patterns) { if (candidate.windows !== pattern.windows) continue; if (pattern.directory && captureGlob(pattern.directory, candidate.path, pattern.windows || captureFoldCase, budget)) return "drop"; const match = captureGlob(pattern.path, candidate.path, pattern.windows || captureFoldCase, budget); if (match === undefined) return "metadata-only"; if (match) return "drop"; } } for (const candidate of candidates) if (captureOutputSpool(candidate.path, spoolBudget) !== false) return "metadata-only"; return "keep"; } if (tool.family === "non-file" && (tool.inline || (tool.command !== undefined && captureCommandOversized(tool.command)))) return "metadata-only"; if (tool.family === "non-file" && tool.command !== undefined) { const split = captureShellSplit(tool.command, tool.powershell || config.windowsHost); const matched = captureMatchCommand(split.words, config, tool.workdir); if (matched.match !== false) return "drop"; if (split.opaque || matched.spool || (config.windowsHost && tool.workdir !== undefined && captureWindowsUnplaceable(tool.workdir, config.base))) return "metadata-only"; } return "keep"; }
@@ -835,7 +857,7 @@ function captureFileRelative(target: string, base: string, checkout: string, win
 function captureOmpTarget(path: string, readings: string[] | undefined, base: string): string { if (!readings?.length || captureExists(resolve(base, path))) return path; for (let i = readings.length - 1; i >= 0; i--) if (captureExists(resolve(base, readings[i]))) return readings[i]; return path; }
 // The reserved `_ai_memory_file` field of a kept file-tool post (#1843): the one file the call names, relative to the checkout root of the lexical cwd, or why it has none; undefined when the call names no single file. An event without a cwd has no checkout to key the path to, so it is `no_checkout` rather than an absent field, which the server would count as an older client. The key is relative to the event's own checkout: these integrations do not reroute a tool event into the checkout an absolute target names, as the native `tool_location_routing_cwd` does, so such a target is `outside_checkout` here. Lexical like the policy, so a symlinked cwd is not resolved, and relative to the nearest `.git` rather than the marker, so two worktrees produce the same key. The path rules follow the OS the plugin runs on, as the native client's `Path` does, not the cwd's spelling (a POSIX `//home/u` is no share), and the base is the cwd as spelled, not the policy's Windows respelling (`\\?\C:\repo` stays verbatim); mirrors `file_path_field`.
 function captureFileField(tool: CaptureTool, cwd: string | undefined): { version: 1; path?: string; skipped?: string } | undefined { const targets = tool.paths ?? tool.patch; if (tool.family !== "file" || targets?.length !== 1 || tool.globs) return undefined; const base = cwd && resolve(cwd); const root = base ? captureCheckoutRoot(base) : undefined; return { version: 1, ...(root === undefined ? { skipped: "no_checkout" } : captureFileRelative(captureOmpTarget(targets[0], tool.readings, base), base, root, typeof process !== "undefined" && process.platform === "win32")) }; }
-function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined, event?: string): { disposition: CaptureDisposition; protocol?: CaptureProtocol; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; if (captureServerRouted(cwd)) return { disposition: "drop", payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } const file = event === "post-tool-use" && disposition === "keep" ? captureFileField(tool, cwd) : undefined; if (config.state === "inactive") return { disposition, payload: file ? { ...payload, _ai_memory_file: file } : payload }; const extraction = config.state === "active" && tool.family === "search-list" ? "not-applicable" : tool.extraction === "not-applicable" ? "extracted" : tool.extraction; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol, ...(file ? { _ai_memory_file: file } : {}) } }; return { disposition, protocol, payload }; }
+function capturePolicy(payload: Record<string, unknown>, cwd: string | undefined, event?: string): { disposition: CaptureDisposition; protocol?: CaptureProtocol; serverRoutedProfile?: string; payload: Record<string, unknown> } { if (captureOwnedExternally()) return { disposition: "drop", payload }; const serverRoute = captureServerRouted(cwd); if (serverRoute) return { disposition: "drop", ...(serverRoute.profile ? { serverRoutedProfile: serverRoute.profile } : {}), payload }; const markerPresent = !!findMarker(cwd); if (CAPTURE_MODE === "allowlist" && !markerPresent) return { disposition: "drop", payload }; const own = findMarker(cwd); let config = captureConfigAt(own, cwd); const tool = captureTool(payload); let disposition = captureDecide(tool, config); if (disposition !== "drop" && tool.family !== "unknown") for (const other of captureForeignConfigs(tool, config, cwd, own)) { const decided = captureDecide(tool, other); if (captureRank[decided] > captureRank[disposition]) { disposition = decided; config = other; } } const file = event === "post-tool-use" && disposition === "keep" ? captureFileField(tool, cwd) : undefined; if (config.state === "inactive") return { disposition, payload: file ? { ...payload, _ai_memory_file: file } : payload }; const extraction = config.state === "active" && tool.family === "search-list" ? "not-applicable" : tool.extraction === "not-applicable" ? "extracted" : tool.extraction; const protocol: CaptureProtocol = { version: CAPTURE_POLICY_V1, disposition, policy_state: config.state, tool_family: tool.family, path_count: tool.paths?.length ?? 0, extraction_state: extraction }; if (disposition === "metadata-only") { const session = payload.sessionID ?? payload.sessionId ?? payload.session_id; const routing = typeof payload.cwd === "string" ? payload.cwd : cwd; return { disposition, protocol, payload: { ...(typeof session === "string" ? { session_id: session } : {}), ...(typeof routing === "string" ? { cwd: routing } : {}), tool_family: tool.family, tool_name: tool.family, ...(tool.callID ? { tool_call_id: tool.callID } : {}), _ai_memory_capture: protocol } }; } if (disposition === "keep") return { disposition, protocol, payload: { ...payload, _ai_memory_capture: protocol, ...(file ? { _ai_memory_file: file } : {}) } }; return { disposition, protocol, payload }; }
 "##;
     let names = |names: &[&str]| {
         let quoted: Vec<String> = names.iter().map(|name| ts_string_literal(name)).collect();
@@ -922,6 +944,7 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
     capture_assistant: bool,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     build_claude_code_payload_with_data_dir_for_platform(
         emit_root,
@@ -930,6 +953,7 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
         data_dir,
         project_strategy,
         capture_assistant,
+        absolute_paths,
         HookCommandPlatform::for_bash_runner(),
     )
 }
@@ -942,6 +966,7 @@ pub(crate) fn build_claude_code_script_payload_for_test(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
     capture_assistant: bool,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     build_claude_code_payload_with_data_dir_for_platform(
         emit_root,
@@ -950,10 +975,12 @@ pub(crate) fn build_claude_code_script_payload_for_test(
         data_dir,
         project_strategy,
         capture_assistant,
+        absolute_paths,
         HookCommandPlatform::Posix,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_claude_code_payload_with_data_dir_for_platform(
     emit_root: &Path,
     server_url: &str,
@@ -961,6 +988,7 @@ fn build_claude_code_payload_with_data_dir_for_platform(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
     capture_assistant: bool,
+    absolute_paths: bool,
     platform: HookCommandPlatform,
 ) -> serde_json::Value {
     with_claude_session_end_timeout(build_hook_payload_for_platform(
@@ -971,7 +999,8 @@ fn build_claude_code_payload_with_data_dir_for_platform(
         HookShape::Nested,
         HookCommandContext::new(platform, "claude-code", data_dir, project_strategy)
             .allow_claude_windows_exec()
-            .with_capture_assistant(capture_assistant),
+            .with_capture_assistant(capture_assistant)
+            .with_absolute_paths(absolute_paths),
     ))
 }
 
@@ -1027,6 +1056,7 @@ pub(crate) fn build_dsh_hooks_payload(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
         &DSH_EVENTS,
@@ -1039,7 +1069,8 @@ pub(crate) fn build_dsh_hooks_payload(
             "dsh",
             data_dir,
             project_strategy,
-        ),
+        )
+        .with_absolute_paths(absolute_paths),
     )
 }
 
@@ -1368,6 +1399,7 @@ pub(crate) fn build_grok_payload_with_data_dir(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
         &GROK_EVENTS,
@@ -1380,7 +1412,8 @@ pub(crate) fn build_grok_payload_with_data_dir(
             "grok",
             data_dir,
             project_strategy,
-        ),
+        )
+        .with_absolute_paths(absolute_paths),
     )
 }
 
@@ -1395,6 +1428,7 @@ pub(crate) fn build_devin_payload_with_data_dir(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     build_hook_payload_for_platform(
         &DEVIN_EVENTS,
@@ -1407,7 +1441,8 @@ pub(crate) fn build_devin_payload_with_data_dir(
             "devin",
             data_dir,
             project_strategy,
-        ),
+        )
+        .with_absolute_paths(absolute_paths),
     )
 }
 
@@ -1511,6 +1546,34 @@ pub(crate) fn build_codebuddy_hooks_payload(
     )
 }
 
+/// `{"hooks": <event map>}` for Tencent WorkBuddy. The `hooks` key of
+/// `~/.workbuddy/settings.json` holds Claude Code's nested shape
+/// (`"Event": [{"matcher": "", "hooks": [{"type": "command", "command": …}]}]`).
+/// WorkBuddy runs each `command` with CodeBuddy's Claude Code-shaped event
+/// JSON on stdin, so every entry invokes the native `ai-memory hook` command;
+/// there is no script bundle. No `SessionEnd` is wired because WorkBuddy never
+/// fires one.
+pub(crate) fn build_workbuddy_hooks_payload(
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+    project_strategy: Option<&str>,
+) -> Value {
+    build_hook_payload_for_platform(
+        &WORKBUDDY_EVENTS,
+        Path::new(""),
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(
+            HookCommandPlatform::native(),
+            "workbuddy",
+            data_dir,
+            project_strategy,
+        ),
+    )
+}
+
 /// `{"hooks": <event map>}` for Qoder's `~/.qoder/settings.json`.
 pub(crate) fn build_qoder_hooks_payload(
     server_url: &str,
@@ -1605,6 +1668,7 @@ pub(crate) fn build_pool_settings_yaml_with_data_dir(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> String {
     build_pool_settings_yaml_for_platform(
         emit_root,
@@ -1615,7 +1679,8 @@ pub(crate) fn build_pool_settings_yaml_with_data_dir(
             "pool",
             data_dir,
             project_strategy,
-        ),
+        )
+        .with_absolute_paths(absolute_paths),
     )
 }
 
@@ -1841,6 +1906,7 @@ pub(crate) fn build_antigravity_payload_with_data_dir(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     build_antigravity_payload_for_platform(
         emit_root,
@@ -1850,9 +1916,11 @@ pub(crate) fn build_antigravity_payload_with_data_dir(
         "antigravity-cli",
         data_dir,
         project_strategy,
+        absolute_paths,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_antigravity_payload_for_platform(
     emit_root: &Path,
     server_url: &str,
@@ -1861,6 +1929,7 @@ fn build_antigravity_payload_for_platform(
     agent: &str,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     let mut group = serde_json::Map::new();
 
@@ -1872,7 +1941,8 @@ fn build_antigravity_payload_for_platform(
             &abs,
             server_url,
             auth_token,
-            HookCommandContext::new(platform, agent, data_dir, project_strategy),
+            HookCommandContext::new(platform, agent, data_dir, project_strategy)
+                .with_absolute_paths(absolute_paths),
             HookShape::Nested,
         ));
         group.insert(
@@ -1892,7 +1962,8 @@ fn build_antigravity_payload_for_platform(
             &abs,
             server_url,
             auth_token,
-            HookCommandContext::new(platform, agent, data_dir, project_strategy),
+            HookCommandContext::new(platform, agent, data_dir, project_strategy)
+                .with_absolute_paths(absolute_paths),
             HookShape::Flat,
         ));
         group.insert((*event).to_string(), Value::Array(vec![handler]));
@@ -1921,6 +1992,7 @@ pub(crate) fn build_profile_payload(
         None,
         None,
         false,
+        false,
     )
 }
 
@@ -1937,6 +2009,7 @@ pub(crate) fn build_profile_payload_for_agent(
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
     capture_assistant: bool,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     build_hook_payload(
         profile.events,
@@ -1950,11 +2023,13 @@ pub(crate) fn build_profile_payload_for_agent(
             data_dir,
             project_strategy,
         )
-        .with_capture_assistant(capture_assistant),
+        .with_capture_assistant(capture_assistant)
+        .with_absolute_paths(absolute_paths),
     )
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_profile_script_payload_for_test(
     profile: &HookProfile,
     emit_root: &Path,
@@ -1963,6 +2038,7 @@ pub(crate) fn build_profile_script_payload_for_test(
     agent: &str,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> serde_json::Value {
     build_hook_payload(
         profile.events,
@@ -1975,7 +2051,8 @@ pub(crate) fn build_profile_script_payload_for_test(
             agent,
             data_dir,
             project_strategy,
-        ),
+        )
+        .with_absolute_paths(absolute_paths),
     )
 }
 
@@ -2005,6 +2082,7 @@ pub(crate) fn kimi_code_hook_commands(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Vec<(&'static str, String)> {
     kimi_code_hook_commands_for_platform(
         emit_root,
@@ -2013,6 +2091,7 @@ pub(crate) fn kimi_code_hook_commands(
         HookCommandPlatform::current(),
         data_dir,
         project_strategy,
+        absolute_paths,
     )
 }
 
@@ -2023,6 +2102,7 @@ fn kimi_code_hook_commands_for_platform(
     platform: HookCommandPlatform,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Vec<(&'static str, String)> {
     KIMI_CODE_EVENTS
         .iter()
@@ -2033,7 +2113,8 @@ fn kimi_code_hook_commands_for_platform(
                 &abs,
                 server_url,
                 auth_token,
-                HookCommandContext::new(platform, "kimi-code", data_dir, project_strategy),
+                HookCommandContext::new(platform, "kimi-code", data_dir, project_strategy)
+                    .with_absolute_paths(absolute_paths),
             );
             (*event, command)
         })
@@ -2060,6 +2141,7 @@ pub(crate) fn build_kiro_cli_v2_hooks_value(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> serde_json::Map<String, Value> {
     build_kiro_cli_v2_hooks_value_for_platform(
         emit_root,
@@ -2068,6 +2150,7 @@ pub(crate) fn build_kiro_cli_v2_hooks_value(
         HookCommandPlatform::current(),
         data_dir,
         project_strategy,
+        absolute_paths,
     )
 }
 
@@ -2083,6 +2166,7 @@ fn build_kiro_cli_v2_hooks_value_for_platform(
     platform: HookCommandPlatform,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> serde_json::Map<String, Value> {
     let mut hooks = serde_json::Map::new();
     for (event, script) in KIRO_CLI_V2_EVENTS {
@@ -2092,7 +2176,8 @@ fn build_kiro_cli_v2_hooks_value_for_platform(
             &abs,
             server_url,
             auth_token,
-            HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+            HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy)
+                .with_absolute_paths(absolute_paths),
         );
         let mut entry = serde_json::Map::new();
         entry.insert("command".to_string(), Value::String(command));
@@ -2116,6 +2201,7 @@ pub(crate) fn build_kiro_cli_v3_hooks_value(
     auth_token: Option<&str>,
     data_dir: Option<&Path>,
     project_strategy: Option<&str>,
+    absolute_paths: bool,
 ) -> Value {
     let platform = HookCommandPlatform::current();
     let hooks = KIRO_CLI_V3_EVENTS
@@ -2126,7 +2212,8 @@ pub(crate) fn build_kiro_cli_v3_hooks_value(
                 &emit_root.join(platform_script.as_ref()),
                 server_url,
                 auth_token,
-                HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy),
+                HookCommandContext::new(platform, "kiro-cli", data_dir, project_strategy)
+                    .with_absolute_paths(absolute_paths),
             );
             let name = script.strip_suffix(".sh").map_or_else(
                 || format!("ai-memory-{script}"),
@@ -2191,6 +2278,9 @@ struct HookCommandContext<'a> {
     /// Bake `--capture-assistant` onto the native `stop` command only (#196).
     /// Set exclusively by `install-hooks --agent claude-code --capture-assistant`.
     capture_assistant: bool,
+    /// Render native hook paths as absolute instead of `"$HOME/..."`
+    /// (`install-hooks --absolute-paths`). Default `false` = portable.
+    absolute_paths: bool,
 }
 
 impl<'a> HookCommandContext<'a> {
@@ -2207,6 +2297,7 @@ impl<'a> HookCommandContext<'a> {
             project_strategy,
             claude_windows_exec_allowed: false,
             capture_assistant: false,
+            absolute_paths: false,
         }
     }
 
@@ -2217,6 +2308,11 @@ impl<'a> HookCommandContext<'a> {
 
     const fn with_capture_assistant(mut self, on: bool) -> Self {
         self.capture_assistant = on;
+        self
+    }
+
+    const fn with_absolute_paths(mut self, on: bool) -> Self {
+        self.absolute_paths = on;
         self
     }
 }
@@ -2589,29 +2685,137 @@ fn hook_command(
             // gets the local spool + OIDC fallback, instead of the `.sh` script
             // that POSTs via curl. Mirrors `WindowsNative` but with POSIX
             // single-quote quoting. The event name is the script stem.
-            let exe = hook_embedded_exe_path().to_string_lossy().into_owned();
-            let event = script
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default();
-            let mut cmd = format!(
-                "{}{} hook --event {event} --agent {agent} --server-url {}",
-                shell_quote(&exe),
-                native_data_dir_arg(context.data_dir, NativeQuote::Posix),
-                shell_quote(server_url),
-                agent = context.agent,
-            );
-            if let Some(t) = auth_token {
-                cmd.push_str(&format!(" --auth-token {}", shell_quote(t)));
-            }
-            cmd.push_str(&native_project_strategy_arg(
-                context.project_strategy,
-                NativeQuote::Posix,
-            ));
-            cmd.push_str(native_capture_assistant_arg(context, event));
-            cmd
+            let exe = hook_embedded_exe_path();
+            let home = portable_hook_home(context.agent, context.absolute_paths);
+            posix_native_hook_command_with(
+                &exe,
+                home.as_deref(),
+                script,
+                server_url,
+                auth_token,
+                context,
+            )
         }
     }
+}
+
+/// The POSIX native command with the exe and home injected. `home` is the
+/// directory written as `"$HOME"`; `None` keeps every path absolute.
+fn posix_native_hook_command_with(
+    exe: &Path,
+    home: Option<&Path>,
+    script: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    context: HookCommandContext<'_>,
+) -> String {
+    let event = script
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let mut cmd = format!(
+        "{}{} hook --event {event} --agent {agent} --server-url {}",
+        posix_path_arg(exe, home),
+        native_data_dir_posix_arg(context.data_dir, home),
+        shell_quote(server_url),
+        agent = context.agent,
+    );
+    if let Some(t) = auth_token {
+        cmd.push_str(&format!(" --auth-token {}", shell_quote(t)));
+    }
+    cmd.push_str(&native_project_strategy_arg(
+        context.project_strategy,
+        NativeQuote::Posix,
+    ));
+    cmd.push_str(native_capture_assistant_arg(context, event));
+    cmd
+}
+
+/// The home that native POSIX hook commands write as `"$HOME"`, read from the
+/// environment and the per-context opt-out. See [`portable_hook_home_from`].
+fn portable_hook_home(agent: &str, absolute: bool) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = test_home_override() {
+        return portable_hook_home_from(agent, home.map(std::ffi::OsString::from), absolute, None);
+    }
+    portable_hook_home_from(
+        agent,
+        std::env::var_os("HOME"),
+        absolute,
+        std::env::var_os("AI_MEMORY_HOOK_ABSOLUTE_PATHS"),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only stand-in for `HOME`: `Some(Some(dir))` renders `dir` as home,
+    /// `Some(None)` simulates an unset `HOME`, `None` reads the real environment.
+    static TEST_HOME_OVERRIDE: std::cell::RefCell<Option<Option<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_home_override() -> Option<Option<PathBuf>> {
+    TEST_HOME_OVERRIDE.with(|home| home.borrow().clone())
+}
+
+/// The home to substitute as `"$HOME"`, or `None` for absolute paths.
+///
+/// `None` when the user opted out (`--absolute-paths` or the env var `1` or
+/// `true`), when the agent runs its hook command as argv with no shell
+/// (`hermes`, `pool`), or when `HOME` is unset, empty, relative or `/`.
+fn portable_hook_home_from(
+    agent: &str,
+    home_env: Option<std::ffi::OsString>,
+    absolute_requested: bool,
+    env_opt_out: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if absolute_requested || env_opt_out.as_deref().is_some_and(absolute_env_opt_out) {
+        return None;
+    }
+    if matches!(agent, "hermes" | "pool") {
+        return None;
+    }
+    let home = PathBuf::from(home_env?);
+    let usable = home.is_absolute() && home.parent().is_some();
+    usable.then_some(home)
+}
+
+fn absolute_env_opt_out(value: &std::ffi::OsStr) -> bool {
+    value
+        .to_str()
+        .map(str::trim)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Render a path for a POSIX shell. Under `home` it becomes `"$HOME/<rest>"`
+/// (exactly `"$HOME"` for `home` itself), so the shell expands the home of the
+/// machine that runs the hook. Anything outside `home`, or whose remainder
+/// holds a character that is special inside double quotes, keeps the
+/// [`shell_quote`] form.
+fn posix_path_arg(path: &Path, home: Option<&Path>) -> String {
+    if let Some(rest) = home.and_then(|home| path.strip_prefix(home).ok()) {
+        let rest = rest.to_string_lossy();
+        if rest.is_empty() {
+            return "\"$HOME\"".to_string();
+        }
+        if rest
+            .chars()
+            .all(|c| !matches!(c, '"' | '$' | '`' | '\\') && !c.is_control())
+        {
+            return format!("\"$HOME/{rest}\"");
+        }
+    }
+    shell_quote(&path.to_string_lossy())
+}
+
+fn native_data_dir_posix_arg(data_dir: Option<&Path>, home: Option<&Path>) -> String {
+    let Some(data_dir) = data_dir else {
+        return String::new();
+    };
+    let lossy = data_dir.to_string_lossy();
+    let path = strip_windows_verbatim_prefix(&lossy);
+    format!(" --data-dir {}", posix_path_arg(Path::new(&*path), home))
 }
 
 fn powershell_encoded_command(program: &str) -> String {
@@ -4143,8 +4347,13 @@ check(captureMarkersBelow(wide, ["*"], undefined, {{ dirs: 0, entries: CAPTURE_M
 // must drop rather than deliver a routed repository to the install default,
 // including under a nested marker that does not repeat the key.
 check(capturePolicy(bash("echo hi"), marker('server = "team-b"\n')).disposition === "drop", "server-routed-drops");
+// A quoted value is reported so a native-routing caller can demand that exact
+// profile (#2122); an unquoted value still drops but yields no name.
+check(capturePolicy(bash("echo hi"), marker('server = "team-b"\n')).serverRoutedProfile === "team-b", "server-routed-reports-profile");
 check(capturePolicy(bash("echo hi"), marker("server = team-b\n")).disposition === "drop", "server-routed-bare-drops");
+check(capturePolicy(bash("echo hi"), marker("server = team-b\n")).serverRoutedProfile === undefined, "server-routed-bare-no-profile");
 check(capturePolicy(bash("echo hi"), marker('servers = "x"\n')).disposition === "keep", "servers-key-is-not-server");
+check(capturePolicy(bash("echo hi"), marker('servers = "x"\n')).serverRoutedProfile === undefined, "servers-key-reports-no-profile");
 const routedRoot = join(markerRoot, "routed-repo");
 const routedChild = join(routedRoot, "child");
 mkdirSync(join(routedRoot, ".git"), {{ recursive: true }});
@@ -4153,6 +4362,7 @@ writeFileSync(join(routedRoot, ".ai-memory.toml"), 'server = "team-b"\n');
 writeFileSync(join(routedChild, ".ai-memory.toml"), 'workspace = "child"\n');
 markerFixtures.set(routedChild, join(routedChild, ".ai-memory.toml"));
 check(capturePolicy(bash("echo hi"), routedChild).disposition === "drop", "server-routed-inherited-drops");
+check(capturePolicy(bash("echo hi"), routedChild).serverRoutedProfile === "team-b", "server-routed-inherited-reports-profile");
 // #1843: a kept file-tool post carries `_ai_memory_file`, the checkout-relative path or why there is none, under an inactive or an active policy; mirrors `post_tool_use_carries_the_file_field_or_its_skip_reason`.
 const fileRepo = join(markerRoot, "file-repo");
 mkdirSync(join(fileRepo, ".git"), {{ recursive: true }});
@@ -5207,6 +5417,7 @@ if (inheritOnly) {
             "antigravity-cli",
             None,
             None,
+            false,
         );
         assert!(
             antigravity
@@ -5231,6 +5442,7 @@ if (inheritOnly) {
             "antigravity-cli",
             Some(Path::new(r"C:\Users\me\AppData\Local\ai-memory")),
             None,
+            false,
         );
         let cmd = ag
             .pointer("/ai-memory/PreInvocation/0/command")
@@ -5262,6 +5474,7 @@ if (inheritOnly) {
             "grok",
             Some(Path::new(r"C:\Users\me\AppData\Local\ai-memory")),
             None,
+            false,
         );
         let other_cmd = other
             .pointer("/ai-memory/PreInvocation/0/command")
@@ -5378,6 +5591,7 @@ if (inheritOnly) {
             "antigravity-cli",
             Some(Path::new(r"C:\Users\Felipe Leite\AppData\Local\ai-memory")),
             Some("repo root"),
+            false,
         );
         let cmd = ag
             .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
@@ -5405,6 +5619,7 @@ if (inheritOnly) {
                 agent,
                 Some(Path::new(r"C:\Users\Felipe Leite\AppData")),
                 None,
+                false,
             );
             let other_cmd = other
                 .pointer("/ai-memory/PreToolUse/0/hooks/0/command")
@@ -5634,6 +5849,7 @@ if (inheritOnly) {
             "antigravity-cli",
             None,
             Some("repo-root"),
+            false,
         );
 
         for pointer in [
@@ -5745,6 +5961,7 @@ $payload = [Console]::In.ReadToEnd()
             "antigravity-cli",
             None,
             None,
+            false,
         );
 
         // Top-level key is the named group "ai-memory", not "hooks"
@@ -5846,6 +6063,7 @@ $payload = [Console]::In.ReadToEnd()
             "antigravity-cli",
             None,
             None,
+            false,
         );
         for (event, token) in [
             ("SessionStart", "--event session-start "),
@@ -5868,6 +6086,7 @@ $payload = [Console]::In.ReadToEnd()
             HookCommandPlatform::Posix,
             None,
             None,
+            false,
         );
         assert_eq!(commands.len(), KIMI_CODE_EVENTS.len());
         let events: Vec<&str> = commands.iter().map(|(event, _)| *event).collect();
@@ -5901,6 +6120,7 @@ $payload = [Console]::In.ReadToEnd()
             HookCommandPlatform::Windows,
             None,
             None,
+            false,
         );
         let (_, cmd) = &commands[0];
         let program = decode_powershell_encoded_command(cmd);
@@ -6241,5 +6461,421 @@ $payload = [Console]::In.ReadToEnd()
         // quoted value), so a real error stays readable.
         let prose = "the token: expired before the request completed";
         assert_eq!(redact_config_echo(prose), prose);
+    }
+
+    #[cfg(unix)]
+    fn portable_exe() -> PathBuf {
+        PathBuf::from("/h/.local/share/ai-memory/native-runner/ai-memory")
+    }
+
+    #[cfg(unix)]
+    fn portable_home(agent: &str) -> Option<PathBuf> {
+        portable_hook_home_from(agent, Some(std::ffi::OsString::from("/h")), false, None)
+    }
+
+    #[cfg(unix)]
+    fn portable_ctx<'a>(agent: &'a str, data_dir: Option<&'a Path>) -> HookCommandContext<'a> {
+        HookCommandContext::new(HookCommandPlatform::PosixNative, agent, data_dir, None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_claude_native_command_uses_home_exe() {
+        let home = portable_home("claude-code");
+        let cmd = posix_native_hook_command_with(
+            &portable_exe(),
+            home.as_deref(),
+            Path::new("stop.sh"),
+            "http://127.0.0.1:49374",
+            None,
+            portable_ctx("claude-code", None),
+        );
+        assert!(
+            cmd.starts_with("\"$HOME/.local/share/ai-memory/native-runner/ai-memory\" "),
+            "{cmd}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_data_dir_examples() {
+        let cases = [
+            (
+                "/h/Library/Application Support/ai-memory",
+                "--data-dir \"$HOME/Library/Application Support/ai-memory\"",
+            ),
+            (
+                "/h/.local/share/ai-memory",
+                "--data-dir \"$HOME/.local/share/ai-memory\"",
+            ),
+            ("/h", "--data-dir \"$HOME\""),
+            ("/elsewhere/data", "--data-dir /elsewhere/data"),
+        ];
+        for (data_dir, expected) in cases {
+            let home = portable_home("claude-code");
+            let cmd = posix_native_hook_command_with(
+                &portable_exe(),
+                home.as_deref(),
+                Path::new("stop.sh"),
+                "http://127.0.0.1:49374",
+                None,
+                portable_ctx("claude-code", Some(Path::new(data_dir))),
+            );
+            assert!(
+                cmd.contains(&format!("{expected} hook --event stop")),
+                "{data_dir}: {cmd}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_unsafe_or_outside_paths_keep_absolute() {
+        let home = Path::new("/h");
+        let cases = [
+            ("/elsewhere/ai-memory", "/elsewhere/ai-memory"),
+            ("/h/it's dir/ai-memory", "\"$HOME/it's dir/ai-memory\""),
+            ("/h/a$b/ai-memory", "'/h/a$b/ai-memory'"),
+            ("/h/a\"b/ai-memory", "'/h/a\"b/ai-memory'"),
+            ("/h/a`b/ai-memory", "'/h/a`b/ai-memory'"),
+            ("/h/a\\b/ai-memory", "'/h/a\\b/ai-memory'"),
+            ("/h/a\u{7}b/ai-memory", "'/h/a\u{7}b/ai-memory'"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                posix_path_arg(Path::new(path), Some(home)),
+                expected,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            posix_path_arg(
+                Path::new("/home/hx/bin/ai-memory"),
+                Some(Path::new("/home/h"))
+            ),
+            "/home/hx/bin/ai-memory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_unusable_home_keeps_absolute() {
+        let homes = [None, Some(""), Some("h"), Some("/")];
+        for home in homes {
+            let env = home.map(std::ffi::OsString::from);
+            assert_eq!(
+                portable_hook_home_from("claude-code", env, false, None),
+                None,
+                "{home:?}"
+            );
+        }
+        let cmd = posix_native_hook_command_with(
+            &portable_exe(),
+            None,
+            Path::new("stop.sh"),
+            "http://127.0.0.1:49374",
+            None,
+            portable_ctx("claude-code", None),
+        );
+        assert_eq!(
+            cmd,
+            "/h/.local/share/ai-memory/native-runner/ai-memory hook --event stop --agent claude-code --server-url http://127.0.0.1:49374"
+        );
+    }
+
+    /// Forces [`portable_hook_home`] to see `home` as `HOME` for this thread.
+    /// Restores the real environment on drop.
+    #[cfg(unix)]
+    struct HomeOverride;
+
+    #[cfg(unix)]
+    impl HomeOverride {
+        fn set(home: Option<PathBuf>) -> Self {
+            TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(home));
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for HomeOverride {
+        fn drop(&mut self) {
+            TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(unix)]
+    const PORTABLE_TEST_URL: &str = "http://127.0.0.1:49374";
+
+    /// Every `command` string in a payload, in document order.
+    #[cfg(unix)]
+    fn payload_commands(payload: &serde_json::Value) -> Vec<String> {
+        fn walk(value: &serde_json::Value, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        match (key.as_str(), child.as_str()) {
+                            ("command", Some(text)) => found.push(text.to_string()),
+                            _ => walk(child, found),
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|item| walk(item, found));
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(payload, &mut found);
+        found
+    }
+
+    #[cfg(unix)]
+    type PortableBuilder = fn(&Path) -> Vec<String>;
+
+    #[cfg(unix)]
+    fn row(agent: &'static str, build: PortableBuilder) -> (&'static str, PortableBuilder) {
+        (agent, build)
+    }
+
+    /// The 13 shell agents, each through the builder `install-hooks` calls.
+    #[cfg(unix)]
+    fn portable_shell_builders() -> [(&'static str, PortableBuilder); 13] {
+        [
+            row("claude-code", |data: &Path| {
+                payload_commands(&build_claude_code_payload_with_data_dir(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                    false,
+                    false,
+                ))
+            }),
+            row("grok", |data: &Path| {
+                payload_commands(&build_grok_payload_with_data_dir(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                    false,
+                ))
+            }),
+            row("devin", |data: &Path| {
+                payload_commands(&build_devin_payload_with_data_dir(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                    false,
+                ))
+            }),
+            row("dsh", |data: &Path| {
+                payload_commands(&build_dsh_hooks_payload(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                    false,
+                ))
+            }),
+            row("antigravity-cli", |data: &Path| {
+                payload_commands(&build_antigravity_payload_with_data_dir(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                    false,
+                ))
+            }),
+            row("kimi-code", |data: &Path| {
+                kimi_code_hook_commands(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                    false,
+                )
+                .into_iter()
+                .map(|(_, command)| command)
+                .collect()
+            }),
+            row("kiro-cli", |data: &Path| {
+                payload_commands(&build_kiro_cli_v3_hooks_value(
+                    Path::new(""),
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                    false,
+                ))
+            }),
+            row("droid", |data: &Path| {
+                payload_commands(&build_droid_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("muse", |data: &Path| {
+                payload_commands(&build_muse_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("codebuddy", |data: &Path| {
+                payload_commands(&build_codebuddy_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("qoder", |data: &Path| {
+                payload_commands(&build_qoder_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("ibm-bob", |data: &Path| {
+                payload_commands(&build_ibm_bob_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+            row("qwen-code", |data: &Path| {
+                payload_commands(&build_qwen_code_hooks_payload(
+                    PORTABLE_TEST_URL,
+                    None,
+                    Some(data),
+                    None,
+                ))
+            }),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_shell_agents_get_home_form() {
+        let exe = hook_embedded_exe_path();
+        let exe_file = exe.file_name().unwrap().to_string_lossy().into_owned();
+        let home = exe.parent().unwrap().to_path_buf();
+        let data = home.join(".local/share/ai-memory");
+        let absolute_exe = shell_quote(&exe.to_string_lossy());
+        let _home = HomeOverride::set(Some(home.clone()));
+        let expected_prefix = format!("\"$HOME/{exe_file}\" ");
+        for (agent, build) in portable_shell_builders() {
+            let commands = build(&data);
+            let hook_commands: Vec<&String> = commands
+                .iter()
+                .filter(|command| command.contains(" hook --event "))
+                .collect();
+            assert!(!hook_commands.is_empty(), "{agent}: no hook commands");
+            assert!(
+                hook_commands
+                    .iter()
+                    .any(|command| command.contains(&expected_prefix)),
+                "{agent}: {commands:?}"
+            );
+            for command in hook_commands {
+                assert!(!command.contains(&absolute_exe), "{agent}: {command}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_argv_agents_keep_absolute() {
+        let exe = hook_embedded_exe_path();
+        let absolute_exe = shell_quote(&exe.to_string_lossy());
+        let home = exe.parent().unwrap().to_path_buf();
+        let data = home.join(".local/share/ai-memory");
+        let _home = HomeOverride::set(Some(home.clone()));
+        for agent in ["hermes", "pool"] {
+            assert_eq!(portable_home(agent), None, "{agent}");
+        }
+        let hermes = build_hermes_hooks_yaml(
+            PORTABLE_TEST_URL,
+            None,
+            Some(&data),
+            None,
+            HermesHookSet::Full,
+        );
+        let pool = build_pool_settings_yaml_with_data_dir(
+            Path::new(""),
+            PORTABLE_TEST_URL,
+            None,
+            Some(&data),
+            None,
+            false,
+        );
+        for (agent, rendered) in [("hermes", hermes), ("pool", pool)] {
+            assert!(rendered.contains(&absolute_exe), "{agent}: {rendered}");
+            assert!(!rendered.contains("$HOME"), "{agent}: {rendered}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_opt_out_matches_shell_quote() {
+        let env = Some(std::ffi::OsString::from("/h"));
+        assert_eq!(
+            portable_hook_home_from("claude-code", env, true, None),
+            None
+        );
+        let data_dir = PathBuf::from("/h/Library/Application Support/ai-memory");
+        let cmd = posix_native_hook_command_with(
+            &portable_exe(),
+            None,
+            Path::new("stop.sh"),
+            "http://127.0.0.1:49374",
+            None,
+            portable_ctx("claude-code", Some(&data_dir)),
+        );
+        assert_eq!(
+            cmd,
+            "/h/.local/share/ai-memory/native-runner/ai-memory --data-dir '/h/Library/Application Support/ai-memory' hook --event stop --agent claude-code --server-url http://127.0.0.1:49374"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_env_opt_out_values() {
+        for value in ["1", "true", "TRUE"] {
+            let env = Some(std::ffi::OsString::from(value));
+            let home = std::ffi::OsString::from("/h");
+            assert_eq!(
+                portable_hook_home_from("claude-code", Some(home), false, env),
+                None,
+                "{value}"
+            );
+        }
+        for value in ["0", "false", ""] {
+            let env = Some(std::ffi::OsString::from(value));
+            let home = std::ffi::OsString::from("/h");
+            assert_eq!(
+                portable_hook_home_from("claude-code", Some(home), false, env),
+                Some(PathBuf::from("/h")),
+                "{value:?}"
+            );
+        }
+        let home = std::ffi::OsString::from("/h");
+        assert_eq!(
+            portable_hook_home_from("claude-code", Some(home), false, None),
+            Some(PathBuf::from("/h")),
+        );
     }
 }

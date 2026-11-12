@@ -146,7 +146,9 @@ where
 {
     let mut attempt = 1;
     loop {
-        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id).await {
+        match complete_structured_with_operation_id::<T>(llm, request.clone(), operation_id.clone())
+            .await
+        {
             Ok(value) => return Ok(value),
             Err(e) if attempt < CONSOLIDATION_LLM_MAX_ATTEMPTS && e.is_transient() => {
                 let wait = consolidation_retry_wait(&e, retry_delay);
@@ -184,6 +186,8 @@ pub struct Consolidator {
     per_user_slots: bool,
     /// Include bounded literal tokens from omitted prompt observations.
     verbatim_residue: bool,
+    /// Operator-fixed output language for generated prose (#2185).
+    output_language: Option<String>,
     /// Prompt input/output limits derived from `[consolidation]`.
     budgets: PromptBudgets,
 }
@@ -209,6 +213,7 @@ impl Consolidator {
             project_id,
             per_user_slots: false,
             verbatim_residue: false,
+            output_language: None,
             budgets: PromptBudgets::default(),
         }
     }
@@ -252,6 +257,14 @@ impl Consolidator {
     #[must_use]
     pub fn with_verbatim_residue(mut self, enabled: bool) -> Self {
         self.verbatim_residue = enabled;
+        self
+    }
+
+    /// Force the natural language of generated prose (`[consolidation]
+    /// output_language`); `None` follows the input's dominant language.
+    #[must_use]
+    pub fn with_output_language(mut self, lang: Option<String>) -> Self {
+        self.output_language = lang;
         self
     }
 
@@ -398,8 +411,13 @@ impl Consolidator {
         // session id) is shared by every attempt of this invocation; a
         // re-entry after a crash or a new queue claim is a NEW operation
         // with a new id.
-        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation);
-        let request = assemble_single_request(&plan, &projected, self.budgets);
+        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation)
+            .with_subject(self.llm_subject(ws, proj, session_id).await);
+        let mut request = assemble_single_request(&plan, &projected, self.budgets);
+        request.system = Some(crate::with_output_language(
+            SYSTEM_PROMPT,
+            self.output_language.as_deref(),
+        ));
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -528,6 +546,22 @@ impl Consolidator {
             .session_target(session_id)
             .await?
             .unwrap_or((self.workspace_id, self.project_id)))
+    }
+
+    /// The scope a consolidation reads and the session's owner, for the
+    /// opt-in request metadata. The owner, not the caller: an operator
+    /// consolidating someone else's session still summarises that person's
+    /// work.
+    async fn llm_subject(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+    ) -> ai_memory_llm::LlmSubject {
+        ai_memory_llm::LlmSubject {
+            user: crate::llm_subject::session_owner(&self.reader, session_id).await,
+            ..crate::llm_subject::scope(&self.reader, ws, Some(proj)).await
+        }
     }
 
     /// The repository a consolidation of `session_id` would write into, or
@@ -935,8 +969,13 @@ impl Consolidator {
         // fresh id is shared by every attempt of this invocation; a
         // re-entry after a crash or a new queue claim is a new operation
         // with a new id.
-        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation);
-        let request = assemble_batch_request(&plan, &projected, self.budgets);
+        let operation_id = LlmOperationId::for_workload(ai_memory_llm::LlmWorkload::Consolidation)
+            .with_subject(self.llm_subject(ws, proj, session_id).await);
+        let mut request = assemble_batch_request(&plan, &projected, self.budgets);
+        request.system = Some(crate::with_output_language(
+            BATCH_SYSTEM_PROMPT,
+            self.output_language.as_deref(),
+        ));
         debug!(
             session = %session_id,
             provider = self.llm.name(),
@@ -2602,6 +2641,30 @@ pub(crate) const SYSTEM_PROMPT: &str = crate::prompt_template::prompt_with_wikil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_language_override_extends_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(SYSTEM_PROMPT, None),
+            SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
+
+    #[test]
+    fn output_language_override_extends_batch_system_prompt_only_when_set() {
+        assert_eq!(
+            crate::with_output_language(BATCH_SYSTEM_PROMPT, None),
+            BATCH_SYSTEM_PROMPT
+        );
+        let out = crate::with_output_language(BATCH_SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(BATCH_SYSTEM_PROMPT));
+        assert!(out.contains("OPERATOR OVERRIDE"));
+        assert!(out.contains("in English"));
+    }
     use ai_memory_core::{ObservationId, ObservationKind, ProjectId, SessionId, WorkspaceId};
     use jiff::Timestamp;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5493,7 +5556,7 @@ mod tests {
 
     /// Gateway compatibility of a fresh operation id: the 36-character
     /// hyphenated UUID v7 form a gateway records in `X-Request-Id`.
-    fn assert_fresh_gateway_form(id: LlmOperationId) {
+    fn assert_fresh_gateway_form(id: &LlmOperationId) {
         let s = id.to_string();
         assert_eq!(s.len(), 36, "the hyphenated wire form is 36 chars: {s}");
         let parsed = uuid::Uuid::parse_str(&s).expect("parses as a UUID");
@@ -5564,8 +5627,8 @@ mod tests {
                 single1[0], single2[0],
                 "two single invocations of one session get distinct operation ids"
             );
-            assert_fresh_gateway_form(single1[0]);
-            assert_fresh_gateway_form(single2[0]);
+            assert_fresh_gateway_form(&single1[0]);
+            assert_fresh_gateway_form(&single2[0]);
             assert_eq!(
                 single1[0].workload(),
                 ai_memory_llm::LlmWorkload::Consolidation
@@ -5634,8 +5697,8 @@ mod tests {
                 multi1[0], multi2[0],
                 "two multi invocations of one session get distinct operation ids"
             );
-            assert_fresh_gateway_form(multi1[0]);
-            assert_fresh_gateway_form(multi2[0]);
+            assert_fresh_gateway_form(&multi1[0]);
+            assert_fresh_gateway_form(&multi2[0]);
             assert_eq!(
                 multi1[0].workload(),
                 ai_memory_llm::LlmWorkload::Consolidation
@@ -5650,6 +5713,59 @@ mod tests {
                 "the operation id is never the session id"
             );
         }
+    }
+
+    /// The request metadata of a consolidation names the scope it reads and
+    /// the session's owner, not the caller: an operator consolidating someone
+    /// else's session still summarises that person's work.
+    #[tokio::test]
+    async fn the_operation_names_the_session_scope_and_its_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ai_memory_store::Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "billing-api", None)
+            .await
+            .unwrap();
+        let session = SessionId::new();
+        seed_session(store.db_path(), session, ws, proj);
+        rusqlite::Connection::open(store.db_path())
+            .unwrap()
+            .execute(
+                "UPDATE sessions SET actor_user = 'user:alice' WHERE id = ?1",
+                rusqlite::params![session.as_bytes()],
+            )
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let caller = ai_memory_core::ActorContext {
+            user: Some("root".into()),
+            ..ai_memory_core::ActorContext::default()
+        };
+
+        let (llm, ids) = OpIdCapturingLlm::new(scripted_page());
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(llm),
+            ws,
+            proj,
+        )
+        .consolidate_session(session, false, caller, None, None)
+        .await
+        .unwrap();
+
+        let ids = ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            ids[0].subject(),
+            Some(&ai_memory_llm::LlmSubject {
+                workspace: Some("acme".into()),
+                project: Some("billing-api".into()),
+                user: Some("alice".into()),
+            })
+        );
     }
 
     async fn write_slot(wiki: &Wiki, ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) {

@@ -432,6 +432,7 @@ async fn m8_retention_lifecycle_end_to_end() {
             embedding: None,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            keep_llm_findings: false,
         },
     )
     .await

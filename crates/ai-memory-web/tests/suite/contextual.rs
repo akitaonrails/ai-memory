@@ -211,6 +211,7 @@ async fn contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_pri
                 actor_user: owner
                     .map(|name| ai_memory_core::IdentityKey::User(name.into()).storage_key()),
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();

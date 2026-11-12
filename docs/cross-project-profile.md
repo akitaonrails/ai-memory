@@ -436,6 +436,39 @@ that sets `[briefing]` keys: an outer marker's `workspace`/`project` do not
 apply through it. `ai-memory profile status` lists the projects that opted out
 of contributing.
 
+## Keeping orchestrator briefs out of the profile
+
+An orchestrator that launches agents non-interactively (a nightly batch, or a
+pane manager that opens each session with a generated brief) is a different
+case from a project you want to exclude. The work those sessions do is worth
+capturing, but their opening brief is not something you said, and a rule-shaped
+sentence in it ("never push", "this run is read-only") can otherwise be
+harvested as your own preference and delivered to every project.
+
+Mark those sessions at launch instead of taking a whole project out. Set
+
+```sh
+AI_MEMORY_SESSION_ORIGIN=automation
+```
+
+in the harness environment the orchestrator starts each agent with. The hook
+clients forward it, and the server records it on the session. Then set the
+server to skip automation sessions when it harvests:
+
+```toml
+[profile]
+harvest_prompts = "interactive"   # default "all"
+```
+
+With both in place, the harvester reads no `user-prompt` from a session marked
+automation, while everything else about those sessions is unchanged: capture,
+handoff, recall, and the projects' curated pages and stack signals still feed
+the profile. `all` (the default) harvests every session's prompts as before, so
+an install that sets neither sees no change. The signal is per session, so an
+interactive session you start by hand in the same project still contributes.
+That is unlike `contribute = false`, which takes the whole project out for
+everyone.
+
 ## Privacy and isolation
 
 - A private profile (`share = "user"`) is a restricted project: another

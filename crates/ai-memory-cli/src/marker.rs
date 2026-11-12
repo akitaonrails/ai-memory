@@ -1244,8 +1244,9 @@ impl MarkerMemo {
 /// section: any root-level scope key (`workspace`/`project`/
 /// `project_strategy`), or any of the other settings
 /// `hook_capture::marker_query_suffix_impl` forwards (`[recall]
-/// default_global`, `[briefing]` and `[profile]` keys, top-level
-/// `drop_subagent_captures`), or `[messaging] inbox_notice_on_prompt`,
+/// default_global`, `[briefing]` and `[profile]` keys, `[retrieval]
+/// default_result_limit`, top-level `drop_subagent_captures`), or
+/// `[messaging] inbox_notice_on_prompt`,
 /// which the hook reads locally instead of forwarding but must still read
 /// from the nearest settings-declaring marker (#1942).
 /// A marker with any of these is a resolution boundary; only a marker whose
@@ -1264,7 +1265,7 @@ fn declares_more_than_capture(text: &str) -> bool {
         "identity",
         "identity_style",
     ];
-    const FLAG_KEYS: [&str; 8] = [
+    const FLAG_KEYS: [&str; 10] = [
         "default_global",
         "inject_on_session_start",
         "inject_on_subagent_start",
@@ -1273,6 +1274,8 @@ fn declares_more_than_capture(text: &str) -> bool {
         "consume",
         "deliver_on_session_start",
         "inbox_notice_on_prompt",
+        "default_result_limit",
+        "min_relevance",
     ];
     QUOTED_KEYS
         .iter()
@@ -2430,6 +2433,8 @@ project = "infra" # this is fine
             "[briefing]\ninject_on_subagent_start = true\n",
             "[briefing]\nmax_chars = 4000\n",
             "[handoff]\ndeliver_on_session_start = false\n",
+            "[retrieval]\ndefault_result_limit = 25\n",
+            "[retrieval]\nmin_relevance = 0.4\n",
         ] {
             assert!(
                 declares_more_than_capture(text),

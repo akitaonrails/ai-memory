@@ -218,6 +218,10 @@ pub enum Command {
     /// Accepts either `--path` (exact path) or a positional query that
     /// searches FTS5 and fetches the top matching page.
     ReadPage(ReadPageArgs),
+    /// Call one MCP tool of the configured server from the shell, or list the
+    /// tools and their input schemas when no tool is named. For agents that
+    /// cannot load MCP.
+    Call(CallArgs),
     /// Write or update a wiki page atomically (also indexes it in the store).
     WritePage(WritePageArgs),
     /// Delete a single wiki page. The server routes scope resolution
@@ -460,6 +464,14 @@ pub struct RunArgs {
     /// Create and select a fresh named workstream.
     #[arg(long = "new", conflicts_with = "workstream")]
     pub new_workstream: Option<String>,
+    /// With `--workstream NAME`: create NAME as `--new NAME` would when it does
+    /// not exist yet, instead of failing. An existing NAME resumes as usual.
+    #[arg(
+        long = "or-new",
+        requires = "workstream",
+        conflicts_with = "new_workstream"
+    )]
+    pub or_new: bool,
     /// Override the native harness executable path.
     #[arg(long)]
     pub executable: Option<PathBuf>,
@@ -1953,6 +1965,9 @@ pub enum InstallSkillsAgent {
     /// `~/.gemini/antigravity-cli/skills` (CLI).
     #[value(alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+    /// Tencent WorkBuddy's `.workbuddy/skills` directory.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// Install into both Claude Code and `.agents` skill directories.
     Both,
 }
@@ -2179,6 +2194,10 @@ pub struct SetupArgs {
     /// holds the write end, so the page goes away with the app.
     #[arg(long, requires = "web", hide = true)]
     pub stop_on_stdin_eof: bool,
+    /// Write the absolute, shell-quoted exe and data dir into the hook commands
+    /// that `setup` installs, instead of the `"$HOME/..."` form.
+    #[arg(long)]
+    pub absolute_paths: bool,
 }
 
 /// Arguments for `status`.
@@ -2375,6 +2394,27 @@ pub struct ReadPageArgs {
     /// Emit the page as JSON (includes frontmatter).
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for `call`.
+#[derive(Debug, Args)]
+pub struct CallArgs {
+    /// MCP tool name (e.g. `memory_query`). Omit to list the server's tools
+    /// with their input schemas.
+    pub tool: Option<String>,
+    /// The tool's arguments as one JSON object (e.g. '{"query":"wal mode"}').
+    /// A call that names no `workspace`, `project`, `project_id` or `global`
+    /// gets the current project's scope when the tool accepts one.
+    #[arg(value_parser = parse_json_object)]
+    pub arguments: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+fn parse_json_object(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    match serde_json::from_str(raw) {
+        Ok(serde_json::Value::Object(object)) => Ok(object),
+        Ok(_) => Err("expected a JSON object".to_owned()),
+        Err(error) => Err(format!("invalid JSON: {error}")),
+    }
 }
 
 /// Arguments for `delete-page`.
@@ -2691,6 +2731,15 @@ pub enum AgentChoice {
     /// stdout (`hookSpecificOutput.additionalContext`) carries the handoff.
     #[value(name = "codebuddy", alias = "code-buddy")]
     CodeBuddy,
+    /// Tencent WorkBuddy (`workbuddy`) — lifecycle hooks merged into the
+    /// `hooks` key of `~/.workbuddy/settings.json`. WorkBuddy takes CodeBuddy's
+    /// Claude Code-shaped hook payloads on stdin, so each entry runs
+    /// ai-memory's native `hook` command directly; there is no script bundle.
+    /// SessionStart stdout (`hookSpecificOutput.additionalContext`) carries
+    /// the handoff. WorkBuddy fires no `SessionEnd`, so a finished session
+    /// closes with `ai-memory finalize-session --agent workbuddy`.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// IBM Bob IDE — lifecycle hooks merged into the `hooks` key of
     /// `~/.bob/settings/settings.json`. Bob sends Claude Code-shaped payloads
     /// and injects plain `SessionStart` stdout into the model context.
@@ -2759,6 +2808,7 @@ impl AgentChoice {
             Self::Droid => AgentKind::Droid,
             Self::Muse => AgentKind::Muse,
             Self::CodeBuddy => AgentKind::CodeBuddy,
+            Self::WorkBuddy => AgentKind::WorkBuddy,
             Self::IbmBob => AgentKind::IbmBob,
             Self::Dsh => AgentKind::Dsh,
             Self::Cline => AgentKind::Cline,
@@ -2786,6 +2836,7 @@ impl AgentChoice {
             | Self::Droid
             | Self::Muse
             | Self::CodeBuddy
+            | Self::WorkBuddy
             | Self::IbmBob
             | Self::Cline
             | Self::QwenCode => None,
@@ -2994,6 +3045,12 @@ pub enum McpClient {
     /// Qoder CLI and IDE — user-level `~/.qoder/settings.json`, with a
     /// stdio `ai-memory mcp-bridge --no-session-id` entry under `mcpServers`.
     Qoder,
+    /// Tencent WorkBuddy (`workbuddy`) — user-level `~/.workbuddy/mcp.json`,
+    /// servers under the root `mcpServers` map with `type: "http"` + `url`
+    /// and an optional `headers` bearer, the shape Claude Code uses. Pair
+    /// with `install-hooks --agent workbuddy` for lifecycle capture.
+    #[value(name = "workbuddy", alias = "work-buddy")]
+    WorkBuddy,
     /// GitHub Copilot CLI — `$COPILOT_HOME/mcp-config.json` (default
     /// `~/.copilot/mcp-config.json`), servers under the root `mcpServers` map
     /// with `type: "http"` + `url` + optional `headers` (#1040). Pair with
@@ -3442,6 +3499,15 @@ pub struct HookArgs {
     /// `capture_assistant`. No effect on other events (#196).
     #[arg(long)]
     pub capture_assistant: bool,
+    /// Fail closed unless this repository resolves to exactly this server
+    /// profile. A generated plugin that forwards a server-profile repository to
+    /// the native hook (rather than dropping it) passes the profile name it
+    /// read from the marker here; the native hook re-resolves the route from the
+    /// cwd and, if it is not exactly this profile, emits nothing rather than
+    /// delivering to the install default or a different profile (#2122, #992). A
+    /// value is a validated profile name, never a token.
+    #[arg(long)]
+    pub expected_profile: Option<String>,
 }
 
 /// Arguments for hidden `hook-drain`.
@@ -3571,6 +3637,11 @@ pub struct InstallHooksArgs {
     /// `PI_PROFILE`; `default` selects the default profile.
     #[arg(long)]
     pub profile: Option<String>,
+    /// Write the absolute, shell-quoted exe and data dir into hook commands
+    /// instead of the `"$HOME/..."` form. `AI_MEMORY_HOOK_ABSOLUTE_PATHS=1`
+    /// opts out the same way.
+    #[arg(long)]
+    pub absolute_paths: bool,
 }
 
 /// Arguments for `install-mcp`.
@@ -5020,6 +5091,48 @@ mod tests {
     }
 
     #[test]
+    fn run_or_new_requires_workstream_and_conflicts_with_new() {
+        // The happy path: `--or-new` rides on `--workstream NAME`.
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--workstream",
+            "401",
+            "--or-new",
+            "claude",
+        ])
+        .expect("--workstream NAME --or-new parses");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args.workstream.as_deref(), Some("401"));
+        assert!(args.or_new, "--or-new sets the flag");
+        assert!(args.new_workstream.is_none());
+
+        // `--or-new` alone has no workstream to fall back on.
+        let error = Cli::try_parse_from(["ai-memory", "run", "--or-new", "claude"])
+            .expect_err("--or-new without --workstream must be rejected");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        // `--or-new` and `--new` name two different create intents.
+        let error = Cli::try_parse_from([
+            "ai-memory",
+            "run",
+            "--workstream",
+            "401",
+            "--or-new",
+            "--new",
+            "402",
+            "claude",
+        ])
+        .expect_err("--or-new must conflict with --new");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn run_env_file_flag_parses_as_a_path() {
         let cli = Cli::try_parse_from([
             "ai-memory",
@@ -5266,6 +5379,27 @@ mod tests {
             assert_eq!(args.agent, AgentChoice::CodeBuddy);
             assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::CodeBuddy);
             assert_eq!(args.agent.script_hook_subdir(), None);
+        }
+    }
+
+    #[test]
+    fn workbuddy_install_hooks_and_mcp_parse_with_both_aliases() {
+        for alias in ["workbuddy", "work-buddy"] {
+            let hooks = Cli::try_parse_from(["ai-memory", "install-hooks", "--agent", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallHooks(args) = hooks.command else {
+                panic!("expected install-hooks");
+            };
+            assert_eq!(args.agent, AgentChoice::WorkBuddy);
+            assert_eq!(args.agent.kind(), ai_memory_core::AgentKind::WorkBuddy);
+            assert_eq!(args.agent.script_hook_subdir(), None);
+
+            let mcp = Cli::try_parse_from(["ai-memory", "install-mcp", "--client", alias])
+                .unwrap_or_else(|error| panic!("{alias}: {error}"));
+            let Command::InstallMcp(args) = mcp.command else {
+                panic!("expected install-mcp");
+            };
+            assert_eq!(args.client, McpClient::WorkBuddy);
         }
     }
 

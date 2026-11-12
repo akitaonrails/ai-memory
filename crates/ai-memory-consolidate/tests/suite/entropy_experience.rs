@@ -117,6 +117,7 @@ async fn harness_with_two_sessions() -> Harness {
                 agent_kind: ai_memory_core::AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -228,5 +229,112 @@ async fn default_off_changes_nothing() {
     assert!(
         prompt.contains("status ok status ok"),
         "with the filter off the boilerplate is NOT skipped: {prompt}"
+    );
+}
+
+/// LLM stub that records the SYSTEM prompt of every structured completion, so a
+/// test can assert what instruction the generation pass actually sent.
+struct SystemCapturingLlm {
+    systems: Arc<Mutex<Vec<String>>>,
+}
+
+impl LlmProvider for SystemCapturingLlm {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+    fn model(&self) -> &str {
+        "system-capturing"
+    }
+    fn complete<'life0, 'async_trait>(
+        &'life0 self,
+        _request: ChatRequest,
+    ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            Ok(ChatResponse {
+                text: "unused".into(),
+                usage: None,
+                model: "system-capturing".into(),
+            })
+        })
+    }
+    fn complete_structured_raw<'life0, 'async_trait>(
+        &'life0 self,
+        request: ChatRequest,
+        _schema: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        let systems = self.systems.clone();
+        Box::pin(async move {
+            systems
+                .lock()
+                .unwrap()
+                .push(request.system.clone().unwrap_or_default());
+            Ok(serde_json::json!({
+                "summary": "none",
+                "proposals": [],
+                "rejected_candidates": []
+            }))
+        })
+    }
+}
+
+/// Run one experience review with the given `output_language` and return the
+/// system prompt the pass actually sent to the model.
+async fn captured_experience_system(output_language: Option<&str>) -> String {
+    let h = harness_with_two_sessions().await;
+    let systems = Arc::new(Mutex::new(Vec::new()));
+    let llm = SystemCapturingLlm {
+        systems: systems.clone(),
+    };
+    let cfg = ExperienceConfig {
+        output_language: output_language.map(str::to_string),
+        ..experience_cfg(false)
+    };
+    run_experience_review(
+        &h.store.reader,
+        &llm,
+        h.ws,
+        h.proj,
+        AutoImproveReviewConfig::default(),
+        &cfg,
+    )
+    .await
+    .unwrap();
+    let systems = systems.lock().unwrap();
+    assert_eq!(systems.len(), 1, "the LLM was called exactly once");
+    systems[0].clone()
+}
+
+/// Wiring: `[consolidation] output_language` must reach a real generation pass's
+/// system prompt, and the default must leave the input-language rule intact.
+/// The const-level helper tests cannot see this config → `ExperienceConfig` →
+/// prompt-site path; this test fails if any link in it is dropped.
+#[tokio::test]
+async fn output_language_override_reaches_experience_system_prompt() {
+    let with = captured_experience_system(Some("English")).await;
+    assert!(
+        with.contains("## OUTPUT LANGUAGE — OPERATOR OVERRIDE"),
+        "configured language appends the override: {with}"
+    );
+    assert!(
+        with.contains("rationale in English"),
+        "the override names the configured language: {with}"
+    );
+
+    let without = captured_experience_system(None).await;
+    assert!(
+        !without.contains("OPERATOR OVERRIDE"),
+        "default sends no override: {without}"
+    );
+    assert!(
+        without.contains("dominant natural language of the session summaries"),
+        "default keeps the input-language rule: {without}"
     );
 }

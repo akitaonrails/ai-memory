@@ -84,6 +84,7 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
         max_procedure_page_tokens:
             ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
         eval: ai_memory_consolidate::AutoImproveEvalConfig::default(),
+        output_language: None,
     }
 }
 
@@ -584,6 +585,20 @@ pub struct AiMemoryServer {
     /// hook ingress) — in which case the baked-in default is used.
     active_project: ActiveProject,
     default_limit: usize,
+    /// Global `[retrieval] min_relevance`: the calibrated reranker-score floor
+    /// applied to `memory_query` hits when a call gives no explicit
+    /// `min_relevance` and the queried project carries none (#2038). `None`
+    /// applies no floor. The threshold needs the configured reranker; a query
+    /// that resolves a floor with none available is rejected.
+    default_min_relevance: Option<f32>,
+    /// Opt-in per-session retrieval-history recording (#2038). When `true`,
+    /// each single-project `memory_query` call records what it returned to the
+    /// read-only `/web` dashboard, best-effort (a query never fails on it).
+    /// `false` (the default) records nothing.
+    record_retrieval_history: bool,
+    /// Newest-N retrieval records kept per `(workspace, project, session)` when
+    /// recording is on; floored to 1 so the feature is never silently inert.
+    retrieval_history_retention: u32,
     answer_max_context_tokens: Option<usize>,
     /// Optional LLM consolidator. When `None`, `memory_consolidate`
     /// returns a "not configured" error.
@@ -733,6 +748,16 @@ struct QueryArgs {
     /// Maximum number of hits to return (default 10, max 100).
     #[serde(default, alias = "n", alias = "top_k")]
     limit: Option<usize>,
+    /// Minimum calibrated reranker relevance (`0.0..=1.0`) a hit must have to be
+    /// returned: hits scoring below it are excluded before `limit` is applied,
+    /// so fewer than `limit` hits (or none) may come back. Needs a configured
+    /// reranker — a query that sets it when none is available is rejected, since
+    /// the uncalibrated fusion rank is not a relevance score. Overrides the
+    /// project's stored `min_relevance` and the global `[retrieval] min_relevance`.
+    /// Applies to the normal single-project / `scopes` search; rejected on
+    /// `global` and `as_of` queries. Omit to apply the project/global floor, if any.
+    #[serde(default)]
+    min_relevance: Option<f32>,
     /// Keep only pages of this semantic kind (ASCII case-insensitive).
     /// Custom kinds are accepted. Applied before ranking.
     #[serde(default)]
@@ -968,6 +993,43 @@ fn bounded_query_filter<'a>(
     Ok(Some(value))
 }
 
+/// Compact JSON of the active pre-ranking filters for the opt-in retrieval
+/// history (#2038), or `None` when a call set none. Records what narrowed the
+/// search so the dashboard can show why a query returned what it did; the raw
+/// values were already length-validated by [`query_page_filter`].
+fn retrieval_filters_json(
+    args: &QueryArgs,
+    include_expired: bool,
+    include_superseded: bool,
+) -> Option<String> {
+    let mut map = serde_json::Map::new();
+    let mut set = |key: &str, value: Option<&str>| {
+        if let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    };
+    set("kind", args.kind.as_deref());
+    set("tier", args.tier.as_deref());
+    set("path_prefix", args.path_prefix.as_deref());
+    set("tag", args.tag.as_deref());
+    if include_expired {
+        map.insert("include_expired".to_string(), serde_json::Value::Bool(true));
+    }
+    if include_superseded {
+        map.insert(
+            "include_superseded".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if map.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).ok()
+}
+
 fn query_page_filter(args: &QueryArgs) -> Result<ai_memory_store::PageFilter<'_>, McpError> {
     let kind = bounded_query_filter(
         "kind",
@@ -1014,32 +1076,52 @@ fn vector_query(qv: &ai_memory_llm::QueryVector) -> ai_memory_store::VectorQuery
 }
 
 /// Rerank fused page hits through `stage`, recording each judged hit's
-/// relevance in its explain details.
+/// relevance in its explain details and returning that calibrated score
+/// alongside each returned hit (`None` for a hit the reranker did not score:
+/// the fused tail beyond the candidate window, or every hit on a transient
+/// rerank failure — timeout, saturation, provider error, or too few
+/// candidates). The scores are aligned with the returned hits so the query path
+/// can apply a `min_relevance` floor outside explain mode (#2038).
 async fn rerank_page_hits(
     stage: &ai_memory_llm::RerankStage,
     query: &str,
     hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
     limit: usize,
     timeout: std::time::Duration,
-) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
-    stage
+) -> (
+    Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+    Vec<Option<f32>>,
+) {
+    // Carry a per-hit score slot through `apply` as a third tuple element: the
+    // `record` closure fills it for every reranked hit in output order, while a
+    // tail or an unscored (failed) run leaves it `None`. This makes the score
+    // available for filtering without forcing explain mode on.
+    let wrapped: Vec<(PageHit, Option<ai_memory_store::SearchExplain>, Option<f32>)> = hits
+        .into_iter()
+        .map(|(hit, explain)| (hit, explain, None))
+        .collect();
+    let out = stage
         .apply(
             query,
-            hits,
+            wrapped,
             limit,
             timeout,
-            |(hit, _)| ai_memory_llm::RerankCandidate {
+            |(hit, _, _)| ai_memory_llm::RerankCandidate {
                 id: hit.id.to_string(),
                 title: hit.title.clone(),
                 snippet: ai_memory_store::plain_snippet(&hit.snippet),
             },
-            |(_, explain), relevance| {
+            |(_, explain, score), relevance| {
+                *score = Some(relevance);
                 if let Some(explain) = explain.as_mut() {
                     explain.rerank_score = Some(relevance);
                 }
             },
         )
-        .await
+        .await;
+    out.into_iter()
+        .map(|(hit, explain, score)| ((hit, explain), score))
+        .unzip()
 }
 
 /// Synthesized "dialectic" answer attached to a `memory_query` response when
@@ -1081,6 +1163,14 @@ struct MemoryQueryResponse {
     /// never an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     answer_unavailable: Option<String>,
+    /// Present only when a resolved `min_relevance` floor could not be applied
+    /// because the reranker scored no hit this query — a transient rerank
+    /// timeout, saturation, or provider error, or too few candidates to rank
+    /// (#2038). A short human-readable reason; the hits are returned unfiltered
+    /// (fused order) rather than dropped, and this is never an error. Omitted
+    /// when no floor was requested or the floor was applied normally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relevance_filter_unavailable: Option<String>,
     /// Present only when optional answer-context admission ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     answer_context: Option<AnswerContext>,
@@ -2269,6 +2359,9 @@ impl AiMemoryServer {
             project_id,
             active_project: ActiveProject::new(),
             default_limit: 10,
+            default_min_relevance: None,
+            record_retrieval_history: false,
+            retrieval_history_retention: ai_memory_store::DEFAULT_RETRIEVAL_HISTORY_RETENTION,
             answer_max_context_tokens: None,
             consolidator: None,
             llm_providers: LlmProviders::default(),
@@ -2315,6 +2408,100 @@ impl AiMemoryServer {
     pub fn with_answer_context_budget(mut self, max_context_tokens: Option<usize>) -> Self {
         self.answer_max_context_tokens = max_context_tokens;
         self
+    }
+
+    /// Set the server-wide default number of hits `memory_query` returns when a
+    /// call gives no explicit `limit` and the queried project carries no stored
+    /// `[retrieval] default_result_limit` of its own (#2038). `None` keeps the
+    /// built-in default of 10. The value is clamped to `1..=100`, matching the
+    /// per-call clamp, so a misconfigured global cannot widen or empty a query.
+    #[must_use]
+    pub fn with_default_limit(mut self, default_limit: Option<usize>) -> Self {
+        if let Some(limit) = default_limit {
+            self.default_limit = limit.clamp(1, 100);
+        }
+        self
+    }
+
+    /// Set the server-wide `memory_query` relevance floor applied when a call
+    /// gives no explicit `min_relevance` and the queried project carries no
+    /// stored `[retrieval] min_relevance` of its own (#2038). `None` keeps no
+    /// floor. A value outside `0.0..=1.0` (or non-finite) is dropped so a
+    /// misconfigured global cannot empty every query; the CLI already rejects
+    /// one at startup, this is defence in depth.
+    #[must_use]
+    pub fn with_default_min_relevance(mut self, min_relevance: Option<f32>) -> Self {
+        self.default_min_relevance =
+            min_relevance.filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+        self
+    }
+
+    /// Enable opt-in per-session retrieval-history recording (#2038) and set the
+    /// per-session retention cap. `enabled = false` (the default) records
+    /// nothing. The cap is floored to 1 so an enabled dashboard never keeps zero
+    /// records; `None` keeps the built-in default. The CLI validates the cap at
+    /// startup, this is defence in depth.
+    #[must_use]
+    pub fn with_retrieval_history_recording(
+        mut self,
+        enabled: bool,
+        retention_per_session: Option<usize>,
+    ) -> Self {
+        self.record_retrieval_history = enabled;
+        if let Some(cap) = retention_per_session {
+            self.retrieval_history_retention = u32::try_from(cap).unwrap_or(u32::MAX).max(1);
+        }
+        self
+    }
+
+    /// Effective result limit for a single-project query under #2038's
+    /// precedence: an explicit per-call `limit` wins; otherwise the queried
+    /// project's stored `[retrieval] default_result_limit`; otherwise the
+    /// server-wide default (itself the global config value, else the built-in
+    /// 10). Always clamped to `1..=100`, so no layer can widen or empty a
+    /// query. A read error falls back to the server-wide default rather than
+    /// failing the query.
+    async fn effective_query_limit(
+        &self,
+        explicit: Option<usize>,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> usize {
+        self.effective_query_criteria(explicit, None, workspace_id, project_id)
+            .await
+            .0
+    }
+
+    /// Resolve both #2038 per-field defaults for a single-project query in one
+    /// project read: the result limit (`call → project → global → built-in 10`,
+    /// clamped `1..=100`) and the relevance floor (`call → project → global →
+    /// none`, bounded `0.0..=1.0`). A project read error falls back to the
+    /// server-wide defaults rather than failing the query.
+    async fn effective_query_criteria(
+        &self,
+        explicit_limit: Option<usize>,
+        explicit_min_relevance: Option<f32>,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> (usize, Option<f32>) {
+        let stored = self
+            .reader
+            .project_retrieval_criteria(workspace_id, project_id)
+            .await
+            .ok();
+        let limit = explicit_limit
+            .or_else(|| {
+                stored
+                    .and_then(|c| c.default_result_limit)
+                    .map(|value| value as usize)
+            })
+            .unwrap_or(self.default_limit)
+            .clamp(1, 100);
+        let min_relevance = explicit_min_relevance
+            .or_else(|| stored.and_then(|c| c.min_relevance))
+            .or(self.default_min_relevance)
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+        (limit, min_relevance)
     }
 
     /// Declare that a trusted proxy may assert end-user identities — mirror of
@@ -2830,6 +3017,39 @@ impl AiMemoryServer {
         format!("{ws_name}/{proj_name}")
     }
 
+    /// What an LLM call made for a request reads and whom it acts for, for
+    /// the opt-in request metadata headers: the caller's username, and the
+    /// scope only when the call reads exactly one. Unlike [`Self::scope_names`],
+    /// an unknown name stays unset rather than becoming a placeholder.
+    async fn llm_subject(
+        &self,
+        actor: &ai_memory_core::ActorContext,
+        scope: Option<(ai_memory_core::WorkspaceId, ai_memory_core::ProjectId)>,
+    ) -> ai_memory_llm::LlmSubject {
+        let (workspace, project) = match scope {
+            Some((ws, proj)) => (
+                self.reader.workspace_name_by_id(ws).await.ok().flatten(),
+                self.reader
+                    .project_name_by_id(ws, proj)
+                    .await
+                    .ok()
+                    .flatten(),
+            ),
+            None => (None, None),
+        };
+        let user = actor
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|user| !user.is_empty())
+            .map(str::to_owned);
+        ai_memory_llm::LlmSubject {
+            workspace,
+            project,
+            user,
+        }
+    }
+
     /// Workspace and project names for a resolved scope, with the same
     /// placeholders as [`Self::scope_label`] when a lookup fails.
     async fn scope_names(
@@ -3012,30 +3232,67 @@ impl AiMemoryServer {
             .map_or(limit, |stage| stage.fetch_limit(limit))
     }
 
+    /// Thin wrapper used by the rerank unit tests that only assert on ordering.
+    /// The query path uses [`Self::rerank_hits_scored`] so it can also filter by
+    /// `min_relevance`.
+    #[cfg(test)]
     async fn rerank_hits(
         &self,
         query: &str,
         hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
         limit: usize,
     ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+        self.rerank_hits_scored(query, hits, limit).await.0
+    }
+
+    /// Like [`Self::rerank_hits`] but also returns each returned hit's
+    /// calibrated reranker score (`None` for the fused tail or a transient
+    /// rerank failure), so the query path can apply a `min_relevance` floor.
+    async fn rerank_hits_scored(
+        &self,
+        query: &str,
+        hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        limit: usize,
+    ) -> (
+        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        Vec<Option<f32>>,
+    ) {
         let timeout = self.rerank.as_ref().map_or(
             ai_memory_llm::reranker::RERANK_TIMEOUT,
             ai_memory_llm::RerankStage::timeout,
         );
-        self.rerank_hits_with_timeout(query, hits, limit, timeout)
+        self.rerank_hits_with_timeout_scored(query, hits, limit, timeout)
             .await
     }
 
+    /// Test-only timeout-injecting wrapper; see [`Self::rerank_hits`].
+    #[cfg(test)]
     async fn rerank_hits_with_timeout(
+        &self,
+        query: &str,
+        hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        limit: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+        self.rerank_hits_with_timeout_scored(query, hits, limit, timeout)
+            .await
+            .0
+    }
+
+    async fn rerank_hits_with_timeout_scored(
         &self,
         query: &str,
         mut hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
         limit: usize,
         timeout: std::time::Duration,
-    ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+    ) -> (
+        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        Vec<Option<f32>>,
+    ) {
         let Some(stage) = &self.rerank else {
             hits.truncate(limit);
-            return hits;
+            let scores = vec![None; hits.len()];
+            return (hits, scores);
         };
         rerank_page_hits(stage, query, hits, limit, timeout).await
     }
@@ -3220,11 +3477,26 @@ impl AiMemoryServer {
     ) -> Result<CallToolResult, McpError> {
         // Dropped on every return path, so errors are timed too.
         let _latency = self.mcp_metrics.query_latency().start();
+        // Wall clock for the opt-in retrieval-history duration (#2038). Read
+        // only when recording is on and the normal single-project path records.
+        let query_started = std::time::Instant::now();
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let include_expired = args.include_expired.unwrap_or(false);
         let include_superseded = args.include_superseded.unwrap_or(false);
         let explain = args.explain.unwrap_or(false);
+        // An explicit per-call floor is validated loudly (a project/global
+        // config floor is range-checked where it is stored/loaded). A raw MCP
+        // call can send anything, so reject a non-finite or out-of-range value
+        // rather than silently dropping it (#2038).
+        if let Some(mr) = args.min_relevance
+            && (!mr.is_finite() || !(0.0..=1.0).contains(&mr))
+        {
+            return Err(McpError::invalid_params(
+                "min_relevance must be between 0.0 and 1.0",
+                None,
+            ));
+        }
         let filter = query_page_filter(&args)?;
         let filtered = filter.is_active();
         // A repo that opted into `[recall] default_global` (published on the
@@ -3266,6 +3538,16 @@ impl AiMemoryServer {
                     None,
                 ));
             }
+            // A global (cross-project) query is FTS-only: there is no calibrated
+            // reranker score to filter on, so an explicit floor cannot be
+            // honored (#2038). Reject it rather than return more than asked.
+            if args.min_relevance.is_some() {
+                return Err(McpError::invalid_params(
+                    "min_relevance is not supported for global (cross-project) queries: \
+                     they are FTS-only, with no calibrated reranker score to filter on",
+                    None,
+                ));
+            }
             let fts_started = explain.then(std::time::Instant::now);
             let global_hits = self
                 .reader
@@ -3290,6 +3572,7 @@ impl AiMemoryServer {
                     "answer synthesis is not supported for global (cross-project) queries"
                         .to_string()
                 }),
+                relevance_filter_unavailable: None,
                 raw_hits: Vec::new(),
                 global_hits,
                 global_scope_hits: Vec::new(),
@@ -3319,6 +3602,16 @@ impl AiMemoryServer {
         // RRF. Vector, graph, and the raw-observation fallback stay out
         // of audit mode.
         if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
+            // Time-travel fuses the entity timeline with version-filtered FTS;
+            // it does not run the reranker, so there is no calibrated score to
+            // apply an explicit floor to (#2038).
+            if args.min_relevance.is_some() {
+                return Err(McpError::invalid_params(
+                    "min_relevance is not supported for as_of (time-travel) queries: \
+                     they do not run the reranker, so there is no calibrated score to filter on",
+                    None,
+                ));
+            }
             let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
                 McpError::invalid_params(format!("as_of must be an ISO-8601 instant: {e}"), None)
             })?;
@@ -3330,6 +3623,9 @@ impl AiMemoryServer {
                     Self::viewer_from_parts(Some(&parts)),
                 )
                 .await?;
+            // This is a single-project read, so the project's own stored
+            // default applies when the call gave no explicit `limit` (#2038).
+            let limit = self.effective_query_limit(args.limit, ws, proj).await;
             let fused = self
                 .reader
                 .search_pages_for_project_at_filtered(
@@ -3360,6 +3656,7 @@ impl AiMemoryServer {
                 answer_unavailable: args.answer.unwrap_or(false).then(|| {
                     "answer synthesis is not supported for as_of (time-travel) queries".to_string()
                 }),
+                relevance_filter_unavailable: None,
                 raw_hits: Vec::new(),
                 global_hits: Vec::new(),
                 global_scope_hits: Vec::new(),
@@ -3370,6 +3667,53 @@ impl AiMemoryServer {
         }
 
         let query = args.query.clone();
+        // Resolve the single-project coordinate up-front for the default path
+        // (absent on the `scopes` path, which spans several projects). Doing it
+        // here lets the project's own stored `default_result_limit` set the
+        // effective limit before the fetch width is derived, and the resolved
+        // pair is reused by the search below instead of being resolved twice.
+        let single_project = if args.scopes.is_empty() {
+            Some(
+                self.effective_ids_for_read_args_with_actor(
+                    args.workspace.as_deref(),
+                    args.project.as_deref(),
+                    &aps_actor,
+                    Self::viewer_from_parts(Some(&parts)),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        // #2038 precedence, per field: explicit call value → project default →
+        // global default. The `scopes` path has no single project, so it keeps
+        // the server-wide limit computed above and resolves the floor from the
+        // call value, then the global config.
+        let (limit, min_relevance) = match &single_project {
+            Some((ws, proj)) => {
+                self.effective_query_criteria(args.limit, args.min_relevance, *ws, *proj)
+                    .await
+            }
+            None => (
+                limit,
+                args.min_relevance
+                    .or(self.default_min_relevance)
+                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            ),
+        };
+        // A relevance floor keys off the reranker's calibrated score; the
+        // uncalibrated RRF rank is not one. With no reranker configured the
+        // floor cannot be honored, so reject the query loudly rather than
+        // silently returning unfiltered hits that look filtered (#2038).
+        if min_relevance.is_some() && self.rerank.is_none() {
+            return Err(McpError::invalid_params(
+                "min_relevance needs a configured reranker: without one there is no calibrated \
+                 relevance score to filter on (the fused ranking is not one). Configure a reranker, \
+                 or remove the floor (the call's min_relevance, the project's [retrieval] \
+                 min_relevance, or the global [retrieval] min_relevance)",
+                None,
+            ));
+        }
         let query_vec = self.embed_query(&args.query).await;
         let candidate_limit = self.rerank_fetch_limit(limit);
         let resolved_scopes = if args.scopes.is_empty() {
@@ -3406,14 +3750,9 @@ impl AiMemoryServer {
         let hits = if let Some(scopes) = &resolved_scopes {
             self.search_scopes(scopes, options).await
         } else {
-            let (ws, proj) = self
-                .effective_ids_for_read_args_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?;
+            // `scopes` empty ⇒ `single_project` was resolved above.
+            let (ws, proj) =
+                single_project.expect("single_project is Some whenever scopes is empty");
             query_signal_scope = Some((ws, proj));
             self.search_project(ws, proj, options).await
         }
@@ -3424,9 +3763,50 @@ impl AiMemoryServer {
         });
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let rerank_started = (explain && self.rerank.is_some()).then(std::time::Instant::now);
-        let hits = self.rerank_hits(&args.query, hits, limit).await;
+        let (mut hits, rerank_scores) = self.rerank_hits_scored(&args.query, hits, limit).await;
         if let (Some(timings), Some(started)) = (timings.as_mut(), rerank_started) {
             timings.rerank_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        // Apply a resolved `min_relevance` floor over the reranker's calibrated
+        // scores (#2038). Because `apply` sorts by relevance before truncating,
+        // the below-floor hits are a suffix, so filtering the returned hits is
+        // equivalent to "exclude below the floor, then take `limit`". A hit the
+        // reranker did not score (the fused tail) is dropped. When the reranker
+        // scored nothing this query — a transient timeout/saturation/provider
+        // error, or too few candidates to rank — the floor cannot be applied, so
+        // the fused order is returned unfiltered and the response says so rather
+        // than silently dropping every hit.
+        // Per-hit calibrated score, kept before the filter consumes
+        // `rerank_scores`, so the opt-in retrieval history can record each
+        // returned hit's relevance (#2038). Unscored hits (the fused tail, a
+        // pinned page) are simply absent → recorded as no score.
+        let rerank_score_by_id: std::collections::HashMap<PageId, f32> = hits
+            .iter()
+            .zip(rerank_scores.iter())
+            .filter_map(|((hit, _), score)| score.map(|value| (hit.id, value)))
+            .collect();
+        let mut relevance_filter_unavailable = None;
+        if let Some(floor) = min_relevance {
+            let scored_count = rerank_scores.iter().filter(|s| s.is_some()).count();
+            if scored_count == 0 {
+                if !hits.is_empty() {
+                    relevance_filter_unavailable = Some(
+                        "min_relevance could not be applied: the reranker scored no hit this query \
+                         (a transient rerank failure, or too few candidates to rank); the hits are \
+                         returned unfiltered in fused order"
+                            .to_string(),
+                    );
+                }
+            } else {
+                hits = hits
+                    .into_iter()
+                    .zip(rerank_scores)
+                    .filter_map(|(hit, score)| match score {
+                        Some(s) if s >= floor => Some(hit),
+                        _ => None,
+                    })
+                    .collect();
+            }
         }
         let bump_actor = Self::bump_actor_from_parts(&parts);
         self.spawn_access_bump(
@@ -3634,7 +4014,10 @@ impl AiMemoryServer {
                 }
             }
         }
-        let streams_active = explain.then(|| self.reader.active_streams(query_vec.is_some()));
+        // Computed once: `explain` returns it to the caller, and the opt-in
+        // retrieval history records it as the call's `source` (#2038).
+        let active_streams = self.reader.active_streams(query_vec.is_some());
+        let streams_active = explain.then(|| active_streams.clone());
         let hits: Vec<QueryHit> = hits
             .into_iter()
             .map(|(hit, score_details)| QueryHit {
@@ -3730,8 +4113,14 @@ impl AiMemoryServer {
                         match ai_memory_llm::complete_structured_with_operation_id::<AnswerSynthesis>(
                         llm.as_ref(),
                         request,
+                        // Evidence can span projects and the `_global`
+                        // scope, so only the caller is named.
                         ai_memory_llm::LlmOperationId::for_workload(
                             ai_memory_llm::LlmWorkload::QueryAnswer,
+                        )
+                        .with_subject(
+                            self.llm_subject(&crate::actor::actor_from_parts(&parts), None)
+                                .await,
                         ),
                     )
                     .await
@@ -3788,6 +4177,7 @@ impl AiMemoryServer {
             hits,
             answer,
             answer_unavailable,
+            relevance_filter_unavailable,
             answer_context,
             raw_hits,
             global_hits: Vec::new(),
@@ -3795,6 +4185,54 @@ impl AiMemoryServer {
             streams_active,
             timings,
         };
+        // Opt-in per-session retrieval history (#2038): record the single-
+        // project path best-effort, never failing the query. Off by default;
+        // the scopes/global/as_of paths return earlier and are out of v1 scope.
+        // `query_signal_scope` is `Some` only on the single-project path, and a
+        // session id is needed to attribute the record to a dashboard session.
+        if self.record_retrieval_history
+            && let Some((ws, proj)) = query_signal_scope
+            && let Some(session_raw) = Self::caller_hook_session_id(&parts)
+        {
+            let query: String = self
+                .sanitizer
+                .scrub(&args.query)
+                .chars()
+                .take(ai_memory_store::RETRIEVAL_HISTORY_QUERY_MAX_CHARS)
+                .collect();
+            if !query.trim().is_empty() {
+                let hits = response
+                    .hits
+                    .iter()
+                    .map(|qh| ai_memory_store::NewRetrievalHistoryHit {
+                        page_path: qh.hit.path.to_string(),
+                        page_version: Some(qh.hit.id.to_string()),
+                        relevance: rerank_score_by_id.get(&qh.hit.id).copied(),
+                        explanation: qh
+                            .score_details
+                            .as_ref()
+                            .and_then(|details| serde_json::to_string(details).ok()),
+                    })
+                    .collect::<Vec<_>>();
+                let record = ai_memory_store::NewRetrievalHistory {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id: ai_memory_core::SessionId::from_native(&session_raw),
+                    query,
+                    scope_kind: "project".to_string(),
+                    source: active_streams.join(","),
+                    result_limit: u32::try_from(limit).ok(),
+                    min_relevance,
+                    filters: retrieval_filters_json(&args, include_expired, include_superseded),
+                    duration_us: i64::try_from(query_started.elapsed().as_micros())
+                        .unwrap_or(i64::MAX),
+                    result_count: u32::try_from(response.hits.len()).unwrap_or(u32::MAX),
+                    notice: response.relevance_filter_unavailable.clone(),
+                    hits,
+                };
+                self.spawn_retrieval_history_record(record);
+            }
+        }
         ok_json(&response)
     }
 
@@ -4359,6 +4797,7 @@ impl AiMemoryServer {
                     }),
                 contradiction_band_min: self.contradiction_band_min,
                 contradiction_band_max: self.contradiction_band_max,
+                keep_llm_findings: false,
             },
         )
         .await
@@ -4783,6 +5222,7 @@ impl AiMemoryServer {
             max_rule_page_tokens: defaults.max_rule_page_tokens,
             max_procedure_page_tokens: defaults.max_procedure_page_tokens,
             eval: defaults.eval.clone(),
+            output_language: defaults.output_language.clone(),
         };
 
         let report =
@@ -7532,7 +7972,7 @@ impl AiMemoryServer {
         // Admission is asked at the crossing point (the recipient scope): a
         // per-operator webhook can refuse prompt-derived text entering another
         // project.
-        let admission = self
+        let mut admission = self
             .authorize_operation(
                 to_ws,
                 to_proj,
@@ -7540,11 +7980,16 @@ impl AiMemoryServer {
                 &parts,
             )
             .await?;
+        let queued_to_agent = message.to_agent;
         let id = self
             .writer
             .insert_message(message)
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if let (Some(wiki), Some(ctx)) = (self.wiki.as_ref(), admission.as_mut()) {
+            wiki.describe_queued_message(ctx, id, queued_to_agent, from_ws, from_proj)
+                .await;
+        }
         self.notify_operation_observers(admission.as_ref());
         ok_json(&serde_json::json!({
             "message_id": id.to_string(),
@@ -7863,9 +8308,11 @@ impl AiMemoryServer {
         project state; use `memory_explore` if you want an LLM-composed \
         prose summary on top of the same data. Pass `settled_first: true` \
         to also lead the briefing with the project's settled rule/decision \
-        pages (highest-standing, ordered by evidence then recency). `scope` \
-        names the project briefed — pass it to memory_message_pop when \
-        `pending_message_count` is non-zero."
+        pages (highest-standing, ordered by evidence then recency). `lint`, \
+        when present, counts the warnings in the project's latest \
+        `_lint/report.md`; read that page before relying on the pages it \
+        flags. `scope` names the project briefed — pass it to \
+        memory_message_pop when `pending_message_count` is non-zero."
     )]
     async fn memory_briefing(
         &self,
@@ -8028,7 +8475,8 @@ impl AiMemoryServer {
                 request,
                 ai_memory_llm::LlmOperationId::for_workload(
                     ai_memory_llm::LlmWorkload::QueryAnswer,
-                ),
+                )
+                .with_subject(self.llm_subject(&actor, Some((ws, proj))).await),
             )
             .await
         {
@@ -8883,6 +9331,19 @@ impl AiMemoryServer {
         tokio::spawn(async move {
             if let Err(e) = writer.bump_access_for_actor(fresh, actor).await {
                 tracing::warn!(error = %e, "access bump failed");
+            }
+        });
+    }
+
+    /// Fire-and-forget one opt-in retrieval-history record (#2038). Detached
+    /// from the query so recording never adds latency to, or fails, the query;
+    /// a write error is logged and dropped.
+    fn spawn_retrieval_history_record(&self, record: ai_memory_store::NewRetrievalHistory) {
+        let writer = self.writer.clone();
+        let retention = self.retrieval_history_retention;
+        tokio::spawn(async move {
+            if let Err(e) = writer.record_retrieval_history(record, retention).await {
+                tracing::warn!(error = %e, "recording retrieval history failed");
             }
         });
     }
@@ -11314,6 +11775,7 @@ mod tests {
                         explain: Some(true),
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -11353,6 +11815,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -11383,6 +11846,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -11940,6 +12404,7 @@ mod tests {
                 cwd: None,
                 actor_user: None,
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12238,6 +12703,7 @@ mod tests {
                 cwd: None,
                 actor_user: None,
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -12321,6 +12787,7 @@ mod tests {
                         cwd: None,
                         actor_user,
                         occurred_at: None,
+                        origin: None,
                     })
                     .await
                     .unwrap();
@@ -12418,6 +12885,7 @@ mod tests {
                     cwd: None,
                     actor_user: None,
                     occurred_at: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -14427,6 +14895,7 @@ mod tests {
             explain: Some(true),
             as_of,
             answer: None,
+            min_relevance: None,
             reasoning: None,
         };
 
@@ -14473,6 +14942,7 @@ mod tests {
                     explain: Some(true),
                     as_of: Some(jiff::Timestamp::now().to_string()),
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -14552,6 +15022,7 @@ mod tests {
             explain: None,
             as_of: None,
             answer: None,
+            min_relevance: None,
             reasoning: None,
         };
         let scope = |project: &str| MemoryScopeArg {
@@ -14639,6 +15110,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -14673,6 +15145,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -14849,6 +15322,7 @@ mod tests {
                             explain: Some(explain),
                             as_of: None,
                             answer: None,
+                            min_relevance: None,
                             reasoning: None,
                         }),
                         OptionalParts(test_parts_default()),
@@ -14953,6 +15427,7 @@ mod tests {
                         explain: Some(true),
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     OptionalParts(test_parts_default()),
@@ -15048,6 +15523,7 @@ mod tests {
             explain: None,
             as_of: None,
             answer: None,
+            min_relevance: None,
             reasoning: None,
         };
 
@@ -15212,6 +15688,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -15256,6 +15733,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -15357,6 +15835,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -15400,6 +15879,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -15491,6 +15971,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -15930,6 +16411,7 @@ mod tests {
                     agent_kind: AgentKind::Codex,
                     cwd: None,
                     actor_user: Some(owner.clone()),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -16011,6 +16493,7 @@ mod tests {
                             explain: Some(true),
                             as_of: None,
                             answer: None,
+                            min_relevance: None,
                             reasoning: None,
                         }),
                         OptionalParts(parts),
@@ -16080,6 +16563,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -16126,6 +16610,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 test_optional_parts(),
@@ -16229,6 +16714,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -16303,6 +16789,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -16353,6 +16840,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 test_optional_parts(),
@@ -16436,6 +16924,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -16510,6 +16999,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -17923,6 +18413,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -18187,6 +18678,7 @@ mod tests {
                 agent_kind,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -18594,6 +19086,7 @@ mod tests {
                 cwd: Some(cwd.into()),
                 actor_user: actor_user
                     .map(|user| ai_memory_core::IdentityKey::User(user.into()).storage_key()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -19103,6 +19596,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19220,6 +19714,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19275,6 +19770,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19444,6 +19940,7 @@ mod tests {
                     explain: None,
                     as_of: Some(jiff::Timestamp::now().to_string()),
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19492,6 +19989,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19701,6 +20199,70 @@ mod tests {
             !text.contains("\"settled\""),
             "settled must be omitted by default:\n{text}"
         );
+        assert!(
+            !text.contains("\"lint\""),
+            "a project without a lint report has no lint summary:\n{text}"
+        );
+    }
+
+    /// #2021: `memory_briefing` reports the counts of the project's latest
+    /// lint report and points at it.
+    #[tokio::test]
+    async fn memory_briefing_reports_the_lint_summary() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("_lint/report.md").unwrap(),
+                title: "Lint report".into(),
+                body: "# Lint findings".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({
+                    "kind": "lint-report",
+                    "findings": 3,
+                    "warnings": 2,
+                    "warning_pages": ["foo.md"],
+                }),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let result = server
+            .memory_briefing(
+                Parameters(BriefingArgs {
+                    recent_pages_limit: Some(5),
+                    recent_sessions_limit: None,
+                    project: None,
+                    workspace: None,
+                    settled_first: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let lint = &json["lint"];
+        assert_eq!(lint["report_path"], "_lint/report.md", "{text}");
+        assert_eq!(lint["warnings"], 2, "{text}");
+        assert_eq!(lint["findings"], 3, "{text}");
+        assert_eq!(
+            lint["warning_pages"],
+            serde_json::json!(["foo.md"]),
+            "{text}"
+        );
     }
 
     /// P4 (docs/design-hindsight-borrowings.md §5): `settled_first: true`
@@ -19877,6 +20439,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: Some(true),
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19964,6 +20527,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -22741,6 +23305,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(parts_as_user(joao)),
@@ -22807,6 +23372,7 @@ mod tests {
             explain: None,
             as_of: None,
             answer: None,
+            min_relevance: None,
             reasoning: None,
         }
     }
@@ -23733,6 +24299,7 @@ mod tests {
                             tier: None,
                             path_prefix: None,
                             tag: None,
+                            min_relevance: None,
                             reasoning: None,
                             answer: None,
                             include_superseded: None,
@@ -23892,6 +24459,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: Some(ai_memory_core::IdentityKey::User("alice".into()).storage_key()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -23959,6 +24527,7 @@ mod tests {
                                 tier: None,
                                 path_prefix: None,
                                 tag: None,
+                                min_relevance: None,
                                 reasoning: None,
                                 answer: None,
                                 include_superseded: None,
@@ -24832,6 +25401,7 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -25551,6 +26121,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: Some("/tmp/aim".into()),
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -26994,6 +27565,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -27411,6 +27983,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -27599,6 +28172,7 @@ mod tests {
                 agent_kind: AgentKind::Other,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -27998,6 +28572,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -28088,6 +28663,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -28130,6 +28706,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),

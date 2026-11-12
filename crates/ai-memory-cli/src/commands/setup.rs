@@ -191,6 +191,7 @@ fn skills_for(agent: AgentChoice) -> InstallSkillsAgent {
         AgentChoice::Devin => InstallSkillsAgent::Devin,
         AgentChoice::Hermes => InstallSkillsAgent::Hermes,
         AgentChoice::AntigravityCli => InstallSkillsAgent::Antigravity,
+        AgentChoice::WorkBuddy => InstallSkillsAgent::WorkBuddy,
         _ => InstallSkillsAgent::Agents,
     }
 }
@@ -246,6 +247,9 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         }
         if let Some(dir) = codebuddy_detected(&home) {
             found.push((AgentChoice::CodeBuddy, Found::ConfigDir(dir)));
+        }
+        if let Some(dir) = workbuddy_detected(&home) {
+            found.push((AgentChoice::WorkBuddy, Found::ConfigDir(dir)));
         }
         if let Some(dir) = ibm_bob_detected(&home) {
             found.push((AgentChoice::IbmBob, Found::ConfigDir(dir)));
@@ -337,6 +341,7 @@ pub async fn run(config: &Config, args: SetupArgs, config_path: Option<&Path>) -
         plan,
         &user_service::SystemRunner,
         SERVICE_READY_TIMEOUT,
+        args.absolute_paths,
     )
     .await
 }
@@ -433,6 +438,13 @@ fn muse_detected(home: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Option<
 /// by [`detect_agents`].
 fn codebuddy_detected(home: &Path) -> Option<PathBuf> {
     Some(home.join(".codebuddy")).filter(|dir| dir.is_dir())
+}
+
+/// WorkBuddy's directory, `~/.workbuddy`, when it exists. WorkBuddy has no
+/// native-session adapter, so setup finds it by that directory rather than by
+/// [`detect_agents`].
+fn workbuddy_detected(home: &Path) -> Option<PathBuf> {
+    Some(home.join(".workbuddy")).filter(|dir| dir.is_dir())
 }
 
 /// IBM Bob's shared configuration directory, `~/.bob`, when it exists.
@@ -836,6 +848,7 @@ async fn execute(
     plan: SetupPlan,
     runner: &dyn CommandRunner,
     ready_timeout: Duration,
+    absolute_paths: bool,
 ) -> Result<()> {
     let i18n = &config.i18n;
     let mut problems: Vec<String> = Vec::new();
@@ -919,7 +932,7 @@ async fn execute(
     let mut skills_done = BTreeSet::new();
     for agent in &plan.agents {
         println!("\n== {}", agent.agent.kind().as_str());
-        for problem in wire_agent(&config, agent, &mut skills_done) {
+        for problem in wire_agent(&config, agent, absolute_paths, &mut skills_done) {
             problems.push(format!("{}: {problem}", agent.agent.kind().as_str()));
         }
     }
@@ -1076,6 +1089,7 @@ async fn wait_until_reachable(endpoint: &ServerEndpoint, timeout: Duration) -> b
 fn wire_agent(
     config: &Config,
     plan: &AgentPlan,
+    absolute_paths: bool,
     skills_done: &mut BTreeSet<String>,
 ) -> Vec<String> {
     let i18n = &config.i18n;
@@ -1090,7 +1104,7 @@ fn wire_agent(
     }
     let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
     match opencode_dialect(plan.agent, &child_env) {
-        Ok(dialect) => wire_mcp_and_hooks(config, plan, dialect, &mut problems),
+        Ok(dialect) => wire_mcp_and_hooks(config, plan, dialect, absolute_paths, &mut problems),
         // A guessed major writes a plugin and MCP shape the installed OpenCode
         // ignores without an error, so nothing is written instead.
         Err(error) => problems.push(format!("skipped install-mcp and install-hooks: {error:#}")),
@@ -1111,11 +1125,33 @@ fn wire_agent(
     problems
 }
 
+/// The `install-hooks` args `setup` builds for one agent.
+fn hooks_install_args(agent: AgentChoice, absolute_paths: bool) -> InstallHooksArgs {
+    InstallHooksArgs {
+        agent,
+        hooks_dir: None,
+        server_url: None,
+        auth_token: None,
+        as_user: None,
+        apply: true,
+        config_file: None,
+        scope: HookInstallScope::Global,
+        project_strategy: None,
+        capture_assistant: false,
+        capture_mode: None,
+        no_capture_prompts: false,
+        capture_prompts: false,
+        profile: None,
+        absolute_paths,
+    }
+}
+
 /// `install-mcp` then `install-hooks` for one agent, in one OpenCode dialect.
 fn wire_mcp_and_hooks(
     config: &Config,
     plan: &AgentPlan,
     dialect: Option<OpenCodeDialect>,
+    absolute_paths: bool,
     problems: &mut Vec<String>,
 ) {
     let i18n = &config.i18n;
@@ -1144,22 +1180,7 @@ fn wire_mcp_and_hooks(
             }
         }
     }
-    let hooks = InstallHooksArgs {
-        agent: plan.agent,
-        hooks_dir: None,
-        server_url: None,
-        auth_token: None,
-        as_user: None,
-        apply: true,
-        config_file: None,
-        scope: HookInstallScope::Global,
-        project_strategy: None,
-        capture_assistant: false,
-        capture_mode: None,
-        no_capture_prompts: false,
-        capture_prompts: false,
-        profile: None,
-    };
+    let hooks = hooks_install_args(plan.agent, absolute_paths);
     if let Err(error) =
         install_hooks::run_with_opencode_dialect_and_mcp_path(config, hooks, dialect, None)
     {
@@ -1302,6 +1323,12 @@ async fn memory_status(config: &Config) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn setup_forwards_absolute_paths() {
+        assert!(hooks_install_args(AgentChoice::ClaudeCode, true).absolute_paths);
+        assert!(!hooks_install_args(AgentChoice::ClaudeCode, false).absolute_paths);
+    }
+
     /// Muse is detected by its config or data directory under the home or
     /// the absolute XDG roots, and not otherwise.
     #[test]
@@ -1352,6 +1379,25 @@ mod tests {
             InstallSkillsAgent::Agents
         );
         assert_eq!(AgentPlan::new(AgentChoice::CodeBuddy, None).mcp, None);
+    }
+
+    #[test]
+    fn workbuddy_is_detected_and_wires_hooks_mcp_and_its_own_skills() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(workbuddy_detected(home.path()), None);
+        std::fs::create_dir_all(home.path().join(".workbuddy")).unwrap();
+        assert_eq!(
+            workbuddy_detected(home.path()),
+            Some(home.path().join(".workbuddy"))
+        );
+        assert_eq!(
+            skills_for(AgentChoice::WorkBuddy),
+            InstallSkillsAgent::WorkBuddy
+        );
+        assert_eq!(
+            AgentPlan::new(AgentChoice::WorkBuddy, None).mcp,
+            Some(McpClient::WorkBuddy)
+        );
     }
 
     #[test]

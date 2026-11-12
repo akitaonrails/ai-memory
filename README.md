@@ -157,6 +157,7 @@ caveats is in [`docs/support-matrix.md`](docs/support-matrix.md).
 | Factory Droid | Supported |
 | Meta Muse Code | Supported |
 | CodeBuddy Code | Hooks-only |
+| WorkBuddy | Supported |
 | IBM Bob | Supported |
 | Qwen Code | Supported |
 | Qoder | Supported |
@@ -487,7 +488,7 @@ ai-memory run --profile work claude  # reusable config.toml env/account preset
 ai-memory continue           # resume the newest managed checkout
 # after a dead launcher left its lease behind (same operator only)
 ai-memory run --force-unlock codex
-ai-memory resume             # pick from ALL workstreams in this checkout only
+ai-memory resume             # pick a workstream; return to the picker after exit
 ai-memory resume --search auth # find a workstream by name (case-insensitive)
 ai-memory resume --all       # pick across every linked checkout
 ```
@@ -653,6 +654,7 @@ readable wiki pages; the next session starts with a handoff.
   [Investigate token usage](docs/usage.md#investigate-token-usage-in-the-dashboard)
   for capture coverage, cache accounting and the investigation flags. You can
   drill down from a project to an agent, its sessions and individual responses.
+  The updated Pi extension reports session totals only, not response-ledger rows.
   The web [agent inbox](docs/agent-messaging.md#in-the-web-ui) lets an operator
   queue requests for registered agents and read the received and sent history.
   Token filters run on the full authorized ledger, with native turn and tool

@@ -110,7 +110,7 @@
 {% endif %}
 
 {% if query == "" %}
-<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-enter-a-search-term-above") }}</p>
+<p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{% if hits.is_empty() %}{{ i18n.text("web-enter-a-search-term-above") }}{% else if self.scoped() %}{{ i18n.text("web-search-or-open-recent-project-pages") }}{% else %}{{ i18n.text("web-search-or-open-recent-pages") }}{% endif %}</p>
 {% else if hits.is_empty() %}
 <p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-results-for") }} <strong>{{ query }}</strong>{% if filtered %} {{ i18n.text("web-with-these-filters") }}{% endif %}.
   {% if unknown_kind != "" %}{{ i18n.rich_one("web-search-unknown-kind", unknown_kind, "")|safe }}{% endif %}
@@ -124,6 +124,8 @@
 {% else %}
 <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{{ hit_count }} {{ i18n.count("web-count-result", hit_count) }}</p>
 {% endif %}
+{% endif %}
+{% if !hits.is_empty() %}
 <ul class="divide-y divide-slate-100 dark:divide-slate-800">
   {% for hit in hits %}
   <li class="py-4" data-hit-path="{{ hit.path }}">
