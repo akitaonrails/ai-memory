@@ -601,6 +601,7 @@ mod tests {
         assert!(
             plugin.contains("url.searchParams.set(\"default_result_limit\", defaultResultLimit)")
         );
+        assert!(plugin.contains("url.searchParams.set(\"min_relevance\", minRelevance)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         assert!(plugin.contains("function tomlFlag"));

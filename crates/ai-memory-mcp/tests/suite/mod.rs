@@ -37,6 +37,7 @@ mod mcp_stateless_http;
 mod message_routes;
 mod query_answer;
 mod query_default_limit;
+mod query_min_relevance;
 mod query_observation_stream;
 mod query_pin_first;
 mod query_reasoning;

@@ -585,6 +585,12 @@ pub struct AiMemoryServer {
     /// hook ingress) — in which case the baked-in default is used.
     active_project: ActiveProject,
     default_limit: usize,
+    /// Global `[retrieval] min_relevance`: the calibrated reranker-score floor
+    /// applied to `memory_query` hits when a call gives no explicit
+    /// `min_relevance` and the queried project carries none (#2038). `None`
+    /// applies no floor. The threshold needs the configured reranker; a query
+    /// that resolves a floor with none available is rejected.
+    default_min_relevance: Option<f32>,
     answer_max_context_tokens: Option<usize>,
     /// Optional LLM consolidator. When `None`, `memory_consolidate`
     /// returns a "not configured" error.
@@ -734,6 +740,16 @@ struct QueryArgs {
     /// Maximum number of hits to return (default 10, max 100).
     #[serde(default, alias = "n", alias = "top_k")]
     limit: Option<usize>,
+    /// Minimum calibrated reranker relevance (`0.0..=1.0`) a hit must have to be
+    /// returned: hits scoring below it are excluded before `limit` is applied,
+    /// so fewer than `limit` hits (or none) may come back. Needs a configured
+    /// reranker — a query that sets it when none is available is rejected, since
+    /// the uncalibrated fusion rank is not a relevance score. Overrides the
+    /// project's stored `min_relevance` and the global `[retrieval] min_relevance`.
+    /// Applies to the normal single-project / `scopes` search; rejected on
+    /// `global` and `as_of` queries. Omit to apply the project/global floor, if any.
+    #[serde(default)]
+    min_relevance: Option<f32>,
     /// Keep only pages of this semantic kind (ASCII case-insensitive).
     /// Custom kinds are accepted. Applied before ranking.
     #[serde(default)]
@@ -1015,32 +1031,52 @@ fn vector_query(qv: &ai_memory_llm::QueryVector) -> ai_memory_store::VectorQuery
 }
 
 /// Rerank fused page hits through `stage`, recording each judged hit's
-/// relevance in its explain details.
+/// relevance in its explain details and returning that calibrated score
+/// alongside each returned hit (`None` for a hit the reranker did not score:
+/// the fused tail beyond the candidate window, or every hit on a transient
+/// rerank failure — timeout, saturation, provider error, or too few
+/// candidates). The scores are aligned with the returned hits so the query path
+/// can apply a `min_relevance` floor outside explain mode (#2038).
 async fn rerank_page_hits(
     stage: &ai_memory_llm::RerankStage,
     query: &str,
     hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
     limit: usize,
     timeout: std::time::Duration,
-) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
-    stage
+) -> (
+    Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+    Vec<Option<f32>>,
+) {
+    // Carry a per-hit score slot through `apply` as a third tuple element: the
+    // `record` closure fills it for every reranked hit in output order, while a
+    // tail or an unscored (failed) run leaves it `None`. This makes the score
+    // available for filtering without forcing explain mode on.
+    let wrapped: Vec<(PageHit, Option<ai_memory_store::SearchExplain>, Option<f32>)> = hits
+        .into_iter()
+        .map(|(hit, explain)| (hit, explain, None))
+        .collect();
+    let out = stage
         .apply(
             query,
-            hits,
+            wrapped,
             limit,
             timeout,
-            |(hit, _)| ai_memory_llm::RerankCandidate {
+            |(hit, _, _)| ai_memory_llm::RerankCandidate {
                 id: hit.id.to_string(),
                 title: hit.title.clone(),
                 snippet: ai_memory_store::plain_snippet(&hit.snippet),
             },
-            |(_, explain), relevance| {
+            |(_, explain, score), relevance| {
+                *score = Some(relevance);
                 if let Some(explain) = explain.as_mut() {
                     explain.rerank_score = Some(relevance);
                 }
             },
         )
-        .await
+        .await;
+    out.into_iter()
+        .map(|(hit, explain, score)| ((hit, explain), score))
+        .unzip()
 }
 
 /// Synthesized "dialectic" answer attached to a `memory_query` response when
@@ -1082,6 +1118,14 @@ struct MemoryQueryResponse {
     /// never an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     answer_unavailable: Option<String>,
+    /// Present only when a resolved `min_relevance` floor could not be applied
+    /// because the reranker scored no hit this query — a transient rerank
+    /// timeout, saturation, or provider error, or too few candidates to rank
+    /// (#2038). A short human-readable reason; the hits are returned unfiltered
+    /// (fused order) rather than dropped, and this is never an error. Omitted
+    /// when no floor was requested or the floor was applied normally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relevance_filter_unavailable: Option<String>,
     /// Present only when optional answer-context admission ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     answer_context: Option<AnswerContext>,
@@ -2270,6 +2314,7 @@ impl AiMemoryServer {
             project_id,
             active_project: ActiveProject::new(),
             default_limit: 10,
+            default_min_relevance: None,
             answer_max_context_tokens: None,
             consolidator: None,
             llm_providers: LlmProviders::default(),
@@ -2331,6 +2376,19 @@ impl AiMemoryServer {
         self
     }
 
+    /// Set the server-wide `memory_query` relevance floor applied when a call
+    /// gives no explicit `min_relevance` and the queried project carries no
+    /// stored `[retrieval] min_relevance` of its own (#2038). `None` keeps no
+    /// floor. A value outside `0.0..=1.0` (or non-finite) is dropped so a
+    /// misconfigured global cannot empty every query; the CLI already rejects
+    /// one at startup, this is defence in depth.
+    #[must_use]
+    pub fn with_default_min_relevance(mut self, min_relevance: Option<f32>) -> Self {
+        self.default_min_relevance =
+            min_relevance.filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+        self
+    }
+
     /// Effective result limit for a single-project query under #2038's
     /// precedence: an explicit per-call `limit` wins; otherwise the queried
     /// project's stored `[retrieval] default_result_limit`; otherwise the
@@ -2344,18 +2402,41 @@ impl AiMemoryServer {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
     ) -> usize {
-        if let Some(explicit) = explicit {
-            return explicit.clamp(1, 100);
-        }
-        let project_default = self
+        self.effective_query_criteria(explicit, None, workspace_id, project_id)
+            .await
+            .0
+    }
+
+    /// Resolve both #2038 per-field defaults for a single-project query in one
+    /// project read: the result limit (`call → project → global → built-in 10`,
+    /// clamped `1..=100`) and the relevance floor (`call → project → global →
+    /// none`, bounded `0.0..=1.0`). A project read error falls back to the
+    /// server-wide defaults rather than failing the query.
+    async fn effective_query_criteria(
+        &self,
+        explicit_limit: Option<usize>,
+        explicit_min_relevance: Option<f32>,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> (usize, Option<f32>) {
+        let stored = self
             .reader
             .project_retrieval_criteria(workspace_id, project_id)
             .await
-            .ok()
-            .and_then(|criteria| criteria.default_result_limit);
-        project_default
-            .map_or(self.default_limit, |value| value as usize)
-            .clamp(1, 100)
+            .ok();
+        let limit = explicit_limit
+            .or_else(|| {
+                stored
+                    .and_then(|c| c.default_result_limit)
+                    .map(|value| value as usize)
+            })
+            .unwrap_or(self.default_limit)
+            .clamp(1, 100);
+        let min_relevance = explicit_min_relevance
+            .or_else(|| stored.and_then(|c| c.min_relevance))
+            .or(self.default_min_relevance)
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+        (limit, min_relevance)
     }
 
     /// Declare that a trusted proxy may assert end-user identities — mirror of
@@ -3086,30 +3167,67 @@ impl AiMemoryServer {
             .map_or(limit, |stage| stage.fetch_limit(limit))
     }
 
+    /// Thin wrapper used by the rerank unit tests that only assert on ordering.
+    /// The query path uses [`Self::rerank_hits_scored`] so it can also filter by
+    /// `min_relevance`.
+    #[cfg(test)]
     async fn rerank_hits(
         &self,
         query: &str,
         hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
         limit: usize,
     ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+        self.rerank_hits_scored(query, hits, limit).await.0
+    }
+
+    /// Like [`Self::rerank_hits`] but also returns each returned hit's
+    /// calibrated reranker score (`None` for the fused tail or a transient
+    /// rerank failure), so the query path can apply a `min_relevance` floor.
+    async fn rerank_hits_scored(
+        &self,
+        query: &str,
+        hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        limit: usize,
+    ) -> (
+        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        Vec<Option<f32>>,
+    ) {
         let timeout = self.rerank.as_ref().map_or(
             ai_memory_llm::reranker::RERANK_TIMEOUT,
             ai_memory_llm::RerankStage::timeout,
         );
-        self.rerank_hits_with_timeout(query, hits, limit, timeout)
+        self.rerank_hits_with_timeout_scored(query, hits, limit, timeout)
             .await
     }
 
+    /// Test-only timeout-injecting wrapper; see [`Self::rerank_hits`].
+    #[cfg(test)]
     async fn rerank_hits_with_timeout(
+        &self,
+        query: &str,
+        hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        limit: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+        self.rerank_hits_with_timeout_scored(query, hits, limit, timeout)
+            .await
+            .0
+    }
+
+    async fn rerank_hits_with_timeout_scored(
         &self,
         query: &str,
         mut hits: Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
         limit: usize,
         timeout: std::time::Duration,
-    ) -> Vec<(PageHit, Option<ai_memory_store::SearchExplain>)> {
+    ) -> (
+        Vec<(PageHit, Option<ai_memory_store::SearchExplain>)>,
+        Vec<Option<f32>>,
+    ) {
         let Some(stage) = &self.rerank else {
             hits.truncate(limit);
-            return hits;
+            let scores = vec![None; hits.len()];
+            return (hits, scores);
         };
         rerank_page_hits(stage, query, hits, limit, timeout).await
     }
@@ -3299,6 +3417,18 @@ impl AiMemoryServer {
         let include_expired = args.include_expired.unwrap_or(false);
         let include_superseded = args.include_superseded.unwrap_or(false);
         let explain = args.explain.unwrap_or(false);
+        // An explicit per-call floor is validated loudly (a project/global
+        // config floor is range-checked where it is stored/loaded). A raw MCP
+        // call can send anything, so reject a non-finite or out-of-range value
+        // rather than silently dropping it (#2038).
+        if let Some(mr) = args.min_relevance
+            && (!mr.is_finite() || !(0.0..=1.0).contains(&mr))
+        {
+            return Err(McpError::invalid_params(
+                "min_relevance must be between 0.0 and 1.0",
+                None,
+            ));
+        }
         let filter = query_page_filter(&args)?;
         let filtered = filter.is_active();
         // A repo that opted into `[recall] default_global` (published on the
@@ -3340,6 +3470,16 @@ impl AiMemoryServer {
                     None,
                 ));
             }
+            // A global (cross-project) query is FTS-only: there is no calibrated
+            // reranker score to filter on, so an explicit floor cannot be
+            // honored (#2038). Reject it rather than return more than asked.
+            if args.min_relevance.is_some() {
+                return Err(McpError::invalid_params(
+                    "min_relevance is not supported for global (cross-project) queries: \
+                     they are FTS-only, with no calibrated reranker score to filter on",
+                    None,
+                ));
+            }
             let fts_started = explain.then(std::time::Instant::now);
             let global_hits = self
                 .reader
@@ -3364,6 +3504,7 @@ impl AiMemoryServer {
                     "answer synthesis is not supported for global (cross-project) queries"
                         .to_string()
                 }),
+                relevance_filter_unavailable: None,
                 raw_hits: Vec::new(),
                 global_hits,
                 global_scope_hits: Vec::new(),
@@ -3393,6 +3534,16 @@ impl AiMemoryServer {
         // RRF. Vector, graph, and the raw-observation fallback stay out
         // of audit mode.
         if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
+            // Time-travel fuses the entity timeline with version-filtered FTS;
+            // it does not run the reranker, so there is no calibrated score to
+            // apply an explicit floor to (#2038).
+            if args.min_relevance.is_some() {
+                return Err(McpError::invalid_params(
+                    "min_relevance is not supported for as_of (time-travel) queries: \
+                     they do not run the reranker, so there is no calibrated score to filter on",
+                    None,
+                ));
+            }
             let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
                 McpError::invalid_params(format!("as_of must be an ISO-8601 instant: {e}"), None)
             })?;
@@ -3437,6 +3588,7 @@ impl AiMemoryServer {
                 answer_unavailable: args.answer.unwrap_or(false).then(|| {
                     "answer synthesis is not supported for as_of (time-travel) queries".to_string()
                 }),
+                relevance_filter_unavailable: None,
                 raw_hits: Vec::new(),
                 global_hits: Vec::new(),
                 global_scope_hits: Vec::new(),
@@ -3465,13 +3617,35 @@ impl AiMemoryServer {
         } else {
             None
         };
-        // #2038 precedence: explicit call `limit` → project default → global
-        // default. The `scopes` path has no single project, so it keeps the
-        // server-wide default computed above.
-        let limit = match &single_project {
-            Some((ws, proj)) => self.effective_query_limit(args.limit, *ws, *proj).await,
-            None => limit,
+        // #2038 precedence, per field: explicit call value → project default →
+        // global default. The `scopes` path has no single project, so it keeps
+        // the server-wide limit computed above and resolves the floor from the
+        // call value, then the global config.
+        let (limit, min_relevance) = match &single_project {
+            Some((ws, proj)) => {
+                self.effective_query_criteria(args.limit, args.min_relevance, *ws, *proj)
+                    .await
+            }
+            None => (
+                limit,
+                args.min_relevance
+                    .or(self.default_min_relevance)
+                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+            ),
         };
+        // A relevance floor keys off the reranker's calibrated score; the
+        // uncalibrated RRF rank is not one. With no reranker configured the
+        // floor cannot be honored, so reject the query loudly rather than
+        // silently returning unfiltered hits that look filtered (#2038).
+        if min_relevance.is_some() && self.rerank.is_none() {
+            return Err(McpError::invalid_params(
+                "min_relevance needs a configured reranker: without one there is no calibrated \
+                 relevance score to filter on (the fused ranking is not one). Configure a reranker, \
+                 or remove the floor (the call's min_relevance, the project's [retrieval] \
+                 min_relevance, or the global [retrieval] min_relevance)",
+                None,
+            ));
+        }
         let query_vec = self.embed_query(&args.query).await;
         let candidate_limit = self.rerank_fetch_limit(limit);
         let resolved_scopes = if args.scopes.is_empty() {
@@ -3521,9 +3695,41 @@ impl AiMemoryServer {
         });
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let rerank_started = (explain && self.rerank.is_some()).then(std::time::Instant::now);
-        let hits = self.rerank_hits(&args.query, hits, limit).await;
+        let (mut hits, rerank_scores) = self.rerank_hits_scored(&args.query, hits, limit).await;
         if let (Some(timings), Some(started)) = (timings.as_mut(), rerank_started) {
             timings.rerank_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        // Apply a resolved `min_relevance` floor over the reranker's calibrated
+        // scores (#2038). Because `apply` sorts by relevance before truncating,
+        // the below-floor hits are a suffix, so filtering the returned hits is
+        // equivalent to "exclude below the floor, then take `limit`". A hit the
+        // reranker did not score (the fused tail) is dropped. When the reranker
+        // scored nothing this query — a transient timeout/saturation/provider
+        // error, or too few candidates to rank — the floor cannot be applied, so
+        // the fused order is returned unfiltered and the response says so rather
+        // than silently dropping every hit.
+        let mut relevance_filter_unavailable = None;
+        if let Some(floor) = min_relevance {
+            let scored_count = rerank_scores.iter().filter(|s| s.is_some()).count();
+            if scored_count == 0 {
+                if !hits.is_empty() {
+                    relevance_filter_unavailable = Some(
+                        "min_relevance could not be applied: the reranker scored no hit this query \
+                         (a transient rerank failure, or too few candidates to rank); the hits are \
+                         returned unfiltered in fused order"
+                            .to_string(),
+                    );
+                }
+            } else {
+                hits = hits
+                    .into_iter()
+                    .zip(rerank_scores)
+                    .filter_map(|(hit, score)| match score {
+                        Some(s) if s >= floor => Some(hit),
+                        _ => None,
+                    })
+                    .collect();
+            }
         }
         let bump_actor = Self::bump_actor_from_parts(&parts);
         self.spawn_access_bump(
@@ -3891,6 +4097,7 @@ impl AiMemoryServer {
             hits,
             answer,
             answer_unavailable,
+            relevance_filter_unavailable,
             answer_context,
             raw_hits,
             global_hits: Vec::new(),
@@ -11427,6 +11634,7 @@ mod tests {
                         explain: Some(true),
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -11466,6 +11674,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -14545,6 +14754,7 @@ mod tests {
             explain: Some(true),
             as_of,
             answer: None,
+            min_relevance: None,
             reasoning: None,
         };
 
@@ -14591,6 +14801,7 @@ mod tests {
                     explain: Some(true),
                     as_of: Some(jiff::Timestamp::now().to_string()),
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -14670,6 +14881,7 @@ mod tests {
             explain: None,
             as_of: None,
             answer: None,
+            min_relevance: None,
             reasoning: None,
         };
         let scope = |project: &str| MemoryScopeArg {
@@ -14757,6 +14969,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -14791,6 +15004,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -14967,6 +15181,7 @@ mod tests {
                             explain: Some(explain),
                             as_of: None,
                             answer: None,
+                            min_relevance: None,
                             reasoning: None,
                         }),
                         OptionalParts(test_parts_default()),
@@ -15071,6 +15286,7 @@ mod tests {
                         explain: Some(true),
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     OptionalParts(test_parts_default()),
@@ -15166,6 +15382,7 @@ mod tests {
             explain: None,
             as_of: None,
             answer: None,
+            min_relevance: None,
             reasoning: None,
         };
 
@@ -15330,6 +15547,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -15374,6 +15592,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -15519,6 +15738,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -16132,6 +16352,7 @@ mod tests {
                             explain: Some(true),
                             as_of: None,
                             answer: None,
+                            min_relevance: None,
                             reasoning: None,
                         }),
                         OptionalParts(parts),
@@ -16248,6 +16469,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 test_optional_parts(),
@@ -16351,6 +16573,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -16425,6 +16648,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -16475,6 +16699,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 test_optional_parts(),
@@ -16558,6 +16783,7 @@ mod tests {
                         explain: None,
                         as_of: None,
                         answer: None,
+                        min_relevance: None,
                         reasoning: None,
                     }),
                     test_optional_parts(),
@@ -16632,6 +16858,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19228,6 +19455,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19345,6 +19573,7 @@ mod tests {
                     explain: Some(true),
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19400,6 +19629,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19569,6 +19799,7 @@ mod tests {
                     explain: None,
                     as_of: Some(jiff::Timestamp::now().to_string()),
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -19617,6 +19848,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -20066,6 +20298,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: Some(true),
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -22931,6 +23164,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(parts_as_user(joao)),
@@ -22997,6 +23231,7 @@ mod tests {
             explain: None,
             as_of: None,
             answer: None,
+            min_relevance: None,
             reasoning: None,
         }
     }
@@ -23923,6 +24158,7 @@ mod tests {
                             tier: None,
                             path_prefix: None,
                             tag: None,
+                            min_relevance: None,
                             reasoning: None,
                             answer: None,
                             include_superseded: None,
@@ -24150,6 +24386,7 @@ mod tests {
                                 tier: None,
                                 path_prefix: None,
                                 tag: None,
+                                min_relevance: None,
                                 reasoning: None,
                                 answer: None,
                                 include_superseded: None,
@@ -28285,6 +28522,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),
@@ -28327,6 +28565,7 @@ mod tests {
                     explain: None,
                     as_of: None,
                     answer: None,
+                    min_relevance: None,
                     reasoning: None,
                 }),
                 OptionalParts(test_parts_default()),

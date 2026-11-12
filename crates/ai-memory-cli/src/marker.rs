@@ -1265,7 +1265,7 @@ fn declares_more_than_capture(text: &str) -> bool {
         "identity",
         "identity_style",
     ];
-    const FLAG_KEYS: [&str; 9] = [
+    const FLAG_KEYS: [&str; 10] = [
         "default_global",
         "inject_on_session_start",
         "inject_on_subagent_start",
@@ -1275,6 +1275,7 @@ fn declares_more_than_capture(text: &str) -> bool {
         "deliver_on_session_start",
         "inbox_notice_on_prompt",
         "default_result_limit",
+        "min_relevance",
     ];
     QUOTED_KEYS
         .iter()
@@ -2432,6 +2433,8 @@ project = "infra" # this is fine
             "[briefing]\ninject_on_subagent_start = true\n",
             "[briefing]\nmax_chars = 4000\n",
             "[handoff]\ndeliver_on_session_start = false\n",
+            "[retrieval]\ndefault_result_limit = 25\n",
+            "[retrieval]\nmin_relevance = 0.4\n",
         ] {
             assert!(
                 declares_more_than_capture(text),

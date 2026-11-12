@@ -2255,6 +2255,14 @@ pub struct RetrievalSettings {
     /// the built-in default of 10. A per-project marker value and an explicit
     /// per-call `limit` both override this; all three are clamped to `1..=100`.
     pub default_result_limit: Option<usize>,
+    /// Lowest calibrated reranker relevance a `memory_query` hit may have when
+    /// a call gives no explicit `min_relevance` and the queried project carries
+    /// no stored `min_relevance` of its own (#2038). `None` (the default)
+    /// applies no floor. A per-project marker value and an explicit per-call
+    /// `min_relevance` both override this; all three are bounded to `0.0..=1.0`.
+    /// The threshold needs a configured reranker — a query that sets it with
+    /// none available is rejected, never silently applied to the RRF rank.
+    pub min_relevance: Option<f32>,
 }
 
 impl Default for RetrievalSettings {
@@ -2269,6 +2277,7 @@ impl Default for RetrievalSettings {
             feedback_demotion: base.feedback_demotion,
             query_signal_weight: base.query_signal_weight,
             default_result_limit: None,
+            min_relevance: None,
         }
     }
 }
@@ -2810,6 +2819,19 @@ impl Config {
             anyhow::bail!(
                 "retrieval.default_result_limit must be between 1 and 100 (got {limit}); it sets \
                  how many hits memory_query returns when a call gives no explicit limit"
+            );
+        }
+        // The relevance floor is a calibrated `0.0..=1.0` reranker score (#2038).
+        // Reject an out-of-range global default at startup (NaN included, since
+        // it fails the range check) rather than silently ignoring a value the
+        // operator clearly meant.
+        if let Some(min_relevance) = config.retrieval.min_relevance
+            && !(0.0..=1.0).contains(&min_relevance)
+        {
+            anyhow::bail!(
+                "retrieval.min_relevance must be between 0 and 1 (got {min_relevance}); it sets the \
+                 lowest calibrated reranker relevance a memory_query hit may have when a call gives \
+                 no explicit min_relevance"
             );
         }
         config.ingest.drop_list = Box::new(
@@ -4819,6 +4841,48 @@ mod tests {
             .unwrap();
             Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
                 .unwrap_or_else(|e| panic!("default_result_limit = {value} must load: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn retrieval_min_relevance_defaults_unset_and_loads_from_toml() {
+        // Unset by default, so no relevance floor is applied.
+        assert_eq!(Config::default().retrieval.min_relevance, None);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[retrieval]\nmin_relevance = 0.35\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.retrieval.min_relevance, Some(0.35));
+    }
+
+    #[test]
+    fn load_rejects_out_of_range_min_relevance() {
+        for value in ["-0.1", "1.1", "2.0"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[retrieval]\nmin_relevance = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err(&format!("min_relevance = {value} must fail closed"));
+            assert!(
+                error.to_string().contains("min_relevance"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+        // The `0.0..=1.0` edges load.
+        for value in ["0.0", "1.0"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[retrieval]\nmin_relevance = {value}\n"),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .unwrap_or_else(|e| panic!("min_relevance = {value} must load: {e:#}"));
         }
     }
 

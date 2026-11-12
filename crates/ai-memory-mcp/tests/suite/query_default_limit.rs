@@ -154,6 +154,7 @@ async fn set_project_limit(h: &Harness, limit: Option<u32>) {
             h.proj,
             RetrievalCriteria {
                 default_result_limit: limit,
+                ..RetrievalCriteria::default()
             },
         )
         .await
