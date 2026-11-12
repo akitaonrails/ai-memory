@@ -13,7 +13,7 @@ use ai_memory_store::{PendingAutoImproveReview, PendingAutoImproveScope};
 use askama::Template;
 use axum::Extension;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use serde::Deserialize;
 
@@ -257,7 +257,9 @@ fn powershell_quote(text: &str) -> String {
 
 fn render(view: impl Template, status: StatusCode) -> Response {
     match view.render() {
-        Ok(body) => (status, Html(body)).into_response(),
+        // Cross-project operator state, like `/health` and `/workstreams`:
+        // a decided proposal must not come back from a cache as pending.
+        Ok(body) => (status, [(header::CACHE_CONTROL, "no-store")], Html(body)).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
