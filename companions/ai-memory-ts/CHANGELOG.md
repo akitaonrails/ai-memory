@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restored `pages.read` and `pages.update` compatibility with servers that
   predate the section metadata added in 3.3.0.
 
-- `api.page` accepts literal `%2e` and `%2e%2e` segments in stored page paths.
+- `api.page` accepts literal `%2e` and `%2e%2e` segments in stored page paths. (#2217)
 
 ### Added
 
