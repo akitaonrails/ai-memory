@@ -376,7 +376,7 @@ fn emit_zcode(args: &SetupAgentArgs) -> Result<()> {
     Ok(())
 }
 
-/// Print the `hooks:` block for `~/.hermes/config.yaml` (the follow-up to
+/// Print the `hooks:` block for the Hermes home's `config.yaml` (the follow-up to
 /// #623, where Hermes was accepted for capture/storage but had no installer).
 /// No scripts are staged: Hermes splits the configured `command` itself and
 /// runs the ai-memory binary directly with the JSON payload on stdin. The
@@ -396,7 +396,12 @@ fn hermes_setup_output(args: &SetupAgentArgs, plugin_dir: Option<&Path>) -> Stri
         hook_set,
     );
     let mut out = String::new();
-    out.push_str("# Hermes Agent — merge the `hooks:` block into ~/.hermes/config.yaml\n");
+    out.push_str(
+        "# Hermes Agent — merge the `hooks:` block into the config.yaml of the\n\
+         # Hermes home that runs it (`$HERMES_HOME/config.yaml`, else\n\
+         # `~/.hermes/config.yaml`; `%LOCALAPPDATA%\\hermes\\config.yaml` on\n\
+         # Windows).\n",
+    );
     out.push_str("# The `command` must be an ai-memory binary reachable on the host that\n");
     out.push_str("# runs Hermes; prefer `ai-memory install-hooks --agent hermes` from\n");
     out.push_str("# that host so the path is resolved for you.\n");

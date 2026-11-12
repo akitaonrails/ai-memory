@@ -2197,9 +2197,13 @@ CodeBuddy session after installing so it loads the hooks.
 
 ### Hermes Agent (Nous Research)
 
-Hermes declares lifecycle hooks in the `hooks:` block of
-`~/.hermes/config.yaml` (`$HERMES_HOME/config.yaml`). `install-hooks --agent
-hermes` (alias `hermes-agent`) prints the block to paste there:
+Hermes declares lifecycle hooks in the `hooks:` block of its home's
+`config.yaml`: `$HERMES_HOME/config.yaml` when that is set, else
+`%LOCALAPPDATA%\hermes\config.yaml` on Windows and `~/.hermes/config.yaml`
+everywhere else (the Windows setup does not export `HERMES_HOME`), with
+`$HERMES_DATA_DIR_SUFFIX` appended to the default's name.
+`install-hooks --agent hermes` (alias `hermes-agent`) prints the block to
+paste there:
 
 ```bash
 ai-memory install-hooks --agent hermes --server-url "http://homelab:49374"
@@ -2209,22 +2213,23 @@ Hermes splits each configured `command` with `shlex.split` and runs it with
 **no shell**, passing the event JSON on stdin, so the generated entry invokes
 the native `ai-memory hook` command directly (the same exec-form shape Zero and
 ZCode use) and there is no script bundle to stage. ai-memory never writes the
-file, `--apply` included: `~/.hermes/config.yaml` is YAML you also edit, and
+file, `--apply` included: the Hermes `config.yaml` is YAML you also edit, and
 Hermes gates user hooks behind its own acceptance prompt (`hooks_auto_accept`).
 Paste the block, let Hermes accept it, and restart Hermes and its gateway.
 
 Hermes runs a hook only when its exact `(event, command)` pair is in that
 home's `shell-hooks-allowlist.json`, or when `hooks_auto_accept`,
 `--accept-hooks` or `HERMES_ACCEPT_HOOKS` approves it. Each profile
-(`~/.hermes/profiles/<name>`) is a home of its own with its own allowlist, so
-pasting the block into a profile's `config.yaml` is not enough: approve it
+(`<Hermes home>/profiles/<name>`) is a home of its own with its own allowlist,
+so pasting the block into a profile's `config.yaml` is not enough: approve it
 there once with `hermes -p <name> --accept-hooks chat`, or run `hermes -p
 <name>` and accept the prompt. A gateway has no terminal to prompt on, so it
 skips an unapproved hook and logs `not allowlisted — skipped` on every event.
 `ai-memory doctor` checks the root home and every profile and names each
-profile whose ai-memory hooks are not approved. It reads both files and never
-changes them, and it cannot see a `HERMES_ACCEPT_HOOKS` set only in the
-gateway's environment.
+profile whose ai-memory hooks are not approved. It resolves the Hermes home the
+same way Hermes does (`$HERMES_HOME`, else the platform default), reads both
+files and never changes them, and it cannot see a `HERMES_ACCEPT_HOOKS` set
+only in the gateway's environment.
 
 Six events are wired, each with a 20-second timeout:
 
@@ -2256,13 +2261,13 @@ existing absolute directory. A multiplexing gateway serves every profile from
 the default profile's process and exports only the default profile's
 `terminal.cwd`, so inside a gateway the variable is used only for events the
 `default` profile fired. Another profile's events keep the process directory
-unless that profile's own Hermes home (`~/.hermes/profiles/<name>`, under the
-gateway's `HERMES_HOME` when it is set) carries an `.ai-memory.toml`; then the
-hook routes them by that marker. This is how the bots of one gateway reach the
-project they work for:
+unless that profile's own Hermes home (`<Hermes home>/profiles/<name>`, under
+the gateway's `HERMES_HOME` when it is set) carries an `.ai-memory.toml`; then
+the hook routes them by that marker. This is how the bots of one gateway reach
+the project they work for:
 
 ```toml
-# ~/.hermes/profiles/sc-seo/.ai-memory.toml
+# ~/.hermes/profiles/sc-seo/.ai-memory.toml   (%LOCALAPPDATA%\hermes\profiles\sc-seo on Windows)
 workspace = "default"
 project = "smart-compost"
 ```
@@ -2290,8 +2295,10 @@ under a profile's `HERMES_HOME` is seen only when the command runs with that
 For MCP, `ai-memory install-mcp --client hermes` prints an `mcp_servers:` entry
 for the same file (see [mcp-install.md](mcp-install.md#hermes-agent)). Hermes
 does not read MCP server instructions, so also install the skills:
-`ai-memory install-skills --scope global --agent hermes` writes them to
-`~/.hermes/skills`. No managed workstream (`ai-memory run hermes`) is claimed.
+`ai-memory install-skills --scope global --agent hermes` writes them to the
+Hermes home's `skills/` (`$HERMES_HOME`, else `%LOCALAPPDATA%\hermes` on
+Windows and `~/.hermes` elsewhere). No managed workstream
+(`ai-memory run hermes`) is claimed.
 
 ### OpenCode
 
@@ -3614,7 +3621,7 @@ Default skill target roots:
 | Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` | `--agent hermes` | `--agent antigravity` |
 |---|---|---|---|---|---|---|---|
 | `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` | `.hermes/skills` | `.agents/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) | `~/.hermes/skills` | both `~/.gemini/config/skills` (Antigravity App and IDE) and `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; non-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (default `~/.grok/skills`), plus the first-turn rule `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (default `~/.copilot/skills`) | `$HERMES_HOME/skills` (default `~/.hermes/skills`; Windows `%LOCALAPPDATA%\hermes\skills`) | both `~/.gemini/config/skills` (Antigravity App and IDE) and `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
 
 Each managed skill is written as `<root>/<skill-name>/SKILL.md`.
 
