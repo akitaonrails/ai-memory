@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
-use crate::commands::path_util::{claude_config_dir, home_dir};
+use crate::commands::path_util::{claude_config_dir, home_dir, strip_windows_verbatim_prefix};
 use crate::commands::render_shared::{
     bearer_header_value, hook_embedded_exe_path, mask_secret, shell_quote, yaml_single_quote,
 };
@@ -393,9 +393,13 @@ fn bridge_data_dir_args(args: &InstallMcpArgs) -> Vec<String> {
     args.bridge_data_dir
         .as_ref()
         .map_or_else(Vec::new, |data_dir| {
+            // The data dir is canonical, so on Windows it carries the `\\?\`
+            // verbatim prefix. Hermes rewrote that into `C:\?\C:\...` and the
+            // bridge could not start (#2203); pass the plain drive path, as
+            // `setup` and the DSH configPath (#2032) already do.
             vec![
                 "--data-dir".to_owned(),
-                data_dir.to_string_lossy().into_owned(),
+                strip_windows_verbatim_prefix(&data_dir.to_string_lossy()).into_owned(),
             ]
         })
 }
@@ -3047,6 +3051,22 @@ mod tests {
             stdio_bridge: false,
             bridge_data_dir: None,
         }
+    }
+
+    #[test]
+    fn bridge_data_dir_args_strip_windows_verbatim_prefix() {
+        // The canonical data dir carries `\\?\` on Windows, which Hermes
+        // mangled into `C:\?\C:\...` so the bridge never started (#2203).
+        // The strip is lexical, so this runs on any host.
+        let mut args = args_for(McpClient::Hermes);
+        args.bridge_data_dir = Some(PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory"));
+        assert_eq!(
+            bridge_data_dir_args(&args),
+            [
+                "--data-dir".to_owned(),
+                r"C:\Users\me\AppData\Local\ai-memory".to_owned(),
+            ]
+        );
     }
 
     fn args_with_token(client: McpClient) -> InstallMcpArgs {
