@@ -1163,7 +1163,7 @@ fn run_with_hook_connection(
             AgentChoice::Zero => apply_to_zero_hooks(&server_url, auth, &config.data_dir, &args),
             AgentChoice::Zcode => apply_to_zcode_hooks(&server_url, auth, &config.data_dir, &args),
             // Nothing to write or stage: the block invokes the native `hook`
-            // subcommand, and `~/.hermes/config.yaml` is a YAML file the
+            // subcommand, and the Hermes `config.yaml` is a YAML file the
             // operator also edits (and Hermes itself gates hooks behind an
             // acceptance prompt). `--apply` prints the same ready-to-paste
             // block a preview does.
@@ -1683,7 +1683,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Grok => grok_hooks_path().ok()?,
             AgentChoice::Zero => zero_hooks_path().ok()?,
             AgentChoice::Zcode => zcode_config_path().ok()?,
-            // Hermes' hook config is `~/.hermes/config.yaml`, which ai-memory
+            // Hermes' hook config is its home's `config.yaml`, which ai-memory
             // never writes, so there is no install-owned file to recover a
             // baked project strategy from.
             AgentChoice::Hermes => return None,
@@ -2171,7 +2171,7 @@ pub(crate) fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         // server URL or token from.
         AgentChoice::Zcode => None,
         // `install-mcp --client hermes` is print-only: ai-memory never writes
-        // `~/.hermes/config.yaml`, so there is no entry of its own to infer a
+        // Hermes' `config.yaml`, so there is no entry of its own to infer a
         // server URL or token from.
         AgentChoice::Hermes => None,
         AgentChoice::CopilotCli => Some(McpClient::CopilotCli),
@@ -7792,19 +7792,16 @@ fn render_zcode(
 
 /// Where the community ai-memory memory-provider plugin for Hermes installs
 /// itself: `$HERMES_HOME/plugins/ai-memory`, with `HERMES_HOME` defaulting to
-/// `~/.hermes` as Hermes and the plugin's installer both resolve it. Both
-/// variables come from the captured environment (invariant #1).
+/// Hermes' platform home (`%LOCALAPPDATA%\hermes` on Windows, `~/.hermes`
+/// elsewhere) as Hermes and the plugin's installer both resolve it. The
+/// environment comes from the captured one (invariant #1).
 pub(crate) fn hermes_plugin_dir(env: &crate::config::RuntimeEnv) -> Option<PathBuf> {
-    hermes_plugin_dir_in(env.var_os("HERMES_HOME"), env.home_dir().map(PathBuf::from))
+    let home = crate::commands::path_util::hermes_home(env, env.home_dir().map(Path::new))?;
+    Some(hermes_plugin_dir_in(home))
 }
 
-fn hermes_plugin_dir_in(
-    hermes_home: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    crate::commands::path_util::agent_config_home(hermes_home)
-        .or_else(|| home.map(|home| home.join(".hermes")))
-        .map(|hermes_home| hermes_home.join("plugins").join("ai-memory"))
+fn hermes_plugin_dir_in(hermes_home: PathBuf) -> PathBuf {
+    hermes_home.join("plugins").join("ai-memory")
 }
 
 /// The plugin posts prompts and session ends and claims the handoff itself,
@@ -7819,7 +7816,7 @@ pub(crate) fn hermes_hook_set(plugin_dir: Option<&Path>) -> HermesHookSet {
 }
 
 /// `install-hooks --agent hermes`: print the ready-to-paste `hooks:` block for
-/// `~/.hermes/config.yaml`.
+/// the Hermes home's `config.yaml`.
 ///
 /// ai-memory deliberately does not write that file. It is YAML the operator
 /// also edits (comments, other hooks) and would have to be spliced, and Hermes
@@ -7864,14 +7861,17 @@ fn render_hermes_output(
     );
     let mut out = String::new();
     out.push_str("# Hermes Agent hooks config — merge the `hooks:` block below\n");
-    out.push_str("# into ~/.hermes/config.yaml and let Hermes accept it when it\n");
-    out.push_str("# prompts (or set `hooks_auto_accept: true`). ai-memory does not\n");
-    out.push_str("# write that file: it is YAML you also edit, and it would have to\n");
-    out.push_str("# be spliced. Restart Hermes (and its gateway) to load it.\n");
+    out.push_str("# into the config.yaml of the Hermes home that runs it\n");
+    out.push_str("# (`$HERMES_HOME/config.yaml`, else `~/.hermes/config.yaml`;\n");
+    out.push_str("#  `%LOCALAPPDATA%\\hermes\\config.yaml` on Windows), and let Hermes\n");
+    out.push_str("# accept it when it prompts (or set `hooks_auto_accept: true`).\n");
+    out.push_str("# ai-memory does not write that file: it is YAML you also edit, and\n");
+    out.push_str("# it would have to be spliced. Restart Hermes (and its gateway) to\n");
+    out.push_str("# load it.\n");
     out.push_str(&format!("# AI-memory server URL: {server_url}\n"));
     if auth_token.is_some() {
         out.push_str("# Auth: this snippet embeds the token in each hook command —\n");
-        out.push_str("#       treat ~/.hermes/config.yaml as sensitive (chmod 600).\n");
+        out.push_str("#       treat the Hermes config as sensitive (chmod 600).\n");
     }
     out.push_str(&hermes_hook_set_notes(hook_set, plugin_dir));
     out.push_str("# NOTE: each `command` is a bare argv line. Hermes splits it with\n");
@@ -11568,27 +11568,21 @@ command = "AI_MEMORY_HOOK_URL=http://h AI_MEMORY_PROJECT_STRATEGY=repo-root /x/a
         assert!(out.contains("hermes plugins disable"));
     }
 
+    /// The home itself is resolved by `path_util::hermes_home` (tested
+    /// there); here the plugin sits under its `plugins/ai-memory`.
     #[test]
-    fn hermes_plugin_dir_follows_hermes_home_then_the_home_default() {
+    fn hermes_plugin_dir_joins_the_plugins_entrypoint() {
         let home = PathBuf::from("/home/alice");
         assert_eq!(
-            hermes_plugin_dir_in(None, Some(home.clone())),
-            Some(home.join(".hermes").join("plugins").join("ai-memory"))
+            hermes_plugin_dir_in(home.join(".hermes")),
+            home.join(".hermes").join("plugins").join("ai-memory")
         );
         assert_eq!(
-            hermes_plugin_dir_in(Some("/srv/hermes".into()), Some(home.clone())),
-            Some(
-                PathBuf::from("/srv/hermes")
-                    .join("plugins")
-                    .join("ai-memory")
-            )
+            hermes_plugin_dir_in(PathBuf::from("/srv/hermes")),
+            PathBuf::from("/srv/hermes")
+                .join("plugins")
+                .join("ai-memory")
         );
-        // A blank HERMES_HOME is an unset expansion, not the filesystem root.
-        assert_eq!(
-            hermes_plugin_dir_in(Some("  ".into()), Some(home.clone())),
-            Some(home.join(".hermes").join("plugins").join("ai-memory"))
-        );
-        assert_eq!(hermes_plugin_dir_in(None, None), None);
         // A file of that name is not an installed plugin.
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("ai-memory");

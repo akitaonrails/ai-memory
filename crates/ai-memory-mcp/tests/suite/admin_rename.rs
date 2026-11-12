@@ -927,3 +927,90 @@ async fn adopt_project_identity_evicts_the_identity_keyed_scope_cache() {
         "an unrelated project's slot must survive the adoption"
     );
 }
+
+/// A rename must evict the hook router's cached scope slots for the renamed
+/// project, and must leave every other project's slot alone.
+///
+/// The declared-`project` rung routes by NAME, never by repository identity
+/// (`repository_identity`'s module docs; the router drops the identity for a
+/// marker-sourced override that carries no aliases). So a repo whose
+/// `.ai-memory.toml` pins `project = "pinned-api"` keeps hitting its cached
+/// slot after the rename and keeps writing into the renamed project, while a
+/// cold server re-resolves the same marker through `get_or_create_project` and
+/// mints a fresh project under the old name.
+///
+/// `ProjectCacheStore::insert` is private to `ai-memory-hooks`, so the cache
+/// here is a plain map driven by the SAME `retain` predicate the real
+/// invalidator in `serve.rs` installs.
+#[tokio::test]
+async fn rename_project_evicts_only_the_renamed_projects_cache_slots() {
+    use ai_memory_core::{ProjectId, WorkspaceId};
+    use ai_memory_mcp::ScopeInvalidation;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    let tmp = TempDir::new().unwrap();
+    let (mut state, store) = make_state(&tmp).await;
+
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let renamed = store
+        .writer
+        .get_or_create_project(ws, "pinned-api", None)
+        .await
+        .unwrap();
+    let untouched = store
+        .writer
+        .get_or_create_project(ws, "unrelated", None)
+        .await
+        .unwrap();
+    assert_ne!(renamed, untouched);
+
+    // Two warm slots, as two repos with declared markers would leave behind.
+    let cache: Arc<Mutex<HashMap<&'static str, (WorkspaceId, ProjectId)>>> = Arc::new(Mutex::new(
+        [
+            ("marker:pinned-api", (ws, renamed)),
+            ("marker:unrelated", (ws, untouched)),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+
+    state.scope_invalidator = Some({
+        let cache = cache.clone();
+        Arc::new(move |target: ScopeInvalidation| {
+            let cache = cache.clone();
+            Box::pin(async move {
+                // Identical predicate to the one `serve.rs` installs.
+                cache
+                    .lock()
+                    .unwrap()
+                    .retain(|_, v: &mut (WorkspaceId, ProjectId)| match target {
+                        ScopeInvalidation::Project(proj) => v.1 != proj,
+                        ScopeInvalidation::Workspace(w) => v.0 != w,
+                    });
+            })
+        })
+    });
+
+    let resp = post(
+        state,
+        "/admin/rename-project",
+        json!({ "workspace": "default", "from": "pinned-api", "to": "legacy-api" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "rename must succeed");
+
+    let cache = cache.lock().unwrap();
+    assert!(
+        !cache.contains_key("marker:pinned-api"),
+        "the renamed project's cached slot must be evicted, got {cache:?}"
+    );
+    assert!(
+        cache.contains_key("marker:unrelated"),
+        "an unrelated project's cached slot must survive, got {cache:?}"
+    );
+}

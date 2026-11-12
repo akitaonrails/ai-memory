@@ -207,6 +207,12 @@ fn resolve_target_roots_from_env(
         (InstallSkillsScope::Global, InstallSkillsAgent::CopilotCli) => {
             Some(install_mcp::copilot_home_in(env.var_os("COPILOT_HOME"))?)
         }
+        // Hermes reads `skills/` from its own home (`get_skills_dir` in
+        // `hermes_constants.py`): `$HERMES_HOME`, else the platform default.
+        (InstallSkillsScope::Global, InstallSkillsAgent::Hermes) => Some(
+            crate::commands::path_util::hermes_home(env, home.as_deref())
+                .context("could not locate the Hermes home for global skill install")?,
+        ),
         _ => None,
     };
     let claude_config_dir = claude_config_dir(env.var_os("CLAUDE_CONFIG_DIR"));
@@ -419,7 +425,10 @@ fn agent_root(
     }
 
     if scope == InstallSkillsScope::Global
-        && matches!(kind, SkillRootKind::Grok | SkillRootKind::CopilotCli)
+        && matches!(
+            kind,
+            SkillRootKind::Grok | SkillRootKind::CopilotCli | SkillRootKind::Hermes
+        )
         && let Some(agent_home) = agent_home
     {
         return Ok(agent_home.join(SKILLS_DIR));
@@ -760,6 +769,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("$HOME"), "{error}");
+    }
+
+    /// Hermes reads `skills/` from its own home (`get_skills_dir` in
+    /// `hermes_constants.py`), which on Windows is `%LOCALAPPDATA%\hermes`
+    /// and never `~/.hermes`; project scope stays under the checkout.
+    #[test]
+    fn global_hermes_skills_follow_the_resolved_hermes_home() {
+        let hermes_home = Path::new("C:/Users/alice/AppData/Local/hermes");
+        let global = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Global, InstallSkillsAgent::Hermes),
+            Path::new("C:/work"),
+            Some(Path::new("C:/Users/alice")),
+            None,
+            Some(hermes_home),
+            None,
+            SkillHostPlatform::Windows,
+        )
+        .unwrap();
+        assert_eq!(
+            root_names(&global),
+            ["C:/Users/alice/AppData/Local/hermes/skills"]
+        );
+
+        let project = resolve_target_roots_for_platform(
+            &args(InstallSkillsScope::Project, InstallSkillsAgent::Hermes),
+            Path::new("/repo"),
+            None,
+            None,
+            Some(Path::new("/srv/hermes")),
+            None,
+            SkillHostPlatform::Other,
+        )
+        .unwrap();
+        assert_eq!(root_names(&project), ["/repo/.hermes/skills"]);
     }
 
     #[test]

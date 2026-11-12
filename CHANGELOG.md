@@ -13,12 +13,6 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- `adopt-project-identity` now drops the hook router's cached resolution for
-  the project that gave the identity away, so the checkout's hooks reach the
-  project that took it. That cache keys entries on the repository identity, and
-  the move left the pre-adoption entry in place: until the server restarted or
-  the entry aged out, new sessions, prompts and observations kept landing in
-  the project the command had just emptied and archived. (#2216)
 - The `/health` page no longer reports a database it could not measure as an
   empty one. When the storage pragma reads failed, the database row rendered
   `0 bytes, 0 reclaimable` — indistinguishable from a real measurement of an
@@ -26,6 +20,26 @@ version in [`docs/changelog/`](docs/changelog/):
   nothing to compact. The figures now read `unknown` and a check reports that
   they could not be read. A failed read still never takes the page down.
   (#2215)
+- The root-only `/pending` triage page now sends `Cache-Control: no-store`,
+  like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
+  cached copy could list a proposal an operator had already approved or
+  rejected as still pending, with its no-longer-actionable review id and CLI
+  commands, until the page was force-reloaded. (#2225)
+- `adopt-project-identity` now drops the hook router's cached resolution for
+  the project that gave the identity away, so the checkout's hooks reach the
+  project that took it. That cache keys entries on the repository identity, and
+  the move left the pre-adoption entry in place: until the server restarted or
+  the entry aged out, new sessions, prompts and observations kept landing in
+  the project the command had just emptied and archived. (#2216)
+- `POST /admin/rename-project` now invalidates the hook router's scope cache
+  for the renamed project, as `rename-workspace` already did for a renamed
+  workspace. A repository whose `.ai-memory.toml` declares `project = "<old
+  name>"` routes by that name, so after a rename its warm cache slot kept
+  sending captures into the renamed project while a freshly started server
+  re-resolved the same marker and created an empty project under the old name
+  — which of the two a capture landed in depended on whether the cache
+  happened to be warm. Other projects' cached slots are left untouched.
+  (#2221)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
@@ -144,6 +158,17 @@ version in [`docs/changelog/`](docs/changelog/):
   Background uploads and startup backfills now inherit only their own standard
   streams, so waiting for hook output no longer waits for a worker's HTTP
   request. (#2193)
+- `ai-memory doctor` now finds a Windows Hermes install, and
+  `install-skills --scope global --agent hermes` writes where Hermes reads
+  skills. Hermes' Windows setup keeps its home at `%LOCALAPPDATA%\hermes` and
+  exports `HERMES_HOME` only into its own process tree, while ai-memory looked
+  at `~/.hermes` alone. `doctor` therefore printed no Hermes profile even with
+  a configured `config.yaml` (its JSON `hermes` array stayed empty), and the
+  global skills went to a directory Hermes never reads. One resolver now
+  follows Hermes (`$HERMES_HOME`, else the platform default with
+  `$HERMES_DATA_DIR_SUFFIX` appended) for the doctor scan, the community
+  plugin check, a named profile's marker routing and the skill root, and the
+  `install-hooks` and `setup-agent` guidance names the platform path. (#2211)
 - `ai-memory status`, `GET /admin/status` and the `/health` panel no longer
   count or list a failed session consolidation that a newer consolidation of
   the same session has since completed. A session that ends, resumes and ends
@@ -225,6 +250,11 @@ version in [`docs/changelog/`](docs/changelog/):
   original pepper instead of `--with-config`. (#2172)
 - Fixed `restore` replacing live data and installing a backup's malformed
   `config.toml`, which prevented the restored server from starting. (#2209)
+
+- Fixed `retrieval-compare` treating unmeasured cutoffs as zero, which could
+  invent accuracy gains or losses and first-hit ranking moves between runs
+  with different `--ks`. Incompatible or incomplete hit/recall grids are now
+  refused before a comparison is printed. (#2220)
 
 ### Security
 
