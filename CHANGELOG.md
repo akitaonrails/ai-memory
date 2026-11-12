@@ -192,7 +192,7 @@ version in [`docs/changelog/`](docs/changelog/):
   quota. The first call after that window tries the provider again, so a
   topped-up primary takes over again without a restart. `ai-memory status`
   names an exhausted primary and the fallback answering for it, and each
-  candidate in the health payload carries a `circuit_reason`.
+  candidate in the health payload carries a `circuit_reason`. (#2227)
 
 ### Changed
 
@@ -228,6 +228,7 @@ version in [`docs/changelog/`](docs/changelog/):
   fall back. The consolidation and bootstrap loops no longer retry exhausted
   quota in place; the SessionEnd queue keeps such a job on its backoff. See
   [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md#credit-and-quota-exhaustion).
+  (#2227)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
