@@ -24,6 +24,15 @@ version in [`docs/changelog/`](docs/changelog/):
   the move left the pre-adoption entry in place: until the server restarted or
   the entry aged out, new sessions, prompts and observations kept landing in
   the project the command had just emptied and archived. (#2216)
+- `POST /admin/rename-project` now invalidates the hook router's scope cache
+  for the renamed project, as `rename-workspace` already did for a renamed
+  workspace. A repository whose `.ai-memory.toml` declares `project = "<old
+  name>"` routes by that name, so after a rename its warm cache slot kept
+  sending captures into the renamed project while a freshly started server
+  re-resolved the same marker and created an empty project under the old name
+  — which of the two a capture landed in depended on whether the cache
+  happened to be warm. Other projects' cached slots are left untouched.
+  (#2221)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
