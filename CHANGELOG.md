@@ -181,7 +181,7 @@ version in [`docs/changelog/`](docs/changelog/):
   a change. It refuses an incomplete body when the read cap prevents this,
   so a metadata-only edit cannot replace page text with a truncated preview (#2054).
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
-  and enforcement metadata when editing the body.
+  and enforcement metadata when editing the body. (#2207)
 - Fixed `ai-memory-wikisync sync --propagate-deletes` deleting a newer server
   page after a repository deletion when only unexported metadata had changed.
   A newer version now requires the usual conflict resolution (#2055).

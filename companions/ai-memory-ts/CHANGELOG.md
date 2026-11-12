@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `pages.update` preserves profile stack filters and enforcement metadata on
   a body edit. `pages.write` and `pages.update` accept `appliesTo` and
-  `enforcedBy` for profile entries.
+  `enforcedBy` for profile entries. (#2207)
 
 - Pinned TypeDoc's transitive `minimatch` to 11.0.3, which fixes
   GHSA-g3hv-75wg-m249 while preserving the generated API documentation on
