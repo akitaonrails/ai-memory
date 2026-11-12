@@ -115,6 +115,8 @@ version in [`docs/changelog/`](docs/changelog/):
   already-absent page with `deleted: true`. (#2181)
 - Fixed native install and reinstall with a trailing slash in
   `AI_MEMORY_LIB_DIR`. (#2171)
+- Preserved the installed Claude Code native hook URL and stored credentials
+  during `ai-memory upgrade` when no server URL is configured. (#2210)
 - Fixed conditional page reads returning a full response for a matching weak
   ETag, a list of validators or the `If-None-Match: *` wildcard. (#2173)
 - Fixed the container wrapper reporting success after a native host-client
@@ -203,8 +205,6 @@ version in [`docs/changelog/`](docs/changelog/):
   before anything live is replaced. It used to skip that check, report success,
   and leave a server that refused to start; the refusal now points at the
   original pepper instead of `--with-config`. (#2172)
-- Preserved the installed Claude Code native hook URL and stored credentials
-  during `ai-memory upgrade` when no server URL is configured. (#2204)
 
 ### Security
 
