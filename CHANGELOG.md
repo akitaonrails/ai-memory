@@ -204,6 +204,11 @@ version in [`docs/changelog/`](docs/changelog/):
   and leave a server that refused to start; the refusal now points at the
   original pepper instead of `--with-config`. (#2172)
 
+- Fixed `retrieval-compare` treating unmeasured cutoffs as zero, which could
+  invent accuracy gains or losses and first-hit ranking moves between runs
+  with different `--ks`. Incompatible or incomplete hit/recall grids are now
+  refused before a comparison is printed.
+
 ### Security
 
 - `ai-memory uninstall --only hooks` now withdraws ZCode's capture hooks. ZCode
