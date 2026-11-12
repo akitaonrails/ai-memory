@@ -186,6 +186,13 @@ version in [`docs/changelog/`](docs/changelog/):
   to the `/admin` routes on an older server. Those routes stay root-only. Admin
   pop and cancel now also run the admission and observer webhooks, as the MCP
   tools already did. (#2146)
+- Added `llm_quota_cooldown_secs` (default 900, env
+  `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`), how long a fallback chain (the default
+  one or a workload's) skips a provider that reported it is out of credit or
+  quota. The first call after that window tries the provider again, so a
+  topped-up primary takes over again without a restart. `ai-memory status`
+  names an exhausted primary and the fallback answering for it, and each
+  candidate in the health payload carries a `circuit_reason`.
 
 ### Changed
 
@@ -208,6 +215,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed `[[llm_fallbacks]]` chains stopping when a provider reported that the
+  account was out of credit, quota or billing. Only a `429`, a `5xx` or a
+  network failure moved the chain on, and Anthropic's `400` "credit balance is
+  too low" counted as a malformed request, so with an exhausted Anthropic
+  primary every consolidation failed and the configured OpenAI fallback never
+  ran. The chain now also advances on these errors from Anthropic, OpenAI
+  (`insufficient_quota`, billing limits, deactivated accounts),
+  OpenAI-compatible gateways such as OpenRouter (`402`), Gemini daily quotas,
+  Codex `usage_limit_reached`, Copilot and OpenCode. The check reads only the
+  bounded, scrubbed error body, and a plain invalid-key `401` still does not
+  fall back. The consolidation and bootstrap loops no longer retry exhausted
+  quota in place; the SessionEnd queue keeps such a job on its backoff. See
+  [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md#credit-and-quota-exhaustion).
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the

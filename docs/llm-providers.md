@@ -312,6 +312,32 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > only when every `openai-compat` endpoint you configure may see your
 > workspace, project and user names.
 
+### Falling back when credit or quota runs out
+
+An ordered `[[llm_fallbacks]]` chain moves to the next provider on a transient
+failure and also when a provider says the account is out of credit, quota or
+billing: Anthropic's `400` "credit balance is too low", OpenAI's
+`429 insufficient_quota`, an OpenRouter `402`, a Gemini daily
+`RESOURCE_EXHAUSTED`, a Codex `usage_limit_reached` or a Copilot
+`quota_exceeded`. A plain invalid-key `401` does not fall back. The exhausted
+provider is skipped for `llm_quota_cooldown_secs` (default 900). The next
+call after that tries it again, so it takes over again once topped up.
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-sonnet-4-6"
+
+[[llm_fallbacks]]
+provider = "openai"
+model = "gpt-5.4-mini"
+api_key_env = "OPENAI_API_KEY"
+```
+
+`ai-memory status` then shows `primary anthropic/claude-sonnet-4-6 exhausted
+(credit/quota); using fallback openai/gpt-5.4-mini`. The full rule, with the
+per-provider signals, is in
+[`llm-provider-fallback.md`](llm-provider-fallback.md#credit-and-quota-exhaustion).
+
 ### Probing the server's own provider
 
 `ai-memory llm-test` builds a provider from the shell it runs in. That is the

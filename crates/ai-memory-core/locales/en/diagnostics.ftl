@@ -747,6 +747,7 @@ diag-consolidation-input-token-safety-margin-must-be = consolidation.input_token
 diag-consolidation-max-input-tokens-must-leave-at = consolidation.max_input_tokens must leave at least { $required_input_chars } characters for the prompt ({ $min_input_tokens } tokens at the default input_token_safety_margin) (got { $value0 }, which is { $effective_input_chars } at input_token_safety_margin = { $safety_margin }); below that the system prompt and page conventions leave no room for observations. Raise max_input_tokens, or raise input_token_safety_margin towards 1.0
 diag-consolidation-max-output-tokens-must-be-at = consolidation.max_output_tokens must be at least { $min_output_tokens } (got { $value0 }); below that a structured consolidation response is unlikely to fit
 diag-llm-timeout-secs-must-be-at-least = llm_timeout_secs must be at least 1 second (got { $value0 }); AI_MEMORY_LLM_TIMEOUT_SECS is read in seconds
+diag-llm-quota-cooldown-secs-must-be-between = llm_quota_cooldown_secs must be between { $min } and { $max } seconds (got { $value0 }); AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS is read in seconds
 diag-rerank-timeout-secs-must-be-at-least = rerank_timeout_secs must be at least 1 second (got { $value0 }); AI_MEMORY_RERANK_TIMEOUT_SECS is read in seconds
 diag-parsing-ai-memory-llm-headers-llm-headers = parsing AI_MEMORY_LLM_HEADERS / llm_headers
 diag-validating-llm-fallbacks = validating llm_fallbacks[{ $i }]
