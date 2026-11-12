@@ -84,6 +84,11 @@ pub(crate) enum WriteCmd {
         flags: crate::ProjectProfileFlags,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    SetProjectRetrievalCriteria {
+        project_id: ProjectId,
+        criteria: crate::RetrievalCriteria,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     RecordProfileHarvest {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -1107,6 +1112,28 @@ impl WriterHandle {
         self.send(WriteCmd::SetProjectProfileFlags {
             project_id,
             flags,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Persist a project's `[retrieval]` criteria (forwarded from its marker at
+    /// session start). A no-op when they already match; a `None` field clears
+    /// the column back to "inherit the global default".
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn set_project_retrieval_criteria(
+        &self,
+        project_id: ProjectId,
+        criteria: crate::RetrievalCriteria,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::SetProjectRetrievalCriteria {
+            project_id,
+            criteria,
             reply: tx,
         })
         .await?;
@@ -4077,6 +4104,16 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = crate::profile::set_project_profile_flags(&conn, project_id, flags);
                 send_or_warn(reply, result, "set_project_profile_flags");
+            }
+            WriteCmd::SetProjectRetrievalCriteria {
+                project_id,
+                criteria,
+                reply,
+            } => {
+                let result = crate::retrieval_criteria::set_project_retrieval_criteria(
+                    &conn, project_id, criteria,
+                );
+                send_or_warn(reply, result, "set_project_retrieval_criteria");
             }
             WriteCmd::RecordProfileHarvest {
                 workspace_id,

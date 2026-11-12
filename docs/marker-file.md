@@ -50,7 +50,8 @@ A marker whose only content is a `[capture]` section (see
 [Capture exclusions](#capture-exclusions) below) is **transparent** to this
 walk: `workspace`, `project`, `project_strategy`, and the other forwarded
 settings (`drop_subagent_captures`, `[recall] default_global`, `[briefing]`,
-`[profile]`, `[handoff]` and `[recovery]` keys) are resolved from the nearest
+`[profile]`, `[retrieval] default_result_limit`, `[handoff]` and `[recovery]`
+keys) are resolved from the nearest
 ancestor marker that declares at least one of them, skipping past any nearer
 marker that declares nothing but `[capture]`. A subdirectory marker added only
 to exclude some paths from capture therefore no longer resets scope to
@@ -62,7 +63,8 @@ The marker path is shared by the POSIX/PowerShell hook scripts and the
 generated OpenCode / OMP / Pi / OpenClaw TypeScript integrations. In all cases,
 hook capture and handoff lookup send the same `cwd`, `workspace`, `project`,
 `project_strategy`, `drop_subagent`, `default_global`, `briefing`,
-`briefing_budget`, `profile_contribute`, `profile_consume`, `handoff`, and
+`briefing_budget`, `profile_contribute`, `profile_consume`,
+`default_result_limit`, `handoff`, and
 `recovery` query params to the server as applicable;
 handoff lookup also sends `cwd` when no marker exists so the default
 `project = basename(cwd)` route works consistently. Every client also sends
@@ -244,6 +246,14 @@ inbox_notice_on_prompt = "true"
 [profile]
 contribute = false
 consume = false
+
+# Optional. This project's default result count for `memory_query` when a call
+# gives no explicit `limit` (1..=100). Forwarded by every hook client at session
+# start and recorded on the project; removing the key clears it back to the
+# global `[retrieval] default_result_limit`, then the built-in 10. An explicit
+# per-call `limit` always wins. An out-of-range value is ignored.
+[retrieval]
+default_result_limit = 25
 ```
 
 **Naming** for `workspace` and `project`: the server stores both names

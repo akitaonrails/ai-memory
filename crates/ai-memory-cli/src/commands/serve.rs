@@ -1466,6 +1466,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_per_user_slots(config.slots.per_user)
         .with_profile(config.profile.clone())
         .with_answer_context_budget(config.query_answer.max_context_tokens)
+        .with_default_limit(config.retrieval.default_result_limit)
         .with_strip_root_combinators(config.strip_root_combinators)
         .with_gemini_safe_schemas(config.gemini_safe_schemas);
     if let Some(e) = embedder.clone() {

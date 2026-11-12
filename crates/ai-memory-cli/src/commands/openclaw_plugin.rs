@@ -598,6 +598,9 @@ mod tests {
         assert!(plugin.contains("tomlKey(body, \"project_strategy\")"));
         assert!(plugin.contains("tomlKey(body, \"drop_subagent_captures\")"));
         assert!(plugin.contains("url.searchParams.set(\"drop_subagent\", dropSubagent)"));
+        assert!(
+            plugin.contains("url.searchParams.set(\"default_result_limit\", defaultResultLimit)")
+        );
         assert!(plugin.contains("url.searchParams.set(\"profile_contribute\", profileContribute)"));
         assert!(plugin.contains("url.searchParams.set(\"profile_consume\", profileConsume)"));
         assert!(plugin.contains("function tomlFlag"));
