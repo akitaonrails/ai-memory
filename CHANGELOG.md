@@ -207,7 +207,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Returned to the workstream picker after a harness launched by `ai-memory resume` exits, including on Ctrl+C.
 - `/web/search` with no search term lists the ten most recently updated
   pages, from the selected project or from every project the viewer can read.
-  It used to show only an empty prompt.
+  It used to show only an empty prompt. (#2226)
 
 ### Fixed
 
