@@ -17,12 +17,26 @@ version in [`docs/changelog/`](docs/changelog/):
   project's legacy key. The default mailbox now opens through the project id.
   A request that names the clashing project keeps the page and shows a warning
   pointing to `merge-project`, where it used to return a bare 400. (#2224)
+- The root-only `/pending` triage page now sends `Cache-Control: no-store`,
+  like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
+  cached copy could list a proposal an operator had already approved or
+  rejected as still pending, with its no-longer-actionable review id and CLI
+  commands, until the page was force-reloaded. (#2225)
 - `adopt-project-identity` now drops the hook router's cached resolution for
   the project that gave the identity away, so the checkout's hooks reach the
   project that took it. That cache keys entries on the repository identity, and
   the move left the pre-adoption entry in place: until the server restarted or
   the entry aged out, new sessions, prompts and observations kept landing in
   the project the command had just emptied and archived. (#2216)
+- `POST /admin/rename-project` now invalidates the hook router's scope cache
+  for the renamed project, as `rename-workspace` already did for a renamed
+  workspace. A repository whose `.ai-memory.toml` declares `project = "<old
+  name>"` routes by that name, so after a rename its warm cache slot kept
+  sending captures into the renamed project while a freshly started server
+  re-resolved the same marker and created an empty project under the old name
+  — which of the two a capture landed in depended on whether the cache
+  happened to be warm. Other projects' cached slots are left untouched.
+  (#2221)
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the

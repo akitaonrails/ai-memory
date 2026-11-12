@@ -6534,6 +6534,16 @@ async fn handle_rename_project(
         return (status, Json(serde_json::json!({ "error": e.to_string() })));
     }
 
+    // The hook router caches `(workspace_id, project_id)` keyed partly on the
+    // declared `project` name, and a declared name routes by name — never by
+    // repository identity. So a marker that pins `project = "<from>"` keeps
+    // hitting the cached slot after this rename and keeps writing into the
+    // renamed project, while a cold server re-resolves the same marker through
+    // `get_or_create_project` and mints a fresh project under the old name.
+    // Evicting here makes both paths agree, the same way `rename-workspace`
+    // already does for a declared `workspace`.
+    invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
+
     // Step 4: count is_latest pages that now belong to the renamed project.
     // COUNT(*) always produces a row, so no optional() needed. We pass the
     // 16-byte project id as a plain &[u8] slice to avoid importing rusqlite
