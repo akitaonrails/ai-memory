@@ -274,7 +274,8 @@ fn now_ms() -> u64 {
 /// same millisecond without clobbering an earlier event.
 ///
 /// # Errors
-/// Returns an error only when the spool file cannot be written.
+/// Returns an error when the entry exceeds the spool's byte limit or the
+/// spool file cannot be written.
 #[cfg(test)]
 pub fn enqueue(spool: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
     enqueue_with_config(spool, entry, None)
@@ -312,7 +313,12 @@ pub fn enqueue_with_config(
                 bytes.len()
             ))
         );
-        return Ok(());
+        // A caller can advance a transcript cursor on success. The next
+        // hook must still be able to carry the usage from this dropped event.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hook spool entry exceeds its byte limit",
+        ));
     }
     write_private(&tmp, &bytes)?;
     // The capacity lock only serializes concurrent count-then-rename checks
@@ -3440,7 +3446,8 @@ mod tests {
             None,
             false,
         );
-        enqueue(&spool, &entry).unwrap();
+        let error = enqueue(&spool, &entry).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(
             list_entries(&spool).unwrap().0.is_empty(),
             "an over-cap event must be dropped, not written to the spool"

@@ -89,6 +89,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "uuid",
+ "win-custody",
  "windows-registry",
  "zip",
 ]
@@ -4962,6 +4963,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "win-custody"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "399f5ddc7e473b74abf5633e31c84917491aa6cf0418ab310dd936645024dbfc"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

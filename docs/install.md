@@ -410,6 +410,11 @@ settings hook), and without the binary Codex reports a failed hook instead
 of the launcher's silent no-op. Changing it would also change the command
 Codex keys hook trust on.
 
+On Windows, native background upload and backfill workers inherit only their
+own standard streams. They cannot keep the hook executor's output pipes open
+while waiting for the server. Session-start backlog recovery and handoff
+delivery still run synchronously before context is injected.
+
 Codex runs plugin hooks and `~/.codex/hooks.json` hooks side by side, and an
 untrusted settings hook is skipped silently, so the plugin cannot safely drop
 its copy the way the Claude Code plugin does. Keep one: `ai-memory setup`
