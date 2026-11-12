@@ -539,6 +539,14 @@ the Safe AI feature of Norton 360 Deluxe 26.10, on processes started by
 Antigravity talking to an `http://` server URL. Avast and AVG come from the
 same vendor and may behave the same way.
 
+Only the applications the product recognizes are affected. On the machine
+above, Safe AI listed Claude, Claude Code, Google Antigravity IDE and Visual
+Studio Code; DeepSeek Harness and Hermes Agent were not on the list, and
+their bridge and hooks to the same server kept working. The list grows with
+product updates, so an agent that works today can start failing after one.
+One agent failing while another on the same machine works points at this
+cause rather than at the server.
+
 **Symptoms.** `ai-memory mcp-bridge` or `ai-memory hook` fails with an HTTP
 decoding error such as `Invalid chunk size line: missing size digit`. The
 response arrives with `Transfer-Encoding: chunked` in place of
@@ -547,7 +555,7 @@ terminal you opened yourself succeeds. MCP tools and hook capture stop
 together, and only for the agent the product protects.
 
 **How to tell.** Look for the agent in the product's list of protected AI
-tools (in Norton, under Safe AI). If the error goes away after you turn the
+tools (in Norton: Safe AI, the tab listing your AI tools). If the error goes away after you turn the
 feature off and restart the agent, the product was the cause.
 
 **What to do.** Turn the feature off (in Norton, switch off Safe AI), then
