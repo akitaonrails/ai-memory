@@ -230,6 +230,11 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed `restore` replacing live data and installing a backup's malformed
   `config.toml`, which prevented the restored server from starting. (#2209)
 
+- Fixed `retrieval-compare` treating unmeasured cutoffs as zero, which could
+  invent accuracy gains or losses and first-hit ranking moves between runs
+  with different `--ks`. Incompatible or incomplete hit/recall grids are now
+  refused before a comparison is printed. (#2220)
+
 ### Security
 
 - `ai-memory uninstall --only hooks` now withdraws ZCode's capture hooks. ZCode
