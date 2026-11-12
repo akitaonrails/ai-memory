@@ -947,8 +947,15 @@ ai-memory install-hooks --agent gemini-cli --apply
 Gemini CLI's lifecycle event names differ from Claude Code's, so use
 `install-hooks --agent gemini-cli` rather than copying another agent's
 settings. ai-memory maps Gemini's `SessionStart`, `SessionEnd`,
-`BeforeTool`, `AfterTool`, and `PreCompress` events to the shared hook
-capture path; `SessionStart` also fetches pending handoffs.
+`BeforeAgent`, `AfterAgent`, `BeforeTool`, `AfterTool`, and `PreCompress`
+events to the shared hook capture path; `SessionStart` also fetches pending
+handoffs. `BeforeAgent` stores each user prompt and `AfterAgent` marks the
+end of each turn. Gemini hands both the prompt with the contents of every
+`@`-referenced file appended; ai-memory keeps only your words, and never
+stores the model's reply that `AfterAgent` carries. The script hooks of the
+Docker wrapper cannot cut the file contents out, so they skip a prompt that
+carries them. Re-run `install-hooks --agent gemini-cli --apply` to add the
+two events to an existing install.
 
 **Gotchas:**
 - Gemini supports stdio too via `command`/`args`, plus SSE via `url`.

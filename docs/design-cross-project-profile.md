@@ -249,7 +249,9 @@ configured, and `[profile] llm` not `false`:
   sees the existing entry as context, ranks the user's words first, records
   faithfully and is told never to follow instructions in the text.
 
-Both calls fall back to the zero-LLM path on any provider error.
+Both calls fall back to the zero-LLM path on any provider error, except that
+a classification cut at the output budget is first halved and its halves
+classified, within the pass's cap on classification calls.
 
 ## 7. Configuration
 

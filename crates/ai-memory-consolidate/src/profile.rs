@@ -2188,6 +2188,78 @@ pub async fn run_profile_pass(
     Ok(report)
 }
 
+/// Classify `batch`, halving any part whose answer is cut at the output
+/// budget and classifying the halves instead. The fixed batch size cannot
+/// know how verbose a model is or how long the sentences are, so a full batch
+/// can outgrow `max_tokens`; a retry at the same size would truncate again.
+/// Every attempt spends `budget`.
+///
+/// Returns one verdict per sentence, then the calls the LLM answered and the
+/// calls that fell back. A verdict is `None` when no answered call covered the
+/// sentence (budget spent, a non-truncation error, or a single sentence that
+/// still truncates), so the caller uses the zero-LLM detector there.
+async fn classify_splitting(
+    llm: &(dyn LlmProvider + 'static),
+    sanitizer: &ai_memory_core::Sanitizer,
+    project: &ProfileHarvestProject,
+    batch: &[PendingSentence],
+    max_tokens: u32,
+    budget: &mut usize,
+) -> (Vec<Option<Option<DetectedPreference>>>, usize, usize) {
+    let mut out = vec![None; batch.len()];
+    let (mut calls, mut fallbacks) = (0, 0);
+    let mut work: Vec<std::ops::Range<usize>> = Vec::new();
+    work.push(0..batch.len());
+    while let Some(range) = work.pop() {
+        if *budget == 0 {
+            // A batch never tried keeps its old accounting; a split whose
+            // halves the budget cannot cover is a truncated call that fell
+            // back.
+            if range.len() < batch.len() {
+                tracing::warn!(
+                    "profile classification budget ran out while splitting a truncated batch; using the zero-LLM detector"
+                );
+                fallbacks += 1;
+            }
+            break;
+        }
+        *budget -= 1;
+        let part = &batch[range.clone()];
+        match classify_batch(
+            llm,
+            sanitizer,
+            part,
+            classify_subject(project, part),
+            max_tokens,
+        )
+        .await
+        {
+            Ok(classified) => {
+                calls += 1;
+                for (slot, verdict) in out[range].iter_mut().zip(classified) {
+                    *slot = Some(verdict);
+                }
+            }
+            Err(ai_memory_llm::LlmError::TruncatedResponse { .. }) if part.len() > 1 => {
+                let mid = range.start + part.len() / 2;
+                tracing::debug!(
+                    sentences = part.len(),
+                    "profile classification hit the output budget; splitting the batch"
+                );
+                // Popped from the end: the first half goes on last so it runs
+                // first.
+                work.push(mid..range.end);
+                work.push(range.start..mid);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "profile classification failed; using the zero-LLM detector");
+                fallbacks += 1;
+            }
+        }
+    }
+    (out, calls, fallbacks)
+}
+
 /// Harvest one project from its marks. Returns new candidates, LLM calls and
 /// LLM fallbacks.
 #[allow(clippy::too_many_arguments)]
@@ -2258,33 +2330,21 @@ async fn harvest_project(
     }
     if let Some(llm) = llm {
         for batch in pending.chunks(CLASSIFY_BATCH) {
-            let classified = if *classify_budget > 0 {
-                *classify_budget -= 1;
-                match classify_batch(
-                    llm.as_ref(),
-                    wiki.sanitizer(),
-                    batch,
-                    classify_subject(project, batch),
-                    max_tokens,
-                )
-                .await
-                {
-                    Ok(classified) => {
-                        calls += 1;
-                        Some(classified)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "profile classification failed; using the zero-LLM detector");
-                        fallbacks += 1;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            for (idx, sentence) in batch.iter().enumerate() {
-                let found = match &classified {
-                    Some(items) => items.get(idx).cloned().flatten(),
+            let (classified, answered, failed) = classify_splitting(
+                llm.as_ref(),
+                wiki.sanitizer(),
+                project,
+                batch,
+                max_tokens,
+                classify_budget,
+            )
+            .await;
+            calls += answered;
+            fallbacks += failed;
+            for (sentence, verdict) in batch.iter().zip(classified) {
+                let by_llm = verdict.is_some();
+                let found = match verdict {
+                    Some(found) => found,
                     None => classify_sentence(&sentence.sentence),
                 };
                 if let Some(found) = found {
@@ -2294,7 +2354,7 @@ async fn harvest_project(
                         &found,
                         sentence.observed_at,
                         sentence.contributor.clone(),
-                        if classified.is_some() { 0.6 } else { 0.5 },
+                        if by_llm { 0.6 } else { 0.5 },
                     ));
                 }
             }

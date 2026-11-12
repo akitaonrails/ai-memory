@@ -381,9 +381,11 @@ stays in the supersession chain). Pages it did not write, or whose body changed
 since it wrote them, are never rewritten; `profile_entry_ledger` keeps a removed
 entry removed until newer evidence arrives. With an LLM provider and
 `[profile] llm`, classification and the per-entry merge use JSON-schema
-structured calls and fall back to the zero-LLM path on any error. A private
-profile converges only its operator's own candidates from projects they can
-read; a shared profile on a multi-user server skips restricted projects.
+structured calls and fall back to the zero-LLM path on any error (a
+classification cut at the output budget is first halved and retried within
+the pass's call cap). A private profile converges only its operator's own
+candidates from projects they can read; a shared profile on a multi-user server
+skips restricted projects.
 `ai-memory profile apply` reads `GET /admin/profile/apply` (the digest's
 selection, capped at `apply_max_lines`, empty for a `consume = false` project)
 and writes it between `<!-- ai-memory:profile:start/end -->` delimiters in the
@@ -1664,7 +1666,8 @@ AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json
 AI_MEMORY_LLM_COMPAT_DISABLE_THINKING  openai-compat only, false by default; true sends
                            chat_template_kwargs:{"enable_thinking":false} on every
                            request (vLLM / SGLang thinking models). A structured
-                           response that stops with finish_reason=length, or a 2xx
+                           response that stops with finish_reason=length (or a
+                           relayed max_tokens), or a 2xx
                            with empty message.content, is a terminal error
                            (classes truncated-response / empty-content)
 AI_MEMORY_LLM_COMPAT_STREAM optional false to request non-streaming openai-compat JSON;

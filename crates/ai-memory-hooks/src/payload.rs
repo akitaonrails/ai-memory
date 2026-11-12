@@ -311,19 +311,30 @@ impl std::fmt::Debug for HookEnvelope {
 /// on subagent events. `agent_type` alone is not a subagent marker: Claude
 /// Code also sets it on top-level sessions launched with `--agent`. The set
 /// is a union so one check covers every harness that signals subagent-ness;
-/// a harness that does not signal it simply never matches.
+/// a harness that does not signal it simply never matches. Cline is the
+/// exception ([`body_is_subagent`]).
 const SUBAGENT_MARKER_KEYS: &[&str] = &["subagentType", "agent_id"];
 
-/// True when the raw hook payload carries a non-empty subagent marker — i.e.
-/// the event originates from a spawned subagent session. The ingest router
-/// consults this to optionally drop subagent captures (the
+/// True when `agent`'s raw hook payload carries a non-empty subagent marker —
+/// i.e. the event originates from a spawned subagent session. The ingest
+/// router consults this to optionally drop subagent captures (the
 /// `drop_subagent_captures` setting). Only top-level string keys are inspected.
-pub(crate) fn body_is_subagent(raw: &serde_json::Value) -> bool {
-    SUBAGENT_MARKER_KEYS.iter().any(|key| {
-        raw.get(*key)
+///
+/// Cline stamps every event with the `agent_id` of the agent that fired it,
+/// the root agent's included, beside a `parent_agent_id` that is null for the
+/// root (<https://github.com/cline/cline/blob/071e1b25b48f9ef5dff7fc32085e6a16f02bf02e/sdk/packages/core/src/hooks/subprocess.ts#L261-L290>,
+/// <https://github.com/cline/cline/blob/071e1b25b48f9ef5dff7fc32085e6a16f02bf02e/sdk/packages/shared/src/hooks/events.ts#L188-L189>),
+/// so only a parent marks a Cline subagent.
+pub(crate) fn body_is_subagent(agent: AgentKind, raw: &serde_json::Value) -> bool {
+    let marked = |key: &str| {
+        raw.get(key)
             .and_then(serde_json::Value::as_str)
             .is_some_and(|value| !value.trim().is_empty())
-    })
+    };
+    if agent == AgentKind::Cline {
+        return marked("parent_agent_id");
+    }
+    SUBAGENT_MARKER_KEYS.iter().copied().any(marked)
 }
 
 /// Truthy interpretation of a query-string flag (`1`/`true`/`yes`/`on`,
@@ -500,7 +511,7 @@ impl HookEvent {
                 Self::SessionStart
             }
             "user-prompt" | "user_prompt" | "user-prompt-submit" | "user_prompt_submit"
-            | "UserPromptSubmit" | "beforeSubmitPrompt" => Self::UserPrompt,
+            | "UserPromptSubmit" | "beforeSubmitPrompt" | "BeforeAgent" => Self::UserPrompt,
             "pre-tool-use" | "pre_tool_use" | "PreToolUse" | "preToolUse" | "BeforeTool" => {
                 Self::PreToolUse
             }
@@ -511,7 +522,7 @@ impl HookEvent {
             }
             "post-compaction" | "post_compaction" | "PostCompaction" => Self::PostCompaction,
             "notification" | "Notification" => Self::Notification,
-            "stop" | "Stop" => Self::Stop,
+            "stop" | "Stop" | "AfterAgent" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
             "subagent-start" | "subagent_start" | "SubagentStart" | "subagentStart" => {
                 Self::SubagentStart
@@ -661,10 +672,13 @@ impl HookEnvelope {
     /// from common shapes used by Claude Code, Codex, and OpenCode hook
     /// payloads.
     #[must_use]
-    pub fn from_query_and_body(query: HookQuery, raw: serde_json::Value) -> Self {
+    pub fn from_query_and_body(query: HookQuery, mut raw: serde_json::Value) -> Self {
         let event = HookEvent::parse(&query.event);
         let agent = agent_from_payload(&raw)
             .unwrap_or_else(|| query.agent.as_deref().map_or(AgentKind::Other, parse_agent));
+        // Gemini CLI appends `@`-referenced file contents to the user's words;
+        // nothing below may read them as the prompt.
+        crate::gemini::strip_gemini_prompt_expansion(agent, &mut raw);
         let context = hook_payload_context(&raw);
         let session_id = context
             .session_id
@@ -1882,17 +1896,43 @@ mod tests {
         assert_eq!(env.occurred_at_micros(), None);
     }
 
+    /// Gemini CLI's `BeforeAgent` `prompt` carries every `@`-referenced file
+    /// after the user's words. The envelope keeps only the words, and the
+    /// file contents are gone from the raw payload too.
+    #[test]
+    fn gemini_before_agent_prompt_keeps_only_the_users_words() {
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt-submit".into(),
+                agent: Some("gemini-cli".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": "g1",
+                "hook_event_name": "BeforeAgent",
+                "prompt": "explain @src/main.rs\n--- Content from referenced files ---\n\
+                           Content from @src/main.rs:\nSECRET_FILE_CONTENT\n--- End of content ---",
+            }),
+        );
+        assert_eq!(env.title_hint.as_deref(), Some("explain @src/main.rs"));
+        assert_eq!(env.body_excerpt.as_deref(), Some("explain @src/main.rs"));
+        assert!(!env.raw.to_string().contains("SECRET_FILE_CONTENT"));
+    }
+
     #[test]
     fn body_is_subagent_detects_harness_markers() {
         // grok tags subagent tool-use events with `subagentType`.
         assert!(body_is_subagent(
+            AgentKind::Grok,
             &serde_json::json!({ "sessionId": "s", "subagentType": "general-purpose" })
         ));
         // Claude Code identifies spawned agents with `agent_id`.
         assert!(body_is_subagent(
+            AgentKind::ClaudeCode,
             &serde_json::json!({ "session_id": "s", "agent_type": "workflow-subagent", "agent_id": "agent-abc123" })
         ));
         assert!(body_is_subagent(
+            AgentKind::ClaudeCode,
             &serde_json::json!({ "agent_id": "agent-abc123" })
         ));
     }
@@ -1904,7 +1944,10 @@ mod tests {
             "session_id": "main-session",
             "agent_type": "regulus:regulus",
         });
-        assert!(!body_is_subagent(&raw), "agent_id absent");
+        assert!(
+            !body_is_subagent(AgentKind::ClaudeCode, &raw),
+            "agent_id absent"
+        );
         for agent_id in [
             serde_json::Value::Null,
             serde_json::json!(""),
@@ -1913,7 +1956,7 @@ mod tests {
             serde_json::json!(false),
         ] {
             raw["agent_id"] = agent_id;
-            assert!(!body_is_subagent(&raw), "{raw}");
+            assert!(!body_is_subagent(AgentKind::ClaudeCode, &raw), "{raw}");
         }
     }
 
@@ -1921,19 +1964,70 @@ mod tests {
     fn body_is_subagent_false_for_top_level_and_empty_markers() {
         // A normal top-level event carries no marker.
         assert!(!body_is_subagent(
+            AgentKind::ClaudeCode,
             &serde_json::json!({ "session_id": "s", "tool_name": "Write" })
         ));
         // An empty / blank or non-string marker does not count as a subagent.
         assert!(!body_is_subagent(
+            AgentKind::Grok,
             &serde_json::json!({ "subagentType": "" })
         ));
         assert!(!body_is_subagent(
+            AgentKind::Grok,
             &serde_json::json!({ "subagentType": "   " })
         ));
         assert!(!body_is_subagent(
+            AgentKind::ClaudeCode,
             &serde_json::json!({ "agent_type": null })
         ));
-        assert!(!body_is_subagent(&serde_json::json!({})));
+        assert!(!body_is_subagent(
+            AgentKind::ClaudeCode,
+            &serde_json::json!({})
+        ));
+    }
+
+    /// Cline puts `agent_id` on every event, the root agent's included; only a
+    /// non-empty `parent_agent_id` marks a subagent.
+    #[test]
+    fn body_is_subagent_reads_a_cline_subagent_from_its_parent() {
+        let root = serde_json::json!({
+            "taskId": "task-1",
+            "agent_id": "agent_root_1",
+            "parent_agent_id": null,
+        });
+        assert!(!body_is_subagent(AgentKind::Cline, &root), "the root agent");
+        let subagent = serde_json::json!({
+            "taskId": "task-1",
+            "agent_id": "agent_sub_1",
+            "parent_agent_id": "agent_root_1",
+        });
+        assert!(body_is_subagent(AgentKind::Cline, &subagent), "a subagent");
+        for parent in [
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(7),
+        ] {
+            let mut raw = subagent.clone();
+            raw["parent_agent_id"] = parent;
+            assert!(!body_is_subagent(AgentKind::Cline, &raw), "{raw}");
+        }
+        // Another harness's `agent_id` still marks a subagent.
+        assert!(body_is_subagent(AgentKind::ClaudeCode, &root));
+    }
+
+    /// Gemini CLI names its events in its own vocabulary
+    /// (<https://github.com/google-gemini/gemini-cli/blob/5a5c7180ff3f0a02511f54b54db7f228d4982a30/docs/hooks/reference.md>).
+    #[test]
+    fn parses_gemini_cli_event_names() {
+        for (name, event) in [
+            ("BeforeAgent", HookEvent::UserPrompt),
+            ("AfterAgent", HookEvent::Stop),
+            ("BeforeTool", HookEvent::PreToolUse),
+            ("AfterTool", HookEvent::PostToolUse),
+            ("PreCompress", HookEvent::PreCompact),
+        ] {
+            assert_eq!(HookEvent::parse(name), event, "{name}");
+        }
     }
 
     #[test]

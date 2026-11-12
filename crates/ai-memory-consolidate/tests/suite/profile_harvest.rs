@@ -1287,10 +1287,15 @@ struct FakeProfileLlm {
     /// Report `changed: false` from the merge: the evidence only corroborates.
     merge_unchanged: bool,
     fail: bool,
+    /// Answer a classification of at least this many sentences as cut at
+    /// the output budget.
+    truncate_from: Option<usize>,
     seen: Arc<Mutex<Vec<String>>>,
     budgets: Arc<Mutex<Vec<(String, u32)>>>,
     /// `("classify" | "merge", operation id)` for every structured call.
     operations: Arc<Mutex<Vec<(String, LlmOperationId)>>>,
+    /// Sentence count of every classification call, in order.
+    classify_sizes: Arc<Mutex<Vec<usize>>>,
 }
 
 #[async_trait::async_trait]
@@ -1333,6 +1338,13 @@ impl LlmProvider for FakeProfileLlm {
         if system.contains("You classify sentences") {
             let payload = request.messages[0].content.clone();
             let count = payload.matches("\"index\"").count();
+            self.classify_sizes.lock().unwrap().push(count);
+            if self.truncate_from.is_some_and(|from| count >= from) {
+                return Err(LlmError::TruncatedResponse {
+                    model: "fake-model".into(),
+                    completion_tokens: None,
+                });
+            }
             let items: Vec<serde_json::Value> = (0..count)
                 .map(|index| {
                     serde_json::json!({
@@ -1591,6 +1603,95 @@ async fn a_provider_failure_falls_back_to_the_zero_llm_path() {
             .1
             .contains("Always use pnpm for installs in every project.")
     );
+}
+
+/// A classification cut at the output budget is halved and the halves are
+/// classified, so every sentence still gets an LLM verdict instead of falling
+/// back to the zero-LLM detector.
+#[tokio::test]
+async fn a_truncated_classification_is_split_and_retried() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let body = (0..6)
+        .map(|i| format!("Always run check number {i} before pushing."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    prompt(&fx, alpha, &body, 1).await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(3),
+        merge_statement: "Run the checks before pushing.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let budgets = llm.budgets.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    assert_eq!(report.llm_fallbacks, 0, "{report:?}");
+    // Of the classification calls, only the four that answered count (1 + 2
+    // + 1 + 2 sentences); `llm_calls` also counts the merges.
+    let merges = budgets
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(operation, _)| operation == "merge")
+        .count();
+    assert_eq!(report.llm_calls, 4 + merges, "{report:?}");
+    let sizes = sizes.lock().unwrap();
+    // 6 truncates, then 3 and 3, which split into 1 + 2 each.
+    assert_eq!(*sizes, vec![6, 3, 1, 2, 3, 1, 2], "{sizes:?}");
+}
+
+/// The pass's call cap still holds while splitting: halves it can no longer
+/// pay for fall back to the zero-LLM detector, counted once as a fallback.
+#[tokio::test]
+async fn splitting_stops_at_the_classification_call_cap() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let body = (0..6)
+        .map(|i| format!("Always run check number {i} before pushing."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    prompt(&fx, alpha, &body, 1).await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(2),
+        merge_statement: "Run the checks before pushing.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    // 6, 3, 1, 2, 1, 1, 3, 1: eight calls spend the cap before the last
+    // sentences of the second half get theirs.
+    assert_eq!(
+        *sizes.lock().unwrap(),
+        vec![6, 3, 1, 2, 1, 1, 3, 1],
+        "{report:?}"
+    );
+    assert_eq!(report.llm_fallbacks, 1, "{report:?}");
+}
+
+/// A single sentence whose classification still truncates cannot be split:
+/// it falls back to the zero-LLM detector.
+#[tokio::test]
+async fn a_single_truncated_sentence_falls_back_to_the_zero_llm_path() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    prompt(
+        &fx,
+        alpha,
+        "Always use pnpm for installs in every project.",
+        1,
+    )
+    .await;
+    let llm = FakeProfileLlm {
+        truncate_from: Some(1),
+        merge_statement: "Use pnpm for installs.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let sizes = llm.classify_sizes.clone();
+    let report = pass_with(&fx, &single_user(), Arc::new(llm)).await;
+    assert_eq!(report.llm_fallbacks, 1, "{report:?}");
+    assert_eq!(*sizes.lock().unwrap(), vec![1]);
+    // The zero-LLM detector still turns the sentence into an entry.
+    assert_eq!(profile_pages(&fx, "_global").len(), 1, "{report:?}");
 }
 
 /// The core scenario on the LLM path: a habit said loosely in one project is

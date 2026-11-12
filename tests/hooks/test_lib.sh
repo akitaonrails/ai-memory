@@ -1352,6 +1352,79 @@ unset AI_MEMORY_DATA_DIR GROK_LOG
 PATH=${PATH#"$TMP/bin:"}
 export PATH
 
+# --- gemini-cli bundle: @ files and the reply never leave the script ---
+# Gemini CLI appends every @-referenced file to the prompt BeforeAgent and
+# AfterAgent carry, and AfterAgent adds the model's reply as prompt_response.
+# The fallback cannot cut either out of the JSON, so it drops such an event
+# before posting or spooling it. The shipped scripts run through a PATH curl
+# shim that logs every request and answers 503, so an event the script does
+# not drop is both attempted and spooled.
+mkdir -p "$TMP/gemini-bin"
+cat >"$TMP/gemini-bin/curl" <<'EOF'
+#!/bin/sh
+_gm=GET
+_gu=""
+_gdata=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -X) shift; [ $# -gt 0 ] || break; _gm=$1 ;;
+        --data-binary) shift; [ $# -gt 0 ] || break; _gdata=$1 ;;
+        http://* | https://*) _gu=$1 ;;
+    esac
+    shift
+done
+[ "$_gdata" = "@-" ] && cat >/dev/null
+printf '%s %s\n' "$_gm" "$_gu" >>"$GEMINI_LOG"
+printf '503'
+EOF
+chmod +x "$TMP/gemini-bin/curl"
+PATH="$TMP/gemini-bin:$PATH"
+export PATH
+gemini_case() {
+    GEMINI_CASE_DIR="$TMP/gemini-$1"
+    mkdir -p "$GEMINI_CASE_DIR/data"
+    AI_MEMORY_DATA_DIR="$GEMINI_CASE_DIR/data"
+    export AI_MEMORY_DATA_DIR
+    GEMINI_LOG="$GEMINI_CASE_DIR/curl.log"
+    : >"$GEMINI_LOG"
+    export GEMINI_LOG
+}
+gemini_posts() { grep -c "^POST .*event=$1&" "$GEMINI_LOG"; }
+gemini_spooled() { find "$AI_MEMORY_DATA_DIR" -name '*.json' -path '*hook-spool*' | wc -l | tr -d ' '; }
+gemini_run() {
+    printf '%s' "$2" | sh "$(dirname "$0")/../../hooks/gemini-cli/$1.sh" 2>/dev/null
+}
+
+gemini_case prompt
+gemini_run user-prompt-submit "{\"session_id\":\"g1\",\"cwd\":\"$GEMINI_CASE_DIR\",\"hook_event_name\":\"BeforeAgent\",\"prompt\":\"Refactor the auth middleware\"}"
+assert_eq "gemini: a plain prompt is posted" "1" "$(gemini_posts user-prompt)"
+
+gemini_case at-files
+gemini_run user-prompt-submit "{\"session_id\":\"g1\",\"cwd\":\"$GEMINI_CASE_DIR\",\"hook_event_name\":\"BeforeAgent\",\"prompt\":\"explain @.env\\n--- Content from referenced files ---\\nAPI_KEY=secret\\n--- End of content ---\"}"
+assert_eq "gemini: a prompt carrying @ files is not posted" "0" "$(gemini_posts user-prompt)"
+assert_eq "gemini: a prompt carrying @ files is not spooled" "0" "$(gemini_spooled)"
+
+gemini_case stop
+gemini_run stop "{\"session_id\":\"g1\",\"cwd\":\"$GEMINI_CASE_DIR\",\"hook_event_name\":\"AfterAgent\",\"prompt\":\"x\",\"stop_hook_active\":false}"
+assert_eq "gemini: a Stop without the reply is posted" "1" "$(gemini_posts stop)"
+
+gemini_case reply
+gemini_run stop "{\"session_id\":\"g1\",\"cwd\":\"$GEMINI_CASE_DIR\",\"hook_event_name\":\"AfterAgent\",\"prompt\":\"x\",\"prompt_response\":\"the reply\",\"stop_hook_active\":false}"
+assert_eq "gemini: a Stop carrying the reply is not posted" "0" "$(gemini_posts stop)"
+assert_eq "gemini: a Stop carrying the reply is not spooled" "0" "$(gemini_spooled)"
+
+# The PowerShell lib drops the same two events (static, no pwsh needed).
+GEMINI_PS_STATIC=$(grep -Fq '$Agent -eq "gemini-cli" -and $Event -eq "user-prompt" -and $Payload' "$PS_LIB" \
+    && grep -Fq "Contains('--- Content from referenced files ---')" "$PS_LIB" \
+    && grep -Fq '$Agent -eq "gemini-cli" -and $Event -eq "stop" -and $Payload' "$PS_LIB" \
+    && grep -Fq "Contains('\"prompt_response\"')" "$PS_LIB" \
+    && printf ok || printf bad)
+assert_eq "gemini: the powershell bundle drops the same events (static)" "ok" "$GEMINI_PS_STATIC"
+
+unset AI_MEMORY_DATA_DIR GEMINI_LOG
+PATH=${PATH#"$TMP/gemini-bin:"}
+export PATH
+
 # --- session-start bundles that must never fetch a handoff (#998) ------
 # grok, kimi-code and pool each document in their own session-start.sh why
 # SessionStart must not call /handoff at all: Grok and Kimi discard its

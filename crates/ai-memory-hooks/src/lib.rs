@@ -27,6 +27,7 @@ mod brief_tiers;
 pub mod capture_policy;
 pub mod drop_list;
 mod file_field;
+mod gemini;
 mod grants;
 pub mod hermes;
 pub mod idle_end;
@@ -65,6 +66,7 @@ pub use capture_policy::{
 };
 pub use drop_list::IngestDropList;
 pub use file_field::{FILE_FIELD_KEY, FileSkip, file_field};
+pub use gemini::strip_gemini_prompt_expansion;
 pub use hermes::{hermes_is_delegated_child, hermes_is_first_turn, shape_hermes_lifecycle_body};
 pub use idle_end::{
     IDLE_END_BATCH, IDLE_END_INTERVAL_SECS, IdleEndTickInput, IdleEndTickOutcome, run_idle_end_tick,
