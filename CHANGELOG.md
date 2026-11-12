@@ -19,6 +19,9 @@ version in [`docs/changelog/`](docs/changelog/):
   the move left the pre-adoption entry in place: until the server restarted or
   the entry aged out, new sessions, prompts and observations kept landing in
   the project the command had just emptied and archived. (#2216)
+- Fixed Gemini structured replies stopped at `MAX_TOKENS` being accepted or
+  reported as unrelated JSON errors. They now report truncation before parsing,
+  allowing profile classification to split the batch and recover its verdicts.
 - `ai-memory run claude --resume <name>` now links the session Claude resumed
   and imports its transcript. The session name was recorded as the native
   session id, so the transcript was never found: the run exited 0 with the
