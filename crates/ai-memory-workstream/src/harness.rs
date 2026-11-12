@@ -442,11 +442,18 @@ pub fn build_launch_plan_with_env_lookup(
         ai_memory_core::NativeSessionIdentity::parse(id, &ai_memory_core::Sanitizer::builtin())?;
     }
     // Command Code and Copilot also resolve a session name or an id prefix;
-    // only an exact UUID identifies the session before launch.
-    if matches!(
-        harness,
-        ManagedHarness::CommandCode | ManagedHarness::Copilot
-    ) {
+    // only an exact UUID identifies the session before launch. Claude's
+    // `--resume` also takes a session name or a transcript path, while its
+    // `--session-id` names the id itself and stays subject to the identity
+    // check in `run`.
+    let claude_resume =
+        harness == ManagedHarness::Claude && flag_value(&args, &["--resume", "-r"]).is_some();
+    if claude_resume
+        || matches!(
+            harness,
+            ManagedHarness::CommandCode | ManagedHarness::Copilot
+        )
+    {
         expected = expected.filter(|value| Uuid::parse_str(value).is_ok());
     }
     let mode = launch_mode(harness, &args);
@@ -2061,6 +2068,62 @@ mod tests {
         .unwrap();
         assert_eq!(strings(&plan.args), ["--session=chosen", "--auto"]);
         assert_eq!(plan.expected_session_id.as_deref(), Some("chosen"));
+    }
+
+    /// Claude Code resolves `--resume` by session id, session name, or the
+    /// absolute path of a transcript:
+    /// <https://code.claude.com/docs/en/sessions#resume-a-session>.
+    #[test]
+    fn claude_explicit_resume_identifies_a_session_only_by_exact_uuid() {
+        let exact = "0cb916db-26aa-40f2-86b5-1ba81b225fd2";
+        for (native, expected) in [
+            (
+                vec![OsString::from("--resume"), OsString::from(exact)],
+                Some(exact),
+            ),
+            (vec![OsString::from(format!("-r={exact}"))], Some(exact)),
+            (
+                vec![OsString::from("--session-id"), OsString::from(exact)],
+                Some(exact),
+            ),
+            // A name or a transcript path resolves natively; neither is the
+            // id the session reports, so nothing is known before launch.
+            (
+                vec![OsString::from("--resume"), OsString::from("my-feature")],
+                None,
+            ),
+            (
+                vec![
+                    OsString::from("--resume"),
+                    OsString::from(format!("/tmp/sessions/{exact}.jsonl")),
+                ],
+                None,
+            ),
+            // `--session-id` names the id itself. A malformed one is kept so
+            // the run refuses it instead of launching with no identity.
+            (
+                vec![OsString::from("--session-id"), OsString::from("chosen")],
+                Some("chosen"),
+            ),
+            (vec![OsString::from("--continue")], None),
+        ] {
+            let plan =
+                build_launch_plan(ManagedHarness::Claude, None, native.clone(), Some("linked"))
+                    .unwrap();
+            assert_eq!(plan.args, native, "{native:?} must stay byte-identical");
+            assert_eq!(plan.expected_session_id.as_deref(), expected, "{native:?}");
+        }
+        // The privacy check on the original bytes still runs before the UUID
+        // filter, so a selector that looks like a secret never launches.
+        let bad = "sk-abcdefghijklmnopqrstuvwx";
+        let refused = build_launch_plan(
+            ManagedHarness::Claude,
+            None,
+            vec![OsString::from("--resume"), OsString::from(bad)],
+            None,
+        );
+        assert!(refused.is_err(), "a dirty selector must be refused");
+        assert!(!format!("{:#}", refused.unwrap_err()).contains(bad));
     }
 
     #[test]
