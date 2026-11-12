@@ -783,6 +783,63 @@ async fn search_body_with_pages(n: usize) -> String {
     search_body_with_pages_at(n, "/search?q=capnoticeterm").await
 }
 
+/// With no search term the page lists the most recently updated pages instead
+/// of an empty prompt: the project's own when one is selected, every readable
+/// project's otherwise. A project with no pages keeps the plain prompt.
+#[tokio::test]
+async fn web_search_without_a_term_lists_recent_pages() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let with_pages = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let other = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .get_or_create_project(ws, "empty", None)
+        .await
+        .unwrap();
+    for (project, path, title) in [
+        (with_pages, "a.md", "Scratch Recent Page"),
+        (other, "b.md", "Other Recent Page"),
+    ] {
+        store
+            .writer
+            .upsert_page(new_page(ws, project, path, title, "body"))
+            .await
+            .unwrap();
+    }
+    let web = router(store.reader.clone(), wiki.clone());
+
+    let (status, all) = get_text(&web, "/search", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(all.contains("Scratch Recent Page"), "{all}");
+    assert!(all.contains("Other Recent Page"), "{all}");
+    assert!(all.contains("most recently updated pages"), "{all}");
+
+    let (_, scoped) = get_text(&web, "/search?scope=default/scratch", None).await;
+    assert!(scoped.contains("Scratch Recent Page"), "{scoped}");
+    assert!(
+        !scoped.contains("Other Recent Page"),
+        "a project search lists only its own pages: {scoped}"
+    );
+
+    let (status, empty) = get_text(&web, "/search?scope=default/empty", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(empty.contains("Enter a search term above."), "{empty}");
+    assert!(!empty.contains("most recently updated pages"), "{empty}");
+}
+
 async fn search_body_with_pages_at(n: usize, uri: &str) -> String {
     let (_tmp, store, wiki) = setup().await;
     let ws = store

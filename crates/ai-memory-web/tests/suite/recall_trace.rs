@@ -423,6 +423,36 @@ async fn search_scope_selector_lists_only_readable_projects() {
     assert!(body.contains(r#"<option value="default/beta">"#), "{body}");
 }
 
+/// The recent-pages list a term-less search shows is as scoped as a search: a
+/// restricted project's pages never reach a viewer without a grant.
+#[tokio::test]
+async fn search_without_a_term_lists_only_readable_projects_pages() {
+    let f = fixture(true).await;
+    let alice = human(&f.store, "alice").await;
+    let bob = human(&f.store, "bob").await;
+    f.store
+        .writer
+        .grant_memory(alice, f.alpha, GrantLevel::Read, None)
+        .await
+        .unwrap();
+    let app = web(&f, Recall::default());
+
+    let (status, body) = get(&app, "/web/search", Some(bob)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for hidden in ["notes/rotation.md", "notes/beta-rotation.md"] {
+        assert!(!body.contains(hidden), "bob sees {hidden}: {body}");
+    }
+
+    // Controls: the granted reader sees alpha's pages only, an unrestricted
+    // viewer both.
+    let (_, body) = get(&app, "/web/search", Some(alice)).await;
+    assert!(body.contains("notes/rotation.md"), "{body}");
+    assert!(!body.contains("notes/beta-rotation.md"), "{body}");
+    let (_, body) = get(&app, "/web/search", None).await;
+    assert!(body.contains("notes/rotation.md"), "{body}");
+    assert!(body.contains("notes/beta-rotation.md"), "{body}");
+}
+
 /// Web and `/api/v1` project search apply `memory_query`'s owner rule to
 /// observation text: another operator's owned session still lifts its shared
 /// session page, but the hit shows the page's own snippet and the trace no
