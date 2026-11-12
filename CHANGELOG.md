@@ -37,6 +37,8 @@ version in [`docs/changelog/`](docs/changelog/):
   compare equal. (#2186)
 - Fixed page deletion moving a directory out of the wiki. Child pages stay
   accessible even when the directory replaced an indexed page. (#2190)
+- Kept usage calls from an oversized native tool result available for the next
+  hook by preserving the transcript cursor on a spool size refusal. (#2179)
 - Restored TypeScript SDK page reads and updates on supported servers that
   predate the section metadata added in 3.3.0 (#2136).
 - The TypeScript SDK's `pages.update` loads the complete body before applying
