@@ -1354,6 +1354,8 @@ Order of operations:
    configured pepper must match the one the keys were hashed with, or the
    restore stops here too. This also applies when the archive has no
    `config.toml`, even with `--with-config`.
+   If the archived config will be installed, its TOML syntax must also be
+   valid before the swap.
 4. Swap: rename the live `wiki/` and `db/` aside and move the staged copies
    into place. The archive's `config.toml` replaces the live config only with
    `--with-config` or when the data dir has none. Otherwise the live config
@@ -1385,6 +1387,9 @@ Failure modes:
 - **Missing, empty or uninitialized database snapshot** → exits before the
   swap. A restore requires the archive's `db/memory.sqlite` and its applied
   migration history; it never initializes a new store to fill in missing data.
+- **Invalid TOML in a config that would be installed** → exits before the
+  swap. When a live config exists, restore without `--with-config` to keep it
+  and save the archived config beside it for review.
 - **Migration history has a gap** → an earlier migration is unrecorded
   although a later one was applied. The staged store is refused, just as at
   normal startup. Keep the backup and report the history for review;

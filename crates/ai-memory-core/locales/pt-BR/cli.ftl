@@ -163,6 +163,8 @@ cli-reset-dry-run-pass-confirm-to-wipe = (simulação; informe --confirm para ap
 cli-restore-source-tarball-not-found = arquivo de origem { $value0 } não encontrado
 cli-restore-restored = restaurado { $value0 } -> { $value1 }
 cli-restore-restored-the-backup-s-config-toml = config.toml do backup restaurado
+cli-restore-reading-backup-config = lendo o config.toml do backup
+cli-restore-backup-config-invalid-toml = o config.toml do backup contém TOML inválido; os dados atuais foram preservados
 cli-restore-kept-the-live-config-toml-the-backup-s-copy-is-at-a-config-can-run-commands = config.toml atual mantido; a cópia do backup está em { $value0 }. Uma configuração pode executar comandos e redirecionar dados: revise antes de adotá-la ou execute novamente com --with-config para restaurá-la no local.
 cli-restore-page-path-was-passed-empty-specify-the-wiki-page-path-to-restore = --path foi informado vazio; especifique o caminho da página da wiki a restaurar
 cli-restore-page-restored-under-from-page-id = { $value0 } restaurada em { $value1 }/{ $value2 } a partir de { $value3 } (page_id={ $value4 })
