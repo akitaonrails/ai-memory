@@ -19,7 +19,7 @@ version in [`docs/changelog/`](docs/changelog/):
   (U+2709) to the platform, expecting Apple Color Emoji, but CoreText
   resolves it to Menlo, whose glyph sits small and low. The templates now
   draw it as an inline SVG that inherits the text colour, and the three
-  translated button labels no longer carry the glyph.
+  translated button labels no longer carry the glyph. (#2230)
 
 - The root-only `/pending` triage page now sends `Cache-Control: no-store`,
   like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
