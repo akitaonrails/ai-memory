@@ -937,7 +937,11 @@ An explicit native selector such as Claude's `--resume`, OpenCode's `--session`,
 Codex's `resume`, Antigravity's `--conversation` / `--continue`, or Copilot's
 `--resume` / `--continue` / `--session-id` / `--connect` wins.
 ai-memory links the selected native session and resets an unrelated adapter
-cursor rather than assuming it belongs to the old session.
+cursor rather than assuming it belongs to the old session. Claude's `--resume`
+also takes a session name or the absolute path of a transcript; neither is the
+session id, so ai-memory links the id the session reports at start. A
+transcript resumed by path from outside `~/.claude/projects` is linked but not
+imported, because the adapter reads only that directory.
 
 When the linked Claude session is a Claude Code background session that is
 still running in the daemon, Claude refuses `--resume <id>` when another flag

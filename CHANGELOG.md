@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory run claude --resume <name>` now links the session Claude resumed
+  and imports its transcript. The session name was recorded as the native
+  session id, so the transcript was never found: the run exited 0 with the
+  conversation missing from the workstream ledger, the server refused that
+  session's hook events, and the next run in the workstream started a fresh
+  session. A transcript path passed to `--resume` was recorded the same way;
+  its session id is now linked correctly, though a transcript outside
+  `~/.claude/projects` is still not imported. A `--resume <uuid>` is
+  unchanged. (#2200)
 - A managed session start that cannot be bound to a single eligible run — two
   live managed runs in the same checkout with a stale shared-daemon run id
   matching neither — no longer falls through to the legacy project-wide handoff
