@@ -22,6 +22,13 @@ version in [`docs/changelog/`](docs/changelog/):
   a bridge entry's `--data-dir`. Hermes rewrote it into `C:\?\C:\...` and the
   bridge failed to start; the entry now carries the plain drive path, as
   `setup` and the generated hooks do. (#2203)
+- The `/health` page no longer reports a database it could not measure as an
+  empty one. When the storage pragma reads failed, the database row rendered
+  `0 bytes, 0 reclaimable` — indistinguishable from a real measurement of an
+  empty store — and the reclaim advice was suppressed as if there were
+  nothing to compact. The figures now read `unknown` and a check reports that
+  they could not be read. A failed read still never takes the page down.
+  (#2215)
 - The root-only `/pending` triage page now sends `Cache-Control: no-store`,
   like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
   cached copy could list a proposal an operator had already approved or
