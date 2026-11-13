@@ -198,7 +198,11 @@ async fn opencode_budget_stop_keeps_headers_and_profile_error_accounting() {
     let wrapped = health.wrap_llm_provider(Arc::new(provider), "opencode", MODEL, None);
     let operation_id = LlmOperationId::for_workload(LlmWorkload::Profile);
     let error = wrapped
-        .complete_structured_raw_with_operation_id(request("Classify"), schema(), operation_id)
+        .complete_structured_raw_with_operation_id(
+            request("Classify"),
+            schema(),
+            operation_id.clone(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(error, LlmError::TruncatedResponse { .. }));
