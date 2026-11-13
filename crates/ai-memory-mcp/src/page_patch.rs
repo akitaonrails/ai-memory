@@ -68,6 +68,8 @@ pub(crate) enum PatchError {
     InvalidNewHeading,
     #[error("heading already exists: {0}")]
     HeadingExists(String),
+    #[error("replace_section content must not repeat the section heading: {0}")]
+    SectionContentRepeatsHeading(String),
     #[error("section precondition failed: {0}")]
     SectionPreconditionFailed(String),
     #[error("edits overlap")]
@@ -209,9 +211,18 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                         section.anchor.clone(),
                     ));
                 }
+                // The content replaces the body under an existing heading; a
+                // copy of that heading inside it would reparse as a second
+                // section with the same anchor, which no later edit can target
+                // unambiguously. Refuse instead of writing the duplicate.
+                if content_repeats_heading(content, &section.normalized) {
+                    return Err(PatchError::SectionContentRepeatsHeading(
+                        section.anchor.clone(),
+                    ));
+                }
                 Change {
                     range: section.content.clone(),
-                    replacement: section_content(content),
+                    replacement: section_content(&body[section.content.clone()], content),
                     placement: Placement::Section,
                     heading: Some(section.whole.start),
                 }
@@ -451,13 +462,40 @@ fn blank_line_before(preceding: &str) -> &'static str {
     }
 }
 
-fn section_content(content: &str) -> String {
-    let suffix = if content.is_empty() || content.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    format!("{content}{suffix}")
+/// The replacement for a section's body range (everything after the heading
+/// line up to the next heading). The `original` region's blank-line padding is
+/// preserved: the blank line after the heading and the blank line(s) before the
+/// next heading survive, so a replace no longer collapses `## One\n\nnew\n\n`
+/// into `## One\nnew\n`. A body-less original keeps its padding too.
+fn section_content(original: &str, content: &str) -> String {
+    let leading = &original[..original.len() - original.trim_start_matches('\n').len()];
+    let trailing_newlines = original.len() - original.trim_end_matches('\n').len();
+    let trailing_blanks = "\n".repeat(trailing_newlines.saturating_sub(1));
+    let body = content.trim_matches('\n');
+    if body.is_empty() {
+        return format!("{leading}{trailing_blanks}");
+    }
+    format!("{leading}{body}\n{trailing_blanks}")
+}
+
+/// True when `content` carries a heading line that normalizes to the section's
+/// own anchor (outside a code fence), which a replace would duplicate.
+fn content_repeats_heading(content: &str, normalized_anchor: &str) -> bool {
+    let mut fence: Option<(char, usize)> = None;
+    for line in content.lines() {
+        if let Some((marker, width)) = fence {
+            if closes_fence(line, marker, width) {
+                fence = None;
+            }
+        } else if let Some(marker) = fence_marker(line) {
+            fence = Some(marker);
+        } else if let Some((_, anchor)) = heading(line)
+            && normalize_anchor(&anchor) == normalized_anchor
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -516,6 +554,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(patched, "# T\n## One\nnew\n## Two\nother\n");
+    }
+
+    fn one_hash(body: &str) -> String {
+        section_hashes(body)
+            .0
+            .into_iter()
+            .find(|section| section.anchor == "One")
+            .unwrap()
+            .sha256
+    }
+
+    #[test]
+    fn replace_section_keeps_blank_lines_around_headings() {
+        let body = "# T\n\n## One\n\nold\n\n## Two\n\nother\n";
+        let patched = apply(
+            body,
+            &[PagePatchEdit::ReplaceSection {
+                anchor: "One".into(),
+                section_sha256: one_hash(body),
+                content: "new".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(patched, "# T\n\n## One\n\nnew\n\n## Two\n\nother\n");
+    }
+
+    #[test]
+    fn replace_section_preserves_a_last_sections_single_trailing_newline() {
+        let body = "# T\n\n## One\n\nold\n";
+        let patched = apply(
+            body,
+            &[PagePatchEdit::ReplaceSection {
+                anchor: "One".into(),
+                section_sha256: one_hash(body),
+                content: "new".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(patched, "# T\n\n## One\n\nnew\n");
+    }
+
+    #[test]
+    fn replace_section_content_repeating_its_heading_is_refused_but_subheadings_pass() {
+        let body = "# T\n\n## One\n\nold\n\n## Two\n\nother\n";
+        assert_eq!(
+            apply(
+                body,
+                &[PagePatchEdit::ReplaceSection {
+                    anchor: "One".into(),
+                    section_sha256: one_hash(body),
+                    content: "## One\n\nnew\n".into(),
+                }]
+            ),
+            Err(PatchError::SectionContentRepeatsHeading("One".into()))
+        );
+        // A genuine sub-heading under the section is not a duplicate and stays.
+        let patched = apply(
+            body,
+            &[PagePatchEdit::ReplaceSection {
+                anchor: "One".into(),
+                section_sha256: one_hash(body),
+                content: "### Detail\n\nnew\n".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            patched,
+            "# T\n\n## One\n\n### Detail\n\nnew\n\n## Two\n\nother\n"
+        );
     }
 
     #[test]

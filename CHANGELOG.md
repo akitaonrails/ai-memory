@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `memory_patch_page` `replace_section` now keeps the blank line after a
+  section's heading and before the next heading, instead of collapsing
+  `## H\n\nbody\n\n` into `## H\nbody\n`. A `content` that repeats the
+  section's own heading is refused (`section_content_repeats_heading`) rather
+  than written, which used to leave two identical headings that no later edit
+  could target. (#2239)
 - The document importer now preserves DOCX nonbreaking hyphens encoded as
   `w:noBreakHyphen` elements. It previously dropped them and joined the
   surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)
