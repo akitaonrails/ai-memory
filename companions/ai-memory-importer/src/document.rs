@@ -1617,6 +1617,37 @@ mod tests {
     }
 
     #[test]
+    fn docx_keeps_move_destination_without_duplicating_source() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("moved.docx");
+        write_zip(
+            &file,
+            &[(
+                "word/document.xml",
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:moveToRangeStart w:author="Fixture" w:date="2026-11-13T12:00:00Z" w:id="0" w:name="move1"/><w:moveTo w:id="1" w:author="Fixture"><w:r><w:t xml:space="preserve">MOVED TEXT. </w:t></w:r></w:moveTo><w:moveToRangeEnd w:id="0"/><w:r><w:t xml:space="preserve">KEPT TEXT. </w:t></w:r><w:moveFromRangeStart w:author="Fixture" w:date="2026-11-13T12:00:00Z" w:id="2" w:name="move1"/><w:moveFrom w:id="3" w:author="Fixture"><w:r><w:t>MOVED TEXT.</w:t><w:br/></w:r><w:ins w:id="4" w:author="Fixture"><w:r><w:t>OLD SOURCE.</w:t></w:r></w:ins></w:moveFrom><w:moveFromRangeEnd w:id="2"/></w:p></w:body></w:document>"#,
+            )],
+        );
+        let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+        assert!(
+            plan.body
+                .contains("## Extracted content\n\nMOVED TEXT. KEPT TEXT.\n"),
+            "{}",
+            plan.body
+        );
+        assert_eq!(plan.body.matches("MOVED TEXT.").count(), 1);
+        assert!(!plan.body.contains("OLD SOURCE."));
+    }
+
+    #[test]
+    fn docx_move_filter_keeps_insertions_and_ordinary_text() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">moveFrom is a revision element. </w:t></w:r><w:ins w:id="1" w:author="Fixture"><w:r><w:t>INSERTED TEXT.</w:t></w:r></w:ins><w:del w:id="2" w:author="Fixture"><w:r><w:delText>DELETED TEXT.</w:delText></w:r></w:del></w:p></w:body></w:document>"#;
+        assert_eq!(
+            xml_text(xml).unwrap(),
+            "moveFrom is a revision element. INSERTED TEXT."
+        );
+    }
+
+    #[test]
     fn docx_extracts_document_footnote_text_and_decodes_entities() {
         let temp = TempDir::new().unwrap();
         let file = temp.path().join("brief.docx");
@@ -1640,37 +1671,6 @@ mod tests {
         assert!(plan.body.contains("Foot"));
         assert!(!plan.body.contains("deleted secret"));
         assert!(!plan.body.contains("field instruction"));
-    }
-
-    #[test]
-    fn docx_keeps_move_destination_without_duplicating_source() {
-        let temp = TempDir::new().unwrap();
-        let file = temp.path().join("moved.docx");
-        write_zip(
-            &file,
-            &[(
-                "word/document.xml",
-                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:moveToRangeStart w:id="0" w:name="move1"/><w:moveTo w:id="1" w:author="Fixture"><w:r><w:t xml:space="preserve">MOVED TEXT. </w:t></w:r></w:moveTo><w:moveToRangeEnd w:id="0"/><w:r><w:t xml:space="preserve">KEPT TEXT. </w:t></w:r><w:moveFromRangeStart w:id="2" w:name="move1"/><w:moveFrom w:id="3" w:author="Fixture"><w:r><w:t>MOVED TEXT.</w:t><w:br/></w:r><w:ins w:id="4" w:author="Fixture"><w:r><w:t>OLD SOURCE.</w:t></w:r></w:ins></w:moveFrom><w:moveFromRangeEnd w:id="2"/></w:p></w:body></w:document>"#,
-            )],
-        );
-        let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
-        assert!(
-            plan.body
-                .contains("## Extracted content\n\nMOVED TEXT. KEPT TEXT.\n"),
-            "{}",
-            plan.body
-        );
-        assert_eq!(plan.body.matches("MOVED TEXT.").count(), 1);
-        assert!(!plan.body.contains("OLD SOURCE."));
-    }
-
-    #[test]
-    fn docx_move_filter_keeps_insertions_and_ordinary_text() {
-        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">moveFrom is a revision element. </w:t></w:r><w:ins w:id="1" w:author="Fixture"><w:r><w:t>INSERTED TEXT.</w:t></w:r></w:ins><w:del w:id="2" w:author="Fixture"><w:r><w:delText>DELETED TEXT.</w:delText></w:r></w:del></w:p></w:body></w:document>"#;
-        assert_eq!(
-            xml_text(xml).unwrap(),
-            "moveFrom is a revision element. INSERTED TEXT."
-        );
     }
 
     #[test]
