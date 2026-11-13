@@ -56,7 +56,7 @@ version in [`docs/changelog/`](docs/changelog/):
   UTF-8's four-byte worst case. (#2241)
 - Fixed Crush transcript imports skipping messages written during an import by
   reading their events and incremental cursor from one SQLite snapshot.
-  Baseline cursor timestamps and revision fingerprints also share one snapshot.
+  Baseline cursor timestamps and revision fingerprints also share one snapshot. (#2243)
 
 ## [3.4.6] - 2026-11-13
 
