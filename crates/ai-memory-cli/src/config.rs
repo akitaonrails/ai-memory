@@ -239,7 +239,8 @@ impl DecaySettings {
 
 /// One `[[llm_fallbacks]]` entry: an ordered LLM provider tried only after
 /// the primary (`llm_provider`) fails a transient call
-/// (`LlmError::is_transient()`). See `docs/llm-provider-fallback.md`.
+/// (`LlmError::is_transient()`) or reports exhausted credit/quota
+/// (`LlmError::is_quota_exhausted()`). See `docs/llm-provider-fallback.md`.
 ///
 /// `Config::load` validates every profile and resolves its credential once,
 /// at startup — a missing/empty provider or model, an unknown provider, or
@@ -466,7 +467,8 @@ pub struct Config {
     /// overriding it. Values are never logged.
     pub llm_headers: Vec<String>,
     /// Ordered LLM fallback chain, tried after the primary provider only on
-    /// a transient failure (`LlmError::is_transient()`); empty by default
+    /// a transient failure (`LlmError::is_transient()`) or exhausted
+    /// credit/quota (`LlmError::is_quota_exhausted()`); empty by default
     /// (no behavior change). See [`FallbackProfile`] and
     /// `docs/llm-provider-fallback.md`. Configure via TOML:
     /// ```toml
@@ -503,6 +505,12 @@ pub struct Config {
     /// server's credentials (#762). Same `pub` rationale as above.
     #[serde(skip)]
     pub llm_fallback_unresolved: Vec<String>,
+    /// Seconds a fallback-chain candidate that reported exhausted credit,
+    /// quota or billing is skipped before the next call probes it again.
+    /// Only used when `llm_fallbacks` is non-empty. Defaults to 900
+    /// (`ai_memory_llm::DEFAULT_QUOTA_COOLDOWN`); accepted range 30–86400.
+    /// Set with `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`.
+    pub llm_quota_cooldown_secs: u64,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -1543,6 +1551,11 @@ where
         .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS))
 }
 
+/// Lower bound for `llm_quota_cooldown_secs`: the transient circuit floor.
+const MIN_LLM_QUOTA_COOLDOWN_SECS: u64 = ai_memory_llm::CIRCUIT_COOLDOWN.as_secs();
+/// Upper bound for `llm_quota_cooldown_secs`: one day.
+const MAX_LLM_QUOTA_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1575,6 +1588,7 @@ impl Default for Config {
             llm_task_configs: BTreeMap::new(),
             llm_fallback_configs: Vec::new(),
             llm_fallback_unresolved: Vec::new(),
+            llm_quota_cooldown_secs: ai_memory_llm::DEFAULT_QUOTA_COOLDOWN.as_secs(),
             consolidate_on_session_end: false,
             capture_assistant: false,
             assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
@@ -2990,6 +3004,19 @@ impl Config {
                  AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT counts concurrent runs"
             );
         }
+        // Below the transient circuit floor a quota-exhausted primary would be
+        // re-probed more often than a merely rate-limited one; above a day it
+        // would outlive any provider's quota window.
+        if !(MIN_LLM_QUOTA_COOLDOWN_SECS..=MAX_LLM_QUOTA_COOLDOWN_SECS)
+            .contains(&config.llm_quota_cooldown_secs)
+        {
+            anyhow::bail!(
+                "llm_quota_cooldown_secs must be between {MIN_LLM_QUOTA_COOLDOWN_SECS} and \
+                 {MAX_LLM_QUOTA_COOLDOWN_SECS} seconds (got {}); \
+                 AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS is read in seconds",
+                config.llm_quota_cooldown_secs
+            );
+        }
         // Zero would time out every rerank before the provider is called,
         // silently turning reranking off while it still reports as enabled.
         if config.rerank_timeout_secs == 0 {
@@ -3358,7 +3385,18 @@ impl Config {
         let Some(primary_cfg) = self.llm_provider_config()? else {
             return Ok(None);
         };
-        build_llm_chain(primary_cfg, &self.llm_fallback_configs).map(Some)
+        build_llm_chain(
+            primary_cfg,
+            &self.llm_fallback_configs,
+            self.llm_quota_cooldown(),
+        )
+        .map(Some)
+    }
+
+    /// How long any chain, the default or a workload's, skips a candidate
+    /// that reported exhausted credit or quota.
+    fn llm_quota_cooldown(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.llm_quota_cooldown_secs)
     }
 
     /// Construct the default chain and each independently configured workload chain.
@@ -3373,7 +3411,11 @@ impl Config {
                 .ok_or_else(|| LlmError::NotConfigured(format!("unknown LLM task llm.{name}")))?;
             overrides.insert(
                 workload,
-                build_llm_chain(task.primary.clone(), &task.fallbacks)?,
+                build_llm_chain(
+                    task.primary.clone(),
+                    &task.fallbacks,
+                    self.llm_quota_cooldown(),
+                )?,
             );
         }
         Ok(LlmProviders { default, overrides })
@@ -3721,6 +3763,7 @@ impl Config {
 fn build_llm_chain(
     primary: ProviderConfig,
     fallbacks: &[ProviderConfig],
+    quota_cooldown: std::time::Duration,
 ) -> LlmResult<Arc<dyn LlmProvider>> {
     if fallbacks.is_empty() {
         return build_provider(primary);
@@ -3738,7 +3781,9 @@ fn build_llm_chain(
             build_provider(cfg.clone())?,
         ));
     }
-    Ok(Arc::new(FallbackLlmProvider::new(candidates)))
+    Ok(Arc::new(
+        FallbackLlmProvider::new(candidates).with_quota_cooldown(quota_cooldown),
+    ))
 }
 
 /// Wire-name parsing shared by `llm_provider` and `llm_fallbacks[].provider`.
@@ -8392,6 +8437,100 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
         assert_eq!(candidates[0].model, "primary-model");
         assert_eq!(candidates[1].provider, "openai-compat");
         assert_eq!(candidates[1].model, "fallback-model");
+    }
+
+    #[test]
+    fn llm_quota_cooldown_defaults_round_trips_and_is_range_checked() {
+        let cfg = load_with_toml("").unwrap();
+        assert_eq!(cfg.llm_quota_cooldown_secs, 900);
+        assert_eq!(
+            cfg.llm_quota_cooldown_secs,
+            ai_memory_llm::DEFAULT_QUOTA_COOLDOWN.as_secs()
+        );
+        let cfg = load_with_toml("llm_quota_cooldown_secs = 3600\n").unwrap();
+        assert_eq!(cfg.llm_quota_cooldown_secs, 3600);
+        for bad in [0, 29, 86_401] {
+            let error = load_with_toml(&format!("llm_quota_cooldown_secs = {bad}\n"))
+                .expect_err("an out-of-range quota cooldown must fail closed");
+            assert!(
+                error.to_string().contains("llm_quota_cooldown_secs"),
+                "{bad}: unexpected error: {error:#}"
+            );
+        }
+    }
+
+    /// The documented "Anthropic primary, OpenAI on credit exhaustion" shape
+    /// loads, and the fallback credential is still resolved from the named
+    /// variable (an unset name here, so it is deferred to `serve`).
+    #[test]
+    fn the_documented_anthropic_primary_openai_fallback_example_loads() {
+        let cfg = load_with_toml(
+            "llm_provider = \"anthropic\"\n\
+             llm_quota_cooldown_secs = 900\n\
+             [[llm_fallbacks]]\n\
+             provider = \"openai\"\n\
+             model = \"gpt-5.4-mini\"\n\
+             api_key_env = \"AI_MEMORY_TEST_QUOTA_FALLBACK_UNSET_KEY\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.llm_fallbacks.len(), 1);
+        assert_eq!(cfg.llm_fallbacks[0].provider, "openai");
+        assert_eq!(cfg.llm_fallback_unresolved.len(), 1);
+    }
+
+    /// The configured quota cooldown reaches the chain: a candidate that
+    /// reports exhausted credit stays skipped (its circuit reason reads
+    /// `quota-exhausted`) for the configured window, not the 30s transient one.
+    #[tokio::test]
+    async fn llm_provider_chain_applies_the_configured_quota_cooldown() {
+        // A loopback endpoint that answers every request with OpenRouter's
+        // documented out-of-credit 402, without a mock-server dependency.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let body = r#"{"error":{"message":"Insufficient credits","code":402}}"#;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 402 Payment Required\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let cfg = load_with_toml(&format!(
+            "llm_provider = \"openai-compat\"\n\
+             llm_model = \"primary-model\"\n\
+             llm_base_url = \"{uri}/v1\"\n\
+             llm_quota_cooldown_secs = 7200\n\
+             [[llm_fallbacks]]\n\
+             provider = \"openai-compat\"\n\
+             model = \"fallback-model\"\n\
+             base_url = \"{uri}/v1\"\n",
+        ))
+        .unwrap();
+        let chain = cfg.llm_provider_chain().unwrap().unwrap();
+        let err = chain
+            .complete(ai_memory_llm::ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("both candidates are out of credit");
+        assert!(err.to_string().contains("quota-exhausted 402"), "{err}");
+        let health = chain.candidate_health();
+        let until = health[0].circuit_open_until.expect("circuit open");
+        let remaining = until.duration_since(jiff::Timestamp::now()).as_secs_f64();
+        assert!(
+            remaining > 7_000.0,
+            "cooldown {remaining}s is not the configured 7200s"
+        );
+        assert_eq!(health[0].circuit_reason.as_deref(), Some("quota-exhausted"));
+        server.abort();
     }
 
     #[test]

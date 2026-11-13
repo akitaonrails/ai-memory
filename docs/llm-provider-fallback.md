@@ -40,7 +40,9 @@ When a task has no profile, it shares the same default provider instance and
 fallback chain. A task profile replaces that chain with its own primary and
 ordered fallbacks; global fallbacks are not appended. Task profiles work when
 the global provider is unset, without enabling other tasks. Existing timeout,
-compatibility, header and reasoning settings apply globally.
+compatibility, header and reasoning settings apply globally, and so does
+`llm_quota_cooldown_secs` (see
+[Credit and quota exhaustion](#credit-and-quota-exhaustion)).
 
 Scalar fields have nested environment forms, such as
 `AI_MEMORY_LLM__BOOTSTRAP__PROVIDER` and `AI_MEMORY_LLM__BOOTSTRAP__MODEL`.
@@ -55,7 +57,8 @@ The following describes the original global fallback chain.
 ## Goals
 
 - Fail over only after a transient provider failure, using the established
-  `LlmError::is_transient()` policy.
+  `LlmError::is_transient()` policy, or after the provider reports that the
+  account is out of credit, quota or billing (`LlmError::is_quota_exhausted()`).
 - Preserve the original request, JSON schema, and logical operation id on every
   candidate attempt.
 - Keep credentials in the existing one-time configuration load and out of logs,
@@ -146,7 +149,8 @@ the wrapper, while callers still receive `Option<Arc<dyn LlmProvider>>`.
 | 429 | Yes | Existing transient policy. |
 | 5xx | Yes | Existing transient policy. |
 | timeout / connection error | Yes | Existing transient policy. |
-| 400 / 401 / 403 / 404 / 422 | No | Usually request, capability, model, or credential configuration. |
+| exhausted credit / quota / billing, disabled account (any status, see below) | Yes | The same request succeeds elsewhere; this provider fails until someone tops up or the quota resets. |
+| 400 / 401 / 403 / 404 / 422 without a credit or quota signal | No | Usually request, capability, model, or credential configuration. |
 | schema / response-shape / deserialize error | No | Same input would deterministically fail again. |
 
 The same rule covers the credential exchanges in front of a provider: the
@@ -166,7 +170,80 @@ uses no durable circuit state and no separate forced request deadline.
 
 If every eligible candidate fails, the wrapper returns a bounded aggregate
 error containing provider/model labels and error classes, never response bodies
-or secrets.
+or secrets. A candidate skipped because its circuit is open appears as
+`provider/model: skipped (circuit open: quota-exhausted)` (or `transient`), so
+the error says why a candidate was not attempted.
+
+## Credit and quota exhaustion
+
+When an account runs out of credit, the HTTP status alone looks like a
+malformed request or a short rate limit: Anthropic sends
+`400 invalid_request_error`, OpenAI `429 insufficient_quota` and OpenRouter
+`402`. Only the `429` used to advance the chain, so an Anthropic primary with
+an empty balance failed every consolidation and the configured fallback never
+ran.
+
+`LlmError::failover_class()` returns `Transient`, `QuotaExhausted` or
+`Permanent`, and `is_transient()`, `is_quota_exhausted()` and
+`should_fail_over()` all derive from it. The quota check lives in
+`crates/ai-memory-llm/src/quota.rs`. It reads only the bounded error body that
+`LlmError::Provider` already carries (at most 1 KiB, with secrets scrubbed),
+returns a boolean, and logs no part of the body.
+
+| Provider | Signal treated as `QuotaExhausted` |
+| --- | --- |
+| `anthropic`, `anthropic-oauth` | `credit balance is too low` (HTTP 400), `billing_error` (402), `reached your specified API usage limits` (monthly spend limit), `organization has been disabled` (403) |
+| `openai` | `insufficient_quota` (429), `billing_hard_limit_reached`, `billing_not_active`, `account_deactivated` (401) |
+| `openai-compat` (OpenRouter, DeepSeek and similar gateways) | any `402`; `insufficient credits`, `insufficient balance`, `out of credits`, `requires more credits`, `key limit exceeded` |
+| `gemini` | `429 RESOURCE_EXHAUSTED` whose violated quota is a daily one (`PerDay`) or has `limit: 0`; `spending cap`; `credits are depleted` |
+| `openai-oauth`, `codex` | `usage_limit_reached` / `usage limit has been reached` (also when it arrives as an SSE terminal error, reported as 502) |
+| `copilot` | `quota_exceeded`, `monthly quota` |
+| `opencode` | any `402`; `insufficient balance`, `out of credits` |
+
+The markers are matched case-insensitively against every provider's body,
+because gateways relay each other's errors. A per-minute rate limit stays
+transient. Gemini reuses OpenAI's "exceeded your current quota" wording for its
+per-minute limit, so that phrase is not a marker.
+
+A plain `401` (an invalid, revoked or mistyped key) never fails over. The
+operator has to fix the key, and moving every call to the fallback would hide
+the problem. A `401` or `403` fails over only when its body carries an explicit
+billing, quota, credit or disabled-account marker from the table, such as
+OpenAI's `account_deactivated` or Anthropic's disabled organization.
+
+The consolidation and bootstrap retry loops do not re-send an exhausted-quota
+error two seconds later, even when it arrives as a `429`, because it is not
+transient. The SessionEnd consolidation queue keeps such a job on its bounded
+backoff instead of marking it terminal: a top-up or quota reset can clear it
+within that window, as it always could for a `429`.
+
+A quota failure opens the candidate's circuit for `llm_quota_cooldown_secs`
+(default 900, accepted range 30 to 86400, env
+`AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`). A longer provider retry hint, such as a
+quota reset time, stretches the window up to one hour or the configured value,
+whichever is longer. A transient failure that arrives while the window is open
+neither shortens it nor changes its reason. The candidate gets no traffic while
+its circuit is open. The first real call after the window tries it again: if it
+answers, it takes over again and its circuit closes; if it is still exhausted,
+that call costs one rejected request and the window starts again. Nothing
+probes in the background, and a restart clears the state.
+
+Example, Anthropic as primary with OpenAI taking over when the Anthropic
+balance runs out:
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-sonnet-4-6"
+llm_quota_cooldown_secs = 900
+
+[[llm_fallbacks]]
+provider = "openai"
+model = "gpt-5.4-mini"
+api_key_env = "OPENAI_API_KEY"
+```
+
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` must both be in the server's
+environment.
 
 ## Health reporting
 
@@ -179,8 +256,16 @@ Per-candidate state contains:
 - provider and model;
 - configured / last-selected state;
 - last success or error timestamp;
-- redacted error class and HTTP status when available;
-- circuit-open-until timestamp.
+- redacted error class (`quota-exhausted` for a credit or quota failure) and
+  HTTP status when available;
+- circuit-open-until timestamp and `circuit_reason` (`transient` or
+  `quota-exhausted`) while it is open.
+
+`ai-memory status` prints a headline when the primary is out of credit or
+quota, for example
+`primary anthropic/claude-sonnet-4-6 exhausted (credit/quota); using fallback openai/gpt-5.4-mini`,
+and marks that candidate `out of credit/quota; skipped until <time>, then
+probed again`.
 
 Status records only calls the server already made. It does not probe fallbacks
 or trigger background recovery traffic.
@@ -190,17 +275,22 @@ fields and never a response body. A transient failure logs a warning naming
 the failing candidate's provider, model, chain position, error class, HTTP
 status and cooldown; that is the only place the failing model shows up,
 because callers such as the reranker label the chain with its first
-candidate. A deterministic failure logs at debug level, since the caller
-reports the returned error itself. An info line records each change of the
-candidate that answers, so a primary that stays down yields one line, not one
-per call.
+candidate. A quota failure logs its own warning (`out of credit or quota`) with
+the same redacted fields and the quota cooldown. A deterministic failure logs
+at debug level, since the caller reports the returned error itself. An info
+line records each change of the candidate that answers, so a primary that
+stays down yields one line, not one per call.
 
 ## Tests
 
 1. Unit-test chain order with fake `LlmProvider` instances.
 2. Verify all four trait methods preserve request/schema/operation id.
 3. Verify `429`, `5xx`, timeout, and connection failures advance; verify
-   deterministic errors stop on the first candidate.
+   deterministic errors stop on the first candidate. Verify each provider's
+   credit/quota body advances (unit fixtures in `quota.rs`, real providers
+   against a local mock in `tests/suite/fallback_provider.rs`), that the
+   exhausted candidate is skipped for the quota window and probed after it,
+   and that a plain invalid-key `401` does not advance.
 4. Verify an open circuit skips only its `(provider, model)` candidate and a
    success closes it.
 5. Test configuration validation, including missing/empty profiles and missing

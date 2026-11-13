@@ -100,6 +100,7 @@ pub mod types;
 
 mod auth_file;
 mod codex_responses;
+mod quota;
 mod redirect;
 mod response;
 mod stored_token;
@@ -124,12 +125,12 @@ pub use embedding::{
     cosine, embed_search_query,
 };
 pub use embedding_capacity::{EmbeddingCapacity, local_capacity};
-pub use error::{LlmError, LlmResult};
+pub use error::{FailoverClass, LlmError, LlmResult};
 pub use factory::{
     EmbedderChoice, EmbedderConfig, ProviderChoice, ProviderConfig, build_embedder, build_provider,
     default_embedding_dim, try_default_embedding_dim,
 };
-pub use fallback::{CIRCUIT_COOLDOWN, Candidate, FallbackLlmProvider};
+pub use fallback::{CIRCUIT_COOLDOWN, Candidate, DEFAULT_QUOTA_COOLDOWN, FallbackLlmProvider};
 pub use gemini::GeminiProvider;
 pub use google::{DEFAULT_MODEL as GOOGLE_DEFAULT_EMBED_MODEL, GoogleEmbedder};
 pub use health::{

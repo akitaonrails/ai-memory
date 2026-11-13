@@ -482,13 +482,53 @@ fn fallback_candidate_line(candidate: &ai_memory_llm::CandidateHealth) -> String
         line.push_str(" (last selected)");
     }
     if let Some(until) = &candidate.circuit_open_until {
-        line.push_str(&format!(" — circuit open until {until}"));
+        if candidate.circuit_reason.as_deref() == Some(QUOTA_EXHAUSTED) {
+            line.push_str(&format!(
+                " — out of credit/quota; skipped until {until}, then probed again"
+            ));
+        } else {
+            line.push_str(&format!(" — circuit open until {until}"));
+        }
     } else if let Some(status) = candidate.last_error_status {
         line.push_str(&format!(" — last error: status {status}"));
     } else if let Some(class) = &candidate.last_error_class {
         line.push_str(&format!(" — last error: {}", terminal_text(class)));
     }
     line
+}
+
+/// Wire label of a circuit opened by exhausted credit or quota
+/// (`ai_memory_llm::FailoverClass::QuotaExhausted`).
+const QUOTA_EXHAUSTED: &str = "quota-exhausted";
+
+/// One headline for a fallback chain whose primary is out of credit or
+/// quota, naming the candidate now answering. `None` while the primary is
+/// usable, so a healthy chain prints nothing extra. Labels only: the
+/// snapshot never carries a response body or credential.
+fn fallback_chain_headline(candidates: &[ai_memory_llm::CandidateHealth]) -> Option<String> {
+    let primary = candidates.first()?;
+    if primary.circuit_open_until.is_none()
+        || primary.circuit_reason.as_deref() != Some(QUOTA_EXHAUSTED)
+    {
+        return None;
+    }
+    let exhausted = format!(
+        "primary {}/{} exhausted (credit/quota)",
+        primary.provider, primary.model
+    );
+    Some(
+        match candidates
+            .iter()
+            .skip(1)
+            .find(|candidate| candidate.last_selected)
+        {
+            Some(fallback) => format!(
+                "{exhausted}; using fallback {}/{}",
+                fallback.provider, fallback.model
+            ),
+            None => format!("{exhausted}; no fallback has answered yet"),
+        },
+    )
 }
 
 /// Render a spool age (ms) as a compact human duration, or `-` when the spool
@@ -1117,6 +1157,7 @@ mod tests {
             last_error_status: None,
             last_error_class: None,
             circuit_open_until: None,
+            circuit_reason: None,
         };
         let line = fallback_candidate_line(&candidate);
         assert!(line.contains("gemini/gemini-3.5-flash"));
@@ -1135,11 +1176,79 @@ mod tests {
             last_error_status: Some(503),
             last_error_class: Some("provider".to_string()),
             circuit_open_until: Some(when),
+            circuit_reason: Some("transient".to_string()),
         };
         let line = fallback_candidate_line(&candidate);
         assert!(line.contains("openai-compat/local-router"));
         assert!(line.contains("circuit open until"));
         assert!(!line.contains("last error"));
+    }
+
+    fn quota_candidate(
+        provider: &str,
+        model: &str,
+        selected: bool,
+        reason: Option<&str>,
+    ) -> ai_memory_llm::CandidateHealth {
+        let when = "2026-05-28T12:15:00Z".parse::<Timestamp>().unwrap();
+        ai_memory_llm::CandidateHealth {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            last_selected: selected,
+            last_success_at: selected.then_some(when),
+            last_error_at: reason.map(|_| when),
+            last_error_status: reason.map(|_| 400),
+            last_error_class: reason.map(str::to_string),
+            circuit_open_until: reason.map(|_| when),
+            circuit_reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn fallback_chain_headline_names_an_exhausted_primary_and_the_answering_fallback() {
+        let chain = [
+            quota_candidate(
+                "anthropic",
+                "claude-sonnet-4-6",
+                false,
+                Some("quota-exhausted"),
+            ),
+            quota_candidate("openai", "gpt-5.4-mini", true, None),
+        ];
+        let headline = fallback_chain_headline(&chain).expect("primary is exhausted");
+        assert_eq!(
+            headline,
+            "primary anthropic/claude-sonnet-4-6 exhausted (credit/quota); \
+             using fallback openai/gpt-5.4-mini"
+        );
+        let line = fallback_candidate_line(&chain[0]);
+        assert!(line.contains("out of credit/quota"), "{line}");
+        assert!(line.contains("probed again"), "{line}");
+
+        let none_yet = [
+            quota_candidate("anthropic", "claude", false, Some("quota-exhausted")),
+            quota_candidate("openai", "gpt", false, None),
+        ];
+        assert!(
+            fallback_chain_headline(&none_yet)
+                .unwrap()
+                .ends_with("no fallback has answered yet")
+        );
+    }
+
+    #[test]
+    fn fallback_chain_headline_is_silent_for_a_healthy_or_rate_limited_primary() {
+        let healthy = [
+            quota_candidate("anthropic", "claude", true, None),
+            quota_candidate("openai", "gpt", false, None),
+        ];
+        assert!(fallback_chain_headline(&healthy).is_none());
+        let rate_limited = [
+            quota_candidate("anthropic", "claude", false, Some("transient")),
+            quota_candidate("openai", "gpt", true, None),
+        ];
+        assert!(fallback_chain_headline(&rate_limited).is_none());
+        assert!(fallback_chain_headline(&[]).is_none());
     }
 
     /// A `Config` whose data dir is `dir`, so the journal read under test

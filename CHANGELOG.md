@@ -186,6 +186,13 @@ version in [`docs/changelog/`](docs/changelog/):
   to the `/admin` routes on an older server. Those routes stay root-only. Admin
   pop and cancel now also run the admission and observer webhooks, as the MCP
   tools already did. (#2146)
+- Added `llm_quota_cooldown_secs` (default 900, env
+  `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`), how long a fallback chain (the default
+  one or a workload's) skips a provider that reported it is out of credit or
+  quota. The first call after that window tries the provider again, so a
+  topped-up primary takes over again without a restart. `ai-memory status`
+  names an exhausted primary and the fallback answering for it, and each
+  candidate in the health payload carries a `circuit_reason`. (#2227)
 
 ### Changed
 
@@ -208,6 +215,14 @@ version in [`docs/changelog/`](docs/changelog/):
 - `/web/search` with no search term lists the ten most recently updated
   pages, from the selected project or from every project the viewer can read.
   It used to show only an empty prompt. (#2226)
+
+### Fixed
+
+- `[[llm_fallbacks]]` chains no longer stop when a provider reports that the
+  account is out of credit, quota or billing: the chain now advances to the
+  next candidate instead of failing the whole request, and the exhausted
+  provider is skipped for `llm_quota_cooldown_secs` before it is retried. See
+  [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md). (#2227)
 
 ## [3.4.6] - 2026-11-13
 

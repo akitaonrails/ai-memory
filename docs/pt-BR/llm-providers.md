@@ -312,6 +312,33 @@ não redireciona os embeddings; defina `AI_MEMORY_EMBEDDING_BASE_URL` também.
 > apenas quando todo endpoint `openai-compat` que você configurar puder ver os nomes do seu
 > espaço de trabalho, projeto e usuário.
 
+### Contingência quando o crédito ou a cota se esgota
+
+Uma cadeia `[[llm_fallbacks]]` ordenada passa para o próximo provedor diante de
+uma falha transitória e também quando um provedor informa que a conta está sem
+crédito, cota ou faturamento: o `400` "credit balance is too low" da Anthropic,
+o `429 insufficient_quota` da OpenAI, um `402` do OpenRouter, um
+`RESOURCE_EXHAUSTED` diário do Gemini, um `usage_limit_reached` do Codex ou um
+`quota_exceeded` do Copilot. Um `401` de chave inválida comum não aciona a
+contingência. O provedor esgotado fica de fora por `llm_quota_cooldown_secs`
+(padrão 900). A próxima chamada depois disso o tenta de novo, então ele volta a
+assumir assim que for recarregado.
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-sonnet-4-6"
+
+[[llm_fallbacks]]
+provider = "openai"
+model = "gpt-5.4-mini"
+api_key_env = "OPENAI_API_KEY"
+```
+
+`ai-memory status` então mostra `primary anthropic/claude-sonnet-4-6 exhausted
+(credit/quota); using fallback openai/gpt-5.4-mini`. A regra completa, com os
+sinais por provedor, está em
+[`llm-provider-fallback.md`](llm-provider-fallback.md#exaustão-de-crédito-e-cota).
+
 ### Sondando o próprio provedor do servidor
 
 `ai-memory llm-test` compila um provedor a partir da shell em que é executado. Esse é o

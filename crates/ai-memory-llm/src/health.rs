@@ -310,10 +310,15 @@ pub struct CandidateHealth {
     /// Redacted error class captured from the last error
     /// ([`LlmError::class`]), never a response body or secret.
     pub last_error_class: Option<String>,
-    /// When this candidate's circuit reopens, if a transient failure has it
-    /// currently open. `None` once the cooldown has elapsed, even if no
-    /// later call has explicitly closed it.
+    /// When this candidate's circuit reopens, if a transient failure or
+    /// exhausted credit/quota has it currently open. `None` once the
+    /// cooldown has elapsed, even if no later call has explicitly closed it.
     pub circuit_open_until: Option<Timestamp>,
+    /// Why the circuit is open while [`Self::circuit_open_until`] is set:
+    /// `transient` or `quota-exhausted` ([`crate::FailoverClass::as_str`]).
+    /// Absent from an older server's payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_reason: Option<String>,
 }
 
 /// Wire-format health snapshot for one provider role.

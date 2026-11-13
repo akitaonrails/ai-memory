@@ -3,10 +3,19 @@
 //! See `docs/llm-provider-fallback.md` (issue #648) for the full design.
 //! `FallbackLlmProvider` wraps an ordered list of already-constructed
 //! providers behind the same [`LlmProvider`] trait: on a transient failure
-//! (`LlmError::is_transient()`) it advances to the next eligible candidate,
-//! preserving the original request, schema, and operation id; a
+//! (`LlmError::is_transient()`) or exhausted credit/quota
+//! (`LlmError::is_quota_exhausted()`) it advances to the next eligible
+//! candidate, preserving the original request, schema, and operation id; a
 //! deterministic failure (bad request, auth, unsupported schema, malformed
 //! response) returns immediately without trying the rest of the chain.
+//!
+//! A transient failure keeps its candidate out for [`CIRCUIT_COOLDOWN`] (or
+//! the provider's retry hint); exhausted credit or quota keeps it out for the
+//! longer quota cooldown ([`DEFAULT_QUOTA_COOLDOWN`] unless configured). When
+//! the cooldown ends, the next real call probes that candidate first again,
+//! so a topped-up primary takes over without a restart and without any
+//! background traffic.
+//!
 //! `Config::llm_provider_chain` in `ai-memory-cli` is the sole place that
 //! builds one; `build_provider` remains the sole construction path for each
 //! candidate.
@@ -18,7 +27,7 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 use tracing::{debug, info, warn};
 
-use crate::error::{LlmError, LlmResult};
+use crate::error::{FailoverClass, LlmError, LlmResult};
 use crate::health::CandidateHealth;
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
@@ -28,6 +37,10 @@ use crate::types::{ChatRequest, ChatResponse, LlmOperationId};
 /// state; there is no durable or cross-process cooldown.
 pub const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
 const MAX_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+/// How long a candidate whose provider reported exhausted credit, quota or
+/// billing stays out of the chain before the next call probes it again.
+/// `llm_quota_cooldown_secs` in `ai-memory-cli` overrides it.
+pub const DEFAULT_QUOTA_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 /// One provider in an ordered fallback chain.
 ///
@@ -66,6 +79,8 @@ struct CandidateState {
     last_error_status: Option<u16>,
     last_error_class: Option<&'static str>,
     circuit_open_until: Option<Instant>,
+    /// Why the circuit was last opened, for health reporting.
+    circuit_reason: Option<FailoverClass>,
 }
 
 struct CandidateEntry {
@@ -76,13 +91,16 @@ struct CandidateEntry {
 /// Ordered LLM provider fallback chain.
 ///
 /// Tries each eligible candidate in declaration order, advancing only on a
-/// transient failure; a deterministic failure returns immediately. See the
+/// transient failure or exhausted credit/quota; a deterministic failure
+/// returns immediately. See the
 /// module docs and `docs/llm-provider-fallback.md`.
 pub struct FallbackLlmProvider {
     entries: Vec<CandidateEntry>,
     /// Index of the candidate that answered the most recently completed
     /// call, for health reporting.
     last_selected: Mutex<Option<usize>>,
+    /// Circuit cooldown after exhausted credit or quota.
+    quota_cooldown: Duration,
 }
 
 impl FallbackLlmProvider {
@@ -99,6 +117,41 @@ impl FallbackLlmProvider {
                 })
                 .collect(),
             last_selected: Mutex::new(None),
+            quota_cooldown: DEFAULT_QUOTA_COOLDOWN,
+        }
+    }
+
+    /// Override how long a candidate that reported exhausted credit or quota
+    /// is skipped before the next call probes it again
+    /// ([`DEFAULT_QUOTA_COOLDOWN`] by default).
+    #[must_use]
+    pub const fn with_quota_cooldown(mut self, cooldown: Duration) -> Self {
+        self.quota_cooldown = cooldown;
+        self
+    }
+
+    /// The circuit cooldown a failure earns, or `None` when it does not
+    /// advance the chain. A transient failure gets [`CIRCUIT_COOLDOWN`],
+    /// stretched by a provider retry hint up to one hour. Exhausted quota
+    /// gets the quota cooldown, stretched by a longer hint (a quota reset
+    /// time) up to one hour or the quota cooldown, whichever is longer.
+    fn cooldown_for(&self, err: &LlmError) -> Option<(FailoverClass, Duration)> {
+        match err.failover_class() {
+            FailoverClass::Transient => Some((
+                FailoverClass::Transient,
+                err.retry_after()
+                    .unwrap_or(CIRCUIT_COOLDOWN)
+                    .max(CIRCUIT_COOLDOWN)
+                    .min(MAX_CIRCUIT_COOLDOWN),
+            )),
+            FailoverClass::QuotaExhausted => Some((
+                FailoverClass::QuotaExhausted,
+                err.retry_after()
+                    .unwrap_or(self.quota_cooldown)
+                    .max(self.quota_cooldown)
+                    .min(MAX_CIRCUIT_COOLDOWN.max(self.quota_cooldown)),
+            )),
+            FailoverClass::Permanent => None,
         }
     }
 
@@ -118,6 +171,7 @@ impl FallbackLlmProvider {
                 .unwrap_or_else(|e| e.into_inner());
             state.last_success_at = Some(Timestamp::now());
             state.circuit_open_until = None;
+            state.circuit_reason = None;
         }
         let previous = self
             .last_selected
@@ -142,12 +196,8 @@ impl FallbackLlmProvider {
     }
 
     fn record_error(&self, index: usize, err: &LlmError) {
-        let cooldown = err.is_transient().then(|| {
-            err.retry_after()
-                .unwrap_or(CIRCUIT_COOLDOWN)
-                .max(CIRCUIT_COOLDOWN)
-                .min(MAX_CIRCUIT_COOLDOWN)
-        });
+        let outcome = self.cooldown_for(err);
+        let cooldown = outcome.map(|(_, cooldown)| cooldown);
         let should_log_transient = {
             let mut state = self.entries[index]
                 .state
@@ -158,9 +208,18 @@ impl FallbackLlmProvider {
             state.last_error_at = Some(Timestamp::now());
             state.last_error_status = err.http_status();
             state.last_error_class = Some(err.class());
-            if let Some(cooldown) = cooldown {
+            if let Some((class, cooldown)) = outcome {
+                // Overlapping failures keep the later deadline, and the
+                // reason follows whichever failure set it: a short transient
+                // blip must not shorten or relabel a quota cooldown.
                 let deadline = Instant::now() + cooldown;
-                state.circuit_open_until = state.circuit_open_until.max(Some(deadline));
+                if state
+                    .circuit_open_until
+                    .is_none_or(|until| deadline >= until)
+                {
+                    state.circuit_open_until = Some(deadline);
+                    state.circuit_reason = Some(class);
+                }
             }
             cooldown.is_some() && !circuit_was_open
         };
@@ -169,8 +228,18 @@ impl FallbackLlmProvider {
         // the failing candidate's, which the caller cannot see: every caller
         // labels the chain with its first candidate.
         let candidate = &self.entries[index].candidate;
-        match cooldown {
-            Some(cooldown) if should_log_transient => warn!(
+        match outcome {
+            Some((FailoverClass::QuotaExhausted, cooldown)) if should_log_transient => warn!(
+                provider = candidate.provider,
+                model = %candidate.model,
+                position = index,
+                error_class = err.class(),
+                error_status = ?err.http_status(),
+                cooldown_secs = cooldown.as_secs(),
+                "llm fallback candidate is out of credit or quota; skipping it until \
+                 its quota cooldown ends, then probing it again"
+            ),
+            Some((_, cooldown)) if should_log_transient => warn!(
                 provider = candidate.provider,
                 model = %candidate.model,
                 position = index,
@@ -209,6 +278,22 @@ impl FallbackLlmProvider {
         }
     }
 
+    /// Summary entry for a candidate skipped because its circuit is open, so
+    /// an aggregate error with every circuit open still names the reason.
+    fn describe_skipped(&self, index: usize) -> String {
+        let candidate = &self.entries[index].candidate;
+        let reason = self.entries[index]
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .circuit_reason
+            .map_or("transient", FailoverClass::as_str);
+        format!(
+            "{}/{}: skipped (circuit open: {reason})",
+            candidate.provider, candidate.model
+        )
+    }
+
     fn exhausted(&self, attempted: usize, summary: Vec<String>) -> LlmError {
         LlmError::AllCandidatesFailed {
             attempted,
@@ -236,6 +321,7 @@ impl LlmProvider for FallbackLlmProvider {
         let mut summary = Vec::new();
         for (i, entry) in self.entries.iter().enumerate() {
             if self.circuit_open(i) {
+                summary.push(self.describe_skipped(i));
                 continue;
             }
             attempted += 1;
@@ -245,10 +331,10 @@ impl LlmProvider for FallbackLlmProvider {
                     return Ok(response);
                 }
                 Err(err) => {
-                    let transient = err.is_transient();
+                    let fail_over = err.should_fail_over();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
-                    if !transient {
+                    if !fail_over {
                         return Err(err);
                     }
                 }
@@ -266,6 +352,7 @@ impl LlmProvider for FallbackLlmProvider {
         let mut summary = Vec::new();
         for (i, entry) in self.entries.iter().enumerate() {
             if self.circuit_open(i) {
+                summary.push(self.describe_skipped(i));
                 continue;
             }
             attempted += 1;
@@ -280,10 +367,10 @@ impl LlmProvider for FallbackLlmProvider {
                     return Ok(response);
                 }
                 Err(err) => {
-                    let transient = err.is_transient();
+                    let fail_over = err.should_fail_over();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
-                    if !transient {
+                    if !fail_over {
                         return Err(err);
                     }
                 }
@@ -301,6 +388,7 @@ impl LlmProvider for FallbackLlmProvider {
         let mut summary = Vec::new();
         for (i, entry) in self.entries.iter().enumerate() {
             if self.circuit_open(i) {
+                summary.push(self.describe_skipped(i));
                 continue;
             }
             attempted += 1;
@@ -315,10 +403,10 @@ impl LlmProvider for FallbackLlmProvider {
                     return Ok(value);
                 }
                 Err(err) => {
-                    let transient = err.is_transient();
+                    let fail_over = err.should_fail_over();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
-                    if !transient {
+                    if !fail_over {
                         return Err(err);
                     }
                 }
@@ -337,6 +425,7 @@ impl LlmProvider for FallbackLlmProvider {
         let mut summary = Vec::new();
         for (i, entry) in self.entries.iter().enumerate() {
             if self.circuit_open(i) {
+                summary.push(self.describe_skipped(i));
                 continue;
             }
             attempted += 1;
@@ -355,10 +444,10 @@ impl LlmProvider for FallbackLlmProvider {
                     return Ok(value);
                 }
                 Err(err) => {
-                    let transient = err.is_transient();
+                    let fail_over = err.should_fail_over();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
-                    if !transient {
+                    if !fail_over {
                         return Err(err);
                     }
                 }
@@ -390,6 +479,11 @@ impl LlmProvider for FallbackLlmProvider {
                         (until > now)
                             .then(|| Timestamp::now() + until.saturating_duration_since(now))
                     }),
+                    circuit_reason: state
+                        .circuit_open_until
+                        .filter(|until| *until > now)
+                        .and(state.circuit_reason)
+                        .map(|reason| reason.as_str().to_string()),
                 }
             })
             .collect()
@@ -789,6 +883,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_transient_failure_does_not_shorten_or_relabel_a_quota_cooldown() {
+        let chain = FallbackLlmProvider::new(vec![Candidate::new(
+            "primary",
+            "m1",
+            Arc::new(ScriptedLlm::ok("primary", "m1", "unused")),
+        )]);
+        chain.record_error(0, &quota(400, ANTHROPIC_CREDIT_BODY));
+        let (deadline, reason) = {
+            let state = chain.entries[0].state.lock().unwrap();
+            (state.circuit_open_until, state.circuit_reason)
+        };
+        assert_eq!(reason, Some(FailoverClass::QuotaExhausted));
+
+        // A request already in flight fails transiently afterwards.
+        chain.record_error(0, &transient(503));
+
+        let state = chain.entries[0].state.lock().unwrap();
+        assert_eq!(state.circuit_open_until, deadline);
+        assert_eq!(state.circuit_reason, Some(FailoverClass::QuotaExhausted));
+    }
+
     #[tokio::test]
     async fn an_open_circuit_skips_only_its_candidate() {
         let first = Arc::new(ScriptedLlm::err("primary", "m1", transient(500)));
@@ -886,6 +1002,307 @@ mod tests {
 
         let rendered = format!("{health:?}");
         assert!(!rendered.contains("must not leak"));
+    }
+
+    const ANTHROPIC_CREDIT_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+    const OPENAI_QUOTA_BODY: &str = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}"#;
+
+    fn quota(status: u16, body: &str) -> LlmError {
+        LlmError::Provider {
+            status,
+            body: body.to_string(),
+            retry_after: None,
+        }
+    }
+
+    fn remaining_cooldown(chain: &FallbackLlmProvider, index: usize) -> Duration {
+        chain.entries[index]
+            .state
+            .lock()
+            .unwrap()
+            .circuit_open_until
+            .expect("circuit open")
+            .saturating_duration_since(Instant::now())
+    }
+
+    #[tokio::test]
+    async fn exhausted_credit_fails_over_and_keeps_the_primary_out_for_the_quota_cooldown() {
+        let primary = Arc::new(ScriptedLlm::err(
+            "anthropic",
+            "claude",
+            quota(400, ANTHROPIC_CREDIT_BODY),
+        ));
+        let fallback = Arc::new(ScriptedLlm::ok("openai", "gpt", "from openai"));
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new("anthropic", "claude", primary.clone()),
+            Candidate::new("openai", "gpt", fallback.clone()),
+        ]);
+
+        for _ in 0..3 {
+            let response = chain
+                .complete(ChatRequest::user_prompt("hi"))
+                .await
+                .expect("the fallback answers while the primary is out of credit");
+            assert_eq!(response.text, "from openai");
+        }
+        // One probe, then the primary is skipped for the whole quota window.
+        assert_eq!(primary.calls(), 1);
+        assert_eq!(fallback.calls(), 3);
+        let remaining = remaining_cooldown(&chain, 0);
+        assert!(
+            remaining > DEFAULT_QUOTA_COOLDOWN - Duration::from_secs(5)
+                && remaining <= DEFAULT_QUOTA_COOLDOWN,
+            "{remaining:?}"
+        );
+
+        let health = chain.candidate_health();
+        assert_eq!(health[0].last_error_status, Some(400));
+        assert_eq!(
+            health[0].last_error_class.as_deref(),
+            Some("quota-exhausted")
+        );
+        assert_eq!(health[0].circuit_reason.as_deref(), Some("quota-exhausted"));
+        assert!(health[1].last_selected);
+        assert!(health[1].circuit_reason.is_none());
+        assert!(!format!("{health:?}").contains("credit balance"));
+    }
+
+    #[tokio::test]
+    async fn every_quota_signal_advances_regardless_of_status() {
+        for err in [
+            quota(400, ANTHROPIC_CREDIT_BODY),
+            quota(429, OPENAI_QUOTA_BODY),
+            quota(
+                402,
+                r#"{"error":{"message":"Insufficient credits","code":402}}"#,
+            ),
+            quota(
+                403,
+                r#"{"type":"error","error":{"type":"permission_error","message":"This organization has been disabled."}}"#,
+            ),
+        ] {
+            let status = err.http_status();
+            let first = Arc::new(ScriptedLlm::err("primary", "m1", err));
+            let second = Arc::new(ScriptedLlm::ok("secondary", "m2", "ok"));
+            let chain = FallbackLlmProvider::new(vec![
+                Candidate::new("primary", "m1", first.clone()),
+                Candidate::new("secondary", "m2", second.clone()),
+            ]);
+            chain
+                .complete_structured_raw(
+                    ChatRequest::user_prompt("hi"),
+                    serde_json::json!({ "type": "object" }),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{status:?} must fail over: {e}"));
+            assert_eq!(second.calls(), 1, "{status:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_primary_is_probed_again_after_the_quota_cooldown_and_takes_back_over() {
+        let primary = Arc::new(ScriptedLlm::new(
+            "anthropic",
+            "claude",
+            vec![
+                Err(quota(400, ANTHROPIC_CREDIT_BODY)),
+                Err(quota(400, ANTHROPIC_CREDIT_BODY)),
+                Ok(ChatResponse {
+                    text: "from anthropic".into(),
+                    usage: None,
+                    model: "claude".into(),
+                }),
+            ],
+        ));
+        let fallback = Arc::new(ScriptedLlm::ok("openai", "gpt", "from openai"));
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new("anthropic", "claude", primary.clone()),
+            Candidate::new("openai", "gpt", fallback.clone()),
+        ])
+        .with_quota_cooldown(Duration::from_secs(600));
+        let expire = |chain: &FallbackLlmProvider| {
+            chain.entries[0].state.lock().unwrap().circuit_open_until =
+                Some(Instant::now() - Duration::from_millis(1));
+        };
+
+        let first = chain.complete(ChatRequest::user_prompt("1")).await.unwrap();
+        assert_eq!(first.text, "from openai");
+        // Inside the window: no traffic to the primary.
+        chain.complete(ChatRequest::user_prompt("2")).await.unwrap();
+        assert_eq!(primary.calls(), 1);
+
+        // Window over, still out of credit: one probe, then back out for
+        // another full window.
+        expire(&chain);
+        let probe = chain.complete(ChatRequest::user_prompt("3")).await.unwrap();
+        assert_eq!(probe.text, "from openai");
+        assert_eq!(primary.calls(), 2);
+        assert!(remaining_cooldown(&chain, 0) > Duration::from_secs(590));
+
+        // Window over and topped up: the primary answers and its circuit closes.
+        expire(&chain);
+        let back = chain.complete(ChatRequest::user_prompt("4")).await.unwrap();
+        assert_eq!(back.text, "from anthropic");
+        assert_eq!(primary.calls(), 3);
+        assert_eq!(fallback.calls(), 3);
+        let health = chain.candidate_health();
+        assert!(health[0].last_selected);
+        assert!(health[0].circuit_open_until.is_none());
+        assert!(health[0].circuit_reason.is_none());
+    }
+
+    #[test]
+    fn a_quota_reset_hint_stretches_the_quota_cooldown_but_never_shortens_it() {
+        let chain = FallbackLlmProvider::new(vec![Candidate::new(
+            "primary",
+            "m1",
+            Arc::new(ScriptedLlm::ok("primary", "m1", "unused")),
+        )])
+        .with_quota_cooldown(Duration::from_secs(900));
+        for (hint, expected) in [
+            (None, 900),
+            (Some(5), 900),
+            (Some(2_400), 2_400),
+            (Some(90_000), 3_600),
+        ] {
+            chain.record_error(
+                0,
+                &LlmError::Provider {
+                    status: 429,
+                    body: OPENAI_QUOTA_BODY.into(),
+                    retry_after: hint.map(Duration::from_secs),
+                },
+            );
+            let actual = remaining_cooldown(&chain, 0);
+            assert!(
+                actual > Duration::from_secs(expected - 2)
+                    && actual <= Duration::from_secs(expected),
+                "hint {hint:?} produced {actual:?}"
+            );
+        }
+        // A configured window longer than an hour is honoured as-is.
+        let long = FallbackLlmProvider::new(vec![Candidate::new(
+            "primary",
+            "m1",
+            Arc::new(ScriptedLlm::ok("primary", "m1", "unused")),
+        )])
+        .with_quota_cooldown(Duration::from_secs(7_200));
+        long.record_error(0, &quota(400, ANTHROPIC_CREDIT_BODY));
+        assert!(remaining_cooldown(&long, 0) > Duration::from_secs(7_190));
+    }
+
+    #[tokio::test]
+    async fn a_real_permanent_error_after_a_quota_failover_still_stops_the_chain() {
+        let primary = Arc::new(ScriptedLlm::err(
+            "anthropic",
+            "claude",
+            quota(400, ANTHROPIC_CREDIT_BODY),
+        ));
+        let fallback = Arc::new(ScriptedLlm::err(
+            "openai",
+            "gpt",
+            quota(
+                400,
+                r#"{"error":{"message":"Invalid schema for response_format","type":"invalid_request_error","code":null}}"#,
+            ),
+        ));
+        let spare = Arc::new(ScriptedLlm::ok("gemini", "flash", "unreachable"));
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new("anthropic", "claude", primary),
+            Candidate::new("openai", "gpt", fallback.clone()),
+            Candidate::new("gemini", "flash", spare.clone()),
+        ]);
+        let err = chain
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("a malformed request must not be retried elsewhere");
+        assert_eq!(err.class(), "provider");
+        assert_eq!(err.http_status(), Some(400));
+        assert_eq!(fallback.calls(), 1);
+        assert_eq!(spare.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_generic_invalid_key_does_not_fail_over() {
+        let primary = Arc::new(ScriptedLlm::err(
+            "anthropic",
+            "claude",
+            quota(
+                401,
+                r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+            ),
+        ));
+        let fallback = Arc::new(ScriptedLlm::ok("openai", "gpt", "unreachable"));
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new("anthropic", "claude", primary),
+            Candidate::new("openai", "gpt", fallback.clone()),
+        ]);
+        let err = chain
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("an invalid key is the operator's to fix");
+        assert_eq!(err.http_status(), Some(401));
+        assert_eq!(fallback.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn every_candidate_out_of_quota_returns_a_clear_redacted_aggregate() {
+        let primary = Arc::new(ScriptedLlm::err(
+            "anthropic",
+            "claude",
+            quota(400, ANTHROPIC_CREDIT_BODY),
+        ));
+        let fallback = Arc::new(ScriptedLlm::err(
+            "openai",
+            "gpt",
+            quota(429, OPENAI_QUOTA_BODY),
+        ));
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new("anthropic", "claude", primary.clone()),
+            Candidate::new("openai", "gpt", fallback.clone()),
+        ]);
+
+        let err = chain
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("nothing is left to answer");
+        let LlmError::AllCandidatesFailed { attempted, summary } = &err else {
+            panic!("expected AllCandidatesFailed, got {err}");
+        };
+        assert_eq!(*attempted, 2);
+        assert!(
+            summary.contains("anthropic/claude: quota-exhausted 400"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("openai/gpt: quota-exhausted 429"),
+            "{summary}"
+        );
+        let rendered = err.to_string();
+        assert!(!rendered.contains("credit balance"), "{rendered}");
+        assert!(!rendered.contains("insufficient_quota"), "{rendered}");
+        assert!(!err.is_transient());
+
+        // While both windows are open nothing is sent, and the error still
+        // says why instead of an empty summary.
+        let err = chain
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("both circuits are open");
+        assert_eq!(primary.calls(), 1);
+        assert_eq!(fallback.calls(), 1);
+        let LlmError::AllCandidatesFailed { attempted, summary } = &err else {
+            panic!("expected AllCandidatesFailed, got {err}");
+        };
+        assert_eq!(*attempted, 0);
+        assert!(
+            summary.contains("anthropic/claude: skipped (circuit open: quota-exhausted)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("openai/gpt: skipped (circuit open: quota-exhausted)"),
+            "{summary}"
+        );
     }
 
     /// Collects what a subscriber writes so a test can assert on log lines.
@@ -986,6 +1403,42 @@ mod tests {
                 .any(|line| line.contains("now answering") && line.contains("gemini-3.6-flash")),
             "the switch to the fallback is logged: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_quota_failover_logs_the_reason_and_cooldown_without_the_body() {
+        let (log, _guard, _companion) = capture_info_logs();
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new(
+                "anthropic",
+                "claude-sonnet",
+                Arc::new(ScriptedLlm::err(
+                    "anthropic",
+                    "claude-sonnet",
+                    quota(400, ANTHROPIC_CREDIT_BODY),
+                )),
+            ),
+            Candidate::new(
+                "openai",
+                "gpt-mini",
+                Arc::new(ScriptedLlm::ok("openai", "gpt-mini", "ok")),
+            ),
+        ]);
+
+        chain
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap();
+
+        let text = log.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("out of credit or quota"))
+            .expect("the quota failover is logged");
+        assert!(line.contains("claude-sonnet"), "{line}");
+        assert!(line.contains("quota-exhausted"), "{line}");
+        assert!(line.contains("cooldown_secs=900"), "{line}");
+        assert!(!text.contains("credit balance"), "the body leaked: {text}");
     }
 
     #[tokio::test]

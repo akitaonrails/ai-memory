@@ -871,6 +871,8 @@ fn session_consolidation_retry_delay(attempt: u32) -> Duration {
 /// provider configuration (`NotConfigured`), a schema failure (`Schema`), a
 /// malformed-request `4xx` — reproduces on identical inputs, so the job goes
 /// terminal and the heuristic page the SessionEnd hook already wrote remains.
+/// Exhausted credit or quota (`LlmError::is_quota_exhausted`) is the one
+/// exception: not transient, but kept on the queue's backoff.
 ///
 /// A `ConsolidatorError::Serde` is not an `LlmError`: it is this crate's own
 /// JSON failure on an unchanged input and stays terminal on its own.
@@ -878,7 +880,12 @@ fn is_terminal_session_consolidation_error(
     error: &ai_memory_consolidate::ConsolidatorError,
 ) -> bool {
     match error {
-        ai_memory_consolidate::ConsolidatorError::Llm(llm) => !llm.is_transient(),
+        // Exhausted credit or quota is not worth an in-process retry seconds
+        // later, but a top-up or quota reset can clear it within the queue's
+        // backoff window, so it keeps the job queued like a 429 always did.
+        ai_memory_consolidate::ConsolidatorError::Llm(llm) => {
+            !llm.is_transient() && !llm.is_quota_exhausted()
+        }
         ai_memory_consolidate::ConsolidatorError::Serde(_) => true,
         _ => false,
     }
@@ -5435,6 +5442,18 @@ mod tests {
                 retry_after: None,
             }),
             ConsolidatorError::Llm(LlmError::Http(connect)),
+            // Exhausted credit or quota: not retried in place, but kept on
+            // the queue's backoff so a top-up or quota reset can clear it.
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 400,
+                body: r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#.into(),
+                retry_after: None,
+            }),
+            ConsolidatorError::Llm(LlmError::Provider {
+                status: 429,
+                body: r#"{"error":{"type":"insufficient_quota","code":"insufficient_quota"}}"#.into(),
+                retry_after: None,
+            }),
         ];
         for error in &not_terminal {
             assert!(
