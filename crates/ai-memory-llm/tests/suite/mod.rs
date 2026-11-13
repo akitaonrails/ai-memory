@@ -9,6 +9,7 @@ mod cursor_provider;
 mod embedder_retry_after;
 mod extra_headers_on_the_wire;
 mod fallback_provider;
+mod gemini_provider;
 mod openai_compat_embedder;
 mod openai_compat_guardrails;
 mod openai_compat_retry_after;

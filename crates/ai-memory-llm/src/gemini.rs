@@ -137,6 +137,8 @@ struct GeminiResponse {
 struct GeminiCandidate {
     #[serde(default)]
     content: Option<GeminiCandidateContent>,
+    #[serde(rename = "finishReason", default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +185,23 @@ impl LlmProvider for GeminiProvider {
         let prepared = prepare_schema_for_gemini(schema)?;
         let body = self.build_request(&request, Some(prepared));
         let response: GeminiResponse = self.post(&body).await?;
+        // MAX_TOKENS is an output-budget stop, even when the partial text
+        // happens to parse. Preserve it for callers that split the batch.
+        // https://ai.google.dev/api/generate-content#FinishReason
+        if response
+            .candidates
+            .first()
+            .and_then(|candidate| candidate.finish_reason.as_deref())
+            == Some("MAX_TOKENS")
+        {
+            return Err(LlmError::TruncatedResponse {
+                model: self.model.clone(),
+                completion_tokens: response
+                    .usage_metadata
+                    .as_ref()
+                    .map(|usage| usage.candidates_token_count),
+            });
+        }
         let text = first_text(&response).ok_or_else(|| {
             LlmError::UnexpectedShape("gemini response had no candidate text".into())
         })?;

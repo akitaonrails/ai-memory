@@ -33,6 +33,9 @@ version in [`docs/changelog/`](docs/changelog/):
   project's legacy key. The default mailbox now opens through the project id.
   A request that names the clashing project keeps the page and shows a warning
   pointing to `merge-project`, where it used to return a bare 400. (#2224)
+- Fixed Gemini structured replies stopped at `MAX_TOKENS` being accepted or
+  reported as unrelated JSON errors. They now report truncation before parsing,
+  allowing profile classification to split the batch and recover its verdicts. (#2218)
 - The root-only `/pending` triage page now sends `Cache-Control: no-store`,
   like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
   cached copy could list a proposal an operator had already approved or
