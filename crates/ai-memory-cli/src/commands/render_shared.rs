@@ -2762,10 +2762,10 @@ fn test_home_override() -> Option<Option<PathBuf>> {
 /// Test-only guard that makes [`portable_hook_home`] render `home` as `"$HOME"`
 /// for the duration of its lifetime, restoring the real environment on drop.
 /// Lets sibling modules exercise recognition of home-relative hook commands.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct TestHookHome;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl TestHookHome {
     pub(crate) fn set(home: Option<PathBuf>) -> Self {
         TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(home));
@@ -2773,7 +2773,7 @@ impl TestHookHome {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for TestHookHome {
     fn drop(&mut self) {
         TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
