@@ -196,6 +196,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- The interface-language picker in the top bar now follows the dashboard's
+  control style instead of the browser's native grey select: the same border,
+  radius, surface colors and height as the search box beside it, its own
+  arrow, and the accent focus ring, in both the light and dark themes and on
+  narrow screens. Switching language still works through the
+  `ai_memory_language` cookie. (#2228)
 - The auto-improvement reviewer now has explicit instructions for user
   corrections. When the user rejects, corrects, interrupts or undoes the
   agent's work and gives a reason, it proposes a `_rules/` page, or a patch to

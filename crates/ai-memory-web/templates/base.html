@@ -44,7 +44,7 @@
       <button type="button" id="ai-memory-logout" class="quiet-button" data-error="{{ i18n.text("web-log-out-failed") }}">{{ i18n.text("web-log-out") }}</button>
       {% endblock %}
       <label for="interface-language" class="sr-only">{{ i18n.text("web-language") }}</label>
-      <select id="interface-language" aria-label="{{ i18n.text("web-language") }}">
+      <select id="interface-language" class="language-select" aria-label="{{ i18n.text("web-language") }}">
         <option value="en" lang="en" {% if i18n.tag() == "en" %}selected{% endif %}>English</option>
         <option value="pt-BR" lang="pt-BR" {% if i18n.tag() == "pt-BR" %}selected{% endif %}>Português (Brasil)</option>
       </select>
