@@ -29,6 +29,10 @@ version in [`docs/changelog/`](docs/changelog/):
   nothing to compact. The figures now read `unknown` and a check reports that
   they could not be read. A failed read still never takes the page down.
   (#2215)
+- Fixed the web inbox refusing to load when a project name was also another
+  project's legacy key. The default mailbox now opens through the project id.
+  A request that names the clashing project keeps the page and shows a warning
+  pointing to `merge-project`, where it used to return a bare 400. (#2224)
 - The root-only `/pending` triage page now sends `Cache-Control: no-store`,
   like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
   cached copy could list a proposal an operator had already approved or

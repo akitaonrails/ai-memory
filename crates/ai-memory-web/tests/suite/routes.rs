@@ -4938,6 +4938,75 @@ async fn web_read_of_an_ambiguous_project_name_is_a_400() {
     assert_eq!(ok.status(), StatusCode::OK);
 }
 
+/// A name two projects answer to must not take the whole mailbox console down:
+/// the default mailbox opens through the project's id, and an explicit request
+/// by the clashing name keeps the page and says why it has nothing to show.
+#[tokio::test]
+async fn web_inbox_survives_an_ambiguous_project_name() {
+    use ai_memory_core::repository_identity::{IdentitySource, IdentityStyle, RepositoryIdentity};
+
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let declared = store
+        .writer
+        .get_or_create_project(ws, "widget", None)
+        .await
+        .unwrap();
+    let sender = store
+        .writer
+        .get_or_create_project(ws, "sender", None)
+        .await
+        .unwrap();
+    let (clone, _) = store
+        .writer
+        .resolve_project_by_identity_for_capture(
+            ws,
+            RepositoryIdentity {
+                identity: "github.com/acme/widget".to_owned(),
+                source: IdentitySource::GitRemote,
+            },
+            IdentityStyle::Path,
+            "acme-widget",
+            Some("/work/widget".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(declared, clone);
+    send_mail(
+        &store,
+        (ws, sender),
+        (ws, declared),
+        "Queued for widget",
+        "body",
+    )
+    .await;
+    let web = router(store.reader.clone(), wiki.clone());
+
+    // No selection: the project with queued mail is opened by id.
+    let (status, body) = get_text(&web, "/inbox", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Queued for widget"), "{body}");
+    assert!(!body.contains("Mailbox unavailable"), "{body}");
+
+    // By the clashing name: the console stays up with a warning and no mail.
+    let (status, body) = get_text(&web, "/inbox?workspace=default&project=widget", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("Mailbox unavailable"), "{body}");
+    assert!(body.contains("is ambiguous in workspace"), "{body}");
+    assert!(!body.contains("Queued for widget"), "{body}");
+
+    // Control: the unambiguous project opens without a warning.
+    let (status, body) = get_text(&web, "/inbox?workspace=default&project=acme-widget", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("Mailbox unavailable"), "{body}");
+}
+
 /// Pins a documented, by-design boundary (see `docs/users.md`): under a
 /// trusted-proxy deployment, a proxied non-root end-user is authenticated as
 /// [`ai_memory_core::AuthLevel::User`] with an [`ai_memory_core::ActorContext`]
