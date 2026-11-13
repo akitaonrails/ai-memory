@@ -2733,7 +2733,7 @@ fn posix_native_hook_command_with(
 
 /// The home that native POSIX hook commands write as `"$HOME"`, read from the
 /// environment and the per-context opt-out. See [`portable_hook_home_from`].
-fn portable_hook_home(agent: &str, absolute: bool) -> Option<PathBuf> {
+pub(crate) fn portable_hook_home(agent: &str, absolute: bool) -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(home) = test_home_override() {
         return portable_hook_home_from(agent, home.map(std::ffi::OsString::from), absolute, None);
@@ -2757,6 +2757,27 @@ thread_local! {
 #[cfg(test)]
 fn test_home_override() -> Option<Option<PathBuf>> {
     TEST_HOME_OVERRIDE.with(|home| home.borrow().clone())
+}
+
+/// Test-only guard that makes [`portable_hook_home`] render `home` as `"$HOME"`
+/// for the duration of its lifetime, restoring the real environment on drop.
+/// Lets sibling modules exercise recognition of home-relative hook commands.
+#[cfg(test)]
+pub(crate) struct TestHookHome;
+
+#[cfg(test)]
+impl TestHookHome {
+    pub(crate) fn set(home: Option<PathBuf>) -> Self {
+        TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(home));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHookHome {
+    fn drop(&mut self) {
+        TEST_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
 }
 
 /// The home to substitute as `"$HOME"`, or `None` for absolute paths.
@@ -2793,7 +2814,7 @@ fn absolute_env_opt_out(value: &std::ffi::OsStr) -> bool {
 /// machine that runs the hook. Anything outside `home`, or whose remainder
 /// holds a character that is special inside double quotes, keeps the
 /// [`shell_quote`] form.
-fn posix_path_arg(path: &Path, home: Option<&Path>) -> String {
+pub(crate) fn posix_path_arg(path: &Path, home: Option<&Path>) -> String {
     if let Some(rest) = home.and_then(|home| path.strip_prefix(home).ok()) {
         let rest = rest.to_string_lossy();
         if rest.is_empty() {
@@ -2807,6 +2828,24 @@ fn posix_path_arg(path: &Path, home: Option<&Path>) -> String {
         }
     }
     shell_quote(&path.to_string_lossy())
+}
+
+/// Whether `raw` is the portable `"$HOME"` / `"$HOME/<rest>"` form that
+/// [`posix_path_arg`] emits for a path under the home directory. The upgrade
+/// hook recognizer accepts this as an installer-generated word so a
+/// home-relative install (#2035) is still recognized for a refresh.
+pub(crate) fn is_portable_home_arg(raw: &str) -> bool {
+    if raw == "\"$HOME\"" {
+        return true;
+    }
+    raw.strip_prefix("\"$HOME/")
+        .and_then(|rest| rest.strip_suffix('"'))
+        .is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| !matches!(c, '"' | '$' | '`' | '\\') && !c.is_control())
+        })
 }
 
 fn native_data_dir_posix_arg(data_dir: Option<&Path>, home: Option<&Path>) -> String {
