@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `backup --to` and `export-okf --to` now decode the downloaded archive to its
+  end before replacing the destination, so a complete `200` whose gzip body has
+  a corrupt CRC or a missing trailer is refused and the existing archive is
+  kept, instead of being overwritten with bytes `restore` then rejects. The
+  earlier check read only the gzip signature. (#2206)
 - The dashboard's envelope icon (sidebar Inbox link, inbox rows and empty
   state, and the Open inbox / Message agent buttons) now renders at the
   size and baseline of the surrounding text on macOS. #2003 left `✉`
@@ -20,7 +25,6 @@ version in [`docs/changelog/`](docs/changelog/):
   resolves it to Menlo, whose glyph sits small and low. The templates now
   draw it as an inline SVG that inherits the text colour, and the three
   translated button labels no longer carry the glyph. (#2230)
-
 - The root-only `/pending` triage page now sends `Cache-Control: no-store`,
   like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
   cached copy could list a proposal an operator had already approved or
