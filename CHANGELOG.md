@@ -54,6 +54,10 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- Fixed CLI/admin message sends counting the body, subject and evidence caps
+  in UTF-8 bytes instead of Unicode characters after scrubbing. Multibyte text
+  within both the character budgets and the existing store byte limits is now
+  preserved. ASCII truncation and the final store byte limits are unchanged.
 
 ## [3.4.6] - 2026-11-13
 

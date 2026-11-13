@@ -3626,6 +3626,15 @@ fn map_message_store_err(e: StoreError) -> (StatusCode, Json<serde_json::Value>)
     }
 }
 
+fn cap_message_chars(input: &str, max_chars: usize) -> String {
+    // Reuse the existing ellipsis and byte-safe cut at a character boundary.
+    let max_bytes = input
+        .char_indices()
+        .nth(max_chars)
+        .map_or(input.len(), |(end, _)| end);
+    ai_memory_core::truncate_utf8_bytes(input, max_bytes)
+}
+
 /// `POST /admin/messages/send` — drop a message into another project's
 /// inbox (V64). Both scopes are resolved with the no-create lookup: sending
 /// to a typo'd project must fail closed rather than silently creating it.
@@ -3652,21 +3661,16 @@ async fn handle_send_message(
         };
 
     let sanitizer = ai_memory_core::Sanitizer::builtin();
-    let body =
-        ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
+    let body = cap_message_chars(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
     let subject = req
         .subject
         .as_deref()
-        .map(|s| {
-            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS)
-        })
+        .map(|s| cap_message_chars(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS))
         .filter(|s| !s.is_empty());
     let evidence = req
         .evidence
         .as_deref()
-        .map(|value| {
-            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(value), MESSAGE_EVIDENCE_MAX_CHARS)
-        })
+        .map(|value| cap_message_chars(&sanitizer.scrub(value), MESSAGE_EVIDENCE_MAX_CHARS))
         .filter(|value| !value.trim().is_empty());
     if req.nature == ai_memory_core::MessageNature::Measured && evidence.is_none() {
         return (
@@ -10358,6 +10362,140 @@ mod tests {
                 .to_string(),
             ))
             .unwrap()
+    }
+
+    struct MessageTextHarness {
+        _tmp: TempDir,
+        store: Store,
+        router: Router,
+        workspace: WorkspaceId,
+        recipient: ProjectId,
+    }
+
+    impl MessageTextHarness {
+        async fn new() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let store = Store::open(tmp.path()).unwrap();
+            let workspace = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            store
+                .writer
+                .get_or_create_project(workspace, "sender", None)
+                .await
+                .unwrap();
+            let recipient = store
+                .writer
+                .get_or_create_project(workspace, "recipient", None)
+                .await
+                .unwrap();
+            let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+            let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+            Self {
+                _tmp: tmp,
+                store,
+                router,
+                workspace,
+                recipient,
+            }
+        }
+
+        async fn send(
+            &self,
+            body: &str,
+            subject: &str,
+            evidence: &str,
+        ) -> ai_memory_core::AgentMessage {
+            let response = self.router.clone().oneshot(
+                Request::builder().method("POST").uri("/admin/messages/send")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({
+                        "from_workspace": "default", "from_project": "sender",
+                        "to_workspace": "default", "to_project": "recipient",
+                        "body": body, "subject": subject, "nature": "measured", "evidence": evidence,
+                    }).to_string())).unwrap()
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                .await
+                .unwrap();
+            let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            self.store
+                .reader
+                .list_messages(
+                    self.workspace,
+                    self.recipient,
+                    ai_memory_core::MessageBox::Inbox,
+                    50,
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|message| message.id.to_string() == sent["message_id"].as_str().unwrap())
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_message_character_caps_preserve_multibyte_text() {
+        let h = MessageTextHarness::new().await;
+        let body = format!("{} SENTINEL", "界".repeat(3_000));
+        let subject = format!("{} SENTINEL", "界".repeat(100));
+        let evidence = format!("{} EVIDENCE", "界".repeat(100));
+        let stored = h.send(&body, &subject, &evidence).await;
+        assert_eq!(stored.body, body);
+        assert_eq!(stored.subject.as_deref(), Some(subject.as_str()));
+        assert_eq!(stored.evidence.as_deref(), Some(evidence.as_str()));
+    }
+
+    #[tokio::test]
+    async fn admin_message_character_caps_keep_ascii_and_clip_oversized_text() {
+        let h = MessageTextHarness::new().await;
+        let body = "x".repeat(MESSAGE_BODY_MAX_CHARS);
+        let subject = "s".repeat(MESSAGE_SUBJECT_MAX_CHARS);
+        let evidence = "e".repeat(MESSAGE_EVIDENCE_MAX_CHARS);
+        let stored = h.send(&body, &subject, &evidence).await;
+        assert_eq!(stored.body, body);
+        assert_eq!(stored.subject.as_deref(), Some(subject.as_str()));
+        assert_eq!(stored.evidence.as_deref(), Some(evidence.as_str()));
+
+        let over_body = format!("{body}tail");
+        let over_evidence = format!("{evidence}tail");
+        let over_subject = "界".repeat(MESSAGE_SUBJECT_MAX_CHARS + 1);
+        let clipped = h.send(&over_body, &over_subject, &over_evidence).await;
+        assert_eq!(
+            clipped.body,
+            format!("{}…", "x".repeat(MESSAGE_BODY_MAX_CHARS - 3))
+        );
+        assert_eq!(
+            clipped.evidence,
+            Some(format!("{}…", "e".repeat(MESSAGE_EVIDENCE_MAX_CHARS - 3)))
+        );
+        assert_eq!(
+            clipped.subject,
+            Some(format!("{}…", "界".repeat(MESSAGE_SUBJECT_MAX_CHARS - 1)))
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_message_character_caps_scrub_before_truncating() {
+        let h = MessageTextHarness::new().await;
+        let fake_key = format!("sk-{}", "A".repeat(48));
+        let body = format!("{} {fake_key}", "x".repeat(MESSAGE_BODY_MAX_CHARS - 10));
+        let subject = format!("{} {fake_key}", "s".repeat(MESSAGE_SUBJECT_MAX_CHARS - 10));
+        let evidence = format!("{} {fake_key}", "e".repeat(MESSAGE_EVIDENCE_MAX_CHARS - 10));
+        let stored = h.send(&body, &subject, &evidence).await;
+        for text in [
+            &stored.body,
+            stored.subject.as_ref().unwrap(),
+            stored.evidence.as_ref().unwrap(),
+        ] {
+            assert!(!text.contains("sk-"), "{text}");
+            assert!(!text.contains(&"A".repeat(6)), "{text}");
+            assert!(text.contains("[REDAC"), "{text}");
+        }
     }
 
     #[tokio::test]

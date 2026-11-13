@@ -148,7 +148,8 @@ ai-memory message cancel --all         # clear this project's outbox
 ```
 
 The CLI resolves the current project as the sender/reader scope, the same way
-`ai-memory handoffs` does.
+`ai-memory handoffs` does. Its message text caps count Unicode characters after
+secret scrubbing.
 
 Both CLI and MCP sends run `message_send` admission against the **recipient**
 scope: deciding webhooks run before insertion, and observers run asynchronously
