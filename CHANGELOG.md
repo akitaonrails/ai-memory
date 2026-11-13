@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The TypeScript SDK's `pages.update` preserves profile entry stack filters
+  and enforcement metadata when editing the body. (#2207)
+
 - `export-okf` no longer silently drops a concept page that occupies an
   OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
   hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
@@ -180,8 +183,6 @@ version in [`docs/changelog/`](docs/changelog/):
 - The TypeScript SDK's `pages.update` loads the complete body before applying
   a change. It refuses an incomplete body when the read cap prevents this,
   so a metadata-only edit cannot replace page text with a truncated preview (#2054).
-- The TypeScript SDK's `pages.update` preserves profile entry stack filters
-  and enforcement metadata when editing the body. (#2207)
 - Fixed `ai-memory-wikisync sync --propagate-deletes` deleting a newer server
   page after a repository deletion when only unexported metadata had changed.
   A newer version now requires the usual conflict resolution (#2055).
