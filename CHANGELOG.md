@@ -11,7 +11,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
-### Security
+### Fixed
 
 - Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
   resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
