@@ -53,7 +53,7 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message", "prompt_re
 /// The raw field that carries the assistant's final message for `(agent, event)`,
 /// or `None` when the pair has no verified assistant-message field.
 ///
-/// Closed table: Claude Code, Codex, and OpenCode support `Stop` capture.
+/// Closed table: Claude Code, Codex, OpenCode, and Pi support `Stop` capture.
 /// Extend deliberately — a new entry opts an agent/event into capture and MUST
 /// have its field name present in [`ASSISTANT_MESSAGE_FIELDS`] so the strip
 /// covers it (enforced by `closed_table_fields_are_all_stripped`).
@@ -62,12 +62,20 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message", "prompt_re
 /// codex-cli 0.154.0, #743) — the same spelling Claude Code uses, so no new
 /// entry in [`ASSISTANT_MESSAGE_FIELDS`] is needed. Codex has no `SubagentStop`
 /// in its supported event vocabulary, so only `(Codex, Stop)` is added.
+///
+/// Pi has no raw assistant field on its `agent_end` (→ `Stop`) payload; its
+/// extension reads the final `role: "assistant"` message from the session
+/// (`ctx.sessionManager.getEntries()`, Pi's `session-format.md`) and funnels it
+/// through the native `ai-memory hook --agent pi --capture-assistant` under the
+/// same `last_assistant_message` spelling, so the Rust sanitizer boundary runs
+/// before the text reaches the wire (#2240). No new strip field is needed.
 #[must_use]
 pub fn assistant_message_field(agent: AgentKind, event: HookEvent) -> Option<&'static str> {
     match (agent, event) {
-        (AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode, HookEvent::Stop) => {
-            Some("last_assistant_message")
-        }
+        (
+            AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode | AgentKind::Pi,
+            HookEvent::Stop,
+        ) => Some("last_assistant_message"),
         _ => None,
     }
 }
@@ -240,8 +248,9 @@ pub fn strip_assistant_message_raw(raw: &mut serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
-    /// Only Claude Code, Codex, and OpenCode Stop are capture candidates; every
-    /// other agent/event pair across the full agent surface must return `None`.
+    /// Only Claude Code, Codex, OpenCode, and Pi Stop are capture candidates;
+    /// every other agent/event pair across the full agent surface must return
+    /// `None`.
     #[test]
     fn only_supported_stop_events_are_capture_candidates() {
         let events = [
@@ -262,7 +271,7 @@ mod tests {
             for event in events {
                 let expected = matches!(
                     agent,
-                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode
+                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode | AgentKind::Pi
                 ) && event == HookEvent::Stop;
                 assert_eq!(
                     assistant_message_field(agent, event).is_some(),

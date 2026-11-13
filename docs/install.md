@@ -1151,6 +1151,9 @@ opt-in**: enable the server first, then the client:
    ai-memory install-hooks --agent claude-code --capture-assistant --apply
    # Codex is supported too — its Stop payload carries last_assistant_message:
    ai-memory install-hooks --agent codex --capture-assistant --apply
+   # Pi has no raw assistant field, so its extension funnels the reply through
+   # the native binary:
+   ai-memory install-hooks --agent pi --capture-assistant --apply
    ```
 
 The client sanitizes (built-in patterns) and truncates the excerpt before it
@@ -1158,9 +1161,13 @@ touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
 before storing. If either side is off, or the marker is malformed, the Stop
 stays empty. Re-running `install-hooks` without `--capture-assistant` preserves
 an existing opt-in. To remove it, run `ai-memory uninstall --only hooks
---apply --yes`, then reinstall without the flag. `--capture-assistant` is Claude Code, Codex and
-OpenCode 2 (`--agent opencode2`) on a native hook platform only; on any other agent or the script fallback the
-installer refuses it rather than enabling something that cannot take effect. Assistant text is
+--apply --yes`, then reinstall without the flag. `--capture-assistant` is Claude Code, Codex,
+OpenCode 2 (`--agent opencode2`) and Pi on a native hook platform only; on any other agent or the script fallback the
+installer refuses it rather than enabling something that cannot take effect. Pi reaches the reply
+differently from the others — it has no raw assistant field, so its extension reads the final
+`role: "assistant"` message from the saved session and pipes it through the native `ai-memory hook`
+binary (never over the extension's own HTTP), which is the only path that runs the sanitizer.
+Assistant text is
 privacy-sensitive. Read the `SECURITY.md` notes on what it can contain and where
 it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
 is configured) before enabling it.

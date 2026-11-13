@@ -13,6 +13,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Pi assistant-response capture. Installing the Pi hooks with
+  `--capture-assistant` (and the server's `capture_assistant` enabled) records
+  the assistant's final turn on `agent_end`. Pi exposes no raw assistant field
+  on its hooks, so the generated extension reads the last `role: "assistant"`
+  message from the saved session and routes it through the native `ai-memory
+  hook` binary — the one path that runs the sanitizer (invariant #6) — instead
+  of its own direct-HTTP post; a missing binary or an absent reply falls back to
+  the ordinary Stop so the turn is still recorded. With the opt-in off the
+  extension is byte-identical to before. `--capture-assistant` now accepts
+  `--agent pi` alongside Claude Code, Codex and OpenCode 2. (#2240)
 - `[auto_improve] include_global_titles` (off by default) lists the titles of
   the reserved `_global` scope's pages to the auto-improvement reviewer, read
   only, in the per-session review and the cross-session experience pass.
