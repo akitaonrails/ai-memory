@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - The document importer now excludes DOCX moved-source revisions
   (`w:moveFrom`) while retaining the destination text (`w:moveTo`). It
   previously extracted both copies of a tracked move, duplicating text that
-  appears only once in the accepted document.
+  appears only once in the accepted document. (#2236)
 
 ## [3.4.6] - 2026-11-13
 
