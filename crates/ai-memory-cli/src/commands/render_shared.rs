@@ -1245,7 +1245,7 @@ pub(crate) const ZCODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const ZCODE_HOOK_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Hermes Agent tool events ai-memory hooks. Each pair is
-/// `(event-name-in-~/.hermes/config.yaml, native `hook --event` value)`.
+/// `(event-name-in-the-Hermes-config.yaml, native `hook --event` value)`.
 ///
 /// Verified against Hermes v0.22.2 (`agent/shell_hooks.py`): a configured
 /// `command` is split into argv by `shlex.split` and executed **without a
@@ -1301,7 +1301,7 @@ pub(crate) enum HermesHookSet {
 /// the turn while it runs, so the entry stays well under that.
 pub(crate) const HERMES_HOOK_TIMEOUT_SECONDS: u64 = 20;
 
-/// The ready-to-paste `hooks:` block for `~/.hermes/config.yaml`.
+/// The ready-to-paste `hooks:` block for the Hermes home's `config.yaml`.
 ///
 /// `command:` must be a bare argv line — Hermes splits it itself, so the
 /// `KEY=value script` prefix every shell-run harness gets would be parsed as

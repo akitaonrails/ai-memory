@@ -3,7 +3,7 @@
 {% block title %}{{ i18n.text("web-projects-ai-memory") }}{% endblock %}
 
 {% block content %}
-<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-workspace-overview") }}</p><h1>{{ i18n.text("web-memory-dashboard") }}</h1><p>{{ i18n.text("web-track-activity-investigate-token-usage-and-coordinate-your-agents") }}</p></div><a href="inbox" class="primary-button">{{ i18n.text("web-open-inbox-projects") }}</a></div>
+<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-workspace-overview") }}</p><h1>{{ i18n.text("web-memory-dashboard") }}</h1><p>{{ i18n.text("web-track-activity-investigate-token-usage-and-coordinate-your-agents") }}</p></div><a href="inbox" class="primary-button">{% include "_icon_envelope.html" %}{{ i18n.text("web-open-inbox-projects") }}</a></div>
 <section aria-label="{{ i18n.text("web-memory-health-overview") }}"><div class="metric-grid">
   <a class="metric-card metric-link" href="#project-list"><span>{{ i18n.text("web-projects") }}</span><span class="metric-marker" aria-hidden="true">▦</span><strong>{{ dashboard.project_count }}</strong><small>{{ i18n.text("web-visible-in-your-workspace") }}</small></a>
   <a class="metric-card metric-link" href="?sort=sessions#project-list"><span>{{ i18n.text("web-sessions-agent") }}</span><span class="metric-marker" aria-hidden="true">◈</span><strong>{{ dashboard.session_count }}</strong><small>{{ i18n.text("web-projects-with-most-sessions-first") }}</small></a>

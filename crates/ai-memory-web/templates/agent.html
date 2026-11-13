@@ -2,7 +2,7 @@
 {% block title %}{{ card.label }} · {{ project }} {{ i18n.text("web-ai-memory") }}{% endblock %}
 {% block content %}
 <nav class="breadcrumbs" aria-label="{{ i18n.text("web-breadcrumb") }}"><a href=".">{{ i18n.text("web-projects") }}</a><span>/</span><a href="{{ project_href }}">{{ project }}</a><span>/</span><span aria-current="page">{{ card.label }}</span></nav>
-<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-agent-insights") }} {{ workspace }}</p><h1>{{ card.label }}</h1><p>{{ i18n.one("web-agent-coverage-subtitle", project) }}</p></div><a class="primary-button" href="{{ card.compose_href }}">{{ i18n.text("web-message-agent") }}</a></div>
+<div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-agent-insights") }} {{ workspace }}</p><h1>{{ card.label }}</h1><p>{{ i18n.one("web-agent-coverage-subtitle", project) }}</p></div><a class="primary-button" href="{{ card.compose_href }}">{% include "_icon_envelope.html" %}{{ i18n.text("web-message-agent") }}</a></div>
 <div class="metric-grid four-metrics">
   <a class="metric-card metric-link" href="#agent-sessions"><span>{{ i18n.text("web-recorded-sessions") }}</span><strong>{{ card.sessions }}</strong><small>{{ i18n.one("web-agent-sessions-without-end", card.open) }}</small></a>
   <a class="metric-card metric-link" href="{{ project_href }}?tab=tokens&calls_agent={{ card.kind }}#token-usage"><span>{{ i18n.text("web-reported-tokens") }}</span><strong>{{ card.tokens }}</strong><small>{{ i18n.text("web-input-output-cache") }}</small></a>

@@ -40,7 +40,7 @@ pub fn run(args: CompareArgs) -> Result<()> {
     let fts = args.fts.as_deref().map(load).transpose()?;
     print!(
         "{}",
-        to_markdown(&compare(&baseline, &candidate, fts.as_ref()))
+        to_markdown(&compare(&baseline, &candidate, fts.as_ref())?)
     );
     Ok(())
 }
@@ -155,11 +155,41 @@ fn label(report: &SavedReport) -> String {
     format!("{} ({}) at {commit}", report.config, report.mode)
 }
 
+fn measured_cutoffs(report: &SavedReport, side: &str) -> Result<Vec<usize>> {
+    let expected: Vec<usize> = report
+        .per_question
+        .first()
+        .map(|question| question.hit_at.keys().copied().collect())
+        .unwrap_or_default();
+    for question in &report.per_question {
+        let hit: Vec<usize> = question.hit_at.keys().copied().collect();
+        let recall: Vec<usize> = question.recall_at.keys().copied().collect();
+        if hit != recall {
+            bail!(
+                "{side} question {} has different hit and recall cutoff grids: {hit:?} vs {recall:?}",
+                question.question_id
+            );
+        }
+        if hit != expected {
+            bail!(
+                "{side} question {} has cutoff grid {hit:?}, different from the report's {expected:?}",
+                question.question_id
+            );
+        }
+    }
+    Ok(expected)
+}
+
 fn compare(
     baseline: &SavedReport,
     candidate: &SavedReport,
     fts: Option<&SavedReport>,
-) -> Comparison {
+) -> Result<Comparison> {
+    let baseline_cutoffs = measured_cutoffs(baseline, "baseline")?;
+    let candidate_cutoffs = measured_cutoffs(candidate, "candidate")?;
+    let fts_cutoffs = fts
+        .map(|report| measured_cutoffs(report, "FTS"))
+        .transpose()?;
     let by_id = |report: &SavedReport| -> BTreeMap<String, usize> {
         report
             .per_question
@@ -170,11 +200,10 @@ fn compare(
     };
     let (base_ids, cand_ids) = (by_id(baseline), by_id(candidate));
     let fts_ids = fts.map(by_id);
-    let mut ks: Vec<usize> = baseline
-        .per_question
+    let mut ks: Vec<usize> = baseline_cutoffs
         .iter()
-        .chain(&candidate.per_question)
-        .flat_map(|question| question.hit_at.keys().copied())
+        .chain(&candidate_cutoffs)
+        .copied()
         .collect();
     ks.sort_unstable();
     ks.dedup();
@@ -187,6 +216,23 @@ fn compare(
         .filter_map(|b| Some((b, &candidate.per_question[*cand_ids.get(&b.question_id)?])))
         .collect();
     let paired = pairs.len();
+    // A coarser grid makes identical first hits look like ranking moves, so
+    // both reports must measure the same cutoffs.
+    if paired > 0 && baseline_cutoffs != candidate_cutoffs {
+        bail!(
+            "baseline and candidate have incompatible cutoff grids: {baseline_cutoffs:?} vs {candidate_cutoffs:?}; compare reports generated with the same --ks"
+        );
+    }
+    if let (Some(grid), Some(ids)) = (&fts_cutoffs, &fts_ids)
+        && grid != &candidate_cutoffs
+        && pairs
+            .iter()
+            .any(|(_, question)| ids.contains_key(&question.question_id))
+    {
+        bail!(
+            "candidate and FTS have incompatible cutoff grids: {candidate_cutoffs:?} vs {grid:?}; compare reports generated with the same --ks"
+        );
+    }
     let mean = |values: &mut dyn Iterator<Item = f64>| {
         if paired == 0 {
             0.0
@@ -194,10 +240,9 @@ fn compare(
             values.sum::<f64>() / paired as f64
         }
     };
-    let hit = |question: &SavedQuestion, k: usize| question.hit_at.get(&k).copied().unwrap_or(0.0);
+    let hit = |question: &SavedQuestion, k: usize| question.hit_at[&k];
     let hits = |question: &SavedQuestion, k: usize| hit(question, k) > 0.0;
-    let recall =
-        |question: &SavedQuestion, k: usize| question.recall_at.get(&k).copied().unwrap_or(0.0);
+    let recall = |question: &SavedQuestion, k: usize| question.recall_at[&k];
     let cutoffs = ks
         .iter()
         .map(|&k| CutoffRow {
@@ -272,7 +317,7 @@ fn compare(
             .map(|question| question.question_id.clone())
             .collect()
     };
-    Comparison {
+    Ok(Comparison {
         baseline: label(baseline),
         candidate: label(candidate),
         only_baseline: unpaired(baseline, &cand_ids),
@@ -283,7 +328,7 @@ fn compare(
         moved,
         by_type,
         fts_checked: fts.is_some(),
-    }
+    })
 }
 
 fn cutoff(hit: Option<usize>) -> String {
@@ -415,6 +460,138 @@ mod tests {
         .unwrap()
     }
 
+    fn measured_at(mut question: serde_json::Value, ks: &[usize]) -> serde_json::Value {
+        for metric in ["hit_at", "recall_at"] {
+            question[metric]
+                .as_object_mut()
+                .unwrap()
+                .retain(|k, _| ks.contains(&k.parse::<usize>().unwrap()));
+        }
+        question
+    }
+
+    fn compare_files(
+        baseline: Vec<serde_json::Value>,
+        candidate: Vec<serde_json::Value>,
+        fts: Option<Vec<serde_json::Value>>,
+    ) -> Result<()> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, questions: Vec<serde_json::Value>| {
+            let path = tmp.path().join(name);
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "commit": "historical",
+                    "config": name,
+                    "mode": "server",
+                    "per_question": questions,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            path
+        };
+        run(CompareArgs {
+            baseline: write("baseline.json", baseline),
+            candidate: write("candidate.json", candidate),
+            fts: fts.map(|questions| write("fts.json", questions)),
+        })
+    }
+
+    #[test]
+    fn incompatible_cutoffs_do_not_become_zero_measurements() {
+        let q = question("q", "user", Some(1));
+        let error = compare_files(
+            vec![measured_at(q.clone(), &[5])],
+            vec![measured_at(q, &[1, 5])],
+            None,
+        )
+        .expect_err("an unmeasured cutoff must not become a zero or a first-hit move");
+        assert!(error.to_string().contains("cutoff"), "{error}");
+    }
+
+    #[test]
+    fn incomplete_hit_or_recall_grids_are_refused_in_every_report() {
+        let q = question("q", "user", Some(1));
+        for side in 0..3 {
+            for metric in ["hit_at", "recall_at"] {
+                let mut malformed = q.clone();
+                malformed[metric].as_object_mut().unwrap().remove("3");
+                let mut rows = [vec![q.clone()], vec![q.clone()], vec![q.clone()]];
+                rows[side] = vec![malformed];
+                let [baseline, candidate, fts] = rows;
+                let error = compare_files(baseline, candidate, Some(fts))
+                    .expect_err("a missing metric cell must not be padded with zero");
+                assert!(error.to_string().contains("q"), "{error}");
+                assert!(error.to_string().contains("cutoff"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn inconsistent_question_grids_are_refused_in_every_report() {
+        let q1 = question("q1", "user", Some(1));
+        let q2 = question("q2", "user", Some(1));
+        for side in 0..3 {
+            let mut rows = [
+                vec![q1.clone(), q2.clone()],
+                vec![q1.clone(), q2.clone()],
+                vec![q1.clone(), q2.clone()],
+            ];
+            rows[side][1] = measured_at(q2.clone(), &[5]);
+            let [baseline, candidate, fts] = rows;
+            let error = compare_files(baseline, candidate, Some(fts))
+                .expect_err("each row must contain the report's complete cutoff grid");
+            assert!(error.to_string().contains("q2"), "{error}");
+            assert!(error.to_string().contains("cutoff"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_unpaired_row_cannot_add_unmeasured_cutoffs_to_paired_rows() {
+        let q = measured_at(question("paired", "user", Some(1)), &[5]);
+        let extra = measured_at(question("unpaired", "user", Some(1)), &[1, 5]);
+        compare_files(vec![q.clone(), extra], vec![q], None)
+            .expect_err("unpaired rows must not introduce zero-filled paired measurements");
+    }
+
+    #[test]
+    fn fts_marking_refuses_incompatible_cutoffs_for_overlapping_questions() {
+        let q = question("q", "user", Some(1));
+        compare_files(
+            vec![question("q", "user", Some(5))],
+            vec![q.clone()],
+            Some(vec![measured_at(q, &[5])]),
+        )
+        .expect_err("an unmeasured FTS cutoff must not look like a different retrieval row");
+    }
+
+    #[test]
+    fn compatible_historical_reports_keep_partial_and_disjoint_question_support() {
+        // No `ks`, `recall_all_at`, or `ingest_ms`: older saved reports still
+        // compare, and the config labels are deliberately different.
+        let q1 = measured_at(question("q1", "user", Some(1)), &[5]);
+        let q2 = measured_at(question("q2", "user", Some(1)), &[5]);
+        compare_files(vec![q1.clone()], vec![q1.clone()], None).unwrap();
+        compare_files(vec![q1.clone(), q2.clone()], vec![q1.clone()], None).unwrap();
+        compare_files(
+            vec![q1.clone()],
+            vec![measured_at(question("q2", "user", Some(1)), &[1, 5])],
+            None,
+        )
+        .unwrap();
+        compare_files(vec![], vec![], None).unwrap();
+        compare_files(vec![], vec![q1.clone()], None).unwrap();
+        compare_files(vec![q1.clone()], vec![], None).unwrap();
+        // An FTS run with no overlapping questions makes no paired claim.
+        compare_files(
+            vec![q1.clone()],
+            vec![q1],
+            Some(vec![measured_at(question("q2", "user", Some(1)), &[1, 5])]),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn moved_questions_carry_their_cutoffs_and_direction() {
         let baseline = report(
@@ -436,7 +613,7 @@ mod tests {
                 question("q4", "temporal", None),
             ],
         );
-        let c = compare(&baseline, &candidate, None);
+        let c = compare(&baseline, &candidate, None).unwrap();
 
         assert_eq!(c.ks, vec![1, 3, 5, 10]);
         assert_eq!(c.paired, 4);
@@ -510,7 +687,7 @@ mod tests {
         differing["retrieved_sessions"] = serde_json::json!(8);
         let fts = report("b", vec![matching, differing]);
 
-        let c = compare(&baseline, &candidate, Some(&fts));
+        let c = compare(&baseline, &candidate, Some(&fts)).unwrap();
         let marks: Vec<(&str, Option<bool>)> = c
             .moved
             .iter()
@@ -521,7 +698,7 @@ mod tests {
         assert!(md.contains("candidate row = FTS row |"));
         assert!(md.contains("| q1 | user | @5 → @10 | 1 | 1.00 → 1.00 | 120 → 120 | yes |"));
         assert!(
-            compare(&baseline, &candidate, None).moved[0]
+            compare(&baseline, &candidate, None).unwrap().moved[0]
                 .same_as_fts
                 .is_none()
         );

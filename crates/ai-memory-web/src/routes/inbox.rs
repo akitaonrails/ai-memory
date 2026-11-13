@@ -7,8 +7,11 @@ use crate::{
 };
 use ai_memory_core::{
     ActorContext, AgentKind, AuthLevel, Capability, MessageBox, MessageState, NewAgentMessage,
+    ProjectId,
 };
-use ai_memory_store::{ProjectAccess, lookup_existing_scope_guarded};
+use ai_memory_store::{
+    ProjectAccess, ScopeResolutionError, lookup_existing_scope_guarded, lookup_project_id_guarded,
+};
 use askama::Template;
 use axum::{
     Json,
@@ -60,13 +63,22 @@ pub(crate) async fn handler(
         .into_iter()
         .map(|c| ((c.workspace_name, c.project_name), c.pending))
         .collect();
+    // The default mailbox is picked from the project list, so it carries the
+    // id: a name another project also answers to (a legacy key) cannot make
+    // the landing page refuse for a project nobody asked for by name.
     let requested = match (query.workspace, query.project) {
-        (Some(w), Some(p)) => (w, p),
+        (Some(w), Some(p)) => (w, p, None),
         (None, None) => projects
             .iter()
             .find(|p| pending.contains_key(&(p.workspace_name.clone(), p.project_name.clone())))
             .or_else(|| projects.first())
-            .map(|p| (p.workspace_name.clone(), p.project_name.clone()))
+            .map(|p| {
+                (
+                    p.workspace_name.clone(),
+                    p.project_name.clone(),
+                    p.project_id.parse::<ProjectId>().ok(),
+                )
+            })
             .unwrap_or_default(),
         _ => {
             return (
@@ -76,7 +88,7 @@ pub(crate) async fn handler(
                 .into_response();
         }
     };
-    let (workspace, project) = requested;
+    let (workspace, project, default_project_id) = requested;
     let mailbox = match query.mailbox.as_deref() {
         None | Some("inbox") => MessageBox::Inbox,
         Some("outbox") => MessageBox::Outbox,
@@ -101,11 +113,37 @@ pub(crate) async fn handler(
         }
         href
     };
+    // An ambiguous name is a data problem the operator fixes with
+    // `merge-project`, not a reason to lose the whole console: keep the page,
+    // show no messages and say why.
+    let mut warning = String::new();
     let scope = if workspace.is_empty() && project.is_empty() {
         None
     } else {
-        match super::resolve_read_scope(&state, viewer, &workspace, &project).await {
+        let resolved = match default_project_id {
+            Some(id) => {
+                lookup_project_id_guarded(
+                    &state.reader,
+                    &workspace,
+                    id,
+                    viewer,
+                    ProjectAccess::Read,
+                )
+                .await
+            }
+            None => super::resolve_read_scope(&state, viewer, &workspace, &project).await,
+        };
+        match resolved {
             Ok(s) => Some(s),
+            Err(e @ ScopeResolutionError::ProjectNameAmbiguous { .. }) => {
+                let reason = if i18n.tag() == "en" {
+                    format!("{e}.")
+                } else {
+                    i18n.text("web-invalid-scope")
+                };
+                warning = format!("{reason} {}", i18n.text("web-mailbox-ambiguous-name"));
+                None
+            }
             Err(e) => return super::page::localized_refusal_response(&i18n, &e),
         }
     };
@@ -261,6 +299,7 @@ pub(crate) async fn handler(
             .iter()
             .any(|r| r.workspace == workspace && r.project == project),
         needs_write_token: legacy.is_some(),
+        warning,
         project_href: project_href(&workspace, &project),
         workspace,
         project,

@@ -124,6 +124,17 @@ describe("api namespace", () => {
     assert.equal(second.notModified, true);
   });
 
+  it("reads a listed page whose path contains literal percent escapes", async () => {
+    const path = "notes/%2e/%2E%2E/literal.md";
+    const written = await memory.pages.write({ path, body: "# Literal percent path" });
+    const listed = (await memory.api.pages()).find((page) => page.path === path);
+    assert.ok(listed);
+    const result = await memory.api.page(listed.path);
+    assert.equal(result.notModified, false);
+    assert.equal(result.page.id, written.pageId);
+    assert.equal(result.page.path, path);
+  });
+
   it("listings, search, handoffs and sessions", async () => {
     assert.ok((await memory.api.workspaces()).some((w) => w.name === "it-reads"));
     assert.ok((await memory.api.projects({ workspace: "it-reads" })).some((p) => p.project === "app"));

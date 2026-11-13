@@ -1355,8 +1355,8 @@ Before that lookup, a Hermes event takes `TERMINAL_CWD` (the session's
 `terminal.cwd`) in place of the process directory. A multiplexing Hermes
 gateway exports only its default profile's `terminal.cwd`, so a gateway event
 of a named profile routes instead by a marker in that profile's own Hermes
-home, `~/.hermes/profiles/<name>/.ai-memory.toml` (under the gateway's
-`HERMES_HOME` when set). It is a normal local marker: `workspace`, `project`,
+home, `<Hermes home>/profiles/<name>/.ai-memory.toml` (under the gateway's
+`HERMES_HOME` when set, else the platform default). It is a normal local marker: `workspace`, `project`,
 `[capture]` and `server` all apply. Without it the event keeps the gateway's
 directory. See [install.md](install.md#hermes-agent-nous-research).
 

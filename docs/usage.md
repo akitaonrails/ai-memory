@@ -620,8 +620,9 @@ both skill roots. For Grok Build CLI, select `--skills-agent grok` so skills
 install under its `.grok/skills` root; for GitHub Copilot CLI, select
 `--skills-agent copilot-cli` so skills install under `.github/skills` (project)
 or `$COPILOT_HOME/skills` (global, default `~/.copilot/skills`); for Hermes
-Agent, `--skills-agent hermes`
-installs under `.hermes/skills` (project) or `~/.hermes/skills` (global).
+Agent, `--skills-agent hermes` installs under `.hermes/skills` (project) or the
+Hermes home's `skills/` (global: `$HERMES_HOME`, else `~/.hermes`, or
+`%LOCALAPPDATA%\hermes` on Windows).
 
 When a project keeps `AGENTS.md` as its canonical instruction file, give it a
 `CLAUDE.md` whose first line is a bare `@AGENTS.md` import. Claude Code 2.1.277

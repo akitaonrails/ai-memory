@@ -102,7 +102,9 @@ describe("api.page", () => {
   it("encodes each path segment and refuses dot segments before fetch", async () => {
     const { server, memory } = setup();
     server.routes.set(`GET ${BASE}/pages/notes/a%20b.md`, () => json(payloads.apiPage));
+    server.routes.set(`GET ${BASE}/pages/notes/%252e/%252E%252E/a.md`, () => json(payloads.apiPage));
     await memory.api.page("notes/a b.md");
+    await memory.api.page("notes/%2e/%2E%2E/a.md");
     const before = server.requests.length;
     await assert.rejects(memory.api.page("../../admin/checkpoints"), ArgumentError);
     await assert.rejects(memory.api.page("notes/./a.md"), ArgumentError);

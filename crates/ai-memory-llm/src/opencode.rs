@@ -407,6 +407,22 @@ impl OpenCodeResponsesProvider {
         let response = self
             .post(&self.build_request(&request, Some(text)), operation_id)
             .await?;
+        // An output-budget stop can arrive before any visible text. Keep it
+        // distinct so callers can split structured batches instead of parsing
+        // partial JSON or treating the answer as empty.
+        // https://developers.openai.com/api/docs/guides/reasoning#allocating-space-for-reasoning
+        if response.status.as_deref() == Some("incomplete")
+            && response
+                .incomplete_details
+                .as_ref()
+                .and_then(|details| details.reason.as_deref())
+                == Some("max_output_tokens")
+        {
+            return Err(LlmError::TruncatedResponse {
+                model: self.model.clone(),
+                completion_tokens: response.usage.as_ref().map(|usage| usage.output_tokens),
+            });
+        }
         // No content at all is a distinct terminal failure, not a JSON parse
         // error, as the OpenAI path already treats it: `unwrap_or_default()` fed
         // an empty string to serde, so the caller saw "EOF while parsing a value
@@ -528,9 +544,19 @@ struct ResponsesReasoning {
 struct ResponsesResponse {
     model: String,
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    incomplete_details: Option<ResponsesIncompleteDetails>,
+    #[serde(default)]
     output: Vec<ResponsesOutputItem>,
     #[serde(default)]
     usage: Option<ResponsesUsage>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
