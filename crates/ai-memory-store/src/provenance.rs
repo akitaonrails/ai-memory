@@ -1,6 +1,8 @@
 //! Version-specific, access-filtered knowledge evidence.
 use crate::{ReaderPool, RelatedPage, StoreResult};
-use ai_memory_core::{OwnerFilter, PageId, ProjectId, SessionId, UserId, WorkspaceId};
+use ai_memory_core::{
+    ObservationId, ObservationKind, OwnerFilter, PageId, ProjectId, SessionId, UserId, WorkspaceId,
+};
 use rusqlite::{OptionalExtension, params};
 
 /// A recorded source; opaque identifiers are never presented as verified links.
@@ -37,7 +39,149 @@ pub struct PageProvenance {
     /// Count after far-end authorization and expiry filtering.
     pub disagreement_count: usize,
 }
+/// Most compiled sources one [`ReaderPool::page_compiled_sources`] call returns.
+pub const MAX_COMPILED_SOURCES_PAGE: usize = 500;
+
+/// What is still stored about an observation a page was compiled from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledSourceObservation {
+    /// The kind the hook router gave the observation at ingress.
+    pub kind: ObservationKind,
+    /// The session that captured it.
+    pub session_id: SessionId,
+    /// Capture time, in UTC microseconds.
+    pub created_at: i64,
+}
+
+/// One observation a page version was compiled from (`page_sources`, V108).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledSource {
+    /// The observation the write named.
+    pub observation_id: ObservationId,
+    /// When the source was recorded against this version, in UTC microseconds.
+    pub recorded_at: i64,
+    /// `None` when the observation is no longer in the page's project: pruned
+    /// by retention, or moved away with its session.
+    pub observation: Option<CompiledSourceObservation>,
+}
+
+/// The observations the current version of a page was compiled from.
+#[derive(Debug)]
+pub struct PageCompiledSources {
+    /// The version the sources belong to.
+    pub page_id: PageId,
+    /// Sources the caller may see, before `offset` and `limit`. Zero means
+    /// the version records none, which is "not recorded", not "no inputs".
+    pub source_count: usize,
+    /// The requested window, oldest observation first; sources whose
+    /// observation is no longer stored come last.
+    pub sources: Vec<CompiledSource>,
+}
+
 impl ReaderPool {
+    /// List the observations the current version of an authorized page
+    /// coordinate was compiled from (#2164). The page itself is shared; a
+    /// source is hidden only when its observation is still stored and belongs
+    /// to a session `owner` does not admit, the rule every other surface
+    /// applies to another operator's observation ids. `limit` is clamped to
+    /// [`MAX_COMPILED_SOURCES_PAGE`].
+    ///
+    /// Returns `None` when the coordinate holds no current page.
+    ///
+    /// # Errors
+    /// Returns pool, SQL and malformed stored-ID errors.
+    pub async fn page_compiled_sources(
+        &self,
+        ws: WorkspaceId,
+        project: ProjectId,
+        path: String,
+        owner: OwnerFilter,
+        offset: usize,
+        limit: usize,
+    ) -> StoreResult<Option<PageCompiledSources>> {
+        self.with_conn(move |conn| {
+            let id: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT id FROM pages WHERE workspace_id=?1 AND project_id=?2 \
+                     AND path=?3 AND is_latest=1",
+                    params![ws.as_bytes(), project.as_bytes(), path],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(id) = id else {
+                return Ok(None);
+            };
+            let (mode, actor) = match owner {
+                OwnerFilter::Any => (0, String::new()),
+                OwnerFilter::User(a) => (1, a),
+                OwnerFilter::Unattributed => (2, String::new()),
+            };
+            // The observation join carries the page coordinate, so a row
+            // that left the project reads like a pruned one: id only.
+            let base = "FROM page_sources ps LEFT JOIN observations o \
+                ON o.id=ps.observation_id AND o.workspace_id=?2 AND o.project_id=?3 \
+                LEFT JOIN sessions s ON s.id=o.session_id \
+                WHERE ps.page_id=?1 AND ps.workspace_id=?2 AND ps.project_id=?3 \
+                AND (o.id IS NULL OR ?4=0 OR s.actor_user IS NULL \
+                OR (?4=1 AND s.actor_user=?5))";
+            let source_count = conn.query_row(
+                &format!("SELECT COUNT(*) {base}"),
+                params![id, ws.as_bytes(), project.as_bytes(), mode, actor],
+                |r| r.get::<_, usize>(0),
+            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT ps.observation_id,ps.created_at,o.kind,o.session_id,o.created_at {base} \
+                 ORDER BY o.created_at IS NULL,o.created_at,ps.observation_id \
+                 LIMIT ?6 OFFSET ?7"
+            ))?;
+            let rows = stmt.query_map(
+                params![
+                    id,
+                    ws.as_bytes(),
+                    project.as_bytes(),
+                    mode,
+                    actor,
+                    i64::try_from(limit.min(MAX_COMPILED_SOURCES_PAGE)).unwrap_or(i64::MAX),
+                    i64::try_from(offset).unwrap_or(i64::MAX)
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )?;
+            let mut sources = Vec::new();
+            for row in rows {
+                let (observation_id, recorded_at, kind, session_id, created_at) = row?;
+                let observation = match (kind, session_id, created_at) {
+                    (Some(kind), Some(session_id), Some(created_at)) => {
+                        Some(CompiledSourceObservation {
+                            kind: kind.parse()?,
+                            session_id: SessionId::from_slice(&session_id)?,
+                            created_at,
+                        })
+                    }
+                    _ => None,
+                };
+                sources.push(CompiledSource {
+                    observation_id: ObservationId::from_slice(&observation_id)?,
+                    recorded_at,
+                    observation,
+                });
+            }
+            Ok(Some(PageCompiledSources {
+                page_id: PageId::from_slice(&id)?,
+                source_count,
+                sources,
+            }))
+        })
+        .await
+    }
+
     /// Read evidence for an authorized page coordinate. Source ownership does
     /// not filter the shared page itself. Missing/foreign source IDs are omitted.
     ///

@@ -21,6 +21,7 @@ mod most_recently_active_scope;
 mod multi_session;
 mod observation_prune;
 mod page_first_created;
+mod page_sources;
 mod pinned_pages;
 mod profile;
 mod project_authz;

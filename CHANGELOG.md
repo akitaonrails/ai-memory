@@ -13,6 +13,25 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Compiled pages record the observations they were built from. A new
+  `page_sources` table (migration V108) holds one row per page version and
+  observation, written in the same transaction as the page. A consolidated page
+  lists the observations whose text reached the consolidation prompt, which on a
+  long session is fewer than the session holds. A `memory_write_page` that
+  passes `session_id` lists the observations that session has in the target
+  project when the write commits. The rows belong to a page version: a
+  recompile that changes the page starts from its own sources, the replaced
+  version keeps its own, and a compile that reproduces the current version adds
+  to it. A version written without a session (a hand edit, a lint or compaction
+  rewrite, a reindex from disk) has none, and neither does any page compiled
+  before this migration, which backfills nothing. The store refuses an
+  observation from another session, project or workspace, and the rows follow
+  their page through `move-project`, `merge-project` and `move-session`.
+  `ReaderPool::page_compiled_sources` reads them back under the session-owner
+  filter. Nothing reads them for ranking yet: this is the first step of the
+  memory-poisoning provenance work in
+  [`docs/design-memory-poisoning-provenance.md`](docs/design-memory-poisoning-provenance.md).
+  (#2164)
 - A per-project default result count for `memory_query`. A project can set
   `[retrieval] default_result_limit = N` (`1..=100`) in its `.ai-memory.toml`;
   the hook clients forward it at session start and the server records it on the

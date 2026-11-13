@@ -732,6 +732,7 @@ async fn merge_one_cluster(
         evidence.push(PageEvidence {
             kind: PageEvidenceKind::Reconsolidation,
             source_id: format!("b2_dream:{}", loser.id),
+            observations: Default::default(),
         });
     }
     // #1218: a cross-scope link the model invented must not be written. The

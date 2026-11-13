@@ -484,6 +484,11 @@ impl Consolidator {
                 evidence: vec![ai_memory_core::PageEvidence {
                     kind: ai_memory_core::PageEvidenceKind::Session,
                     source_id: session_id.to_string(),
+                    // Exactly what the prompt carried, not the whole session:
+                    // the projection omits rows on a long session (#2164).
+                    observations: ai_memory_core::SourceObservations::Listed(
+                        projected.source_ids.clone(),
+                    ),
                 }],
             })
             .await?;
@@ -1019,9 +1024,14 @@ impl Consolidator {
                 // rule — see the matching block in `consolidate_session`.
                 disambiguate_anchor_title(&mut req, &mut outcome, &existing_titles, session_id);
             }
+            // Every page of the batch came out of the one prompt, so each
+            // names the observations that prompt carried (#2164).
             req.evidence = vec![ai_memory_core::PageEvidence {
                 kind: ai_memory_core::PageEvidenceKind::Session,
                 source_id: session_id.to_string(),
+                observations: ai_memory_core::SourceObservations::Listed(
+                    projected.source_ids.clone(),
+                ),
             }];
             // A slot the engine writes belongs to the operator whose session
             // produced it, and `build_update` keeps the model's path verbatim
@@ -5997,6 +6007,181 @@ mod tests {
                 "path {} must cite the batch's session as evidence",
                 outcome.path.as_str()
             );
+        }
+    }
+
+    /// Answers with a fixed structured response and keeps every prompt.
+    struct SourceCapturingLlm {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        response: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SourceCapturingLlm {
+        fn name(&self) -> &'static str {
+            "source-capturing"
+        }
+        fn model(&self) -> &str {
+            "source-capturing"
+        }
+        async fn complete(
+            &self,
+            _request: ChatRequest,
+        ) -> ai_memory_llm::LlmResult<ai_memory_llm::ChatResponse> {
+            unreachable!("consolidation only uses structured completion");
+        }
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> ai_memory_llm::LlmResult<serde_json::Value> {
+            self.seen.lock().unwrap().push(format!("{request:?}"));
+            Ok(self.response.clone())
+        }
+    }
+
+    /// #2164 step 1: a consolidated page names exactly the observations its
+    /// prompt carried. The session is longer than the projection's selection
+    /// cap, so the prompt omits some rows; those must not be listed, and
+    /// every page of a batch lists the same set. Citing the whole session
+    /// instead of `projected.source_ids` fails this test.
+    #[tokio::test]
+    async fn consolidated_pages_name_exactly_the_observations_in_the_prompt() {
+        for multi in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (store, wiki, session, ws, proj) = batch_fixture(tmp.path()).await;
+            // `batch_fixture` seeded one observation; add enough to pass the cap.
+            let extra = MAX_PROJECTED_OBSERVATIONS + 40;
+            {
+                let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+                for n in 0..extra {
+                    conn.execute(
+                        "INSERT INTO observations \
+                         (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+                         VALUES (?1, ?2, ?3, ?4, 'post-tool-use', 'tool', 'routine output', ?5)",
+                        rusqlite::params![
+                            ai_memory_core::ObservationId::new().as_bytes(),
+                            session.as_bytes(),
+                            ws.as_bytes(),
+                            proj.as_bytes(),
+                            1_700_000_000_001_i64 + i64::try_from(n).unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                }
+            }
+            let session_ids: Vec<String> = {
+                let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT id FROM observations WHERE session_id = ?1")
+                    .unwrap();
+                stmt.query_map([session.as_bytes()], |row| row.get::<_, Vec<u8>>(0))
+                    .unwrap()
+                    .map(|id| {
+                        ai_memory_core::ObservationId::from_slice(&id.unwrap())
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect()
+            };
+            assert_eq!(session_ids.len(), extra + 1);
+
+            let session_path = format!("sessions/{session}.md");
+            let response = if multi {
+                serde_json::json!({
+                    "rationale": "test provenance",
+                    "updates": [
+                        {
+                            "path": session_path,
+                            "tier": "episodic",
+                            "kind": "fact",
+                            "title": "Session narrative",
+                            "body_markdown": "Session body.",
+                            "tags": []
+                        },
+                        {
+                            "path": "concepts/queue.md",
+                            "tier": "semantic",
+                            "kind": "fact",
+                            "title": "Queue",
+                            "body_markdown": "Concept body.",
+                            "tags": []
+                        }
+                    ]
+                })
+            } else {
+                serde_json::json!({
+                    "title": "Queue decision",
+                    "body_markdown": "The queue is bounded.",
+                    "tags": [],
+                })
+            };
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let consolidator = Consolidator::new(
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki.clone(),
+                Arc::new(SourceCapturingLlm {
+                    seen: seen.clone(),
+                    response,
+                }),
+                ws,
+                proj,
+            );
+            let actor = ai_memory_core::ActorContext::anonymous();
+            let paths: Vec<String> = if multi {
+                consolidator
+                    .consolidate_session_multi(session, false, actor, None, None)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|outcome| outcome.path.as_str().to_owned())
+                    .collect()
+            } else {
+                consolidator
+                    .consolidate_session(session, false, actor, None, None)
+                    .await
+                    .unwrap();
+                vec![session_path.clone()]
+            };
+            assert_eq!(paths.len(), if multi { 2 } else { 1 });
+
+            let prompts = seen.lock().unwrap().clone();
+            assert_eq!(prompts.len(), 1, "one prompt compiled the pages");
+            let mut in_prompt: Vec<String> = session_ids
+                .iter()
+                .filter(|id| prompts[0].contains(&format!("id: {id}")))
+                .cloned()
+                .collect();
+            in_prompt.sort();
+            assert_eq!(in_prompt.len(), MAX_PROJECTED_OBSERVATIONS);
+            assert!(in_prompt.len() < session_ids.len(), "the prompt omits rows");
+
+            for path in paths {
+                let read = store
+                    .reader
+                    .page_compiled_sources(
+                        ws,
+                        proj,
+                        path.clone(),
+                        ai_memory_core::OwnerFilter::Any,
+                        0,
+                        ai_memory_store::MAX_COMPILED_SOURCES_PAGE,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut listed: Vec<String> = read
+                    .sources
+                    .iter()
+                    .map(|source| source.observation_id.to_string())
+                    .collect();
+                listed.sort();
+                assert_eq!(
+                    listed, in_prompt,
+                    "{path} (multi = {multi}) lists exactly the prompt's observations"
+                );
+            }
         }
     }
 

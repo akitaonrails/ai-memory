@@ -11,7 +11,7 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{PageId, PagePath, ProjectId, WorkspaceId};
+use crate::ids::{ObservationId, PageId, PagePath, ProjectId, WorkspaceId};
 
 /// Lifetime classification for a page.
 ///
@@ -105,6 +105,31 @@ pub struct PageEvidence {
     /// feedback row id, or reconsolidation run id) — opaque to the
     /// store, unique within `kind` for this page.
     pub source_id: String,
+    /// For a [`PageEvidenceKind::Session`] citation, which of that
+    /// session's observations the page was compiled from (#2164). The
+    /// store records them in `page_sources` (V108) in the page-upsert
+    /// transaction. Ignored for every other kind.
+    #[serde(default)]
+    pub observations: SourceObservations,
+}
+
+/// Which observations of a cited session a page write was compiled from
+/// (#2164, docs/design-memory-poisoning-provenance.md step 1).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceObservations {
+    /// The write does not say. No `page_sources` row is recorded.
+    #[default]
+    Unrecorded,
+    /// Exactly these observations: the ones whose text reached the
+    /// consolidation prompt. The store keeps only ids that belong to the
+    /// cited session inside the page's own workspace and project.
+    Listed(Vec<ObservationId>),
+    /// Every observation the cited session has in the page's workspace and
+    /// project when the write commits. For a caller that compiled the page
+    /// from the session without naming observations (`memory_write_page`
+    /// with a `session_id`).
+    WholeSession,
 }
 
 /// The closed vocabulary of evidence sources a page write can cite.

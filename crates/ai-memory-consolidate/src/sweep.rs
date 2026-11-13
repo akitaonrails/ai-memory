@@ -1391,6 +1391,7 @@ async fn plan_cold_cluster_dedup(
             evidence.push(PageEvidence {
                 kind: PageEvidenceKind::Reconsolidation,
                 source_id: format!("a3_merge:{}", member.id),
+                observations: Default::default(),
             });
             // Supersede the loser with a merge-note stub pointing at the
             // survivor. Marked `compacted: true` so it is terminal for the decay

@@ -242,10 +242,12 @@ async fn contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_pri
             .map(|id| PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: id.to_string(),
+                observations: Default::default(),
             })
             .chain([PageEvidence {
                 kind: PageEvidenceKind::Feedback,
                 source_id: "OPAQUE_PRIVATE_IDENTIFIER".into(),
+                observations: Default::default(),
             }])
             .collect(),
     ))
@@ -437,6 +439,7 @@ async fn contextual_evidence_paginates_versions_and_hides_expired_disagreements(
                 .map(|n| PageEvidence {
                     kind: PageEvidenceKind::Reconsolidation,
                     source_id: format!("private-opaque-{n}"),
+                    observations: Default::default(),
                 })
                 .collect(),
         ))

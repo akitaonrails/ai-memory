@@ -2996,4 +2996,114 @@ mod tests {
             .unwrap();
         assert!(plan.contains("idx_observations_file_path"), "{plan}");
     }
+
+    /// V108 adds `page_sources` to a store whose pages were compiled by an
+    /// older build: nothing is backfilled (the session citation in
+    /// `page_evidence` cannot say which observations the prompt carried), the
+    /// existing page and its evidence are untouched, and the next compile of
+    /// that page records its sources.
+    #[test]
+    fn v108_adds_page_sources_without_backfilling_compiled_pages() {
+        use ai_memory_core::{
+            NewPage, PageEvidence, PageEvidenceKind, PagePath, SourceObservations, Tier,
+        };
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 107).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        let observation_id = crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "before V108".into(),
+                importance: 5,
+                file_path: None,
+            },
+        )
+        .unwrap();
+        let compiled = |body: &str, observations: SourceObservations| NewPage {
+            workspace_id,
+            project_id,
+            path: PagePath::new(format!("sessions/{session_id}.md")).unwrap(),
+            title: "session".into(),
+            body: body.into(),
+            tier: Tier::Episodic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: vec![PageEvidence {
+                kind: PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+                observations,
+            }],
+        };
+        // What the older build wrote: the session citation alone.
+        let old_page =
+            crate::ops::upsert_page(&mut conn, &compiled("old", SourceObservations::Unrecorded))
+                .unwrap();
+
+        // A direct `run` caller must turn foreign keys off for the trailing
+        // `sessions` rebuild, as `Store::open` does.
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let count = |conn: &Connection, sql: &str| -> i64 {
+            conn.query_row(sql, [], |row| row.get(0)).unwrap()
+        };
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM page_sources"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM page_evidence"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM pages WHERE is_latest = 1"),
+            1
+        );
+
+        let new_page = crate::ops::upsert_page(
+            &mut conn,
+            &compiled("new", SourceObservations::Listed(vec![observation_id])),
+        )
+        .unwrap();
+        let recorded: Vec<(Vec<u8>, Vec<u8>)> = conn
+            .prepare("SELECT page_id, observation_id FROM page_sources")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            recorded,
+            vec![(
+                new_page.as_bytes().to_vec(),
+                observation_id.as_bytes().to_vec()
+            )],
+            "the old version {old_page} stays unrecorded"
+        );
+    }
 }

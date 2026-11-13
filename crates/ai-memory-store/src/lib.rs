@@ -30,7 +30,10 @@ mod profile;
 mod provenance;
 mod retrieval_criteria;
 mod retrieval_history;
-pub use provenance::{PageDisagreement, PageProvenance, PageSource};
+pub use provenance::{
+    CompiledSource, CompiledSourceObservation, MAX_COMPILED_SOURCES_PAGE, PageCompiledSources,
+    PageDisagreement, PageProvenance, PageSource,
+};
 mod project_authz;
 mod project_coordinates;
 pub mod query_signals;
@@ -3774,6 +3777,7 @@ mod tests {
         with_evidence.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-1".into(),
+            observations: Default::default(),
         }];
         store
             .writer
@@ -3783,6 +3787,7 @@ mod tests {
         with_evidence.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-2".into(),
+            observations: Default::default(),
         }];
         store.writer.upsert_page(with_evidence).await.unwrap();
 
@@ -6339,10 +6344,12 @@ mod tests {
             PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: "session-1".into(),
+                observations: Default::default(),
             },
             PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: "session-2".into(),
+                observations: Default::default(),
             },
         ];
         store.writer.upsert_page(decision_a).await.unwrap();

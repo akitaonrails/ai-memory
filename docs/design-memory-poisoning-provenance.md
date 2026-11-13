@@ -1,7 +1,8 @@
 # Design: source provenance and trust class against memory poisoning
 
 Status: design, partially staged. Tracks #2164. Step 1 (the `page_sources`
-table) lands as its own PR; this note covers steps 2 to 5, which build on it.
+table, migration V108) is implemented; "Step 1 as built" below records what
+steps 2 to 5 can rely on. The rest of this note covers those steps.
 
 ## Problem
 
@@ -36,6 +37,45 @@ filter is out of scope.
 4. `memory_query` trust ranking: the class is returned, and tool-origin pages
    rank below operator-authored ones by default.
 5. Adversarial tests and a `docs/security-boundaries.md` row.
+
+## Step 1 as built
+
+`page_sources(workspace_id, project_id, page_id, observation_id, created_at)`
+is keyed by page version and written in the page-upsert transaction, from the
+session citation a write already carries (`PageEvidence::observations`).
+
+- **Consolidation** lists the observations whose text reached the prompt:
+  every rendered block, plus every verbatim-residue group, minus anything the
+  final clip cut off (`ProjectedObservations::source_ids`). On a session longer
+  than the projection's selection cap this is fewer than the session holds.
+  Every page of a batch lists the same set, since one prompt produced them.
+- **`memory_write_page` with a `session_id`** lists every observation the
+  session has in the target project when the write commits. The tool names a
+  session, not observations, so this is the narrowest honest set.
+- **Re-derived per compiled version.** A new version starts from the sources of
+  its own compile and the superseded version keeps its rows. A write that
+  reproduces the current version byte for byte creates no new version, so its
+  sources are added to that version's: the same text has then been compiled
+  from both sets, and dropping the earlier one would let a later compile hide a
+  tool result behind identical text.
+- **A version written without a session citation has no rows.** That covers a
+  hand edit, `memory_patch_page`, a lint or compaction rewrite, a reindex from
+  disk and a copy+purge `move-project`. Zero rows means "not recorded". Step 2
+  has to decide what class such a version takes when the version it replaces
+  had tool-result sources; the chain is reachable through `pages.supersedes`.
+- **The store filters.** A row is kept only for an observation of the cited
+  session inside the page's own workspace and project.
+- **`observation_id` is not a foreign key.** Observation retention prunes rows,
+  and the id outlives the observation. A class that must survive pruning has to
+  be stored at compile time, not looked up from the observation later.
+- **Not covered:** the zero-LLM rule-based `sessions/<id>.md` page the hook
+  router writes at SessionEnd and at compaction checkpoints. It is built from
+  the session's observations and cites no session today, so it records no
+  sources. Pages compiled before V108 have none either; nothing is backfilled,
+  because the observations an old prompt selected were not kept.
+
+Read path: `ReaderPool::page_compiled_sources`, by `(workspace_id, project_id,
+path)`, under the session-owner filter.
 
 ## Step 2: trust class
 
@@ -128,9 +168,12 @@ level, per the security-boundary test rule.
 
 ## Open questions
 
-- Whether `page_sources` is append-only across a supersession chain or re-derived
-  per compiled version. This note assumes re-derived (the current rows reflect the
-  latest compile), matching how consolidation rewrites a page; step 1 settles it.
+- Settled by step 1: `page_sources` is re-derived per compiled version, not
+  append-only across the supersession chain. See "Step 1 as built".
+- What class a version takes when it was written without a session citation
+  over a version that had tool-result sources (see "Step 1 as built").
+- Whether the rule-based session page should cite its session, which would
+  also add a `page_evidence` row on zero-LLM installs.
 - Whether `model_generated` should also be demoted at retrieval, or only
   `tool_result`. The paper's vector is the tool result; demoting model-generated
   text as well is a larger behaviour change, left out of the default until the
