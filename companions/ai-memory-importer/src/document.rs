@@ -1265,6 +1265,9 @@ fn xml_text(xml: &str) -> Result<String> {
                 match tag.local_name().as_ref() {
                     "br" | "cr" => push_bounded(&mut output, "\n")?,
                     "tab" => push_bounded(&mut output, "\t")?,
+                    // Word can encode a visible hyphen outside its text nodes.
+                    // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.nobreakhyphen
+                    "noBreakHyphen" => push_bounded(&mut output, "\u{2011}")?,
                     _ => {}
                 }
             }
@@ -1638,6 +1641,31 @@ mod tests {
         assert!(plan.body.contains("Foot"));
         assert!(!plan.body.contains("deleted secret"));
         assert!(!plan.body.contains("field instruction"));
+    }
+
+    #[test]
+    fn docx_preserves_nonbreaking_hyphen_elements() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("hyphen.docx");
+        for hyphen in ["<w:noBreakHyphen/>", "<w:noBreakHyphen></w:noBreakHyphen>"] {
+            let document = format!(
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Profit</w:t>{hyphen}<w:t>loss</w:t></w:r></w:p></w:body></w:document>"#
+            );
+            write_zip(&file, &[("word/document.xml", &document)]);
+            let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+            assert!(
+                plan.body
+                    .contains("## Extracted content\n\nProfit\u{2011}loss\n"),
+                "{hyphen}: {}",
+                plan.body
+            );
+        }
+    }
+
+    #[test]
+    fn docx_nonbreaking_hyphens_keep_literal_text_and_skipped_runs_unchanged() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Profit‑loss</w:t></w:r></w:p><w:p><w:r><w:t>Kept</w:t></w:r><w:del><w:r><w:delText>deleted</w:delText><w:noBreakHyphen/></w:r></w:del><w:instrText>field instruction</w:instrText><w:r><w:t> together</w:t></w:r></w:p></w:body></w:document>"#;
+        assert_eq!(xml_text(xml).unwrap(), "Profit\u{2011}loss\nKept together");
     }
 
     #[test]
