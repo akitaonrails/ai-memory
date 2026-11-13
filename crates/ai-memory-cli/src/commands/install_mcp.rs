@@ -25,7 +25,7 @@ use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
-use crate::commands::path_util::{claude_config_dir, home_dir};
+use crate::commands::path_util::{claude_config_dir, home_dir, strip_windows_verbatim_prefix};
 use crate::commands::render_shared::{
     bearer_header_value, hook_embedded_exe_path, mask_secret, shell_quote, yaml_single_quote,
 };
@@ -393,9 +393,13 @@ fn bridge_data_dir_args(args: &InstallMcpArgs) -> Vec<String> {
     args.bridge_data_dir
         .as_ref()
         .map_or_else(Vec::new, |data_dir| {
+            // The data dir is canonical, so on Windows it carries the `\\?\`
+            // verbatim prefix. Hermes rewrote that into `C:\?\C:\...` and the
+            // bridge could not start (#2203); pass the plain drive path, as
+            // `setup` and the DSH configPath (#2032) already do.
             vec![
                 "--data-dir".to_owned(),
-                data_dir.to_string_lossy().into_owned(),
+                strip_windows_verbatim_prefix(&data_dir.to_string_lossy()).into_owned(),
             ]
         })
 }
@@ -2358,7 +2362,12 @@ fn render_claude_code(args: &InstallMcpArgs, config_path: &Path) -> Result<Strin
             .bridge_data_dir
             .as_ref()
             .map_or_else(String::new, |path| {
-                format!(" --data-dir {}", shell_quote(&path.to_string_lossy()))
+                // The canonical data dir carries the Windows `\\?\` verbatim
+                // prefix; strip it as `bridge_data_dir_args` does so the
+                // `claude mcp add` snippet names the plain drive path, not the
+                // prefix Hermes mangled into `C:\?\C:\...` (#2203).
+                let data_dir = strip_windows_verbatim_prefix(&path.to_string_lossy()).into_owned();
+                format!(" --data-dir {}", shell_quote(&data_dir))
             });
         format!(
             "claude mcp add --transport stdio{env} {name} -- \\\n    {command} mcp-bridge --server-url {url}{data_dir}",
@@ -3048,6 +3057,22 @@ mod tests {
             stdio_bridge: false,
             bridge_data_dir: None,
         }
+    }
+
+    #[test]
+    fn bridge_data_dir_args_strip_windows_verbatim_prefix() {
+        // The canonical data dir carries `\\?\` on Windows, which Hermes
+        // mangled into `C:\?\C:\...` so the bridge never started (#2203).
+        // The strip is lexical, so this runs on any host.
+        let mut args = args_for(McpClient::Hermes);
+        args.bridge_data_dir = Some(PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory"));
+        assert_eq!(
+            bridge_data_dir_args(&args),
+            [
+                "--data-dir".to_owned(),
+                r"C:\Users\me\AppData\Local\ai-memory".to_owned(),
+            ]
+        );
     }
 
     fn args_with_token(client: McpClient) -> InstallMcpArgs {
@@ -4592,6 +4617,29 @@ mod tests {
         assert!(
             !out.contains("~/.claude.json"),
             "render must not hardcode ~/.claude.json when the resolved path differs:\n{out}"
+        );
+    }
+
+    #[test]
+    fn claude_code_session_aware_render_strips_the_windows_verbatim_data_dir() {
+        // The `claude mcp add` snippet renders `args.bridge_data_dir` directly,
+        // not through `bridge_data_dir_args`, so it is a second site of the
+        // same bug: the canonical dir carries the Windows `\\?\` prefix Hermes
+        // mangled into `C:\?\C:\...` (#2203). The snippet must name the plain
+        // drive path, as the bridge entry does. The strip is lexical, so this
+        // runs on any host.
+        let mut args = args_for(McpClient::ClaudeCode);
+        args.session_aware = true;
+        args.bridge_data_dir = Some(PathBuf::from(r"\\?\C:\Users\me\AppData\Local\ai-memory"));
+        let out =
+            render_claude_code(&args, std::path::Path::new("/stores/claude/.claude.json")).unwrap();
+        assert!(
+            out.contains(r"C:\Users\me\AppData\Local\ai-memory"),
+            "the snippet must name the data dir:\n{out}"
+        );
+        assert!(
+            !out.contains(r"\\?\"),
+            "the snippet must not carry the verbatim prefix:\n{out}"
         );
     }
 
