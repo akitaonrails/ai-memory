@@ -20,7 +20,9 @@ use crate::embedding::{
     Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values, retry_delay,
 };
 use crate::error::{LlmError, LlmResult};
-use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
+use crate::openai::{
+    STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas, is_length_truncated,
+};
 use crate::openai_oauth::model_uses_default_temperature;
 use crate::provider::LlmProvider;
 use crate::response::{provider_error, response_json_limited, response_text_limited};
@@ -456,32 +458,51 @@ impl LlmProvider for CopilotProvider {
         enforce_strict_object_schemas(&mut schema);
         let token = self.state.current_token().await?;
         let text = match self.endpoint(&token).await? {
-            CopilotEndpoint::ChatCompletions => self
-                .post_chat(
-                    &token,
-                    &build_chat_request(
-                        &self.model,
-                        &request,
-                        Some(CopilotResponseFormat::JsonSchema {
-                            json_schema: CopilotJsonSchema {
-                                name: STRUCTURED_OUTPUT_SCHEMA_NAME.into(),
-                                schema,
-                                strict: true,
-                            },
-                        }),
-                    ),
-                )
-                .await?
-                .choices
-                .first()
-                .and_then(|c| c.message.content.as_deref())
-                .filter(|text| !text.is_empty())
-                .ok_or_else(|| {
-                    LlmError::UnexpectedShape(
-                        "copilot /chat/completions returned no structured content".into(),
+            CopilotEndpoint::ChatCompletions => {
+                let response = self
+                    .post_chat(
+                        &token,
+                        &build_chat_request(
+                            &self.model,
+                            &request,
+                            Some(CopilotResponseFormat::JsonSchema {
+                                json_schema: CopilotJsonSchema {
+                                    name: STRUCTURED_OUTPUT_SCHEMA_NAME.into(),
+                                    schema,
+                                    strict: true,
+                                },
+                            }),
+                        ),
                     )
-                })?
-                .to_owned(),
+                    .await?;
+                // As on the OpenAI structured path, a budget stop cannot be
+                // treated as complete even when the partial output parses.
+                if is_length_truncated(
+                    response
+                        .choices
+                        .first()
+                        .and_then(|choice| choice.finish_reason.as_deref()),
+                ) {
+                    return Err(LlmError::TruncatedResponse {
+                        model: self.model.clone(),
+                        completion_tokens: response
+                            .usage
+                            .as_ref()
+                            .map(|usage| usage.completion_tokens),
+                    });
+                }
+                response
+                    .choices
+                    .first()
+                    .and_then(|c| c.message.content.as_deref())
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| {
+                        LlmError::UnexpectedShape(
+                            "copilot /chat/completions returned no structured content".into(),
+                        )
+                    })?
+                    .to_owned()
+            }
             CopilotEndpoint::Responses => response_text(
                 &self
                     .post_responses(
@@ -1007,6 +1028,10 @@ struct CopilotChatResponse {
 #[derive(Debug, Deserialize)]
 struct CopilotChoice {
     message: CopilotMessageResponse,
+    /// OpenAI-style completion stop reason; older responses can omit it.
+    /// <https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/streaming-events>
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

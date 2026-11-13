@@ -392,6 +392,12 @@ short-lived Copilot API token via GitHub's `/copilot_internal/v2/token`, and
 uses the Copilot Chat endpoint with `vscode-chat` integration headers. You can
 also set `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` on the server.
 
+Structured Copilot Chat Completions stopped at the token budget
+(`finish_reason = "length"`) fail with `truncated-response`, even if the
+returned text parses as JSON. This is a terminal failure; increase the output
+budget or reduce the requested output before trying again. Plain text
+completions keep returning the generated text.
+
 > [!TIP]
 > **For the OAuth/subscription backends, prefer a small, fast model** via
 > `AI_MEMORY_LLM_MODEL` where the backend lets you choose one. ai-memory's LLM
