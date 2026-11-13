@@ -1125,7 +1125,10 @@ async fn build_okf_bundle_file(
                             "page {} occupies the OKF-reserved filename `{name}` \
                              (OKF v0.2 §3.1 reserves `index.md` and `log.md` at every \
                              level); rename it before exporting",
-                            path.strip_prefix(&bundle_dir).unwrap_or(&path).display()
+                            path.strip_prefix(&bundle_dir)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .replace('\\', "/")
                         );
                     }
                     continue; // generated index.md / unadopted log ledger
@@ -1148,7 +1151,10 @@ async fn build_okf_bundle_file(
                     anyhow::bail!(
                         "page {} is not OKF-conformant; run the server once to migrate \
                          before exporting",
-                        path.strip_prefix(&bundle_dir).unwrap_or(&path).display()
+                        path.strip_prefix(&bundle_dir)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/")
                     );
                 }
                 files.push((path, raw));
@@ -12427,6 +12433,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // The refusal names the nested path with forward slashes on every
+        // platform; a `Path::display()` here renders `notes\legacy.md` on
+        // Windows (#2233 twin site).
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert!(
+            message.contains("notes/legacy.md") && message.contains("not OKF-conformant"),
+            "{message}"
+        );
     }
 
     fn admin_state_for_store(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {
