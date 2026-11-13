@@ -57,7 +57,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed MCP and HTTP/admin message pop and cancel treating an explicitly blank
   `message_id` as omitted, which could claim the oldest message or cancel the
   whole outbox. Blank ids are now refused without changing pending mail;
-  omitted ids and valid UUIDs with surrounding whitespace keep their behavior.
+  omitted ids and valid UUIDs with surrounding whitespace keep their behavior. (#2244)
 
 ## [3.4.6] - 2026-11-13
 
