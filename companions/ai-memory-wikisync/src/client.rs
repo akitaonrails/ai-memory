@@ -1,8 +1,8 @@
 //! Read-only `/api/v1` client.
 //!
 //! Only the documented frontend endpoints are used: incremental `recent`
-//! paging for the page listing (with the legacy bare-array response accepted
-//! as a fallback) and single-page reads with `ETag` / `If-None-Match`
+//! paging for the page listing (falling back to `pages` when `recent` returns
+//! its legacy limited array) and single-page reads with `ETag` / `If-None-Match`
 //! revalidation. No MCP, no admin routes, no writes. The bearer token is
 //! only ever attached as a request header — it never reaches an error
 //! message, a URL, or the state file.
@@ -171,8 +171,8 @@ impl ApiClient {
     /// List the project's latest pages via incremental `recent` paging from
     /// the epoch. Incremental results already exclude superseded and expired
     /// pages, which is exactly the latest-only projection an export wants.
-    /// A server without incremental support answers the legacy bare array;
-    /// that is accepted as the full listing.
+    /// A server without incremental support answers a limited bare array;
+    /// use its full `pages` listing instead of treating recent pages as all pages.
     pub async fn list_pages(&self, workspace: &str, project: &str) -> Result<Vec<PageSummary>> {
         let mut all: Vec<PageSummary> = Vec::new();
         let mut cursor: Option<String> = None;
@@ -196,14 +196,17 @@ impl ApiClient {
                 .copied()
                 .unwrap_or(b'{');
             if first == b'[' {
-                let pages: Vec<PageSummary> = serde_json::from_slice(&bytes).map_err(|e| {
+                // Legacy `recent` clamps `limit` to 100 and has no cursor.
+                // Its array cannot establish that any other page is absent.
+                let url = self.api_url(workspace, project, &["pages"], &[])?;
+                let response = self.send(&url, None, "check --workspace/--project").await?;
+                let pages: Vec<PageSummary> = response.json().await.map_err(|e| {
                     anyhow!(
                         "legacy page listing from {} is malformed: {e}",
                         url.as_str()
                     )
                 })?;
-                all.extend(pages);
-                return Ok(all);
+                return Ok(pages);
             }
             let page: RecentIncremental = serde_json::from_slice(&bytes)
                 .map_err(|e| anyhow!("page listing from {} is malformed: {e}", url.as_str()))?;
