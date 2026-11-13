@@ -6102,9 +6102,13 @@ pub fn cancel_handoff(
 // V64__agent_messages.sql. Modeled on the handoff claim-once discipline above.
 // ---------------------------------------------------------------------------
 
-/// Store-boundary bound for a message field (16 KiB — the last gate; MCP
-/// callers scrub and cap tighter). Reuses the handoff field budget.
-const MESSAGE_FIELD_MAX_BYTES: usize = HANDOFF_FIELD_MAX_BYTES;
+/// Store-boundary bound for a message field (the last gate; MCP and web
+/// callers scrub and cap the body at 8 000 characters first). 32 KiB holds
+/// 8 000 characters even at UTF-8's four-bytes-per-character worst case, so a
+/// message inside the published character budget is never silently truncated
+/// here, as it was when this reused the 16 KiB handoff budget (#2241). The
+/// handoff budget stays 16 KiB.
+const MESSAGE_FIELD_MAX_BYTES: usize = 32 * 1024;
 const MESSAGE_EVIDENCE_MAX_BYTES: usize = 1_000;
 
 /// Maximum pending messages one recipient project may hold. A full inbox

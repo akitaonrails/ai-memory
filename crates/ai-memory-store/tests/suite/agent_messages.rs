@@ -779,3 +779,76 @@ async fn collected_or_cancelled_mail_cannot_be_taken_for_editing() {
         );
     }
 }
+
+/// A message whose body is within the published 8 000-character budget must
+/// survive the store boundary whole, on both the insert and the edit-save
+/// paths. The store field cap used to reuse the 16 KiB handoff budget, which
+/// silently truncated multibyte bodies well inside that character budget
+/// (#2241); the dedicated 32 KiB message cap holds 8 000 characters even at
+/// UTF-8's four-byte worst case.
+#[tokio::test]
+async fn a_message_within_the_character_budget_is_not_truncated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+
+    // 6 000 three-byte characters plus a tail sentinel: 18 015 bytes, over the
+    // old 16 KiB cap that would have cut the sentinel off.
+    let three_byte = format!("{}{}", "界".repeat(6000), " FINAL-SENTINEL");
+    assert_eq!(three_byte.chars().count(), 6015);
+    assert!(three_byte.len() > 16 * 1024 && three_byte.len() < 32 * 1024);
+
+    // insert_message path.
+    let id = store
+        .writer
+        .insert_message(message(a, b, &three_byte))
+        .await
+        .unwrap();
+    let popped = store
+        .writer
+        .pop_message(claim(b), Some(id))
+        .await
+        .unwrap()
+        .expect("the message is in the inbox");
+    assert_eq!(
+        popped.body, three_byte,
+        "insert_message must not truncate a body inside the character budget"
+    );
+
+    // finish_message_edit path, worst case: 8 000 four-byte characters =
+    // 32 000 bytes, the largest a body within the 8 000-character budget can
+    // be, still under the 32 KiB cap.
+    let four_byte = "𝐀".repeat(8000);
+    assert_eq!(four_byte.chars().count(), 8000);
+    assert_eq!(four_byte.len(), 32_000);
+
+    let edit_id = store
+        .writer
+        .insert_message(message(a, b, "placeholder"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .begin_message_edit(b.0, b.1, edit_id)
+        .await
+        .unwrap()
+        .expect("a pending message can be held");
+    assert!(
+        store
+            .writer
+            .finish_message_edit(b.0, b.1, edit_id, Some((None, four_byte.clone())))
+            .await
+            .unwrap()
+    );
+    let edited = store
+        .writer
+        .pop_message(claim(b), Some(edit_id))
+        .await
+        .unwrap()
+        .expect("the saved message is back in the queue");
+    assert_eq!(
+        edited.body, four_byte,
+        "finish_message_edit must not truncate a body inside the character budget"
+    );
+}
