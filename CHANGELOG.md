@@ -270,6 +270,25 @@ version in [`docs/changelog/`](docs/changelog/):
 - Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
   resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
   to `quinn-proto` 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524. (#2242)
+- `export-okf` no longer silently drops a concept page that occupies an
+  OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
+  hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
+  throughout the hierarchy, so the export now refuses with the page's path
+  and asks you to rename it, instead of returning a `200` bundle that is
+  missing the page. A frontmatter-less file at a reserved name (the raw event
+  ledger) is still skipped. (#2233)
+- `memory_patch_page` `replace_section` now keeps the blank line after a
+  section's heading and before the next heading, instead of collapsing
+  `## H\n\nbody\n\n` into `## H\nbody\n`. A `content` that repeats the
+  section's own heading is refused (`section_content_repeats_heading`) rather
+  than written, which used to leave two identical headings that no later edit
+  could target. (#2239)
+- A cross-project message whose body is within the published 8 000-character
+  budget is no longer silently truncated at the store boundary. The store
+  field cap reused the 16 KiB handoff budget, so a body of mostly multibyte
+  characters was cut mid-text even though the MCP and web callers had accepted
+  it; messages now have their own 32 KiB cap, which holds 8 000 characters at
+  UTF-8's four-byte worst case. (#2241)
 
 ## [3.4.6] - 2026-11-13
 
