@@ -628,6 +628,7 @@ web-health-detail-the-llm-provider-s-last-call-failed = A última chamada do pro
 web-health-detail-the-embedding-provider-s-last-call-failed-searches-run-without-the-vector-st = A última chamada do provedor de embeddings falhou{ $value0 }; as buscas executam sem o fluxo vetorial até que ele responda.
 web-health-detail-stale-stored-vector-s-were-made-under-another-provider-model-or-dimension-an = { $value0 } vetor(es) armazenado(s) foram gerados com outro provedor, modelo ou dimensão e são ignorados.
 web-health-detail-missing-latest-page-s-have-no-vector-failed-after-a-failed-or-skipped-embed = { $value0 } página(s) mais recente(s) não têm vetor ({ $value1 } após falha ou omissão de geração de embeddings).
+web-health-detail-the-database-storage-figures-could-not-be-read-reclaim-advice-is-unavailable = Não foi possível ler os dados de armazenamento do banco de dados; a recomendação de recuperação de espaço não está disponível.
 web-health-detail-of-the-byte-database-is-reclaimable-compacting-blocks-writes-while-it-runs = { $value0 } do banco de { $value1 } bytes são recuperáveis; a compactação bloqueia gravações durante a execução.
 web-health-detail-session-consolidation-job-s-gave-up-after-their-retries = { $value0 } tarefa(s) de consolidação de sessão esgotaram suas tentativas.
 web-health-detail-never = nunca

@@ -97,8 +97,11 @@ pub struct HealthSnapshot {
     pub process: ProcessState,
     /// Derived-index readiness.
     pub derived: DerivedIndexStatus,
-    /// Database file and reclaimable space.
-    pub storage: StorageStatus,
+    /// Database file and reclaimable space. `None` when the pragma reads
+    /// failed: a zeroed [`StorageStatus`] is indistinguishable from a real
+    /// measurement of an empty database, so the unreadable case carries no
+    /// figures at all rather than borrowing an empty one's.
+    pub storage: Option<StorageStatus>,
     /// SessionEnd consolidation queue.
     pub consolidation: SessionConsolidationQueue,
     /// The configured embedder; `None` on a zero-LLM server.
@@ -337,13 +340,29 @@ pub fn localized_checks(
             );
         }
     }
-    if fix_lines::reclaim_advised(s.storage.reclaimable_bytes, s.storage.database_bytes) {
-        push(
-            "storage_reclaim",
+    match s.storage {
+        // Without the figures the reclaim test cannot run, and staying silent
+        // reads as "nothing to compact" — the same answer an empty database
+        // gets. Say which of the two it is.
+        None => push(
+            "storage_unreadable",
             CheckStatus::Warn,
-            i18n.format("web-health-detail-of-the-byte-database-is-reclaimable-compacting-blocks-writes-while-it-runs", &[("value0", format!("{}", s.storage.reclaimable_bytes)), ("value1", format!("{}", s.storage.database_bytes))]),
-            Some(fix_lines::COMPACT),
-        );
+            i18n.text(
+                "web-health-detail-the-database-storage-figures-could-not-be-read-reclaim-advice-is-unavailable",
+            ),
+            None,
+        ),
+        Some(storage)
+            if fix_lines::reclaim_advised(storage.reclaimable_bytes, storage.database_bytes) =>
+        {
+            push(
+                "storage_reclaim",
+                CheckStatus::Warn,
+                i18n.format("web-health-detail-of-the-byte-database-is-reclaimable-compacting-blocks-writes-while-it-runs", &[("value0", format!("{}", storage.reclaimable_bytes)), ("value1", format!("{}", storage.database_bytes))]),
+                Some(fix_lines::COMPACT),
+            );
+        }
+        Some(_) => {}
     }
     if s.consolidation.failed > 0 {
         push(
@@ -382,7 +401,7 @@ mod tests {
                 journal: Some(JournalState::default()),
             },
             derived: DerivedIndexStatus::default(),
-            storage: StorageStatus::default(),
+            storage: Some(StorageStatus::default()),
             consolidation: SessionConsolidationQueue::default(),
             embedder: Some(EmbedderIdentity {
                 provider: "synthetic".into(),
@@ -587,11 +606,33 @@ mod tests {
     #[test]
     fn reclaimable_storage_points_at_compact() {
         let mut snapshot = healthy();
-        snapshot.storage.database_bytes = 1024 * 1024 * 1024;
-        snapshot.storage.reclaimable_bytes = 300 * 1024 * 1024;
+        snapshot.storage = Some(StorageStatus {
+            database_bytes: 1024 * 1024 * 1024,
+            reclaimable_bytes: 300 * 1024 * 1024,
+            ..StorageStatus::default()
+        });
         let check = only(&snapshot);
         assert_eq!(check.id, "storage_reclaim");
         assert_eq!(check.fix.as_deref(), Some(fix_lines::COMPACT));
+    }
+
+    /// An unreadable pragma read is not an empty database: the reclaim test
+    /// cannot run, so the page says so instead of staying silent the way it
+    /// does for a store with nothing to compact.
+    #[test]
+    fn unreadable_storage_warns_instead_of_reading_as_nothing_to_compact() {
+        let mut snapshot = healthy();
+        snapshot.storage = None;
+        let check = only(&snapshot);
+        assert_eq!(check.id, "storage_unreadable");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.fix, None, "there is no command that fixes a read");
+
+        snapshot.storage = Some(StorageStatus::default());
+        assert!(
+            checks(&snapshot).is_empty(),
+            "a genuinely empty database still advises nothing"
+        );
     }
 
     #[test]
