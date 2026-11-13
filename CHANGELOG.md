@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.6] - 2026-11-13
+
 ### Fixed
 
 - The dashboard's envelope icon (sidebar Inbox link, inbox rows and empty
@@ -5145,7 +5147,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.5...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.6...HEAD
+[3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6
 [3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
 [3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
 [3.4.3]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.3
