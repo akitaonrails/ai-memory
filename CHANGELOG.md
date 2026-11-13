@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- OKF exports now include ordinary concept pages beneath nested `_pending`
+  directories such as `notes/_pending/manual.md`. The exclusion for the
+  project's proposal staging directory matched that name at every depth and
+  silently omitted these pages. Project-root proposal sidecars stay excluded.
+
 ## [3.4.6] - 2026-11-13
 
 ### Fixed
