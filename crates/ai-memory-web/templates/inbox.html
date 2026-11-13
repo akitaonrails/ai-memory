@@ -3,6 +3,7 @@
 {% block content %}
 {% if project != "" %}<nav class="breadcrumbs" aria-label="{{ i18n.text("web-breadcrumb") }}"><a href=".">{{ i18n.text("web-projects") }}</a><span>/</span><span>{{ workspace }}</span><span>/</span><a href="{{ project_href }}">{{ project }}</a><span>/</span><span aria-current="page">{{ i18n.text("web-inbox") }}</span></nav>{% endif %}
 <div class="page-heading"><div><p class="eyebrow">{{ i18n.text("web-keep-work-moving") }}</p><h1>{{ i18n.text("web-agent-inbox") }}</h1><p>{% if project != "" %}{{ i18n.text("web-viewing-mailbox") }} <a href="{{ project_href }}"><strong>{{ workspace }} / {{ project }}</strong></a>{% else %}{{ i18n.text("web-create-a-project-to-start-exchanging-messages-with-agents") }}{% endif %}</p></div><a href="{{ inbox_href }}#compose" id="compose-shortcut" class="primary-button">{{ i18n.text("web-new-message") }}</a></div>
+{% if warning != "" %}<p class="section-note" role="alert"><strong>{{ i18n.text("web-mailbox-unavailable") }}</strong> {{ warning }}</p>{% endif %}
 <section class="surface mail-overview" aria-labelledby="mail-overview-title">
   <h2 id="mail-overview-title">{{ i18n.text("web-waiting-for-agents") }}</h2>
   {% if pending_total > 0 %}<p class="section-note"><strong>{{ pending_total }} {{ i18n.text("web-queued") }}</strong> · {% if pending_projects == 1 %}{{ i18n.text("web-1-project") }}{% else %}{{ pending_projects }} {{ i18n.text("web-projects-inbox") }}{% endif %}{{ i18n.text("web-opening-a-mailbox-does-not-collect-its-messages") }}</p>
