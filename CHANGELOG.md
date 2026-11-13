@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - `status --json` now preserves the server's write-queue depth and wiki-format
   diagnostics. Both fields were read from the server and shown in the human
   report but silently dropped from JSON, hiding a backed-up writer from
-  monitors. Older servers that omit the fields keep the same JSON shape.
+  monitors. Older servers that omit the fields keep the same JSON shape. (#2235)
 
 ## [3.4.6] - 2026-11-13
 
