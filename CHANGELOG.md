@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `[auto_improve] include_global_titles` (off by default) lists the titles of
+  the reserved `_global` scope's pages to the auto-improvement reviewer, read
+  only, in the per-session review and the cross-session experience pass.
+  Validation rejects a full-page proposal that reuses one of their paths or
+  titles (`duplicate_global_path`, `duplicate_global_title`), so a standing
+  cross-project rule stops coming back as a project page. Only `_global` is
+  read, and with the option off the reviewer prompt is unchanged. (#2248)
 - Compiled pages record the observations they were built from. A new
   `page_sources` table (migration V108) holds one row per page version and
   observation, written in the same transaction as the page. A consolidated page
