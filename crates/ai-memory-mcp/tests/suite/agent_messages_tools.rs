@@ -356,6 +356,71 @@ async fn sender_can_cancel_a_pending_message() {
     );
 }
 
+async fn assert_blank_message_id_preserves_mail(tool: &str, project: &str) {
+    let h = harness().await;
+    let first = send(&h.router, "first", "first request").await;
+    let second = send(&h.router, "second", "second request").await;
+    let pending = list(&h.router, B, "inbox").await;
+    assert_eq!(pending.len(), 2);
+
+    for message_id in ["", " \t\n ", "not-a-uuid"] {
+        let refused = call_rpc(
+            &h.router,
+            tool,
+            json!({ "workspace": WS, "project": project, "message_id": message_id }),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], -32602, "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid message_id"),
+            "{refused}"
+        );
+        assert_eq!(list(&h.router, B, "inbox").await, pending);
+    }
+
+    // A padded UUID still selects the second message, not the oldest one.
+    let selected = call(
+        &h.router,
+        tool,
+        json!({ "workspace": WS, "project": project, "message_id": format!(" {second}\n") }),
+    )
+    .await;
+    if tool == "memory_message_pop" {
+        assert_eq!(selected["message"]["id"], second);
+    } else {
+        assert_eq!(selected["cancelled"], 1);
+    }
+    let remaining = list(&h.router, B, "inbox").await;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["id"], first);
+
+    let omitted = call(
+        &h.router,
+        tool,
+        json!({ "workspace": WS, "project": project }),
+    )
+    .await;
+    if tool == "memory_message_pop" {
+        assert_eq!(omitted["message"]["id"], first);
+    } else {
+        assert_eq!(omitted["cancelled"], 1);
+    }
+    assert!(list(&h.router, B, "inbox").await.is_empty());
+}
+
+#[tokio::test]
+async fn blank_message_pop_id_preserves_pending_mail() {
+    assert_blank_message_id_preserves_mail("memory_message_pop", B).await;
+}
+
+#[tokio::test]
+async fn blank_message_cancel_id_preserves_pending_mail() {
+    assert_blank_message_id_preserves_mail("memory_message_cancel", A).await;
+}
+
 /// Cancel is scoped to the SENDER coordinate: the recipient calling cancel from
 /// its own project clears nothing and the message it received survives — the
 /// tool-surface mirror of the store's `recipient_cannot_cancel_the_senders_outbox`.

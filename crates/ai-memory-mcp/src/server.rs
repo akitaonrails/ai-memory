@@ -7668,7 +7668,7 @@ impl AiMemoryServer {
         .await?;
         let specific_id =
             match args.message_id.as_deref().map(str::trim) {
-                None | Some("") => None,
+                None => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
                     McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
@@ -7770,7 +7770,7 @@ impl AiMemoryServer {
         .await?;
         let specific_id =
             match args.message_id.as_deref().map(str::trim) {
-                None | Some("") => None,
+                None => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
                     McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),

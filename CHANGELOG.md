@@ -54,6 +54,10 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- Fixed MCP and HTTP/admin message pop and cancel treating an explicitly blank
+  `message_id` as omitted, which could claim the oldest message or cancel the
+  whole outbox. Blank ids are now refused without changing pending mail;
+  omitted ids and valid UUIDs with surrounding whitespace keep their behavior.
 
 ## [3.4.6] - 2026-11-13
 
