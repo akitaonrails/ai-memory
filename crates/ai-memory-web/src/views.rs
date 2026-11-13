@@ -68,4 +68,5 @@ pub(crate) struct InboxView {
     pub next: String,
     pub can_send: bool,
     pub needs_write_token: bool,
+    pub warning: String,
 }
