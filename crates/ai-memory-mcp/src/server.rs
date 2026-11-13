@@ -61,6 +61,7 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
         max_input_tokens: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
         max_proposals_per_run: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
         include_raw_fallback: false,
+        include_global_titles: false,
         proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
         pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
         max_patchable_pages: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
@@ -5207,6 +5208,7 @@ impl AiMemoryServer {
             include_raw_fallback: args
                 .include_raw_fallback
                 .unwrap_or(defaults.include_raw_fallback),
+            include_global_titles: defaults.include_global_titles,
             proposal_actor: defaults.proposal_actor.clone(),
             pending_path: defaults.pending_path.clone(),
             max_patchable_pages: defaults.max_patchable_pages,

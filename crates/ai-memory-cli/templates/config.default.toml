@@ -593,6 +593,12 @@ pending_path = "_pending/auto-improve"
 # max_patchable_pages = 8
 # max_patchable_body_chars = 8000
 #
+# List the titles of the reserved `_global` scope's pages to the reviewer,
+# read-only, so it stops proposing project pages that restate a standing
+# cross-project rule. A full-page proposal that reuses one of their paths or
+# titles is rejected. Off by default (#1212).
+# include_global_titles = false
+#
 # Size limits on patch proposals. Raise them only when validated proposals are
 # being rejected for size. max_final_body_chars is also capped at 32000 in
 # code, so a higher value has no effect; lower it to tighten the limit.

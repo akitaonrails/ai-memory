@@ -436,6 +436,27 @@ Observe que `max_patchable_pages` ainda limita quantas das páginas corresponden
 enviadas, e a lista de páginas recentes de onde são extraídas é ordenada por recência; logo, uma
 página durável que não tenha sido atualizada recentemente pode ficar fora dela.
 
+### Regras permanentes no escopo `_global`
+
+Uma regra escrita uma vez no escopo reservado `_global` já vale para todo projeto, mas o
+revisor lê só o projeto revisado e pode propor a mesma regra de novo como página do projeto.
+Ative `include_global_titles = true` para listar também as páginas do escopo `_global` ao
+revisor, uma linha cada (caminho, título, tipo, data de atualização), sem o corpo:
+
+```toml
+[auto_improve]
+include_global_titles = true
+```
+
+A validação então rejeita uma proposta de página inteira cujo caminho ou título coincida com
+uma página do `_global`, com o motivo `duplicate_global_path` ou `duplicate_global_title`.
+Essas rejeições entram no contexto de rejeições das revisões seguintes como qualquer outra. A
+lista é só leitura: uma página do `_global` nunca é alvo de correção, e a revisão do próprio
+escopo `_global` não acrescenta nada, porque as páginas dele já são dele. Só o `_global` é
+lido. As leituras padrão de todo leitor já o incluem, então nenhuma página de outro projeto
+chega ao revisor. A opção vem desligada, e desligada o prompt não muda. O revisor por sessão
+e o passe de experiência entre sessões seguem a mesma opção.
+
 
 `[auto_improve.scheduler]` controla se e com que frequência o servidor inicia a
 revisão em segundo plano. `[auto_improve] require_approval` controla se propostas validadas
@@ -584,7 +605,9 @@ pode notar que já existe e, portanto, o que ele pode repropor de forma redundan
   são enviadas integralmente ao revisor, a menos que sua pasta seja adicionada. Propostas de
   correção permanecem limitadas a `_rules/` e `procedures/` de qualquer maneira.
 - **A lista de "páginas recentes" é ordenada por recência, uma linha por página** (caminho,
-  título, tipo, data de atualização), extraída do briefing do projeto. Por ser uma lista plana
+  título, tipo, data de atualização), extraída do briefing do projeto. Com
+  `include_global_titles` ligado, uma segunda lista no mesmo formato traz até 100 páginas do
+  escopo reservado `_global`. Por ser uma lista plana
   delimitada, um projeto com muitas páginas exibe ao revisor apenas as atualizadas mais
   recentemente. Para manter esses slots para o conhecimento durável, o revisor
   de autoaprimoramento exclui páginas de `sessions/` do *seu* contexto de páginas recentes

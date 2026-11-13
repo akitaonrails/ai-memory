@@ -255,6 +255,7 @@ The defaults named `DEFAULT_AUTO_IMPROVE_*` are constants in `ai-memory-consolid
 | `max_rule_page_tokens` | `2000` (`DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS`) | `AI_MEMORY_AUTO_IMPROVE__MAX_RULE_PAGE_TOKENS` | Approximate tokens allowed in one `_rules/` page. |
 | `max_procedure_page_tokens` | `2000` (`DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS`) | `AI_MEMORY_AUTO_IMPROVE__MAX_PROCEDURE_PAGE_TOKENS` | Approximate tokens allowed in one `procedures/` page. |
 | `include_raw_fallback` | `false` | `AI_MEMORY_AUTO_IMPROVE__INCLUDE_RAW_FALLBACK` | Let the reviewer include raw observation fallback details. |
+| `include_global_titles` | `false` | `AI_MEMORY_AUTO_IMPROVE__INCLUDE_GLOBAL_TITLES` | List the reserved `_global` scope's page titles to the reviewer, read-only, and reject full-page proposals that reuse their paths or titles. |
 | `proposal_actor` | `auto_improve` (`DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR`) | `AI_MEMORY_AUTO_IMPROVE__PROPOSAL_ACTOR` | Synthetic actor recorded as the author of autonomous proposals. |
 | `pending_path` | `_pending/auto-improve` (`DEFAULT_AUTO_IMPROVE_PENDING_PATH`) | `AI_MEMORY_AUTO_IMPROVE__PENDING_PATH` | Wiki-relative folder for non-indexed pending proposal files. |
 

@@ -24,8 +24,8 @@ use ai_memory_store::{ReaderPool, StoredPageBody};
 use crate::auto_improve::{
     AutoImproveError, AutoImproveLlmResponse, AutoImproveReport, AutoImproveResult,
     AutoImproveReviewConfig, ExistingPageIndex, apply_eval_gate, estimate_tokens,
-    load_patchable_pages, load_rejection_context, render_patchable_pages, render_recent_pages,
-    render_rejection_context,
+    load_global_pages, load_patchable_pages, load_rejection_context, render_global_section,
+    render_patchable_pages, render_recent_pages, render_rejection_context,
 };
 
 /// Settings for the cross-session pass.
@@ -170,6 +170,7 @@ pub async fn run_experience_review(
     )
     .await?;
     let rejection_context = load_rejection_context(reader, workspace_id, project_id, &cfg).await?;
+    let global_pages = load_global_pages(reader, workspace_id, project_id, &cfg).await?;
 
     let mut warnings = Vec::new();
     if entropy_skipped > 0 {
@@ -184,6 +185,10 @@ pub async fn run_experience_review(
          ## Recent wiki pages (existing knowledge)\n\n",
     );
     prompt.push_str(&render_recent_pages(&briefing.recent_pages));
+    if !global_pages.is_empty() {
+        prompt.push_str("\n## Standing _global pages (read-only, never restate)\n\n");
+        prompt.push_str(&render_global_section(&global_pages));
+    }
     let rendered_patchable = render_patchable_pages(
         &patchable_pages,
         cfg.max_patchable_body_chars,
@@ -218,7 +223,8 @@ pub async fn run_experience_review(
         .filter(|page| rendered_patchable.included_paths.contains(&page.path))
         .cloned()
         .collect();
-    let existing_index = ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable);
+    let existing_index = ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable)
+        .with_global_pages(&global_pages);
     let estimated_input_tokens = estimate_tokens(&prompt);
     let request = ChatRequest {
         system: Some(crate::with_output_language(

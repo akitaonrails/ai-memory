@@ -2827,6 +2827,9 @@ async fn handle_auto_improve(
         max_input_tokens: req.max_input_tokens,
         max_proposals_per_run: req.max_proposals_per_run,
         include_raw_fallback: req.include_raw_fallback,
+        // Server-owned like the eval policy: the admin body cannot widen what
+        // the reviewer reads.
+        include_global_titles: state.auto_improve_review_config.include_global_titles,
         proposal_actor: req.proposal_actor.clone(),
         pending_path: req.pending_path.clone(),
         max_patchable_pages: req.max_patchable_pages,
@@ -3202,7 +3205,9 @@ fn auto_improve_error_response(
         AutoImproveError::Llm(_) => StatusCode::BAD_GATEWAY,
         AutoImproveError::Eval(_) => StatusCode::BAD_GATEWAY,
         AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
-        AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        AutoImproveError::Store(_) | AutoImproveError::Scope(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     };
     log_server_error(status, "auto-improve", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
