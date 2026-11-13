@@ -9582,6 +9582,9 @@ fn page_patch_error(path: &PagePath, error: crate::page_patch::PatchError) -> Mc
         PatchError::AnchorNotFound(anchor) => ("anchor_not_found", Some(anchor.as_str())),
         PatchError::AmbiguousAnchor(anchor) => ("ambiguous_anchor", Some(anchor.as_str())),
         PatchError::HeadingExists(anchor) => ("heading_exists", Some(anchor.as_str())),
+        PatchError::SectionContentRepeatsHeading(anchor) => {
+            ("section_content_repeats_heading", Some(anchor.as_str()))
+        }
         PatchError::SectionPreconditionFailed(anchor) => {
             ("section_precondition_failed", Some(anchor.as_str()))
         }
