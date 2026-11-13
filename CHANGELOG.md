@@ -38,7 +38,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Rejected Copilot Chat Completions structured output stopped at its token
   budget before parsing it as JSON. A valid-looking partial object could
   previously be accepted as a complete result; it now reports the terminal
-  `truncated-response` error, matching Copilot Responses. (#NNN)
+  `truncated-response` error, matching Copilot Responses. (#2251)
 
 ## [3.4.6] - 2026-11-13
 
