@@ -57,7 +57,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed CLI/admin message sends counting the body, subject and evidence caps
   in UTF-8 bytes instead of Unicode characters after scrubbing. Multibyte text
   within both the character budgets and the existing store byte limits is now
-  preserved. ASCII truncation and the final store byte limits are unchanged.
+  preserved. ASCII truncation and the final store byte limits are unchanged. (#2245)
 
 ## [3.4.6] - 2026-11-13
 
