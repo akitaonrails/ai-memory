@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `export-okf` no longer silently drops a concept page that occupies an
+  OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
+  hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
+  throughout the hierarchy, so the export now refuses with the page's path
+  and asks you to rename it, instead of returning a `200` bundle that is
+  missing the page. A frontmatter-less file at a reserved name (the raw event
+  ledger) is still skipped. (#2233)
 - `memory_patch_page` `replace_section` now keeps the blank line after a
   section's heading and before the next heading, instead of collapsing
   `## H\n\nbody\n\n` into `## H\nbody\n`. A `content` that repeats the
