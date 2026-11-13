@@ -299,6 +299,7 @@ cli-backfill-ai-memory-no-local-session-history-found-to-backfill-for = ai-memor
 cli-backup-requesting-backup-from-server = solicitando backup ao servidor
 cli-archive-download-reading-signature = lendo a assinatura do arquivo baixado
 cli-archive-download-not-gzip = a resposta do servidor não começa com uma assinatura gzip
+cli-archive-download-corrupt-gzip = o arquivo baixado não é um fluxo gzip válido (corrompido ou truncado); o arquivo anterior foi mantido
 cli-backup-agents-locating-user-home-directory = localizando o diretório pessoal do usuário
 cli-backup-agents-locating-current-working-directory = localizando o diretório de trabalho atual
 cli-backup-agents-no-ai-agent-assets-detected-for-backup = Nenhum recurso de agente de IA detectado para backup.
