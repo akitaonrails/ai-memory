@@ -9,8 +9,8 @@ use std::collections::{BTreeSet, HashSet};
 use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
     MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage, NewSession, NewSessionUsage,
-    ObservationId, ObservationKind, OwnerFilter, PageEvidence, PageId, PagePath, ProjectId,
-    SessionId, WorkspaceId,
+    ObservationId, ObservationKind, OwnerFilter, PageEvidence, PageEvidenceKind, PageId, PagePath,
+    ProjectId, SessionId, SourceObservations, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -2141,7 +2141,7 @@ pub(crate) fn upsert_page_in_tx(
             // reconsolidation from a different session still cites the
             // page it reaffirmed (P2, docs/design-hindsight-borrowings.md
             // §3) — record the evidence against the still-current id.
-            insert_evidence_in_tx(tx, &unchanged_id, &page.evidence, now)?;
+            insert_evidence_in_tx(tx, &unchanged_id, page, now)?;
             return Ok(unchanged_id);
         }
         let frontmatter_str = stamped_frontmatter(conformed, now)?;
@@ -2194,7 +2194,7 @@ pub(crate) fn upsert_page_in_tx(
         replace_links_in_tx(tx, &new_id, page)?;
         attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
-        insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
+        insert_evidence_in_tx(tx, &new_id, page, now)?;
         audit(
             tx,
             "supersede_page",
@@ -2285,7 +2285,7 @@ pub(crate) fn upsert_page_in_tx(
     replace_links_in_tx(tx, &new_id, page)?;
     attach_entities_in_tx(tx, &new_id, page, now)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
-    insert_evidence_in_tx(tx, &new_id, &page.evidence, now)?;
+    insert_evidence_in_tx(tx, &new_id, page, now)?;
     audit(
         tx,
         if tombstone.is_some() {
@@ -2457,15 +2457,81 @@ fn replace_links_in_tx(
 fn insert_evidence_in_tx(
     tx: &rusqlite::Transaction<'_>,
     page_id: &PageId,
-    evidence: &[PageEvidence],
+    page: &NewPage,
     now: i64,
 ) -> StoreResult<()> {
-    for e in evidence {
+    for e in &page.evidence {
         tx.execute(
             "INSERT OR IGNORE INTO page_evidence (page_id, source_kind, source_id, created_at) \
              VALUES (?1, ?2, ?3, ?4)",
             params![page_id.as_bytes(), e.kind.as_str(), e.source_id, now],
         )?;
+        insert_page_sources_in_tx(tx, page_id, page, e, now)?;
+    }
+    Ok(())
+}
+
+/// Record which observations a session citation says the page was compiled
+/// from (`page_sources`, V108, #2164), in the page-upsert transaction.
+///
+/// The rows take the page's own coordinate, and an observation is recorded
+/// only when it belongs to the cited session inside that same workspace and
+/// project. A listed id that is unknown, belongs to another session or sits
+/// in another project is skipped: a write can never make a page name an
+/// observation its project does not hold. `INSERT OR IGNORE` on the
+/// `(page_id, observation_id)` key makes a repeated compile of an unchanged
+/// version add only the sources it had not named yet.
+fn insert_page_sources_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+    page: &NewPage,
+    evidence: &PageEvidence,
+    now: i64,
+) -> StoreResult<()> {
+    if evidence.kind != PageEvidenceKind::Session {
+        return Ok(());
+    }
+    // `source_id` is opaque to `page_evidence`; here it has to be the session
+    // the observations belong to, so anything else records no source.
+    let Ok(session_id) = evidence.source_id.parse::<SessionId>() else {
+        return Ok(());
+    };
+    match &evidence.observations {
+        SourceObservations::Unrecorded => {}
+        SourceObservations::Listed(observation_ids) => {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO page_sources \
+                     (workspace_id, project_id, page_id, observation_id, created_at) \
+                 SELECT o.workspace_id, o.project_id, ?1, o.id, ?2 FROM observations o \
+                 WHERE o.id = ?3 AND o.session_id = ?4 \
+                   AND o.workspace_id = ?5 AND o.project_id = ?6",
+            )?;
+            for observation_id in observation_ids {
+                stmt.execute(params![
+                    page_id.as_bytes(),
+                    now,
+                    observation_id.as_bytes(),
+                    session_id.as_bytes(),
+                    page.workspace_id.as_bytes(),
+                    page.project_id.as_bytes(),
+                ])?;
+            }
+        }
+        SourceObservations::WholeSession => {
+            tx.execute(
+                "INSERT OR IGNORE INTO page_sources \
+                     (workspace_id, project_id, page_id, observation_id, created_at) \
+                 SELECT o.workspace_id, o.project_id, ?1, o.id, ?2 FROM observations o \
+                 WHERE o.session_id = ?3 AND o.workspace_id = ?4 AND o.project_id = ?5",
+                params![
+                    page_id.as_bytes(),
+                    now,
+                    session_id.as_bytes(),
+                    page.workspace_id.as_bytes(),
+                    page.project_id.as_bytes(),
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -8717,6 +8783,12 @@ pub fn move_project_workspace(
         "UPDATE pages SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
     )? as u64;
+    // `page_sources` repeats its page's coordinate (V108), so it follows the
+    // page; left behind, the old workspace's deletion would cascade it away.
+    tx.execute(
+        "UPDATE page_sources SET workspace_id = ?1 WHERE project_id = ?2",
+        params![&to[..], &pid[..]],
+    )?;
     let sessions_moved = tx.execute(
         "UPDATE sessions SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
@@ -9045,6 +9117,7 @@ pub fn merge_project(
         "auto_improve_scheduler_claims",
         "session_consolidation_jobs",
         "page_feedback",
+        "page_sources",
         "purged_sessions",
         "query_page_signals",
     ] {
@@ -9632,6 +9705,23 @@ pub fn move_session(
                 if taken.is_some() || candidate_latest > 1 {
                     return Err(StoreError::PagePathTaken { path: page_path });
                 }
+                // The moved versions' `page_sources` rows repeat the page
+                // coordinate (V108); re-stamp them first, while the pages
+                // can still be found under the scope they are leaving.
+                tx.execute(
+                    &format!(
+                        "UPDATE page_sources SET workspace_id = ?4, project_id = ?5 \
+                         WHERE page_id IN ( \
+                             SELECT id FROM pages WHERE {page_scope_sql} AND path = ?3)"
+                    ),
+                    params![
+                        page_scope_params.0,
+                        page_scope_params.1,
+                        page_path.as_str(),
+                        &to_ws[..],
+                        &to_proj[..],
+                    ],
+                )?;
                 summary.page_versions_moved = tx.execute(
                     &format!(
                         "UPDATE pages SET workspace_id = ?4, project_id = ?5 \
@@ -14313,6 +14403,7 @@ pub(crate) mod tests {
         p.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-a".into(),
+            observations: Default::default(),
         }];
         let id = upsert_page(&mut conn, &p).unwrap();
         assert_eq!(evidence_count(&conn, &id), 1);
@@ -14320,6 +14411,7 @@ pub(crate) mod tests {
         p.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-b".into(),
+            observations: Default::default(),
         }];
         let id2 = upsert_page(&mut conn, &p).unwrap();
         assert_eq!(id2, id, "unchanged content must not create a new version");
@@ -14347,6 +14439,7 @@ pub(crate) mod tests {
         p2.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-a".into(),
+            observations: Default::default(),
         }];
         let id2 = upsert_page(&mut conn, &p2).unwrap();
         assert_ne!(id2, id1, "changed body supersedes to a new version");
@@ -14367,6 +14460,7 @@ pub(crate) mod tests {
         p.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-a".into(),
+            observations: Default::default(),
         }];
         let id = upsert_page(&mut conn, &p).unwrap();
         assert_eq!(evidence_count(&conn, &id), 1);

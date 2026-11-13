@@ -8049,6 +8049,97 @@ mod tests {
         );
     }
 
+    /// `page_sources` (V108, #2164) is written in the page-upsert
+    /// transaction: when a later page of the batch fails in SQL, the staged
+    /// files and the sources the earlier page had already recorded go away
+    /// together. Control: the earlier page alone commits file and source.
+    #[tokio::test]
+    async fn apply_batch_rolls_back_page_sources_with_files_when_sql_batch_fails() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let session = ai_memory_core::SessionId::new();
+        let observation = ai_memory_core::ObservationId::new();
+        let db =
+            || rusqlite::Connection::open(tmp.path().join("db").join("memory.sqlite")).unwrap();
+        {
+            let db = db();
+            db.execute(
+                "INSERT INTO sessions (id, workspace_id, project_id, agent_kind, cwd, started_at) \
+                 VALUES (?1, ?2, ?3, 'codex', '/w', 1)",
+                rusqlite::params![session.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'post-tool-use', 'tool', 'output', 1)",
+                rusqlite::params![
+                    observation.as_bytes(),
+                    session.as_bytes(),
+                    ws.as_bytes(),
+                    proj.as_bytes()
+                ],
+            )
+            .unwrap();
+        }
+        let source_rows = || -> i64 {
+            db().query_row("SELECT COUNT(*) FROM page_sources", [], |row| row.get(0))
+                .unwrap()
+        };
+        let compiled = PagePath::new("batch/compiled.md").unwrap();
+        let compiled_req = || {
+            let mut request = req(
+                ws,
+                proj,
+                compiled.as_str(),
+                "compiled from the session",
+                serde_json::json!({ "title": "Compiled" }),
+            );
+            request.evidence = vec![ai_memory_core::PageEvidence {
+                kind: ai_memory_core::PageEvidenceKind::Session,
+                source_id: session.to_string(),
+                observations: ai_memory_core::SourceObservations::Listed(vec![observation]),
+            }];
+            request
+        };
+        let failing = PagePath::new("batch/failing.md").unwrap();
+        let mut failing_req = req(
+            ws,
+            proj,
+            failing.as_str(),
+            "an unknown author fails the foreign key",
+            serde_json::json!({ "title": "Failing" }),
+        );
+        failing_req.author_id = Some(ai_memory_core::UserId::new());
+
+        let err = wiki
+            .apply_batch(vec![compiled_req(), failing_req])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("FOREIGN KEY") || err.to_string().contains("constraint"),
+            "expected FK failure, got {err}"
+        );
+        assert!(!wiki.abs_path(ws, proj, &compiled).exists());
+        assert!(!wiki.abs_path(ws, proj, &failing).exists());
+        assert_eq!(source_rows(), 0, "no source outlives the rollback");
+
+        wiki.apply_batch(vec![compiled_req()]).await.unwrap();
+        assert!(wiki.abs_path(ws, proj, &compiled).exists());
+        assert_eq!(source_rows(), 1);
+    }
+
     #[tokio::test]
     async fn apply_batch_runs_admission_and_scrubs_webhook_mutations() {
         use crate::admission::{

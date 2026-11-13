@@ -5886,6 +5886,10 @@ impl AiMemoryServer {
                 .map(|id| ai_memory_core::PageEvidence {
                     kind: ai_memory_core::PageEvidenceKind::Session,
                     source_id: id.to_string(),
+                    // The tool names a session, not observations, so the
+                    // page's sources are the session's observations in this
+                    // project at commit time (#2164).
+                    observations: ai_memory_core::SourceObservations::WholeSession,
                 })
                 .into_iter()
                 .collect(),
@@ -21636,6 +21640,7 @@ mod tests {
             );
         }
         assert_eq!(session_evidence_rows(&store, foreign), 0);
+        assert!(page_source_rows(&store).is_empty());
 
         server
             .memory_write_page(
@@ -21649,6 +21654,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claimable_sessions(&store).await, vec![foreign]);
+    }
+
+    /// Every `page_sources` row as `(page path, observation id)`.
+    fn page_source_rows(store: &Store) -> Vec<(String, Vec<u8>)> {
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.path, ps.observation_id FROM page_sources ps \
+                 JOIN pages p ON p.id = ps.page_id \
+                  AND p.workspace_id = ps.workspace_id AND p.project_id = ps.project_id \
+                 ORDER BY p.path, ps.observation_id",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// #2164 step 1: a page written with a `session_id` names the
+    /// observations that session has in the target project, and nothing the
+    /// session left in another project. Control: the same write without a
+    /// `session_id` names none.
+    #[tokio::test]
+    async fn write_page_with_a_session_records_its_observations_as_sources() {
+        let (_tmp, store, server, ws, [(proj, own), (elsewhere, _)]) =
+            session_evidence_fixture().await;
+        // The session also left one observation in the other project.
+        {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            conn.execute(
+                "INSERT INTO observations \
+                 (id, session_id, workspace_id, project_id, kind, title, body, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'post-tool-use', 'tool', 'landed elsewhere', 1)",
+                rusqlite::params![
+                    ai_memory_core::ObservationId::new().as_bytes(),
+                    own.as_bytes(),
+                    ws.as_bytes(),
+                    elsewhere.as_bytes(),
+                ],
+            )
+            .unwrap();
+        }
+        let in_project: Vec<Vec<u8>> = {
+            let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM observations \
+                     WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
+                     ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map(
+                rusqlite::params![own.as_bytes(), ws.as_bytes(), proj.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        assert!(!in_project.is_empty());
+
+        let mut plain = session_write_args(
+            "decisions/by-hand.md".into(),
+            "# By hand\n\nNo session cited.",
+            own,
+        );
+        plain.session_id = None;
+        server
+            .memory_write_page(Parameters(plain), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert!(page_source_rows(&store).is_empty());
+
+        server
+            .memory_write_page(
+                Parameters(session_write_args(
+                    "decisions/retry-policy.md".into(),
+                    "# Retry policy\n\nKeep the event id on retry.",
+                    own,
+                )),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page_source_rows(&store),
+            in_project
+                .into_iter()
+                .map(|id| ("decisions/retry-policy.md".to_owned(), id))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Writing the session page settles what `memory_consolidate` would have

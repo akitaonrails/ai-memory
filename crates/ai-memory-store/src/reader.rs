@@ -18391,11 +18391,13 @@ mod tests {
         page.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: codex_session.to_string(),
+            observations: Default::default(),
         }];
         store.writer.upsert_page(page.clone()).await.unwrap();
         page.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: claude_session.to_string(),
+            observations: Default::default(),
         }];
         store.writer.upsert_page(page).await.unwrap();
 

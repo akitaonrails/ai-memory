@@ -4371,6 +4371,7 @@ async fn project_view_shows_agent_attribution() {
             evidence: vec![PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: session_id.to_string(),
+                observations: Default::default(),
             }],
             ..new_page(
                 ws,

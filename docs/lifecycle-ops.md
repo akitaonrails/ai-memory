@@ -618,7 +618,8 @@ a low-level re-stamp:
    (`projects`, `pages`, `sessions`, `observations`, `handoffs`, `audit_log`,
    auto-improvement state, SessionEnd consolidation jobs, managed
    `workstreams`, pending cross-project messages on both ends, entities, page
-   feedback, purge tombstones, and the profile evidence). Native workstream
+   feedback, the pages' recorded source observations (`page_sources`), purge
+   tombstones, and the profile evidence). Native workstream
    sessions, runs, and events remain attached
    through `workstream_id`; `page_embeddings` and `links` remain attached
    through `page_id`, so none of those rows need a direct re-stamp.
@@ -705,7 +706,8 @@ deletes: its `sessions`, `observations`, and `handoffs` (the raw episodic
 capture log), its managed workstreams with their native sessions, runs,
 events and `raw/workstreams/` segments, the cross-project messages it sent
 or received, auto-improvement and profile-harvest state, session-consolidation
-jobs, ingest deduplication keys, entities, page feedback, per-session purge tombstones and
+jobs, ingest deduplication keys, entities, page feedback, the observations each
+page was compiled from (`page_sources`), per-session purge tombstones and
 project grants. The moved pages start a fresh supersession chain (the real
 page history lives in the wiki's git mirror). The append-only audit trail
 remains, with references to the removed source ids. The `true-move` path has
@@ -812,7 +814,10 @@ session (decisions, gotchas: pages are not tracked per session), handoffs the
 session *accepted*, and `auto_improve_proposals` (they have no `session_id`;
 they target pages in the scope they were staged in). `entities` and
 `page_feedback` are not re-stamped either, unlike `move-project`, which
-moves the whole project and re-stamps both.
+moves the whole project and re-stamps both. The session page's `page_sources`
+rows move with it. Another page left behind keeps the ids of the observations
+it was compiled from, but those observations now belong to the destination, so
+the source project lists them by id only.
 
 **Order of operations (per session):** validate the destination (404 unless
 `create`), reject a batch whose source is the destination (422; the single
