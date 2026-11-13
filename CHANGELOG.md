@@ -13,6 +13,25 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The document importer now preserves DOCX nonbreaking hyphens encoded as
+  `w:noBreakHyphen` elements. It previously dropped them and joined the
+  surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)
+- `status --json` now preserves the server's write-queue depth and wiki-format
+  diagnostics. Both fields were read from the server and shown in the human
+  report but silently dropped from JSON, hiding a backed-up writer from
+  monitors. Older servers that omit the fields keep the same JSON shape. (#2235)
+- The document importer now excludes DOCX moved-source revisions
+  (`w:moveFrom`) while retaining the destination text (`w:moveTo`). It
+  previously extracted both copies of a tracked move, duplicating text that
+  appears only once in the accepted document. (#2236)
+- Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
+  without a native session id. Explicitly pinned executions now keep their own
+  capture identity instead of sharing the fallback session. A pinned Devin
+  session end leaves the unrelated fallback slot intact. (#2237)
+- OKF exports now include ordinary concept pages beneath nested `_pending`
+  directories such as `notes/_pending/manual.md`. The exclusion for the
+  project's proposal staging directory matched that name at every depth and
+  silently omitted these pages. Project-root proposal sidecars stay excluded. (#2238)
 - Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
   resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
   to `quinn-proto` 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524. (#2242)
