@@ -18,6 +18,10 @@ version in [`docs/changelog/`](docs/changelog/):
   a corrupt CRC or a missing trailer is refused and the existing archive is
   kept, instead of being overwritten with bytes `restore` then rejects. The
   earlier check read only the gzip signature. (#2206)
+- `install-mcp` on Windows no longer writes the `\\?\` verbatim prefix into
+  a bridge entry's `--data-dir`. Hermes rewrote it into `C:\?\C:\...` and the
+  bridge failed to start; the entry now carries the plain drive path, as
+  `setup` and the generated hooks do. (#2203)
 - The root-only `/pending` triage page now sends `Cache-Control: no-store`,
   like `/health` and `/workstreams`. It sent no `Cache-Control` at all, so a
   cached copy could list a proposal an operator had already approved or
