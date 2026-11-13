@@ -830,6 +830,10 @@ function Invoke-AiMemoryDrainSpool {
         }
         $code = 0
         $NoProxy = Get-AiMemoryNoProxy
+        # The drain runs behind the hook call, so its own deadline is a retry
+        # budget rather than a latency bound; see the capture site below and
+        # row 11c of `docs/security-boundaries.md` for the 200 ms invariant's
+        # PowerShell exception.
         try {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
@@ -1161,6 +1165,11 @@ function Invoke-AiMemoryHook {
         # GUID's hex fits the server's key grammar.
         $HookUrl = "$Server/hook?event=$Event&agent=$Agent$QS$SessionQS&ingest_key=ps$([Guid]::NewGuid().ToString('N').Substring(0, 16))"
         $NoProxy = Get-AiMemoryNoProxy
+        # Invariant #5's 200 ms budget is a POSIX-bundle property. Cold start
+        # here can exceed it before this request is opened at all
+        # (`docs/design-windows-ci.md`), so this bundle keeps its own
+        # capture deadline and spools what it cannot deliver. Recorded as the
+        # deliberate exception in `docs/security-boundaries.md` row 11c.
         try {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
