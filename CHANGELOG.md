@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin
-  session end leaves the unrelated fallback slot intact.
+  session end leaves the unrelated fallback slot intact. (#2237)
 
 ## [3.4.6] - 2026-11-13
 
