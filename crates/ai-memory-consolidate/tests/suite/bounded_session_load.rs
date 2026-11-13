@@ -1670,6 +1670,7 @@ mod slow {
         auto_improve_prompt_sections(
             session_page.as_ref(),
             &reviewer_recent_pages,
+            &[],
             &patchable_pages,
             &rejection_context,
             cfg,

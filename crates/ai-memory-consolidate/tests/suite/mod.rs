@@ -23,6 +23,7 @@ mod multi_machine;
 mod observation_retention;
 mod profile_harvest;
 mod recall_eval;
+mod reviewer_global_titles;
 mod rule_slug_collisions;
 mod search_quality;
 mod typed_edges;

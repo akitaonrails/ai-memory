@@ -1898,6 +1898,10 @@ pub struct AutoImproveSettings {
     pub max_procedure_page_tokens: usize,
     /// Whether future reviewers may include raw observation fallback details.
     pub include_raw_fallback: bool,
+    /// List the reserved `_global` scope's page titles to the reviewer,
+    /// read-only, and refuse a full-page proposal that reuses one of their
+    /// paths or titles. Off by default (#1212).
+    pub include_global_titles: bool,
     /// Synthetic actor used for autonomous proposal provenance.
     pub proposal_actor: String,
     /// Wiki-relative folder for non-indexed pending proposal sidecars.
@@ -2009,6 +2013,7 @@ impl Default for AutoImproveSettings {
             max_procedure_page_tokens:
                 ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             include_raw_fallback: false,
+            include_global_titles: false,
             proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
         }
@@ -4788,6 +4793,7 @@ mod tests {
         assert_eq!(cfg.auto_improve.eval.targets, vec!["_rules", "procedures"]);
         assert_eq!(cfg.auto_improve.eval.min_delta, 0.0);
         assert!(!cfg.auto_improve.include_raw_fallback);
+        assert!(!cfg.auto_improve.include_global_titles);
         assert_eq!(cfg.auto_improve.proposal_actor, "auto_improve");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/auto-improve");
     }
@@ -6654,6 +6660,7 @@ input_token_safety_margin = {margin}
             max_rule_page_tokens = 1000
             max_procedure_page_tokens = 1500
             include_raw_fallback = true
+            include_global_titles = true
             proposal_actor = "review_bot"
             pending_path = "_pending/review-bot"
 
@@ -6719,6 +6726,7 @@ input_token_safety_margin = {margin}
         assert_eq!(cfg.auto_improve.eval.targets, vec!["_rules"]);
         assert_eq!(cfg.auto_improve.eval.min_delta, 0.05);
         assert!(cfg.auto_improve.include_raw_fallback);
+        assert!(cfg.auto_improve.include_global_titles);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
     }

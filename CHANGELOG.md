@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `[auto_improve] include_global_titles` (off by default) lists the titles of
+  the reserved `_global` scope's pages to the auto-improvement reviewer, read
+  only, in the per-session review and the cross-session experience pass.
+  Validation rejects a full-page proposal that reuses one of their paths or
+  titles (`duplicate_global_path`, `duplicate_global_title`), so a standing
+  cross-project rule stops coming back as a project page. Only `_global` is
+  read, and with the option off the reviewer prompt is unchanged. (#2248)
 - A per-project default result count for `memory_query`. A project can set
   `[retrieval] default_result_limit = N` (`1..=100`) in its `.ai-memory.toml`;
   the hook clients forward it at session start and the server records it on the

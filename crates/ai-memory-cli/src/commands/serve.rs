@@ -3127,6 +3127,7 @@ fn auto_improve_review_config_from_settings(
         max_input_tokens: settings.max_input_tokens,
         max_proposals_per_run: settings.max_proposals_per_run,
         include_raw_fallback: settings.include_raw_fallback,
+        include_global_titles: settings.include_global_titles,
         proposal_actor: settings.proposal_actor.clone(),
         pending_path: settings.pending_path.clone(),
         max_patchable_pages: settings.max_patchable_pages,

@@ -165,6 +165,10 @@ pub struct AutoImproveReviewConfig {
     pub max_proposals_per_run: usize,
     /// Whether raw fallback content may be considered. Hooks still provide raw observations.
     pub include_raw_fallback: bool,
+    /// Whether the reviewer also sees the titles of the reserved `_global`
+    /// scope's pages, read-only, and validation refuses a full-page proposal
+    /// that reuses one of their paths or titles (#1212). Off by default.
+    pub include_global_titles: bool,
     /// Synthetic actor name used for staged proposal provenance.
     pub proposal_actor: String,
     /// Wiki-relative pending proposal sidecar folder.
@@ -210,6 +214,7 @@ impl Default for AutoImproveReviewConfig {
             max_input_tokens: DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS,
             max_proposals_per_run: DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS,
             include_raw_fallback: false,
+            include_global_titles: false,
             proposal_actor: DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
@@ -239,6 +244,9 @@ pub enum AutoImproveError {
     /// Underlying store error.
     #[error(transparent)]
     Store(#[from] ai_memory_store::StoreError),
+    /// Reserved-scope lookup failed.
+    #[error(transparent)]
+    Scope(#[from] ai_memory_store::ScopeResolutionError),
     /// Underlying LLM error.
     #[error(transparent)]
     Llm(#[from] LlmError),
@@ -273,6 +281,7 @@ pub enum AutoImproveError {
 pub fn redacted_auto_improve_summary(error: &AutoImproveError) -> String {
     let (class, status) = match error {
         AutoImproveError::Store(_) => ("store", None),
+        AutoImproveError::Scope(_) => ("scope", None),
         AutoImproveError::Llm(llm) => (llm.class(), llm.http_status()),
         AutoImproveError::Memory(_) => ("memory", None),
         AutoImproveError::SessionNotFound(_) => ("session-not-found", None),
@@ -614,6 +623,7 @@ pub async fn run_auto_improve_review(
     )
     .await?;
     let rejection_context = load_rejection_context(reader, workspace_id, project_id, &cfg).await?;
+    let global_pages = load_global_pages(reader, workspace_id, project_id, &cfg).await?;
     // The prompt sections and the observation budget are knowable before
     // any row is read; the single snapshot read below is the only read that
     // touches the session's rows — totals, the preflight decision and the
@@ -623,6 +633,7 @@ pub async fn run_auto_improve_review(
     let sections = auto_improve_prompt_sections(
         session_page.as_ref(),
         &reviewer_recent_pages,
+        &global_pages,
         &patchable_pages,
         &rejection_context,
         &cfg,
@@ -722,7 +733,8 @@ pub async fn run_auto_improve_review(
                 .cloned()
                 .collect();
             let existing_index =
-                ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
+                ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages)
+                    .with_global_pages(&global_pages);
             let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
             let request = ChatRequest {
                 system: Some(crate::with_output_language(
@@ -1374,6 +1386,8 @@ pub(crate) struct ExistingPageIndex {
     paths: BTreeSet<String>,
     titles: BTreeSet<String>,
     patchable: BTreeMap<String, PatchablePageContext>,
+    global_paths: BTreeSet<String>,
+    global_titles: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1411,11 +1425,35 @@ impl ExistingPageIndex {
                 .iter()
                 .map(|page| (page.path.clone(), page.clone()))
                 .collect(),
+            global_paths: BTreeSet::new(),
+            global_titles: BTreeSet::new(),
         }
+    }
+
+    /// Adds the reserved `_global` scope's pages as read-only duplicates: a
+    /// full-page proposal may not reuse their paths or titles, and none of
+    /// them is ever a patch target.
+    pub(crate) fn with_global_pages(mut self, pages: &[BriefingPage]) -> Self {
+        self.global_paths = pages.iter().map(|page| page.path.clone()).collect();
+        self.global_titles = pages
+            .iter()
+            .map(|page| normalize_title(&page.title))
+            .filter(|title| !title.is_empty())
+            .collect();
+        self
     }
 
     fn contains_path(&self, path: &str) -> bool {
         self.paths.contains(path)
+    }
+
+    fn contains_global_path(&self, path: &str) -> bool {
+        self.global_paths.contains(path)
+    }
+
+    fn contains_global_title(&self, title: &str) -> bool {
+        let normalized = normalize_title(title);
+        !normalized.is_empty() && self.global_titles.contains(&normalized)
     }
 
     fn contains_title(&self, title: &str) -> bool {
@@ -1479,6 +1517,61 @@ pub(crate) async fn load_patchable_pages(
     Ok(out)
 }
 
+/// Maximum `_global` pages listed for the reviewer's duplicate check.
+const MAX_GLOBAL_TITLES: usize = 100;
+
+/// The reserved `_global` scope's pages, for the reviewer's read-only
+/// duplicate check (#1212). Empty when `include_global_titles` is off, when
+/// the scope does not exist yet, or when the review is of `_global` itself,
+/// whose pages are already the project's own.
+///
+/// `lookup_global_scope` is unauthorized by design: the scope is unioned into
+/// every reader's default reads, so listing its titles here shows the
+/// reviewer nothing a session in this project could not read. No other
+/// project is consulted.
+pub(crate) async fn load_global_pages(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    cfg: &AutoImproveReviewConfig,
+) -> AutoImproveResult<Vec<BriefingPage>> {
+    if !cfg.include_global_titles {
+        return Ok(Vec::new());
+    }
+    let Some(global) = ai_memory_store::lookup_global_scope(reader).await? else {
+        return Ok(Vec::new());
+    };
+    if global.workspace_id == workspace_id && global.project_id == project_id {
+        return Ok(Vec::new());
+    }
+    let briefing = reader
+        .briefing_for_project(
+            global.workspace_id,
+            global.project_id,
+            MAX_GLOBAL_TITLES,
+            ai_memory_core::OwnerFilter::Any,
+            false,
+        )
+        .await?;
+    Ok(briefing
+        .recent_pages
+        .into_iter()
+        .filter(|page| !page.path.starts_with("sessions/"))
+        .collect())
+}
+
+/// The prompt section listing `_global` titles, or nothing at all when the
+/// list is empty, so a review with the option off keeps its exact prompt.
+pub(crate) fn render_global_section(pages: &[BriefingPage]) -> String {
+    if pages.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Standing cross-project pages in the reserved _global scope, listed read-only for duplicate avoidance. They already apply to this project: never propose a project page that restates one, and full-page proposals must not reuse these paths or titles:\n{}\n",
+        render_recent_pages(pages)
+    )
+}
+
 pub(crate) async fn load_rejection_context(
     reader: &ReaderPool,
     workspace_id: WorkspaceId,
@@ -1513,6 +1606,7 @@ pub(crate) async fn load_rejection_context(
 /// prompt assembly must reuse exactly these renders.
 pub(crate) struct PromptSections {
     recent: String,
+    global: String,
     patchable: RenderedPatchablePages,
     session_page_section: String,
     rejection_text: String,
@@ -1524,6 +1618,7 @@ pub(crate) struct PromptSections {
 pub(crate) fn auto_improve_prompt_sections(
     session_page: Option<&StoredPageBody>,
     recent_pages: &[BriefingPage],
+    global_pages: &[BriefingPage],
     patchable_pages: &[PatchablePageContext],
     rejection_context: &[AutoImproveRejectionSummary],
     cfg: &AutoImproveReviewConfig,
@@ -1533,6 +1628,7 @@ pub(crate) fn auto_improve_prompt_sections(
     let usable_chars = usable_tokens.saturating_mul(CHARS_PER_TOKEN);
 
     let recent = render_recent_pages(recent_pages);
+    let global = render_global_section(global_pages);
     let patchable_budget = usable_chars / 4;
     let patchable = render_patchable_pages(
         patchable_pages,
@@ -1550,6 +1646,7 @@ pub(crate) fn auto_improve_prompt_sections(
     let rejection_text = render_rejection_context(rejection_context, rejection_budget);
     let observation_budget = usable_chars
         .saturating_sub(recent.len())
+        .saturating_sub(global.len())
         .saturating_sub(patchable.text.len())
         .saturating_sub(rejection_text.len())
         .saturating_sub(session_page_section.len())
@@ -1561,6 +1658,7 @@ pub(crate) fn auto_improve_prompt_sections(
     };
     PromptSections {
         recent,
+        global,
         patchable,
         session_page_section,
         rejection_text,
@@ -1591,6 +1689,7 @@ fn test_prompt_input(
     let sections = auto_improve_prompt_sections(
         session_page,
         recent_pages,
+        &[],
         patchable_pages,
         rejection_context,
         cfg,
@@ -1625,6 +1724,7 @@ fn build_prompt_input(
     let mut warnings = sections.warnings;
     let mut rejected_candidates = Vec::new();
     let recent = sections.recent;
+    let global = sections.global;
     let session_page_section = sections.session_page_section;
     let rejection_text = sections.rejection_text;
     let patchable = sections.patchable;
@@ -1657,6 +1757,7 @@ fn build_prompt_input(
          Include raw fallback: {}\n\
          Pending proposal sidecar path: {}\n\n\
          Existing project pages, for duplicate avoidance. Full-page proposals must not target these existing paths or titles except _slots/current-focus.md:\n{recent}\n\n\
+         {global}\
          Patchable existing target context. Patch mode is allowed only for these listed _rules/ and procedures/ paths. Use exact markdown heading anchors including markers. Do not request patches for pages, anchors, or bodies not included here. delete_section is unsupported. Budgets: max edits/proposal {}, max patch edits/run {}, max content chars/edit {}, max changed chars/proposal {}, max final body chars {}, max rule page tokens {}, max procedure page tokens {}.\n{patchable_text}\n\n\
          Recent rejected auto-improvement attempts for this workspace/project. Avoid repeating these target/reason/fingerprint patterns unless the session provides clearly new evidence:\n{rejection_text}\n\n\
          Consolidated session page, primary source when present:\n{session_page_section}\n\n\
@@ -2226,6 +2327,12 @@ fn validate_full_page_proposal(
     if path != "_slots/current-focus.md" && existing_index.contains_title(&proposal.title) {
         return Err("duplicate_existing_title".into());
     }
+    if path != "_slots/current-focus.md" && existing_index.contains_global_path(path) {
+        return Err("duplicate_global_path".into());
+    }
+    if path != "_slots/current-focus.md" && existing_index.contains_global_title(&proposal.title) {
+        return Err("duplicate_global_title".into());
+    }
     if !kind_matches_path(&proposal.kind, path) {
         return Err("kind_path_mismatch".into());
     }
@@ -2750,6 +2857,7 @@ mod tests {
             max_input_tokens: 24_000,
             max_proposals_per_run: 2,
             include_raw_fallback: false,
+            include_global_titles: false,
             proposal_actor: "auto_improve".into(),
             pending_path: "_pending/auto-improve".into(),
             max_patchable_pages: DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES,
