@@ -1516,9 +1516,11 @@ fill both in:
   `SessionStart`, stores it in a single per-host slot
   (`<data-dir>/hook-state/devin-session-id`), reuses it for every later
   event, and clears it at `SessionEnd`. Set `AI_MEMORY_SESSION_ID` in the
-  hook environment to pin an externally managed run id instead. Because the
-  slot is per host+agent, two Devin sessions running *concurrently* on the
-  same machine share it: the newest `SessionStart` wins and earlier
+  hook environment to pin an externally managed run id instead. The native
+  hook uses that pin without changing the fallback slot, and a pinned
+  `SessionEnd` leaves the slot intact. Because the slot is per host+agent,
+  two unpinned Devin sessions running *concurrently* on the same machine
+  share it: the newest `SessionStart` wins and earlier
   sessions' remaining events are attributed to it (same graceful-degradation
   stance as the single-slot `/handoff` fallback). A payload that does carry
   its own `session_id` always wins over both.

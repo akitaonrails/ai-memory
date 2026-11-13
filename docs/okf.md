@@ -94,6 +94,10 @@ identity record, and `index.md` is the OKF-facing description. Nothing in
 the current tree writes `index.md`, so that reserved name is free.
 `log.md` is not adopted: git is the log.
 
+Export excludes the project's root `_pending/` proposal staging directory.
+An identically named directory below a concept family, such as
+`notes/_pending/`, contains ordinary concept pages and is included.
+
 The hooks *do* write a raw per-month event ledger at the project root
 (`log-YYYY-MM.md`: `## [ts] event | title` lines, no frontmatter). It
 is capture, not a concept file, so the export drops it exactly as it

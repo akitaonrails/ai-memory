@@ -498,6 +498,14 @@ prior-art bug (see `docs/ARCHITECTURE.md` and `docs/issues-*.md`):
    at ≤200 ms; the server returns 202 immediately or 429 when saturated
    (and 409 for a session it already knows is bound to another agent,
    decided in memory without a database round trip, #2023).
+   The Windows PowerShell bundle is a documented exception to the 200 ms
+   figure: cold start can exceed it before the request is opened at all
+   (`docs/design-windows-ci.md`), so `hooks/lib/ai-memory-hook.ps1` keeps
+   3 s for the capture POST and the spool drain and 2 s for the briefing
+   and handoff fetches, spooling whatever it cannot deliver. Lowering them
+   under the cold-start cost would drop every capture instead of delivering
+   it, so the deadlines stand and row 11c of
+   `docs/security-boundaries.md` records them.
    No unbounded `tokio::spawn` fan-out or queues on hook paths.
 6. **Privacy strip is a typed boundary.** `Sanitized<NewObservation>` has
    no constructor other than `sanitize()`; the hook router's sanitizer is

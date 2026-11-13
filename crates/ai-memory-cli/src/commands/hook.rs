@@ -662,10 +662,14 @@ fn session_id_query_suffix(
     agent: &str,
     event: &str,
     raw: &serde_json::Value,
+    session_id_pin: Option<&str>,
 ) -> String {
     let agent_kind = AgentKind::from_wire(agent);
     if !agent_needs_session_id_state(agent_kind) || payload_has_session_id(raw) {
         return String::new();
+    }
+    if let Some(session_id) = session_id_pin {
+        return format!("&session_id={}", url_encode(session_id));
     }
 
     let session_id = if event == "session-start" {
@@ -1631,6 +1635,12 @@ where
     }
     let agent_kind = AgentKind::from_wire(&args.agent);
     let mut hook_event = HookEvent::parse(&args.event);
+    // As in the script hooks, an execution's explicit id bypasses the shared
+    // fallback slot; a native payload id remains authoritative.
+    let session_id_pin = runtime_env
+        .var_os("AI_MEMORY_SESSION_ID")
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty());
     // This is inherited execution context, like AI_MEMORY_RUN_ID, rather
     // than server configuration. Hooks deliberately bypass Config::load, and
     // the captured runtime env (not a fresh global read) makes it injectable
@@ -1669,10 +1679,15 @@ where
         // Retiring the fallback session ID is lifecycle housekeeping, not
         // capture. Preserve it even when no event is enqueued.
         if agent_kind == AgentKind::Devin && hook_event == HookEvent::SessionEnd {
-            clear_session_id(
-                &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
-                agent_kind,
-            );
+            let pinned = session_id_pin.is_some()
+                && parse_hook_payload(payload)
+                    .is_ok_and(|(_, json)| !payload_has_session_id(&json));
+            if !pinned {
+                clear_session_id(
+                    &resolve_data_dir_with(data_dir.as_deref(), &runtime_env),
+                    agent_kind,
+                );
+            }
         }
         write_success_response(stdout, agent_kind, hook_event)?;
         return Ok(());
@@ -1690,6 +1705,9 @@ where
             return Ok(());
         }
     };
+    let session_id_pin = session_id_pin
+        .as_deref()
+        .filter(|_| !payload_has_session_id(&json));
     // Read before the Hermes shaping below drops `extra` and `profile`.
     // A delegated child's lifecycle belongs to the parent's session: storing
     // it would open a session nothing ever finalizes, and its first turn
@@ -2138,7 +2156,7 @@ where
     let handoff_scoped = policy_cwd.is_some();
     let spool = hook_spool::spool_dir(&dd);
     let mut incremental_background_drain = false;
-    let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json);
+    let session_qs = session_id_query_suffix(&dd, &args.agent, &args.event, &json, session_id_pin);
     let managed_qs = managed_run_query_suffix();
     let session_origin_qs = session_origin_query_suffix();
     let auto_handoff_qs = auto_handoff_query_suffix_with(env_lookup);
@@ -2250,7 +2268,10 @@ where
         // ZCode is intentionally absent here: it has no SessionEnd and fires Stop
         // per turn, so its stored id is cleared by `finalize-session` (or
         // overwritten by the next session-start), never by a hook event.
-        if AgentKind::from_wire(&args.agent) == AgentKind::Devin && args.event == "session-end" {
+        if AgentKind::from_wire(&args.agent) == AgentKind::Devin
+            && args.event == "session-end"
+            && session_id_pin.is_none()
+        {
             clear_session_id(&dd, AgentKind::Devin);
         }
 
@@ -4224,8 +4245,10 @@ mod tests {
             "tool_response": {"success": true, "output": "ok", "error": null}
         });
 
-        let first = session_id_query_suffix(data_dir, "devin", "session-start", &session_start);
-        let second = session_id_query_suffix(data_dir, "devin", "post-tool-use", &post_tool_use);
+        let first =
+            session_id_query_suffix(data_dir, "devin", "session-start", &session_start, None);
+        let second =
+            session_id_query_suffix(data_dir, "devin", "post-tool-use", &post_tool_use, None);
 
         assert!(first.starts_with("&session_id="), "{first}");
         assert_eq!(second, first);
@@ -4505,10 +4528,122 @@ mod tests {
             "hook_event_name": "PostToolUse"
         });
 
-        let suffix = session_id_query_suffix(tmp.path(), "devin", "post-tool-use", &with_session);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "devin", "post-tool-use", &with_session, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::Devin).is_none());
+    }
+
+    #[tokio::test]
+    async fn native_hook_honours_session_id_env_without_replacing_native_ids_or_fallback_state() {
+        for agent in [AgentKind::Devin, AgentKind::Zcode] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            store_session_id(&data_dir, agent, "existing-fallback-session");
+            let payload = serde_json::json!({
+                "cwd": tmp.path(),
+                "hook_event_name": "PostToolUse",
+                "tool_name": "exec",
+                "tool_input": {"command": "printf fixture"},
+                "tool_response": {"success": true, "output": "fixture"}
+            });
+
+            for (pin, native, expected) in [
+                ("launch/a 1", None, Some("launch%2Fa%201")),
+                ("launch-b", None, Some("launch-b")),
+                ("launch-c", Some("native-session"), None),
+                ("", None, Some("existing-fallback-session")),
+                ("   ", None, Some("existing-fallback-session")),
+            ] {
+                let mut payload = payload.clone();
+                if let Some(native) = native {
+                    payload["session_id"] = native.into();
+                }
+                let mut args = devin_hook_args("post-tool-use");
+                args.agent = agent.as_str().into();
+                let mut stdout = Vec::new();
+                run_with_payload_in_home(
+                    Some(data_dir.clone()),
+                    args,
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| panic!("a single tool event must not start a drainer"),
+                    None,
+                    RuntimeEnv::with_process_env_for_tests(&[("AI_MEMORY_SESSION_ID", pin)]),
+                )
+                .await
+                .unwrap();
+
+                let entries = read_spooled_entries(&hook_spool::spool_dir(&data_dir));
+                let entry = entries.last().unwrap();
+                assert_eq!(
+                    query_param(&entry.url, "session_id"),
+                    expected,
+                    "{agent:?}: {pin:?}"
+                );
+                let body: serde_json::Value = serde_json::from_str(&entry.body).unwrap();
+                assert_eq!(body.get("session_id").and_then(|id| id.as_str()), native);
+                assert_eq!(stdout, b"{}\n");
+                assert_eq!(
+                    stored_session_id(&data_dir, agent).as_deref(),
+                    Some("existing-fallback-session"),
+                    "an execution's pin must not replace another session's fallback slot"
+                );
+                // Unit-test spools hold at most three entries. Each case has
+                // already inspected its event; keep room for the next one.
+                for file in std::fs::read_dir(hook_spool::spool_dir(&data_dir)).unwrap() {
+                    let path = file.unwrap().path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                    {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_devin_session_end_keeps_the_unrelated_fallback_slot() {
+        for external_capture in [false, true] {
+            for (pin, native, expected) in [
+                ("pinned-run", None, Some("existing-fallback-session")),
+                ("", None, None),
+                ("pinned-run", Some("native-session"), None),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let data_dir = tmp.path().join("data");
+                store_session_id(&data_dir, AgentKind::Devin, "existing-fallback-session");
+                let mut payload = serde_json::json!({"cwd": tmp.path()});
+                if let Some(native) = native {
+                    payload["session_id"] = native.into();
+                }
+                let mut env = vec![("AI_MEMORY_SESSION_ID", pin)];
+                if external_capture {
+                    env.push(("AI_MEMORY_CAPTURE_OWNER", "external-fixture"));
+                }
+                let mut stdout = Vec::new();
+                run_with_payload_in_home(
+                    Some(data_dir.clone()),
+                    devin_hook_args("session-end"),
+                    payload.to_string(),
+                    &mut stdout,
+                    |_, _| Ok(()),
+                    None,
+                    RuntimeEnv::with_process_env_for_tests(&env),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    stored_session_id(&data_dir, AgentKind::Devin).as_deref(),
+                    expected,
+                    "external={external_capture}, pin={pin:?}, native={native:?}"
+                );
+                assert_eq!(stdout, b"{}\n");
+            }
+        }
     }
 
     #[test]
@@ -4516,7 +4651,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
 
-        let suffix = session_id_query_suffix(tmp.path(), "claude-code", "post-tool-use", &raw);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "claude-code", "post-tool-use", &raw, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::ClaudeCode).is_none());
@@ -4531,9 +4667,9 @@ mod tests {
         let data_dir = tmp.path();
         let bare = serde_json::json!({"hook_event_name": "SessionStart"});
 
-        let first = session_id_query_suffix(data_dir, "zcode", "session-start", &bare);
-        let after_stop = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
-        let next_turn = session_id_query_suffix(data_dir, "zcode", "pre-tool-use", &bare);
+        let first = session_id_query_suffix(data_dir, "zcode", "session-start", &bare, None);
+        let after_stop = session_id_query_suffix(data_dir, "zcode", "stop", &bare, None);
+        let next_turn = session_id_query_suffix(data_dir, "zcode", "pre-tool-use", &bare, None);
 
         assert!(first.starts_with("&session_id="), "{first}");
         assert_eq!(after_stop, first);
@@ -4552,7 +4688,8 @@ mod tests {
             "hook_event_name": "PostToolUse"
         });
 
-        let suffix = session_id_query_suffix(tmp.path(), "zcode", "post-tool-use", &with_session);
+        let suffix =
+            session_id_query_suffix(tmp.path(), "zcode", "post-tool-use", &with_session, None);
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::Zcode).is_none());
@@ -4568,7 +4705,7 @@ mod tests {
         // id is cleared by `finalize-session` (or overwritten by the next
         // session-start), never by Stop.
         let bare = serde_json::json!({"hook_event_name": "Stop"});
-        let _ = session_id_query_suffix(data_dir, "zcode", "stop", &bare);
+        let _ = session_id_query_suffix(data_dir, "zcode", "stop", &bare, None);
 
         assert_eq!(
             stored_session_id(data_dir, AgentKind::Zcode).as_deref(),

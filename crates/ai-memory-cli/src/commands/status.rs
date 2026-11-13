@@ -628,6 +628,12 @@ fn json_report(
         },
         "auth_posture": { "posture": auth_posture, "fix": auth_posture.fix() },
     });
+    if let Some(write_queue) = report.write_queue {
+        value["write_queue"] = serde_json::json!(write_queue);
+    }
+    if let Some(wiki_format) = report.wiki_format {
+        value["wiki_format"] = serde_json::json!(wiki_format);
+    }
     // Absent when there is nothing to say, so the shape consumers read is
     // unchanged.
     if let Some(problem) = windows_logon {
@@ -706,6 +712,61 @@ fn error_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_json_preserves_reported_write_queue_and_wiki_format() {
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:49374".into()), None);
+        for (write_queue, wiki_format) in [
+            (
+                serde_json::json!([99, 100]),
+                serde_json::json!({
+                    "okf_migrated": true,
+                    "backup_archive": "/data/pre-migration.tar.gz",
+                    "backup_archive_bytes": 4096,
+                }),
+            ),
+            (
+                serde_json::json!([0, 100]),
+                serde_json::json!({
+                    "okf_migrated": false,
+                    "backup_archive": null,
+                    "backup_archive_bytes": null,
+                }),
+            ),
+            (serde_json::Value::Null, serde_json::Value::Null),
+        ] {
+            let mut response = serde_json::json!({
+                "version": "3.4.6",
+                "data_dir": "/data",
+                "bind": "127.0.0.1:49374",
+                "db_path": "/data/db/memory.sqlite",
+                "counts": {"pages_latest": 1, "pages_all": 2, "sessions": 3, "observations": 4},
+            });
+            if !write_queue.is_null() {
+                response["write_queue"] = write_queue.clone();
+                response["wiki_format"] = wiki_format.clone();
+            }
+            let value = json_report(
+                serde_json::from_value(response).unwrap(),
+                SpoolHealth::default(),
+                0,
+                0,
+                0,
+                None,
+                "denylist",
+                &endpoint,
+                crate::local_auth::AuthPosture::NoneLoopback,
+                None,
+            );
+            if write_queue.is_null() {
+                assert!(value.get("write_queue").is_none(), "{value}");
+                assert!(value.get("wiki_format").is_none(), "{value}");
+            } else {
+                assert_eq!(value["write_queue"], write_queue);
+                assert_eq!(value["wiki_format"], wiki_format);
+            }
+        }
+    }
 
     #[test]
     fn status_json_keeps_existing_fields_and_adds_recovery_compatibly() {

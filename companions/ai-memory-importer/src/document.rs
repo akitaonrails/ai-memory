@@ -1234,10 +1234,12 @@ fn xml_text(xml: &str) -> Result<String> {
             // These tab lists define paragraph layout, not tab characters:
             // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.tabs
             // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.drawing.tabstoplist
+            // A moved source is a revision; its destination carries the text.
+            // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.movefromrun
             Event::Start(tag)
                 if matches!(
                     tag.local_name().as_ref(),
-                    "del" | "delText" | "instrText" | "tabs" | "tabLst"
+                    "del" | "delText" | "moveFrom" | "instrText" | "tabs" | "tabLst"
                 ) =>
             {
                 skipped_depth = 1;
@@ -1265,6 +1267,9 @@ fn xml_text(xml: &str) -> Result<String> {
                 match tag.local_name().as_ref() {
                     "br" | "cr" => push_bounded(&mut output, "\n")?,
                     "tab" => push_bounded(&mut output, "\t")?,
+                    // Word can encode a visible hyphen outside its text nodes.
+                    // https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.nobreakhyphen
+                    "noBreakHyphen" => push_bounded(&mut output, "\u{2011}")?,
                     _ => {}
                 }
             }
@@ -1615,6 +1620,37 @@ mod tests {
     }
 
     #[test]
+    fn docx_keeps_move_destination_without_duplicating_source() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("moved.docx");
+        write_zip(
+            &file,
+            &[(
+                "word/document.xml",
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:moveToRangeStart w:author="Fixture" w:date="2026-11-13T12:00:00Z" w:id="0" w:name="move1"/><w:moveTo w:id="1" w:author="Fixture"><w:r><w:t xml:space="preserve">MOVED TEXT. </w:t></w:r></w:moveTo><w:moveToRangeEnd w:id="0"/><w:r><w:t xml:space="preserve">KEPT TEXT. </w:t></w:r><w:moveFromRangeStart w:author="Fixture" w:date="2026-11-13T12:00:00Z" w:id="2" w:name="move1"/><w:moveFrom w:id="3" w:author="Fixture"><w:r><w:t>MOVED TEXT.</w:t><w:br/></w:r><w:ins w:id="4" w:author="Fixture"><w:r><w:t>OLD SOURCE.</w:t></w:r></w:ins></w:moveFrom><w:moveFromRangeEnd w:id="2"/></w:p></w:body></w:document>"#,
+            )],
+        );
+        let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+        assert!(
+            plan.body
+                .contains("## Extracted content\n\nMOVED TEXT. KEPT TEXT.\n"),
+            "{}",
+            plan.body
+        );
+        assert_eq!(plan.body.matches("MOVED TEXT.").count(), 1);
+        assert!(!plan.body.contains("OLD SOURCE."));
+    }
+
+    #[test]
+    fn docx_move_filter_keeps_insertions_and_ordinary_text() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t xml:space="preserve">moveFrom is a revision element. </w:t></w:r><w:ins w:id="1" w:author="Fixture"><w:r><w:t>INSERTED TEXT.</w:t></w:r></w:ins><w:del w:id="2" w:author="Fixture"><w:r><w:delText>DELETED TEXT.</w:delText></w:r></w:del></w:p></w:body></w:document>"#;
+        assert_eq!(
+            xml_text(xml).unwrap(),
+            "moveFrom is a revision element. INSERTED TEXT."
+        );
+    }
+
+    #[test]
     fn docx_extracts_document_footnote_text_and_decodes_entities() {
         let temp = TempDir::new().unwrap();
         let file = temp.path().join("brief.docx");
@@ -1638,6 +1674,31 @@ mod tests {
         assert!(plan.body.contains("Foot"));
         assert!(!plan.body.contains("deleted secret"));
         assert!(!plan.body.contains("field instruction"));
+    }
+
+    #[test]
+    fn docx_preserves_nonbreaking_hyphen_elements() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("hyphen.docx");
+        for hyphen in ["<w:noBreakHyphen/>", "<w:noBreakHyphen></w:noBreakHyphen>"] {
+            let document = format!(
+                r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Profit</w:t>{hyphen}<w:t>loss</w:t></w:r></w:p></w:body></w:document>"#
+            );
+            write_zip(&file, &[("word/document.xml", &document)]);
+            let plan = plan_document(&file, "w", "p", DEFAULT_DEST_PREFIX, None).unwrap();
+            assert!(
+                plan.body
+                    .contains("## Extracted content\n\nProfit\u{2011}loss\n"),
+                "{hyphen}: {}",
+                plan.body
+            );
+        }
+    }
+
+    #[test]
+    fn docx_nonbreaking_hyphens_keep_literal_text_and_skipped_runs_unchanged() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Profit‑loss</w:t></w:r></w:p><w:p><w:r><w:t>Kept</w:t></w:r><w:del><w:r><w:delText>deleted</w:delText><w:noBreakHyphen/></w:r></w:del><w:instrText>field instruction</w:instrText><w:r><w:t> together</w:t></w:r></w:p></w:body></w:document>"#;
+        assert_eq!(xml_text(xml).unwrap(), "Profit\u{2011}loss\nKept together");
     }
 
     #[test]

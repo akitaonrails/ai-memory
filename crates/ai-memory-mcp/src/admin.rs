@@ -1077,11 +1077,10 @@ async fn build_okf_bundle_file(
             let path = entry.path();
             let ft = entry.file_type()?;
             if ft.is_dir() {
-                // `_pending/` is the auto-improve staging area — proposal
-                // sidecars, not concept files; a strict OKF reader has no
-                // business seeing them (post-audit finding: an unresolved
-                // pending proposal blocked every export).
-                if entry.file_name() == "_pending" {
+                // Only the project's root `_pending/` is proposal staging;
+                // nested names contain ordinary pages, as in the watcher
+                // and migration walks.
+                if dir == bundle_dir && entry.file_name() == "_pending" {
                     continue;
                 }
                 if dir == bundle_dir {
@@ -11620,6 +11619,14 @@ mod tests {
     async fn export_okf_tolerates_manifests_and_skips_pending() {
         let (tmp, router) = read_page_test_router();
         post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        post_write_page(
+            &router,
+            "default",
+            "scratch",
+            "notes/_pending/manual.md",
+            "ordinary nested concept",
+        )
+        .await;
         let ws_dir = std::fs::read_dir(tmp.path().join("wiki"))
             .unwrap()
             .flatten()
@@ -11669,6 +11676,10 @@ mod tests {
             .map(|e| e.unwrap().path().unwrap().display().to_string())
             .collect();
         assert!(names.iter().any(|n| n == "_meta.md"), "{names:?}");
+        assert!(
+            names.iter().any(|n| n == "notes/_pending/manual.md"),
+            "nested _pending directories contain ordinary concept pages: {names:?}"
+        );
         assert!(
             !names.iter().any(|n| n.starts_with("_pending")),
             "pending sidecars must not ship: {names:?}"
