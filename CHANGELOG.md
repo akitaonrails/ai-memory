@@ -24,6 +24,10 @@ version in [`docs/changelog/`](docs/changelog/):
   (`w:moveFrom`) while retaining the destination text (`w:moveTo`). It
   previously extracted both copies of a tracked move, duplicating text that
   appears only once in the accepted document. (#2236)
+- Rejected Copilot Chat Completions structured output stopped at its token
+  budget before parsing it as JSON. A valid-looking partial object could
+  previously be accepted as a complete result; it now reports the terminal
+  `truncated-response` error, matching Copilot Responses. (#2251)
 - Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin
@@ -35,10 +39,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
   resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
   to `quinn-proto` 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524. (#2242)
-- Rejected Copilot Chat Completions structured output stopped at its token
-  budget before parsing it as JSON. A valid-looking partial object could
-  previously be accepted as a complete result; it now reports the terminal
-  `truncated-response` error, matching Copilot Responses. (#2251)
+
 
 ## [3.4.6] - 2026-11-13
 
