@@ -3387,6 +3387,7 @@ impl Wiki {
                     .unwrap_or(false);
             markdown.frontmatter =
                 canonicalize_index_frontmatter(markdown.frontmatter, req.tier, req.pinned);
+            persist_explicit_title(&mut markdown.frontmatter, req.title.as_deref());
             conform_frontmatter_for_disk(
                 &self.abs_path(req.workspace_id, req.project_id, &req.path),
                 req.path.as_str(),
@@ -3742,6 +3743,8 @@ impl Wiki {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
         markdown.frontmatter = canonicalize_index_frontmatter(markdown.frontmatter, tier, pinned);
+        let explicit_title = explicit_title.map(|title| self.sanitizer.scrub(&title));
+        persist_explicit_title(&mut markdown.frontmatter, explicit_title.as_deref());
         conform_frontmatter_for_disk(
             &self.abs_path(workspace_id, project_id, &path),
             path.as_str(),
@@ -3753,8 +3756,6 @@ impl Wiki {
         // mutations and webhooks that rename or restructure the body
         // still get the right title/links extracted.
         let title = explicit_title
-            .clone()
-            .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
         let links =
             crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
@@ -4247,6 +4248,18 @@ fn conform_frontmatter_for_disk_keeping(
             .to_string()
     });
     ai_memory_core::okf::stamp_generated_at(&mut markdown.frontmatter, &at);
+}
+
+// An explicit title keeps its existing precedence over webhook changes. It
+// must also live in Markdown, or the watcher replaces the indexed title on its
+// first reindex and creates another version of an otherwise unchanged page.
+fn persist_explicit_title(frontmatter: &mut serde_json::Value, title: Option<&str>) {
+    if let Some(title) = title {
+        if !frontmatter.is_object() {
+            *frontmatter = serde_json::json!({});
+        }
+        frontmatter["title"] = serde_json::Value::String(title.to_string());
+    }
 }
 
 fn canonicalize_index_frontmatter(
@@ -6635,6 +6648,117 @@ mod tests {
             wiki.read_page(ws, proj, &path).unwrap().body,
             "checkpoint body"
         );
+    }
+
+    async fn assert_title_matches_disk_and_reindex(
+        wiki: &Wiki,
+        store: &Store,
+        mut request: WritePageRequest,
+        expected: &str,
+    ) {
+        for batch in [false, true] {
+            request.path = PagePath::new(format!("notes/title-{batch}.md")).unwrap();
+            let id = if batch {
+                wiki.apply_batch(vec![request.clone()]).await.unwrap()[0]
+            } else {
+                wiki.write_page(request.clone()).await.unwrap()
+            };
+            let disk = wiki
+                .read_page(request.workspace_id, request.project_id, &request.path)
+                .unwrap();
+            assert_eq!(
+                derive_title(&disk.frontmatter, &disk.body, &request.path),
+                expected,
+                "disk title (batch={batch})"
+            );
+            let indexed = store.reader.page_meta_by_id(id).await.unwrap().unwrap();
+            assert_eq!(indexed.title, expected, "indexed title (batch={batch})");
+            assert_eq!(
+                wiki.reindex_page(
+                    request.workspace_id,
+                    request.project_id,
+                    request.path.clone()
+                )
+                .await
+                .unwrap(),
+                id,
+                "an unchanged file must not mint another version (batch={batch})"
+            );
+            let rewritten = if batch {
+                wiki.apply_batch(vec![request.clone()]).await.unwrap()[0]
+            } else {
+                wiki.write_page(request.clone()).await.unwrap()
+            };
+            assert_eq!(
+                rewritten, id,
+                "an identical rewrite must remain idempotent (batch={batch})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_titles_survive_admission_and_reindex_for_single_and_batch_writes() {
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/mutate",
+            post(|Json(mut payload): Json<serde_json::Value>| async move {
+                payload["page"]["frontmatter"]["title"] = "Webhook title".into();
+                Json(serde_json::json!({ "page": payload["page"] }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "title-normalizer".into(),
+                url: format!("http://{addr}/mutate"),
+                timeout_ms: 1000,
+                failure_policy: FailurePolicy::Reject,
+                events: vec![AdmissionOp::WritePage],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+        let mut request = req(
+            ws,
+            proj,
+            "notes/title.md",
+            "# Body title\n",
+            serde_json::json!({ "title": "Requested title" }),
+        );
+        request.title = Some("Requested title".into());
+        assert_title_matches_disk_and_reindex(&wiki, &store, request.clone(), "Requested title")
+            .await;
+        request.title = None;
+        assert_title_matches_disk_and_reindex(&wiki, &store, request, "Webhook title").await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_titles_keep_their_precedence_without_admission_for_single_and_batch_writes() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        for frontmatter in [
+            serde_json::Value::Null,
+            serde_json::json!({ "title": "Frontmatter title" }),
+        ] {
+            let mut request = req(ws, proj, "notes/title.md", "# Body title\n", frontmatter);
+            for title in [
+                "Explicit title",
+                "ANTHROPIC_API_KEY=sk-ant-title-fixture-1234567890abcdef",
+            ] {
+                request.title = Some(title.into());
+                let expected = wiki.sanitizer().scrub(title);
+                assert_title_matches_disk_and_reindex(&wiki, &store, request.clone(), &expected)
+                    .await;
+            }
+        }
     }
 
     #[tokio::test]

@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Kept explicit page titles in the final Markdown frontmatter for single and
+  batch writes, preserving their existing precedence over webhook mutations.
+  Reindexing no longer replaces the selected title or creates an extra version
+  solely because the file carried a different title. (#NNN)
 - The document importer now preserves DOCX nonbreaking hyphens encoded as
   `w:noBreakHyphen` elements. It previously dropped them and joined the
   surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)
