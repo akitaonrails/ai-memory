@@ -123,8 +123,15 @@ struct AppSettingsTests {
                 dataDir: noDataDir
             ) == nil
         )
-        // ...and a later launch cannot re-adopt it (nothing is left to adopt).
-        settings.adoptUnboundToken()
+        // ...and a later launch does not re-adopt it. AppModel.init only calls
+        // adoptUnboundToken() under its `tokenConfigured` guard, and the failed
+        // save cleared the keychain, so that guard now skips adoption instead of
+        // re-binding the stale bearer to the new server.
+        let tokenConfigured = store.read()?.isEmpty == false
+        #expect(tokenConfigured == false)
+        if tokenConfigured, settings.tokenOrigin == nil {
+            settings.adoptUnboundToken()
+        }
         #expect(settings.tokenOrigin == nil)
     }
 
