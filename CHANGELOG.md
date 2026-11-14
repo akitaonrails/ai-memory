@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `memory_patch_page` now uses the page's dominant line ending for generated
+  boundaries when appending text or adding a section, preserving CRLF pages
+  and avoiding stray carriage returns in leading blank lines. (#2290)
+
 - A `move-project` true move now re-resolves project-only cross-project links
   (`[[project:path]]` with the workspace omitted) in the source and destination
   workspaces, so the moved project's edges rebind to the destination workspace

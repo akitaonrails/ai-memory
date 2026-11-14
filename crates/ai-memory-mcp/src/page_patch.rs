@@ -126,6 +126,13 @@ pub(crate) fn section_hashes(body: &str) -> (Vec<SectionHash>, bool) {
 
 pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, PatchError> {
     validate_bounds(edits)?;
+    let crlf = body.match_indices("\r\n").count();
+    let lf = body.bytes().filter(|&byte| byte == b'\n').count();
+    let eol = if crlf > 0 && crlf * 2 >= lf {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let sections = parse_sections(body);
     let mut by_anchor: HashMap<&str, Vec<&Section>> = HashMap::new();
     for section in &sections {
@@ -156,7 +163,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 }
                 Change {
                     range: body.len()..body.len(),
-                    replacement: appended(body, content),
+                    replacement: appended(body, content, eol),
                     placement: Placement::EndOfPage,
                     heading: None,
                 }
@@ -173,7 +180,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 }
                 Change {
                     range: section.whole.end..section.whole.end,
-                    replacement: appended(&body[section.whole.clone()], content),
+                    replacement: appended(&body[section.whole.clone()], content, eol),
                     placement: Placement::Section,
                     heading: Some(section.whole.start),
                 }
@@ -189,7 +196,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 let heading = format!("{} {}", "#".repeat(level as usize), title);
                 Change {
                     range: body.len()..body.len(),
-                    replacement: new_section(&heading, content),
+                    replacement: new_section(&heading, content, eol),
                     placement: Placement::NewSection,
                     heading: None,
                 }
@@ -264,7 +271,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
             };
             change
                 .replacement
-                .insert_str(0, blank_line_before(preceding));
+                .insert_str(0, &blank_line_before(preceding, eol));
         }
         if joins_previous && let Some(previous) = merged.last_mut() {
             previous.replacement.push_str(&change.replacement);
@@ -434,35 +441,44 @@ fn normalize_anchor(raw: &str) -> String {
         .to_lowercase()
 }
 
-fn appended(existing: &str, content: &str) -> String {
+fn appended(existing: &str, content: &str, eol: &str) -> String {
     let prefix = if existing.is_empty() || existing.ends_with('\n') {
         ""
     } else {
-        "\n"
+        eol
     };
-    let suffix = if content.ends_with('\n') { "" } else { "\n" };
+    let suffix = if content.ends_with('\n') { "" } else { eol };
     format!("{prefix}{content}{suffix}")
 }
 
 /// A new section's heading, a blank line, then its text (MD022). The blank
 /// line before the heading depends on what precedes it, so the merge step
 /// adds it.
-fn new_section(heading: &str, content: &str) -> String {
-    let content = content.trim_start_matches('\n');
-    if content.is_empty() {
-        return format!("{heading}\n");
+fn new_section(heading: &str, content: &str, eol: &str) -> String {
+    let mut content = content;
+    while let Some(rest) = content
+        .strip_prefix("\r\n")
+        .or_else(|| content.strip_prefix('\n'))
+    {
+        content = rest;
     }
-    let suffix = if content.ends_with('\n') { "" } else { "\n" };
-    format!("{heading}\n\n{content}{suffix}")
+    if content.is_empty() {
+        return format!("{heading}{eol}");
+    }
+    let suffix = if content.ends_with('\n') { "" } else { eol };
+    format!("{heading}{eol}{eol}{content}{suffix}")
 }
 
-fn blank_line_before(preceding: &str) -> &'static str {
-    if preceding.is_empty() || preceding.ends_with("\n\n") {
-        ""
+fn blank_line_before(preceding: &str, eol: &str) -> String {
+    let without_last = preceding
+        .strip_suffix("\r\n")
+        .or_else(|| preceding.strip_suffix('\n'));
+    if preceding.is_empty() || without_last.is_some_and(|s| s.ends_with('\n')) {
+        String::new()
     } else if preceding.ends_with('\n') {
-        "\n"
+        eol.to_owned()
     } else {
-        "\n\n"
+        eol.repeat(2)
     }
 }
 
@@ -544,6 +560,49 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_and_add_section_preserve_page_line_endings() {
+        for (eol, body) in [
+            ("\n", "# T\n## One\nold"),
+            ("\r\n", "# T\r\n## One\r\nold"),
+            ("\r\n", "# T\r\n## One\nold\r\n"),
+        ] {
+            for edit in [
+                PagePatchEdit::Append {
+                    target: AppendTarget::Section,
+                    anchor: Some("One".into()),
+                    content: "new".into(),
+                },
+                PagePatchEdit::Append {
+                    target: AppendTarget::EndOfPage,
+                    anchor: None,
+                    content: "new".into(),
+                },
+                PagePatchEdit::AddSection {
+                    anchor: "## Two".into(),
+                    content: "\r\nnew".into(),
+                },
+            ] {
+                let actual = apply(body, &[edit.clone()]).unwrap();
+                let separator = if body.ends_with('\n') { "" } else { eol };
+                let expected = match edit {
+                    PagePatchEdit::AddSection { .. } => {
+                        format!("{body}{separator}{eol}## Two{eol}{eol}new{eol}")
+                    }
+                    _ => format!("{body}{separator}new{eol}"),
+                };
+                assert_eq!(actual, expected);
+                assert!(
+                    !actual
+                        .as_bytes()
+                        .windows(2)
+                        .any(|p| p[0] == b'\r' && p[1] != b'\n')
+                );
+                assert!(!actual.ends_with('\r'));
+            }
+        }
+    }
 
     #[test]
     fn replace_section_keeps_crlf_blank_lines() {
