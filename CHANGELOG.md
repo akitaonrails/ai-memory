@@ -41,6 +41,9 @@ version in [`docs/changelog/`](docs/changelog/):
   section's own heading is refused (`section_content_repeats_heading`) rather
   than written, which used to leave two identical headings that no later edit
   could target. (#2239)
+- Fixed project activity timestamps and default ordering ignoring newer
+  sessions or page updates whenever an older observation existed. Project
+  lists now use the latest of all three activity sources. (#2266)
 - The document importer now preserves DOCX nonbreaking hyphens encoded as
   `w:noBreakHyphen` elements. It previously dropped them and joined the
   surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)

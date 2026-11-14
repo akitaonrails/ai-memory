@@ -23,6 +23,7 @@ mod observation_prune;
 mod page_first_created;
 mod pinned_pages;
 mod profile;
+mod project_activity;
 mod project_authz;
 mod project_link_graph;
 mod reader_pool_bounds;
