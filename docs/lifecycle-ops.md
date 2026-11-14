@@ -17,7 +17,7 @@ on a homelab box where mistakes are harder to undo.
 | `/admin/delete-workspace` | ✅ yes | the workspace and every child project, **plus** any observation stamped into a different workspace by one of this workspace's sessions (cascades regardless of the observation's own `workspace_id`), and it nulls (does not delete) the session reference on any handoff in a different workspace that this workspace's sessions authored or accepted | no | Runs `purge_workspace` admission first, deletes SQLite rows in one cascade, removes the UUID-keyed workspace directory and managed-workstream raw segments, reports filesystem partial failures, and dispatches mirror notification after durable work. Logical delete by default; `"compact": true` additionally rebuilds the FTS indexes and `VACUUM`s (see below). `"dry_run": true` previews the same counts, including the cross-workspace ones, without deleting anything (see below). |
 | `move-project --confirm` | ✅ yes | source only in the merge case (a `Reject`-policy `purge_project` webhook can still abort the source teardown leaving everything intact) | no | Fresh destination → lossless **true move** (re-stamp `workspace_id`, keep `project_id`, rename the dir): sessions/observations/handoffs + history all survive. Destination with a same-named project → **copy+purge merge**: only latest pages migrate.  An existing same-named destination project makes this a **copy+purge merge**, which deletes the source's sessions, observations, handoffs and older page versions: it now needs `--allow-lossy-merge` as well, and without it the server answers `409` naming the counts it would discard (#1713). |
 | `merge-project [--confirm]` | ✅ yes | no | no | Same-workspace, lossless identity repair. The default is a writer-transaction dry run. `--confirm` re-stamps every history-bearing row and removes the source only after the target files are installed; open sessions and live managed runs refuse. Same-path bodies are appended into a new stale-flagged target version while both histories remain reachable. |
-| `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims, profile prompt candidates, ingest keys and its `sessions/<id>.md` page, one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
+| `move-session <id> --to --confirm` | ✅ yes | no | yes (move it back) | Re-stamps one session (or every session touching `--from-project`) into another project: `sessions`, `observations`, its `handoffs`, consolidation jobs, auto-improve runs/claims, profile prompt candidates, ingest keys and its `sessions/<id>.md` page (along with its page feedback, query signals, and entity links under `--pages move`), one transaction per session; the page file moves with it (`--pages move`, default) or is retired for regeneration. Without `--confirm` it is a real dry run (rolled back). Refuses with `409` an open session or a pending consolidation job unless `--force`. |
 | `repair-backfill-timestamps --project --confirm` | ✅ yes | no | yes, if the operator kept the audit row or the CLI's before/after report (nothing else) | Corrects `sessions.started_at`/`ended_at` for sessions an older `backfill` imported before it carried the transcript's own event time. The CLI reads the operator's local transcripts read-only and posts candidate `(session_id, started_at, ended_at)` tuples to `POST /admin/repair-session-times`, which validates each one against `(workspace, project)` (a candidate outside that scope is `not_found` and untouched), only rewrites a row whose `started_at` postdates the candidate's own end (`not_flattened` otherwise, so a correctly hook-captured session or a re-run is a no-op), refuses negative/inverted/future-dated times, and never assigns an end time to a session still open. Without `--confirm` the server validates and reports inside a rolled-back transaction, so it is a real dry run; a confirmed run writes one `audit_log` row per request with the before/after times. Touches only the two timestamp columns of rows already in scope; `observations` and pages (including the session's own page frontmatter) are untouched. |
 | `backup --to` | ✅ yes | no | n/a | Streams a gzipped tarball from the server's online `sqlite3 .backup` plus the wiki tree. Safe alongside the live writer. |
 | `forget-sweep` event-ledger pass (`[decay] ledger_retention_months`) | ✅ yes | old hook event ledger *files* (`log-YYYY-MM.md`) from disk, nothing in the database | no ai-memory command restores a ledger (`restore-page` restores pages only); the content stays in the wiki's git history when a checkpoint captured it, recoverable with plain git until the repository is compacted | **Off by default** (`0`). Runs inside the forget sweep, so `--dry-run` previews it: the report lists `ledgers_prunable` and `ledger_bytes_prunable`. Online through the admin API. Only a file whose name is `log-YYYY-MM.md` **and** whose content opens with a ledger hook entry qualifies; `log.md`, the current month and the previous month are never deleted, whatever the setting. Each removal consults the blocking admission chain (`delete_event_ledger` op); a `reject`-policy webhook keeps the file and the report counts it in `ledgers_undeleted`. |
@@ -784,15 +784,17 @@ scope), the `handoffs` it produced (`from_session_id`), its
 - `--pages move` (default): every version of the page is re-stamped into the
   destination and the file is renamed into the destination project
   directory, so the curated page and its supersession history follow the
-  session. Refused with `409` when the destination already has a latest page
-  (or a page file) at that path; retry with `--pages regenerate` or resolve
-  the destination page first.
+  session (along with `page_feedback`, `query_page_signals`, and
+  `entity_page_links` bound to those moved versions). Refused with `409` when
+  the destination already has a latest page (or a page file) at that path;
+  retry with `--pages regenerate` or resolve the destination page first.
 - `--pages regenerate`: the source versions are retired (`is_latest = 0`),
   the session's `summary_page_id` is cleared when it pointed at them, and the
   file is removed, so the next consolidation of the session writes a fresh
-  page in the destination. The file has to go: a page file left on
-  disk with no latest row is re-indexed as a new latest page by the next
-  reconciliation pass.
+  page in the destination (retired versions' audit feedback and query signals
+  stay with those `is_latest = 0` rows in the source project). The file has to
+  go: a page file left on disk with no latest row is re-indexed as a new
+  latest page by the next reconciliation pass.
 
 The file step follows the page rows the store sweeps. For a re-home, every
 other project holding a latest `sessions/<id>.md` row has its file relocated
@@ -809,10 +811,11 @@ response carries `cwd_warning` when its basename is not the destination
 project, since new sessions started there still resolve by basename unless a
 `.ai-memory.toml` marker pins the project), other pages written during the
 session (decisions, gotchas: pages are not tracked per session), handoffs the
-session *accepted*, and `auto_improve_proposals` (they have no `session_id`;
-they target pages in the scope they were staged in). `entities` and
-`page_feedback` are not re-stamped either, unlike `move-project`, which
-moves the whole project and re-stamps both.
+session *accepted*, `auto_improve_proposals` (they have no `session_id`;
+they target pages in the scope they were staged in), and feedback/signals
+on source versions retired by `--pages regenerate`. With `--pages move`,
+`page_feedback`, `query_page_signals`, and `entity_page_links` attached to
+the moved `sessions/<id>.md` versions move with them.
 
 **Order of operations (per session):** validate the destination (404 unless
 `create`), reject a batch whose source is the destination (422; the single
