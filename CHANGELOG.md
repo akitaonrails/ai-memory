@@ -100,6 +100,11 @@ version in [`docs/changelog/`](docs/changelog/):
   had no record cwd and the capture policy judged them from the session cwd
   instead. The export now takes the last cwd from the records before the
   cursor, as a full export does. (#2258)
+- OpenCode transcript imports now keep each tool call's `callID` on the call
+  and its result. The adapter dropped the id, so each result took the
+  strictest capture decision among all calls of its turn, and one excluded
+  call withheld the results of every other call in that turn. A result is
+  now paired with its own call by id. (#2259)
 
 ## [3.4.6] - 2026-11-13
 

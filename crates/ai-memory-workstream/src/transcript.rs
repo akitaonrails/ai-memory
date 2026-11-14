@@ -3922,6 +3922,8 @@ fn parse_opencode(
         }
         "tool" => {
             let name = first_string(part, &["tool", "name"]).unwrap_or("tool");
+            // https://github.com/anomalyco/opencode/blob/c63a93995f1e5c28dd73cc032dcb224780f208ff/packages/schema/src/v1/session.ts#L315-L322
+            let call_id = first_string(part, &["callID"]);
             let state = part.get("state").unwrap_or(&Value::Null);
             let input = state.get("input").map(compact_json).unwrap_or_default();
             push_event(
@@ -3934,7 +3936,7 @@ fn parse_opencode(
                 Some("assistant"),
                 &format!("{name}: {input}"),
                 None,
-                json!({"tool": name}),
+                with_tool_use_id(json!({"tool": name}), call_id),
             );
             let status = state.get("status").and_then(Value::as_str);
             // V1 terminal failures store their visible result in `error`, not
@@ -3959,11 +3961,14 @@ fn parse_opencode(
                     Some("tool"),
                     &output,
                     None,
-                    if status == Some("error") {
-                        json!({"status": status, "is_error": true})
-                    } else {
-                        json!({"status": status})
-                    },
+                    with_tool_use_id(
+                        if status == Some("error") {
+                            json!({"status": status, "is_error": true})
+                        } else {
+                            json!({"status": status})
+                        },
+                        call_id,
+                    ),
                 );
             }
         }
@@ -9984,6 +9989,26 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn opencode_tool_calls_and_results_keep_their_call_id() {
+        let message = json!({"role":"assistant"});
+        let part = json!({
+            "type":"tool",
+            "callID":"call-1",
+            "tool":"bash",
+            "state":{"status":"completed","input":{"command":"ls"},"output":"file"}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_opencode(&message, &part, "s1", "p1", &mut events, &mut losses);
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolCall);
+        assert_eq!(events[0].metadata["tool_use_id"], "call-1");
+        assert_eq!(events[1].kind, WorkstreamEventKind::ToolResult);
+        assert_eq!(events[1].metadata["tool_use_id"], "call-1");
     }
 
     /// Beta store fixture: `session_v2` + `session_message` with the shapes
