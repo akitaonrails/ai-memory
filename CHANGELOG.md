@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `memory_patch_page` now separates an inserted section body from a heading
+  at end of file even when the heading has no final newline. Previously,
+  replacing such a section silently appended the body to the heading text.
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
   and enforcement metadata when editing the body. (#2207)
 

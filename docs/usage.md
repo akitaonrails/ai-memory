@@ -527,6 +527,9 @@ immediately before patching, then call `memory_patch_page` with that required
 }
 ```
 
+When a section heading is the last line and has no final newline, a nonempty
+`replace_section` body is inserted on a new line after the heading.
+
 Use `target: "end_of_page"` with no anchor to append at EOF. `add_section`
 requires an ATX level 2-6 heading such as `## Decisions` and rejects a heading
 that already exists after whitespace/case normalization. Edits that land at the

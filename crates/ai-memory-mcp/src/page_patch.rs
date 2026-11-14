@@ -139,7 +139,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
     let mut added = HashSet::new();
     let mut changes = Vec::with_capacity(edits.len());
     for edit in edits {
-        let change = match edit {
+        let mut change = match edit {
             PagePatchEdit::Append {
                 target: AppendTarget::EndOfPage,
                 anchor,
@@ -228,6 +228,30 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 }
             }
         };
+        // An unterminated heading at EOF has an empty content range directly
+        // after the heading text. Separate an inserted body from that heading.
+        if matches!(edit, PagePatchEdit::ReplaceSection { .. })
+            && change.range.start == body.len()
+            && !body.ends_with('\n')
+            && !change.replacement.is_empty()
+        {
+            let newline = if change
+                .heading
+                .is_some_and(|start| body[..start].ends_with("\r\n"))
+            {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            if newline == "\r\n"
+                && change.replacement.ends_with('\n')
+                && !change.replacement.ends_with("\r\n")
+            {
+                change.replacement.pop();
+                change.replacement.push_str(newline);
+            }
+            change.replacement.insert_str(0, newline);
+        }
         changes.push(change);
     }
 
@@ -263,6 +287,17 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 .insert_str(0, blank_line_before(preceding));
         }
         if joins_previous && let Some(previous) = merged.last_mut() {
+            // The section insertion now supplies the missing EOF separator;
+            // an end-of-page append computed against the old body must not
+            // add it a second time.
+            if change.placement == Placement::EndOfPage
+                && previous.placement == Placement::Section
+                && !body.ends_with('\n')
+                && previous.replacement.ends_with('\n')
+                && change.replacement.starts_with('\n')
+            {
+                change.replacement.remove(0);
+            }
             previous.replacement.push_str(&change.replacement);
             continue;
         }
@@ -915,5 +950,75 @@ mod tests {
             patched,
             "# T\n## Notes on C#\nold\nmore\n## Tail ##\nend\n\n## F#\n\nnew\n"
         );
+    }
+    #[test]
+    fn replace_section_at_unterminated_heading_adds_a_separator() {
+        for (body, content, expected) in [
+            ("# T\n## One", "new", "# T\n## One\nnew\n"),
+            ("# T\r\n## One", "new", "# T\r\n## One\r\nnew\r\n"),
+            ("# T\r\n## One", "new\r\n", "# T\r\n## One\r\nnew\r\n"),
+            ("## One", "new\n", "## One\nnew\n"),
+            ("# T\n## One", "", "# T\n## One"),
+            ("# T\n## One", "\n\n", "# T\n## One"),
+        ] {
+            let section = section_hashes(body)
+                .0
+                .into_iter()
+                .find(|s| s.anchor == "One")
+                .unwrap();
+            let edit = PagePatchEdit::ReplaceSection {
+                anchor: "One".into(),
+                section_sha256: section.sha256,
+                content: content.into(),
+            };
+            assert_eq!(
+                apply(body, &[edit]).unwrap(),
+                expected,
+                "{body:?} {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_unterminated_heading_and_append_at_eof_are_ordered() {
+        let body = "# T\n## One";
+        let section = section_hashes(body)
+            .0
+            .into_iter()
+            .find(|s| s.anchor == "One")
+            .unwrap();
+        let replace = PagePatchEdit::ReplaceSection {
+            anchor: "One".into(),
+            section_sha256: section.sha256,
+            content: "new".into(),
+        };
+        let append = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append.clone()],
+            vec![append.clone(), replace.clone()],
+        ] {
+            assert_eq!(apply(body, &edits).unwrap(), "# T\n## One\nnew\nfooter\n");
+        }
+        let add = PagePatchEdit::AddSection {
+            anchor: "## Next".into(),
+            content: "end".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append.clone(), add.clone()],
+            vec![replace.clone(), add.clone(), append.clone()],
+            vec![append.clone(), replace.clone(), add.clone()],
+            vec![append.clone(), add.clone(), replace.clone()],
+            vec![add.clone(), replace.clone(), append.clone()],
+            vec![add, append, replace],
+        ] {
+            assert_eq!(
+                apply(body, &edits).unwrap(),
+                "# T\n## One\nnew\nfooter\n\n## Next\n\nend\n"
+            );
+        }
     }
 }

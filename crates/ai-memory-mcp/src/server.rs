@@ -21451,6 +21451,90 @@ mod tests {
         assert!(!stored.body.contains("lost"));
     }
 
+    #[tokio::test]
+    async fn memory_patch_page_keeps_unterminated_heading() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let write = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "notes/unterminated.md".into(),
+                    body: "# Status\n## Log".into(),
+                    title: None,
+                    tier: None,
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    project_id: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let page_id = call_tool_json(write)["page_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let read = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    path: Some("notes/unterminated.md".into()),
+                    query: None,
+                    project: None,
+                    project_id: None,
+                    workspace: None,
+                    scope: None,
+                    include_related: false,
+                    related_depth: None,
+                    max_chars: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let read = call_tool_json(read);
+        let section_sha256 = read["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["anchor"] == "Log")
+            .unwrap()["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        server
+            .memory_patch_page(
+                Parameters(PatchPageArgs {
+                    path: "notes/unterminated.md".into(),
+                    expected_page_id: page_id,
+                    edits: vec![crate::page_patch::PagePatchEdit::ReplaceSection {
+                        anchor: "Log".into(),
+                        section_sha256,
+                        content: "new".into(),
+                    }],
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let stored = server
+            .wiki
+            .as_ref()
+            .unwrap()
+            .read_page(ws, proj, &PagePath::new("notes/unterminated.md").unwrap())
+            .unwrap();
+        assert_eq!(stored.body, "# Status\n## Log\nnew\n");
+    }
+
     /// Replacing a section while appending to its last nested section used to
     /// delete the nested heading and report success. The batch now fails as
     /// overlapping and the stored page keeps its body and version.
