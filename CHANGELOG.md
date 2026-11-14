@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed project activity timestamps and default ordering ignoring newer
+  sessions or page updates whenever an older observation existed. Project
+  lists now use the latest of all three activity sources. (#NNN)
 - `export-okf` no longer silently drops a concept page that occupies an
   OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
   hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names

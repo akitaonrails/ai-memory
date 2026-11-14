@@ -11776,6 +11776,9 @@ impl ReaderPool {
             // project row, not only on the pages counted beside it.
             let visible = readable_repository_predicate("p.id", viewer);
             let ttl = not_expired("pg", "?2");
+            // A known observation need not be the newest activity. Aggregate
+            // the three values so missing sources stay null, without a zero
+            // fallback that would overtake a pre-epoch timestamp.
             let mut stmt = conn.prepare(&format!(
                 "SELECT w.id AS workspace_id, \
                         w.name AS workspace_name, \
@@ -11786,9 +11789,10 @@ impl ReaderPool {
                         (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id), \
                         (SELECT COUNT(*) FROM observations o WHERE o.project_id = p.id), \
                         (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id AND s.ended_at IS NULL), \
-                        COALESCE((SELECT MAX(o.created_at) FROM observations o WHERE o.project_id = p.id), \
-                            (SELECT MAX(s.started_at) FROM sessions s WHERE s.project_id = p.id), \
-                            MAX(pg.updated_at)) AS last_activity \
+                        (SELECT MAX(column1) FROM (VALUES \
+                            ((SELECT MAX(o.created_at) FROM observations o WHERE o.project_id = p.id)), \
+                            ((SELECT MAX(s.started_at) FROM sessions s WHERE s.project_id = p.id)), \
+                            (MAX(pg.updated_at)))) AS last_activity \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
                  LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1{ttl} \
