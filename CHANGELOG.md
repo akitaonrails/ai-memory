@@ -43,7 +43,7 @@ version in [`docs/changelog/`](docs/changelog/):
   could target. (#2239)
 - `memory_patch_page` now preserves blank-line padding around nonempty section
   bodies in CRLF Markdown and avoids adding an LF-only boundary. Previously,
-  the padding was lost when the section was replaced. (#2239)
+  the padding was lost when the section was replaced. (#2281)
 - Fixed project activity timestamps and default ordering ignoring newer
   sessions or page updates whenever an older observation existed. Project
   lists now use the latest of all three activity sources. (#2266)
