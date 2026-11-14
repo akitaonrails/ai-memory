@@ -94,6 +94,11 @@ Kimi calls `memory_message_cancel`. With no id it clears every pending message A
 has sent; with a `message_id` it retracts just that one. A message already
 popped by B cannot be cancelled.
 
+For pop and cancel, omit `message_id` to use that default. An explicitly empty
+or whitespace-only id is refused without claiming or cancelling any message.
+A valid UUID may have surrounding whitespace. The HTTP/admin endpoints apply
+the same rule, and the CLI refuses an empty `--id` before sending a request.
+
 ### Naming the project: pop, cancel, and send refuse a guess
 
 A session-aware MCP client forwards its lifecycle-hook session id, so the server

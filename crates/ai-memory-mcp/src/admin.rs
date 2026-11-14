@@ -3773,7 +3773,6 @@ fn parse_optional_message_id(
     raw: Option<&str>,
 ) -> Result<Option<ai_memory_core::MessageId>, (StatusCode, Json<serde_json::Value>)> {
     raw.map(str::trim)
-        .filter(|s| !s.is_empty())
         .map(str::parse::<ai_memory_core::MessageId>)
         .transpose()
         .map_err(|_| {
@@ -10452,6 +10451,148 @@ mod tests {
                 .is_err()
         );
         server.abort();
+    }
+
+    async fn message_id_request(
+        router: &Router,
+        action: &str,
+        input: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/messages/{action}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(input.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn assert_admin_blank_message_id_preserves_mail(action: &str, project: &str) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        store
+            .writer
+            .get_or_create_project(ws, "sender", None)
+            .await
+            .unwrap();
+        let recipient = store
+            .writer
+            .get_or_create_project(ws, "recipient", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let mut ids = Vec::new();
+        for body in ["first request", "second request"] {
+            let (status, sent) = message_id_request(
+                &router,
+                "send",
+                serde_json::json!({
+                    "from_workspace": "default", "from_project": "sender",
+                    "to_workspace": "default", "to_project": "recipient", "body": body,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{sent}");
+            ids.push(sent["message_id"].as_str().unwrap().to_owned());
+        }
+        let pending = store
+            .reader
+            .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 50)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        for message_id in ["", " \t\n ", "not-a-uuid"] {
+            let (status, refused) = message_id_request(
+                &router,
+                action,
+                serde_json::json!({
+                    "workspace": "default", "project": project, "message_id": message_id,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+            assert_eq!(refused["error"], "message_id must be a full UUID");
+            let untouched = store
+                .reader
+                .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 50)
+                .await
+                .unwrap();
+            assert_eq!(untouched.len(), 2);
+            for (actual, original) in untouched.iter().zip(&pending) {
+                assert_eq!(actual.id, original.id);
+                assert_eq!(actual.body, original.body);
+                assert_eq!(actual.state, original.state);
+            }
+        }
+        let (status, selected) = message_id_request(
+            &router,
+            action,
+            serde_json::json!({
+                "workspace": "default", "project": project, "message_id": format!(" {}\n", ids[1]),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        if action == "pop" {
+            assert_eq!(selected["message"]["id"], ids[1]);
+        } else {
+            assert_eq!(selected["cancelled"], 1);
+        }
+        let remaining = store
+            .reader
+            .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 50)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id.to_string(), ids[0]);
+        let (status, omitted) = message_id_request(
+            &router,
+            action,
+            serde_json::json!({
+                "workspace": "default", "project": project,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{omitted}");
+        if action == "pop" {
+            assert_eq!(omitted["message"]["id"], ids[0]);
+        } else {
+            assert_eq!(omitted["cancelled"], 1);
+        }
+        assert!(
+            store
+                .reader
+                .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_blank_message_pop_id_preserves_pending_mail() {
+        assert_admin_blank_message_id_preserves_mail("pop", "recipient").await;
+    }
+
+    #[tokio::test]
+    async fn admin_blank_message_cancel_id_preserves_pending_mail() {
+        assert_admin_blank_message_id_preserves_mail("cancel", "sender").await;
     }
 
     struct FakeAutoImproveLlm;
