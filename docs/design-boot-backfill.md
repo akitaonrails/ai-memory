@@ -30,7 +30,7 @@ behavior and touches the trust boundary (retroactive untrusted text enters the s
 `backfill --dry-run` only plans the import; it neither creates nor overwrites
 the local sentinel, so it does not suppress a later automatic attempt.
 
-The automatic path runs detached and silent (like Claude Code's own auto-memory); the
+The automatic path runs detached and silent; the
 `📼 imported N session(s)` summary is shown on a **manual** `ai-memory backfill` only.
 `backfill --session <id>` looks up that exact native session, including one older
 than the newest 200 sessions enumerated per harness. It retains the adapter's
@@ -290,8 +290,8 @@ note** at the top) resolved each:
 2. **Shared-server default:** shipped **on by default** with `AI_MEMORY_BACKFILL_ON_START=false`
    / `--no`-style opt-out; the emptiness gate makes it safe on any posture (it only ever
    bootstraps an empty project).
-3. **Notice delivery:** the automatic path runs detached and silent (like Claude Code's
-   own auto-memory); the summary shows on a manual `ai-memory backfill`. Surfacing it in
+3. **Notice delivery:** the automatic path runs detached and silent; the summary
+   shows on a manual `ai-memory backfill`. Surfacing it in
    the next session's on-start context remains a possible follow-up.
 4. **Consolidation quality:** shipped **behind the hard cap** (newest 25 sessions / 50k
    events) and iterating; a dedicated eval remains a follow-up.
