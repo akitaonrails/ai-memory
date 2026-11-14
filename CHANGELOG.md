@@ -39,7 +39,7 @@ version in [`docs/changelog/`](docs/changelog/):
   appears only once in the accepted document. (#2236)
 - The document importer now resolves XLSX worksheet and PPTX slide
   relationships by XML namespace rather than requiring the `r:` prefix.
-  Valid files using a different prefix no longer fail to import.
+  Valid files using a different prefix no longer fail to import. (#2273)
 - Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin
