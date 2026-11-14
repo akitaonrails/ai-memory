@@ -194,16 +194,18 @@ impl QaEngine {
             .as_deref()
             .unwrap_or(answer_provider_str);
         let grader_model = args.qa_grader_model.as_deref().unwrap_or(answer_model);
+        // A credential is tied to its endpoint: the grader reuses the
+        // answerer's key only when it targets the same provider and base URL,
+        // never when it is pointed elsewhere (GHSA grader-key-reuse).
+        let grader_auth = grader_auth(args, answer_provider_str, grader_provider_str);
         let grader = build_llm_provider(
             "grader",
             grader_provider_str,
             grader_model,
             args.qa_grader_base_url.or_ref(&args.qa_base_url),
-            args.qa_grader_api_key.or_ref(&args.qa_api_key),
-            args.qa_grader_api_key_env.or_ref(&args.qa_api_key_env),
-            args.qa_grader_token_file
-                .as_deref()
-                .or(args.qa_token_file.as_deref()),
+            grader_auth.api_key,
+            grader_auth.api_key_env,
+            grader_auth.token_file,
         )?;
 
         Ok(Self {
@@ -341,6 +343,46 @@ trait OrRef {
 impl OrRef for Option<String> {
     fn or_ref<'a>(&'a self, fallback: &'a Option<String>) -> Option<&'a str> {
         self.as_deref().or(fallback.as_deref())
+    }
+}
+
+/// The grader's endpoint-tied credential material.
+struct GraderAuth<'a> {
+    api_key: Option<&'a str>,
+    api_key_env: Option<&'a str>,
+    token_file: Option<&'a std::path::Path>,
+}
+
+/// The grader's API key / key-env / token file, tied to its endpoint. A
+/// credential belongs to one endpoint: the grader inherits the answerer's key
+/// material only when it targets the **same** provider and base URL (the common
+/// one-judge LongMemEval setup). A grader pointed at a different provider or
+/// base URL must bring its own credential, so an answerer key is never sent to
+/// a different grader endpoint; with none of its own, `build_llm_provider`
+/// fails closed and the run skips. Base URL and model are not credentials and
+/// still default to the answerer's independently.
+fn grader_auth<'a>(
+    args: &'a QaArgs,
+    answer_provider: &str,
+    grader_provider: &str,
+) -> GraderAuth<'a> {
+    let same_endpoint = grader_provider == answer_provider
+        && args.qa_grader_base_url.or_ref(&args.qa_base_url) == args.qa_base_url.as_deref();
+    if same_endpoint {
+        GraderAuth {
+            api_key: args.qa_grader_api_key.or_ref(&args.qa_api_key),
+            api_key_env: args.qa_grader_api_key_env.or_ref(&args.qa_api_key_env),
+            token_file: args
+                .qa_grader_token_file
+                .as_deref()
+                .or(args.qa_token_file.as_deref()),
+        }
+    } else {
+        GraderAuth {
+            api_key: args.qa_grader_api_key.as_deref(),
+            api_key_env: args.qa_grader_api_key_env.as_deref(),
+            token_file: args.qa_grader_token_file.as_deref(),
+        }
     }
 }
 
@@ -560,6 +602,69 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("requires an API key"), "{err}");
+    }
+
+    #[test]
+    fn grader_credential_is_tied_to_its_endpoint() {
+        // Answerer with inline key + key-env + token file, native openai vendor.
+        fn answerer_with(edit: impl FnOnce(&mut QaArgs)) -> QaArgs {
+            let mut a = QaArgs {
+                enabled: true,
+                qa_provider: Some("openai".into()),
+                qa_model: Some("gpt-x".into()),
+                qa_api_key: Some("sk-answerer-inline".into()),
+                qa_api_key_env: Some("ANSWERER_KEY_ENV".into()),
+                qa_token_file: Some("/answerer/token".into()),
+                ..Default::default()
+            };
+            edit(&mut a);
+            a
+        }
+
+        // A grader pointed at a different base URL, with no credentials of its
+        // own, must NOT inherit the answerer's key material (GHSA grader-key
+        // reuse). With the old unconditional fallback these would be `Some`.
+        let diff_url =
+            answerer_with(|a| a.qa_grader_base_url = Some("https://grader.example/v1".into()));
+        let auth = grader_auth(&diff_url, "openai", "openai");
+        assert_eq!(
+            auth.api_key, None,
+            "inline key leaked to a different endpoint"
+        );
+        assert_eq!(
+            auth.api_key_env, None,
+            "key-env leaked to a different endpoint"
+        );
+        assert_eq!(
+            auth.token_file, None,
+            "token file leaked to a different endpoint"
+        );
+
+        // A grader at a different provider also does not inherit.
+        let diff_provider = answerer_with(|_| {});
+        let auth = grader_auth(&diff_provider, "openai", "gemini");
+        assert_eq!(auth.api_key, None);
+        assert_eq!(auth.api_key_env, None);
+        assert_eq!(auth.token_file, None);
+
+        // Control: same provider and base URL (the common single-judge setup)
+        // still inherits the answerer's credential.
+        let same = answerer_with(|_| {});
+        let auth = grader_auth(&same, "openai", "openai");
+        assert_eq!(auth.api_key, Some("sk-answerer-inline"));
+        assert_eq!(auth.api_key_env, Some("ANSWERER_KEY_ENV"));
+        assert_eq!(
+            auth.token_file,
+            Some(std::path::Path::new("/answerer/token"))
+        );
+
+        // The operator may still give a different-endpoint grader its own key.
+        let own = answerer_with(|a| {
+            a.qa_grader_base_url = Some("https://grader.example/v1".into());
+            a.qa_grader_api_key = Some("sk-grader-own".into());
+        });
+        let auth = grader_auth(&own, "openai", "openai");
+        assert_eq!(auth.api_key, Some("sk-grader-own"));
     }
 
     /// Live end-to-end QA smoke over a hand-made retrieval outcome (no eval

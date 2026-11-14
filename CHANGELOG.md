@@ -162,6 +162,14 @@ version in [`docs/changelog/`](docs/changelog/):
   built-in sanitizer, so a password inside a URL or a provider key under an
   unrelated name is redacted too. (#2274)
 
+### Security
+
+- The eval QA grader no longer reuses the answerer's API key, key-env, or
+  auth file when it is pointed at a different provider or base URL. A grader
+  at a different endpoint must supply its own credential (or the run skips),
+  so an answerer key is never sent to an endpoint it was not issued for.
+  (GHSA-5xw9-4g32-84fr)
+
 ## [3.4.6] - 2026-11-13
 
 ### Fixed
