@@ -94,6 +94,12 @@ identity record, and `index.md` is the OKF-facing description. Nothing in
 the current tree writes `index.md`, so that reserved name is free.
 `log.md` is not adopted: git is the log.
 
+OKF v0.2 §3.1 reserves `index.md` and `log.md` at every level. If a concept
+page (one with real frontmatter) occupies one of those names at any depth,
+the export refuses with that page's path rather than silently dropping it;
+rename the page and export again. A frontmatter-less file at a reserved name
+is raw capture, not a concept, and is skipped.
+
 Export excludes the project's root `_pending/` proposal staging directory.
 An identically named directory below a concept family, such as
 `notes/_pending/`, contains ordinary concept pages and is included.
