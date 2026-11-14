@@ -8845,8 +8845,9 @@ pub fn move_project_workspace(
         params![&to[..], &pid[..], &from[..]],
     )? as u64;
     // The remaining tables that carry the workspace beside the project id.
-    // Left behind, an entity or a feedback row stops matching reads keyed on
-    // the new workspace, and a purge tombstone stops matching the moved
+    // Left behind, an entity, feedback, or retrieval-history row stops
+    // matching reads keyed on the new workspace (and would cascade on source
+    // workspace deletion), and a purge tombstone stops matching the moved
     // project's session ids, so a purged session could be recreated.
     for table in [
         "entities",
@@ -8856,6 +8857,7 @@ pub fn move_project_workspace(
         "profile_entry_ledger",
         "profile_harvest_marks",
         "query_page_signals",
+        "retrieval_history",
     ] {
         tx.execute(
             &format!(
@@ -9124,6 +9126,7 @@ pub fn merge_project(
         "page_sources",
         "purged_sessions",
         "query_page_signals",
+        "retrieval_history",
     ] {
         tx.execute(
             &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
@@ -9639,6 +9642,7 @@ pub fn move_session(
     summary.consolidation_jobs = restamp("session_consolidation_jobs", "session_id")?;
     summary.auto_improve_runs = restamp("auto_improve_runs", "session_id")?;
     summary.auto_improve_claims = restamp("auto_improve_scheduler_claims", "session_id")?;
+    restamp("retrieval_history", "session_id")?;
 
     // Profile evidence harvested from this session's prompts, keyed by
     // `session:<id>`. Re-stamped so later convergence attributes the
