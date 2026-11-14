@@ -496,6 +496,11 @@ every `--query-arg` value, also pass through the built-in sanitizer patterns
 that hook capture applies, so a password inside a URL shows as
 `[REDACTED:<kind>]`.
 
+The spawned servers do not inherit `AI_MEMORY_*` settings from the evaluator's
+environment. Pass intended server settings through `--server-env` or
+`--candidate-server-env` so the report records them. System settings such as
+`PATH`, home directories and certificate configuration remain inherited.
+
 ```bash
 # Determinism check — baseline == candidate ⇒ accuracy/context delta = 0:
 cargo run --release -p ai-memory-eval -- retrieval --candidate --sample 2
