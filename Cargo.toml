@@ -148,6 +148,9 @@ winapi-util = "0.1"
 # `aws_lc_rs`, which is exactly the C/JNI toolchain the bridge avoids by using
 # rmcp's `reqwest-tls-no-provider`. `ring` is already in the lockfile via reqwest 0.12.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# Signs the RS256 assertion a Google service-account key trades for a Vertex AI
+# token; already in the tree through rustls.
+ring = "0.17"
 # rmcp 3.x speaks the MCP 2026-07-28 revision (stateless `server/discover`,
 # per-request `_meta` negotiation) while keeping the legacy `initialize`
 # handshake, so both-era clients connect without a shim (#1924).

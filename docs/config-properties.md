@@ -32,7 +32,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
 | `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`. The only value is `llm`, which needs an LLM provider. |
 | `rerank_timeout_secs` | `20` (`ai_memory_llm::reranker::RERANK_TIMEOUT`) | `AI_MEMORY_RERANK_TIMEOUT_SECS` | Seconds one rerank call may take before `memory_query` keeps the pre-rerank order. Must be at least 1. |
-| `llm_provider` | unset | `AI_MEMORY_LLM_PROVIDER` | LLM provider: `anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `anthropic-oauth`, `codex`, `copilot`, `opencode` or `cursor`. |
+| `llm_provider` | unset | `AI_MEMORY_LLM_PROVIDER` | LLM provider: `anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `anthropic-oauth`, `codex`, `copilot`, `opencode`, `cursor` or `vertex`. |
 | `llm_model` | unset | `AI_MEMORY_LLM_MODEL` | Model override for the LLM provider. |
 | `llm_base_url` | unset | `AI_MEMORY_LLM_BASE_URL` | Endpoint override for the LLM provider. Required for `openai-compat`. |
 | `llm_compat_strict` | `true` | `AI_MEMORY_LLM_COMPAT_STRICT` | Send `response_format=json_schema` (strict) to the `openai-compat` provider. |
@@ -62,7 +62,7 @@ An array of tables. Each entry is tried in order after the primary provider, onl
 | `provider` | empty (required) | - | Provider for this candidate, using the same names as `llm_provider`. |
 | `model` | empty (required) | - | Model id for this candidate. |
 | `base_url` | unset | - | Endpoint override for this candidate. Required for `openai-compat`. |
-| `api_key_env` | unset | - | Name of the environment variable holding this candidate's key. Required unless the provider has a native credential source. `copilot` and `anthropic-oauth` use the named key instead of their native token; `openai-oauth`, `codex` and `cursor` reject it. |
+| `api_key_env` | unset | - | Name of the environment variable holding this candidate's key. Required unless the provider has a native credential source. `copilot` and `anthropic-oauth` use the named key instead of their native token; `openai-oauth`, `codex`, `cursor` and `vertex` reject it. |
 
 ## `[llm.<task>]`
 

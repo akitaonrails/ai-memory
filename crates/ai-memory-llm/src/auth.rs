@@ -52,6 +52,22 @@ pub enum AuthRequirement {
     AnthropicOAuthToken,
     /// Provider shells out to the logged-in Cursor Agent CLI.
     CursorCli,
+    /// Provider requires Google Application Default Credentials (a
+    /// `gcloud auth application-default login` file or a service-account key).
+    GoogleAdc,
+}
+
+/// Resolved inputs for the Vertex AI provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexAuth {
+    /// ADC credentials file: `GOOGLE_APPLICATION_CREDENTIALS`, else the file
+    /// `gcloud auth application-default login` writes.
+    pub credentials_file: PathBuf,
+    /// Google Cloud project from `GOOGLE_CLOUD_PROJECT`. When unset, the
+    /// project the credentials file names is used.
+    pub project: Option<String>,
+    /// Vertex AI location (`global`, `us-central1`, …).
+    pub location: String,
 }
 
 /// Resolved Copilot auth inputs.
@@ -144,7 +160,12 @@ pub enum Credential {
     AnthropicOAuthToken(SecretString),
     /// Cursor Agent CLI executable. Login lives in the Cursor app, not here.
     Cursor(CursorAuth),
+    /// Google Application Default Credentials for Vertex AI.
+    Vertex(VertexAuth),
 }
+
+const GOOGLE_ADC_MISSING: &str = "google application default credentials missing; run \
+     `gcloud auth application-default login` or set GOOGLE_APPLICATION_CREDENTIALS";
 
 /// Resolved authentication for one provider instance.
 #[derive(Debug, Clone)]
@@ -230,6 +251,34 @@ impl ProviderAuth {
         }
     }
 
+    /// Resolve Vertex AI auth. `credentials_file` is `None` when neither
+    /// `GOOGLE_APPLICATION_CREDENTIALS` nor a home directory to find the
+    /// `gcloud` file under was available.
+    #[must_use]
+    pub fn vertex(
+        credentials_file: Option<PathBuf>,
+        project: Option<String>,
+        location: String,
+        source: CredentialSource,
+    ) -> Self {
+        let has_file = credentials_file.is_some();
+        Self {
+            requirement: AuthRequirement::GoogleAdc,
+            credential: credentials_file.map(|credentials_file| {
+                Credential::Vertex(VertexAuth {
+                    credentials_file,
+                    project,
+                    location,
+                })
+            }),
+            source: if has_file {
+                source
+            } else {
+                CredentialSource::NotProvided
+            },
+        }
+    }
+
     /// Resolve Anthropic OAuth auth from a subscription token (from `claude setup-token`).
     #[must_use]
     pub fn anthropic_oauth_token(token: Option<SecretString>) -> Self {
@@ -309,6 +358,9 @@ impl ProviderAuth {
             (_, Some(Credential::Cursor(_))) => Err(LlmError::NotConfigured(
                 "API key credential expected, got cursor agent CLI".into(),
             )),
+            (_, Some(Credential::Vertex(_))) => Err(LlmError::NotConfigured(
+                "API key credential expected, got google application default credentials".into(),
+            )),
             (AuthRequirement::RequiredApiKey { env_var }, None) => {
                 Err(LlmError::NotConfigured((*env_var).into()))
             }
@@ -335,6 +387,9 @@ impl ProviderAuth {
                 "cursor agent executable missing; set AI_MEMORY_CURSOR_AGENT or install `agent`"
                     .into(),
             )),
+            (AuthRequirement::GoogleAdc, None) => Err(LlmError::NotConfigured(
+                GOOGLE_ADC_MISSING.into(),
+            )),
         }
     }
 
@@ -348,7 +403,8 @@ impl ProviderAuth {
                 | Credential::Codex(_)
                 | Credential::Copilot(_)
                 | Credential::AnthropicOAuthToken(_)
-                | Credential::Cursor(_),
+                | Credential::Cursor(_)
+                | Credential::Vertex(_),
             )
             | None => None,
         }
@@ -424,6 +480,23 @@ impl ProviderAuth {
             )),
             _ => Err(LlmError::NotConfigured(
                 "cursor agent credential required".into(),
+            )),
+        }
+    }
+
+    /// Extract the resolved Vertex AI inputs.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] if this is not Google ADC auth or no
+    /// credentials file could be located.
+    pub fn require_vertex_auth(&self) -> LlmResult<VertexAuth> {
+        match (&self.requirement, &self.credential) {
+            (AuthRequirement::GoogleAdc, Some(Credential::Vertex(auth))) => Ok(auth.clone()),
+            (AuthRequirement::GoogleAdc, None) => {
+                Err(LlmError::NotConfigured(GOOGLE_ADC_MISSING.into()))
+            }
+            _ => Err(LlmError::NotConfigured(
+                "google application default credentials required".into(),
             )),
         }
     }
@@ -565,6 +638,40 @@ mod tests {
     fn optional_api_key_returns_none_for_anthropic_oauth_credential() {
         let auth = ProviderAuth::anthropic_oauth_token(Some(SecretString::from("tok")));
         assert!(auth.optional_api_key().is_none());
+    }
+
+    #[test]
+    fn vertex_auth_round_trips_inputs_and_source() {
+        let auth = ProviderAuth::vertex(
+            Some(PathBuf::from("/tmp/adc.json")),
+            Some("my-project".into()),
+            "us-central1".into(),
+            CredentialSource::Environment {
+                name: "GOOGLE_APPLICATION_CREDENTIALS",
+            },
+        );
+        let vertex = auth.require_vertex_auth().unwrap();
+        assert_eq!(auth.requirement(), AuthRequirement::GoogleAdc);
+        assert_eq!(vertex.credentials_file, Path::new("/tmp/adc.json"));
+        assert_eq!(vertex.project.as_deref(), Some("my-project"));
+        assert_eq!(vertex.location, "us-central1");
+        assert!(auth.optional_api_key().is_none());
+        assert!(auth.require_api_key().is_err());
+    }
+
+    #[test]
+    fn vertex_auth_without_a_credentials_file_names_both_fixes() {
+        let auth = ProviderAuth::vertex(None, None, "global".into(), CredentialSource::TokenFile);
+        assert_eq!(auth.source(), CredentialSource::NotProvided);
+        let message = auth.require_vertex_auth().unwrap_err().to_string();
+        assert!(
+            message.contains("gcloud auth application-default login"),
+            "{message}"
+        );
+        assert!(
+            message.contains("GOOGLE_APPLICATION_CREDENTIALS"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -57,6 +57,7 @@ Recommended defaults:
 | `cursor` | `cursor-grok-4.6-high` | Cursor subscription via the logged-in `agent` CLI. Runs `agent --print --mode ask` (read-only). Does not pass `--yolo`. The default id is the one `agent --list-models` labels "Grok 4.6". |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
+| `vertex` | `gemini-3.5-flash` | The same Gemini models through Vertex AI, billed to a Google Cloud project (Cloud credits apply). Uses `gcloud` Application Default Credentials; no API key. |
 | `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
 | `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Standard Compute, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 | `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
@@ -105,6 +106,36 @@ workspace is created under the system temp directory captured at startup.
 export AI_MEMORY_LLM_PROVIDER=cursor
 export AI_MEMORY_LLM_MODEL=cursor-grok-4.6-high
 ai-memory llm-test --provider cursor --model cursor-grok-4.6-high --prompt "Reply with OK"
+```
+
+`vertex` calls the same Gemini models as `gemini`, through Vertex AI instead of
+AI Studio. Usage is billed to a Google Cloud project, so Google Cloud credits
+(free trial, startup and promotional credits) pay for it; they do not pay for
+AI Studio. There is no API key. The provider uses Google Application Default
+Credentials, read from the same places Google's SDKs read them:
+
+- `GOOGLE_APPLICATION_CREDENTIALS`, the path to a service-account key file;
+- otherwise the file `gcloud auth application-default login` writes:
+  `$CLOUDSDK_CONFIG/application_default_credentials.json`, else
+  `~/.config/gcloud/` (`%APPDATA%\gcloud\` on Windows).
+
+`GOOGLE_CLOUD_PROJECT` names the project to bill. Without it, ai-memory uses
+the project the credentials file names (`project_id` in a service-account key,
+`quota_project_id` in a `gcloud` login). `GOOGLE_CLOUD_LOCATION` picks the
+region and defaults to `global`, which serves the newest Gemini models. The
+access token is refreshed before it expires and re-read after a `401`, so a new
+`gcloud` login is picked up without a restart. Workload identity federation,
+service-account impersonation and the GCE metadata server are not supported.
+The project needs the Vertex AI API enabled
+(`gcloud services enable aiplatform.googleapis.com`), and the account needs the
+`roles/aiplatform.user` role. Embeddings are unchanged: `vertex` covers the
+chat provider only.
+
+```bash
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT=my-project
+export AI_MEMORY_LLM_PROVIDER=vertex
+ai-memory llm-test --provider vertex --model gemini-3.5-flash --prompt "Reply with OK"
 ```
 
 Codex credential storage mode `file` is supported. `auto` works only when its

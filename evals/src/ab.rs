@@ -520,6 +520,12 @@ fn resolve_provider(side: &str, args: &AbArgs) -> Result<ResolvedConfig> {
             std::env::temp_dir(),
             &std::env::vars_os().collect::<Vec<_>>(),
         )),
+        AuthRequirement::GoogleAdc => ProviderAuth::vertex(
+            token_file,
+            None,
+            "global".into(),
+            ai_memory_llm::CredentialSource::TokenFile,
+        ),
     };
 
     Ok(ResolvedConfig {

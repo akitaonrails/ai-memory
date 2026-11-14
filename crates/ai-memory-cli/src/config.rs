@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_llm::{
-    AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, CursorAuth, EmbedderChoice, EmbedderConfig,
-    ExtraHeaders, FallbackLlmProvider, LlmError, LlmProvider, LlmProviders, LlmResult, LlmWorkload,
-    OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort,
-    build_provider, cursor_executable,
+    AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, CredentialSource, CursorAuth, EmbedderChoice,
+    EmbedderConfig, ExtraHeaders, FallbackLlmProvider, LlmError, LlmProvider, LlmProviders,
+    LlmResult, LlmWorkload, OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice, ProviderConfig,
+    ReasoningEffort, build_provider, cursor_executable,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -851,6 +851,11 @@ pub struct RuntimeEnv {
     copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
     opencode_api_key: Option<SecretString>,
+    google_application_credentials: Option<PathBuf>,
+    cloudsdk_config: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    google_cloud_project: Option<String>,
+    google_cloud_location: Option<String>,
     hook_spool_max_attempts: Option<String>,
     run_require_server: Option<String>,
 }
@@ -913,6 +918,13 @@ impl RuntimeEnv {
             copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
             opencode_api_key: env_secret("OPENCODE_API_KEY"),
+            // The names Google's own SDKs and `gcloud` read, so a machine already
+            // set up for Vertex AI needs nothing ai-memory-specific.
+            google_application_credentials: env_path("GOOGLE_APPLICATION_CREDENTIALS"),
+            cloudsdk_config: env_path("CLOUDSDK_CONFIG"),
+            appdata: env_path("APPDATA"),
+            google_cloud_project: env_string("GOOGLE_CLOUD_PROJECT"),
+            google_cloud_location: env_string("GOOGLE_CLOUD_LOCATION"),
             hook_spool_max_attempts: std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").ok(),
             // A flat env var (not `AI_MEMORY_RUN__REQUIRE_SERVER`, which
             // figment's `__` split would map onto `run.require_server`) so it
@@ -3134,7 +3146,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "AI_MEMORY_LLM_PROVIDER={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
+                 anthropic|openai|gemini|vertex|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         self.make_provider_config(
@@ -3160,6 +3172,7 @@ impl Config {
                 ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
+                ProviderChoice::Vertex => "gemini-3.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
                 ProviderChoice::Codex => "gpt-5.6-luna".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
@@ -3270,7 +3283,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "{path}.provider={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
+                 anthropic|openai|gemini|vertex|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         let model = non_empty(Some(profile.model.as_str()))
@@ -3341,6 +3354,7 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken
             | AuthRequirement::CodexAuthFile
             | AuthRequirement::CursorCli
+            | AuthRequirement::GoogleAdc
                 if explicit_key =>
             {
                 return Err(LlmError::NotConfigured(format!(
@@ -3614,6 +3628,7 @@ impl Config {
             ProviderChoice::AnthropicOAuth => None,
             ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
             ProviderChoice::Cursor => None,
+            ProviderChoice::Vertex => None,
         }
     }
 
@@ -3651,6 +3666,40 @@ impl Config {
             cursor_executable(self.runtime_env.cursor_executable.as_deref()),
             self.runtime_env.temp_dir.clone().unwrap_or_default(),
             self.runtime_env.process_env(),
+        )
+    }
+
+    /// Vertex AI inputs, from values captured once by [`Config::load`]: an
+    /// explicit `GOOGLE_APPLICATION_CREDENTIALS`, else the file
+    /// `gcloud auth application-default login` writes.
+    fn vertex_auth(&self) -> ProviderAuth {
+        let env = &self.runtime_env;
+        let (credentials_file, source) = match &env.google_application_credentials {
+            Some(path) => (
+                Some(path.clone()),
+                CredentialSource::Environment {
+                    name: "GOOGLE_APPLICATION_CREDENTIALS",
+                },
+            ),
+            None => (
+                gcloud_adc_file(
+                    env.cloudsdk_config.as_deref(),
+                    env.appdata.as_deref(),
+                    env.platform_home
+                        .as_deref()
+                        .or_else(|| env.home_dir.as_deref().map(Path::new)),
+                    cfg!(windows),
+                ),
+                CredentialSource::TokenFile,
+            ),
+        };
+        ProviderAuth::vertex(
+            credentials_file,
+            env.google_cloud_project.clone(),
+            env.google_cloud_location
+                .clone()
+                .unwrap_or_else(|| "global".to_string()),
+            source,
         )
     }
 
@@ -3720,6 +3769,7 @@ impl Config {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
             AuthRequirement::CursorCli => ProviderAuth::cursor(self.cursor_auth()),
+            AuthRequirement::GoogleAdc => self.vertex_auth(),
         }
     }
 
@@ -3791,6 +3841,24 @@ fn build_llm_chain(
     ))
 }
 
+/// Where `gcloud auth application-default login` writes its credentials:
+/// `$CLOUDSDK_CONFIG`, else `%APPDATA%\gcloud` on Windows and
+/// `~/.config/gcloud` elsewhere.
+/// <https://cloud.google.com/docs/authentication/application-default-credentials#personal>
+fn gcloud_adc_file(
+    cloudsdk_config: Option<&Path>,
+    appdata: Option<&Path>,
+    home: Option<&Path>,
+    windows: bool,
+) -> Option<PathBuf> {
+    let config_dir = match cloudsdk_config {
+        Some(dir) => dir.to_path_buf(),
+        None if windows => appdata?.join("gcloud"),
+        None => home?.join(".config").join("gcloud"),
+    };
+    Some(config_dir.join("application_default_credentials.json"))
+}
+
 /// Wire-name parsing shared by `llm_provider` and `llm_fallbacks[].provider`.
 fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
     Some(match raw {
@@ -3804,6 +3872,7 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
         "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
         "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
         "cursor" => ProviderChoice::Cursor,
+        "vertex" | "vertex-ai" | "vertex_ai" => ProviderChoice::Vertex,
         _ => return None,
     })
 }
@@ -7749,6 +7818,94 @@ input_token_safety_margin = {margin}
         assert_eq!(provider.auth.requirement(), AuthRequirement::CursorCli);
     }
 
+    #[test]
+    fn vertex_provider_reads_google_cloud_env_and_defaults_to_global() {
+        let cfg = Config {
+            llm_provider: Some("vertex".into()),
+            runtime_env: RuntimeEnv {
+                google_application_credentials: Some(PathBuf::from("/secrets/sa.json")),
+                google_cloud_project: Some("billing-project".into()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_vertex_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Vertex);
+        assert_eq!(provider.model, "gemini-3.5-flash");
+        assert_eq!(auth.credentials_file, PathBuf::from("/secrets/sa.json"));
+        assert_eq!(auth.project.as_deref(), Some("billing-project"));
+        assert_eq!(auth.location, "global");
+        assert_eq!(
+            provider.auth.source(),
+            CredentialSource::Environment {
+                name: "GOOGLE_APPLICATION_CREDENTIALS"
+            }
+        );
+    }
+
+    /// Without `GOOGLE_APPLICATION_CREDENTIALS` the provider uses the file a
+    /// `gcloud auth application-default login` left in the operator's home.
+    #[test]
+    fn vertex_provider_falls_back_to_the_gcloud_login_file() {
+        let cfg = Config {
+            llm_provider: Some("vertex-ai".into()),
+            runtime_env: RuntimeEnv {
+                platform_home: Some(PathBuf::from("/home/op")),
+                google_cloud_location: Some("us-central1".into()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_vertex_auth().unwrap();
+
+        if !cfg!(windows) {
+            assert_eq!(
+                auth.credentials_file,
+                Path::new("/home/op/.config/gcloud/application_default_credentials.json")
+            );
+        }
+        assert_eq!(auth.project, None);
+        assert_eq!(auth.location, "us-central1");
+        assert_eq!(provider.auth.source(), CredentialSource::TokenFile);
+    }
+
+    #[test]
+    fn gcloud_adc_file_follows_cloudsdk_config_then_the_platform_default() {
+        let file = "application_default_credentials.json";
+        assert_eq!(
+            gcloud_adc_file(
+                Some(Path::new("/custom/gcloud")),
+                Some(Path::new("C:/Users/op/AppData/Roaming")),
+                Some(Path::new("/home/op")),
+                true,
+            ),
+            Some(Path::new("/custom/gcloud").join(file))
+        );
+        assert_eq!(
+            gcloud_adc_file(
+                None,
+                Some(Path::new("C:/Users/op/AppData/Roaming")),
+                None,
+                true
+            ),
+            Some(Path::new("C:/Users/op/AppData/Roaming/gcloud").join(file))
+        );
+        assert_eq!(
+            gcloud_adc_file(None, None, Some(Path::new("/home/op")), false),
+            Some(Path::new("/home/op/.config/gcloud").join(file))
+        );
+        assert_eq!(gcloud_adc_file(None, None, None, false), None);
+        assert_eq!(
+            gcloud_adc_file(None, None, Some(Path::new("/home/op")), true),
+            None
+        );
+    }
+
     /// The Cursor child reads untrusted session text: the provider config
     /// hands it the captured environment's allowlisted part only, so the
     /// server's own bearer and other providers' keys never reach it.
@@ -8300,7 +8457,7 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
 
     #[test]
     fn native_profiles_reject_unsupported_named_credentials() {
-        for provider in ["openai-oauth", "codex", "cursor"] {
+        for provider in ["openai-oauth", "codex", "cursor", "vertex"] {
             for profile in [
                 format!("[llm.lint]\nprovider = '{provider}'\napi_key_env = 'KEY'\n"),
                 format!(

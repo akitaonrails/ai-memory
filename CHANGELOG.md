@@ -13,6 +13,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added the `vertex` LLM provider: the same Gemini models as `gemini`, called
+  through Vertex AI so usage is billed to a Google Cloud project and Google
+  Cloud credits pay for it (they do not cover AI Studio). It authenticates with
+  Application Default Credentials, either the `gcloud auth
+  application-default login` file or a service-account key in
+  `GOOGLE_APPLICATION_CREDENTIALS`, and caches the access token until shortly
+  before it expires. `GOOGLE_CLOUD_PROJECT` selects the project (default: the
+  one the credentials name) and `GOOGLE_CLOUD_LOCATION` the region (default
+  `global`). (#2287)
 - Pi assistant-response capture. Installing the Pi hooks with
   `--capture-assistant` (and the server's `capture_assistant` enabled) records
   the assistant's final turn on `agent_end`. Pi exposes no raw assistant field
