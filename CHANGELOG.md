@@ -306,6 +306,13 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- `move-project`, `merge-project`, and `move-session` now re-stamp
+  `retrieval_history` rows to the target scope alongside other project and
+  session records. They previously left those rows on the old scope, so
+  `merge-project` cascade-deleted source retrieval history (and its
+  `retrieval_history_hits`), while `move-project` and `move-session` hid
+  moved session history from `/retrievals` and exposed it to cascade deletion
+  when the source workspace or project was removed. (#2268)
 
 ## [3.4.6] - 2026-11-13
 
