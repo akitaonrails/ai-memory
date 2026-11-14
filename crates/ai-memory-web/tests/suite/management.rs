@@ -15,9 +15,9 @@ async fn management_assets_work_under_a_prefix_and_deny_framing() {
         "/memory/manage/login",
         "/memory/manage/static/tailwind.css",
         "/memory/manage/static/logo.png",
-        "/memory/manage/static/instrument-sans-latin-wdth-normal.woff2",
-        "/memory/manage/static/bricolage-grotesque-latin-standard-normal.woff2",
-        "/memory/manage/static/commit-mono-latin-400-normal.woff2",
+        "/memory/manage/static/ibm-plex-sans-latin-400-normal.woff2",
+        "/memory/manage/static/chakra-petch-latin-600-normal.woff2",
+        "/memory/manage/static/jetbrains-mono-latin-400-normal.woff2",
         "/memory/manage/static/font-licenses.txt",
     ] {
         let response = router
@@ -49,6 +49,7 @@ async fn management_assets_work_under_a_prefix_and_deny_framing() {
         "/memory/manage/static/app.js",
         "/memory/manage/static/config.toml",
         "/memory/manage/static/fonts.txt",
+        "/memory/manage/static/instrument-sans-latin-wdth-normal.woff2",
         "/memory/manage/static/%2e%2e%2fconfig.toml",
         "/memory/manage/static/../../db/memory.sqlite",
     ] {

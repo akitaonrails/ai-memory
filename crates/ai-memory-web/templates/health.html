@@ -5,24 +5,24 @@
 {% block nav_health_current %}aria-current="page"{% endblock %}
 
 {% block content %}
-<h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{{ i18n.text("web-server-health") }}</h1>
-<p class="text-sm text-slate-500 dark:text-slate-400 mb-6">{{ i18n.text("web-counters-queues-and-model-state-for-this-server-process-read-only-each-fix-is-a-comma") }}</p>
+<h1 class="text-3xl font-semibold text-text mb-2">{{ i18n.text("web-server-health") }}</h1>
+<p class="text-sm text-muted mb-6">{{ i18n.text("web-counters-queues-and-model-state-for-this-server-process-read-only-each-fix-is-a-comma") }}</p>
 
 {% if !wired %}
-<p class="mb-6 rounded-md border border-amber-300 dark:border-amber-700 p-3 text-sm text-amber-800 dark:text-amber-300">{{ i18n.text("web-this-server-did-not-wire-its-process-counters-into-the-web-ui-hook-spool-and-provider") }}</p>
+<p class="callout mb-6" data-hue="amber">{{ i18n.text("web-this-server-did-not-wire-its-process-counters-into-the-web-ui-hook-spool-and-provider") }}</p>
 {% endif %}
 
 <section class="mb-8" aria-label="{{ i18n.text("web-checks") }}">
-  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-checks") }}</h2>
+  <h2 class="section-label mb-3">{{ i18n.text("web-checks") }}</h2>
   {% if checks.is_empty() %}
-  <p class="text-sm text-green-700 dark:text-green-400" data-check="none">{{ i18n.text("web-every-server-side-check-passes") }}</p>
+  <p class="text-sm text-green" data-check="none">{{ i18n.text("web-every-server-side-check-passes") }}</p>
   {% else %}
   <ul class="space-y-3">
     {% for check in checks %}
-    <li class="rounded-md border border-slate-200 dark:border-slate-800 p-3" data-check="{{ check.id }}">
-      <p class="text-sm"><span class="font-mono text-xs uppercase {% if check.status == "error" %}text-red-700 dark:text-red-400{% else %}text-amber-700 dark:text-amber-400{% endif %}">{{ i18n.status(check.status) }}</span> {{ check.detail }}</p>
+    <li class="rounded-md border border-line bg-surface p-3" data-check="{{ check.id }}">
+      <p class="text-sm"><span class="section-label font-mono {% if check.status == "error" %}text-rose {% else %}text-amber-ink {% endif %}">{{ i18n.status(check.status) }}</span> {{ check.detail }}</p>
       {% if let Some(fix) = check.fix %}
-      <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">{{ i18n.text("web-fix") }} <code class="font-mono">{{ fix }}</code></p>
+      <p class="mt-1 text-sm text-muted">{{ i18n.text("web-fix") }} <code class="font-mono">{{ fix }}</code></p>
       {% endif %}
     </li>
     {% endfor %}
@@ -32,11 +32,11 @@
 
 {% for section in sections %}
 <section class="mb-6" aria-label="{{ section.title }}">
-  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ section.title }}</h2>
+  <h2 class="section-label mb-2">{{ section.title }}</h2>
   <dl class="grid grid-cols-1 sm:grid-cols-[12rem_1fr] gap-x-4 gap-y-1 text-sm">
     {% for row in section.rows %}
-    <dt class="text-slate-500 dark:text-slate-400">{{ row.label }}</dt>
-    <dd class="font-mono text-slate-800 dark:text-slate-200 break-words">{{ row.value }}</dd>
+    <dt class="text-muted">{{ row.label }}</dt>
+    <dd class="font-mono text-text break-words">{{ row.value }}</dd>
     {% endfor %}
   </dl>
 </section>

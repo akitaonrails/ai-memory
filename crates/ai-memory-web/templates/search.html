@@ -3,29 +3,29 @@
 {% block title %}{{ i18n.text("web-search-search") }} {{ query }} {{ i18n.text("web-ai-memory") }}{% endblock %}
 
 {% block content %}
-<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="mb-6 flex items-center gap-1 text-sm text-slate-500 dark:text-slate-400">
-  <a href="." class="hover:text-blue-600 dark:hover:text-blue-400">{{ i18n.text("web-home") }}</a>
+<nav aria-label="{{ i18n.text("web-breadcrumb") }}" class="breadcrumbs">
+  <a href="." class="hover:text-green">{{ i18n.text("web-home") }}</a>
   <span aria-hidden="true">/</span>
   {% if self.scoped() %}
-  <a href="{{ project_href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ workspace }}/{{ project }}</a>
+  <a href="{{ project_href }}" class="hover:text-green">{{ workspace }}/{{ project }}</a>
   <span aria-hidden="true">/</span>
   {% endif %}
-  <span aria-current="page" class="text-slate-700 dark:text-slate-200 font-medium">{{ i18n.text("web-search-search-2") }}</span>
+  <span aria-current="page" class="text-text font-medium">{{ i18n.text("web-search-search-2") }}</span>
 </nav>
 
 <div class="mb-6">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">
+  <h1 class="text-3xl font-semibold text-text">
     {% if query != "" %}
-    {{ i18n.text("web-search-search") }} <span class="text-blue-600 dark:text-blue-400">{{ query }}</span>
+    {{ i18n.text("web-search-search") }} <span class="text-green">{{ query }}</span>
     {% else %}
     {{ i18n.text("web-search") }}
     {% endif %}
   </h1>
   {% if self.scoped() %}
   <p class="mt-2 text-sm">
-    <span class="inline-flex items-center gap-1 rounded-full bg-slate-100 dark:bg-slate-800 pl-3 pr-1 py-0.5 text-slate-700 dark:text-slate-300">
+    <span class="badge gap-1 pl-3 pr-1">
       {{ i18n.text("web-in") }} {{ workspace }}/{{ project }}
-      <a href="{{ global_href }}" aria-label="{{ i18n.text("web-search-every-project") }}" class="rounded-full px-1.5 hover:bg-slate-200 dark:hover:bg-slate-700">×</a>
+      <a href="{{ global_href }}" aria-label="{{ i18n.text("web-search-every-project") }}" class="rounded-full px-1.5 hover:bg-line">×</a>
     </span>
   </p>
   {% endif %}
@@ -36,7 +36,7 @@
   <select
     id="search-scope"
     name="scope"
-    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+    class="field-control"
   >
     <option value=""{% if !self.scoped() %} selected{% endif %}>{{ i18n.text("web-all-projects") }}</option>
     {% for group in scope_groups %}
@@ -51,7 +51,7 @@
   <select
     id="search-kind"
     name="kind"
-    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+    class="field-control"
   >
     <option value="">{{ i18n.text("web-any-kind") }}</option>
     {% for option in kind_options %}
@@ -62,7 +62,7 @@
   <select
     id="search-tier"
     name="tier"
-    class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+    class="field-control"
   >
     <option value="">{{ i18n.text("web-any-tier") }}</option>
     {% for option in tier_options %}
@@ -76,29 +76,29 @@
     type="search"
     value="{{ query }}"
     placeholder="{{ i18n.text("web-search-pages-search") }}"
-    class="flex-1 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+    class="field-control flex-1 max-w-md"
   >
-  <label class="flex items-center gap-1 text-sm text-slate-600 dark:text-slate-400">
+  <label class="flex items-center gap-1 text-sm text-muted">
     <input type="checkbox" name="explain" value="1"{% if explain %} checked{% endif %}>
     {{ i18n.text("web-explain-ranking") }}
   </label>
-  <button type="submit" class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
+  <button type="submit" class="primary-button">
     {{ i18n.text("web-search") }}
   </button>
 </form>
 
 {% if explain && query != "" %}
-<section class="mb-8 rounded-md border border-slate-200 dark:border-slate-800 p-4 text-sm" aria-label="{{ i18n.text("web-recall-trace") }}">
-  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-recall-trace") }}</h2>
+<section class="mb-8 rounded-md border border-line bg-surface p-4 text-sm" aria-label="{{ i18n.text("web-recall-trace") }}">
+  <h2 class="section-label mb-2">{{ i18n.text("web-recall-trace") }}</h2>
   {% if self.scoped() %}
-  <p class="text-slate-600 dark:text-slate-400">{{ i18n.rich("web-search-hybrid-ranker", "")|safe }} <span class="font-mono">{{ streams_active }}</span></p>
-  <p class="text-slate-600 dark:text-slate-400">{{ i18n.text("web-embedder") }} <span class="font-mono">{{ embedder }}</span> {{ i18n.text("web-reranker") }} <span class="font-mono">{{ reranker }}</span></p>
+  <p class="text-muted">{{ i18n.rich("web-search-hybrid-ranker", "")|safe }} <span class="font-mono">{{ streams_active }}</span></p>
+  <p class="text-muted">{{ i18n.text("web-embedder") }} <span class="font-mono">{{ embedder }}</span> {{ i18n.text("web-reranker") }} <span class="font-mono">{{ reranker }}</span></p>
   {% else %}
-  <p class="text-slate-600 dark:text-slate-400">{{ i18n.rich("web-search-cross-project-fts", "")|safe }}</p>
+  <p class="text-muted">{{ i18n.rich("web-search-cross-project-fts", "")|safe }}</p>
   {% endif %}
   {% if !timings.is_empty() %}
   <table class="mt-3 text-xs">
-    <thead><tr><th class="pr-4 text-left font-medium text-slate-500">{{ i18n.text("web-stream") }}</th><th class="text-right font-medium text-slate-500">ms</th></tr></thead>
+    <thead><tr><th class="pr-4 text-left font-medium text-muted">{{ i18n.text("web-stream") }}</th><th class="text-right font-medium text-muted">ms</th></tr></thead>
     <tbody>
       {% for t in timings %}
       <tr><td class="pr-4 font-mono">{{ t.stream }}</td><td class="text-right font-mono">{{ t.ms }}</td></tr>
@@ -110,44 +110,44 @@
 {% endif %}
 
 {% if query == "" %}
-<p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{% if hits.is_empty() %}{{ i18n.text("web-enter-a-search-term-above") }}{% else if self.scoped() %}{{ i18n.text("web-search-or-open-recent-project-pages") }}{% else %}{{ i18n.text("web-search-or-open-recent-pages") }}{% endif %}</p>
+<p class="text-sm text-muted mb-4">{% if hits.is_empty() %}{{ i18n.text("web-enter-a-search-term-above") }}{% else if self.scoped() %}{{ i18n.text("web-search-or-open-recent-project-pages") }}{% else %}{{ i18n.text("web-search-or-open-recent-pages") }}{% endif %}</p>
 {% else if hits.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-results-for") }} <strong>{{ query }}</strong>{% if filtered %} {{ i18n.text("web-with-these-filters") }}{% endif %}.
+<p class="text-sm text-muted">{{ i18n.text("web-no-results-for") }} <strong>{{ query }}</strong>{% if filtered %} {{ i18n.text("web-with-these-filters") }}{% endif %}.
   {% if unknown_kind != "" %}{{ i18n.rich_one("web-search-unknown-kind", unknown_kind, "")|safe }}{% endif %}
   {% if self.scoped() %}
-  <a href="{{ global_href }}" class="ml-2 inline-block rounded-md border border-slate-300 dark:border-slate-700 px-3 py-1 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-900">{{ i18n.text("web-search-all-projects") }}</a>
+  <a href="{{ global_href }}" class="secondary-button ml-2">{{ i18n.text("web-search-all-projects") }}</a>
   {% endif %}
 </p>
 {% else %}
 {% if truncated %}
-<p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{{ i18n.one("web-search-first-results", max_results) }}</p>
+<p class="text-sm text-muted mb-4">{{ i18n.one("web-search-first-results", max_results) }}</p>
 {% else %}
-<p class="text-sm text-slate-500 dark:text-slate-400 mb-4">{{ hit_count }} {{ i18n.count("web-count-result", hit_count) }}</p>
+<p class="text-sm text-muted mb-4">{{ hit_count }} {{ i18n.count("web-count-result", hit_count) }}</p>
 {% endif %}
 {% endif %}
 {% if !hits.is_empty() %}
-<ul class="divide-y divide-slate-100 dark:divide-slate-800">
+<ul class="divide-y divide-line">
   {% for hit in hits %}
   <li class="py-4" data-hit-path="{{ hit.path }}">
     <a href="{{ hit.href }}"
-       class="text-base font-medium text-blue-700 dark:text-blue-400 hover:underline block mb-1">
+       class="text-base font-medium text-green hover:underline block mb-1">
       {{ hit.title }}
     </a>
-    <div class="text-sm text-slate-600 dark:text-slate-400 mb-1">{{ hit.snippet|safe }}</div>
-    <div class="text-xs text-slate-500 dark:text-slate-400">{{ hit.workspace }}/{{ hit.project }} · {{ hit.path }}</div>
+    <div class="text-sm text-muted mb-1">{{ hit.snippet|safe }}</div>
+    <div class="text-xs text-muted">{{ hit.workspace }}/{{ hit.project }} · {{ hit.path }}</div>
     {% if let Some(trace) = hit.trace %}
     <div class="mt-2 overflow-x-auto" data-trace>
-      <p class="text-xs text-slate-500 dark:text-slate-400">#{{ trace.position }} {{ i18n.text("web-rank") }} <span class="font-mono">{{ trace.rank }}</span> {{ i18n.text("web-fused") }} <span class="font-mono">{{ trace.fused }}</span> {{ i18n.text("web-authority") }} <span class="font-mono">{{ trace.authority }}</span>{% if let Some(boost) = trace.intent_boost %} {{ i18n.text("web-intent-boost") }} <span class="font-mono">{{ boost }}</span>{% endif %}{% if let Some(score) = trace.rerank_score %} {{ i18n.text("web-rerank") }} <span class="font-mono">{{ score }}</span>{% endif %}</p>
+      <p class="text-xs text-muted">#{{ trace.position }} {{ i18n.text("web-rank") }} <span class="font-mono">{{ trace.rank }}</span> {{ i18n.text("web-fused") }} <span class="font-mono">{{ trace.fused }}</span> {{ i18n.text("web-authority") }} <span class="font-mono">{{ trace.authority }}</span>{% if let Some(boost) = trace.intent_boost %} {{ i18n.text("web-intent-boost") }} <span class="font-mono">{{ boost }}</span>{% endif %}{% if let Some(score) = trace.rerank_score %} {{ i18n.text("web-rerank") }} <span class="font-mono">{{ score }}</span>{% endif %}</p>
       <table class="mt-1 text-xs">
-        <thead><tr><th class="pr-4 text-left font-medium text-slate-500">{{ i18n.text("web-stream") }}</th><th class="pr-4 text-right font-medium text-slate-500">{{ i18n.text("web-rank--knowledge") }}</th><th class="pr-4 text-right font-medium text-slate-500">{{ i18n.text("web-raw-score") }}</th><th class="text-right font-medium text-slate-500">{{ i18n.text("web-rrf") }}</th></tr></thead>
+        <thead><tr><th class="pr-4 text-left font-medium text-muted">{{ i18n.text("web-stream") }}</th><th class="pr-4 text-right font-medium text-muted">{{ i18n.text("web-rank--knowledge") }}</th><th class="pr-4 text-right font-medium text-muted">{{ i18n.text("web-raw-score") }}</th><th class="text-right font-medium text-muted">{{ i18n.text("web-rrf") }}</th></tr></thead>
         <tbody>
           {% for row in trace.streams %}
           <tr><td class="pr-4 font-mono">{{ row.stream }}</td><td class="pr-4 text-right font-mono">{{ row.rank }}</td><td class="pr-4 text-right font-mono">{{ row.raw }}</td><td class="text-right font-mono">{{ row.rrf }}</td></tr>
           {% endfor %}
         </tbody>
       </table>
-      {% if trace.matched_entities != "" %}<p class="text-xs text-slate-500 dark:text-slate-400">{{ i18n.text("web-matched-entities") }} {{ trace.matched_entities }}</p>{% endif %}
-      {% if let Some(via) = trace.graph_via %}<p class="text-xs text-slate-500 dark:text-slate-400">{{ i18n.text("web-reached-through") }} {{ via }}</p>{% endif %}
+      {% if trace.matched_entities != "" %}<p class="text-xs text-muted">{{ i18n.text("web-matched-entities") }} {{ trace.matched_entities }}</p>{% endif %}
+      {% if let Some(via) = trace.graph_via %}<p class="text-xs text-muted">{{ i18n.text("web-reached-through") }} {{ via }}</p>{% endif %}
     </div>
     {% endif %}
   </li>

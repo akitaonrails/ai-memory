@@ -6,51 +6,51 @@
 
 {% block content %}
 <div class="mb-6">
-  <h1 class="text-2xl font-bold text-slate-900 dark:text-slate-100">{{ i18n.text("web-pending-writes") }}</h1>
-  <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">
+  <h1 class="text-3xl font-semibold text-text">{{ i18n.text("web-pending-writes") }}</h1>
+  <p class="mt-1 text-sm text-muted">
     {{ i18n.text("web-auto-improvement-proposals-that-wait-for-a-decision-open-a-proposal-to-read-it-then-a") }}
   </p>
 </div>
 
 <form action="pending" method="get" id="pending-filter" class="mb-4 flex flex-wrap items-end gap-3 text-sm">
   <label class="flex flex-col gap-1">
-    <span class="font-medium text-slate-700 dark:text-slate-300">{{ i18n.text("web-project") }}</span>
-    <select name="project" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <span class="font-medium text-text">{{ i18n.text("web-project") }}</span>
+    <select name="project" class="field-control">
       {% for option in projects %}
       <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ i18n.label(option.label) }}</option>
       {% endfor %}
     </select>
   </label>
   <label class="flex flex-col gap-1">
-    <span class="font-medium text-slate-700 dark:text-slate-300">{{ i18n.text("web-sort-pending") }}</span>
-    <select name="sort" class="rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <span class="font-medium text-text">{{ i18n.text("web-sort-pending") }}</span>
+    <select name="sort" class="field-control">
       {% for option in sorts %}
       <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ i18n.label(option.label) }}</option>
       {% endfor %}
     </select>
   </label>
-  <button type="submit" class="rounded-md bg-blue-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-blue-700">{{ i18n.text("web-apply") }}</button>
+  <button type="submit" class="primary-button">{{ i18n.text("web-apply") }}</button>
 </form>
 
-<p class="mb-4 text-sm text-slate-500 dark:text-slate-400">
+<p class="mb-4 text-sm text-muted">
   <span id="pending-count">{{ rows.len() }}</span> {{ i18n.text("web-shown") }} {{ i18n.two("web-pending-in-projects", total, project_count) }} {{ i18n.count("web-count-project", project_count) }}
   {% if truncated %}{{ i18n.text("web-only-the-oldest") }} {{ limit }} {{ i18n.text("web-of-this-selection-are-listed-pick-a-project-or-use") }} <code>ai-memory pending-writes list</code>{% endif %}
 </p>
 
 {% if read_only %}
-<p class="mb-4 rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
+<p class="callout mb-4" data-hue="amber">
   {{ i18n.rich("web-pending-root-token-cannot-decide", "")|safe }}
 </p>
 {% endif %}
 
-<p id="pending-status" class="mb-4 hidden rounded-md px-3 py-2 text-sm" role="status" aria-live="polite"></p>
+<p id="pending-status" class="callout mb-4 hidden" role="status" aria-live="polite"></p>
 
 {% if rows.is_empty() %}
-<p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-pending-proposals") }}</p>
+<p class="text-sm text-muted">{{ i18n.text("web-no-pending-proposals") }}</p>
 {% else %}
 <ul id="pending-list" class="space-y-3">
   {% for row in rows %}
-  <li class="pending-item rounded-md border border-slate-200 dark:border-slate-800"
+  <li class="pending-item rounded-md border border-line bg-surface"
       data-id="{{ row.id }}"
       data-workspace="{{ row.workspace }}"
       data-project="{{ row.project }}"
@@ -58,64 +58,64 @@
     <details>
       <summary class="cursor-pointer select-none px-4 py-3">
         <div class="inline-flex flex-wrap items-center gap-2 align-middle">
-          <span class="text-sm font-medium text-slate-800 dark:text-slate-100">{{ row.title }}</span>
+          <span class="text-sm font-medium text-text">{{ row.title }}</span>
           {% if row.rewrites_existing %}
-          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-300">{{ row.operation }}</span>
+          <span class="badge" data-hue="amber">{{ row.operation }}</span>
           {% else %}
-          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ row.operation }}</span>
+          <span class="badge">{{ row.operation }}</span>
           {% endif %}
           {% if row.is_rule %}
-          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-300">{{ i18n.text("web-rule") }}</span>
+          <span class="badge" data-hue="amber">{{ i18n.text("web-rule") }}</span>
           {% endif %}
-          <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{{ row.kind }}</span>
+          <span class="badge">{{ row.kind }}</span>
         </div>
-        <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
+        <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
           <span>{{ row.scope_label }}</span>
           <span class="font-mono break-all">{{ row.target_path }}</span>
           <span>{{ i18n.text("web-confidence") }} {{ row.confidence_pct }}%</span>
           <span>{{ i18n.text("web-staged") }} {{ row.staged_relative }}</span>
         </div>
       </summary>
-      <div class="border-t border-slate-200 dark:border-slate-800 px-4 py-4 space-y-4">
+      <div class="border-t border-line px-4 py-4 space-y-4">
         {% if row.is_rule %}
-        <p class="rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
+        <p class="callout" data-hue="amber">
           {{ i18n.rich("web-pending-writes-rules", "")|safe }}
         </p>
         {% endif %}
         {% if row.rewrites_existing %}
-        <p class="rounded-md bg-amber-50 dark:bg-amber-950 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
+        <p class="callout" data-hue="amber">
           {{ i18n.text("web-this-proposal-replaces-an-existing-page-compare-it-with-the") }}
           <a href="{{ row.target_href }}" class="underline">{{ i18n.text("web-current-page") }}</a> {{ i18n.text("web-before-you-approve-it") }}
         </p>
         {% endif %}
         <div>
-          <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-rationale") }}</h2>
-          <pre class="whitespace-pre-wrap break-words rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-sm text-slate-700 dark:text-slate-300">{{ row.rationale }}</pre>
+          <h2 class="section-label mb-2">{{ i18n.text("web-rationale") }}</h2>
+          <pre class="whitespace-pre-wrap break-words rounded-md bg-tint p-3 text-sm text-text">{{ row.rationale }}</pre>
         </div>
         <div>
-          <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-2">{{ i18n.text("web-proposed-body") }}{{ row.edit_mode }})</h2>
-          <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-sm text-slate-700 dark:text-slate-300">{{ row.body_markdown }}</pre>
+          <h2 class="section-label mb-2">{{ i18n.text("web-proposed-body") }}{{ row.edit_mode }})</h2>
+          <pre class="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-tint p-3 text-sm text-text">{{ row.body_markdown }}</pre>
         </div>
-        <p class="text-xs text-slate-500 dark:text-slate-400 font-mono break-all">{{ i18n.text("web-id") }} {{ row.id }}</p>
+        <p class="text-xs text-muted font-mono break-all">{{ i18n.text("web-id") }} {{ row.id }}</p>
         {% if read_only %}
         <div>
-          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-posix-shell") }}</h2>
-          <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.posix_cli_approve }}
+          <h2 class="section-label mb-2">{{ i18n.text("web-posix-shell") }}</h2>
+          <pre class="terminal-block whitespace-pre-wrap break-all">{{ row.posix_cli_approve }}
 {{ row.posix_cli_reject }}</pre>
         </div>
         <div>
-          <h2 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-powershell") }}</h2>
-          <pre class="whitespace-pre-wrap break-all rounded-md bg-slate-50 dark:bg-slate-900 p-3 text-xs text-slate-700 dark:text-slate-300">{{ row.powershell_cli_approve }}
+          <h2 class="section-label mb-2">{{ i18n.text("web-powershell") }}</h2>
+          <pre class="terminal-block whitespace-pre-wrap break-all">{{ row.powershell_cli_approve }}
 {{ row.powershell_cli_reject }}</pre>
         </div>
         {% else %}
         <div class="flex flex-wrap items-center gap-2">
           <button type="button" data-action="approve"
-                  class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50">{{ i18n.text("web-approve") }}</button>
+                  class="primary-button">{{ i18n.text("web-approve") }}</button>
           <button type="button" data-action="reject"
-                  class="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50">{{ i18n.text("web-reject") }}</button>
+                  class="danger-button">{{ i18n.text("web-reject") }}</button>
           <input type="text" name="reason" maxlength="500" placeholder="{{ i18n.text("web-reject-reason-optional") }}" aria-label="{{ i18n.text("web-reject-reason") }}"
-                 class="flex-1 min-w-0 max-w-md rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm placeholder-slate-500 dark:placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                 class="field-control flex-1 min-w-0 max-w-md">
         </div>
         {% endif %}
       </div>
@@ -142,8 +142,8 @@
 
   function showStatus(ok, text) {
     status.textContent = text;
-    status.classList.remove("hidden", "bg-green-50", "text-green-800", "bg-red-50", "text-red-800");
-    status.classList.add(ok ? "bg-green-50" : "bg-red-50", ok ? "text-green-800" : "text-red-800");
+    status.classList.remove("hidden");
+    status.dataset.hue = ok ? "green" : "rose";
   }
 
   // The decision goes to the existing admin handlers; this page never writes.

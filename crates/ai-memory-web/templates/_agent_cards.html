@@ -1,6 +1,6 @@
 <section id="agents" class="section-block" aria-labelledby="agents-title">
   <div class="section-heading"><div><p class="eyebrow">{{ i18n.text("web-your-agent-fleet") }}</p><h2 id="agents-title">{{ i18n.text("web-one-project-every-agent") }}</h2><p>{{ i18n.text("web-see-who-has-worked-here-where-tokens-went-and-what-needs-attention") }}</p></div><span class="subtle-pill">{{ agents.len() }} {{ i18n.text("web-registered") }}</span></div>
-  {% if agents.is_empty() %}<div class="empty-state"><span aria-hidden="true">◈</span><h3>{{ i18n.text("web-your-agents-will-appear-here") }}</h3><p>{{ i18n.text("web-a-captured-session-registers-its-agent-in-this-project") }}</p></div>{% else %}
+  {% if agents.is_empty() %}<div class="empty-state"><span aria-hidden="true">{% include "_icon_terminal.html" %}</span><h3>{{ i18n.text("web-your-agents-will-appear-here") }}</h3><p>{{ i18n.text("web-a-captured-session-registers-its-agent-in-this-project") }}</p></div>{% else %}
   <div class="agent-grid">
     {% for agent in agents %}
     <article class="agent-card" data-agent="{{ agent.kind }}">

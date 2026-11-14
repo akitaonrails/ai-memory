@@ -6754,7 +6754,7 @@ async fn page_outline_links_to_the_ids_on_the_headings() {
         html.matches(r#"lg:hidden">"#).count(),
         "{html}"
     );
-    assert!(html.contains(r#"lg:block text-xs"#) && html.contains(">On this page</h2>"));
+    assert!(html.contains(r#"hidden lg:block""#) && html.contains(">On this page</h2>"));
     for id in ["intro", "intro-1", "intro-2"] {
         assert!(html.contains(&format!(r#" id="{id}">"#)), "{id}: {html}");
         // Anchored on the page URL, since `#id` alone resolves against <base>.
