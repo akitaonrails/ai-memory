@@ -475,6 +475,12 @@ version in [`docs/changelog/`](docs/changelog/):
   and re-adopted on the next launch. A failed save now clears both the stored
   token and its binding, and the failure is surfaced in Settings.
   (GHSA-xj78-fp6w-8r74)
+- Pi assistant-response capture (`--agent pi --capture-assistant`) now
+  forwards `--project-strategy` when spawning the native `stop` hook, matching
+  the OpenCode integrations. Previously, `postPiStop` omitted
+  `--project-strategy` even when `repo-root` was configured for all direct-HTTP
+  events, splitting assistant stops into the current folder's project name in
+  subdirectories or worktrees without `.ai-memory.toml`. (#2270)
 
 ## [3.4.6] - 2026-11-13
 

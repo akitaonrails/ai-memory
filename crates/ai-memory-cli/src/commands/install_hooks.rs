@@ -6545,6 +6545,7 @@ function postPiStop(ctx: any): void {
     const args = ["--data-dir", dirname(hookSpoolDir()), "hook", "--agent", AGENT,
       "--event", "stop", "--server-url", SERVER, "--capture-assistant",
       "--capture-mode", CAPTURE_MODE];
+    if (NATIVE_PROJECT_STRATEGY) args.push("--project-strategy", NATIVE_PROJECT_STRATEGY);
     const child = spawn(NATIVE_HOOK, args, {
       stdio: ["pipe", "ignore", "ignore"],
       windowsHide: true,
@@ -6575,8 +6576,14 @@ fn build_pi_extension(
         let native_hook = ts_string_literal(&strip_windows_verbatim_prefix(
             &hook_embedded_exe_path().to_string_lossy(),
         ));
+        let native_project_strategy = project_strategy
+            .map(ts_string_literal)
+            .unwrap_or_else(|| "undefined".to_string());
         format!(
-            "const AGENT = \"pi\";\nconst CAPTURE_ASSISTANT = true;\nconst NATIVE_HOOK: string | undefined = {native_hook};"
+            "const AGENT = \"pi\";\n\
+             const CAPTURE_ASSISTANT = true;\n\
+             const NATIVE_HOOK: string | undefined = {native_hook};\n\
+             const NATIVE_PROJECT_STRATEGY: string | undefined = {native_project_strategy};"
         )
     } else {
         "const AGENT = \"pi\";".to_string()
@@ -17155,12 +17162,65 @@ process.exit(0);
         );
         assert!(!off.contains("CAPTURE_ASSISTANT"), "{off}");
         assert!(!off.contains("NATIVE_HOOK"), "{off}");
+        assert!(!off.contains("NATIVE_PROJECT_STRATEGY"), "{off}");
         assert!(!off.contains("postPiStop"), "{off}");
         assert!(!off.contains("piAssistantText"), "{off}");
         assert!(!off.contains("execFileSync, spawn"), "{off}");
         assert!(
             off.contains("postHook(\"stop\", piSessionPayload(ctx));"),
             "{off}"
+        );
+    }
+
+    /// #2270: when `--project-strategy` is baked alongside
+    /// `--capture-assistant`, Pi's `postPiStop` forwards it to `NATIVE_HOOK`
+    /// just as the OpenCode plugins do, instead of falling back to basename.
+    #[test]
+    fn pi_assistant_capture_forwards_project_strategy() {
+        let with_strat = build_pi_extension(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            Some("repo-root"),
+            "denylist",
+            true,
+            PiToolExposure::Direct,
+        );
+        let strategy_decl = "const NATIVE_PROJECT_STRATEGY: string | undefined = \"repo-root\";";
+        let push_line = concat!(
+            "if (NATIVE_PROJECT_STRATEGY) ",
+            "args.push(\"--project-strategy\", NATIVE_PROJECT_STRATEGY);",
+        );
+        assert!(with_strat.contains(strategy_decl), "{with_strat}");
+        assert!(with_strat.contains(push_line), "{with_strat}");
+
+        let no_strategy = build_pi_extension(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            None,
+            "denylist",
+            true,
+            PiToolExposure::Direct,
+        );
+        let unset_decl = "const NATIVE_PROJECT_STRATEGY: string | undefined = undefined;";
+        assert!(no_strategy.contains(unset_decl), "{no_strategy}");
+
+        // Capture OFF stays identical to pre-#2240: no NATIVE_PROJECT_STRATEGY
+        // even when a project strategy is baked for HTTP posts.
+        let capture_off = build_pi_extension(
+            "http://127.0.0.1:49374",
+            Some("tok"),
+            Some("repo-root"),
+            "denylist",
+            false,
+            PiToolExposure::Direct,
+        );
+        assert!(
+            !capture_off.contains("NATIVE_PROJECT_STRATEGY"),
+            "{capture_off}"
+        );
+        assert!(
+            capture_off.contains("const DEFAULT_PROJECT_STRATEGY = \"repo-root\";"),
+            "{capture_off}"
         );
     }
 
