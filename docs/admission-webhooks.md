@@ -31,6 +31,10 @@ in a single atomic step (see
 [ARCHITECTURE.md](ARCHITECTURE.md) on the writer actor / atomic write
 invariants).
 
+A caller's explicit title takes precedence over a webhook's `frontmatter.title`.
+The final frontmatter records that same selected title. Without an explicit
+title, the final frontmatter and body determine the indexed title.
+
 Webhooks run **sequentially**, in the order declared in config. Each one
 sees the (possibly mutated) page from the previous webhook, so a
 `contributors` hook that adds frontmatter is followed by a `git-mirror`

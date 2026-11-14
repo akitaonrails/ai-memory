@@ -39,6 +39,10 @@ version in [`docs/changelog/`](docs/changelog/):
   diagnostics. Both fields were read from the server and shown in the human
   report but silently dropped from JSON, hiding a backed-up writer from
   monitors. Older servers that omit the fields keep the same JSON shape. (#2235)
+- Kept explicit page titles in the final Markdown frontmatter for single and
+  batch writes, preserving their existing precedence over webhook mutations.
+  Reindexing no longer replaces the selected title or creates an extra version
+  solely because the file carried a different title. (#2250)
 - The document importer now excludes DOCX moved-source revisions
   (`w:moveFrom`) while retaining the destination text (`w:moveTo`). It
   previously extracted both copies of a tracked move, duplicating text that
