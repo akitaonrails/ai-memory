@@ -58,7 +58,7 @@ version in [`docs/changelog/`](docs/changelog/):
   longer gets the rule or decision kind. The path-kind match used SQLite
   `LIKE`, which ignores ASCII case, so `_RULES/x.md` carried rule authority in
   search while the rule and briefing loaders, which match `_rules/` exactly,
-  never loaded it. The match is now case-sensitive and such pages are facts.
+  never loaded it. The match is now case-sensitive and such pages are facts. (#2260)
 
 ## [3.4.6] - 2026-11-13
 
