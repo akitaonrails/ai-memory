@@ -58,7 +58,7 @@ version in [`docs/changelog/`](docs/changelog/):
   `--top-limit` is small. The finding summed `eval_gate_*` reasons from the
   rejection-reason table, which keeps only the top N reasons, so with
   `--top-limit 1` three human rejections hid two eval-gate failures. The
-  report now reads a separate eval-gate count that ignores the limit.
+  report now reads a separate eval-gate count that ignores the limit. (#2263)
 
 ## [3.4.6] - 2026-11-13
 
