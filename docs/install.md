@@ -3605,6 +3605,7 @@ Re-running the command is safe. If a project still has the old long ai-memory
 block between line-anchored markers, the refresh replaces that block in place
 with the slim snippet, leaves unrelated instructions before and after it alone,
 and writes a timestamped `.bak-*` backup before changing an existing file.
+Updates within the same second add a numeric suffix to keep each prior version.
 Managed skill files contain an ai-memory ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
 Their embedded payloads use LF line endings on every release platform, so CLI

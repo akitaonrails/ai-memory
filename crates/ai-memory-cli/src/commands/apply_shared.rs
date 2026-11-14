@@ -21,6 +21,7 @@
 //! TOML / markdown) and the idempotency rule; the I/O atomics live here.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -115,6 +116,18 @@ pub fn apply_atomic_with_backup<F>(
 where
     F: FnOnce(&str) -> Result<String>,
 {
+    apply_atomic_with_backup_at(path, private_backup, mutator, Timestamp::now().as_second())
+}
+
+fn apply_atomic_with_backup_at<F>(
+    path: &Path,
+    private_backup: Option<&PrivateBackup>,
+    mutator: F,
+    stamp: i64,
+) -> Result<ApplyOutcome>
+where
+    F: FnOnce(&str) -> Result<String>,
+{
     let write_target = resolve_write_target(path)?;
     let existed = write_target.exists();
     let original = if existed {
@@ -139,12 +152,24 @@ where
     if existed {
         match private_backup {
             None => {
-                let backup = backup_path_for(path);
-                fs::copy(&write_target, &backup).with_context(|| {
-                    format!("backing up {} → {}", path.display(), backup.display())
-                })?;
+                let (backup, mut file) =
+                    reserve_backup(|suffix| backup_path_for(path, stamp, suffix)).with_context(
+                        || {
+                            format!(
+                                "backing up {} → {}",
+                                path.display(),
+                                backup_path_for(path, stamp, "").display()
+                            )
+                        },
+                    )?;
+                let context = || format!("backing up {} → {}", path.display(), backup.display());
+                let mut source = fs::File::open(&write_target).with_context(context)?;
+                std::io::copy(&mut source, &mut file).with_context(context)?;
+                file.set_permissions(source.metadata().with_context(context)?.permissions())
+                    .with_context(context)?;
+                file.sync_all().with_context(context)?;
             }
-            Some(private) => write_private_backup(path, private, &original)?,
+            Some(private) => write_private_backup(path, private, &original, stamp)?,
         }
     }
 
@@ -193,34 +218,62 @@ fn resolve_write_target(path: &Path) -> Result<PathBuf> {
     )
 }
 
-fn backup_path_for(path: &Path) -> PathBuf {
-    let stamp = Timestamp::now().as_second();
+fn backup_path_for(path: &Path, stamp: i64, suffix: &str) -> PathBuf {
     let mut bak = path.as_os_str().to_owned();
-    bak.push(format!(".bak-{stamp}"));
+    bak.push(format!(".bak-{stamp}{suffix}"));
     PathBuf::from(bak)
 }
 
-fn write_private_backup(path: &Path, private: &PrivateBackup, original: &str) -> Result<()> {
-    let mut name = format!("{}-{}", private.stem, Timestamp::now().as_second());
-    if let Some(extension) = path.extension() {
-        name.push('.');
-        name.push_str(&extension.to_string_lossy());
-    }
-    let backup = private.dir.join(name);
-    let context = || format!("backing up {} → {}", path.display(), backup.display());
+fn write_private_backup(
+    path: &Path,
+    private: &PrivateBackup,
+    original: &str,
+    stamp: i64,
+) -> Result<()> {
+    let path_for = |suffix: &str| {
+        let mut name = format!("{}-{stamp}{suffix}", private.stem);
+        if let Some(extension) = path.extension() {
+            name.push('.');
+            name.push_str(&extension.to_string_lossy());
+        }
+        private.dir.join(name)
+    };
+    let context = || format!("backing up {} → {}", path.display(), path_for("").display());
     crate::commands::path_util::create_private_dir(&private.dir).with_context(context)?;
-    // Owner-only from creation: the content can carry machine-specific hook
-    // commands, and on Unix the mode is set before any byte is written.
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&backup).with_context(context)?;
-    std::io::Write::write_all(&mut file, original.as_bytes()).with_context(context)?;
+    let (backup, mut file) = reserve_backup(path_for).with_context(context)?;
+    let context = || format!("backing up {} → {}", path.display(), backup.display());
+    file.write_all(original.as_bytes()).with_context(context)?;
+    file.sync_all().with_context(context)?;
     Ok(())
+}
+
+/// Keep the timestamped name when available, then reserve a numbered sibling.
+/// Multiple installer steps can back up one configuration in the same second.
+fn reserve_backup(path_for: impl Fn(&str) -> PathBuf) -> std::io::Result<(PathBuf, fs::File)> {
+    for attempt in 0_u32..=u32::MAX {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!("-{attempt}")
+        };
+        let path = path_for(&suffix);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not reserve a unique configuration backup path",
+    ))
 }
 
 /// Atomic write via the canonical [`ai_memory_wiki::write_atomic`]
@@ -313,6 +366,129 @@ where
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn repeated_adjacent_backups_preserve_each_previous_version() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("AGENTS.md");
+        fs::write(&path, "original rules\n").unwrap();
+        let stamp = 1_800_000_000;
+        for content in ["first update\n", "second update\n"] {
+            assert_eq!(
+                apply_atomic_with_backup_at(&path, None, |_| Ok(content.into()), stamp).unwrap(),
+                ApplyOutcome::Updated,
+            );
+        }
+        let mut saved: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &path)
+            .map(|entry| fs::read_to_string(entry).unwrap())
+            .collect();
+        saved.sort();
+        assert_eq!(saved, ["first update\n", "original rules\n"]);
+        assert_eq!(
+            fs::read_to_string(backup_path_for(&path, stamp, "")).unwrap(),
+            "original rules\n"
+        );
+        assert_eq!(
+            fs::read_to_string(backup_path_for(&path, stamp, "-1")).unwrap(),
+            "first update\n"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second update\n");
+        assert_eq!(
+            apply_atomic_with_backup_at(&path, None, |text| Ok(text.into()), stamp).unwrap(),
+            ApplyOutcome::NoOp
+        );
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn private_backups_preserve_versions_of_distinct_targets_in_one_second() {
+        let tmp = TempDir::new().unwrap();
+        let private = PrivateBackup {
+            dir: tmp.path().join("backups"),
+            stem: "checkout-id".into(),
+        };
+        let stamp = 1_800_000_000;
+        for (name, original) in [
+            ("AGENTS.md", "agent rules\n"),
+            ("CLAUDE.md", "claude rules\n"),
+        ] {
+            let path = tmp.path().join(name);
+            fs::write(&path, original).unwrap();
+            apply_atomic_with_backup_at(&path, Some(&private), |_| Ok("new rules\n".into()), stamp)
+                .unwrap();
+        }
+        let mut saved: Vec<_> = fs::read_dir(&private.dir)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        saved.sort();
+        assert_eq!(saved, ["agent rules\n", "claude rules\n"]);
+        assert_eq!(
+            fs::read_to_string(private.dir.join(format!("checkout-id-{stamp}.md"))).unwrap(),
+            "agent rules\n"
+        );
+        assert_eq!(
+            fs::read_to_string(private.dir.join(format!("checkout-id-{stamp}-1.md"))).unwrap(),
+            "claude rules\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for entry in fs::read_dir(&private.dir).unwrap() {
+                assert_eq!(
+                    entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_backup_failure_leaves_the_target_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("AGENTS.md");
+        fs::write(&path, "original rules\n").unwrap();
+        let blocked = tmp.path().join("not-a-directory");
+        fs::write(&blocked, "keep this too\n").unwrap();
+        let private = PrivateBackup {
+            dir: blocked.clone(),
+            stem: "checkout-id".into(),
+        };
+        assert!(
+            apply_atomic_with_backup_at(
+                &path,
+                Some(&private),
+                |_| Ok("new rules\n".into()),
+                1_800_000_000
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), "original rules\n");
+        assert_eq!(fs::read_to_string(blocked).unwrap(), "keep this too\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_adjacent_backup_preserves_the_source_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(&path, "original config\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let stamp = 1_800_000_000;
+        apply_atomic_with_backup_at(&path, None, |_| Ok("new config\n".into()), stamp).unwrap();
+        assert_eq!(
+            fs::metadata(backup_path_for(&path, stamp, ""))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
 
     #[test]
     fn apply_to_missing_file_creates() {
