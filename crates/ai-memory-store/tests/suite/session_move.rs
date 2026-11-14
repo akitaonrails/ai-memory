@@ -1,16 +1,18 @@
 //! What follows a session when `move_session` re-stamps it into another
-//! project: the ingest keys that make a spool redelivery idempotent, and the
-//! profile evidence harvested from its prompts, which must answer to the
-//! target project's profile governance rather than the source's.
+//! project: the ingest keys that make a spool redelivery idempotent, the
+//! profile evidence harvested from its prompts (which must answer to the
+//! target project's profile governance rather than the source's), and the
+//! moved session page's `page_feedback`, `query_page_signals`, and
+//! `entity_page_links`.
 
 use ai_memory_core::profile::{ProfileCandidateSource, ProfileGenerality};
 use ai_memory_core::{
-    AgentKind, NewObservation, NewSession, ObservationKind, OwnerFilter, ProjectId, Sanitized,
-    Sanitizer, SessionId, WorkspaceId,
+    AgentKind, FeedbackKind, NewObservation, NewPage, NewSession, ObservationKind, OwnerFilter,
+    PagePath, ProjectId, Sanitized, Sanitizer, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_store::{
-    AccessMode, HookSessionAdmission, IngestObservationOutcome, NewProfileCandidate, PagesMode,
-    ProfileHarvestMark, ProjectProfileFlags, Store,
+    AccessMode, Compaction, DecayParams, HookSessionAdmission, IngestObservationOutcome,
+    NewProfileCandidate, PagesMode, ProfileHarvestMark, ProjectProfileFlags, PurgeMode, Store,
 };
 use rusqlite::{Connection, params};
 
@@ -323,4 +325,550 @@ async fn a_moved_session_takes_its_file_paths_along() {
 
     assert_eq!(sessions(source).await, 0);
     assert_eq!(sessions(target).await, 1);
+}
+
+fn page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str, entities: &[&str]) -> NewPage {
+    NewPage {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new(path).unwrap(),
+        title: path.into(),
+        body: body.into(),
+        tier: Tier::Semantic,
+        frontmatter_json: serde_json::json!({}),
+        pinned: false,
+        links: Vec::new(),
+        author_id: None,
+        expires_at: None,
+        entities: entities.iter().map(|name| (*name).to_owned()).collect(),
+        evidence: Vec::new(),
+    }
+}
+
+/// #2254: `page_feedback` moves with `sessions/<id>.md` under `PagesMode::Move`
+/// so source lint findings stop reporting the moved page, target findings
+/// and flags retain it, and purging the source project does not cascade it away.
+#[tokio::test]
+async fn a_moved_session_page_takes_feedback_and_survives_source_purge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_owned())
+        .await
+        .unwrap();
+    let source = project(&store, ws, "source").await;
+    let target = project(&store, ws, "target").await;
+
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(hook_session(sid, ws, source))
+        .await
+        .unwrap();
+    let page_path = format!("sessions/{sid}.md");
+    let page_id = store
+        .writer
+        .upsert_page(page(ws, source, &page_path, "session summary", &[]))
+        .await
+        .unwrap();
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            source,
+            PagePath::new(page_path.as_str()).unwrap(),
+            FeedbackKind::Stale,
+            Some("needs refresh".to_owned()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+
+    let source_before = store
+        .reader
+        .open_feedback_findings(ws, source)
+        .await
+        .unwrap();
+    assert_eq!(source_before.len(), 1);
+    assert_eq!(source_before[0].path, page_path);
+    assert!(
+        store
+            .reader
+            .open_feedback_findings(ws, target)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Dry run must leave `page_feedback` untouched.
+    store
+        .writer
+        .move_session(sid, ws, target, PagesMode::Move, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reader
+            .open_feedback_findings(ws, source)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .reader
+            .open_feedback_findings(ws, target)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .writer
+        .move_session(sid, ws, target, PagesMode::Move, None, true)
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .reader
+            .open_feedback_findings(ws, source)
+            .await
+            .unwrap()
+            .is_empty(),
+        "source lint must not report a session page moved to target"
+    );
+    assert!(
+        store
+            .reader
+            .feedback_flagged_page_ids(ws, source, vec![page_id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let target_after = store
+        .reader
+        .open_feedback_findings(ws, target)
+        .await
+        .unwrap();
+    assert_eq!(target_after.len(), 1);
+    assert_eq!(target_after[0].path, page_path);
+    assert_eq!(target_after[0].kind, "stale");
+    assert_eq!(target_after[0].reason.as_deref(), Some("needs refresh"));
+    assert!(
+        store
+            .reader
+            .feedback_flagged_page_ids(ws, target, vec![page_id])
+            .await
+            .unwrap()
+            .contains(&page_id)
+    );
+
+    // Purging the old project must not cascade-delete moved feedback.
+    store
+        .writer
+        .purge_project(
+            ws,
+            source,
+            "source",
+            None,
+            true,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .reader
+            .open_feedback_findings(ws, target)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .reader
+            .feedback_flagged_page_ids(ws, target, vec![page_id])
+            .await
+            .unwrap()
+            .contains(&page_id)
+    );
+}
+
+/// #2254: `query_page_signals` and `entity_page_links` follow moved session
+/// page versions into the destination project, reuse matching destination
+/// entities, preserve link validity windows, and prune orphaned source entities
+/// while keeping shared source entities intact.
+#[tokio::test]
+async fn a_moved_session_page_takes_query_signals_and_entity_links() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_owned())
+        .await
+        .unwrap();
+    let source = project(&store, ws, "source").await;
+    let target = project(&store, ws, "target").await;
+
+    let other_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            source,
+            "notes/other.md",
+            "other source page",
+            &["commonlabel"],
+        ))
+        .await
+        .unwrap();
+    let existing_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            target,
+            "notes/existing.md",
+            "existing target page",
+            &["targetalias"],
+        ))
+        .await
+        .unwrap();
+
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(hook_session(sid, ws, source))
+        .await
+        .unwrap();
+    let page_path = format!("sessions/{sid}.md");
+    let v1_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            source,
+            &page_path,
+            "session summary v1",
+            &["solitaryid", "commonlabel"],
+        ))
+        .await
+        .unwrap();
+    let v2_id = store
+        .writer
+        .upsert_page(page(
+            ws,
+            source,
+            &page_path,
+            "session summary v2",
+            &["solitaryid", "commonlabel", "targetalias"],
+        ))
+        .await
+        .unwrap();
+
+    let v1_window: (Option<i64>, Option<i64>) = {
+        let conn = Connection::open(store.db_path()).unwrap();
+        conn.query_row(
+            "SELECT l.valid_from, l.superseded_at \
+             FROM entity_page_links l \
+             JOIN entities e ON e.id = l.entity_id \
+             WHERE l.page_id = ?1 AND e.name = 'solitaryid'",
+            params![v1_id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert!(v1_window.0.is_some());
+    assert!(v1_window.1.is_some());
+
+    store
+        .writer
+        .record_query_page_signal(
+            ws,
+            source,
+            v2_id,
+            "postgres migration".to_owned(),
+            Some(sid.to_string()),
+        )
+        .await
+        .unwrap();
+
+    // Dry run must leave signals and entities untouched.
+    store
+        .writer
+        .move_session(sid, ws, target, PagesMode::Move, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reader
+            .query_signals_for_pages(ws, source, vec![v2_id])
+            .await
+            .unwrap()
+            .get(&v2_id)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert!(
+        store
+            .reader
+            .entity_hits_for_project_at(ws, target, "solitaryid", 10, None, None, false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    store
+        .writer
+        .move_session(sid, ws, target, PagesMode::Move, None, true)
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .reader
+            .query_signals_for_pages(ws, source, vec![v2_id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let target_signals = store
+        .reader
+        .query_signals_for_pages(ws, target, vec![v2_id])
+        .await
+        .unwrap();
+    let v2_signals = target_signals.get(&v2_id).unwrap();
+    assert_eq!(v2_signals.len(), 1);
+    assert_eq!(v2_signals[0].query_text, "postgres migration");
+
+    let target_only_moved = store
+        .reader
+        .entity_hits_for_project_at(ws, target, "solitaryid", 10, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(target_only_moved.len(), 1);
+    assert_eq!(target_only_moved[0].hit.id, v2_id);
+
+    let target_all_versions = store
+        .reader
+        .entity_hits_for_project_at(ws, target, "solitaryid", 10, None, None, true)
+        .await
+        .unwrap();
+    let all_ids: Vec<_> = target_all_versions.iter().map(|hit| hit.hit.id).collect();
+    assert_eq!(all_ids.len(), 2);
+    assert!(all_ids.contains(&v1_id));
+    assert!(all_ids.contains(&v2_id));
+
+    let target_shared = store
+        .reader
+        .entity_hits_for_project_at(ws, target, "commonlabel", 10, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(target_shared.len(), 1);
+    assert_eq!(target_shared[0].hit.id, v2_id);
+
+    let target_reused = store
+        .reader
+        .entity_hits_for_project_at(ws, target, "targetalias", 10, None, None, false)
+        .await
+        .unwrap();
+    let reused_ids: Vec<_> = target_reused.iter().map(|hit| hit.hit.id).collect();
+    assert_eq!(reused_ids.len(), 2);
+    assert!(reused_ids.contains(&existing_id));
+    assert!(reused_ids.contains(&v2_id));
+
+    let source_shared = store
+        .reader
+        .entity_hits_for_project_at(ws, source, "commonlabel", 10, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(source_shared.len(), 1);
+    assert_eq!(source_shared[0].hit.id, other_id);
+    assert!(
+        (source_shared[0].weight - 1.0).abs() < 1e-9,
+        "source entity frequency must no longer count the moved session page: {:?}",
+        source_shared
+    );
+    assert!(
+        store
+            .reader
+            .entity_hits_for_project_at(ws, source, "solitaryid", 10, None, None, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    {
+        let conn = Connection::open(store.db_path()).unwrap();
+        let orphaned_only_moved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND name = 'solitaryid'",
+                params![ws.as_bytes(), source.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphaned_only_moved, 0,
+            "source entity with no remaining links must be pruned"
+        );
+        let scope_mismatches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_page_links l \
+                 JOIN entities e ON e.id = l.entity_id \
+                 JOIN pages p ON p.id = l.page_id \
+                 WHERE e.workspace_id != p.workspace_id OR e.project_id != p.project_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope_mismatches, 0);
+        let migrated_v1_window: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT l.valid_from, l.superseded_at \
+                 FROM entity_page_links l \
+                 JOIN entities e ON e.id = l.entity_id \
+                 WHERE l.page_id = ?1 AND e.name = 'solitaryid'",
+                params![v1_id.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated_v1_window, v1_window);
+    }
+
+    // Purging the old project must keep target signals and entities intact.
+    store
+        .writer
+        .purge_project(
+            ws,
+            source,
+            "source",
+            None,
+            true,
+            Compaction::Skip,
+            PurgeMode::Commit,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .reader
+            .query_signals_for_pages(ws, target, vec![v2_id])
+            .await
+            .unwrap()
+            .get(&v2_id)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        store
+            .reader
+            .entity_hits_for_project_at(ws, target, "solitaryid", 10, None, None, false)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Control (#2254): `PagesMode::Regenerate` retires source page versions in
+/// place, so their historical feedback and query signals stay attached to the
+/// source scope rather than migrating into the target project.
+#[tokio::test]
+async fn regenerate_mode_keeps_retired_feedback_and_signals_in_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default".to_owned())
+        .await
+        .unwrap();
+    let source = project(&store, ws, "source").await;
+    let target = project(&store, ws, "target").await;
+
+    let sid = SessionId::new();
+    store
+        .writer
+        .begin_session(hook_session(sid, ws, source))
+        .await
+        .unwrap();
+    let page_path = format!("sessions/{sid}.md");
+    let page_id = store
+        .writer
+        .upsert_page(page(ws, source, &page_path, "session summary", &[]))
+        .await
+        .unwrap();
+    store
+        .writer
+        .record_page_feedback(
+            ws,
+            source,
+            PagePath::new(page_path.as_str()).unwrap(),
+            FeedbackKind::Wrong,
+            Some("wrong summary".to_owned()),
+            None,
+            DecayParams::default(),
+        )
+        .await
+        .unwrap();
+    store
+        .writer
+        .record_query_page_signal(
+            ws,
+            source,
+            page_id,
+            "wrong summary query".to_owned(),
+            Some(sid.to_string()),
+        )
+        .await
+        .unwrap();
+
+    store
+        .writer
+        .move_session(sid, ws, target, PagesMode::Regenerate, None, true)
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .reader
+            .open_feedback_findings(ws, source)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .reader
+            .open_feedback_findings(ws, target)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let conn = Connection::open(store.db_path()).unwrap();
+    let source_feedback: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM page_feedback \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND page_id = ?3",
+            params![ws.as_bytes(), source.as_bytes(), page_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let source_signals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM query_page_signals \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND page_id = ?3",
+            params![ws.as_bytes(), source.as_bytes(), page_id.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(source_feedback, 1);
+    assert_eq!(source_signals, 1);
 }
