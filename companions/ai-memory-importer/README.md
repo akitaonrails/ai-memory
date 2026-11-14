@@ -206,6 +206,9 @@ XLSX extraction reads the base cell text and omits pronunciation annotations.
 It accepts the Open XML SDK's unnumbered `xl/worksheets/sheet.xml` part
 alongside numbered worksheet parts.
 
+XLSX worksheet and PPTX slide relationship IDs accept any prefix bound to the
+Office relationship namespace, including the Transitional and Strict variants.
+
 VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
 between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep
 their cue text. WebVTT character references such as `&amp;` and `&#233;` are

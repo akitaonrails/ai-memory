@@ -67,6 +67,9 @@ version in [`docs/changelog/`](docs/changelog/):
   budget before parsing it as JSON. A valid-looking partial object could
   previously be accepted as a complete result; it now reports the terminal
   `truncated-response` error, matching Copilot Responses. (#2251)
+- The document importer now resolves XLSX worksheet and PPTX slide
+  relationships by XML namespace rather than requiring the `r:` prefix.
+  Valid files using a different prefix no longer fail to import. (#2273)
 - Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin
