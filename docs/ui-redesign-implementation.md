@@ -134,8 +134,9 @@ directory, port 49399) seeded with sessions through `/hook`, pages through
   CI's pinned toolchain is the reference.
 - **Full tier.** `cargo tf` (nextest) is not installed here; the web and CLI
   crates' suites ran with `cargo test`.
-- **Humanizer.** The maintainer-side humanizer pass on the new docs has not
-  run.
+- **Humanizer.** The maintainer-side humanizer pass ran on the new docs at
+  merge time and found them already free of the targeted patterns; no prose
+  changed.
 
 ## Not changed, noticed while testing
 
