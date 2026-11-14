@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OKF export links pointing at a different filename when a literal
+  wikilink path contained an HTML character reference such as `&copy;`. (#2279)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
