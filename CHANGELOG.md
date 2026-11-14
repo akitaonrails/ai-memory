@@ -58,7 +58,7 @@ version in [`docs/changelog/`](docs/changelog/):
   share a timestamp with the last row of a full 2 000-row pass, which happens
   with imported prompts that keep their original `occurred_at`. The pass cut
   the group at the row limit and moved its mark to that timestamp, so the
-  rest of the group was never read. A pass now returns the whole group.
+  rest of the group was never read. A pass now returns the whole group. (#2262)
 
 ## [3.4.6] - 2026-11-13
 
