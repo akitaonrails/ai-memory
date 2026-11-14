@@ -1939,7 +1939,7 @@ fn fresh_queue_init_and_v1_reopens_work_across_processes() {
             v1_fixture("process-reopen")
         } else {
             let sandbox = fixture("process-init");
-            let path = fsguard::prepare_queue_dir(&queue_dir(&sandbox)).unwrap();
+            let path = queue_dir(&sandbox);
             Sandbox {
                 _guard: sandbox._guard,
                 path,
