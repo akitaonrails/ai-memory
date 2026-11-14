@@ -60,7 +60,7 @@ version in [`docs/changelog/`](docs/changelog/):
   only the records after the cursor, so events before the next `turn_context`
   had no record cwd and the capture policy judged them from the session cwd
   instead. The export now takes the last cwd from the records before the
-  cursor, as a full export does.
+  cursor, as a full export does. (#2258)
 
 ## [3.4.6] - 2026-11-13
 
