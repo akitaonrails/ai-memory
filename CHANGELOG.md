@@ -55,6 +55,9 @@ version in [`docs/changelog/`](docs/changelog/):
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin
   session end leaves the unrelated fallback slot intact. (#2237)
+- Fixed wikisync exports silently omitting pages beyond a legacy server's
+  100-page `recent` limit. The fallback now fetches the full `pages` listing
+  before planning any file changes. (#2252)
 - OKF exports now include ordinary concept pages beneath nested `_pending`
   directories such as `notes/_pending/manual.md`. The exclusion for the
   project's proposal staging directory matched that name at every depth and
@@ -79,6 +82,7 @@ version in [`docs/changelog/`](docs/changelog/):
   in UTF-8 bytes instead of Unicode characters after scrubbing. Multibyte text
   within both the character budgets and the existing store byte limits is now
   preserved. ASCII truncation and the final store byte limits are unchanged. (#2245)
+
 
 
 ## [3.4.6] - 2026-11-13
