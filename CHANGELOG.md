@@ -110,6 +110,13 @@ version in [`docs/changelog/`](docs/changelog/):
   `LIKE`, which ignores ASCII case, so `_RULES/x.md` carried rule authority in
   search while the rule and briefing loaders, which match `_rules/` exactly,
   never loaded it. The match is now case-sensitive and such pages are facts. (#2260)
+- A page tagged `do-not-answer-from`, `test-fixture`, `superseded` or
+  `historical` now stays at or below its authority cap in every search. The
+  cap was applied once to the base factor, then session-recall routing and the
+  opt-in belief, feedback and query-signal adjustments were added after it, so
+  a tagged session page could reach 1.03 under the default session-recall bonus
+  and a tagged page with query signals could outrank untagged pages. The cap is
+  now applied after each of those adjustments; untagged pages rank as before. (#2261)
 
 ## [3.4.6] - 2026-11-13
 
