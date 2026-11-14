@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Preserved separate installer and profile-apply backups when multiple updates
+  happen in the same second, instead of overwriting the earlier recovery copy. (#2280)
+
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
   and enforcement metadata when editing the body. (#2207)
 
