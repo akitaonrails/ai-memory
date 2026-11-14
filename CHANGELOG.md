@@ -37,6 +37,9 @@ version in [`docs/changelog/`](docs/changelog/):
   (`w:moveFrom`) while retaining the destination text (`w:moveTo`). It
   previously extracted both copies of a tracked move, duplicating text that
   appears only once in the accepted document. (#2236)
+- The document importer now resolves XLSX worksheet and PPTX slide
+  relationships by XML namespace rather than requiring the `r:` prefix.
+  Valid files using a different prefix no longer fail to import.
 - Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin

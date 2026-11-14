@@ -17,6 +17,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use quick_xml::Reader as XmlReader;
 use quick_xml::events::Event;
+use quick_xml::name::ResolveResult;
+use quick_xml::reader::NsReader;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -638,7 +640,7 @@ fn extract_xlsx(bytes: &[u8]) -> Result<String> {
 
 fn pptx_slide_order(presentation: &str, relationships: &str) -> Result<Vec<String>> {
     let targets = office_relationships(relationships, "/slide", pptx_slide_target)?;
-    let mut reader = XmlReader::from_str(presentation);
+    let mut reader = NsReader::from_str(presentation);
     let mut slides = Vec::new();
     loop {
         match reader
@@ -646,7 +648,7 @@ fn pptx_slide_order(presentation: &str, relationships: &str) -> Result<Vec<Strin
             .context("parse PPTX presentation metadata")?
         {
             Event::Start(tag) | Event::Empty(tag) if tag.local_name().as_ref() == "sldId" => {
-                let id = required_qualified_attribute(&tag, "r:id", "PPTX slide id")?;
+                let id = required_office_relationship_id(&reader, &tag, "PPTX slide id")?;
                 let target = targets
                     .get(&id)
                     .ok_or_else(|| anyhow!("PPTX slide id {id:?} has no slide relationship"))?;
@@ -664,7 +666,7 @@ fn pptx_slide_order(presentation: &str, relationships: &str) -> Result<Vec<Strin
 
 fn xlsx_sheet_order(workbook: &str, relationships: &str) -> Result<Vec<(String, String)>> {
     let targets = office_relationships(relationships, "/worksheet", xlsx_sheet_target)?;
-    let mut reader = XmlReader::from_str(workbook);
+    let mut reader = NsReader::from_str(workbook);
     let mut sheets = Vec::new();
     loop {
         match reader
@@ -673,7 +675,7 @@ fn xlsx_sheet_order(workbook: &str, relationships: &str) -> Result<Vec<(String, 
         {
             Event::Start(tag) | Event::Empty(tag) if tag.local_name().as_ref() == "sheet" => {
                 let name = required_attribute(&tag, "name", "XLSX sheet name")?;
-                let id = required_qualified_attribute(&tag, "r:id", "XLSX sheet id")?;
+                let id = required_office_relationship_id(&reader, &tag, "XLSX sheet id")?;
                 // `<sheets>` lists chartsheets and dialogsheets alongside worksheets;
                 // only the relationship type tells them apart, so skip the ones that
                 // carry no worksheet relationship instead of failing the whole import.
@@ -766,20 +768,36 @@ fn required_attribute(
     bail!("missing {description}")
 }
 
-fn required_qualified_attribute(
+fn required_office_relationship_id(
+    reader: &NsReader<&[u8]>,
     tag: &quick_xml::events::BytesStart<'_>,
-    name: &str,
     description: &str,
 ) -> Result<String> {
+    let mut found = None;
     for attribute in tag.attributes() {
         let attribute = attribute.context("parse Office XML attribute")?;
-        if attribute.key.as_ref() == name {
-            return Ok(attribute
-                .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
-                .into_owned());
+        let (namespace, local_name) = reader.resolver().resolve_attribute(attribute.key);
+        if local_name.as_ref() != "id" {
+            continue;
+        }
+        if let ResolveResult::Bound(ns) = namespace {
+            // NamespaceResolver retains the raw XML attribute value, including
+            // character references, so resolve those before comparing the URI.
+            let raw = ns.as_ref();
+            let uri = quick_xml::escape::unescape(raw).context("decode Office namespace")?;
+            if uri == "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                || uri == "http://purl.oclc.org/ooxml/officeDocument/relationships"
+            {
+                let value = attribute
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                    .into_owned();
+                if found.replace(value).is_some() {
+                    bail!("duplicate {description}");
+                }
+            }
         }
     }
-    bail!("missing {description}")
+    found.ok_or_else(|| anyhow!("missing {description}"))
 }
 
 fn xlsx_shared_strings(xml: &str) -> Result<Vec<String>> {
@@ -1885,7 +1903,7 @@ mod tests {
             &[
                 (
                     "ppt/presentation.xml",
-                    r#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst><p:sldId id="10" r:id="rId10"/><p:sldId id="2" r:id="rId2"/></p:sldIdLst></p:presentation>"#,
+                    r#"<p:presentation xmlns:p="p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="10" r:id="rId10"/><p:sldId id="2" r:id="rId2"/></p:sldIdLst></p:presentation>"#,
                 ),
                 (
                     "ppt/_rels/presentation.xml.rels",
@@ -1946,7 +1964,7 @@ mod tests {
                 &[
                     (
                         "ppt/presentation.xml",
-                        r#"<p:presentation xmlns:p="p" xmlns:r="r"><p:sldIdLst><p:sldId id="1" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
+                        r#"<p:presentation xmlns:p="p" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="1" r:id="rId1"/></p:sldIdLst></p:presentation>"#,
                     ),
                     (
                         "ppt/_rels/presentation.xml.rels",
@@ -2291,5 +2309,85 @@ mod tests {
         assert!(!message.contains("did not write"), "{message}");
         assert_eq!(recorded()["status"], "failed");
         assert_eq!(server.state().stored_versions(), 2);
+    }
+    #[test]
+    fn office_relationship_prefix_is_not_fixed() {
+        let temp = TempDir::new().unwrap();
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:rel="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" rel:id="rId1"/></sheets></workbook>"#;
+        let worksheet_relations = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let xlsx = temp.path().join("alternate-prefix.xlsx");
+        write_zip(
+            &xlsx,
+            &[
+                ("xl/workbook.xml", workbook),
+                ("xl/_rels/workbook.xml.rels", worksheet_relations),
+                (
+                    "xl/worksheets/sheet1.xml",
+                    r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c><v>42</v></c></row></sheetData></worksheet>"#,
+                ),
+            ],
+        );
+        let text = extract_xlsx(&fs::read(xlsx).unwrap()).unwrap();
+        assert!(
+            text.contains("## Sheet: Data") && text.contains("42"),
+            "{text}"
+        );
+        let presentation = r#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:rel="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="1" rel:id="rId1"/></p:sldIdLst></p:presentation>"#;
+        let slide_relations = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#;
+        let pptx = temp.path().join("alternate-prefix.pptx");
+        write_zip(
+            &pptx,
+            &[
+                ("ppt/presentation.xml", presentation),
+                ("ppt/_rels/presentation.xml.rels", slide_relations),
+                (
+                    "ppt/slides/slide1.xml",
+                    "<slide><p><t>Slide body</t></p></slide>",
+                ),
+            ],
+        );
+        let text = extract_pptx(&fs::read(pptx).unwrap()).unwrap();
+        assert!(
+            text.contains("## Slide 1") && text.contains("Slide body"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn office_relationship_id_resolves_namespace_and_scope() {
+        let relationships = r#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let transitional = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let strict = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+        for uri in [transitional, strict] {
+            // A sheet may declare its prefix locally, even if an ancestor used it for something else.
+            let xml = format!(
+                r#"<workbook xmlns:r="urn:wrong"><sheets><sheet xmlns:r="{uri}" name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+            );
+            assert_eq!(
+                xlsx_sheet_order(&xml, relationships).unwrap(),
+                vec![("Data".into(), "xl/worksheets/sheet1.xml".into())]
+            );
+        }
+        let escaped = r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationsh&#105;ps"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        assert_eq!(
+            xlsx_sheet_order(escaped, relationships).unwrap(),
+            vec![("Data".into(), "xl/worksheets/sheet1.xml".into())]
+        );
+        let bad_entity = r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationsh&nope;ps"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        assert!(xlsx_sheet_order(bad_entity, relationships).is_err());
+        let both = [r#"r:id="rId1" q:id="rId2""#, r#"q:id="rId2" r:id="rId1""#];
+        for attrs in both {
+            let xml = format!(
+                r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:q="http://schemas.openxmlformats.org/officeDocument/2006/relationsh&#105;ps"><sheets><sheet name="Data" sheetId="1" {attrs}/></sheets></workbook>"#
+            );
+            assert!(xlsx_sheet_order(&xml, relationships).is_err(), "{xml}");
+        }
+        for xml in [
+            r#"<workbook xmlns:r="urn:wrong"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" id="rId1"/></sheets></workbook>"#,
+            r#"<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet xmlns:r="urn:wrong" name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+        ] {
+            assert!(xlsx_sheet_order(xml, relationships).is_err(), "{xml}");
+        }
     }
 }

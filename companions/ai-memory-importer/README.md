@@ -203,6 +203,8 @@ start/end tags and self-closing tags produce the same separators.
 Paragraph tab-stop definitions are formatting and do not insert text.
 
 XLSX extraction reads the base cell text and omits pronunciation annotations.
+XLSX worksheet and PPTX slide relationship IDs accept any prefix bound to the
+Office relationship namespace, including the Transitional and Strict variants.
 
 VTT/SRT files accept LF, CRLF, or CR line endings and any number of blank lines
 between cues. WebVTT comments are omitted; identifiers such as `NOTE123` keep
