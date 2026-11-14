@@ -67,6 +67,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `message_id` as omitted, which could claim the oldest message or cancel the
   whole outbox. Blank ids are now refused without changing pending mail;
   omitted ids and valid UUIDs with surrounding whitespace keep their behavior. (#2244)
+- Fixed CLI/admin message sends counting the body, subject and evidence caps
+  in UTF-8 bytes instead of Unicode characters after scrubbing. Multibyte text
+  within both the character budgets and the existing store byte limits is now
+  preserved. ASCII truncation and the final store byte limits are unchanged. (#2245)
 
 ## [3.4.6] - 2026-11-13
 
