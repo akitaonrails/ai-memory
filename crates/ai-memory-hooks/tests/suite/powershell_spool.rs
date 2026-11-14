@@ -545,3 +545,29 @@ fn powershell_devin_session_id_pin_and_native_precedence() {
         );
     }
 }
+
+/// TEMP DIAGNOSTIC (#2256): isolate which Clear guard term fails on Windows.
+#[test]
+fn diag_devin_native_detection_and_clear_guard() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let program = format!(
+        ". '{lib}'; \
+         $env:AI_MEMORY_SESSION_ID = 'ps-pin 1'; \
+         $bare = @{{ cwd = $env:AI_MEMORY_TEST_REPO }} | ConvertTo-Json -Compress; \
+         $parsed = $bare | ConvertFrom-Json; \
+         $native = Get-AiMemoryNativeSessionId -ParsedPayload $parsed; \
+         $pinWhite = [string]::IsNullOrWhiteSpace($env:AI_MEMORY_SESSION_ID); \
+         $natWhite = [string]::IsNullOrWhiteSpace([string]$native); \
+         [Console]::Out.Write(\"native=[$native] pinWhite=$pinWhite natWhite=$natWhite parsedType=$($parsed.GetType().Name)\")",
+        lib = hook_lib()
+    );
+    let output = run_powershell(
+        &program,
+        home.path(),
+        &[("AI_MEMORY_TEST_REPO", repo.to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, "DIAGNOSTIC_MARKER", "DIAG: {stdout}");
+}
