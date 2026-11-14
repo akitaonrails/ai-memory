@@ -36,6 +36,13 @@ version in [`docs/changelog/`](docs/changelog/):
   read before that check and keeps the agent's page when it lands in between;
   a rule-based summary or checkpoint landing in between is still replaced, as
   before. (#2275)
+- Devin POSIX shell (`hooks/_lib.sh`, `hooks/devin/*.sh`) and PowerShell
+  (`hooks/lib/ai-memory-hook.ps1`) hooks now match native `ai-memory hook`
+  behavior (#2237) for `AI_MEMORY_SESSION_ID`: whitespace-only values are
+  ignored, top-level native payload session IDs take precedence over both
+  `AI_MEMORY_SESSION_ID` and `<data-dir>/hook-state/devin-session-id` (and are
+  forwarded on PowerShell handoff requests when missing), and a pinned bare
+  `session-end` keeps the fallback `devin-session-id` slot intact. (#2256)
 - `export-okf` no longer silently drops a concept page that occupies an
   OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
   hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
