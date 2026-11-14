@@ -525,7 +525,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
             source,
             "notes/other.md",
             "other source page",
-            &["shared-noun"],
+            &["commonlabel"],
         ))
         .await
         .unwrap();
@@ -536,7 +536,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
             target,
             "notes/existing.md",
             "existing target page",
-            &["target-noun"],
+            &["targetalias"],
         ))
         .await
         .unwrap();
@@ -555,7 +555,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
             source,
             &page_path,
             "session summary v1",
-            &["only-moved", "shared-noun"],
+            &["solitaryid", "commonlabel"],
         ))
         .await
         .unwrap();
@@ -566,7 +566,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
             source,
             &page_path,
             "session summary v2",
-            &["only-moved", "shared-noun", "target-noun"],
+            &["solitaryid", "commonlabel", "targetalias"],
         ))
         .await
         .unwrap();
@@ -577,7 +577,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
             "SELECT l.valid_from, l.superseded_at \
              FROM entity_page_links l \
              JOIN entities e ON e.id = l.entity_id \
-             WHERE l.page_id = ?1 AND e.name = 'only-moved'",
+             WHERE l.page_id = ?1 AND e.name = 'solitaryid'",
             params![v1_id.as_bytes()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -617,7 +617,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
     assert!(
         store
             .reader
-            .entity_hits_for_project_at(ws, target, "only-moved", 10, None, None, false)
+            .entity_hits_for_project_at(ws, target, "solitaryid", 10, None, None, false)
             .await
             .unwrap()
             .is_empty()
@@ -648,7 +648,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
 
     let target_only_moved = store
         .reader
-        .entity_hits_for_project_at(ws, target, "only-moved", 10, None, None, false)
+        .entity_hits_for_project_at(ws, target, "solitaryid", 10, None, None, false)
         .await
         .unwrap();
     assert_eq!(target_only_moved.len(), 1);
@@ -656,7 +656,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
 
     let target_all_versions = store
         .reader
-        .entity_hits_for_project_at(ws, target, "only-moved", 10, None, None, true)
+        .entity_hits_for_project_at(ws, target, "solitaryid", 10, None, None, true)
         .await
         .unwrap();
     let all_ids: Vec<_> = target_all_versions.iter().map(|hit| hit.hit.id).collect();
@@ -666,7 +666,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
 
     let target_shared = store
         .reader
-        .entity_hits_for_project_at(ws, target, "shared-noun", 10, None, None, false)
+        .entity_hits_for_project_at(ws, target, "commonlabel", 10, None, None, false)
         .await
         .unwrap();
     assert_eq!(target_shared.len(), 1);
@@ -674,7 +674,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
 
     let target_reused = store
         .reader
-        .entity_hits_for_project_at(ws, target, "target-noun", 10, None, None, false)
+        .entity_hits_for_project_at(ws, target, "targetalias", 10, None, None, false)
         .await
         .unwrap();
     let reused_ids: Vec<_> = target_reused.iter().map(|hit| hit.hit.id).collect();
@@ -684,7 +684,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
 
     let source_shared = store
         .reader
-        .entity_hits_for_project_at(ws, source, "shared-noun", 10, None, None, false)
+        .entity_hits_for_project_at(ws, source, "commonlabel", 10, None, None, false)
         .await
         .unwrap();
     assert_eq!(source_shared.len(), 1);
@@ -697,7 +697,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
     assert!(
         store
             .reader
-            .entity_hits_for_project_at(ws, source, "only-moved", 10, None, None, true)
+            .entity_hits_for_project_at(ws, source, "solitaryid", 10, None, None, true)
             .await
             .unwrap()
             .is_empty()
@@ -708,7 +708,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
         let orphaned_only_moved: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM entities \
-                 WHERE workspace_id = ?1 AND project_id = ?2 AND name = 'only-moved'",
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND name = 'solitaryid'",
                 params![ws.as_bytes(), source.as_bytes()],
                 |row| row.get(0),
             )
@@ -733,7 +733,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
                 "SELECT l.valid_from, l.superseded_at \
                  FROM entity_page_links l \
                  JOIN entities e ON e.id = l.entity_id \
-                 WHERE l.page_id = ?1 AND e.name = 'only-moved'",
+                 WHERE l.page_id = ?1 AND e.name = 'solitaryid'",
                 params![v1_id.as_bytes()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -769,7 +769,7 @@ async fn a_moved_session_page_takes_query_signals_and_entity_links() {
     assert_eq!(
         store
             .reader
-            .entity_hits_for_project_at(ws, target, "only-moved", 10, None, None, false)
+            .entity_hits_for_project_at(ws, target, "solitaryid", 10, None, None, false)
             .await
             .unwrap()
             .len(),
