@@ -67,7 +67,7 @@ async fn message_evidence_is_bounded_at_the_store_boundary() {
     let b = project(&store, "default", "project-b").await;
     let mut measured = message(a, b, "the benchmark improved");
     measured.nature = MessageNature::Measured;
-    measured.evidence = Some("x".repeat(2_000));
+    measured.evidence = Some("x".repeat(8_000));
     store.writer.insert_message(measured).await.unwrap();
 
     let listed = store
@@ -75,7 +75,7 @@ async fn message_evidence_is_bounded_at_the_store_boundary() {
         .list_messages(b.0, b.1, MessageBox::Inbox, 50)
         .await
         .unwrap();
-    assert_eq!(listed[0].evidence.as_deref().unwrap().len(), 1_000);
+    assert_eq!(listed[0].evidence.as_deref().unwrap().len(), 4 * 1024);
 }
 
 #[tokio::test]
@@ -850,5 +850,57 @@ async fn a_message_within_the_character_budget_is_not_truncated() {
     assert_eq!(
         edited.body, four_byte,
         "finish_message_edit must not truncate a body inside the character budget"
+    );
+}
+
+/// Evidence within the published 1 000-character budget (even at UTF-8's
+/// four-byte worst case plus an MCP character-cap notice) must survive the
+/// store boundary intact (#2283).
+#[tokio::test]
+async fn message_evidence_within_character_budget_is_not_truncated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "team", "sender").await;
+    let b = project(&store, "team", "receiver").await;
+
+    // 500 three-byte characters plus a tail sentinel: 1 515 bytes, well over
+    // the old 1 000-byte cap.
+    let three_byte = format!("{} FINAL-SENTINEL", "界".repeat(500));
+    assert_eq!(three_byte.chars().count(), 515);
+    assert!(three_byte.len() > 1_000 && three_byte.len() < 4 * 1024);
+
+    let mut first = message(a, b, "multibyte evidence");
+    first.nature = MessageNature::Measured;
+    first.evidence = Some(three_byte.clone());
+    let first_id = store.writer.insert_message(first).await.unwrap();
+    let first_popped = store
+        .writer
+        .pop_message(claim(b), Some(first_id))
+        .await
+        .unwrap()
+        .expect("the first message is in the inbox");
+    assert_eq!(first_popped.evidence.as_deref(), Some(three_byte.as_str()));
+
+    // Worst case: 1 000 four-byte characters (4 000 bytes) plus an MCP
+    // character-cap notice, still under the 4 KiB store cap.
+    let four_byte_capped = format!(
+        "{}\n[message evidence truncated; 500 chars omitted]",
+        "𝐀".repeat(1_000)
+    );
+    assert!(four_byte_capped.len() > 4_000 && four_byte_capped.len() <= 4 * 1024);
+
+    let mut second = message(a, b, "four-byte evidence");
+    second.nature = MessageNature::Measured;
+    second.evidence = Some(four_byte_capped.clone());
+    let second_id = store.writer.insert_message(second).await.unwrap();
+    let second_popped = store
+        .writer
+        .pop_message(claim(b), Some(second_id))
+        .await
+        .unwrap()
+        .expect("the second message is in the inbox");
+    assert_eq!(
+        second_popped.evidence.as_deref(),
+        Some(four_byte_capped.as_str())
     );
 }
