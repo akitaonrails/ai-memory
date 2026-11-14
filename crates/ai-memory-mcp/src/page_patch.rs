@@ -138,6 +138,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
     let mut targets = HashSet::new();
     let mut added = HashSet::new();
     let mut changes = Vec::with_capacity(edits.len());
+    let mut repaired_unterminated_heading = false;
     for edit in edits {
         let mut change = match edit {
             PagePatchEdit::Append {
@@ -251,6 +252,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 change.replacement.push_str(newline);
             }
             change.replacement.insert_str(0, newline);
+            repaired_unterminated_heading = true;
         }
         changes.push(change);
     }
@@ -292,6 +294,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
             // add it a second time.
             if change.placement == Placement::EndOfPage
                 && previous.placement == Placement::Section
+                && repaired_unterminated_heading
                 && !body.ends_with('\n')
                 && previous.replacement.ends_with('\n')
                 && change.replacement.starts_with('\n')
@@ -1019,6 +1022,31 @@ mod tests {
                 apply(body, &edits).unwrap(),
                 "# T\n## One\nnew\nfooter\n\n## Next\n\nend\n"
             );
+        }
+    }
+    #[test]
+    fn append_section_and_eof_keep_existing_spacing() {
+        for (body, expected) in [
+            ("# T\n## One\nold", "# T\n## One\nold\nsection\n\nfooter\n"),
+            ("# T\n## One", "# T\n## One\nsection\n\nfooter\n"),
+            ("# T\n## One\n", "# T\n## One\nsection\nfooter\n"),
+        ] {
+            let section = PagePatchEdit::Append {
+                target: AppendTarget::Section,
+                anchor: Some("One".into()),
+                content: "section".into(),
+            };
+            let footer = PagePatchEdit::Append {
+                target: AppendTarget::EndOfPage,
+                anchor: None,
+                content: "footer".into(),
+            };
+            for edits in [
+                vec![section.clone(), footer.clone()],
+                vec![footer.clone(), section.clone()],
+            ] {
+                assert_eq!(apply(body, &edits).unwrap(), expected, "{body:?}");
+            }
         }
     }
 }
