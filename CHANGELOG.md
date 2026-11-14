@@ -122,6 +122,11 @@ version in [`docs/changelog/`](docs/changelog/):
   with imported prompts that keep their original `occurred_at`. The pass cut
   the group at the row limit and moved its mark to that timestamp, so the
   rest of the group was never read. A pass now returns the whole group. (#2262)
+- `auto-improve-report` no longer drops the eval-gate rejection finding when
+  `--top-limit` is small. The finding summed `eval_gate_*` reasons from the
+  rejection-reason table, which keeps only the top N reasons, so with
+  `--top-limit 1` three human rejections hid two eval-gate failures. The
+  report now reads a separate eval-gate count that ignores the limit. (#2263)
 
 ## [3.4.6] - 2026-11-13
 
