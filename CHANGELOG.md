@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Cross-project message `evidence` within the 1 000-character MCP/admin budget
+  is no longer silently truncated at the store boundary, and the
+  `memory_message_send` truncation notice on longer inputs is preserved. The
+  store evidence cap was left at 1 000 bytes after #2241, cutting multibyte
+  strings and `[message evidence truncated; ...]` suffixes short; it is now
+  4 KiB. (#2283)
+
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
   and enforcement metadata when editing the body. (#2207)
 
