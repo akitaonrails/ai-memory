@@ -488,6 +488,11 @@ knobs like `pin_first` / `include_superseded` can be A/B'd;
 `--candidate-server-env`, `--candidate-query-arg`); a candidate knob left
 unset mirrors the baseline.
 
+The spawned servers do not inherit `AI_MEMORY_*` settings from the evaluator's
+environment. Pass intended server settings through `--server-env` or
+`--candidate-server-env` so the report records them. System settings such as
+`PATH`, home directories and certificate configuration remain inherited.
+
 ```bash
 # Determinism check — baseline == candidate ⇒ accuracy/context delta = 0:
 cargo run --release -p ai-memory-eval -- retrieval --candidate --sample 2

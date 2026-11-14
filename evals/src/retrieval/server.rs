@@ -4,6 +4,7 @@
 //! the same binary a user runs, configured for deterministic zero-LLM
 //! operation (no consolidation LLM, no embedder, no reranker).
 
+use std::ffi::OsString;
 use std::io::Read as _;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -63,6 +64,20 @@ pub struct LaunchConfig<'a> {
     pub env: &'a [(String, String)],
 }
 
+/// Keep operating-system settings while removing unrecorded `AI_MEMORY_*`
+/// values; the explicit benchmark overrides are applied afterward.
+fn clear_ambient_product_env(cmd: &mut Command, keys: impl IntoIterator<Item = OsString>) {
+    for key in keys {
+        if key
+            .as_encoded_bytes()
+            .get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"AI_MEMORY_"))
+        {
+            cmd.env_remove(key);
+        }
+    }
+}
+
 impl EvalServer {
     /// Launch `server_bin` on a free loopback port with a fresh data dir.
     pub async fn launch(
@@ -98,6 +113,7 @@ impl EvalServer {
             }
         }
         let mut cmd = Command::new(server_bin);
+        clear_ambient_product_env(&mut cmd, std::env::vars_os().map(|(key, _)| key));
         cmd.args([
             "serve",
             "--transport",
@@ -109,10 +125,8 @@ impl EvalServer {
         .arg(&data_dir_path)
         .env("AI_MEMORY_AUTH_TOKEN", EVAL_AUTH_TOKEN)
         .env("AI_MEMORY_CAPTURE_ASSISTANT", "true")
-        // Start from a hermetic baseline: no chat LLM, no reranker, no
-        // inherited provider keys. The knob matrix below re-enables only
-        // what the config asks for, so a run never picks up the
-        // developer's ambient environment.
+        // The knob matrix below explicitly selects a provider and reranker;
+        // do not inherit the common provider keys into the child either.
         .env_remove("AI_MEMORY_LLM_PROVIDER")
         .env_remove("AI_MEMORY_RERANKER")
         .env_remove("OPENAI_API_KEY")
@@ -232,5 +246,34 @@ impl Drop for EvalServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn product_settings_are_removed_without_dropping_system_environment() {
+        let mut cmd = Command::new("fixture");
+        let keys = [
+            OsString::from("AI_MEMORY_INGEST__DROP_EVENTS"),
+            OsString::from("ai_memory_RERANKER"),
+            OsString::from("Ai_MeMoRy_AUTH_TOKEN"),
+            OsString::from("PATH"),
+            OsString::from("SYSTEMROOT"),
+        ];
+        clear_ambient_product_env(&mut cmd, keys.clone());
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter_map(|(key, value)| value.is_none().then_some(key.to_owned()))
+            .collect();
+        assert_eq!(removed.len(), 3);
+        for key in &keys[..3] {
+            assert!(removed.contains(key), "missing removal for {key:?}");
+        }
+        for key in &keys[3..] {
+            assert!(!removed.contains(key), "system variable removed: {key:?}");
+        }
     }
 }
