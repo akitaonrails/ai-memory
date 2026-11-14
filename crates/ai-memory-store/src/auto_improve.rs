@@ -406,7 +406,6 @@ pub struct AutoImproveRejectionSummary {
     pub created_at: i64,
 }
 
-/// Rejection reasons the eval gate records for a candidate it refused.
 pub(crate) const EVAL_GATE_REJECTION_REASONS: [&str; 3] =
     ["eval_gate_failed", "eval_gate_timeout", "eval_gate_error"];
 
@@ -431,7 +430,6 @@ pub struct AutoImproveTelemetryAggregate {
     pub top_targets: Vec<AutoImproveTelemetryCount>,
     /// Rejection counts by reason.
     pub rejections_by_reason: Vec<AutoImproveTelemetryCount>,
-    /// Eval-gate rejections in the window, independent of the top-N limit.
     #[serde(default)]
     pub eval_gate_rejections: usize,
     /// Repeated rejection fingerprints.
