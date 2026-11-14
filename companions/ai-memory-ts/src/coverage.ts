@@ -65,6 +65,8 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
       "abstract",
       "relations",
       "expires_at",
+      "applies_to",
+      "enforced_by",
       "source_files",
       "expected_page_id",
       "create_only",
