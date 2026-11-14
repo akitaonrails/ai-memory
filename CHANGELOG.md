@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- A `move-project` true move now re-resolves project-only cross-project links
+  (`[[project:path]]` with the workspace omitted) in the source and destination
+  workspaces, so the moved project's edges rebind to the destination workspace
+  and the live graph matches a clean reindex of the unchanged Markdown.
+  Previously the restamp left those edges pointing at the old workspace's
+  target. Explicit workspace-qualified and bare same-project edges are
+  unaffected. (#2264)
+
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
   and enforcement metadata when editing the body. (#2207)
 

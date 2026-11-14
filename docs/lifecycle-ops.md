@@ -620,8 +620,15 @@ a low-level re-stamp:
    `workstreams`, pending cross-project messages on both ends, entities, page
    feedback, purge tombstones, and the profile evidence). Native workstream
    sessions, runs, and events remain attached
-   through `workstream_id`; `page_embeddings` and `links` remain attached
-   through `page_id`, so none of those rows need a direct re-stamp.
+   through `workstream_id`, and `page_embeddings` through `page_id`, so none of
+   those rows need a direct re-stamp. The `links` rows stay attached by
+   `page_id` too, but a project-only cross-project edge (`[[project:path]]`,
+   workspace omitted) resolves against its source page's own workspace, so the
+   same transaction re-resolves those edges in the source and destination
+   workspaces against the moved project — rebinding to the destination's
+   project, or going unresolved where it is absent — so the live graph matches a
+   clean reindex of the unchanged Markdown (#2264). Explicit
+   workspace-qualified and bare same-project edges are unaffected.
 
 After a successful CLI true move, or a completed copy-purge move, the client
 rekeys its local `show` checkout link. Existing destination links win during a

@@ -2428,7 +2428,7 @@ fn replace_links_in_tx(
         if !seen.insert(key) {
             continue;
         }
-        let to_page_id = latest_page_id_for_link(tx, page, link)?;
+        let to_page_id = latest_page_id_for_link(tx, &page.workspace_id, &page.project_id, link)?;
         let to_page_blob = to_page_id.as_ref().map(|id| &id.as_bytes()[..]);
         tx.execute(
             "INSERT INTO links \
@@ -2490,17 +2490,18 @@ fn link_workspace_name(link: &LinkTarget) -> Option<&str> {
 /// `[[_global:path]]` link always resolves in the default workspace.
 fn latest_page_id_for_link(
     tx: &rusqlite::Transaction<'_>,
-    page: &NewPage,
+    source_workspace: &WorkspaceId,
+    source_project: &ProjectId,
     link: &LinkTarget,
 ) -> StoreResult<Option<PageId>> {
     let (workspace_blob, project_blob): (Vec<u8>, Vec<u8>) = match &link.project {
         None => (
-            page.workspace_id.as_bytes().to_vec(),
-            page.project_id.as_bytes().to_vec(),
+            source_workspace.as_bytes().to_vec(),
+            source_project.as_bytes().to_vec(),
         ),
         Some(project_name) => {
             let workspace_blob: Vec<u8> = match link_workspace_name(link) {
-                None => page.workspace_id.as_bytes().to_vec(),
+                None => source_workspace.as_bytes().to_vec(),
                 Some(workspace_name) => {
                     let found: Option<Vec<u8>> = tx
                         .query_row(
@@ -2540,6 +2541,68 @@ fn latest_page_id_for_link(
     bytes
         .map(|bytes| PageId::from_slice(&bytes).map_err(StoreError::from))
         .transpose()
+}
+
+/// Re-resolve every project-only cross-project link whose source page lives in
+/// `from_workspace` or `to_workspace`, so a true-move's live graph matches a
+/// clean reindex of the same Markdown (#2264).
+///
+/// A project-only `[[project:path]]` edge (`to_workspace IS NULL`, `to_project`
+/// set) resolves against the source page's own workspace, so moving a project
+/// between workspaces changes which page those edges point at: the moved
+/// project's outgoing edges follow it to `to_workspace`, and edges in either
+/// workspace that name the moved project gain or lose their target. Edges in
+/// any other workspace are unaffected, which is why the scan is bounded to
+/// these two. Explicit workspace-qualified edges (`to_workspace` set, which
+/// includes `_global`) and bare same-project edges (`to_project` NULL, repointed
+/// by page id as versions change) resolve the same before and after the move and
+/// are left untouched. An edge whose destination is absent in the resolved
+/// workspace becomes unresolved (`to_page_id` NULL), as a clean reindex would
+/// leave it.
+fn reresolve_project_only_links_after_move_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    from_workspace: &WorkspaceId,
+    to_workspace: &WorkspaceId,
+) -> StoreResult<()> {
+    let mut stmt = tx.prepare(
+        "SELECT l.rowid, p.workspace_id, p.project_id, l.to_project, l.to_path \
+         FROM links l \
+         JOIN pages p ON p.id = l.from_page_id \
+         WHERE l.to_workspace IS NULL AND l.to_project IS NOT NULL \
+           AND p.workspace_id IN (?1, ?2)",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![from_workspace.as_bytes(), to_workspace.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (rowid, ws_blob, proj_blob, to_project, to_path) in rows {
+        let source_workspace = WorkspaceId::from_slice(&ws_blob)?;
+        let source_project = ProjectId::from_slice(&proj_blob)?;
+        let link = LinkTarget {
+            workspace: None,
+            project: Some(to_project),
+            path: PagePath::new(to_path)?,
+            relation: None,
+        };
+        let resolved = latest_page_id_for_link(tx, &source_workspace, &source_project, &link)?;
+        tx.execute(
+            "UPDATE links SET to_page_id = ?1 WHERE rowid = ?2",
+            params![resolved.as_ref().map(|id| &id.as_bytes()[..]), rowid],
+        )?;
+    }
+    Ok(())
 }
 
 fn refresh_incoming_links_for_path(
@@ -8766,6 +8829,12 @@ pub fn move_project_workspace(
             "project {project_id} not found in source workspace {from_workspace}"
         )));
     }
+
+    // The restamp above moved the pages but left their resolved cross-project
+    // link edges pointing at the old workspace. Project-only edges resolve
+    // against the source page's own workspace, so re-resolve them now to match
+    // a clean reindex (#2264).
+    reresolve_project_only_links_after_move_in_tx(&tx, from_workspace, to_workspace)?;
 
     tx.commit()?;
     Ok(MoveSummary {
@@ -16773,6 +16842,126 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(src_pages, 1, "rollback must preserve source pages");
+    }
+
+    /// A true move re-resolves project-only cross-project edges so the live
+    /// graph matches a clean reindex of the same Markdown (#2264). A
+    /// `[[infra:notes/target]]` edge resolves against the source page's own
+    /// workspace, so after the move it must point at the destination
+    /// workspace's `infra`, become unresolved where that project is absent,
+    /// and leave explicit (`[[default/infra:…]]`) and bare (`[[notes/local]]`)
+    /// edges untouched.
+    #[test]
+    fn move_project_workspace_rebinds_project_only_cross_project_links() {
+        let (_tmp, mut conn, default_ws, scratch) = fresh_db(); // default/scratch
+        let infra_default = get_or_create_project(&mut conn, &default_ws, "infra", None).unwrap();
+        let other_default = get_or_create_project(&mut conn, &default_ws, "other", None).unwrap();
+        let moved_ws = get_or_create_workspace(&mut conn, "moved").unwrap();
+        let infra_moved = get_or_create_project(&mut conn, &moved_ws, "infra", None).unwrap();
+        // Deliberately no `moved/other`, so that edge goes unresolved on move.
+
+        // Distinct targets, one per infra project, plus a bare local target and
+        // an `other` target that only exists in the source workspace.
+        let target_default_id = upsert_page(
+            &mut conn,
+            &page(default_ws, infra_default, "notes/target.md", "d"),
+        )
+        .unwrap();
+        let target_moved_id = upsert_page(
+            &mut conn,
+            &page(moved_ws, infra_moved, "notes/target.md", "m"),
+        )
+        .unwrap();
+        let local_id =
+            upsert_page(&mut conn, &page(default_ws, scratch, "notes/local.md", "l")).unwrap();
+        let other_id = upsert_page(
+            &mut conn,
+            &page(default_ws, other_default, "notes/x.md", "x"),
+        )
+        .unwrap();
+
+        let tgt = |p: &str| PagePath::new(p).unwrap();
+        let mut source = page(default_ws, scratch, "notes/source.md", "source");
+        source.links = vec![
+            // Implicit cross-project: workspace omitted, resolves to the
+            // source's own workspace.
+            LinkTarget {
+                workspace: None,
+                project: Some("infra".into()),
+                path: tgt("notes/target.md"),
+                relation: None,
+            },
+            // Explicit workspace-qualified control: must stay on default/infra.
+            LinkTarget {
+                workspace: Some("default".into()),
+                project: Some("infra".into()),
+                path: tgt("notes/target.md"),
+                relation: None,
+            },
+            // Bare same-project control: follows the moved page by id.
+            LinkTarget {
+                workspace: None,
+                project: None,
+                path: tgt("notes/local.md"),
+                relation: None,
+            },
+            // Implicit cross-project with no destination in the new workspace.
+            LinkTarget {
+                workspace: None,
+                project: Some("other".into()),
+                path: tgt("notes/x.md"),
+                relation: None,
+            },
+        ];
+        let source_id = upsert_page(&mut conn, &source).unwrap();
+
+        let edge = |conn: &Connection, from: &PageId, pred: &str| -> Option<PageId> {
+            conn.query_row(
+                &format!("SELECT to_page_id FROM links WHERE from_page_id = ?1 AND {pred}"),
+                params![from.as_bytes()],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .unwrap()
+            .map(|b| PageId::from_slice(&b).unwrap())
+        };
+        let implicit =
+            "to_workspace IS NULL AND to_project = 'infra' AND to_path = 'notes/target.md'";
+        let explicit =
+            "to_workspace = 'default' AND to_project = 'infra' AND to_path = 'notes/target.md'";
+        let bare = "to_project IS NULL AND to_path = 'notes/local.md'";
+        let dangling = "to_workspace IS NULL AND to_project = 'other' AND to_path = 'notes/x.md'";
+
+        // Before the move everything resolves in the default workspace.
+        assert_eq!(edge(&conn, &source_id, implicit), Some(target_default_id));
+        assert_eq!(edge(&conn, &source_id, explicit), Some(target_default_id));
+        assert_eq!(edge(&conn, &source_id, bare), Some(local_id));
+        assert_eq!(edge(&conn, &source_id, dangling), Some(other_id));
+
+        move_project_workspace(&mut conn, &scratch, &default_ws, &moved_ws).unwrap();
+
+        // The implicit edge rebinds to the destination workspace's infra; the
+        // `other` edge, absent in `moved`, goes unresolved; explicit and bare
+        // edges are unchanged. This matches a clean reindex of the same files.
+        assert_eq!(
+            edge(&conn, &source_id, implicit),
+            Some(target_moved_id),
+            "project-only edge must rebind to the destination workspace"
+        );
+        assert_eq!(
+            edge(&conn, &source_id, dangling),
+            None,
+            "project-only edge absent in the destination must go unresolved"
+        );
+        assert_eq!(
+            edge(&conn, &source_id, explicit),
+            Some(target_default_id),
+            "explicit workspace-qualified edge must not move"
+        );
+        assert_eq!(
+            edge(&conn, &source_id, bare),
+            Some(local_id),
+            "bare same-project edge follows its page by id"
+        );
     }
 
     #[test]
