@@ -90,4 +90,119 @@ struct AppSettingsTests {
         settings.adoptUnboundToken()
         #expect(settings.tokenOrigin == origin("https://a.example.com"))
     }
+
+    private let noDataDir = URL(string: "file:///nonexistent")!
+
+    @Test func aFailedTokenSaveDoesNotLeaveTheOldBearerBoundOrResent() {
+        // An old token is saved and bound; the user retargets the app at a new
+        // server and enters a new token, so applyEdit binds the new origin.
+        let store = FakeTokenStore(value: "old-secret")
+        store.failSave = true
+        var settings = AppSettings(
+            serverURL: url("https://old.example.com"),
+            tokenOrigin: origin("https://old.example.com")
+        )
+        settings.applyEdit(
+            serverURLString: "https://new.example.com",
+            dataDirOverride: "",
+            tokenInEdit: "new-secret"
+        )
+
+        let err = settings.commitTokenEdit(clearToken: false, token: "new-secret", to: store)
+
+        #expect(err != nil) // the failure is reported, not swallowed
+        // The retained old token is gone and unbound, so nothing stale is sent
+        // to the new server...
+        #expect(store.read() == nil)
+        #expect(settings.tokenOrigin == nil)
+        #expect(
+            DataDirToken.effective(
+                saved: store.read(),
+                savedOrigin: settings.tokenOrigin,
+                serverURL: url("https://new.example.com"),
+                dataDir: noDataDir
+            ) == nil
+        )
+        // ...and a later launch cannot re-adopt it (nothing is left to adopt).
+        settings.adoptUnboundToken()
+        #expect(settings.tokenOrigin == nil)
+    }
+
+    @Test func aSuccessfulTokenSaveBindsAndSendsTheNewBearer() {
+        let store = FakeTokenStore(value: "old-secret")
+        var settings = AppSettings(
+            serverURL: url("https://old.example.com"),
+            tokenOrigin: origin("https://old.example.com")
+        )
+        settings.applyEdit(
+            serverURLString: "https://new.example.com",
+            dataDirOverride: "",
+            tokenInEdit: "new-secret"
+        )
+
+        let err = settings.commitTokenEdit(clearToken: false, token: "new-secret", to: store)
+
+        #expect(err == nil)
+        #expect(store.read() == "new-secret")
+        #expect(settings.tokenOrigin == origin("https://new.example.com"))
+        #expect(
+            DataDirToken.effective(
+                saved: store.read(),
+                savedOrigin: settings.tokenOrigin,
+                serverURL: url("https://new.example.com"),
+                dataDir: noDataDir
+            ) == "new-secret"
+        )
+    }
+
+    @Test func aFailedClearLeavesTheTokenAndBindingUntouched() {
+        let store = FakeTokenStore(value: "secret")
+        store.failClear = true
+        var settings = AppSettings(
+            serverURL: url("https://a.example.com"),
+            tokenOrigin: origin("https://a.example.com")
+        )
+
+        let err = settings.commitTokenEdit(clearToken: true, token: nil, to: store)
+
+        #expect(err != nil)
+        #expect(store.read() == "secret") // not lost on a failed clear
+        #expect(settings.tokenOrigin == origin("https://a.example.com")) // binding intact
+    }
+
+    @Test func aSuccessfulClearForgetsTheTokenAndBinding() {
+        let store = FakeTokenStore(value: "secret")
+        var settings = AppSettings(
+            serverURL: url("https://a.example.com"),
+            tokenOrigin: origin("https://a.example.com")
+        )
+
+        let err = settings.commitTokenEdit(clearToken: true, token: nil, to: store)
+
+        #expect(err == nil)
+        #expect(store.read() == nil)
+        #expect(settings.tokenOrigin == nil)
+    }
+}
+
+private enum FakeTokenStoreError: Error { case induced }
+
+private final class FakeTokenStore: TokenStore, @unchecked Sendable {
+    private var value: String?
+    var failSave = false
+    var failClear = false
+
+    init(value: String? = nil) { self.value = value }
+
+    func read() -> String? { value }
+
+    func save(_ token: String) throws {
+        if failSave { throw FakeTokenStoreError.induced }
+        value = token
+    }
+
+    func clear() throws {
+        if failClear { throw FakeTokenStoreError.induced }
+        value = nil
+    }
 }

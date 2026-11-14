@@ -95,6 +95,46 @@ public struct AppSettings: Equatable, Sendable {
         tokenOrigin = nil
     }
 
+    /// Commit a token edit to `store` and this settings' binding together, so a
+    /// failed keychain write never leaves a retained bearer the app would still
+    /// send. Call it after ``applyEdit(serverURLString:dataDirOverride:tokenInEdit:)``
+    /// has set the new server and (for a non-empty token) the matching binding.
+    ///
+    /// On a failed `set`, the old token is still in the keychain while the
+    /// binding now points at the configured server, so ``DataDirToken/effective``
+    /// would send that stale bearer and ``adoptUnboundToken()`` would re-bind it
+    /// on the next launch. This clears both the keychain token and the binding
+    /// so nothing stale is sent or re-adopted. A failed `clear` leaves the token
+    /// and its existing binding untouched (it stays exactly as before the edit).
+    /// Returns the keychain error, or `nil` on success or a no-op.
+    @discardableResult
+    public mutating func commitTokenEdit(
+        clearToken: Bool,
+        token: String?,
+        to store: any TokenStore
+    ) -> Error? {
+        if clearToken {
+            do {
+                try store.clear()
+                clearTokenBinding()
+                return nil
+            } catch {
+                return error
+            }
+        }
+        guard let token else { return nil }
+        let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        do {
+            try store.save(value)
+            return nil
+        } catch {
+            try? store.clear()
+            clearTokenBinding()
+            return error
+        }
+    }
+
     private enum Keys {
         static let serverURL = "serverURL"
         static let dataDir = "dataDirOverride"

@@ -169,6 +169,13 @@ version in [`docs/changelog/`](docs/changelog/):
   at a different endpoint must supply its own credential (or the run skips),
   so an answerer key is never sent to an endpoint it was not issued for.
   (GHSA-5xw9-4g32-84fr)
+- The macOS menu bar app no longer keeps sending a retained bearer after a
+  failed credential update. When a keychain save failed while the user was
+  pointing the app at a new server, the old token stayed in the keychain
+  while the binding had already moved to the new server, so it was sent there
+  and re-adopted on the next launch. A failed save now clears both the stored
+  token and its binding, and the failure is surfaced in Settings.
+  (GHSA-xj78-fp6w-8r74)
 
 ## [3.4.6] - 2026-11-13
 
