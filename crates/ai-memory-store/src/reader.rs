@@ -14667,7 +14667,8 @@ impl ReaderPool {
     }
 
     /// What the harvester reads next from one project: user prompts and
-    /// curated pages past its marks, at most `limit` of each.
+    /// curated pages past its marks, at most `limit` of each plus the rest of
+    /// the last row's timestamp group.
     ///
     /// # Errors
     /// Propagates SQL or pool errors.

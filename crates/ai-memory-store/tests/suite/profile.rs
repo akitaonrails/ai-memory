@@ -597,3 +597,101 @@ async fn session_start_digest_read_is_bounded_but_scope_reads_are_not() {
         "the harvester's convergence read stays uncapped"
     );
 }
+
+/// Imported prompts keep their own `occurred_at`, so several can share one
+/// timestamp, and a page batch can share one `updated_at`. A harvest pass
+/// that ends inside such a group must still return the rest of it, or the
+/// mark moves past the group and the rest is never read.
+#[tokio::test]
+async fn harvest_reads_every_row_of_a_timestamp_group_split_by_the_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = default_workspace(&store).await;
+    let app = store
+        .writer
+        .get_or_create_project(ws, "app".to_owned(), None)
+        .await
+        .unwrap();
+    let session = SessionId::new();
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: Some(1_000_000),
+            id: session,
+            workspace_id: ws,
+            project_id: app,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: Some("/repo/app".into()),
+            actor_user: None,
+        })
+        .await
+        .unwrap();
+    for body in ["Always use pnpm.", "Never force-push to main."] {
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: session,
+                    workspace_id: ws,
+                    project_id: app,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: body.into(),
+                    importance: 5,
+                    occurred_at: Some(2_000_000),
+                    file_path: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+    }
+    for path in ["decisions/a.md", "decisions/b.md"] {
+        store
+            .writer
+            .upsert_page(profile_page(ws, app, path, "# Decision\n\nUse tokio."))
+            .await
+            .unwrap();
+    }
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE pages SET updated_at = 3000000 WHERE path IN ('decisions/a.md', 'decisions/b.md')",
+        [],
+    )
+    .unwrap();
+
+    let mut mark = ai_memory_store::ProfileHarvestMark::default();
+    let (mut prompts, mut pages) = (Vec::new(), Vec::new());
+    for _ in 0..4 {
+        let (new_prompts, new_pages, _) = store
+            .reader
+            .profile_harvest_inputs(ws, app, mark, 1)
+            .await
+            .unwrap();
+        if new_prompts.is_empty() && new_pages.is_empty() {
+            break;
+        }
+        for prompt in new_prompts {
+            mark.observations_until = mark.observations_until.max(prompt.created_at);
+            prompts.push(prompt.body);
+        }
+        for page in new_pages {
+            mark.pages_until = mark.pages_until.max(page.updated_at);
+            pages.push(page.path);
+        }
+    }
+    prompts.sort();
+    pages.sort();
+    assert_eq!(
+        prompts,
+        vec!["Always use pnpm.", "Never force-push to main."],
+        "a prompt sharing the batch's last timestamp was never harvested"
+    );
+    assert_eq!(
+        pages,
+        vec!["decisions/a.md", "decisions/b.md"],
+        "a page sharing the batch's last timestamp was never harvested"
+    );
+}
