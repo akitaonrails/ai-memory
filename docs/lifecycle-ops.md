@@ -618,8 +618,9 @@ a low-level re-stamp:
    (`projects`, `pages`, `sessions`, `observations`, `handoffs`, `audit_log`,
    auto-improvement state, SessionEnd consolidation jobs, managed
    `workstreams`, pending cross-project messages on both ends, entities, page
-   feedback, the pages' recorded source observations (`page_sources`), purge
-   tombstones, and the profile evidence). Native workstream
+   feedback, the pages' recorded source observations (`page_sources`),
+   retrieval history (`retrieval_history`), purge tombstones, and the profile
+   evidence). Native workstream
    sessions, runs, and events remain attached
    through `workstream_id`; `page_embeddings` and `links` remain attached
    through `page_id`, so none of those rows need a direct re-stamp.
@@ -781,7 +782,7 @@ scope), the `handoffs` it produced (`from_session_id`), its
 `session_consolidation_jobs`, `auto_improve_runs` and
 `auto_improve_scheduler_claims`, its profile prompt `profile_candidates`
 (`source_kind = 'prompt' AND source_ref = 'session:<id>'`), its
-`ingest_keys`, and its `sessions/<id>.md` page:
+`ingest_keys`, its `retrieval_history`, and its `sessions/<id>.md` page:
 
 - `--pages move` (default): every version of the page is re-stamped into the
   destination and the file is renamed into the destination project
