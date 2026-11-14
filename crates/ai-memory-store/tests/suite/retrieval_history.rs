@@ -281,3 +281,201 @@ async fn purge_session_deletes_the_history() {
         .unwrap();
     assert_eq!(kept.total, 1, "a sibling session's history is untouched");
 }
+
+async fn seed_history(
+    store: &Store,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    sid: SessionId,
+    query: &str,
+    path: &str,
+    end: bool,
+) {
+    store
+        .writer
+        .begin_session(NewSession {
+            occurred_at: None,
+            id: sid,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::ClaudeCode,
+            cwd: None,
+            actor_user: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    if end {
+        store.writer.end_session(sid, None).await.unwrap();
+    }
+    store
+        .writer
+        .record_retrieval_history(
+            record(ws, proj, sid, query, vec![hit(0, path, Some(0.8))]),
+            500,
+        )
+        .await
+        .unwrap();
+}
+
+/// `move_project_workspace`, `merge_project`, and `move_session` re-stamp
+/// `retrieval_history` to the target scope so history and its hits stay
+/// readable there and survive deletion of the source scope.
+#[tokio::test]
+async fn history_follows_project_and_session_through_move_and_merge() {
+    let sibling = SessionId::from_native("22222222-2222-4222-8222-222222222222");
+
+    // move_project_workspace: rows move to the destination workspace and
+    // survive deleting the vacated workspace.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws1, app) = scope(&store, "default", "app").await;
+        let ws2 = store
+            .writer
+            .get_or_create_workspace("elsewhere".to_owned())
+            .await
+            .unwrap();
+        let sid = SessionId::from_native(SESSION);
+        seed_history(&store, ws1, app, sid, "move", "notes/m.md", false).await;
+
+        store
+            .writer
+            .move_project_workspace(app, ws1, ws2)
+            .await
+            .unwrap();
+        let old = store
+            .reader
+            .retrieval_history_page(ws1, app, sid, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(old.total, 0);
+
+        store
+            .writer
+            .delete_workspace(
+                ws1,
+                true,
+                ai_memory_store::Compaction::Skip,
+                ai_memory_store::PurgeMode::Commit,
+            )
+            .await
+            .unwrap();
+
+        let moved = store
+            .reader
+            .retrieval_history_page(ws2, app, sid, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(moved.total, 1);
+        assert_eq!(moved.records[0].query, "move");
+        assert_eq!(moved.records[0].hits.len(), 1);
+        assert_eq!(moved.records[0].hits[0].page_path, "notes/m.md");
+    }
+
+    // merge_project: source retrieval history is re-keyed to the target and
+    // survives source-project deletion alongside existing target history.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, src) = scope(&store, "default", "source").await;
+        let dst = store
+            .writer
+            .get_or_create_project(ws, "target".to_owned(), None)
+            .await
+            .unwrap();
+        let sid = SessionId::from_native(SESSION);
+        seed_history(&store, ws, src, sid, "src", "notes/s.md", true).await;
+        seed_history(&store, ws, dst, sibling, "dst", "notes/d.md", true).await;
+
+        store
+            .writer
+            .merge_project(ws, src, dst, Vec::new(), true)
+            .await
+            .unwrap();
+
+        let merged = store
+            .reader
+            .retrieval_history_page(ws, dst, sid, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(merged.total, 1);
+        assert_eq!(merged.records[0].query, "src");
+        assert_eq!(merged.records[0].hits.len(), 1);
+        assert_eq!(merged.records[0].hits[0].page_path, "notes/s.md");
+
+        let untouched = store
+            .reader
+            .retrieval_history_page(ws, dst, sibling, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(untouched.total, 1);
+    }
+
+    // move_session: only the moved session's history moves to target, leaving
+    // sibling sessions untouched and surviving a purge of the source project.
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, src) = scope(&store, "default", "source").await;
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_owned(), None)
+            .await
+            .unwrap();
+        let sid = SessionId::from_native(SESSION);
+        seed_history(&store, ws, src, sid, "moved", "notes/a.md", true).await;
+        seed_history(&store, ws, src, sibling, "stay", "notes/b.md", true).await;
+
+        store
+            .writer
+            .move_session(
+                sid,
+                ws,
+                target,
+                ai_memory_store::PagesMode::Move,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let old = store
+            .reader
+            .retrieval_history_page(ws, src, sid, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(old.total, 0);
+
+        let kept = store
+            .reader
+            .retrieval_history_page(ws, src, sibling, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(kept.total, 1);
+
+        store
+            .writer
+            .purge_project(
+                ws,
+                src,
+                "default/source",
+                None,
+                true,
+                ai_memory_store::Compaction::Skip,
+                ai_memory_store::PurgeMode::Commit,
+            )
+            .await
+            .unwrap();
+
+        let moved = store
+            .reader
+            .retrieval_history_page(ws, target, sid, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(moved.total, 1);
+        assert_eq!(moved.records[0].query, "moved");
+        assert_eq!(moved.records[0].hits.len(), 1);
+        assert_eq!(moved.records[0].hits[0].page_path, "notes/a.md");
+    }
+}
