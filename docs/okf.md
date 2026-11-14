@@ -64,6 +64,9 @@ Ordinary Markdown links use URL path encoding: `notes/my%20note.md` points
 to `notes/my note.md`. Import and the web UI decode that path once before
 resolving it. A literal percent sequence in a filename uses `%25` in a
 Markdown URL, while `[[wikilinks]]` continue to name literal page paths.
+Exported wikilink destinations also encode `&` as `%26`, so a filename such
+as `notes/a&copy;.md` keeps its literal spelling when a Markdown reader
+interprets character references.
 
 | OKF key | ai-memory source |
 |---|---|
