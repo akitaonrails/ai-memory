@@ -28,6 +28,12 @@ version in [`docs/changelog/`](docs/changelog/):
   strings and `[message evidence truncated; ...]` suffixes short; it is now
   4 KiB. (#2283)
 
+- `ai-memory uninstall` now sweeps Hermes skill directories (`.hermes/skills`,
+  `~/.hermes/skills`, `$HERMES_HOME/skills`, and the Windows `%LOCALAPPDATA%`
+  default) alongside the other supported Agent Skill roots. Previously none of
+  the Hermes skill roots were scanned, leaving managed skills behind on
+  uninstall. (#2285)
+
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
   and enforcement metadata when editing the body. (#2207)
 
