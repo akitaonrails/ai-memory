@@ -46,7 +46,7 @@ version in [`docs/changelog/`](docs/changelog/):
   lists now use the latest of all three activity sources. (#2266)
 - Retrieval benchmarks no longer inherit unreported `AI_MEMORY_*` settings
   from the evaluator's environment. Pass server settings explicitly with
-  `--server-env` or `--candidate-server-env` so the report records them.
+  `--server-env` or `--candidate-server-env` so the report records them. (#2282)
 - The document importer now preserves DOCX nonbreaking hyphens encoded as
   `w:noBreakHyphen` elements. It previously dropped them and joined the
   surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)
