@@ -61,7 +61,10 @@ version in [`docs/changelog/`](docs/changelog/):
   evals README describes ended up in a report meant for `docs/benchmarks/`.
   A variable whose name has a `KEY`, `APIKEY`, `TOKEN`, `SECRET`,
   `PASSWORD`, `PASSWD`, `CREDENTIALS` or `HEADERS` word now shows as
-  `env:NAME=<redacted>`; the eval server still receives the real value. (#2274)
+  `env:NAME=<redacted>`; the eval server still receives the real value.
+  Values the line keeps, and `--query-arg` values, also pass through the
+  built-in sanitizer, so a password inside a URL or a provider key under an
+  unrelated name is redacted too. (#2274)
 
 ## [3.4.6] - 2026-11-13
 

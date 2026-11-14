@@ -44,6 +44,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ai_memory_core::Sanitizer;
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 
@@ -294,18 +295,23 @@ impl Knobs {
             "embeddings={embeddings} reranker={}",
             if reranker { "on" } else { "off" }
         );
+        // A value kept in the summary still goes through the built-in
+        // sanitizer: a name check cannot see a password inside a URL or a
+        // provider key passed under an unrelated name.
+        let sanitizer = Sanitizer::builtin();
         for (k, v) in &env {
             // The summary is the report's `config:` line, which gets copied
             // into docs/benchmarks/: a credential is named, never printed.
             let shown = if is_credential_env_name(k) {
-                "<redacted>"
+                "<redacted>".to_owned()
             } else {
-                v
+                sanitizer.scrub(v)
             };
             summary.push_str(&format!(" env:{k}={shown}"));
         }
         for (k, v) in &query_args {
-            summary.push_str(&format!(" arg:{k}={v}"));
+            let shown = sanitizer.scrub(&v.to_string());
+            summary.push_str(&format!(" arg:{k}={shown}"));
         }
         // Only non-default ablations are named, so a default run's summary
         // reads exactly as the published baselines do.
@@ -1013,6 +1019,40 @@ mod tests {
             k.env
                 .contains(&("OPENAI_API_KEY".into(), "sk-test-123".into()))
         );
+    }
+
+    #[test]
+    fn knobs_summary_scrubs_secrets_in_values_it_keeps() {
+        let k = Knobs::parse(
+            "candidate",
+            "none",
+            true,
+            &[
+                "AI_MEMORY_LLM_BASE_URL=https://evaluser:hunter2pass@llm.example.test/v1".into(),
+                "AI_MEMORY_RERANKER_MODEL=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                "AI_MEMORY_LLM_PROVIDER=openai".into(),
+            ],
+            &[r#"filter={"note":"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#.into()],
+            IngestMode::Hooks,
+            DatePrefix::Turn,
+        )
+        .unwrap();
+        for secret in [
+            "hunter2pass",
+            "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(
+                !k.summary.contains(secret),
+                "{secret} leaked: {}",
+                k.summary
+            );
+        }
+        // Control: a value with nothing secret in it reads as given.
+        assert!(k.summary.contains("env:AI_MEMORY_LLM_PROVIDER=openai"));
+        assert!(k.summary.contains("env:AI_MEMORY_LLM_BASE_URL="));
+        // The server and the query still get the real values.
+        assert!(k.env.iter().any(|(_, v)| v.contains("hunter2pass")));
     }
 
     #[test]
