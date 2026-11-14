@@ -282,6 +282,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Pi assistant capture (`--capture-assistant`) no longer lets the native Stop
+  overtake the turn's own prompt and tool events: `postPiStop` now drains the
+  direct-hook queue before it spawns the native Stop, matching OpenCode 2. The
+  ordering is online-only; an offline spool backlog is recovered on a separate
+  drain, and that order is a documented boundary
+  ([`docs/external-lifecycle.md`](docs/external-lifecycle.md)). (#2272)
 - `[[llm_fallbacks]]` chains no longer stop when a provider reports that the
   account is out of credit, quota or billing: the chain now advances to the
   next candidate instead of failing the whole request, and the exhausted

@@ -6534,13 +6534,22 @@ function piAssistantText(ctx: any): string | undefined {
   return undefined;
 }
 
-function postPiStop(ctx: any): void {
+async function postPiStop(ctx: any): Promise<void> {
   const payload = piSessionPayload(ctx);
   const text = CAPTURE_ASSISTANT ? piAssistantText(ctx) : undefined;
   if (!NATIVE_HOOK || !text) {
     postHook("stop", payload);
     return;
   }
+  // Drain this turn's already-enqueued prompt and tool events before the native
+  // Stop is spawned, so the Stop is not stored ahead of them (#2272). Mirrors
+  // OpenCode 2's postStop. This orders the online path only: a request that
+  // fails here is spooled and recovered on a separate drain, so ordering across
+  // an offline backlog is a known shared limitation (see docs/external-lifecycle.md).
+  // The agent_end handler calls this fire-and-forget, so the drain never blocks
+  // the turn's completion.
+  await requestHookDrain();
+  if (hookAbort.signal.aborted) return;
   try {
     const args = ["--data-dir", dirname(hookSpoolDir()), "hook", "--agent", AGENT,
       "--event", "stop", "--server-url", SERVER, "--capture-assistant",
@@ -6589,7 +6598,9 @@ fn build_pi_extension(
         "const AGENT = \"pi\";".to_string()
     };
     let stop_post = if capture_assistant {
-        "postPiStop(ctx);"
+        // Fire-and-forget: postPiStop drains the queue before spawning the
+        // native Stop internally (#2272), so agent_end is not blocked.
+        "void postPiStop(ctx);"
     } else {
         "postHook(\"stop\", piSessionPayload(ctx));"
     };
@@ -17126,7 +17137,10 @@ process.exit(0);
             "{on}"
         );
         assert!(on.contains("function piAssistantText(ctx: any)"), "{on}");
-        assert!(on.contains("function postPiStop(ctx: any): void"), "{on}");
+        assert!(
+            on.contains("async function postPiStop(ctx: any): Promise<void>"),
+            "postPiStop must be async so it can await the queue drain (#2272): {on}"
+        );
         // The funnel references resolveToken() and hookSpoolDir(); both helper
         // definitions must be present in the generated extension, or the spawn
         // path throws ReferenceError at runtime (no other test exercises it).
@@ -17138,11 +17152,29 @@ process.exit(0);
             on.contains("function hookSpoolDir("),
             "hookSpoolDir missing: {on}"
         );
-        // The agent_end Stop routes through the funnel, not the direct-HTTP post.
-        assert!(on.contains("postPiStop(ctx);"), "{on}");
+        // The agent_end Stop routes through the funnel, not the direct-HTTP post,
+        // and fires it fire-and-forget so the drain never blocks the turn (#2272).
+        assert!(on.contains("void postPiStop(ctx);"), "{on}");
         assert!(
             !on.contains("postHook(\"stop\", piSessionPayload(ctx));"),
             "capture-on must route Stop through the native funnel, not direct HTTP: {on}"
+        );
+        // #2272: the native Stop must not overtake the turn's already-queued
+        // prompt and tool events. postPiStop drains the direct-hook queue before
+        // it spawns the native hook (mirrors OpenCode 2's postStop).
+        let funnel = on
+            .split_once("async function postPiStop")
+            .expect("postPiStop present")
+            .1;
+        let drain = funnel
+            .find("await requestHookDrain();")
+            .expect("postPiStop must await the queue drain (#2272)");
+        let spawn = funnel
+            .find("spawn(NATIVE_HOOK")
+            .expect("postPiStop spawns the native hook");
+        assert!(
+            drain < spawn,
+            "the queue drain must precede the native Stop spawn (#2272): {funnel}"
         );
         // The native hook runs the sanitizer; the reply is piped to it under the
         // stripped spelling and tagged with --capture-assistant for agent pi.
