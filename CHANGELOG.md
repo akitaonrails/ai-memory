@@ -460,6 +460,19 @@ version in [`docs/changelog/`](docs/changelog/):
   Values the line keeps, and `--query-arg` values, also pass through the
   built-in sanitizer, so a password inside a URL or a provider key under an
   unrelated name is redacted too. (#2274)
+- Pi assistant-response capture (`--agent pi --capture-assistant`) now
+  forwards `--project-strategy` when spawning the native `stop` hook, matching
+  the OpenCode integrations. Previously, `postPiStop` omitted
+  `--project-strategy` even when `repo-root` was configured for all direct-HTTP
+  events, splitting assistant stops into the current folder's project name in
+  subdirectories or worktrees without `.ai-memory.toml`. (#2270)
+- `move-project`, `merge-project`, and `move-session` now re-stamp
+  `retrieval_history` rows to the target scope alongside other project and
+  session records. They previously left those rows on the old scope, so
+  `merge-project` cascade-deleted source retrieval history (and its
+  `retrieval_history_hits`), while `move-project` and `move-session` hid
+  moved session history from `/retrievals` and exposed it to cascade deletion
+  when the source workspace or project was removed. (#2268)
 
 ### Security
 
@@ -475,19 +488,6 @@ version in [`docs/changelog/`](docs/changelog/):
   and re-adopted on the next launch. A failed save now clears both the stored
   token and its binding, and the failure is surfaced in Settings.
   (GHSA-xj78-fp6w-8r74)
-- Pi assistant-response capture (`--agent pi --capture-assistant`) now
-  forwards `--project-strategy` when spawning the native `stop` hook, matching
-  the OpenCode integrations. Previously, `postPiStop` omitted
-  `--project-strategy` even when `repo-root` was configured for all direct-HTTP
-  events, splitting assistant stops into the current folder's project name in
-  subdirectories or worktrees without `.ai-memory.toml`. (#2270)
-- `move-project`, `merge-project`, and `move-session` now re-stamp
-  `retrieval_history` rows to the target scope alongside other project and
-  session records. They previously left those rows on the old scope, so
-  `merge-project` cascade-deleted source retrieval history (and its
-  `retrieval_history_hits`), while `move-project` and `move-session` hid
-  moved session history from `/retrievals` and exposed it to cascade deletion
-  when the source workspace or project was removed. (#2268)
 
 ## [3.4.6] - 2026-11-13
 
