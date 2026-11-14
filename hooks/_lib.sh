@@ -343,7 +343,13 @@ ai_memory_payload_has_top_level_key() {
                 for (i++; i <= len; i++) {
                     c = substr(buf, i, 1)
                     if (c == "\\") {
-                        if (cap) tok = tok substr(buf, i, 2)
+                        if (cap) {
+                            nc = substr(buf, i + 1, 1)
+                            if (nc == "t") tok = tok "\t"
+                            else if (nc == "n") tok = tok "\n"
+                            else if (nc == "r") tok = tok "\r"
+                            else tok = tok substr(buf, i, 2)
+                        }
                         i++
                         continue
                     }
