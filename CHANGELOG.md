@@ -108,7 +108,6 @@ version in [`docs/changelog/`](docs/changelog/):
   within both the character budgets and the existing store byte limits is now
   preserved. ASCII truncation and the final store byte limits are unchanged. (#2245)
 
-
 - Codex transcript imports resumed from a saved cursor now label each new
   event with the working directory of its turn. Codex writes a `turn_context`
   record only when the turn context changes, and an incremental export read
