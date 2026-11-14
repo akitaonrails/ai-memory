@@ -519,6 +519,8 @@ struct PageAuthority {
     /// Kind/tier penalty this page carries *because* it is a session page
     /// (`0.0` for every other kind). A `session_recall` query gives it back.
     session_penalty: f64,
+    /// Ceiling a negative curator tag sets; `None` for untagged pages.
+    cap: Option<f64>,
 }
 
 impl PageAuthority {
@@ -577,21 +579,29 @@ impl PageAuthority {
         // Negative tags are explicit curator instructions. They cap the
         // result's authority instead of merely cancelling a canonical path
         // boost, but they never remove the page from search.
-        if tags
+        let cap = if tags
             .iter()
             .any(|tag| tag == "do-not-answer-from" || tag == "test-fixture")
         {
-            factor = factor.min(0.55);
+            Some(0.55)
         } else if tags.iter().any(|tag| tag == "superseded") {
-            factor = factor.min(0.65);
+            Some(0.65)
         } else if tags.iter().any(|tag| tag == "historical") {
-            factor = factor.min(0.80);
-        }
+            Some(0.80)
+        } else {
+            None
+        };
+        let factor = factor.clamp(0.55, 1.50);
 
         Self {
-            factor: factor.clamp(0.55, 1.50),
+            factor: cap.map_or(factor, |cap| factor.min(cap)),
             session_penalty,
+            cap,
         }
+    }
+
+    fn capped(&self, factor: f64) -> f64 {
+        self.cap.map_or(factor, |cap| factor.min(cap))
     }
 
     fn adjust_rank(&self, rank: f64) -> f64 {
@@ -604,7 +614,7 @@ impl PageAuthority {
     /// other page lives in. Any other query leaves the factor alone.
     fn factor_for(&self, session_recall: bool, bonus: f64) -> f64 {
         if session_recall && self.session_penalty > 0.0 {
-            (self.factor + self.session_penalty + bonus).clamp(0.55, 1.50)
+            self.capped((self.factor + self.session_penalty + bonus).clamp(0.55, 1.50))
         } else {
             self.factor
         }
@@ -9217,9 +9227,11 @@ impl ReaderPool {
                 };
                 let factor = match (belief_add, feedback_pen, signal_add) {
                     (None, None, None) => base,
-                    _ => (base + belief_add.unwrap_or(0.0) - feedback_pen.unwrap_or(0.0)
-                        + signal_add.unwrap_or(0.0))
-                    .clamp(0.55, 1.50),
+                    _ => authority.capped(
+                        (base + belief_add.unwrap_or(0.0) - feedback_pen.unwrap_or(0.0)
+                            + signal_add.unwrap_or(0.0))
+                        .clamp(0.55, 1.50),
+                    ),
                 };
                 hit.rank = apply_rank_multiplier(hit.rank, factor);
                 // `fused` stays the raw RRF sum; without the multiplier
@@ -17365,6 +17377,38 @@ mod tests {
         assert_eq!(authority_candidate_limit(10), 40);
         assert_eq!(authority_candidate_limit(1_000), 1_300);
         assert_eq!(authority_candidate_limit(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn negative_tags_cap_authority_under_session_recall() {
+        use super::PageAuthority;
+
+        let bonus = crate::RetrievalTuning::default().session_recall_bonus;
+        for (tag, cap) in [
+            ("do-not-answer-from", 0.55),
+            ("test-fixture", 0.55),
+            ("superseded", 0.65),
+            ("historical", 0.80),
+        ] {
+            let frontmatter = format!(r#"{{"tags":["{tag}"]}}"#);
+            let tagged = PageAuthority::from_stored(
+                "sessions/a.md",
+                "session",
+                "episodic",
+                false,
+                &frontmatter,
+            );
+            assert!(
+                tagged.factor_for(true, bonus) <= cap,
+                "{tag}: session recall lifted the factor to {} above its {cap} cap",
+                tagged.factor_for(true, bonus)
+            );
+        }
+
+        let untagged =
+            PageAuthority::from_stored("sessions/a.md", "session", "episodic", false, "{}");
+        assert!(untagged.factor_for(true, bonus) > untagged.factor_for(false, bonus));
+        assert_eq!(untagged.factor_for(false, bonus), untagged.factor);
     }
 
     /// Build an open handoff for the pure-selection tests. `manual` toggles
