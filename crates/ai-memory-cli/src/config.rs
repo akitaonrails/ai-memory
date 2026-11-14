@@ -7854,6 +7854,10 @@ input_token_safety_margin = {margin}
             llm_provider: Some("vertex-ai".into()),
             runtime_env: RuntimeEnv {
                 platform_home: Some(PathBuf::from("/home/op")),
+                // Windows resolves the gcloud login file under %APPDATA%, not the
+                // POSIX `~/.config` path, so the fallback needs an appdata root to
+                // resolve on that platform too.
+                appdata: Some(PathBuf::from("C:/Users/op/AppData/Roaming")),
                 google_cloud_location: Some("us-central1".into()),
                 ..RuntimeEnv::default()
             },
@@ -7863,7 +7867,14 @@ input_token_safety_margin = {margin}
         let provider = cfg.llm_provider_config().unwrap().unwrap();
         let auth = provider.auth.require_vertex_auth().unwrap();
 
-        if !cfg!(windows) {
+        if cfg!(windows) {
+            assert_eq!(
+                auth.credentials_file,
+                Path::new(
+                    "C:/Users/op/AppData/Roaming/gcloud/application_default_credentials.json"
+                )
+            );
+        } else {
             assert_eq!(
                 auth.credentials_file,
                 Path::new("/home/op/.config/gcloud/application_default_credentials.json")
