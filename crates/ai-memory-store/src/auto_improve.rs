@@ -430,6 +430,7 @@ pub struct AutoImproveTelemetryAggregate {
     pub top_targets: Vec<AutoImproveTelemetryCount>,
     /// Rejection counts by reason.
     pub rejections_by_reason: Vec<AutoImproveTelemetryCount>,
+    /// Eval-gate rejections in the window, independent of the top-N limit.
     #[serde(default)]
     pub eval_gate_rejections: usize,
     /// Repeated rejection fingerprints.
