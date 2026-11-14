@@ -723,7 +723,10 @@ Crush cursors fingerprint every message revision in the newest one-second
 timestamp bucket. This preserves inserts whose UUID sorts below the prior
 cursor and edits whose native timestamp did not advance. Exact recovery ranges
 also retain the captured endpoint fingerprints, so a revision written later in
-that second is not pulled backward into an earlier interval.
+that second is not pulled backward into an earlier interval. Each import reads
+its events and cursor from one SQLite snapshot, so a concurrent native write
+remains available to the next import. Baseline cursor timestamps and revision
+fingerprints also share one snapshot.
 
 Search and tail also return optional `source_record_id` and `metadata` fields.
 The text CLI prints the source record and correlation metadata as escaped JSON;

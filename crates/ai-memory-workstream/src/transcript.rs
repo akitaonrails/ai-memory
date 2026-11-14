@@ -3532,6 +3532,26 @@ fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> CrushRe
 }
 
 fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
+    crush_cursor_inner(
+        connection,
+        session,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn crush_cursor_inner(
+    connection: &Connection,
+    session: &str,
+    #[cfg(test)] after_newest: Option<&dyn Fn()>,
+) -> Result<CrushCursor> {
+    // Exports already hold a snapshot; a standalone baseline needs the same
+    // protection across its timestamp and revision queries.
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
     let newest = connection
         .query_row(
             "SELECT updated_at, id FROM messages WHERE session_id = ?1 \
@@ -3543,6 +3563,10 @@ fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
     let Some((updated, id)) = newest else {
         return Ok(CrushCursor::default());
     };
+    #[cfg(test)]
+    if let Some(after_newest) = after_newest {
+        after_newest();
+    }
     let mut statement = connection.prepare(
         "SELECT id, role, parts, is_summary_message FROM messages \
          WHERE session_id = ?1 AND updated_at = ?2 ORDER BY id LIMIT ?3",
@@ -3595,12 +3619,36 @@ fn export_crush_range(
     source_cursor: Option<&str>,
     final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
+    export_crush_range_inner(
+        home,
+        cwd,
+        session_dir,
+        session,
+        source_cursor,
+        final_cursor,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn export_crush_range_inner(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
+    #[cfg(test)] after_rows: Option<&dyn Fn()>,
+) -> Result<ExportedTranscript> {
     let db = crush_db(home, cwd, session_dir);
     let connection = Connection::open_with_flags(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("opening Crush session database {} read-only", db.display()))?;
+    // The cursor must acknowledge only revisions visible to the event query,
+    // even if the native WAL writer commits before that cursor is collected.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<CrushCursor>(raw).ok())
         .unwrap_or_default();
@@ -3691,6 +3739,10 @@ fn export_crush_range(
             &mut source_bytes,
             0,
         )?;
+    }
+    #[cfg(test)]
+    if let Some(after_rows) = after_rows {
+        after_rows();
     }
     let next_cursor = if final_cursor.is_some() {
         upper
@@ -8217,6 +8269,157 @@ mod tests {
         assert!(
             exact.events.is_empty(),
             "rows and revisions added after the captured endpoint stay outside the interval"
+        );
+    }
+
+    /// A native WAL writer may commit after the event query is exhausted.
+    /// Its unseen row must remain outside the returned cursor until the next read.
+    #[test]
+    fn crush_export_cursor_covers_only_its_event_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let data = cwd.join(".crush");
+        fs::create_dir_all(&data).unwrap();
+        let db = data.join("crush.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
+                 parts TEXT, updated_at INTEGER, is_summary_message INTEGER);",
+            )
+            .unwrap();
+        let insert = |connection: &Connection, id: &str, text: &str, updated: i64| {
+            connection
+                .execute(
+                    "INSERT INTO messages VALUES (?1, 's', 'assistant', ?2, ?3, 0)",
+                    params![
+                        id,
+                        json!([{"type":"text","data":{"text":text}}]).to_string(),
+                        updated
+                    ],
+                )
+                .unwrap();
+        };
+        insert(&writer, "before", "before export", 100);
+        let during = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let writer = Connection::open(&db).unwrap();
+                        insert(&writer, "during", "during export", 200);
+                    })
+                    .join()
+                    .unwrap();
+            });
+        };
+        let first =
+            export_crush_range_inner(temp.path(), &cwd, None, "s", None, None, Some(&during))
+                .unwrap();
+        assert_eq!(kinds_and_contents(&first), [("message", "before export")]);
+        let cursor: CrushCursor =
+            serde_json::from_str(first.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            cursor.updated, 100,
+            "the cursor must use the event query's snapshot"
+        );
+        assert_eq!(
+            cursor
+                .boundary
+                .iter()
+                .map(|revision| revision.id.as_str())
+                .collect::<Vec<_>>(),
+            ["before"]
+        );
+        assert!(first.losses.is_empty());
+
+        insert(&writer, "after", "after export", 300);
+        let second =
+            export_crush(temp.path(), &cwd, None, "s", first.source_cursor.as_deref()).unwrap();
+        assert_eq!(
+            kinds_and_contents(&second),
+            [("message", "during export"), ("message", "after export")]
+        );
+        assert!(second.losses.is_empty());
+        assert!(
+            export_crush(
+                temp.path(),
+                &cwd,
+                None,
+                "s",
+                second.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
+        );
+    }
+
+    /// Cursor timestamps and revision fingerprints must describe one snapshot,
+    /// including when a same-second insert lands between its two queries.
+    #[test]
+    fn crush_baseline_cursor_revisions_share_the_timestamp_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("crush.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
+                 parts TEXT, updated_at INTEGER, is_summary_message INTEGER);",
+            )
+            .unwrap();
+        let before = json!([{"type":"text","data":{"text":"before baseline"}}]).to_string();
+        writer
+            .execute(
+                "INSERT INTO messages VALUES ('m', 's', 'assistant', ?1, 100, 0)",
+                [&before],
+            )
+            .unwrap();
+        let reader = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let during = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let writer = Connection::open(&db).unwrap();
+                        let after =
+                            json!([{"type":"text","data":{"text":"during baseline"}}]).to_string();
+                        writer
+                            .execute(
+                                "INSERT INTO messages VALUES ('z', 's', 'assistant', ?1, 100, 0)",
+                                [&after],
+                            )
+                            .unwrap();
+                    })
+                    .join()
+                    .unwrap();
+            });
+        };
+        let cursor = crush_cursor_inner(&reader, "s", Some(&during)).unwrap();
+        assert_eq!(
+            cursor.boundary,
+            [crush_revision("m", "assistant", &before, 0)]
+        );
+        let next = export_crush(
+            temp.path(),
+            temp.path(),
+            Some(temp.path()),
+            "s",
+            Some(&serde_json::to_string(&cursor).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(kinds_and_contents(&next), [("message", "during baseline")]);
+        assert!(
+            export_crush(
+                temp.path(),
+                temp.path(),
+                Some(temp.path()),
+                "s",
+                next.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
         );
     }
 
