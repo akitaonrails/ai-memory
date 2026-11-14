@@ -60,7 +60,7 @@ version in [`docs/changelog/`](docs/changelog/):
   opt-in belief, feedback and query-signal adjustments were added after it, so
   a tagged session page could reach 1.03 under the default session-recall bonus
   and a tagged page with query signals could outrank untagged pages. The cap is
-  now applied after each of those adjustments; untagged pages rank as before.
+  now applied after each of those adjustments; untagged pages rank as before. (#2261)
 
 ## [3.4.6] - 2026-11-13
 
