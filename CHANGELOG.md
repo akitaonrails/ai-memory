@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed OKF export links pointing at a different filename when a literal
+  wikilink path contained an HTML character reference such as `&copy;`. (#2279)
+
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
   and enforcement metadata when editing the body. (#2207)
 

@@ -813,8 +813,11 @@ fn resolve_local_wikilink(
             dir.split('/').filter(|s| !s.is_empty()).collect()
         });
     // The wikilink names a literal path; a Markdown destination is a URL
-    // that `extract_links` decodes once, so a literal `%` leaves as `%25`.
-    let mut href = relative_href(&page_dir, &target).replace('%', "%25");
+    // that `extract_links` decodes once. Encode `%` and `&` so URL escapes
+    // and CommonMark character references cannot change the filename.
+    let mut href = relative_href(&page_dir, &target)
+        .replace('%', "%25")
+        .replace('&', "%26");
     href.push_str(suffix);
     let display = label
         .map(str::trim)
@@ -2134,6 +2137,24 @@ mod tests {
             let before = extract_links(body, &page);
             assert_eq!(before.len(), 1, "{body}");
             let exported = rewrite_local_wikilinks(body, &page, "proj");
+            assert!(exported.contains(&format!("]({href})")), "{exported}");
+            assert_eq!(extract_links(&exported, &page), before, "{exported}");
+        }
+    }
+
+    #[test]
+    fn rewrite_local_wikilinks_keeps_literal_html_entities_in_the_target() {
+        let page = PagePath::new("notes/here.md").unwrap();
+        for (target, href) in [
+            ("a&copy;.md", "a%26copy;.md"),
+            ("a&amp;.md", "a%26amp;.md"),
+            ("a&b.md", "a%26b.md"),
+            ("a%26copy;&copy;.md", "a%2526copy;%26copy;.md"),
+        ] {
+            let body = format!("See [[notes/{target}]].\n");
+            let before = extract_links(&body, &page);
+            assert_eq!(before.len(), 1, "{body}");
+            let exported = rewrite_local_wikilinks(&body, &page, "proj");
             assert!(exported.contains(&format!("]({href})")), "{exported}");
             assert_eq!(extract_links(&exported, &page), before, "{exported}");
         }
