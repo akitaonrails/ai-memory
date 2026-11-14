@@ -54,6 +54,11 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- A page under an uppercase folder such as `_RULES/` or `Decisions/` no
+  longer gets the rule or decision kind. The path-kind match used SQLite
+  `LIKE`, which ignores ASCII case, so `_RULES/x.md` carried rule authority in
+  search while the rule and briefing loaders, which match `_rules/` exactly,
+  never loaded it. The match is now case-sensitive and such pages are facts.
 
 ## [3.4.6] - 2026-11-13
 

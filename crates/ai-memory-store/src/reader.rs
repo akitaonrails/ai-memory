@@ -255,11 +255,7 @@ pub const PAGE_KINDS: [&str; 10] = [
 pub(crate) fn page_kind_expr(path_column: &str, frontmatter_column: &str) -> String {
     let arms: String = PATH_KINDS
         .iter()
-        .map(|(prefix, kind)| {
-            // `_` is a LIKE wildcard; escape it so `_rules/` matches only itself.
-            let prefix = prefix.replace('_', "\\_");
-            format!("WHEN {path_column} LIKE '{prefix}%' ESCAPE '\\' THEN '{kind}' ")
-        })
+        .map(|(prefix, kind)| format!("WHEN {path_column} GLOB '{prefix}*' THEN '{kind}' "))
         .collect();
     // The cast keeps a non-string frontmatter `kind` (`kind: 5`) readable as
     // text instead of failing the row.
@@ -295,6 +291,9 @@ mod page_kind_tests {
         assert_eq!(kind("_rules/a.md", "{}"), "rule");
         assert_eq!(kind("xrules/a.md", "{}"), "fact");
         assert_eq!(kind("profile/a.md", "{}"), "preference");
+        assert_eq!(kind("_RULES/a.md", "{}"), "fact");
+        assert_eq!(kind("Decisions/a.md", "{}"), "fact");
+        assert_eq!(kind("SESSIONS/a.md", "{}"), "fact");
         assert_eq!(kind("sessions/a.md", r#"{"kind":"custom"}"#), "custom");
         assert_eq!(kind("sessions/a.md", r#"{"kind":5}"#), "5");
     }
