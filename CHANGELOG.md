@@ -13,10 +13,6 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
-- The lifecycle relay now accepts an identical concurrent `init` whose peer
-  created the queue directory first, after rechecking its privacy and path
-  guards. It previously failed with `File exists` during first-time startup.
-  (#2265)
 - `export-okf` no longer silently drops a concept page that occupies an
   OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
   hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
@@ -33,6 +29,10 @@ version in [`docs/changelog/`](docs/changelog/):
 - The document importer now preserves DOCX nonbreaking hyphens encoded as
   `w:noBreakHyphen` elements. It previously dropped them and joined the
   surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)
+- The lifecycle relay now accepts an identical concurrent `init` whose peer
+  created the queue directory first, after rechecking its privacy and path
+  guards. It previously failed with `File exists` during first-time startup.
+  (#2265)
 - `status --json` now preserves the server's write-queue depth and wiki-format
   diagnostics. Both fields were read from the server and shown in the human
   report but silently dropped from JSON, hiding a backed-up writer from
