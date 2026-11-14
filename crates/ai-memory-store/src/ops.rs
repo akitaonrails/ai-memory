@@ -6109,7 +6109,12 @@ pub fn cancel_handoff(
 /// here, as it was when this reused the 16 KiB handoff budget (#2241). The
 /// handoff budget stays 16 KiB.
 const MESSAGE_FIELD_MAX_BYTES: usize = 32 * 1024;
-const MESSAGE_EVIDENCE_MAX_BYTES: usize = 1_000;
+/// Store-boundary bound for `evidence` (the last gate; MCP and web callers
+/// scrub and cap evidence at 1 000 characters first). 4 KiB holds 1 000
+/// characters at UTF-8's four-byte worst case plus margin for the MCP tool's
+/// character-cap notice, so valid evidence is never silently truncated here
+/// (#2283).
+const MESSAGE_EVIDENCE_MAX_BYTES: usize = 4 * 1024;
 
 /// Maximum pending messages one recipient project may hold. A full inbox
 /// rejects new sends, so a hostile or buggy sender cannot flood a recipient's
