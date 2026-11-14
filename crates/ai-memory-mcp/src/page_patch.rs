@@ -257,6 +257,23 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
         changes.push(change);
     }
 
+    // Two section insertions at an unterminated heading's EOF have no
+    // unambiguous order: an ancestor append and the new section body resolve
+    // to the same byte, regardless of the request order. Refuse the batch.
+    if repaired_unterminated_heading
+        && changes
+            .iter()
+            .filter(|change| {
+                change.placement == Placement::Section
+                    && change.range.start == body.len()
+                    && change.range.is_empty()
+            })
+            .count()
+            > 1
+    {
+        return Err(PatchError::Overlapping);
+    }
+
     // A replacement deletes every section nested in it, so no other edit may
     // write into one of those. An append to the last nested section inserts
     // exactly where the replaced range ends, which the range check below lets
@@ -1047,6 +1064,41 @@ mod tests {
             ] {
                 assert_eq!(apply(body, &edits).unwrap(), expected, "{body:?}");
             }
+        }
+    }
+
+    #[test]
+    fn replacing_unterminated_heading_refuses_an_ancestor_append_at_same_eof() {
+        let body = "# T\n## Parent\ntext\n### One";
+        let section = section_hashes(body)
+            .0
+            .into_iter()
+            .find(|s| s.anchor == "One")
+            .unwrap();
+        let replace = PagePatchEdit::ReplaceSection {
+            anchor: "One".into(),
+            section_sha256: section.sha256,
+            content: "new".into(),
+        };
+        let append_parent = PagePatchEdit::Append {
+            target: AppendTarget::Section,
+            anchor: Some("Parent".into()),
+            content: "parent".into(),
+        };
+        let append_eof = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append_parent.clone(), append_eof.clone()],
+            vec![replace.clone(), append_eof.clone(), append_parent.clone()],
+            vec![append_parent.clone(), replace.clone(), append_eof.clone()],
+            vec![append_parent.clone(), append_eof.clone(), replace.clone()],
+            vec![append_eof.clone(), replace.clone(), append_parent.clone()],
+            vec![append_eof, append_parent, replace],
+        ] {
+            assert_eq!(apply(body, &edits), Err(PatchError::Overlapping));
         }
     }
 }
