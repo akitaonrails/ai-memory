@@ -519,7 +519,6 @@ struct PageAuthority {
     /// Kind/tier penalty this page carries *because* it is a session page
     /// (`0.0` for every other kind). A `session_recall` query gives it back.
     session_penalty: f64,
-    /// Ceiling a negative curator tag sets; `None` for untagged pages.
     cap: Option<f64>,
 }
 
