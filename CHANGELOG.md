@@ -58,7 +58,7 @@ version in [`docs/changelog/`](docs/changelog/):
   and its result. The adapter dropped the id, so each result took the
   strictest capture decision among all calls of its turn, and one excluded
   call withheld the results of every other call in that turn. A result is
-  now paired with its own call by id.
+  now paired with its own call by id. (#2259)
 
 ## [3.4.6] - 2026-11-13
 
