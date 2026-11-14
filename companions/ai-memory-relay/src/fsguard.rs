@@ -188,6 +188,22 @@ fn check_existing_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn finish_directory_creation(dir: &Path, created: std::io::Result<()>) -> Result<()> {
+    match created {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another initializer may win after our missing-path inspection.
+            // Its path must pass the same checks as any pre-existing queue.
+            reject_symlink(dir)?;
+            if !std::fs::symlink_metadata(dir)?.is_dir() {
+                bail!("--queue-dir {} is not a directory", dir.display());
+            }
+            check_existing_dir(dir)
+        }
+        Err(error) => Err(error).with_context(|| format!("create {}", dir.display())),
+    }
+}
+
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -200,10 +216,7 @@ fn create_private_dir(dir: &Path) -> Result<()> {
             dir.display()
         );
     }
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("create {}", dir.display()))
+    finish_directory_creation(dir, std::fs::DirBuilder::new().mode(0o700).create(dir))
 }
 
 #[cfg(not(unix))]
@@ -217,7 +230,7 @@ fn create_private_dir(dir: &Path) -> Result<()> {
             dir.display()
         );
     }
-    std::fs::create_dir(dir).with_context(|| format!("create {}", dir.display()))
+    finish_directory_creation(dir, std::fs::create_dir(dir))
 }
 
 /// Create a queue file owner-only, or leave an existing one alone.
@@ -301,5 +314,74 @@ mod tests {
             Err::<(), _>(Error::from(ErrorKind::NotFound))
         });
         assert_eq!(missing.unwrap(), None);
+    }
+
+    #[test]
+    fn a_concurrent_private_directory_creator_is_recognized() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("queue");
+        create_private_dir(&dir).unwrap();
+
+        // The first creator won after the other process inspected a missing path.
+        create_private_dir(&dir).expect("an identical creator must be recognized");
+        assert_eq!(
+            prepare_queue_dir(&dir).unwrap(),
+            dir.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_concurrent_file_creator_is_refused_without_changing_its_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("queue");
+        std::fs::write(&dir, b"not a queue directory").unwrap();
+
+        assert!(create_private_dir(&dir).is_err());
+        assert_eq!(std::fs::read(&dir).unwrap(), b"not a queue directory");
+    }
+
+    #[test]
+    fn a_concurrent_directory_holding_unrelated_files_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("queue");
+        create_private_dir(&dir).unwrap();
+        let foreign = dir.join("unrelated.txt");
+        std::fs::write(&foreign, b"keep this file").unwrap();
+
+        assert!(create_private_dir(&dir).is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"keep this file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_concurrent_shared_directory_creator_is_refused_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("queue");
+        create_private_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(create_private_dir(&dir).is_err());
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_concurrent_symlink_creator_is_refused_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let dir = root.path().join("queue");
+        create_private_dir(&target).unwrap();
+        symlink(&target, &dir).unwrap();
+
+        assert!(create_private_dir(&dir).is_err());
+        assert!(dir.is_symlink());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
     }
 }

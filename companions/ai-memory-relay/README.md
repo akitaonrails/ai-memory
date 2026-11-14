@@ -37,8 +37,10 @@ ai-memory-relay init \
 ```
 
 This binds the queue to one destination and scope. Repeating an identical `init`
-is safe. A different binding is rejected. `actor` is a stable namespace used to
-derive retry keys; authentication still comes from the server's bearer token.
+is safe, including concurrent first-time initialization of the same queue
+directory. A directory created by another initializer must pass the existing
+privacy and path checks. A different binding is rejected. `actor` is a stable
+namespace used to derive retry keys; authentication still comes from the server's bearer token.
 It does not select or impersonate a server user.
 
 When the orchestrator launches a harness whose lifecycle it captures, pass
