@@ -54,6 +54,11 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- `auto-improve-report` no longer drops the eval-gate rejection finding when
+  `--top-limit` is small. The finding summed `eval_gate_*` reasons from the
+  rejection-reason table, which keeps only the top N reasons, so with
+  `--top-limit 1` three human rejections hid two eval-gate failures. The
+  report now reads a separate eval-gate count that ignores the limit.
 
 ## [3.4.6] - 2026-11-13
 

@@ -1588,6 +1588,18 @@ mod tests {
                 .iter()
                 .any(|row| row.count == 2)
         );
+        assert_eq!(aggregate.eval_gate_rejections, 4);
+
+        let top_one = store
+            .reader
+            .auto_improve_telemetry_aggregate(ws, proj, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(top_one.rejections_by_reason.len(), 1);
+        assert_eq!(
+            top_one.eval_gate_rejections, 4,
+            "the eval-gate count must not depend on the top-N reason table"
+        );
 
         let other_aggregate = store
             .reader

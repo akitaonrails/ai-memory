@@ -13194,6 +13194,12 @@ impl ReaderPool {
                     since_created_at,
                     top_limit,
                 )?,
+                eval_gate_rejections: auto_improve_eval_gate_rejection_count(
+                    conn,
+                    workspace_id,
+                    project_id,
+                    since_created_at,
+                )?,
                 repeated_rejection_fingerprints: auto_improve_repeated_rejection_fingerprints(
                     conn,
                     workspace_id,
@@ -16038,6 +16044,37 @@ fn auto_improve_group_counts(
         out.push(row?);
     }
     Ok(out)
+}
+
+fn auto_improve_eval_gate_rejection_count(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    since_created_at: i64,
+) -> rusqlite::Result<usize> {
+    let reasons = crate::auto_improve::EVAL_GATE_REJECTION_REASONS
+        .iter()
+        .map(|reason| format!("'{reason}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT COUNT(*)
+         FROM auto_improve_rejections r
+         LEFT JOIN auto_improve_proposals p ON p.id = r.source_proposal_id
+         WHERE r.workspace_id = ?1 AND r.project_id = ?2 AND r.created_at >= ?3
+           AND (r.source_proposal_id IS NULL OR COALESCE(p.kind, '') NOT IN ('curator_report', 'auto_improve_report'))
+           AND r.reason IN ({reasons})"
+    );
+    let count: i64 = conn.query_row(
+        &sql,
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            since_created_at
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
 fn auto_improve_rejection_group_counts(

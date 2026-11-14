@@ -134,9 +134,7 @@ pub fn build_auto_improve_telemetry_report(
         .iter()
         .map(|row| row.count)
         .sum();
-    let eval_gate_count = count_for(&aggregate.rejections_by_reason, "eval_gate_failed")
-        + count_for(&aggregate.rejections_by_reason, "eval_gate_timeout")
-        + count_for(&aggregate.rejections_by_reason, "eval_gate_error");
+    let eval_gate_count = aggregate.eval_gate_rejections;
     let mut findings = Vec::new();
     if terminal_rates.denominator == 0 {
         findings.push(AutoImproveTelemetryFinding {
@@ -410,6 +408,7 @@ mod tests {
             maintenance_proposals_by_kind: vec![count("auto_improve_report", 1)],
             top_targets: vec![count("notes/a.md", 2)],
             rejections_by_reason: vec![count("eval_gate_failed", 2)],
+            eval_gate_rejections: 2,
             repeated_rejection_fingerprints: vec![count("abc123", 2)],
             rejected_targets: vec![count("notes/a.md", 2)],
         };
@@ -447,5 +446,44 @@ mod tests {
         assert!(markdown.contains("# Auto-Improve Telemetry Report"));
         assert!(markdown.contains("Denominator: terminal learning proposals only"));
         assert!(markdown.contains("Eval-gate rejection reasons are counted"));
+    }
+
+    #[test]
+    fn eval_gate_finding_survives_a_truncated_reason_table() {
+        let aggregate = AutoImproveTelemetryAggregate {
+            run_count: 1,
+            runs_with_learning_proposals: 1,
+            proposals_by_status: vec![count("rejected", 3)],
+            proposals_by_operation: Vec::new(),
+            proposals_by_edit_mode: Vec::new(),
+            proposals_by_kind: Vec::new(),
+            maintenance_proposals_by_kind: Vec::new(),
+            top_targets: Vec::new(),
+            rejections_by_reason: vec![count("human rejected", 3)],
+            eval_gate_rejections: 2,
+            repeated_rejection_fingerprints: Vec::new(),
+            rejected_targets: Vec::new(),
+        };
+        let report = build_auto_improve_telemetry_report(
+            "default",
+            "app",
+            "2026-06-22T00:00:00Z".into(),
+            42,
+            AutoImproveTelemetryParams {
+                since_days: 30,
+                top_limit: 1,
+            },
+            aggregate,
+        );
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == "eval_gate_rejections_seen")
+            .expect("eval-gate finding must not vanish with --top-limit 1");
+        assert_eq!(
+            finding.detail,
+            Some(serde_json::json!({ "eval_gate_rejections": 2 }))
+        );
     }
 }
