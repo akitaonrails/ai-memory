@@ -13,6 +13,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- The SessionEnd consolidation worker no longer replaces a session page the
+  agent writes with `memory_write_page` while the worker's completion is
+  running. It checked for the agent's page once, before the completion, and
+  then wrote unconditionally, so the agent's page survived only as a
+  superseded version. The worker now writes conditional on the page version it
+  read before that check and keeps the agent's page when it lands in between;
+  a rule-based summary or checkpoint landing in between is still replaced, as
+  before. (#2275)
 - `export-okf` no longer silently drops a concept page that occupies an
   OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
   hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
