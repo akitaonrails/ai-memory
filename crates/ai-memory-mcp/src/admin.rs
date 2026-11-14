@@ -10448,11 +10448,15 @@ mod tests {
         let h = MessageTextHarness::new().await;
         let body = format!("{} SENTINEL", "界".repeat(3_000));
         let subject = format!("{} SENTINEL", "界".repeat(100));
-        let evidence = format!("{} EVIDENCE", "界".repeat(100));
+        let evidence = format!("{} EVIDENCE", "界".repeat(500));
         let stored = h.send(&body, &subject, &evidence).await;
         assert_eq!(stored.body, body);
         assert_eq!(stored.subject.as_deref(), Some(subject.as_str()));
         assert_eq!(stored.evidence.as_deref(), Some(evidence.as_str()));
+
+        let max = "𝐀".repeat(MESSAGE_EVIDENCE_MAX_CHARS);
+        let stored_max = h.send("body", "subject", &max).await;
+        assert_eq!(stored_max.evidence.as_deref(), Some(max.as_str()));
     }
 
     #[tokio::test]

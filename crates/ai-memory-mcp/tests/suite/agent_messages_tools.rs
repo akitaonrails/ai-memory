@@ -458,3 +458,70 @@ async fn recipient_cannot_cancel_the_senders_message() {
     .await;
     assert_eq!(popped["message"]["id"].as_str(), Some(id.as_str()));
 }
+
+/// Measured evidence within the 1 000-character budget (including multibyte UTF-8)
+/// and the character-cap notice added for oversized inputs must survive the store
+/// boundary intact (#2283).
+#[tokio::test]
+async fn measured_evidence_within_char_budget_and_truncation_marker_survive() {
+    let h = harness().await;
+    let multibyte = format!("{} END", "界".repeat(500));
+    assert_eq!(multibyte.chars().count(), 504);
+    assert!(multibyte.len() > 1_000);
+
+    let sent_multibyte = call(
+        &h.router,
+        "memory_message_send",
+        json!({
+            "from_workspace": WS,
+            "from_project": A,
+            "to_workspace": WS,
+            "to_project": B,
+            "body": "benchmark result",
+            "nature": "measured",
+            "evidence": multibyte,
+        }),
+    )
+    .await;
+    let multibyte_id = sent_multibyte["message_id"].as_str().unwrap().to_string();
+
+    let oversized = "e".repeat(1_500);
+    let sent_oversized = call(
+        &h.router,
+        "memory_message_send",
+        json!({
+            "from_workspace": WS,
+            "from_project": A,
+            "to_workspace": WS,
+            "to_project": B,
+            "body": "long evidence result",
+            "nature": "measured",
+            "evidence": oversized,
+        }),
+    )
+    .await;
+    let oversized_id = sent_oversized["message_id"].as_str().unwrap().to_string();
+
+    let inbox = list(&h.router, B, "inbox").await;
+    let stored_multibyte = inbox
+        .iter()
+        .find(|m| m["id"].as_str() == Some(multibyte_id.as_str()))
+        .unwrap();
+    assert_eq!(
+        stored_multibyte["evidence"].as_str(),
+        Some(multibyte.as_str())
+    );
+
+    let stored_oversized = inbox
+        .iter()
+        .find(|m| m["id"].as_str() == Some(oversized_id.as_str()))
+        .unwrap();
+    let expected = format!(
+        "{}\n[message evidence truncated; 500 chars omitted]",
+        "e".repeat(1_000)
+    );
+    assert_eq!(
+        stored_oversized["evidence"].as_str(),
+        Some(expected.as_str())
+    );
+}
