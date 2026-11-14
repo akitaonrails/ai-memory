@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - The lifecycle relay now accepts an identical concurrent `init` whose peer
   created the queue directory first, after rechecking its privacy and path
   guards. It previously failed with `File exists` during first-time startup.
-  (#PR)
+  (#2265)
 - `export-okf` no longer silently drops a concept page that occupies an
   OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
   hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
