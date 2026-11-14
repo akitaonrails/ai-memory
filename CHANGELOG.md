@@ -54,6 +54,11 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- OpenCode transcript imports now keep each tool call's `callID` on the call
+  and its result. The adapter dropped the id, so each result took the
+  strictest capture decision among all calls of its turn, and one excluded
+  call withheld the results of every other call in that turn. A result is
+  now paired with its own call by id.
 
 ## [3.4.6] - 2026-11-13
 
