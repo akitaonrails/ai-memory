@@ -1,4 +1,4 @@
-function Get-AiMemoryCwd {
+﻿function Get-AiMemoryCwd {
     param([string] $Payload)
     if (-not $Payload) { return $null }
     try {
@@ -920,9 +920,26 @@ function New-AiMemorySessionId {
     return "$Agent-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$PID"
 }
 
+function Get-AiMemoryNativeSessionId {
+    param([object] $ParsedPayload)
+    if ($null -eq $ParsedPayload) { return $null }
+    foreach ($Name in @(
+        "session_id", "sessionId", "sessionID", "session", "conversationId", "taskId"
+    )) {
+        $Property = $ParsedPayload.PSObject.Properties[$Name]
+        if ($null -ne $Property -and $Property.Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Property.Value)) {
+            return $Property.Value.Trim()
+        }
+    }
+    return $null
+}
+
 function Get-AiMemorySessionIdQuery {
-    param([string] $Agent, [string] $Event)
-    if ($env:AI_MEMORY_SESSION_ID) {
+    param([string] $Agent, [string] $Event, [string] $NativeSessionId = "")
+    if (-not [string]::IsNullOrWhiteSpace($NativeSessionId)) {
+        return ""
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:AI_MEMORY_SESSION_ID)) {
         return "&session_id=$([uri]::EscapeDataString($env:AI_MEMORY_SESSION_ID))"
     }
 
@@ -931,7 +948,7 @@ function Get-AiMemorySessionIdQuery {
     if ($Event -ne "session-start" -and (Test-Path $Path -PathType Leaf)) {
         $SessionId = (Get-Content $Path -TotalCount 1 -ErrorAction SilentlyContinue)
     }
-    if (-not $SessionId) {
+    if ([string]::IsNullOrWhiteSpace($SessionId)) {
         $SessionId = New-AiMemorySessionId -Agent $Agent
         $Parent = Split-Path $Path -Parent
         New-Item -ItemType Directory -Force -Path $Parent -ErrorAction SilentlyContinue | Out-Null
@@ -941,7 +958,10 @@ function Get-AiMemorySessionIdQuery {
 }
 
 function Clear-AiMemorySessionId {
-    param([string] $Agent)
+    param([string] $Agent, [string] $NativeSessionId = "")
+    if ($Agent -eq "devin" -and -not [string]::IsNullOrWhiteSpace($env:AI_MEMORY_SESSION_ID) -and [string]::IsNullOrWhiteSpace($NativeSessionId)) {
+        return
+    }
     $Path = Get-AiMemorySessionIdPath -Agent $Agent
     Remove-Item -Force -ErrorAction SilentlyContinue $Path
 }
@@ -1134,9 +1154,16 @@ function Invoke-AiMemoryHook {
     if ($env:AI_MEMORY_AUTO_HANDOFF -and $env:AI_MEMORY_AUTO_HANDOFF.Trim().ToLowerInvariant() -in @("0", "false", "no", "off")) {
         $QS += "&auto_handoff=0"
     }
+    $HookParsedPayload = $null
+    $HookNativeSessionId = $null
+    try {
+        $HookParsedPayload = $Payload | ConvertFrom-Json
+        $HookNativeSessionId = Get-AiMemoryNativeSessionId -ParsedPayload $HookParsedPayload
+    } catch {
+    }
     $SessionQS = ""
     if ($Agent -eq "devin") {
-        $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event
+        $SessionQS = Get-AiMemorySessionIdQuery -Agent $Agent -Event $Event -NativeSessionId ([string]$HookNativeSessionId)
     }
     # Every request names this client: an unauthenticated server reached
     # through a non-loopback host name refuses a handoff fetch without the
@@ -1198,7 +1225,7 @@ function Invoke-AiMemoryHook {
         }
     }
     if ($Agent -eq "devin" -and $Event -eq "session-end") {
-        Clear-AiMemorySessionId -Agent $Agent
+        Clear-AiMemorySessionId -Agent $Agent -NativeSessionId ([string]$HookNativeSessionId)
     }
 
     # A subagent runs inside its parent's session, so its brief comes from the
@@ -1241,22 +1268,13 @@ function Invoke-AiMemoryHook {
     # Without a directory the handoff stays open for memory_handoff_accept
     # (parity with the native hook and `ai_memory_get_handoff`).
     if ($FetchHandoff -and $Cwd) {
+        $ParsedPayload = $HookParsedPayload
+        $NativeSessionId = $HookNativeSessionId
         $NativeSessionQS = ""
-        $NativeSessionId = $null
-        try {
-            $ParsedPayload = $Payload | ConvertFrom-Json
-            $NativeSessionId = @(
-                $ParsedPayload.session_id,
-                $ParsedPayload.sessionId,
-                $ParsedPayload.sessionID,
-                $ParsedPayload.session,
-                $ParsedPayload.conversationId
-            ) | Where-Object { $_ } | Select-Object -First 1
-            if ($NativeSessionId) {
-                $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
-            }
-        } catch {
+        if ($NativeSessionId) {
+            $NativeSessionQS = "&session_id=$([Uri]::EscapeDataString([string]$NativeSessionId))"
         }
+        $HandoffSessionQS = if ($NativeSessionQS) { $NativeSessionQS } else { $SessionQS }
         # A compaction's SessionStart (`source: "compact"`) is mid-session:
         # claim no handoff, recovery snapshot or brief, and print the same
         # empty reply as "no pending handoff" (parity with the native hook and
@@ -1346,7 +1364,7 @@ function Invoke-AiMemoryHook {
             $Response = Invoke-WebRequest @NoProxy `
                 -UseBasicParsing `
                 -TimeoutSec 2 `
-                -Uri "$Server/handoff?agent=$Agent$QS$NativeSessionQS$BriefQS$ProfileQS$ClaimQS" `
+                -Uri "$Server/handoff?agent=$Agent$QS$HandoffSessionQS$BriefQS$ProfileQS$ClaimQS" `
                 -Headers $Headers
             $Status = Get-AiMemoryResponseStatus $Response
             if ($Status -ge 200 -and $Status -lt 300 -and $null -ne $Response -and $Response.Content) {

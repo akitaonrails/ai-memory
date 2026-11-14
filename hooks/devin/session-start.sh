@@ -14,11 +14,14 @@ CWD=$(ai_memory_resolve_cwd "$PAYLOAD")
 QS=$(ai_memory_marker_qs "$CWD")
 # The `[briefing]` opt-in rides the handoff GET, as in the native hook.
 BRIEF_QS=$(ai_memory_briefing_qs "$CWD")
-SID_QS=$(ai_memory_session_id_qs devin session-start)
+SID_QS=$(ai_memory_session_id_qs devin session-start "$PAYLOAD")
 
 printf '%s' "$PAYLOAD" \
     | ai_memory_post_hook "$SERVER/hook?event=session-start&agent=devin${QS}${SID_QS}" >/dev/null 2>&1 || true
 
+if [ -z "$SID_QS" ] && _am_native_sid=$(ai_memory_payload_session_id "$PAYLOAD"); then
+    SID_QS="&session_id=$(ai_memory_url_encode "$_am_native_sid")"
+fi
 HANDOFF=$(ai_memory_get_start_handoff "$PAYLOAD" "$SERVER/handoff?agent=devin${QS}${SID_QS}${BRIEF_QS}" 2>/dev/null || true)
 if [ -n "$HANDOFF" ]; then
     printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":%s}}\n' \

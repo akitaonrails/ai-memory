@@ -7,9 +7,11 @@
 #![cfg(windows)]
 
 use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +38,46 @@ fn header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
+fn read_http_request(stream: &mut TcpStream, require_len: bool) -> (String, Vec<u8>) {
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    let mut request = Vec::new();
+    let (body_start, body_len) = loop {
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk).expect("read request");
+        assert!(read > 0, "request ended before its headers");
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(end) = header_end(&request) {
+            let headers = String::from_utf8_lossy(&request[..end]);
+            let parsed_len = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            });
+            let len = if require_len {
+                parsed_len.expect("drain request should carry Content-Length")
+            } else {
+                parsed_len.unwrap_or(0)
+            };
+            break (end + 4, len);
+        }
+    };
+    while request.len() < body_start + body_len {
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk).expect("read request body");
+        assert!(read > 0, "request body ended early");
+        request.extend_from_slice(&chunk[..read]);
+    }
+
+    let headers = String::from_utf8(request[..body_start - 4].to_vec()).unwrap();
+    let body = request[body_start..body_start + body_len].to_vec();
+    (headers, body)
+}
+
 /// Read one full HTTP request and answer it with `response`. A cold
 /// PowerShell start on a loaded windows-latest runner can take well over
 /// ten seconds before opening a connection, so the accept window only
@@ -56,42 +98,33 @@ fn serve_one(listener: &TcpListener, response: &[u8]) -> (String, Vec<u8>) {
             Err(error) => panic!("mock drain server accept failed: {error}"),
         }
     };
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-
-    let mut request = Vec::new();
-    let (body_start, body_len) = loop {
-        let mut chunk = [0_u8; 4096];
-        let read = stream.read(&mut chunk).expect("read drain request");
-        assert!(read > 0, "drain request ended before its headers");
-        request.extend_from_slice(&chunk[..read]);
-        if let Some(end) = header_end(&request) {
-            let headers = String::from_utf8_lossy(&request[..end]);
-            let len = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .expect("drain request should carry Content-Length");
-            break (end + 4, len);
-        }
-    };
-    while request.len() < body_start + body_len {
-        let mut chunk = [0_u8; 4096];
-        let read = stream.read(&mut chunk).expect("read drain request body");
-        assert!(read > 0, "drain request body ended early");
-        request.extend_from_slice(&chunk[..read]);
-    }
-
+    let (headers, body) = read_http_request(&mut stream, true);
     stream.write_all(response).unwrap();
-    let headers = String::from_utf8(request[..body_start - 4].to_vec()).unwrap();
-    let body = request[body_start..body_start + body_len].to_vec();
     (headers, body)
+}
+
+fn serve_requests(listener: &TcpListener, stop: &AtomicBool, resp: &[u8]) -> Vec<String> {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut requests = Vec::new();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let (headers, _) = read_http_request(&mut stream, false);
+                stream.write_all(resp).unwrap();
+                let line = headers.lines().next().unwrap_or_default().to_owned();
+                requests.push(line);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    return requests;
+                }
+                assert!(Instant::now() < deadline, "Devin server timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("mock Devin accept failed: {error}"),
+        }
+    }
 }
 
 /// Run a PowerShell program with HOME/USERPROFILE and the data dir pinned
@@ -349,4 +382,166 @@ fn powershell_drain_keeps_backlog_on_429_saturation() {
         1,
         "a 429 response must keep the entry queued"
     );
+}
+
+#[test]
+fn powershell_devin_session_id_pin_and_native_precedence() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let receiver = thread::spawn(move || {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        serve_requests(&listener, &stop_flag, resp)
+    });
+
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = home.path().join("data");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let slot = data_dir.join("hook-state").join("devin-session-id");
+    let report_path = home.path().join("report.txt");
+
+    let program = format!(
+        ". '{lib}'; \
+         $script:payload = '{{}}'; \
+         function Read-AiMemoryStdin {{ $script:payload }}; \
+         $repo = $env:AI_MEMORY_TEST_REPO; \
+         $slot = $env:AI_MEMORY_TEST_SLOT; \
+         $report = $env:AI_MEMORY_TEST_REPORT; \
+         $slotDir = Split-Path -LiteralPath $slot -Parent; \
+         New-Item -ItemType Directory -Force -Path $slotDir | Out-Null; \
+         function Set-Slot([string]$v) {{ Set-Content -LiteralPath $slot -Value $v -NoNewline }}; \
+         function Record-Slot([string]$tag) {{ \
+             if (Test-Path -LiteralPath $slot -PathType Leaf) {{ \
+                 $v = Get-Content -LiteralPath $slot -Raw; \
+                 Add-Content -LiteralPath $report -Value ($tag + '=present:' + $v) \
+             }} else {{ \
+                 Add-Content -LiteralPath $report -Value ($tag + '=missing') \
+             }} \
+         }}; \
+         $bare = @{{ cwd = $repo }} | ConvertTo-Json -Compress; \
+         $native = @{{ cwd = $repo; session_id = 'native-ps-1' }} | ConvertTo-Json -Compress; \
+         $taskPayload = @{{ cwd = $repo; taskId = 'task-ps-1' }} | ConvertTo-Json -Compress; \
+         $nested = @{{ cwd = $repo; tool_input = @{{ session_id = 'nested-ps' }} }} \
+             | ConvertTo-Json -Compress; \
+         function Start-Devin {{ \
+             Invoke-AiMemoryHook -Event 'session-start' -Agent 'devin' \
+                 -FetchHandoff -SessionStartEnvelope \
+         }}; \
+         $env:AI_MEMORY_SESSION_ID = 'ps-pin 1'; \
+         Remove-Item Env:AI_MEMORY_CAPTURE_OWNER -ErrorAction SilentlyContinue; \
+         Set-Slot 'stale-slot'; \
+         $script:payload = $bare; \
+         Start-Devin; \
+         Invoke-AiMemoryHook -Event 'session-end' -Agent 'devin'; \
+         Record-Slot 'pin-bare-unowned'; \
+         $env:AI_MEMORY_CAPTURE_OWNER = 'external'; \
+         Invoke-AiMemoryHook -Event 'session-end' -Agent 'devin'; \
+         Record-Slot 'pin-bare-owned'; \
+         Remove-Item Env:AI_MEMORY_CAPTURE_OWNER -ErrorAction SilentlyContinue; \
+         $script:payload = $native; \
+         Start-Devin; \
+         $env:AI_MEMORY_CAPTURE_OWNER = 'external'; \
+         Invoke-AiMemoryHook -Event 'session-end' -Agent 'devin'; \
+         Record-Slot 'pin-native-owned'; \
+         Set-Slot 'stale-slot'; \
+         Remove-Item Env:AI_MEMORY_CAPTURE_OWNER -ErrorAction SilentlyContinue; \
+         Invoke-AiMemoryHook -Event 'session-end' -Agent 'devin'; \
+         Record-Slot 'pin-native-unowned'; \
+         Set-Slot 'stale-slot'; \
+         $script:payload = $taskPayload; \
+         Start-Devin; \
+         Invoke-AiMemoryHook -Event 'session-end' -Agent 'devin'; \
+         Record-Slot 'pin-taskid'; \
+         Set-Slot 'stale-slot'; \
+         $script:payload = $nested; \
+         Start-Devin; \
+         Invoke-AiMemoryHook -Event 'session-end' -Agent 'devin'; \
+         Record-Slot 'pin-nested'; \
+         $env:AI_MEMORY_SESSION_ID = '   ' + [char]9; \
+         Set-Slot 'stale-slot'; \
+         $script:payload = $bare; \
+         Start-Devin; \
+         Record-Slot 'ws-start'; \
+         Invoke-AiMemoryHook -Event 'post-tool-use' -Agent 'devin'; \
+         Invoke-AiMemoryHook -Event 'session-end' -Agent 'devin'; \
+         Record-Slot 'ws-end'",
+        lib = hook_lib()
+    );
+
+    let output = run_powershell(
+        &program,
+        home.path(),
+        &[
+            ("AI_MEMORY_HOOK_URL", server.as_str()),
+            ("AI_MEMORY_DATA_DIR", data_dir.to_str().unwrap()),
+            ("AI_MEMORY_TEST_REPO", repo.to_str().unwrap()),
+            ("AI_MEMORY_TEST_SLOT", slot.to_str().unwrap()),
+            ("AI_MEMORY_TEST_REPORT", report_path.to_str().unwrap()),
+        ],
+    );
+    stop.store(true, Ordering::Release);
+    let requests = receiver.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "PowerShell Devin harness failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 16, "unexpected: {requests:?}");
+
+    let report_text = std::fs::read_to_string(&report_path).unwrap();
+    let reports: Vec<&str> = report_text.lines().collect();
+    let minted = reports
+        .get(6)
+        .and_then(|line| line.strip_prefix("ws-start=present:"))
+        .expect("whitespace pin session-start should record minted slot");
+    assert!(
+        minted.starts_with("devin-") && minted != "stale-slot",
+        "expected fresh fallback slot id, got {minted:?}"
+    );
+    let expected_ws = format!("ws-start=present:{minted}");
+    assert_eq!(
+        reports,
+        [
+            "pin-bare-unowned=present:stale-slot",
+            "pin-bare-owned=present:stale-slot",
+            "pin-native-owned=missing",
+            "pin-native-unowned=missing",
+            "pin-taskid=missing",
+            "pin-nested=present:stale-slot",
+            expected_ws.as_str(),
+            "ws-end=missing",
+        ]
+    );
+
+    let expected = [
+        ("POST /hook?", Some("&session_id=ps-pin%201")),
+        ("GET /handoff?", Some("&session_id=ps-pin%201")),
+        ("POST /hook?", Some("&session_id=ps-pin%201")),
+        ("POST /hook?", None),
+        ("GET /handoff?", Some("&session_id=native-ps-1")),
+        ("POST /hook?", None),
+        ("POST /hook?", None),
+        ("GET /handoff?", Some("&session_id=task-ps-1")),
+        ("POST /hook?", None),
+        ("POST /hook?", Some("&session_id=ps-pin%201")),
+        ("GET /handoff?", Some("&session_id=ps-pin%201")),
+        ("POST /hook?", Some("&session_id=ps-pin%201")),
+    ];
+    for (req, (prefix, sid)) in requests.iter().zip(expected) {
+        assert!(req.contains(prefix), "missing {prefix} in {req:?}");
+        match sid {
+            Some(qs) => assert!(req.contains(qs), "missing {qs} in {req:?}"),
+            None => assert!(!req.contains("session_id="), "pin leaked: {req:?}"),
+        }
+    }
+    let minted_qs = format!("&session_id={minted}");
+    for request in &requests[12..=15] {
+        assert!(
+            request.contains(&minted_qs),
+            "expected {minted_qs} in {request:?}"
+        );
+    }
 }
