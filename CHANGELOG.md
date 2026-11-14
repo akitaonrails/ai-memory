@@ -54,6 +54,17 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- `ai-memory-eval retrieval` no longer prints credential `--server-env` and
+  `--candidate-server-env` values in its reports. The run's config line,
+  which lands in `report.md`, `report.json` and the log, copied every
+  `KEY=VALUE` pair as given, so a reranker provider key passed the way the
+  evals README describes ended up in a report meant for `docs/benchmarks/`.
+  A variable whose name has a `KEY`, `APIKEY`, `TOKEN`, `SECRET`,
+  `PASSWORD`, `PASSWD`, `CREDENTIALS` or `HEADERS` word now shows as
+  `env:NAME=<redacted>`; the eval server still receives the real value.
+  Values the line keeps, and `--query-arg` values, also pass through the
+  built-in sanitizer, so a password inside a URL or a provider key under an
+  unrelated name is redacted too. (#2274)
 
 ## [3.4.6] - 2026-11-13
 

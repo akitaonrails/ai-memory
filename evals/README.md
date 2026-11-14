@@ -486,7 +486,15 @@ knobs like `pin_first` / `include_superseded` can be A/B'd;
 `query`/`workspace`/`project`/`limit` are reserved). Each has a
 `--candidate-*` twin (`--candidate-embeddings`, `--candidate-reranker`,
 `--candidate-server-env`, `--candidate-query-arg`); a candidate knob left
-unset mirrors the baseline.
+unset mirrors the baseline. The report's config line names every
+`--server-env` variable, but prints `<redacted>` for the value of any name
+with a `KEY`, `APIKEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+`CREDENTIALS` or `HEADERS` word
+(`OPENAI_API_KEY`, `AI_MEMORY_LLM_HEADERS`), so a provider key passed for
+`--reranker` never reaches a published report. The values it keeps, and
+every `--query-arg` value, also pass through the built-in sanitizer patterns
+that hook capture applies, so a password inside a URL shows as
+`[REDACTED:<kind>]`.
 
 ```bash
 # Determinism check — baseline == candidate ⇒ accuracy/context delta = 0:
