@@ -1,4 +1,4 @@
-﻿function Get-AiMemoryCwd {
+function Get-AiMemoryCwd {
     param([string] $Payload)
     if (-not $Payload) { return $null }
     try {
