@@ -48,6 +48,9 @@ pub enum ProviderChoice {
     OpenCode,
     /// Cursor subscription via the logged-in `agent` CLI (`--print --mode ask`).
     Cursor,
+    /// Google Gemini through Vertex AI, billed to a Google Cloud project and
+    /// authenticated with Application Default Credentials.
+    Vertex,
 }
 
 impl ProviderChoice {
@@ -65,6 +68,7 @@ impl ProviderChoice {
             Self::AnthropicOAuth => "anthropic-oauth",
             Self::OpenCode => "opencode",
             Self::Cursor => "cursor",
+            Self::Vertex => "vertex",
         }
     }
 
@@ -92,6 +96,7 @@ impl ProviderChoice {
                 env_var: "OPENCODE_API_KEY",
             },
             Self::Cursor => AuthRequirement::CursorCli,
+            Self::Vertex => AuthRequirement::GoogleAdc,
         }
     }
 
@@ -431,6 +436,18 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                     .with_extra_headers(extra_headers),
             ))
         }
+        ProviderChoice::Vertex => {
+            let auth = config.auth.require_vertex_auth()?;
+            let mut provider = GeminiProvider::new_vertex(auth, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
+            Ok(Arc::new(
+                provider
+                    .with_timeout_secs(timeout)
+                    .with_extra_headers(extra_headers),
+            ))
+        }
         ProviderChoice::OpenAiCompat => {
             let base = config
                 .base_url
@@ -567,6 +584,7 @@ mod tests {
             ProviderChoice::AnthropicOAuth,
             ProviderChoice::Codex,
             ProviderChoice::Cursor,
+            ProviderChoice::Vertex,
         ] {
             assert!(
                 !choice.endpoint_is_operator_chosen(),
@@ -623,6 +641,41 @@ mod tests {
         assert_eq!(
             ProviderChoice::Cursor.auth_requirement(),
             AuthRequirement::CursorCli
+        );
+        assert_eq!(ProviderChoice::Vertex.name(), "vertex");
+        assert_eq!(
+            ProviderChoice::Vertex.auth_requirement(),
+            AuthRequirement::GoogleAdc
+        );
+    }
+
+    #[test]
+    fn vertex_without_credentials_fails_before_any_request() {
+        let cfg = ProviderConfig {
+            provider: ProviderChoice::Vertex,
+            model: "gemini-3.5-flash".into(),
+            auth: ProviderAuth::vertex(
+                None,
+                None,
+                "global".into(),
+                crate::CredentialSource::TokenFile,
+            ),
+            base_url: None,
+            compat_strict: false,
+            compat_disable_thinking: false,
+            compat_stream: None,
+            request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
+            reasoning_effort: None,
+            extra_headers: crate::ExtraHeaders::default(),
+            request_metadata_headers: false,
+        };
+        let err = match build_provider(cfg) {
+            Ok(_) => panic!("vertex must not build without credentials"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, LlmError::NotConfigured(ref msg) if msg.contains("GOOGLE_APPLICATION_CREDENTIALS")),
+            "{err}"
         );
     }
 

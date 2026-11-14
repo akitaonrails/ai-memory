@@ -63,6 +63,13 @@ regexes = [
     '''FAKEfake0123456789[A-Za-z0-9]*={0,2}''',
     '''xoxb-1234567890-abcdefghij''',
 
+    # ---- Throwaway RSA key for the Vertex service-account tests ----
+    # crates/ai-memory-llm/tests/support/vertex_test_service_account_key.pem
+    # was generated locally with `openssl genpkey` for the token-exchange tests
+    # and was never a Google key. This matches one line of that key only, so
+    # any other private key still fails the scan.
+    '''e7omM0NM\+GpBaK1otkSnN55aoJ\+rYP5RQOpRZXreSm7dRMsOLG36rPl1Q/3SBh7l''',
+
     # ---- Canary string used by the e2e test in tests/e2e/ ----
     '''sk-canary-LEAK_ME_PLEASE_[a-z0-9_]+''',
 

@@ -143,6 +143,7 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::AnthropicOauth => Self::AnthropicOAuth,
             LlmProviderChoice::Openai => Self::OpenAi,
             LlmProviderChoice::Gemini => Self::Gemini,
+            LlmProviderChoice::Vertex => Self::Vertex,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
             LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
             LlmProviderChoice::Codex => Self::Codex,
@@ -189,6 +190,14 @@ mod tests {
         assert_eq!(
             ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
             ProviderChoice::AnthropicOAuth
+        );
+    }
+
+    #[test]
+    fn vertex_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Vertex),
+            ProviderChoice::Vertex
         );
     }
 

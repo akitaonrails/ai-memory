@@ -3162,6 +3162,8 @@ pub enum LlmProviderChoice {
     Openai,
     /// Google Gemini (Generative Language API).
     Gemini,
+    /// Google Gemini through Vertex AI (Google Cloud billing, `gcloud` credentials).
+    Vertex,
     /// OpenAI-compatible local (Ollama, vLLM, LM Studio).
     OpenaiCompat,
     /// OpenAI ChatGPT/Codex OAuth backend.

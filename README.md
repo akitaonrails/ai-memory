@@ -724,8 +724,8 @@ identity/SSO, and offline-install questions specifically, see
 
 Optional. Everything works with zero LLM calls; adding a provider
 upgrades session summaries and enables semantic search. Anthropic,
-OpenAI (including OAuth), Codex CLI credential reuse, GitHub Copilot, Gemini,
-OpenCode (Go and Zen), the Cursor Agent CLI (`cursor`), and
+OpenAI (including OAuth), Codex CLI credential reuse, GitHub Copilot, Gemini
+(through AI Studio or Vertex AI), OpenCode (Go and Zen), the Cursor Agent CLI (`cursor`), and
 any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM) are supported
 for consolidation; OpenAI, Voyage, Gemini, and keyless OpenAI-compatible
 endpoints for embeddings. Configuration lives in

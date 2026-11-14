@@ -460,6 +460,12 @@ fn build_llm_provider(
             std::env::temp_dir(),
             &std::env::vars_os().collect::<Vec<_>>(),
         )),
+        AuthRequirement::GoogleAdc => ProviderAuth::vertex(
+            token_file.map(Into::into),
+            None,
+            "global".into(),
+            ai_memory_llm::CredentialSource::TokenFile,
+        ),
     };
 
     let config = ProviderConfig {

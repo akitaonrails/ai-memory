@@ -16,3 +16,4 @@ mod openai_compat_retry_after;
 mod openai_compat_strict;
 mod opencode_responses;
 mod redirect_credentials;
+mod vertex_provider;

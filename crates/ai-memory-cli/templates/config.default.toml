@@ -123,7 +123,7 @@ log_level = "info"
 # independently. Top-level keys have `AI_MEMORY_` environment equivalents.
 #   llm_provider = "anthropic"   # or openai | gemini | openai-compat |
 #                                # openai-oauth | anthropic-oauth | codex |
-#                                # copilot | opencode | cursor
+#                                # copilot | opencode | cursor | vertex
 #   llm_model    = "..."         # provider-specific model override
 #   llm_base_url = "..."         # endpoint override; required for openai-compat
 
