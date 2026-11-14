@@ -86,11 +86,12 @@ and reindex respect the purge tombstone.
 
 ## Interface and development
 
-The console uses a restrained operational light/dark palette with neutral
-surfaces, amber primary actions, and teal focus indicators. System is the
-default theme; explicit Light/Dark preferences persist locally. Fonts and
-their license notice are embedded under
-`static/management/` and served only by the optional console.
+The console shares the web interface's Memory Archive palette and type
+([`ui-design-system.md`](ui-design-system.md)): mineral-paper and graphite
+surfaces, amber primary actions and a copper focus outline. System is the
+default theme; explicit Light/Dark preferences persist locally. The fonts are
+embedded from `static/fonts/` and served from one table shared with `/web`;
+their license notice is served at `static/font-licenses.txt` by the console.
 
 Templates live in `templates/management/`. `src/management/views.rs` builds
 escaped view models, `forms.rs` maps plain POST operations, and `backend.rs`

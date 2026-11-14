@@ -4,10 +4,10 @@
 
 {% block content %}
 <div class="text-center py-20">
-  <p class="text-6xl font-bold text-slate-200 dark:text-slate-800">404</p>
-  <h1 class="mt-4 text-2xl font-semibold text-slate-700 dark:text-slate-300">{{ i18n.text("web-page-not-found") }}</h1>
-  <p class="mt-2 text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-the-page-you-re-looking-for-doesn-t-exist-or-has-been-superseded") }}</p>
-  <a href="." class="mt-6 inline-block rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
+  <p class="font-display text-6xl font-semibold text-line">404</p>
+  <h1 class="mt-4 text-3xl font-semibold text-text">{{ i18n.text("web-page-not-found") }}</h1>
+  <p class="mt-2 text-sm text-muted">{{ i18n.text("web-the-page-you-re-looking-for-doesn-t-exist-or-has-been-superseded") }}</p>
+  <a href="." class="primary-button mt-6">
     {{ i18n.text("web-back-to-home") }}
   </a>
 </div>

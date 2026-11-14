@@ -232,6 +232,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Changed
 
+- The built-in web interface and the management console now use the Memory
+  Archive identity of aimemory.sh: its mineral-paper and graphite palette in
+  both themes, Chakra Petch headings, IBM Plex Sans text and JetBrains Mono for
+  code and identifiers, 2px squared controls, amber primary buttons and a
+  copper focus outline. The sidebar, code blocks and the knowledge graph are
+  dark technical panels in both themes, navigation icons are inline SVG line
+  icons instead of Unicode symbols, and status chips, notices and section
+  labels follow the site's badge, callout and kicker patterns. Templates read
+  colors only from shared tokens (a test rejects stock Tailwind shades), the
+  three new faces replace Instrument Sans, Bricolage Grotesque and Commit Mono,
+  and the smallest text grows from 9-11px to 12-13px. Routes, markup
+  structure, scripts and the theme choice are unchanged; the design system is
+  documented in [`docs/ui-design-system.md`](docs/ui-design-system.md). (#2253)
 - The interface-language picker in the top bar now follows the dashboard's
   control style instead of the browser's native grey select: the same border,
   radius, surface colors and height as the search box beside it, its own

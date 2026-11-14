@@ -18,6 +18,8 @@ mod management;
 
 mod contextual;
 
+mod design_tokens;
+
 mod localization;
 
 mod logout;
