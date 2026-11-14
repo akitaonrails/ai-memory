@@ -12,7 +12,7 @@ use crate::commands::apply_shared::mutate_json;
 use crate::commands::apply_shared::mutate_toml;
 use crate::commands::apply_shared::{PrivateBackup, apply_atomic_with_backup};
 use crate::commands::path_util::{
-    agent_config_home, claude_config_dir, claude_config_paths, home_dir,
+    agent_config_home, claude_config_dir, claude_config_paths, hermes_home, home_dir,
 };
 use crate::commands::user_service::{self, ServiceManager};
 use crate::commands::{agent_plugins, data_purge, install_hooks, install_mcp, openclaw_plugin};
@@ -21,7 +21,7 @@ use crate::localization::diagnostic;
 use ai_memory_core::routing_skills::{
     AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
     GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER, GROK_RULES_DIR, GROK_SKILL_DIR,
-    MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
+    HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
 };
 use ai_memory_core::{MARKER_END, find_managed_block};
 use anyhow::{Context, Result};
@@ -201,7 +201,7 @@ fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: Del
 /// produce no entry. `name`/`url` identify the MCP server.
 ///
 /// Harness homes (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `COPILOT_HOME`,
-/// `GROK_HOME`, `APPDATA`) come
+/// `GROK_HOME`, `HERMES_HOME`, `APPDATA`, `LOCALAPPDATA`) come
 /// from `env`, the environment `Config::load` captured (invariant #1).
 fn build_plan(
     i18n: &ai_memory_core::i18n::Localizer,
@@ -595,6 +595,7 @@ fn build_plan(
         let appdata = env.var_os("APPDATA").map(PathBuf::from);
         let grok_home = install_mcp::grok_home_in(env.var_os("GROK_HOME")).ok();
         let copilot_home = install_mcp::copilot_home_in(env.var_os("COPILOT_HOME")).ok();
+        let hermes_home = hermes_home(env, home.as_deref());
         for root in skill_roots(
             &cwd,
             home.as_deref(),
@@ -602,6 +603,7 @@ fn build_plan(
             grok_home.as_deref(),
             copilot_home.as_deref(),
             claude_config_dir.as_deref(),
+            hermes_home.as_deref(),
         ) {
             for skill in MANAGED_SKILLS {
                 push_generated_delete(
@@ -656,13 +658,15 @@ fn skill_roots(
     grok_home: Option<&Path>,
     copilot_home: Option<&Path>,
     claude_config_dir: Option<&Path>,
+    hermes_home: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(14);
+    let mut roots = Vec::with_capacity(16);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GITHUB_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(HERMES_SKILL_DIR).join(SKILLS_DIR));
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
@@ -675,6 +679,7 @@ fn skill_roots(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
         push_unique_skill_root(&mut roots, copilot_root.join(SKILLS_DIR));
+        push_unique_skill_root(&mut roots, home.join(HERMES_SKILL_DIR).join(SKILLS_DIR));
         for root in super::install_skills::antigravity_global_skill_roots(home) {
             push_unique_skill_root(&mut roots, root);
         }
@@ -689,6 +694,13 @@ fn skill_roots(
     // installs may predate the env var.
     if let Some(claude_config_dir) = claude_config_dir {
         push_unique_skill_root(&mut roots, claude_config_dir.join(SKILLS_DIR));
+    }
+    // Global Hermes skills install to `$HERMES_HOME/skills` (or the platform
+    // default, e.g. `%LOCALAPPDATA%\hermes\skills` on Windows). Sweep it
+    // alongside `~/.hermes/skills` so installs predating the env override or
+    // platform default are removed too.
+    if let Some(hermes_home) = hermes_home {
+        push_unique_skill_root(&mut roots, hermes_home.join(SKILLS_DIR));
     }
     roots
 }
@@ -2305,6 +2317,47 @@ mod tests {
         );
     }
 
+    /// The skill sweep finds a global Hermes skill under the HERMES_HOME
+    /// `Config::load` captured (invariant #1), not only ~/.hermes/skills.
+    #[test]
+    fn skill_sweep_uses_the_captured_hermes_home() {
+        let hermes_home = tempfile::tempdir().unwrap();
+        let skill = hermes_home
+            .path()
+            .join(SKILLS_DIR)
+            .join(MANAGED_SKILLS[0].relative_path);
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, MANAGED_SKILLS[0].content).unwrap();
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "HERMES_HOME",
+            hermes_home.path().to_str().unwrap(),
+        )]);
+        let args = UninstallArgs {
+            apply: false,
+            purge_data: false,
+            only: Some(crate::cli::UninstallOnly::Skills),
+            mcp_name: None,
+            mcp_url: String::new(),
+            yes: false,
+            profile: None,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let plan = build_plan(
+            &ai_memory_core::i18n::Localizer::default(),
+            &args,
+            data.path(),
+            &env,
+        )
+        .unwrap();
+        assert!(
+            plan.iter().any(|change| matches!(
+                change,
+                PlannedChange::DeleteFile { path, .. } if *path == skill
+            )),
+            "{plan:?}"
+        );
+    }
+
     /// Each installed plugin is removed through its own harness CLI, and one
     /// failure does not stop the next.
     #[test]
@@ -2347,17 +2400,17 @@ mod tests {
         let home = Path::new("/home/alice");
         let appdata = Path::new("C:/Users/Alice/AppData/Roaming");
 
-        let roots = skill_roots(cwd, Some(home), Some(appdata), None, None, None);
+        let roots = skill_roots(cwd, Some(home), Some(appdata), None, None, None, None);
         assert!(
             roots.contains(&appdata.join("devin").join(SKILLS_DIR)),
             "{roots:?}"
         );
 
-        let without = skill_roots(cwd, Some(home), None, None, None, None);
+        let without = skill_roots(cwd, Some(home), None, None, None, None, None);
         assert_eq!(
             without.len(),
-            12,
-            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot × \
+            14,
+            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot/hermes × \
              project+global, plus Antigravity's two global roots)"
         );
         assert!(
@@ -2382,6 +2435,7 @@ mod tests {
             None,
             None,
             Some(Path::new("/stores/claude")),
+            None,
         );
         assert!(
             roots.contains(&PathBuf::from("/stores/claude/skills")),
@@ -2400,6 +2454,7 @@ mod tests {
             Some(Path::new("/home/alice")),
             None,
             Some(Path::new("/custom/grok")),
+            None,
             None,
             None,
         );
@@ -2484,6 +2539,7 @@ mod tests {
             None,
             Some(Path::new("/custom/copilot")),
             None,
+            None,
         );
         assert!(
             roots.contains(&PathBuf::from("/repo/.github/skills")),
@@ -2498,6 +2554,7 @@ mod tests {
         let default_home = skill_roots(
             Path::new("/repo"),
             Some(Path::new("/home/alice")),
+            None,
             None,
             None,
             None,
@@ -2518,6 +2575,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         for root in [
             "/home/alice/.gemini/config/skills",
@@ -2525,6 +2583,44 @@ mod tests {
         ] {
             assert!(roots.contains(&PathBuf::from(root)), "{root}: {roots:?}");
         }
+    }
+
+    /// `install-skills --agent hermes` writes `.hermes/skills` in the project
+    /// and `$HERMES_HOME/skills` (or the platform default) globally; uninstall
+    /// must sweep project, `~/.hermes/skills`, and relocated Hermes homes.
+    #[test]
+    fn skill_roots_sweep_hermes_project_home_and_relocated_roots() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+            Some(Path::new("/custom/hermes")),
+        );
+        for root in [
+            "/repo/.hermes/skills",
+            "/home/alice/.hermes/skills",
+            "/custom/hermes/skills",
+        ] {
+            assert!(roots.contains(&PathBuf::from(root)), "{root}: {roots:?}");
+        }
+
+        let default_home = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+            Some(Path::new("/home/alice/.hermes")),
+        );
+        let home_hermes_count = default_home
+            .iter()
+            .filter(|root| *root == Path::new("/home/alice/.hermes/skills"))
+            .count();
+        assert_eq!(home_hermes_count, 1);
     }
 
     #[test]
