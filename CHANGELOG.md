@@ -244,7 +244,7 @@ version in [`docs/changelog/`](docs/changelog/):
   three new faces replace Instrument Sans, Bricolage Grotesque and Commit Mono,
   and the smallest text grows from 9-11px to 12-13px. Routes, markup
   structure, scripts and the theme choice are unchanged; the design system is
-  documented in [`docs/ui-design-system.md`](docs/ui-design-system.md). (#TBD)
+  documented in [`docs/ui-design-system.md`](docs/ui-design-system.md). (#2253)
 - The interface-language picker in the top bar now follows the dashboard's
   control style instead of the browser's native grey select: the same border,
   radius, surface colors and height as the search box beside it, its own

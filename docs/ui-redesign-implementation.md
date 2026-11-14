@@ -136,8 +136,6 @@ directory, port 49399) seeded with sessions through `/hook`, pages through
   crates' suites ran with `cargo test`.
 - **Humanizer.** The maintainer-side humanizer pass on the new docs has not
   run.
-- **CHANGELOG reference.** The entry ends with `(#TBD)` until a pull request
-  number exists.
 
 ## Not changed, noticed while testing
 
@@ -153,7 +151,6 @@ directory, port 49399) seeded with sessions through `/hook`, pages through
 
 ## Pending
 
-- Assign the pull request number in `CHANGELOG.md`.
 - Run the full CI matrix (`cargo tf`, Windows, macOS) on the pull request.
 - Optional follow-ups: syntax highlighting, a graph legend, the four items
   above.
