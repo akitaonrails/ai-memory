@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Preserved quoted full-text search phrases as contiguous, ordered terms
+  instead of matching their words independently. Quoted CJK queries use the
+  primary FTS stream so substring expansion cannot widen the phrase. (#2278)
+
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
   and enforcement metadata when editing the body. (#2207)
 

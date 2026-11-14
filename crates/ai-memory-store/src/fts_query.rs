@@ -131,8 +131,7 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         || raw
             .split_whitespace()
             .any(|t| matches!(t, "OR" | "AND" | "NOT" | "NEAR"));
-    let tokens: Vec<String> = raw
-        .split_whitespace()
+    let tokens: Vec<String> = fts5_query_tokens(raw)
         // Bare natural-language queries drop stopwords before the
         // OR-join: with no tokenizer-level stopword list, "the/of/a"
         // match nearly every page and BM25 term frequency lets a page
@@ -207,6 +206,23 @@ pub fn prepare_fts5_query(raw: &str, stopwords: &FtsStopwords) -> String {
         .join(" OR ")
 }
 
+fn fts5_query_tokens(raw: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    let mut quotes_left = raw.bytes().filter(|byte| *byte == b'"').count();
+    raw.split(move |ch: char| {
+        if ch == '"' {
+            // Leave an unclosed quote to the existing invalid-query fallback.
+            // Doubled FTS5 quote escapes toggle twice, keeping the phrase open.
+            if quoted || quotes_left > 1 {
+                quoted = !quoted;
+            }
+            quotes_left -= 1;
+        }
+        ch.is_whitespace() && !quoted
+    })
+    .filter(|token| !token.is_empty())
+}
+
 /// Terms stored in the auxiliary CJK index.
 ///
 /// Each maximal Han/Kana/Hangul run contributes its scalar values and its
@@ -242,6 +258,8 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
 /// rebuilding the expression is the real fix; declining the stream meanwhile
 /// restores the pre-#1433 answer instead of an inverted one. `OR` stays,
 /// because the expander reproduces it faithfully.
+/// Quoted queries also stay on the primary stream: extracting each CJK run
+/// independently would discard the phrase's order and adjacency constraints.
 ///
 /// A leading `title:` / `body:` qualifier is carried onto the run's phrase.
 /// This stream is auxiliary — callers UNION it into the primary stream — so a
@@ -252,9 +270,10 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
 #[must_use]
 pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
     let bounded = bounded_query_text(raw);
-    if bounded
-        .split_whitespace()
-        .any(|t| matches!(t, "AND" | "NOT" | "NEAR"))
+    if bounded.contains('"')
+        || bounded
+            .split_whitespace()
+            .any(|t| matches!(t, "AND" | "NOT" | "NEAR"))
     {
         return None;
     }
@@ -475,7 +494,8 @@ fn has_unknown_bare_column(token: &str) -> bool {
 }
 
 fn should_quote_fts5_token(token: &str) -> bool {
-    if token.starts_with('"') && token.ends_with('"') {
+    let phrase = token.strip_suffix('*').unwrap_or(token);
+    if phrase.starts_with('"') && phrase.ends_with('"') {
         return false;
     }
     // Quote any token carrying ASCII punctuation so FTS5 treats it as a literal
@@ -589,6 +609,8 @@ mod tests {
         assert_eq!(prepare_cjk_fts5_query("東京 NOT 大阪"), None);
         assert_eq!(prepare_cjk_fts5_query("東京 AND 大阪"), None);
         assert_eq!(prepare_cjk_fts5_query("東京 NEAR 大阪"), None);
+        assert_eq!(prepare_cjk_fts5_query("\"東京 大阪\""), None);
+        assert_eq!(prepare_cjk_fts5_query("title:\"東京 大阪\""), None);
         // Control: `OR` is the one operator the run expander reproduces, so
         // the auxiliary stream still runs for it — and a lowercase `not` is
         // not FTS5 syntax, so it must not suppress the stream either.
@@ -783,12 +805,9 @@ mod tests {
             prepared,
             "{title title_parts}:handoff OR {body body_parts}:deploy"
         );
-        // Quoted phrases were re-tokenized into escaped-quote form long
-        // before the validation fallback existed; the contract here is
-        // "still valid FTS5 with AND preserved", not byte identity.
         let phrase = prepare_fts5_query("\"exact phrase\" AND deploy");
         assert_parses(&phrase);
-        assert!(phrase.contains(" AND deploy"), "{phrase}");
+        assert_eq!(phrase, "\"exact phrase\" AND deploy");
     }
 
     #[test]
@@ -938,16 +957,25 @@ mod tests {
     /// A query containing a quoted phrase is treated as explicit FTS5
     /// syntax — `"exact phrase" baz` must not become
     /// `"exact" OR "phrase" OR baz` (which destroys the phrase semantics).
-    /// The exact assertion is "space-joined, not OR-joined"; what the
-    /// individual tokens look like after `prepare_fts5_token` is a
-    /// separate concern (and unchanged from pre-#58 behaviour).
     #[test]
     fn quoted_phrase_query_is_not_or_joined() {
         let q = prepare_fts5_query("\"exact phrase\" baz");
-        assert!(
-            !q.contains(" OR "),
-            "explicit quoted-phrase query must not get OR-joined; got {q}"
-        );
+        assert_eq!(q, "\"exact phrase\" baz");
+    }
+
+    #[test]
+    fn quoted_phrases_keep_filters_groups_escapes_and_prefixes() {
+        for (raw, expected) in [
+            ("title:\"alpha beta\"", "{title title_parts}:\"alpha beta\""),
+            ("body:\"alpha beta\"*", "{body body_parts}:\"alpha beta\"*"),
+            ("(\"alpha beta\") OR gamma", "(\"alpha beta\") OR gamma"),
+            ("\"say \"\"hello\"\" now\"", "\"say \"\"hello\"\" now\""),
+            ("\"alpha beta\"*", "\"alpha beta\"*"),
+            ("\"alpha\tbeta\" gamma", "\"alpha\tbeta\" gamma"),
+        ] {
+            assert_eq!(prepare_fts5_query(raw), expected, "{raw}");
+            assert_parses(expected);
+        }
     }
 
     /// Same escape-hatch logic for parenthesised sub-expressions —
