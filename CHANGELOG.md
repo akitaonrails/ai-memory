@@ -50,7 +50,7 @@ version in [`docs/changelog/`](docs/changelog/):
   Restart now reloads changed launch arguments and the data-directory override
   even when the bundled executable's path is unchanged. An invalid bundled
   template leaves the installed job alone; a failed reload restores its
-  previous plist so a retry still reloads the selected configuration. (#NNN)
+  previous plist so a retry still reloads the selected configuration. (#2267)
 - Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
   resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
   to `quinn-proto` 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524. (#2242)
