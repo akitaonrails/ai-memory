@@ -45,6 +45,12 @@ version in [`docs/changelog/`](docs/changelog/):
   directories such as `notes/_pending/manual.md`. The exclusion for the
   project's proposal staging directory matched that name at every depth and
   silently omitted these pages. Project-root proposal sidecars stay excluded. (#2238)
+- Fixed **Restart Server** in the macOS menu app retaining the previous data
+  directory after its override was added, changed, or cleared in Settings.
+  Restart now reloads changed launch arguments and the data-directory override
+  even when the bundled executable's path is unchanged. An invalid bundled
+  template leaves the installed job alone; a failed reload restores its
+  previous plist so a retry still reloads the selected configuration. (#NNN)
 - Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
   resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
   to `quinn-proto` 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524. (#2242)

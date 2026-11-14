@@ -102,6 +102,80 @@ public struct LaunchdController: Sendable {
         try runLaunchctl(["kickstart", "-k", domainService])
     }
 
+    public func restart(template: String, binary: URL, dataDir: URL?) throws {
+        let desired = Self.renderTemplate(template, binary: binary, home: home, dataDir: dataDir)
+        guard let desired = Self.managedConfiguration(inPlist: desired),
+              desired.arguments.first == binary.path
+        else {
+            throw CocoaError(.propertyListReadCorrupt, userInfo: [
+                NSLocalizedDescriptionKey: "The bundled LaunchAgent template is invalid.",
+            ])
+        }
+        let fm = FileManager.default
+        let previous = fm.fileExists(atPath: plistDestination.path) ? try Data(contentsOf: plistDestination) : nil
+        let installed = previous.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        // kickstart reuses launchd's loaded configuration, including its data
+        // directory. Reload when the managed arguments or override changed.
+        // See launchctl(1), bootstrap/bootout versus kickstart, and Apple's guide:
+        // https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html
+        if let installed = Self.managedConfiguration(inPlist: installed),
+           installed == desired
+        {
+            try kickstart()
+        } else {
+            try? bootout()
+            do {
+                try writePlist(template: template, binary: binary, dataDir: dataDir)
+                try bootstrap()
+            } catch {
+                let failure = error
+                do {
+                    if let previous {
+                        try previous.write(to: plistDestination, options: .atomic)
+                    } else if fm.fileExists(atPath: plistDestination.path) {
+                        try fm.removeItem(at: plistDestination)
+                    }
+                } catch {
+                    throw RestartRollbackFailure(failure: failure, rollback: error)
+                }
+                throw failure
+            }
+        }
+    }
+
+    private struct RestartRollbackFailure: LocalizedError {
+        let failure: any Error
+        let rollback: any Error
+
+        var errorDescription: String? {
+            "The LaunchAgent could not be restored after a failed restart (\(failure.localizedDescription)): \(rollback.localizedDescription)"
+        }
+    }
+
+    private struct ManagedConfiguration: Equatable {
+        let arguments: [String]
+        let dataDir: String?
+    }
+
+    private static func managedConfiguration(inPlist plist: String) -> ManagedConfiguration? {
+        guard let values = try? PropertyListSerialization.propertyList(
+            from: Data(plist.utf8), format: nil
+        ) as? [String: Any],
+            values["Label"] as? String == Self.label,
+            let arguments = values["ProgramArguments"] as? [String],
+            !arguments.isEmpty
+        else {
+            return nil
+        }
+        guard let rawEnvironment = values["EnvironmentVariables"] else {
+            return ManagedConfiguration(arguments: arguments, dataDir: nil)
+        }
+        guard let environment = rawEnvironment as? [String: String] else {
+            return nil
+        }
+        return ManagedConfiguration(arguments: arguments, dataDir: environment["AI_MEMORY_DATA_DIR"])
+    }
+
     private func runLaunchctl(_ arguments: [String]) throws {
         let result = try runner.run(
             binary: URL(fileURLWithPath: "/bin/launchctl"),
