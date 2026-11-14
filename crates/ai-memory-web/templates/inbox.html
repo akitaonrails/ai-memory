@@ -33,7 +33,7 @@
       <label class="field-label" for="message-subject">{{ i18n.text("web-subject") }} <span>{{ i18n.text("web-optional") }}</span></label><input id="message-subject" class="field-input" maxlength="200" placeholder="{{ i18n.text("web-what-needs-to-happen") }}">
       <label class="field-label" for="message-body">{{ i18n.text("web-message") }}</label><textarea id="message-body" class="field-input" rows="7" maxlength="8000" required placeholder="{{ i18n.text("web-describe-the-request-relevant-context-and-what-a-successful-result-looks-like") }}"></textarea>
       <div class="composer-meta"><span>{{ i18n.text("web-plain-text-secrets-are-scrubbed") }}</span><span id="message-count">0 / 8,000</span></div>
-      <div class="delivery-note"><span aria-hidden="true">◷</span><p>{{ i18n.text("web-queued-for-this-agent-s-next-inbox-check-sending-a-message-does-not-start-an-agent-or") }}</p></div>
+      <div class="delivery-note"><span aria-hidden="true">{% include "_icon_clock.html" %}</span><p>{{ i18n.text("web-queued-for-this-agent-s-next-inbox-check-sending-a-message-does-not-start-an-agent-or") }}</p></div>
       <button class="primary-button send-button" type="submit" {% if !can_send %}disabled{% endif %}>{{ i18n.text("web-queue-message") }} <span aria-hidden="true">↗</span></button>
       <p id="message-result" role="status" aria-live="polite" tabindex="-1"></p>
     </form>
