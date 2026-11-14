@@ -9357,7 +9357,9 @@ pub struct MoveSessionSummary {
 /// `handoffs` it produced, its consolidation jobs, auto-improve runs,
 /// scheduler claim, profile prompt candidates, and ingest keys) into
 /// `(target_workspace, target_project)` in ONE transaction, plus its
-/// `sessions/<session_id>.md` page per `pages`.
+/// `sessions/<session_id>.md` page per `pages` (along with its
+/// `page_feedback`, `query_page_signals`, and `entity_page_links` when moving
+/// pages).
 ///
 /// Dependent rows are matched by session id alone, so a hybrid session whose
 /// events were scattered over other scopes (mid-session routing before the
@@ -9653,6 +9655,9 @@ pub fn move_session(
         }
         summary.page_path = Some(page_path.clone());
     }
+    if matches!(pages, PagesMode::Move) {
+        migrate_moved_page_metadata(&tx, &page_path, &to_ws[..], &to_proj[..])?;
+    }
     summary.page_versions_in_target = tx.query_row(
         "SELECT COUNT(*) FROM pages WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
         params![&to_ws[..], &to_proj[..], page_path.as_str()],
@@ -9675,6 +9680,99 @@ pub fn move_session(
         tx.rollback()?;
     }
     Ok(summary)
+}
+
+struct MismatchedEntityLink {
+    entity_id: Vec<u8>,
+    name: String,
+    created_at: i64,
+    valid_from: Option<i64>,
+    superseded_at: Option<i64>,
+}
+
+/// Re-stamp `page_feedback`, `query_page_signals`, and `entity_page_links`
+/// for all `sessions/<id>.md` versions now residing in `(to_ws, to_proj)`.
+fn migrate_moved_page_metadata(
+    tx: &rusqlite::Transaction<'_>,
+    page_path: &str,
+    to_ws: &[u8],
+    to_proj: &[u8],
+) -> StoreResult<()> {
+    let target_page_ids: Vec<Vec<u8>> = tx
+        .prepare(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+        )?
+        .query_map(params![to_ws, to_proj, page_path], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for page_id in target_page_ids {
+        tx.execute(
+            "UPDATE page_feedback SET workspace_id = ?1, project_id = ?2 \
+             WHERE page_id = ?3 AND NOT (workspace_id = ?1 AND project_id = ?2)",
+            params![to_ws, to_proj, &page_id[..]],
+        )?;
+        tx.execute(
+            "UPDATE OR IGNORE query_page_signals SET workspace_id = ?1, project_id = ?2 \
+             WHERE page_id = ?3 AND NOT (workspace_id = ?1 AND project_id = ?2)",
+            params![to_ws, to_proj, &page_id[..]],
+        )?;
+        tx.execute(
+            "DELETE FROM query_page_signals \
+             WHERE page_id = ?1 AND NOT (workspace_id = ?2 AND project_id = ?3)",
+            params![&page_id[..], to_ws, to_proj],
+        )?;
+        let old_links: Vec<MismatchedEntityLink> = tx
+            .prepare(
+                "SELECT e.id, e.name, e.created_at, l.valid_from, l.superseded_at \
+                 FROM entity_page_links l \
+                 JOIN entities e ON e.id = l.entity_id \
+                 WHERE l.page_id = ?1 \
+                   AND NOT (e.workspace_id = ?2 AND e.project_id = ?3)",
+            )?
+            .query_map(params![&page_id[..], to_ws, to_proj], |row| {
+                Ok(MismatchedEntityLink {
+                    entity_id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: row.get(2)?,
+                    valid_from: row.get(3)?,
+                    superseded_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        for link in old_links {
+            let new_entity_id = EntityId::new();
+            let name = link.name.as_str();
+            let target_entity_id: Vec<u8> = tx.query_row(
+                "INSERT INTO entities (id, workspace_id, project_id, name, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT (workspace_id, project_id, name) \
+                 DO UPDATE SET name = excluded.name \
+                 RETURNING id",
+                params![new_entity_id.as_bytes(), to_ws, to_proj, name, link.created_at],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO entity_page_links \
+                     (entity_id, page_id, valid_from, superseded_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (entity_id, page_id) DO NOTHING",
+                params![target_entity_id, &page_id[..], link.valid_from, link.superseded_at],
+            )?;
+            tx.execute(
+                "DELETE FROM entity_page_links WHERE entity_id = ?1 AND page_id = ?2",
+                params![&link.entity_id[..], &page_id[..]],
+            )?;
+            tx.execute(
+                "DELETE FROM entities \
+                 WHERE id = ?1 \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM entity_page_links l WHERE l.entity_id = entities.id \
+                   )",
+                params![&link.entity_id[..]],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Remove embedding rows in a workspace/project scope whose `(provider, model, dim)`
