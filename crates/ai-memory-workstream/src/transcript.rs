@@ -1322,15 +1322,19 @@ fn export_jsonl_range(
             Sha256::new(),
         )
     };
-    let (mut reader, start): (Box<dyn BufRead>, u64) = if compressed {
-        // A zstd stream cannot seek: decode and drop the bytes before `start`.
-        // A shorter stream ends the skip early, which clamps `start` the way
-        // `min(len)` clamps it for a plain file.
-        let mut reader = transcript_reader(harness, path, file)?;
-        let skipped = std::io::copy(
-            &mut std::io::Read::by_ref(&mut reader).take(start),
-            &mut std::io::sink(),
-        )?;
+    let mut codex_turn_cwd: Option<String> = None;
+    let (mut reader, start): (Box<dyn BufRead>, u64) = if harness == ManagedHarness::Codex {
+        let mut reader = if compressed {
+            // A zstd stream cannot seek: decode and drop the bytes before `start`.
+            // A shorter stream ends the skip early, which clamps `start` the way
+            // `min(len)` clamps it for a plain file.
+            transcript_reader(harness, path, file)?
+        } else {
+            file.seek(SeekFrom::Start(0))?;
+            Box::new(BufReader::new(file))
+        };
+        let (skipped, cwd) = skip_codex_prefix(&mut reader, start)?;
+        codex_turn_cwd = cwd;
         (reader, skipped)
     } else {
         file.seek(SeekFrom::Start(start))?;
@@ -1345,7 +1349,6 @@ fn export_jsonl_range(
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
-    let mut codex_turn_cwd: Option<String> = None;
     loop {
         line.clear();
         let remaining = len.saturating_sub(offset);
@@ -1576,11 +1579,7 @@ fn export_jsonl_range(
         let record_cwd = match harness {
             ManagedHarness::Claude => value.get("cwd").and_then(Value::as_str),
             ManagedHarness::Codex => {
-                if matches!(
-                    value.get("type").and_then(Value::as_str),
-                    Some("session_meta" | "turn_context")
-                ) && let Some(cwd) = value.pointer("/payload/cwd").and_then(Value::as_str)
-                {
+                if let Some(cwd) = codex_context_cwd(&value) {
                     codex_turn_cwd = Some(cwd.to_owned());
                 }
                 codex_turn_cwd.as_deref()
@@ -1633,6 +1632,51 @@ fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
             metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
         }
     }
+}
+
+fn codex_context_cwd(value: &Value) -> Option<&str> {
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("session_meta" | "turn_context")
+    ) {
+        value.pointer("/payload/cwd").and_then(Value::as_str)
+    } else {
+        None
+    }
+}
+
+/// Codex persists a `turn_context` only when the turn context changed
+/// (https://github.com/openai/codex/blob/b1573f102413e96a6481087922bf425231222dee/codex-rs/core/src/session/mod.rs#L5600-L5621).
+fn skip_codex_prefix(reader: &mut impl BufRead, len: u64) -> Result<(u64, Option<String>)> {
+    let mut cwd = None;
+    let mut consumed = 0_u64;
+    let mut line = Vec::new();
+    while consumed < len {
+        line.clear();
+        let limit = (len - consumed).min((MAX_SOURCE_RECORD_BYTES + 1) as u64);
+        let read = reader.by_ref().take(limit).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        consumed += read as u64;
+        if read > MAX_SOURCE_RECORD_BYTES {
+            if !line.ends_with(b"\n") {
+                let (tail, _) = discard_through_newline(
+                    &mut reader.by_ref().take(len - consumed),
+                    &mut |_| {},
+                )?;
+                consumed += tail;
+            }
+            continue;
+        }
+        if line.ends_with(b"\n")
+            && let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && let Some(record_cwd) = codex_context_cwd(&value)
+        {
+            cwd = Some(record_cwd.to_owned());
+        }
+    }
+    Ok((consumed, cwd))
 }
 
 /// Count how many times each rewrite-in-place record identity (the SHA-256 of
@@ -8480,6 +8524,52 @@ mod tests {
             .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
             .collect();
         assert_eq!(cwds, [root.to_str(), docs.to_str()], "{events:?}");
+    }
+
+    #[test]
+    fn incremental_codex_export_keeps_the_turn_cwd_from_before_the_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let docs = root.join("docs");
+        let codex = temp.path().join("codex.jsonl");
+        let item = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+        let lines = |values: &[Value]| {
+            values
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+        };
+        fs::write(
+            &codex,
+            lines(&[
+                json!({"type":"session_meta","payload":{"id":"s","cwd":root}}),
+                item("first turn"),
+                json!({"type":"turn_context","payload":{"cwd":docs}}),
+                item("second turn"),
+            ]),
+        )
+        .unwrap();
+        let first = export_jsonl(ManagedHarness::Codex, &codex, "s", None).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
+        std::io::Write::write_all(&mut file, lines(&[item("same turn, later")]).as_bytes())
+            .unwrap();
+        let next = export_jsonl(
+            ManagedHarness::Codex,
+            &codex,
+            "s",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(next.events.len(), 1, "{:?}", next.events);
+        assert_eq!(
+            next.events[0]
+                .metadata
+                .get(RECORD_CWD_KEY)
+                .and_then(Value::as_str),
+            docs.to_str(),
+            "{:?}",
+            next.events
+        );
     }
 
     #[test]

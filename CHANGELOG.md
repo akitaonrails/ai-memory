@@ -93,6 +93,13 @@ version in [`docs/changelog/`](docs/changelog/):
   preserved. ASCII truncation and the final store byte limits are unchanged. (#2245)
 
 
+- Codex transcript imports resumed from a saved cursor now label each new
+  event with the working directory of its turn. Codex writes a `turn_context`
+  record only when the turn context changes, and an incremental export read
+  only the records after the cursor, so events before the next `turn_context`
+  had no record cwd and the capture policy judged them from the session cwd
+  instead. The export now takes the last cwd from the records before the
+  cursor, as a full export does. (#2258)
 
 ## [3.4.6] - 2026-11-13
 
