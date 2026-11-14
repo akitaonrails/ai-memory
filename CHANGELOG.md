@@ -105,6 +105,11 @@ version in [`docs/changelog/`](docs/changelog/):
   strictest capture decision among all calls of its turn, and one excluded
   call withheld the results of every other call in that turn. A result is
   now paired with its own call by id. (#2259)
+- A page under an uppercase folder such as `_RULES/` or `Decisions/` no
+  longer gets the rule or decision kind. The path-kind match used SQLite
+  `LIKE`, which ignores ASCII case, so `_RULES/x.md` carried rule authority in
+  search while the rule and briefing loaders, which match `_rules/` exactly,
+  never loaded it. The match is now case-sensitive and such pages are facts. (#2260)
 
 ## [3.4.6] - 2026-11-13
 
