@@ -169,6 +169,36 @@ describe("pages against a real server", () => {
     assert.equal((await memory.pages.read({ path: "notes/meta.md" })).body, "# Meta\nother writer");
   });
 
+  it("update preserves profile scope and enforcement when changing the body", async () => {
+    const scope = { workspace: "default", project: "_global" };
+    const path = "profile/style/types.md";
+    await memory.callTool("memory_write_page", {
+      scope: "profile",
+      path: "style/types.md",
+      body: "# Types\n\nUse precise types.",
+      applies_to: ["typescript"],
+      enforced_by: "eslint rule",
+    });
+    const original = await memory.pages.read({ path, scope });
+    assert.deepEqual(original.frontmatter["applies_to"], ["typescript"]);
+    assert.equal(original.frontmatter["enforced_by"], "eslint rule");
+
+    const body = "# Types\n\nName narrowing explicitly.";
+    const updated = await memory.pages.update(path, () => ({ body }), { scope });
+    const page = await memory.pages.read({ path, scope });
+    assert.equal(page.pageId, updated.pageId);
+    assert.notEqual(page.pageId, original.pageId);
+    assert.equal(page.body, body);
+    assert.deepEqual(page.frontmatter["applies_to"], ["typescript"]);
+    assert.equal(page.frontmatter["enforced_by"], "eslint rule");
+
+    await memory.pages.update(path, () => ({ appliesTo: ["rust"], enforcedBy: null }), { scope });
+    const edited = await memory.pages.read({ path, scope });
+    assert.equal(edited.body, body);
+    assert.deepEqual(edited.frontmatter["applies_to"], ["rust"]);
+    assert.equal(edited.frontmatter["enforced_by"], undefined);
+  });
+
   it("patch replaces one section and preserves frontmatter", async () => {
     await memory.pages.write({
       path: "notes/patch.md",

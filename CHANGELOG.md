@@ -265,25 +265,122 @@ version in [`docs/changelog/`](docs/changelog/):
   next candidate instead of failing the whole request, and the exhausted
   provider is skipped for `llm_quota_cooldown_secs` before it is retried. See
   [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md). (#2227)
+- A `move-project` true move now re-resolves project-only cross-project links
+  (`[[project:path]]` with the workspace omitted) in the source and destination
+  workspaces, so the moved project's edges rebind to the destination workspace
+  and the live graph matches a clean reindex of the unchanged Markdown.
+  Previously the restamp left those edges pointing at the old workspace's
+  target. Explicit workspace-qualified and bare same-project edges are
+  unaffected. (#2264)
+
+- Cross-project message `evidence` within the 1 000-character MCP/admin budget
+  is no longer silently truncated at the store boundary, and the
+  `memory_message_send` truncation notice on longer inputs is preserved. The
+  store evidence cap was left at 1 000 bytes after #2241, cutting multibyte
+  strings and `[message evidence truncated; ...]` suffixes short; it is now
+  4 KiB. (#2283)
+
+- `ai-memory uninstall` now sweeps Hermes skill directories (`.hermes/skills`,
+  `~/.hermes/skills`, `$HERMES_HOME/skills`, and the Windows `%LOCALAPPDATA%`
+  default) alongside the other supported Agent Skill roots. Previously none of
+  the Hermes skill roots were scanned, leaving managed skills behind on
+  uninstall. (#2285)
+
+- The TypeScript SDK's `pages.update` preserves profile entry stack filters
+  and enforcement metadata when editing the body. (#2207)
+
+- Fixed XLSX document import rejecting the Open XML SDK's unnumbered
+  `xl/worksheets/sheet.xml` worksheet part. (#2208)
+
+- `move-session` with `--pages move` now migrates `page_feedback`,
+  `query_page_signals`, and `entity_page_links` (along with matching target
+  `entities`) alongside the moved `sessions/<id>.md` page versions, and
+  `open_feedback_findings` verifies page scope on join. Previously, feedback
+  on a moved session page stayed scoped to the source project, continuing to
+  appear in source lint findings while missing in target and getting removed
+  if the source project was purged; query signals and entity links similarly
+  stayed on the source scope. `PagesMode::Regenerate` continues to leave
+  retired `is_latest = 0` versions' historical rows in source. (#2254)
+- The SessionEnd consolidation worker no longer replaces a session page the
+  agent writes with `memory_write_page` while the worker's completion is
+  running. It checked for the agent's page once, before the completion, and
+  then wrote unconditionally, so the agent's page survived only as a
+  superseded version. The worker now writes conditional on the page version it
+  read before that check and keeps the agent's page when it lands in between;
+  a rule-based summary or checkpoint landing in between is still replaced, as
+  before. (#2275)
+- Devin POSIX shell (`hooks/_lib.sh`, `hooks/devin/*.sh`) and PowerShell
+  (`hooks/lib/ai-memory-hook.ps1`) hooks now match native `ai-memory hook`
+  behavior (#2237) for `AI_MEMORY_SESSION_ID`: whitespace-only values are
+  ignored, top-level native payload session IDs take precedence over both
+  `AI_MEMORY_SESSION_ID` and `<data-dir>/hook-state/devin-session-id` (and are
+  forwarded on PowerShell handoff requests when missing), and a pinned bare
+  `session-end` keeps the fallback `devin-session-id` slot intact. (#2256)
+- `export-okf` no longer silently drops a concept page that occupies an
+  OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
+  hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
+  throughout the hierarchy, so the export now refuses with the page's path
+  and asks you to rename it, instead of returning a `200` bundle that is
+  missing the page. A frontmatter-less file at a reserved name (the raw event
+  ledger) is still skipped. (#2233)
+- `memory_patch_page` `replace_section` now keeps the blank line after a
+  section's heading and before the next heading, instead of collapsing
+  `## H\n\nbody\n\n` into `## H\nbody\n`. A `content` that repeats the
+  section's own heading is refused (`section_content_repeats_heading`) rather
+  than written, which used to leave two identical headings that no later edit
+  could target. (#2239)
+- `memory_patch_page` now preserves blank-line padding around nonempty section
+  bodies in CRLF Markdown and avoids adding an LF-only boundary. Previously,
+  the padding was lost when the section was replaced. (#2281)
+- Fixed project activity timestamps and default ordering ignoring newer
+  sessions or page updates whenever an older observation existed. Project
+  lists now use the latest of all three activity sources. (#2266)
+- Retrieval benchmarks no longer inherit unreported `AI_MEMORY_*` settings
+  from the evaluator's environment. Pass server settings explicitly with
+  `--server-env` or `--candidate-server-env` so the report records them. (#2282)
 - The document importer now preserves DOCX nonbreaking hyphens encoded as
   `w:noBreakHyphen` elements. It previously dropped them and joined the
   surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)
+- The lifecycle relay now accepts an identical concurrent `init` whose peer
+  created the queue directory first, after rechecking its privacy and path
+  guards. It previously failed with `File exists` during first-time startup.
+  (#2265)
 - `status --json` now preserves the server's write-queue depth and wiki-format
   diagnostics. Both fields were read from the server and shown in the human
   report but silently dropped from JSON, hiding a backed-up writer from
   monitors. Older servers that omit the fields keep the same JSON shape. (#2235)
+- Kept explicit page titles in the final Markdown frontmatter for single and
+  batch writes, preserving their existing precedence over webhook mutations.
+  Reindexing no longer replaces the selected title or creates an extra version
+  solely because the file carried a different title. (#2250)
 - The document importer now excludes DOCX moved-source revisions
   (`w:moveFrom`) while retaining the destination text (`w:moveTo`). It
   previously extracted both copies of a tracked move, duplicating text that
   appears only once in the accepted document. (#2236)
+- Rejected Copilot Chat Completions structured output stopped at its token
+  budget before parsing it as JSON. A valid-looking partial object could
+  previously be accepted as a complete result; it now reports the terminal
+  `truncated-response` error, matching Copilot Responses. (#2251)
+- The document importer now resolves XLSX worksheet and PPTX slide
+  relationships by XML namespace rather than requiring the `r:` prefix.
+  Valid files using a different prefix no longer fail to import. (#2273)
 - Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin
   session end leaves the unrelated fallback slot intact. (#2237)
+- Fixed wikisync exports silently omitting pages beyond a legacy server's
+  100-page `recent` limit. The fallback now fetches the full `pages` listing
+  before planning any file changes. (#2252)
 - OKF exports now include ordinary concept pages beneath nested `_pending`
   directories such as `notes/_pending/manual.md`. The exclusion for the
   project's proposal staging directory matched that name at every depth and
   silently omitted these pages. Project-root proposal sidecars stay excluded. (#2238)
+- Fixed **Restart Server** in the macOS menu app retaining the previous data
+  directory after its override was added, changed, or cleared in Settings.
+  Restart now reloads changed launch arguments and the data-directory override
+  even when the bundled executable's path is unchanged. An invalid bundled
+  template leaves the installed job alone; a failed reload restores its
+  previous plist so a retry still reloads the selected configuration. (#2267)
 - Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
   resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
   to `quinn-proto` 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524. (#2242)
@@ -306,6 +403,78 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- Fixed Crush transcript imports skipping messages written during an import by
+  reading their events and incremental cursor from one SQLite snapshot.
+  Baseline cursor timestamps and revision fingerprints also share one snapshot. (#2243)
+- Fixed MCP and HTTP/admin message pop and cancel treating an explicitly blank
+  `message_id` as omitted, which could claim the oldest message or cancel the
+  whole outbox. Blank ids are now refused without changing pending mail;
+  omitted ids and valid UUIDs with surrounding whitespace keep their behavior. (#2244)
+- Fixed CLI/admin message sends counting the body, subject and evidence caps
+  in UTF-8 bytes instead of Unicode characters after scrubbing. Multibyte text
+  within both the character budgets and the existing store byte limits is now
+  preserved. ASCII truncation and the final store byte limits are unchanged. (#2245)
+
+- Codex transcript imports resumed from a saved cursor now label each new
+  event with the working directory of its turn. Codex writes a `turn_context`
+  record only when the turn context changes, and an incremental export read
+  only the records after the cursor, so events before the next `turn_context`
+  had no record cwd and the capture policy judged them from the session cwd
+  instead. The export now takes the last cwd from the records before the
+  cursor, as a full export does. (#2258)
+- OpenCode transcript imports now keep each tool call's `callID` on the call
+  and its result. The adapter dropped the id, so each result took the
+  strictest capture decision among all calls of its turn, and one excluded
+  call withheld the results of every other call in that turn. A result is
+  now paired with its own call by id. (#2259)
+- A page under an uppercase folder such as `_RULES/` or `Decisions/` no
+  longer gets the rule or decision kind. The path-kind match used SQLite
+  `LIKE`, which ignores ASCII case, so `_RULES/x.md` carried rule authority in
+  search while the rule and briefing loaders, which match `_rules/` exactly,
+  never loaded it. The match is now case-sensitive and such pages are facts. (#2260)
+- A page tagged `do-not-answer-from`, `test-fixture`, `superseded` or
+  `historical` now stays at or below its authority cap in every search. The
+  cap was applied once to the base factor, then session-recall routing and the
+  opt-in belief, feedback and query-signal adjustments were added after it, so
+  a tagged session page could reach 1.03 under the default session-recall bonus
+  and a tagged page with query signals could outrank untagged pages. The cap is
+  now applied after each of those adjustments; untagged pages rank as before. (#2261)
+- The profile harvester no longer skips user prompts or curated pages that
+  share a timestamp with the last row of a full 2 000-row pass, which happens
+  with imported prompts that keep their original `occurred_at`. The pass cut
+  the group at the row limit and moved its mark to that timestamp, so the
+  rest of the group was never read. A pass now returns the whole group. (#2262)
+- `auto-improve-report` no longer drops the eval-gate rejection finding when
+  `--top-limit` is small. The finding summed `eval_gate_*` reasons from the
+  rejection-reason table, which keeps only the top N reasons, so with
+  `--top-limit 1` three human rejections hid two eval-gate failures. The
+  report now reads a separate eval-gate count that ignores the limit. (#2263)
+- `ai-memory-eval retrieval` no longer prints credential `--server-env` and
+  `--candidate-server-env` values in its reports. The run's config line,
+  which lands in `report.md`, `report.json` and the log, copied every
+  `KEY=VALUE` pair as given, so a reranker provider key passed the way the
+  evals README describes ended up in a report meant for `docs/benchmarks/`.
+  A variable whose name has a `KEY`, `APIKEY`, `TOKEN`, `SECRET`,
+  `PASSWORD`, `PASSWD`, `CREDENTIALS` or `HEADERS` word now shows as
+  `env:NAME=<redacted>`; the eval server still receives the real value.
+  Values the line keeps, and `--query-arg` values, also pass through the
+  built-in sanitizer, so a password inside a URL or a provider key under an
+  unrelated name is redacted too. (#2274)
+
+### Security
+
+- The eval QA grader no longer reuses the answerer's API key, key-env, or
+  auth file when it is pointed at a different provider or base URL. A grader
+  at a different endpoint must supply its own credential (or the run skips),
+  so an answerer key is never sent to an endpoint it was not issued for.
+  (GHSA-5xw9-4g32-84fr)
+- The macOS menu bar app no longer keeps sending a retained bearer after a
+  failed credential update. When a keychain save failed while the user was
+  pointing the app at a new server, the old token stayed in the keychain
+  while the binding had already moved to the new server, so it was sent there
+  and re-adopted on the next launch. A failed save now clears both the stored
+  token and its binding, and the failure is surfaced in Settings.
+  (GHSA-xj78-fp6w-8r74)
 
 ## [3.4.6] - 2026-11-13
 

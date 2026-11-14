@@ -529,6 +529,66 @@ async fn query_signals_boost_only_their_similar_query_and_current_version() {
     );
 }
 
+#[tokio::test]
+async fn query_signal_boost_does_not_lift_a_negative_tag_cap() {
+    let (_tmp, mut store, ws, proj) = two_page_store().await;
+    let mut fixture = page(
+        ws,
+        proj,
+        "notes/fixture.md",
+        "fixture",
+        "zebraquux",
+        Tier::Semantic,
+    );
+    fixture.frontmatter_json = serde_json::json!({"tags": ["test-fixture"]});
+    let fixture_id = store.writer.upsert_page(fixture).await.unwrap();
+    for session in ["s1", "s2"] {
+        store
+            .writer
+            .record_query_page_signal(
+                ws,
+                proj,
+                fixture_id,
+                "zebraquux caddy".to_string(),
+                Some(session.to_string()),
+            )
+            .await
+            .unwrap();
+    }
+
+    store.reader.set_retrieval_tuning(RetrievalTuning {
+        query_signal_weight: 1.0,
+        ..tuning(false, 0.0, false)
+    });
+    let hits = store
+        .reader
+        .hybrid_search_explained(
+            ws,
+            proj,
+            "zebraquux caddy".to_string(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            10,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let details = &hits
+        .iter()
+        .find(|(hit, _)| hit.path.as_str() == "notes/fixture.md")
+        .unwrap()
+        .1;
+    assert!(details.query_signal_boost.is_some());
+    assert!(
+        details.authority.unwrap() <= 0.55,
+        "a test-fixture page rose to authority {:?}",
+        details.authority
+    );
+}
+
 /// A purged session takes its query text with it (#1941): an association the
 /// session wrote last is deleted in the purge transaction, while one another
 /// session wrote last stays. The client's native session id is stored as the

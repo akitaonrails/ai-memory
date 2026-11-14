@@ -10051,6 +10051,162 @@ mod tests {
             .unwrap()
     }
 
+    struct MessageTextHarness {
+        _tmp: TempDir,
+        store: Store,
+        router: Router,
+        workspace: WorkspaceId,
+        recipient: ProjectId,
+    }
+
+    impl MessageTextHarness {
+        async fn new() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let store = Store::open(tmp.path()).unwrap();
+            let workspace = store
+                .writer
+                .get_or_create_workspace("default")
+                .await
+                .unwrap();
+            store
+                .writer
+                .get_or_create_project(workspace, "sender", None)
+                .await
+                .unwrap();
+            let recipient = store
+                .writer
+                .get_or_create_project(workspace, "recipient", None)
+                .await
+                .unwrap();
+            let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+            let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+            Self {
+                _tmp: tmp,
+                store,
+                router,
+                workspace,
+                recipient,
+            }
+        }
+
+        async fn send(
+            &self,
+            body: &str,
+            subject: &str,
+            evidence: &str,
+        ) -> ai_memory_core::AgentMessage {
+            let response = self.router.clone().oneshot(
+                Request::builder().method("POST").uri("/admin/messages/send")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({
+                        "from_workspace": "default", "from_project": "sender",
+                        "to_workspace": "default", "to_project": "recipient",
+                        "body": body, "subject": subject, "nature": "measured", "evidence": evidence,
+                    }).to_string())).unwrap()
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+                .await
+                .unwrap();
+            let sent: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            self.store
+                .reader
+                .list_messages(
+                    self.workspace,
+                    self.recipient,
+                    ai_memory_core::MessageBox::Inbox,
+                    50,
+                )
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|message| message.id.to_string() == sent["message_id"].as_str().unwrap())
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_message_character_caps_preserve_multibyte_text() {
+        let h = MessageTextHarness::new().await;
+        let body = format!("{} SENTINEL", "界".repeat(3_000));
+        let subject = format!("{} SENTINEL", "界".repeat(100));
+        let evidence = format!("{} EVIDENCE", "界".repeat(500));
+        let stored = h.send(&body, &subject, &evidence).await;
+        assert_eq!(stored.body, body);
+        assert_eq!(stored.subject.as_deref(), Some(subject.as_str()));
+        assert_eq!(stored.evidence.as_deref(), Some(evidence.as_str()));
+
+        let max = "𝐀".repeat(crate::messages::MESSAGE_EVIDENCE_MAX_CHARS);
+        let stored_max = h.send("body", "subject", &max).await;
+        assert_eq!(stored_max.evidence.as_deref(), Some(max.as_str()));
+    }
+
+    #[tokio::test]
+    async fn admin_message_character_caps_keep_ascii_and_clip_oversized_text() {
+        let h = MessageTextHarness::new().await;
+        let body = "x".repeat(crate::messages::MESSAGE_BODY_MAX_CHARS);
+        let subject = "s".repeat(crate::messages::MESSAGE_SUBJECT_MAX_CHARS);
+        let evidence = "e".repeat(crate::messages::MESSAGE_EVIDENCE_MAX_CHARS);
+        let stored = h.send(&body, &subject, &evidence).await;
+        assert_eq!(stored.body, body);
+        assert_eq!(stored.subject.as_deref(), Some(subject.as_str()));
+        assert_eq!(stored.evidence.as_deref(), Some(evidence.as_str()));
+
+        let over_body = format!("{body}tail");
+        let over_evidence = format!("{evidence}tail");
+        let over_subject = "界".repeat(crate::messages::MESSAGE_SUBJECT_MAX_CHARS + 1);
+        let clipped = h.send(&over_body, &over_subject, &over_evidence).await;
+        assert_eq!(
+            clipped.body,
+            format!(
+                "{}…",
+                "x".repeat(crate::messages::MESSAGE_BODY_MAX_CHARS - 3)
+            )
+        );
+        assert_eq!(
+            clipped.evidence,
+            Some(format!(
+                "{}…",
+                "e".repeat(crate::messages::MESSAGE_EVIDENCE_MAX_CHARS - 3)
+            ))
+        );
+        assert_eq!(
+            clipped.subject,
+            Some(format!(
+                "{}…",
+                "界".repeat(crate::messages::MESSAGE_SUBJECT_MAX_CHARS - 1)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_message_character_caps_scrub_before_truncating() {
+        let h = MessageTextHarness::new().await;
+        let fake_key = format!("sk-{}", "A".repeat(48));
+        let body = format!(
+            "{} {fake_key}",
+            "x".repeat(crate::messages::MESSAGE_BODY_MAX_CHARS - 10)
+        );
+        let subject = format!(
+            "{} {fake_key}",
+            "s".repeat(crate::messages::MESSAGE_SUBJECT_MAX_CHARS - 10)
+        );
+        let evidence = format!(
+            "{} {fake_key}",
+            "e".repeat(crate::messages::MESSAGE_EVIDENCE_MAX_CHARS - 10)
+        );
+        let stored = h.send(&body, &subject, &evidence).await;
+        for text in [
+            &stored.body,
+            stored.subject.as_ref().unwrap(),
+            stored.evidence.as_ref().unwrap(),
+        ] {
+            assert!(!text.contains("sk-"), "{text}");
+            assert!(!text.contains(&"A".repeat(6)), "{text}");
+            assert!(text.contains("[REDAC"), "{text}");
+        }
+    }
+
     #[tokio::test]
     async fn admin_message_send_observer_sees_commit_without_blocking_response() {
         let (_tmp, _store, router, _ws, _recipient, mut rx, release, server) =
@@ -10214,6 +10370,148 @@ mod tests {
                 .is_err()
         );
         server.abort();
+    }
+
+    async fn message_id_request(
+        router: &Router,
+        action: &str,
+        input: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/messages/{action}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(input.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn assert_admin_blank_message_id_preserves_mail(action: &str, project: &str) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        store
+            .writer
+            .get_or_create_project(ws, "sender", None)
+            .await
+            .unwrap();
+        let recipient = store
+            .writer
+            .get_or_create_project(ws, "recipient", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki));
+        let mut ids = Vec::new();
+        for body in ["first request", "second request"] {
+            let (status, sent) = message_id_request(
+                &router,
+                "send",
+                serde_json::json!({
+                    "from_workspace": "default", "from_project": "sender",
+                    "to_workspace": "default", "to_project": "recipient", "body": body,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{sent}");
+            ids.push(sent["message_id"].as_str().unwrap().to_owned());
+        }
+        let pending = store
+            .reader
+            .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 50)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        for message_id in ["", " \t\n ", "not-a-uuid"] {
+            let (status, refused) = message_id_request(
+                &router,
+                action,
+                serde_json::json!({
+                    "workspace": "default", "project": project, "message_id": message_id,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+            assert_eq!(refused["error"], "message_id must be a full UUID");
+            let untouched = store
+                .reader
+                .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 50)
+                .await
+                .unwrap();
+            assert_eq!(untouched.len(), 2);
+            for (actual, original) in untouched.iter().zip(&pending) {
+                assert_eq!(actual.id, original.id);
+                assert_eq!(actual.body, original.body);
+                assert_eq!(actual.state, original.state);
+            }
+        }
+        let (status, selected) = message_id_request(
+            &router,
+            action,
+            serde_json::json!({
+                "workspace": "default", "project": project, "message_id": format!(" {}\n", ids[1]),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{selected}");
+        if action == "pop" {
+            assert_eq!(selected["message"]["id"], ids[1]);
+        } else {
+            assert_eq!(selected["cancelled"], 1);
+        }
+        let remaining = store
+            .reader
+            .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 50)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id.to_string(), ids[0]);
+        let (status, omitted) = message_id_request(
+            &router,
+            action,
+            serde_json::json!({
+                "workspace": "default", "project": project,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{omitted}");
+        if action == "pop" {
+            assert_eq!(omitted["message"]["id"], ids[0]);
+        } else {
+            assert_eq!(omitted["cancelled"], 1);
+        }
+        assert!(
+            store
+                .reader
+                .list_messages(ws, recipient, ai_memory_core::MessageBox::Inbox, 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_blank_message_pop_id_preserves_pending_mail() {
+        assert_admin_blank_message_id_preserves_mail("pop", "recipient").await;
+    }
+
+    #[tokio::test]
+    async fn admin_blank_message_cancel_id_preserves_pending_mail() {
+        assert_admin_blank_message_id_preserves_mail("cancel", "sender").await;
     }
 
     struct FakeAutoImproveLlm;

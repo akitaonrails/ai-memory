@@ -219,19 +219,12 @@ final class AppModel {
         await runBusy {
             let controller = self.launchdController()
             let runtime = try self.requireRuntime()
-            let installed = (try? String(contentsOf: controller.plistDestination, encoding: .utf8)) ?? ""
-            if LaunchdController.programArgumentsBinary(inPlist: installed) != runtime.binary.path {
-                try? controller.bootout()
-                let template = try String(contentsOf: runtime.plistTemplate, encoding: .utf8)
-                try controller.writePlist(
-                    template: template,
-                    binary: runtime.binary,
-                    dataDir: self.settings.dataDirOverride
-                )
-                try controller.bootstrap()
-            } else {
-                try controller.kickstart()
-            }
+            let template = try String(contentsOf: runtime.plistTemplate, encoding: .utf8)
+            try controller.restart(
+                template: template,
+                binary: runtime.binary,
+                dataDir: self.settings.dataDirOverride
+            )
         }
         clearStartingIfFailed()
         await poll()
@@ -276,14 +269,11 @@ final class AppModel {
             dataDirOverride: dataDirOverride,
             tokenInEdit: clearToken ? nil : token
         )
-        if clearToken {
-            try? tokenStore.clear()
-            settings.clearTokenBinding()
-        } else if let token {
-            let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty {
-                try? tokenStore.save(value)
-            }
+        // The keychain write and the binding are committed together: a failed
+        // write must not leave the retained old bearer bound and resent.
+        if settings.commitTokenEdit(clearToken: clearToken, token: token, to: tokenStore) != nil {
+            lastError = "Couldn't update the saved token in the keychain. "
+                + "Re-check the bearer in Settings."
         }
         settings.save()
         tokenConfigured = tokenStore.read()?.isEmpty == false

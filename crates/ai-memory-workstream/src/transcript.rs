@@ -1322,15 +1322,19 @@ fn export_jsonl_range(
             Sha256::new(),
         )
     };
-    let (mut reader, start): (Box<dyn BufRead>, u64) = if compressed {
-        // A zstd stream cannot seek: decode and drop the bytes before `start`.
-        // A shorter stream ends the skip early, which clamps `start` the way
-        // `min(len)` clamps it for a plain file.
-        let mut reader = transcript_reader(harness, path, file)?;
-        let skipped = std::io::copy(
-            &mut std::io::Read::by_ref(&mut reader).take(start),
-            &mut std::io::sink(),
-        )?;
+    let mut codex_turn_cwd: Option<String> = None;
+    let (mut reader, start): (Box<dyn BufRead>, u64) = if harness == ManagedHarness::Codex {
+        let mut reader = if compressed {
+            // A zstd stream cannot seek: decode and drop the bytes before `start`.
+            // A shorter stream ends the skip early, which clamps `start` the way
+            // `min(len)` clamps it for a plain file.
+            transcript_reader(harness, path, file)?
+        } else {
+            file.seek(SeekFrom::Start(0))?;
+            Box::new(BufReader::new(file))
+        };
+        let (skipped, cwd) = skip_codex_prefix(&mut reader, start)?;
+        codex_turn_cwd = cwd;
         (reader, skipped)
     } else {
         file.seek(SeekFrom::Start(start))?;
@@ -1345,7 +1349,6 @@ fn export_jsonl_range(
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
-    let mut codex_turn_cwd: Option<String> = None;
     loop {
         line.clear();
         let remaining = len.saturating_sub(offset);
@@ -1576,11 +1579,7 @@ fn export_jsonl_range(
         let record_cwd = match harness {
             ManagedHarness::Claude => value.get("cwd").and_then(Value::as_str),
             ManagedHarness::Codex => {
-                if matches!(
-                    value.get("type").and_then(Value::as_str),
-                    Some("session_meta" | "turn_context")
-                ) && let Some(cwd) = value.pointer("/payload/cwd").and_then(Value::as_str)
-                {
+                if let Some(cwd) = codex_context_cwd(&value) {
                     codex_turn_cwd = Some(cwd.to_owned());
                 }
                 codex_turn_cwd.as_deref()
@@ -1633,6 +1632,51 @@ fn stamp_record_cwd(events: &mut [NewWorkstreamEvent], cwd: Option<&str>) {
             metadata.insert(RECORD_CWD_KEY.into(), Value::String(cwd.to_owned()));
         }
     }
+}
+
+fn codex_context_cwd(value: &Value) -> Option<&str> {
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("session_meta" | "turn_context")
+    ) {
+        value.pointer("/payload/cwd").and_then(Value::as_str)
+    } else {
+        None
+    }
+}
+
+/// Codex persists a `turn_context` only when the turn context changed
+/// (https://github.com/openai/codex/blob/b1573f102413e96a6481087922bf425231222dee/codex-rs/core/src/session/mod.rs#L5600-L5621).
+fn skip_codex_prefix(reader: &mut impl BufRead, len: u64) -> Result<(u64, Option<String>)> {
+    let mut cwd = None;
+    let mut consumed = 0_u64;
+    let mut line = Vec::new();
+    while consumed < len {
+        line.clear();
+        let limit = (len - consumed).min((MAX_SOURCE_RECORD_BYTES + 1) as u64);
+        let read = reader.by_ref().take(limit).read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        consumed += read as u64;
+        if read > MAX_SOURCE_RECORD_BYTES {
+            if !line.ends_with(b"\n") {
+                let (tail, _) = discard_through_newline(
+                    &mut reader.by_ref().take(len - consumed),
+                    &mut |_| {},
+                )?;
+                consumed += tail;
+            }
+            continue;
+        }
+        if line.ends_with(b"\n")
+            && let Ok(value) = serde_json::from_slice::<Value>(&line)
+            && let Some(record_cwd) = codex_context_cwd(&value)
+        {
+            cwd = Some(record_cwd.to_owned());
+        }
+    }
+    Ok((consumed, cwd))
 }
 
 /// Count how many times each rewrite-in-place record identity (the SHA-256 of
@@ -3532,6 +3576,26 @@ fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> CrushRe
 }
 
 fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
+    crush_cursor_inner(
+        connection,
+        session,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn crush_cursor_inner(
+    connection: &Connection,
+    session: &str,
+    #[cfg(test)] after_newest: Option<&dyn Fn()>,
+) -> Result<CrushCursor> {
+    // Exports already hold a snapshot; a standalone baseline needs the same
+    // protection across its timestamp and revision queries.
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
     let newest = connection
         .query_row(
             "SELECT updated_at, id FROM messages WHERE session_id = ?1 \
@@ -3543,6 +3607,10 @@ fn crush_cursor(connection: &Connection, session: &str) -> Result<CrushCursor> {
     let Some((updated, id)) = newest else {
         return Ok(CrushCursor::default());
     };
+    #[cfg(test)]
+    if let Some(after_newest) = after_newest {
+        after_newest();
+    }
     let mut statement = connection.prepare(
         "SELECT id, role, parts, is_summary_message FROM messages \
          WHERE session_id = ?1 AND updated_at = ?2 ORDER BY id LIMIT ?3",
@@ -3595,12 +3663,36 @@ fn export_crush_range(
     source_cursor: Option<&str>,
     final_cursor: Option<&str>,
 ) -> Result<ExportedTranscript> {
+    export_crush_range_inner(
+        home,
+        cwd,
+        session_dir,
+        session,
+        source_cursor,
+        final_cursor,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn export_crush_range_inner(
+    home: &Path,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    session: &str,
+    source_cursor: Option<&str>,
+    final_cursor: Option<&str>,
+    #[cfg(test)] after_rows: Option<&dyn Fn()>,
+) -> Result<ExportedTranscript> {
     let db = crush_db(home, cwd, session_dir);
     let connection = Connection::open_with_flags(
         &db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("opening Crush session database {} read-only", db.display()))?;
+    // The cursor must acknowledge only revisions visible to the event query,
+    // even if the native WAL writer commits before that cursor is collected.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<CrushCursor>(raw).ok())
         .unwrap_or_default();
@@ -3691,6 +3783,10 @@ fn export_crush_range(
             &mut source_bytes,
             0,
         )?;
+    }
+    #[cfg(test)]
+    if let Some(after_rows) = after_rows {
+        after_rows();
     }
     let next_cursor = if final_cursor.is_some() {
         upper
@@ -3826,6 +3922,8 @@ fn parse_opencode(
         }
         "tool" => {
             let name = first_string(part, &["tool", "name"]).unwrap_or("tool");
+            // https://github.com/anomalyco/opencode/blob/c63a93995f1e5c28dd73cc032dcb224780f208ff/packages/schema/src/v1/session.ts#L315-L322
+            let call_id = first_string(part, &["callID"]);
             let state = part.get("state").unwrap_or(&Value::Null);
             let input = state.get("input").map(compact_json).unwrap_or_default();
             push_event(
@@ -3838,7 +3936,7 @@ fn parse_opencode(
                 Some("assistant"),
                 &format!("{name}: {input}"),
                 None,
-                json!({"tool": name}),
+                with_tool_use_id(json!({"tool": name}), call_id),
             );
             let status = state.get("status").and_then(Value::as_str);
             // V1 terminal failures store their visible result in `error`, not
@@ -3863,11 +3961,14 @@ fn parse_opencode(
                     Some("tool"),
                     &output,
                     None,
-                    if status == Some("error") {
-                        json!({"status": status, "is_error": true})
-                    } else {
-                        json!({"status": status})
-                    },
+                    with_tool_use_id(
+                        if status == Some("error") {
+                            json!({"status": status, "is_error": true})
+                        } else {
+                            json!({"status": status})
+                        },
+                        call_id,
+                    ),
                 );
             }
         }
@@ -8220,6 +8321,157 @@ mod tests {
         );
     }
 
+    /// A native WAL writer may commit after the event query is exhausted.
+    /// Its unseen row must remain outside the returned cursor until the next read.
+    #[test]
+    fn crush_export_cursor_covers_only_its_event_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let data = cwd.join(".crush");
+        fs::create_dir_all(&data).unwrap();
+        let db = data.join("crush.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
+                 parts TEXT, updated_at INTEGER, is_summary_message INTEGER);",
+            )
+            .unwrap();
+        let insert = |connection: &Connection, id: &str, text: &str, updated: i64| {
+            connection
+                .execute(
+                    "INSERT INTO messages VALUES (?1, 's', 'assistant', ?2, ?3, 0)",
+                    params![
+                        id,
+                        json!([{"type":"text","data":{"text":text}}]).to_string(),
+                        updated
+                    ],
+                )
+                .unwrap();
+        };
+        insert(&writer, "before", "before export", 100);
+        let during = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let writer = Connection::open(&db).unwrap();
+                        insert(&writer, "during", "during export", 200);
+                    })
+                    .join()
+                    .unwrap();
+            });
+        };
+        let first =
+            export_crush_range_inner(temp.path(), &cwd, None, "s", None, None, Some(&during))
+                .unwrap();
+        assert_eq!(kinds_and_contents(&first), [("message", "before export")]);
+        let cursor: CrushCursor =
+            serde_json::from_str(first.source_cursor.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            cursor.updated, 100,
+            "the cursor must use the event query's snapshot"
+        );
+        assert_eq!(
+            cursor
+                .boundary
+                .iter()
+                .map(|revision| revision.id.as_str())
+                .collect::<Vec<_>>(),
+            ["before"]
+        );
+        assert!(first.losses.is_empty());
+
+        insert(&writer, "after", "after export", 300);
+        let second =
+            export_crush(temp.path(), &cwd, None, "s", first.source_cursor.as_deref()).unwrap();
+        assert_eq!(
+            kinds_and_contents(&second),
+            [("message", "during export"), ("message", "after export")]
+        );
+        assert!(second.losses.is_empty());
+        assert!(
+            export_crush(
+                temp.path(),
+                &cwd,
+                None,
+                "s",
+                second.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
+        );
+    }
+
+    /// Cursor timestamps and revision fingerprints must describe one snapshot,
+    /// including when a same-second insert lands between its two queries.
+    #[test]
+    fn crush_baseline_cursor_revisions_share_the_timestamp_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("crush.db");
+        let writer = Connection::open(&db).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE messages(id TEXT PRIMARY KEY, session_id TEXT, role TEXT,
+                 parts TEXT, updated_at INTEGER, is_summary_message INTEGER);",
+            )
+            .unwrap();
+        let before = json!([{"type":"text","data":{"text":"before baseline"}}]).to_string();
+        writer
+            .execute(
+                "INSERT INTO messages VALUES ('m', 's', 'assistant', ?1, 100, 0)",
+                [&before],
+            )
+            .unwrap();
+        let reader = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let during = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let writer = Connection::open(&db).unwrap();
+                        let after =
+                            json!([{"type":"text","data":{"text":"during baseline"}}]).to_string();
+                        writer
+                            .execute(
+                                "INSERT INTO messages VALUES ('z', 's', 'assistant', ?1, 100, 0)",
+                                [&after],
+                            )
+                            .unwrap();
+                    })
+                    .join()
+                    .unwrap();
+            });
+        };
+        let cursor = crush_cursor_inner(&reader, "s", Some(&during)).unwrap();
+        assert_eq!(
+            cursor.boundary,
+            [crush_revision("m", "assistant", &before, 0)]
+        );
+        let next = export_crush(
+            temp.path(),
+            temp.path(),
+            Some(temp.path()),
+            "s",
+            Some(&serde_json::to_string(&cursor).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(kinds_and_contents(&next), [("message", "during baseline")]);
+        assert!(
+            export_crush(
+                temp.path(),
+                temp.path(),
+                Some(temp.path()),
+                "s",
+                next.source_cursor.as_deref()
+            )
+            .unwrap()
+            .events
+            .is_empty()
+        );
+    }
+
     /// Claude Code writes `cwd` on every record and Codex in each
     /// `turn_context`; each event carries the cwd of the record it came from,
     /// so an import resolves relative tool arguments from where the call ran.
@@ -8277,6 +8529,52 @@ mod tests {
             .map(|event| event.metadata.get(RECORD_CWD_KEY).and_then(Value::as_str))
             .collect();
         assert_eq!(cwds, [root.to_str(), docs.to_str()], "{events:?}");
+    }
+
+    #[test]
+    fn incremental_codex_export_keeps_the_turn_cwd_from_before_the_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let docs = root.join("docs");
+        let codex = temp.path().join("codex.jsonl");
+        let item = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+        let lines = |values: &[Value]| {
+            values
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+        };
+        fs::write(
+            &codex,
+            lines(&[
+                json!({"type":"session_meta","payload":{"id":"s","cwd":root}}),
+                item("first turn"),
+                json!({"type":"turn_context","payload":{"cwd":docs}}),
+                item("second turn"),
+            ]),
+        )
+        .unwrap();
+        let first = export_jsonl(ManagedHarness::Codex, &codex, "s", None).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&codex).unwrap();
+        std::io::Write::write_all(&mut file, lines(&[item("same turn, later")]).as_bytes())
+            .unwrap();
+        let next = export_jsonl(
+            ManagedHarness::Codex,
+            &codex,
+            "s",
+            first.source_cursor.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(next.events.len(), 1, "{:?}", next.events);
+        assert_eq!(
+            next.events[0]
+                .metadata
+                .get(RECORD_CWD_KEY)
+                .and_then(Value::as_str),
+            docs.to_str(),
+            "{:?}",
+            next.events
+        );
     }
 
     #[test]
@@ -9691,6 +9989,26 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn opencode_tool_calls_and_results_keep_their_call_id() {
+        let message = json!({"role":"assistant"});
+        let part = json!({
+            "type":"tool",
+            "callID":"call-1",
+            "tool":"bash",
+            "state":{"status":"completed","input":{"command":"ls"},"output":"file"}
+        });
+        let mut events = Vec::new();
+        let mut losses = Vec::new();
+        parse_opencode(&message, &part, "s1", "p1", &mut events, &mut losses);
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].kind, WorkstreamEventKind::ToolCall);
+        assert_eq!(events[0].metadata["tool_use_id"], "call-1");
+        assert_eq!(events[1].kind, WorkstreamEventKind::ToolResult);
+        assert_eq!(events[1].metadata["tool_use_id"], "call-1");
     }
 
     /// Beta store fixture: `session_v2` + `session_message` with the shapes

@@ -192,7 +192,11 @@ GET /api/v1/projects?workspace=NAME   # projects in one workspace
     "project_id": "0193e7a1-0000-7000-8000-00000000000b",
     "project_name": "ai-memory",
     "page_count": 138,
-    "last_updated": "2026-05-28T14:02:11.123Z"
+    "session_count": 27,
+    "observation_count": 921,
+    "open_session_count": 1,
+    "last_updated": "2026-05-28T14:02:11.123Z",
+    "last_activity": "2026-05-28T14:05:00Z"
   }
 ]
 ```
@@ -201,6 +205,11 @@ GET /api/v1/projects?workspace=NAME   # projects in one workspace
 twin row can carry another project's old name), and the admin project
 operations accept the id where the name is ambiguous. A restricted project's
 row, id included, is hidden from a caller without a grant.
+
+Rows are ordered newest first by `last_activity`: the latest observation,
+session start, or latest unexpired page update. A project with none of these
+has `last_activity: null` and sorts last. `last_updated` measures only the
+latest unexpired page update.
 
 ### 4.3 Pages (list)
 

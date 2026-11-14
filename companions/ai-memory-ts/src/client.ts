@@ -167,6 +167,12 @@ function metadataFromFrontmatter(frontmatter: Raw): PageMetadata {
   if (abstractText !== undefined) meta.abstract = abstractText;
   const expiresAt = text("expires_at");
   if (expiresAt !== undefined) meta.expiresAt = expiresAt;
+  const appliesTo = texts("applies_to");
+  const singleStack = text("applies_to");
+  if (appliesTo !== undefined) meta.appliesTo = appliesTo;
+  else if (singleStack !== undefined) meta.appliesTo = [singleStack];
+  const enforcedBy = text("enforced_by");
+  if (enforcedBy !== undefined) meta.enforcedBy = enforcedBy;
   const relations = frontmatter["relations"];
   if (relations !== null && typeof relations === "object" && !Array.isArray(relations)) {
     const kept: Partial<Record<RelationName, string[]>> = {};
@@ -339,6 +345,8 @@ export class PagesNamespace {
         abstract: a.abstract,
         relations: a.relations,
         expires_at: a.expiresAt,
+        applies_to: a.appliesTo,
+        enforced_by: a.enforcedBy,
         source_files: a.sourceFiles,
         expected_page_id: a.expectedPageId,
         create_only: a.createOnly === true ? true : undefined,

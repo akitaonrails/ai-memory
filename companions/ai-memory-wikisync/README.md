@@ -117,9 +117,10 @@ This section describes `plan` and `export`; `sync` adds the rules under
 
 - **API-only.** Documented read-only `/api/v1` endpoints (incremental
   `recent` listing with cursor paging, single-page reads with
-  `ETag`/`If-None-Match` revalidation; the legacy array listing is
-  accepted as a fallback). No admin routes, and `plan` and `export` never
-  write to the server. `401`/`403`/`404` become clear errors; page count
+  `ETag`/`If-None-Match` revalidation; when a legacy server returns a limited
+  `recent` array, the full `pages` listing is fetched instead). No admin routes,
+  and `plan` and `export` never write to the server. `401`/`403`/`404` become
+  clear errors; page count
   and body size are bounded per run.
 - **Path safety.** Every server-reported path is validated into a
   portable shape (ASCII, no traversal, no dotfiles, no reserved Windows

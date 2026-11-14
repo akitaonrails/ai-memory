@@ -47,9 +47,11 @@ await memory.pages.update("notes/retries.md", (current) => ({
 }));
 ```
 
-`update` reads the page, applies your change, carries the current metadata
-over, and writes with the version it read as `expectedPageId`. Set a field to
-`null` in the change to clear it.
+`update` reads the page, applies your change, carries the supported write
+metadata over, and writes with the version it read as `expectedPageId`. Set a
+field to `null` in the change to clear it. For profile entries, this includes
+`appliesTo` and `enforcedBy`. Use the explicit profile scope, for example
+`{ workspace: "default", project: "_global" }` for a single-operator profile.
 
 If the first read is truncated and the reported size is at most 64,000
 characters, `update` reads the page once more with that cap and uses the

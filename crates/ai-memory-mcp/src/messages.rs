@@ -28,9 +28,21 @@ use crate::admin::{internal_err, scope_err, skip_webhooks_for_admin_request};
 
 /// Caps on stored message text. The body crosses a project-isolation boundary
 /// and is untrusted on the receiving side.
-const MESSAGE_BODY_MAX_CHARS: usize = 8000;
-const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
-const MESSAGE_EVIDENCE_MAX_CHARS: usize = 1_000;
+pub(crate) const MESSAGE_BODY_MAX_CHARS: usize = 8000;
+pub(crate) const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
+pub(crate) const MESSAGE_EVIDENCE_MAX_CHARS: usize = 1_000;
+
+/// Clip to at most `max_chars` characters, counting characters rather than
+/// bytes so multibyte text is not truncated mid-cap below its intended length
+/// (#2283). The byte-safe cut lands on a character boundary and keeps the
+/// shared ellipsis notice.
+fn cap_message_chars(input: &str, max_chars: usize) -> String {
+    let max_bytes = input
+        .char_indices()
+        .nth(max_chars)
+        .map_or(input.len(), |(end, _)| end);
+    ai_memory_core::truncate_utf8_bytes(input, max_bytes)
+}
 
 type Reply = (StatusCode, Json<Value>);
 type Viewer = Option<Extension<AuthorizedViewer>>;
@@ -99,8 +111,10 @@ async fn owner_stamp(
 }
 
 fn parse_message_id(raw: Option<&str>) -> Result<Option<MessageId>, Reply> {
+    // An explicitly blank id is a malformed request, not an absent one: keep it
+    // so it is rejected as invalid rather than silently treated as "no id"
+    // (#2245).
     raw.map(str::trim)
-        .filter(|s| !s.is_empty())
         .map(str::parse::<MessageId>)
         .transpose()
         .map_err(|_| {
@@ -226,17 +240,16 @@ pub(crate) async fn send(
     .await?;
 
     let sanitizer = ai_memory_core::Sanitizer::builtin();
-    let cap = ai_memory_core::truncate_utf8_bytes;
-    let body = cap(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
+    let body = cap_message_chars(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
     let subject = req
         .subject
         .as_deref()
-        .map(|s| cap(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS))
+        .map(|s| cap_message_chars(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS))
         .filter(|s| !s.is_empty());
     let evidence = req
         .evidence
         .as_deref()
-        .map(|s| cap(&sanitizer.scrub(s), MESSAGE_EVIDENCE_MAX_CHARS))
+        .map(|s| cap_message_chars(&sanitizer.scrub(s), MESSAGE_EVIDENCE_MAX_CHARS))
         .filter(|s| !s.trim().is_empty());
     if req.nature == ai_memory_core::MessageNature::Measured && evidence.is_none() {
         return Err((
