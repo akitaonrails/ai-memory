@@ -1953,8 +1953,10 @@ for _am_key in session_id sessionId sessionID session conversationId taskId; do
 done
 assert_eq "whitespace native session id is ignored" "no" \
     "$(devin_has_sid '{"session_id":"  \t "}')"
+assert_eq "escaped backslash-t native session id counts as present" "yes" \
+    "$(devin_has_sid '{"session_id":"\\t"}')"
 assert_eq "whitespace primary key falls through to taskId" "t-1" \
-    "$(ai_memory_payload_session_id '{"session_id":"  ","taskId":"t-1"}' || true)"
+    "$(ai_memory_payload_session_id '{"session_id":"  \n\r\t ","taskId":"t-1"}' || true)"
 assert_eq "nested session_id inside tool_input does not count as native" "no" \
     "$(devin_has_sid '{"tool_input":{"session_id":"nested"},"cwd":"/work"}')"
 assert_eq "quoted taskId inside tool_response does not count as native" "no" \
