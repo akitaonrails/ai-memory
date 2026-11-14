@@ -33,6 +33,118 @@ fn responses(content: &str) -> serde_json::Value {
     json!({"status":"completed","model":"responses-model","output":[{"type":"message","content":[{"type":"output_text","text":content}]}],"usage":{"input_tokens":2,"output_tokens":3}})
 }
 
+/// A budget stop must win over both valid-looking JSON and a parse failure.
+#[tokio::test]
+async fn structured_chat_rejects_token_budget_stops_before_parsing() {
+    for (content, completion_tokens) in [
+        (Some(r#"{"updates":[]}"#), Some(4096)),
+        (Some(r#"{"updates":["#), None),
+        (None, Some(4096)),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(metadata("chat", &["/chat/completions"])),
+            )
+            .mount(&server)
+            .await;
+        let mut body = chat("");
+        body["choices"][0]["message"]["content"] = json!(content);
+        body["choices"][0]["finish_reason"] = json!("length");
+        body["usage"] = completion_tokens.map_or(
+            serde_json::Value::Null,
+            |tokens| json!({"prompt_tokens": 2, "completion_tokens": tokens}),
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = provider(&server, "chat")
+            .complete_structured_raw(
+                ai_memory_llm::ChatRequest::user_prompt("json"),
+                json!({"type":"object","properties":{"updates":{"type":"array","items":{"type":"string"}}}}),
+            )
+            .await
+            .expect_err("a token-budget stop must not be accepted as a complete result");
+
+        assert!(
+            matches!(&err, LlmError::TruncatedResponse { model, completion_tokens: actual }
+                if model == "chat" && *actual == completion_tokens),
+            "{err:?}"
+        );
+        assert!(!err.is_transient());
+        assert!(!err.to_string().contains("updates"));
+    }
+}
+
+#[tokio::test]
+async fn structured_chat_preserves_completed_and_legacy_responses() {
+    for finish_reason in [Some("stop"), None] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(metadata("chat", &["/chat/completions"])),
+            )
+            .mount(&server)
+            .await;
+        let mut body = chat(r#"{"ok":true}"#);
+        if let Some(reason) = finish_reason {
+            body["choices"][0]["finish_reason"] = json!(reason);
+        }
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            provider(&server, "chat")
+                .complete_structured_raw(
+                    ai_memory_llm::ChatRequest::user_prompt("json"),
+                    json!({"type":"object","properties":{"ok":{"type":"boolean"}}}),
+                )
+                .await
+                .unwrap(),
+            json!({"ok": true})
+        );
+    }
+}
+
+#[tokio::test]
+async fn plain_chat_preserves_text_at_the_token_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata("chat", &["/chat/completions"])),
+        )
+        .mount(&server)
+        .await;
+    let mut body = chat("partial prose");
+    body["choices"][0]["finish_reason"] = json!("length");
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    assert_eq!(
+        provider(&server, "chat")
+            .complete(ai_memory_llm::ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap()
+            .text,
+        "partial prose"
+    );
+}
+
 /// A `/responses` answer stopped by `max_output_tokens` is a truncation the
 /// operator can act on, not an unexpected shape. `error` is null on an
 /// incomplete response, so the old message always ended "no error detail" and

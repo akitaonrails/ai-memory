@@ -47,6 +47,10 @@ version in [`docs/changelog/`](docs/changelog/):
   (`w:moveFrom`) while retaining the destination text (`w:moveTo`). It
   previously extracted both copies of a tracked move, duplicating text that
   appears only once in the accepted document. (#2236)
+- Rejected Copilot Chat Completions structured output stopped at its token
+  budget before parsing it as JSON. A valid-looking partial object could
+  previously be accepted as a complete result; it now reports the terminal
+  `truncated-response` error, matching Copilot Responses. (#2251)
 - Fixed native Devin and ZCode hooks ignoring `AI_MEMORY_SESSION_ID` on events
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin
@@ -75,6 +79,7 @@ version in [`docs/changelog/`](docs/changelog/):
   in UTF-8 bytes instead of Unicode characters after scrubbing. Multibyte text
   within both the character budgets and the existing store byte limits is now
   preserved. ASCII truncation and the final store byte limits are unchanged. (#2245)
+
 
 ## [3.4.6] - 2026-11-13
 
