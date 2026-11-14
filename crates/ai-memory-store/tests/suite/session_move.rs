@@ -386,7 +386,11 @@ async fn a_moved_session_page_takes_feedback_and_survives_source_purge() {
         .await
         .unwrap();
 
-    let source_before = store.reader.open_feedback_findings(ws, source).await.unwrap();
+    let source_before = store
+        .reader
+        .open_feedback_findings(ws, source)
+        .await
+        .unwrap();
     assert_eq!(source_before.len(), 1);
     assert_eq!(source_before[0].path, page_path);
     assert!(
@@ -446,7 +450,11 @@ async fn a_moved_session_page_takes_feedback_and_survives_source_purge() {
             .is_empty()
     );
 
-    let target_after = store.reader.open_feedback_findings(ws, target).await.unwrap();
+    let target_after = store
+        .reader
+        .open_feedback_findings(ws, target)
+        .await
+        .unwrap();
     assert_eq!(target_after.len(), 1);
     assert_eq!(target_after[0].path, page_path);
     assert_eq!(target_after[0].kind, "stale");

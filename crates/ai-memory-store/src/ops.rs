@@ -9748,7 +9748,13 @@ fn migrate_moved_page_metadata(
                  ON CONFLICT (workspace_id, project_id, name) \
                  DO UPDATE SET name = excluded.name \
                  RETURNING id",
-                params![new_entity_id.as_bytes(), to_ws, to_proj, name, link.created_at],
+                params![
+                    new_entity_id.as_bytes(),
+                    to_ws,
+                    to_proj,
+                    name,
+                    link.created_at
+                ],
                 |row| row.get(0),
             )?;
             tx.execute(
@@ -9756,7 +9762,12 @@ fn migrate_moved_page_metadata(
                      (entity_id, page_id, valid_from, superseded_at) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT (entity_id, page_id) DO NOTHING",
-                params![target_entity_id, &page_id[..], link.valid_from, link.superseded_at],
+                params![
+                    target_entity_id,
+                    &page_id[..],
+                    link.valid_from,
+                    link.superseded_at
+                ],
             )?;
             tx.execute(
                 "DELETE FROM entity_page_links WHERE entity_id = ?1 AND page_id = ?2",
