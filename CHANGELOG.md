@@ -54,6 +54,13 @@ version in [`docs/changelog/`](docs/changelog/):
   characters was cut mid-text even though the MCP and web callers had accepted
   it; messages now have their own 32 KiB cap, which holds 8 000 characters at
   UTF-8's four-byte worst case. (#2241)
+- Codex transcript imports resumed from a saved cursor now label each new
+  event with the working directory of its turn. Codex writes a `turn_context`
+  record only when the turn context changes, and an incremental export read
+  only the records after the cursor, so events before the next `turn_context`
+  had no record cwd and the capture policy judged them from the session cwd
+  instead. The export now takes the last cwd from the records before the
+  cursor, as a full export does.
 
 ## [3.4.6] - 2026-11-13
 
