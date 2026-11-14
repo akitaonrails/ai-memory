@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import Testing
 @testable import AIMemoryMenuCore
 
@@ -97,6 +98,191 @@ struct LaunchdControllerTests {
         #expect(LaunchdController.programArgumentsBinary(inPlist: plist) == "/Applications/R&D/AI Memory.app/ai-memory")
         #expect(LaunchdController.programArgumentsBinary(inPlist: "not a plist") == nil)
         #expect(LaunchdController.programArgumentsBinary(inPlist: "<plist version=\"1.0\"><dict/></plist>") == nil)
+    }
+
+    @Test func restartReloadsChangedOrClearedDataDirectory() throws {
+        let original = URL(fileURLWithPath: "/tmp/old-memory")
+        let changed = URL(fileURLWithPath: "/tmp/Memory & Notes")
+        for (previous, desired) in [(nil, changed), (original, changed), (original, nil)] {
+            let fixture = try RestartFixture()
+            defer { fixture.remove() }
+            try fixture.controller.writePlist(template: fixture.template, binary: fixture.binary, dataDir: previous)
+
+            try fixture.controller.restart(template: fixture.template, binary: fixture.binary, dataDir: desired)
+
+            #expect(fixture.runner.calls == fixture.reloadCalls)
+            let values = try fixture.installedValues()
+            #expect((values["EnvironmentVariables"] as? [String: String])?["AI_MEMORY_DATA_DIR"] == desired?.path)
+        }
+    }
+
+    @Test func restartKeepsUnchangedConfigurationAndUnmanagedFields() throws {
+        for dataDir in [URL(fileURLWithPath: "/tmp/custom-memory"), nil] {
+            let fixture = try RestartFixture()
+            defer { fixture.remove() }
+            try fixture.controller.writePlist(template: fixture.template, binary: fixture.binary, dataDir: dataDir)
+            var values = try fixture.installedValues()
+            values["Nice"] = 5
+            var environment = values["EnvironmentVariables"] as? [String: String] ?? [:]
+            environment["UNMANAGED_FIXTURE_SETTING"] = "keep this value"
+            values["EnvironmentVariables"] = environment
+            let original = try PropertyListSerialization.data(fromPropertyList: values, format: .xml, options: 0)
+            try original.write(to: fixture.controller.plistDestination)
+
+            try fixture.controller.restart(template: fixture.template, binary: fixture.binary, dataDir: dataDir)
+
+            #expect(fixture.runner.calls == [["kickstart", "-k", fixture.domainService]])
+            #expect(try Data(contentsOf: fixture.controller.plistDestination) == original)
+        }
+    }
+
+    @Test func restartReloadsChangedBinaryOrArguments() throws {
+        for changeBinary in [false, true] {
+            let fixture = try RestartFixture()
+            defer { fixture.remove() }
+            let oldBinary = changeBinary ? URL(fileURLWithPath: "/Applications/Old AI Memory.app/ai-memory") : fixture.binary
+            let oldTemplate = changeBinary ? fixture.template : fixture.template.replacingOccurrences(of: "<string>--enable-web</string>", with: "<string>--no-watcher</string>")
+            try fixture.controller.writePlist(template: oldTemplate, binary: oldBinary, dataDir: nil)
+
+            try fixture.controller.restart(template: fixture.template, binary: fixture.binary, dataDir: nil)
+
+            #expect(fixture.runner.calls == fixture.reloadCalls)
+            #expect(try fixture.installedValues()["ProgramArguments"] as? [String] == [fixture.binary.path, "serve", "--transport", "http", "--enable-web"])
+        }
+    }
+
+    @Test func restartRebuildsMissingOrMalformedPlist() throws {
+        for malformed in [false, true] {
+            let fixture = try RestartFixture()
+            defer { fixture.remove() }
+            if malformed {
+                try FileManager.default.createDirectory(at: fixture.controller.plistDestination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try "not a plist".write(to: fixture.controller.plistDestination, atomically: true, encoding: .utf8)
+            }
+            fixture.runner.results = [ProcessResult(exitCode: 3, stdout: "", stderr: "not loaded"), ProcessResult(exitCode: 0, stdout: "", stderr: "")]
+
+            try fixture.controller.restart(template: fixture.template, binary: fixture.binary, dataDir: nil)
+
+            #expect(fixture.runner.calls == fixture.reloadCalls)
+            #expect(try fixture.installedValues()["ProgramArguments"] as? [String] == [fixture.binary.path, "serve", "--transport", "http", "--enable-web"])
+        }
+    }
+
+    @Test func restartSurfacesBootstrapFailure() throws {
+        let fixture = try RestartFixture()
+        defer { fixture.remove() }
+        fixture.runner.results = [ProcessResult(exitCode: 3, stdout: "", stderr: "not loaded"), ProcessResult(exitCode: 5, stdout: "", stderr: "bootstrap refused")]
+
+        #expect(throws: CliError.failed(5, "bootstrap refused")) {
+            try fixture.controller.restart(template: fixture.template, binary: fixture.binary, dataDir: nil)
+        }
+        #expect(fixture.runner.calls == fixture.reloadCalls)
+        #expect(!FileManager.default.fileExists(atPath: fixture.controller.plistDestination.path))
+    }
+
+    @Test func failedReloadRestoresThePreviousPlistAndRetriesTheReload() throws {
+        let fixture = try RestartFixture()
+        defer { fixture.remove() }
+        let oldDataDir = URL(fileURLWithPath: "/tmp/old-memory")
+        let newDataDir = URL(fileURLWithPath: "/tmp/new-memory")
+        try fixture.controller.writePlist(template: fixture.template, binary: fixture.binary, dataDir: oldDataDir)
+        let previous = try Data(contentsOf: fixture.controller.plistDestination)
+        fixture.runner.results = [
+            ProcessResult(exitCode: 5, stdout: "", stderr: "bootout refused"),
+            ProcessResult(exitCode: 5, stdout: "", stderr: "bootstrap refused"),
+            ProcessResult(exitCode: 0, stdout: "", stderr: ""),
+            ProcessResult(exitCode: 0, stdout: "", stderr: ""),
+        ]
+
+        #expect(throws: CliError.failed(5, "bootstrap refused")) {
+            try fixture.controller.restart(template: fixture.template, binary: fixture.binary, dataDir: newDataDir)
+        }
+        #expect(try Data(contentsOf: fixture.controller.plistDestination) == previous)
+
+        try fixture.controller.restart(template: fixture.template, binary: fixture.binary, dataDir: newDataDir)
+
+        #expect(fixture.runner.calls == fixture.reloadCalls + fixture.reloadCalls)
+        #expect((try fixture.installedValues()["EnvironmentVariables"] as? [String: String])?["AI_MEMORY_DATA_DIR"] == newDataDir.path)
+    }
+
+    @Test func invalidDesiredTemplateLeavesTheInstalledJobAlone() throws {
+        let fixture = try RestartFixture()
+        defer { fixture.remove() }
+        try fixture.controller.writePlist(template: fixture.template, binary: fixture.binary, dataDir: nil)
+        let previous = try Data(contentsOf: fixture.controller.plistDestination)
+
+        for template in [
+            "not a plist",
+            fixture.template.replacingOccurrences(of: LaunchdController.label, with: "invalid.label"),
+            fixture.template.replacingOccurrences(of: "__AI_MEMORY_BIN__", with: "/bin/unexpected"),
+        ] {
+            #expect(throws: CocoaError.self) {
+                try fixture.controller.restart(template: template, binary: fixture.binary, dataDir: nil)
+            }
+            #expect(fixture.runner.calls.isEmpty)
+            #expect(try Data(contentsOf: fixture.controller.plistDestination) == previous)
+        }
+    }
+
+    @Test func failedRollbackIsReported() throws {
+        let fixture = try RestartFixture()
+        defer { fixture.remove() }
+        try fixture.controller.writePlist(template: fixture.template, binary: fixture.binary, dataDir: nil)
+        fixture.runner.onCall = { arguments in
+            if arguments.first == "bootstrap" {
+                let parent = fixture.controller.plistDestination.deletingLastPathComponent()
+                try FileManager.default.removeItem(at: parent)
+                try Data("blocked".utf8).write(to: parent)
+            }
+        }
+        fixture.runner.results = [
+            ProcessResult(exitCode: 0, stdout: "", stderr: ""),
+            ProcessResult(exitCode: 5, stdout: "", stderr: "bootstrap refused"),
+        ]
+
+        do {
+            try fixture.controller.restart(template: fixture.template, binary: fixture.binary, dataDir: URL(fileURLWithPath: "/tmp/new-memory"))
+            Issue.record("expected the restart and rollback to fail")
+        } catch {
+            #expect(error.localizedDescription.contains("could not be restored"))
+        }
+        #expect(fixture.runner.calls == fixture.reloadCalls)
+    }
+}
+
+private struct RestartFixture {
+    let home: URL
+    let runner = LaunchdMockRunner()
+    let binary = URL(fileURLWithPath: "/Applications/AI Memory.app/Contents/Resources/runtime/ai-memory")
+    let template: String
+
+    init() throws {
+        home = FileManager.default.temporaryDirectory.appending(path: "ai-memory-restart-\(UUID().uuidString)")
+        template = try String(contentsOf: repoRoot().appending(path: "packaging/launchd/com.github.akitaonrails.ai-memory.plist"), encoding: .utf8)
+    }
+
+    var controller: LaunchdController { LaunchdController(home: home, runner: runner) }
+    var domainService: String { "gui/\(getuid())/\(LaunchdController.label)" }
+    var reloadCalls: [[String]] { [["bootout", domainService], ["bootstrap", "gui/\(getuid())", controller.plistDestination.path]] }
+
+    func installedValues() throws -> [String: Any] {
+        let data = try Data(contentsOf: controller.plistDestination)
+        return try #require(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+    }
+
+    func remove() { try? FileManager.default.removeItem(at: home) }
+}
+
+private final class LaunchdMockRunner: CommandRunning, @unchecked Sendable {
+    var calls: [[String]] = []
+    var results: [ProcessResult] = []
+    var onCall: (([String]) throws -> Void)?
+
+    func run(binary: URL, arguments: [String], extraEnv: [String: String]) throws -> ProcessResult {
+        #expect(binary.path == "/bin/launchctl")
+        calls.append(arguments)
+        try onCall?(arguments)
+        return results.isEmpty ? ProcessResult(exitCode: 0, stdout: "", stderr: "") : results.removeFirst()
     }
 }
 

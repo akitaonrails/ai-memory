@@ -49,7 +49,10 @@ Drag the `.app` to `/Applications` for a stable LaunchAgent path. Notarization, 
 
 Updates: replace `/Applications/AI Memory.app`. The data dir is untouched. If
 the helper path inside the bundle changed, **Restart Server** re-renders the
-plist. App and home-directory paths preserve spaces and XML characters such as
+plist. It also reloads the LaunchAgent when a data-directory override is added,
+changed, or cleared in Settings; restarting then uses the selected directory
+without moving existing files. App and home-directory paths preserve spaces
+and XML characters such as
 `&` in the generated LaunchAgent.
 
 ## Tests

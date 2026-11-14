@@ -219,19 +219,12 @@ final class AppModel {
         await runBusy {
             let controller = self.launchdController()
             let runtime = try self.requireRuntime()
-            let installed = (try? String(contentsOf: controller.plistDestination, encoding: .utf8)) ?? ""
-            if LaunchdController.programArgumentsBinary(inPlist: installed) != runtime.binary.path {
-                try? controller.bootout()
-                let template = try String(contentsOf: runtime.plistTemplate, encoding: .utf8)
-                try controller.writePlist(
-                    template: template,
-                    binary: runtime.binary,
-                    dataDir: self.settings.dataDirOverride
-                )
-                try controller.bootstrap()
-            } else {
-                try controller.kickstart()
-            }
+            let template = try String(contentsOf: runtime.plistTemplate, encoding: .utf8)
+            try controller.restart(
+                template: template,
+                binary: runtime.binary,
+                dataDir: self.settings.dataDirOverride
+            )
         }
         clearStartingIfFailed()
         await poll()
