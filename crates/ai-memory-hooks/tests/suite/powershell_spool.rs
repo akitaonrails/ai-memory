@@ -545,3 +545,51 @@ fn powershell_devin_session_id_pin_and_native_precedence() {
         );
     }
 }
+
+/// TEMP DIAGNOSTIC (#2256): isolate which Clear guard term fails on Windows.
+/// Probes both the direct native-detection + guard inputs AND the real
+/// Invoke-AiMemoryHook session-end path (slot survival) for a bare pinned turn.
+#[test]
+fn diag_devin_native_detection_and_clear_guard() {
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = home.path().join("data");
+    let repo = home.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let slot = data_dir.join("hook-state").join("devin-session-id");
+    let program = format!(
+        ". '{lib}'; \
+         function Read-AiMemoryStdin {{ $script:payload }}; \
+         $env:AI_MEMORY_SESSION_ID = 'ps-pin 1'; \
+         Remove-Item Env:AI_MEMORY_CAPTURE_OWNER -ErrorAction SilentlyContinue; \
+         $bare = @{{ cwd = $env:AI_MEMORY_TEST_REPO }} | ConvertTo-Json -Compress; \
+         $parsed = $bare | ConvertFrom-Json; \
+         $native = Get-AiMemoryNativeSessionId -ParsedPayload $parsed; \
+         $pinWhite = [string]::IsNullOrWhiteSpace($env:AI_MEMORY_SESSION_ID); \
+         $natWhite = [string]::IsNullOrWhiteSpace([string]$native); \
+         $psv = $PSVersionTable.PSVersion.ToString(); \
+         $slot = $env:AI_MEMORY_TEST_SLOT; \
+         $slotDir = Split-Path -LiteralPath $slot -Parent; \
+         New-Item -ItemType Directory -Force -Path $slotDir | Out-Null; \
+         Set-Content -LiteralPath $slot -Value 'stale-slot' -NoNewline; \
+         $script:payload = $bare; \
+         Clear-AiMemorySessionId -Agent 'devin' -NativeSessionId ([string]$native); \
+         $clearGuardKept = Test-Path -LiteralPath $slot -PathType Leaf; \
+         Set-Content -LiteralPath $slot -Value 'stale-slot' -NoNewline; \
+         Invoke-AiMemoryHook -Event 'session-end' -Agent 'devin'; \
+         $fullPathKept = Test-Path -LiteralPath $slot -PathType Leaf; \
+         [Console]::Out.Write(\"native=[$native] pinWhite=$pinWhite natWhite=$natWhite psv=$psv clearGuardKept=$clearGuardKept fullPathKept=$fullPathKept\")",
+        lib = hook_lib()
+    );
+    let output = run_powershell(
+        &program,
+        home.path(),
+        &[
+            ("AI_MEMORY_TEST_REPO", repo.to_str().unwrap()),
+            ("AI_MEMORY_TEST_SLOT", slot.to_str().unwrap()),
+            ("AI_MEMORY_DATA_DIR", data_dir.to_str().unwrap()),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stdout, "DIAGNOSTIC_MARKER", "DIAG: {stdout} | STDERR: {stderr}");
+}
