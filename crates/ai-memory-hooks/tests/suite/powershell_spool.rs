@@ -409,7 +409,7 @@ fn powershell_devin_session_id_pin_and_native_precedence() {
          $repo = $env:AI_MEMORY_TEST_REPO; \
          $slot = $env:AI_MEMORY_TEST_SLOT; \
          $report = $env:AI_MEMORY_TEST_REPORT; \
-         $slotDir = Split-Path -LiteralPath $slot -Parent; \
+         $slotDir = [System.IO.Path]::GetDirectoryName($slot); \
          New-Item -ItemType Directory -Force -Path $slotDir | Out-Null; \
          function Set-Slot([string]$v) {{ Set-Content -LiteralPath $slot -Value $v -NoNewline }}; \
          function Record-Slot([string]$tag) {{ \
