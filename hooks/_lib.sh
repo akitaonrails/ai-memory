@@ -314,19 +314,98 @@ ai_memory_extract_cwd() {
     done
 }
 
+# True when the payload carries a non-whitespace string at the top level
+# for any space-separated key in "$2". Shared by subagent detection and
+# native session ID detection so quoted or nested tool output keys never
+# falsely trigger either check, and skipping non-matching values stays O(N).
+ai_memory_payload_has_top_level_key() {
+    _am_keys="$2"
+    _am_extract="${3:-}"
+    printf '%s' "$1" | LC_ALL=C awk -v keylist="$_am_keys" -v extract="$_am_extract" '
+        BEGIN {
+            nkeys = split(keylist, names, " ")
+            for (n = 1; n <= nkeys; n++) marker[names[n]] = n
+        }
+        { buf = buf $0 "\n" }
+        END {
+            len = length(buf)
+            depth = 0
+            want = "key"
+            key = ""
+            for (i = 1; i <= len; i++) {
+                c = substr(buf, i, 1)
+                if (c == "{" || c == "[") { depth++; if (depth == 1) want = "key"; continue }
+                if (c == "}" || c == "]") { depth--; continue }
+                if (c == ",") { if (depth == 1) want = "key"; continue }
+                if (c != "\"") continue
+                cap = (depth == 1 && (want == "key" || (key in marker)))
+                tok = ""
+                for (i++; i <= len; i++) {
+                    c = substr(buf, i, 1)
+                    if (c == "\\") {
+                        if (cap) {
+                            nc = substr(buf, i + 1, 1)
+                            if (nc == "t") tok = tok "\t"
+                            else if (nc == "n") tok = tok "\n"
+                            else if (nc == "r") tok = tok "\r"
+                            else tok = tok substr(buf, i, 2)
+                        }
+                        i++
+                        continue
+                    }
+                    if (c == "\"") break
+                    if (cap) tok = tok c
+                }
+                if (depth != 1) continue
+                if (want == "key") { key = tok; want = "value"; continue }
+                if (key in marker) {
+                    gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", tok)
+                    if (tok != "") {
+                        if (!extract) exit 0
+                        idx = marker[key]
+                        if (!(idx in found)) found[idx] = tok
+                        if (idx == 1) { print found[1]; exit 0 }
+                    }
+                }
+                want = "key"
+            }
+            if (extract) {
+                for (n = 1; n <= nkeys; n++) {
+                    if (n in found) { print found[n]; exit 0 }
+                }
+            }
+            exit 1
+        }'
+}
+
 # Extract a harness-native session id from the common hook payload spellings.
 # Like the cwd fallback above this intentionally handles top-level JSON strings
 # only; native `ai-memory hook` uses a real JSON parser.
 ai_memory_extract_session_id() {
     payload="${1:-$(cat)}"
-    for key in session_id sessionId sessionID session conversationId; do
+    for key in session_id sessionId sessionID session conversationId taskId; do
         if rest=$(printf '%s' "$payload" | ai_memory_after_key "$key"); then
-            printf '%s' "$rest" \
+            _am_val=$(printf '%s' "$rest" \
                 | sed -n -E 's/^[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
-                | head -n 1
-            return 0
+                | head -n 1)
+            if [ -n "$(printf '%s' "$_am_val" | tr -d '[:space:]')" ]; then
+                printf '%s\n' "$_am_val"
+                return 0
+            fi
         fi
     done
+}
+
+# True when the payload carries a native non-whitespace session id at the top
+# level (parity with `payload_has_session_id` in `commands/hook.rs`).
+ai_memory_payload_has_session_id() {
+    ai_memory_payload_has_top_level_key "${1:-$(cat)}" \
+        "session_id sessionId sessionID session conversationId taskId"
+}
+
+ai_memory_payload_session_id() {
+    ai_memory_payload_has_top_level_key "${1:-$(cat)}" \
+        "session_id sessionId sessionID session conversationId taskId" 1
 }
 
 # True when the payload claims to be a subagent/child session: a known marker
@@ -337,35 +416,8 @@ ai_memory_extract_session_id() {
 # and tool output routinely quote these key names (reading a source file that
 # names them is enough), and a session must not lose its handoff over that.
 ai_memory_payload_is_subagent() {
-    printf '%s' "${1:-$(cat)}" | LC_ALL=C awk '
-        { buf = buf $0 "\n" }
-        END {
-            split("subagentType subagent_type agent_type agent_id parentSessionId", names, " ")
-            for (n in names) marker[names[n]] = 1
-            len = length(buf)
-            depth = 0
-            want = "key"
-            for (i = 1; i <= len; i++) {
-                c = substr(buf, i, 1)
-                if (c == "{" || c == "[") { depth++; if (depth == 1) want = "key"; continue }
-                if (c == "}" || c == "]") { depth--; continue }
-                if (c == ",") { if (depth == 1) want = "key"; continue }
-                if (c != "\"") continue
-                tok = ""
-                for (i++; i <= len; i++) {
-                    c = substr(buf, i, 1)
-                    if (c == "\\") { tok = tok substr(buf, i, 2); i++; continue }
-                    if (c == "\"") break
-                    tok = tok c
-                }
-                if (depth != 1) continue
-                if (want == "key") { key = tok; want = "value"; continue }
-                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", tok)
-                if (marker[key] && tok != "") exit 0
-                want = "key"
-            }
-            exit 1
-        }'
+    ai_memory_payload_has_top_level_key "${1:-$(cat)}" \
+        "subagentType subagent_type agent_type agent_id parentSessionId"
 }
 
 # Antigravity's PreInvocation hook fires before every model call. Only the
@@ -966,9 +1018,16 @@ ai_memory_new_session_id() {
     printf '%s-%s-%s' "$agent" "$now" "$$"
 }
 
+ai_memory_has_session_id_pin() {
+    [ -n "$(printf '%s' "${AI_MEMORY_SESSION_ID:-}" | tr -d '[:space:]')" ]
+}
+
 ai_memory_session_id_qs() {
-    agent="$1"; event="$2"
-    if [ -n "${AI_MEMORY_SESSION_ID:-}" ]; then
+    agent="$1"; event="$2"; payload="${3:-}"
+    if [ -n "$payload" ] && ai_memory_payload_has_session_id "$payload"; then
+        return 0
+    fi
+    if ai_memory_has_session_id_pin; then
         printf '&session_id=%s' "$(ai_memory_url_encode "$AI_MEMORY_SESSION_ID")"
         return 0
     fi
@@ -976,6 +1035,7 @@ ai_memory_session_id_qs() {
     sid=""
     if [ "$event" != "session-start" ] && [ -f "$file" ]; then
         sid=$(sed -n '1p' "$file" 2>/dev/null)
+        [ -n "$(printf '%s' "$sid" | tr -d '[:space:]')" ] || sid=""
     fi
     if [ -z "$sid" ]; then
         sid=$(ai_memory_new_session_id "$agent")
@@ -987,7 +1047,12 @@ ai_memory_session_id_qs() {
 }
 
 ai_memory_clear_session_id() {
-    agent="$1"
+    agent="$1"; payload="${2:-}"
+    if [ "$agent" = "devin" ] && ai_memory_has_session_id_pin; then
+        if [ -z "$payload" ] || ! ai_memory_payload_has_session_id "$payload"; then
+            return 0
+        fi
+    fi
     rm -f "$(ai_memory_session_id_file "$agent")" 2>/dev/null || true
 }
 

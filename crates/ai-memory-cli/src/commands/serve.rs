@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
-    ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
-    run_lint,
+    ScheduledAutoImproveSettings, SessionPageConsolidation, run_auto_improve_scheduler_tick,
+    run_embedding_backfill, run_lint,
 };
 use ai_memory_core::{ActiveProject, IdentityKey, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -1044,40 +1044,11 @@ async fn run_session_consolidation_worker(
         let session_id = job.session_id();
         let generation = job.generation();
         let attempts = job.attempts();
-        // An agent may have written the session page with its own model
-        // while the session was still open, before this job existed. Leave
-        // that page alone: the agent's own tool call, the Stop and the
-        // SessionEnd always land after it, so no observation count can tell
-        // a stale page from a current one.
-        match consolidator.session_page_written_by_agent(session_id).await {
-            Ok(true) => {
-                match writer.complete_session_consolidation(job).await {
-                    Ok(()) => info!(
-                        session = %session_id,
-                        generation,
-                        "session page was written by the agent; queued consolidation skipped",
-                    ),
-                    Err(error) => tracing::warn!(
-                        %error,
-                        session = %session_id,
-                        generation,
-                        "session consolidation skip could not complete the queue job",
-                    ),
-                }
-                #[cfg(test)]
-                completed.notify_one();
-                continue;
-            }
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                %error,
-                session = %session_id,
-                generation,
-                "could not read the session page before queued consolidation; consolidating",
-            ),
-        }
+        // The agent's own session page is kept, whether it was written while
+        // the session was open or lands during the completion: the write is
+        // conditional on the page version read before the check.
         let actor = session_consolidation_actor(&reader, session_id).await;
-        let consolidation = consolidator.consolidate_session(session_id, false, actor, None, None);
+        let consolidation = consolidator.consolidate_session_keeping_agent_page(session_id, actor);
         tokio::pin!(consolidation);
         let result = tokio::select! {
             () = cancel.cancelled() => {
@@ -1090,15 +1061,22 @@ async fn run_session_consolidation_worker(
         };
 
         match result {
-            Ok(outcome) => match writer.complete_session_consolidation(job).await {
+            Ok(consolidated) => match writer.complete_session_consolidation(job).await {
                 Ok(()) => {
-                    info!(
-                        session = %session_id,
-                        generation,
-                        attempts,
-                        path = %outcome.path,
-                        "queued LLM consolidation written",
-                    );
+                    match consolidated {
+                        SessionPageConsolidation::Consolidated(outcome) => info!(
+                            session = %session_id,
+                            generation,
+                            attempts,
+                            path = %outcome.path,
+                            "queued LLM consolidation written",
+                        ),
+                        SessionPageConsolidation::AgentPageKept => info!(
+                            session = %session_id,
+                            generation,
+                            "session page was written by the agent; queued consolidation skipped",
+                        ),
+                    }
                     #[cfg(test)]
                     completed.notify_one();
                 }
@@ -6117,6 +6095,114 @@ mod tests {
             session_id,
         )
         .await;
+        assert!(body.contains("Durable worker completed"), "{body}");
+    }
+
+    /// A provider that writes a session page version while the worker's
+    /// completion is in flight, i.e. after the worker's agent-page check and
+    /// before its write. With `consolidated_by: agent` it stands in for a
+    /// concurrent `memory_write_page(session_id)`.
+    struct WritesSessionPageDuringCompletionLlm {
+        wiki: Wiki,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        frontmatter: serde_json::Value,
+        body: &'static str,
+    }
+
+    impl LlmProvider for WritesSessionPageDuringCompletionLlm {
+        fn name(&self) -> &'static str {
+            "writes-session-page-during-completion"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { panic!("only the structured call is expected") })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                self.wiki
+                    .write_page(WritePageRequest {
+                        workspace_id: self.workspace_id,
+                        project_id: self.project_id,
+                        path: PagePath::new(format!("sessions/{}.md", self.session_id)).unwrap(),
+                        frontmatter: self.frontmatter.clone(),
+                        body: self.body.into(),
+                        tier: Tier::Episodic,
+                        pinned: false,
+                        title: None,
+                        admission_ctx: None,
+                        author_id: None,
+                        actor: ai_memory_core::ActorContext::anonymous(),
+                        evidence: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+                Ok(serde_json::json!({
+                    "title": "Compiled session",
+                    "body_markdown": "Durable worker completed this session.",
+                    "tags": ["test"]
+                }))
+            })
+        }
+    }
+
+    /// The agent writes the session page while the worker's completion runs,
+    /// after the worker found no agent page: the worker's conditional write
+    /// backs off and the agent's page stays the latest version.
+    #[tokio::test]
+    async fn session_consolidation_worker_keeps_an_agent_page_written_during_the_completion() {
+        let (_tmp, store, wiki, workspace_id, project_id, session_id) =
+            session_with_written_page(serde_json::json!({"consolidated": true})).await;
+        let llm = Arc::new(WritesSessionPageDuringCompletionLlm {
+            wiki: wiki.clone(),
+            workspace_id,
+            project_id,
+            session_id,
+            frontmatter: serde_json::json!({"consolidated_by": "agent"}),
+            body: "# Agent page\n\nWritten by the agent during the completion.",
+        });
+        let body = run_worker_once(&store, wiki, llm, workspace_id, project_id, session_id).await;
+        assert!(body.contains("Written by the agent during"), "{body}");
+    }
+
+    /// Control: a version no agent wrote (a rule-based summary, a checkpoint)
+    /// landing during the completion is still replaced by the worker's page,
+    /// as before the write became conditional.
+    #[tokio::test]
+    async fn session_consolidation_worker_replaces_a_non_agent_page_written_during_the_completion()
+    {
+        let (_tmp, store, wiki, workspace_id, project_id, session_id) =
+            session_with_written_page(serde_json::json!({"consolidated": true})).await;
+        let llm = Arc::new(WritesSessionPageDuringCompletionLlm {
+            wiki: wiki.clone(),
+            workspace_id,
+            project_id,
+            session_id,
+            frontmatter: serde_json::json!({"consolidated": true}),
+            body: "# Rule-based page\n\nWritten by a rule-based writer during the completion.",
+        });
+        let body = run_worker_once(&store, wiki, llm, workspace_id, project_id, session_id).await;
         assert!(body.contains("Durable worker completed"), "{body}");
     }
 

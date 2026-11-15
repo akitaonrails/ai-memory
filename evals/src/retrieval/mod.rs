@@ -44,6 +44,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ai_memory_core::Sanitizer;
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 
@@ -294,11 +295,23 @@ impl Knobs {
             "embeddings={embeddings} reranker={}",
             if reranker { "on" } else { "off" }
         );
+        // A value kept in the summary still goes through the built-in
+        // sanitizer: a name check cannot see a password inside a URL or a
+        // provider key passed under an unrelated name.
+        let sanitizer = Sanitizer::builtin();
         for (k, v) in &env {
-            summary.push_str(&format!(" env:{k}={v}"));
+            // The summary is the report's `config:` line, which gets copied
+            // into docs/benchmarks/: a credential is named, never printed.
+            let shown = if is_credential_env_name(k) {
+                "<redacted>".to_owned()
+            } else {
+                sanitizer.scrub(v)
+            };
+            summary.push_str(&format!(" env:{k}={shown}"));
         }
         for (k, v) in &query_args {
-            summary.push_str(&format!(" arg:{k}={v}"));
+            let shown = sanitizer.scrub(&v.to_string());
+            summary.push_str(&format!(" arg:{k}={shown}"));
         }
         // Only non-default ablations are named, so a default run's summary
         // reads exactly as the published baselines do.
@@ -356,6 +369,26 @@ fn parse_env(side: &str, items: &[String]) -> Result<Vec<(String, String)>> {
             Ok((k.to_string(), v.to_string()))
         })
         .collect()
+}
+
+/// Whether a `--server-env` name holds a credential, judged by its
+/// `_`-separated words. Words rather than a closed list of names, because
+/// `[[llm_fallbacks]] api_key_env` lets an operator pick any variable name;
+/// `HEADERS` covers an `Authorization` header in `AI_MEMORY_LLM_HEADERS`.
+/// A false positive only hides a value from the report.
+fn is_credential_env_name(name: &str) -> bool {
+    const WORDS: [&str; 8] = [
+        "KEY",
+        "APIKEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIALS",
+        "HEADERS",
+    ];
+    name.split('_')
+        .any(|word| WORDS.iter().any(|w| word.eq_ignore_ascii_case(w)))
 }
 
 /// Reserved args the harness always sets; a config may not override them.
@@ -945,5 +978,101 @@ mod tests {
         let mut fts = parse("none");
         fts.use_embedding_cache(root);
         assert_eq!(fts.launch_config().embedding_cache, None);
+    }
+
+    #[test]
+    fn knobs_summary_names_credentials_without_their_values() {
+        let k = Knobs::parse(
+            "candidate",
+            "none",
+            true,
+            &[
+                "OPENAI_API_KEY=sk-test-123".into(),
+                "AI_MEMORY_AUTH_TOKEN=tok-456".into(),
+                "AI_MEMORY_LLM_HEADERS=authorization=Bearer hdr-789".into(),
+                "MY_ROUTER_SECRET=sec-000".into(),
+                "AI_MEMORY_LLM_PROVIDER=openai".into(),
+                "AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true".into(),
+            ],
+            &[],
+            IngestMode::Hooks,
+            DatePrefix::Turn,
+        )
+        .unwrap();
+        for secret in ["sk-test-123", "tok-456", "hdr-789", "sec-000"] {
+            assert!(
+                !k.summary.contains(secret),
+                "{secret} leaked: {}",
+                k.summary
+            );
+        }
+        assert!(k.summary.contains("env:OPENAI_API_KEY=<redacted>"));
+        assert!(k.summary.contains("env:AI_MEMORY_AUTH_TOKEN=<redacted>"));
+        // Other knobs keep their value: a published report says what ran.
+        assert!(k.summary.contains("env:AI_MEMORY_LLM_PROVIDER=openai"));
+        assert!(
+            k.summary
+                .contains("env:AI_MEMORY_RETRIEVAL__OBSERVATION_STREAM=true")
+        );
+        // The server still gets the real value.
+        assert!(
+            k.env
+                .contains(&("OPENAI_API_KEY".into(), "sk-test-123".into()))
+        );
+    }
+
+    #[test]
+    fn knobs_summary_scrubs_secrets_in_values_it_keeps() {
+        let k = Knobs::parse(
+            "candidate",
+            "none",
+            true,
+            &[
+                "AI_MEMORY_LLM_BASE_URL=https://evaluser:hunter2pass@llm.example.test/v1".into(),
+                "AI_MEMORY_RERANKER_MODEL=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                "AI_MEMORY_LLM_PROVIDER=openai".into(),
+            ],
+            &[r#"filter={"note":"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#.into()],
+            IngestMode::Hooks,
+            DatePrefix::Turn,
+        )
+        .unwrap();
+        for secret in [
+            "hunter2pass",
+            "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(
+                !k.summary.contains(secret),
+                "{secret} leaked: {}",
+                k.summary
+            );
+        }
+        // Control: a value with nothing secret in it reads as given.
+        assert!(k.summary.contains("env:AI_MEMORY_LLM_PROVIDER=openai"));
+        assert!(k.summary.contains("env:AI_MEMORY_LLM_BASE_URL="));
+        // The server and the query still get the real values.
+        assert!(k.env.iter().any(|(_, v)| v.contains("hunter2pass")));
+    }
+
+    #[test]
+    fn credential_env_names_match_whole_words() {
+        for name in [
+            "OPENAI_API_KEY",
+            "LLM_API_KEY",
+            "ai_memory_auth_token",
+            "AI_MEMORY_LLM_HEADERS",
+            "ROUTER_APIKEY",
+            "PROXY_PASSWD",
+        ] {
+            assert!(is_credential_env_name(name), "{name}");
+        }
+        for name in [
+            "AI_MEMORY_LLM_PROVIDER",
+            "AI_MEMORY_EVAL_SKIP_WIKI_CHECKPOINTS",
+            "MONKEY_MODE",
+        ] {
+            assert!(!is_credential_env_name(name), "{name}");
+        }
     }
 }

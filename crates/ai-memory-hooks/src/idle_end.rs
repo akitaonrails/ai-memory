@@ -329,7 +329,7 @@ async fn summary_page_decision(
         session.session_id,
     )
     .await?;
-    let page = synthesize_session_page(
+    let mut page = synthesize_session_page(
         session.workspace_id,
         session.project_id,
         session.session_id,
@@ -340,6 +340,15 @@ async fn summary_page_decision(
     // from the session row — the server process is the writer, not the
     // author.
     let actor = stored_session_identity(session.actor_user.clone())?.1;
+    // Zero-LLM session pages get the same title-collision backstop the LLM and
+    // `memory_write_page` paths already apply (#2300).
+    crate::synth::disambiguate_session_page_title(
+        input.reader,
+        &actor,
+        session.session_id,
+        &mut page,
+    )
+    .await;
     // The precondition is the version the tick SAW WHEN IT READ THE
     // SESSION (the selection), captured before any write in this tick: a
     // real SessionEnd that lands the page after the selection changes the

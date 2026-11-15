@@ -14,8 +14,8 @@ use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmError, LlmOperationId, LlmProvider, Role,
     complete_structured_with_operation_id,
 };
-use ai_memory_store::{ReaderPool, StoreError, WriterHandle};
-use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki, WritePageRequest};
+use ai_memory_store::{PagePrecondition, ReaderPool, StoreError, WriterHandle};
+use ai_memory_wiki::{AdmissionContext, AdmissionOp, ConditionalWrite, Wiki, WritePageRequest};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -64,6 +64,12 @@ pub enum ConsolidatorError {
     /// Session had no observations to consolidate.
     #[error("session {0} has no observations")]
     EmptySession(SessionId),
+
+    /// The session page kept changing under a conditional write
+    /// ([`Consolidator::consolidate_session_keeping_agent_page`]); nothing was
+    /// written and the job can be retried.
+    #[error("session {0} page kept changing during consolidation")]
+    SessionPageContended(SessionId),
 }
 
 impl From<serde_json::Error> for ConsolidatorError {
@@ -94,6 +100,7 @@ pub fn redacted_error_summary(error: &ConsolidatorError) -> String {
         ConsolidatorError::Serde(_) => ("serde", None),
         ConsolidatorError::SessionNotFound(_) => ("session-not-found", None),
         ConsolidatorError::EmptySession(_) => ("empty-session", None),
+        ConsolidatorError::SessionPageContended(_) => ("session-page-contended", None),
     };
     format!(
         "consolidation failed: class={class} status={}",
@@ -108,6 +115,69 @@ pub type ConsolidatorResult<T> = Result<T, ConsolidatorError>;
 
 /// Maximum attempts (initial + retries) for one consolidation LLM call.
 const CONSOLIDATION_LLM_MAX_ATTEMPTS: u32 = 3;
+
+/// Conditional writes [`Consolidator::consolidate_session_keeping_agent_page`]
+/// tries before giving the job back to the queue. Each retry follows a
+/// non-agent version that landed during the previous one.
+const SESSION_PAGE_WRITE_ATTEMPTS: usize = 3;
+
+/// What [`Consolidator::consolidate_session_keeping_agent_page`] did.
+#[derive(Debug)]
+pub enum SessionPageConsolidation {
+    /// The server's provider compiled the page and it was written.
+    Consolidated(ConsolidationOutcome),
+    /// The agent wrote the session page itself; it was kept and nothing was
+    /// written.
+    AgentPageKept,
+}
+
+/// A session page the completion produced, ready to write.
+struct PreparedSessionPage {
+    path: PagePath,
+    page: ConsolidatedPage,
+    frontmatter: serde_json::Value,
+}
+
+impl PreparedSessionPage {
+    fn write_request(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        actor: ai_memory_core::ActorContext,
+        author_id: Option<ai_memory_core::UserId>,
+    ) -> WritePageRequest {
+        WritePageRequest {
+            workspace_id,
+            project_id,
+            path: self.path.clone(),
+            frontmatter: self.frontmatter.clone(),
+            body: self.page.body_markdown.clone(),
+            tier: Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: Some(AdmissionContext {
+                op: AdmissionOp::Consolidate,
+                actor: actor.clone(),
+                ..Default::default()
+            }),
+            author_id,
+            actor,
+            evidence: vec![ai_memory_core::PageEvidence {
+                kind: ai_memory_core::PageEvidenceKind::Session,
+                source_id: session_id.to_string(),
+            }],
+        }
+    }
+}
+
+/// Where [`Consolidator::prepare_session_page`] left a session consolidation.
+enum SessionPagePlan {
+    /// A dry run: the plan, with nothing compiled.
+    DryRun(ConsolidationOutcome),
+    /// A compiled page to write.
+    Write(PreparedSessionPage),
+}
 /// Fixed, short delay between consolidation retries. Deliberately not
 /// tenacity-style escalating backoff — see the cognee #2840 lesson in
 /// `ai-memory-llm`; the same policy `bootstrap.rs` applies to its chunks.
@@ -310,6 +380,126 @@ impl Consolidator {
         author_id: Option<ai_memory_core::UserId>,
         instructions: Option<&str>,
     ) -> ConsolidatorResult<ConsolidationOutcome> {
+        let prepared = match self
+            .prepare_session_page(
+                workspace_id,
+                project_id,
+                session_id,
+                dry_run,
+                &actor,
+                instructions,
+            )
+            .await?
+        {
+            SessionPagePlan::DryRun(outcome) => return Ok(outcome),
+            SessionPagePlan::Write(prepared) => prepared,
+        };
+        let request =
+            prepared.write_request(workspace_id, project_id, session_id, actor, author_id);
+        let id = self.wiki.write_page(request).await?;
+        Ok(self.finish_session_page(session_id, prepared, id))
+    }
+
+    /// The SessionEnd worker's consolidation: [`Self::consolidate_session`],
+    /// except that a session page the agent wrote itself
+    /// ([`Wiki::session_page_written_by_agent`]) is kept, whether it was there
+    /// before the job started or landed while the completion ran.
+    ///
+    /// The page version is read before the agent check, and the write is
+    /// conditional on that version ([`Wiki::write_page_if`]). A version that
+    /// lands after the read makes the write back off, so a page the agent
+    /// wrote during the completion is never superseded by the server's. On a
+    /// mismatch the page is checked again: the agent's page ends the job
+    /// without a write; any other page is replaced, as an unconditional
+    /// consolidation would, conditional on the version just seen.
+    ///
+    /// # Errors
+    /// As [`Self::consolidate_session`], plus
+    /// [`ConsolidatorError::SessionPageContended`] when the page keeps moving
+    /// under the write.
+    pub async fn consolidate_session_keeping_agent_page(
+        &self,
+        session_id: SessionId,
+        actor: ai_memory_core::ActorContext,
+    ) -> ConsolidatorResult<SessionPageConsolidation> {
+        let (ws, proj) = self.resolve_target(session_id).await?;
+        // The version first, the agent check second: an agent write landing
+        // between the two reads is either seen by the check or changes the
+        // version the write is conditional on.
+        let mut precondition = match self
+            .reader
+            .latest_page_id_by_ids(ws, proj, format!("sessions/{session_id}.md"))
+            .await?
+        {
+            Some(seen) => PagePrecondition::Latest(seen),
+            None => PagePrecondition::Absent,
+        };
+        // An agent may have written the session page with its own model
+        // while the session was still open, before this job existed. Leave
+        // that page alone: the agent's own tool call, the Stop and the
+        // SessionEnd always land after it, so no observation count can tell
+        // a stale page from a current one.
+        match self
+            .wiki
+            .session_page_written_by_agent(ws, proj, session_id)
+        {
+            Ok(true) => return Ok(SessionPageConsolidation::AgentPageKept),
+            Ok(false) => {}
+            Err(error) => warn!(
+                %error,
+                session = %session_id,
+                "could not read the session page before queued consolidation; consolidating",
+            ),
+        }
+        let prepared = match self
+            .prepare_session_page(ws, proj, session_id, false, &actor, None)
+            .await?
+        {
+            SessionPagePlan::DryRun(outcome) => {
+                return Ok(SessionPageConsolidation::Consolidated(outcome));
+            }
+            SessionPagePlan::Write(prepared) => prepared,
+        };
+        let request = prepared.write_request(ws, proj, session_id, actor, None);
+        for _ in 0..SESSION_PAGE_WRITE_ATTEMPTS {
+            match self
+                .wiki
+                .write_page_if(request.clone(), precondition)
+                .await?
+            {
+                ConditionalWrite::Written(id) => {
+                    return Ok(SessionPageConsolidation::Consolidated(
+                        self.finish_session_page(session_id, prepared, id),
+                    ));
+                }
+                ConditionalWrite::Mismatch { current } => {
+                    if self
+                        .wiki
+                        .session_page_written_by_agent(ws, proj, session_id)?
+                    {
+                        return Ok(SessionPageConsolidation::AgentPageKept);
+                    }
+                    precondition = match current {
+                        Some(current) => PagePrecondition::Latest(current),
+                        None => PagePrecondition::Absent,
+                    };
+                }
+            }
+        }
+        Err(ConsolidatorError::SessionPageContended(session_id))
+    }
+
+    /// Everything [`Self::consolidate_session_in_scope`] does before the page
+    /// write: the gates, the completion and the link guard.
+    async fn prepare_session_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        dry_run: bool,
+        actor: &ai_memory_core::ActorContext,
+        instructions: Option<&str>,
+    ) -> ConsolidatorResult<SessionPagePlan> {
         let (ws, proj) = (workspace_id, project_id);
 
         // Bounded gate: count and span only, no row is materialised. A
@@ -347,14 +537,14 @@ impl Consolidator {
         // return the resolved plan. Callers wanting the actual rewritten body
         // run a real (non-dry) consolidation.
         if dry_run {
-            return Ok(ConsolidationOutcome {
+            return Ok(SessionPagePlan::DryRun(ConsolidationOutcome {
                 path,
                 dry_run: true,
                 new_title: String::new(),
                 new_body_markdown: String::new(),
                 page_id: None,
                 tags: Vec::new(),
-            });
+            }));
         }
 
         let current_body = self
@@ -363,9 +553,7 @@ impl Consolidator {
             .map(|md| md.body)
             .unwrap_or_default();
         let instructions = self.resolve_instructions(ws, proj, instructions).await;
-        let existing_titles = self
-            .existing_page_titles(ws, proj, &actor, session_id)
-            .await;
+        let existing_titles = self.existing_page_titles(ws, proj, actor, session_id).await;
         // The prefix and its budget are known now; only the observation
         // dump is read from the store — bounded: a full read while the
         // session fits the selection cap, otherwise one streaming scan
@@ -445,30 +633,21 @@ impl Consolidator {
             crate::link_guard::delink_body(&page.body_markdown, &path, &unresolved.body)
                 .into_owned();
         crate::link_guard::prune_relations(&mut frontmatter, &unresolved.relations);
-        let id = self
-            .wiki
-            .write_page(WritePageRequest {
-                workspace_id: ws,
-                project_id: proj,
-                path: path.clone(),
-                frontmatter,
-                body: page.body_markdown.clone(),
-                tier: Tier::Episodic,
-                pinned: false,
-                title: None,
-                admission_ctx: Some(AdmissionContext {
-                    op: AdmissionOp::Consolidate,
-                    actor: actor.clone(),
-                    ..Default::default()
-                }),
-                author_id,
-                actor,
-                evidence: vec![ai_memory_core::PageEvidence {
-                    kind: ai_memory_core::PageEvidenceKind::Session,
-                    source_id: session_id.to_string(),
-                }],
-            })
-            .await?;
+        Ok(SessionPagePlan::Write(PreparedSessionPage {
+            path,
+            page,
+            frontmatter,
+        }))
+    }
+
+    /// Commit and report a written session page.
+    fn finish_session_page(
+        &self,
+        session_id: SessionId,
+        prepared: PreparedSessionPage,
+        id: ai_memory_core::PageId,
+    ) -> ConsolidationOutcome {
+        let PreparedSessionPage { path, page, .. } = prepared;
         // Auto-commit the result so the supersession lands in git.
         let _ = self
             .wiki
@@ -486,14 +665,14 @@ impl Consolidator {
             page = %id,
             "session consolidated via LLM",
         );
-        Ok(ConsolidationOutcome {
+        ConsolidationOutcome {
             path,
             dry_run: false,
             new_title: page.title,
             new_body_markdown: page.body_markdown,
             page_id: Some(id),
             tags: page.tags,
-        })
+        }
     }
 
     /// Borrow the underlying writer (used by the MCP tool to ack the
@@ -555,24 +734,6 @@ impl Consolidator {
             return Ok(Some(scope));
         }
         Ok(self.reader.session_project_ids(session_id).await?)
-    }
-
-    /// Whether the calling agent wrote the session page through
-    /// `memory_write_page` ([`Wiki::session_page_written_by_agent`]). The
-    /// SessionEnd worker then leaves the page alone instead of replacing it
-    /// with a completion from the server's provider, however many
-    /// observations arrived after it.
-    ///
-    /// # Errors
-    /// Propagates store and wiki errors other than a missing page.
-    pub async fn session_page_written_by_agent(
-        &self,
-        session_id: SessionId,
-    ) -> ConsolidatorResult<bool> {
-        let (ws, proj) = self.resolve_target(session_id).await?;
-        Ok(self
-            .wiki
-            .session_page_written_by_agent(ws, proj, session_id)?)
     }
 
     /// Resolve the session's creating harness from the persisted session row.

@@ -39,8 +39,14 @@ final class AppModel {
         self.dataDirTokenPresent = DataDirToken.read(dataDir: settings.resolvedDataDir) != nil
         // A token saved by an earlier version has no recorded origin. Bind it
         // to the server configured at first launch, where it was already being
-        // sent, so the upgrade keeps working until a later URL change.
-        if self.tokenConfigured, self.settings.tokenOrigin == nil {
+        // sent, so the upgrade keeps working until a later URL change. But a
+        // token left unbound by a failed clear after a failed save is a stale
+        // bearer that must stay unbound and unsent, not be adopted onto the
+        // current server (GHSA-xj78 follow-up, #2289).
+        if self.tokenConfigured,
+           self.settings.tokenOrigin == nil,
+           !self.settings.pendingClearFailed
+        {
             self.settings.adoptUnboundToken()
             self.settings.save()
         }
@@ -269,14 +275,11 @@ final class AppModel {
             dataDirOverride: dataDirOverride,
             tokenInEdit: clearToken ? nil : token
         )
-        if clearToken {
-            try? tokenStore.clear()
-            settings.clearTokenBinding()
-        } else if let token {
-            let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty {
-                try? tokenStore.save(value)
-            }
+        // The keychain write and the binding are committed together: a failed
+        // write must not leave the retained old bearer bound and resent.
+        if settings.commitTokenEdit(clearToken: clearToken, token: token, to: tokenStore) != nil {
+            lastError = "Couldn't update the saved token in the keychain. "
+                + "Re-check the bearer in Settings."
         }
         settings.save()
         tokenConfigured = tokenStore.read()?.isEmpty == false

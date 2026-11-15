@@ -23,7 +23,7 @@ export HOME
 CALLER_SPOOL="${AI_MEMORY_DATA_DIR:-${XDG_DATA_HOME:-$ORIG_HOME/.local/share}/ai-memory}/hook-spool"
 unset AI_MEMORY_DATA_DIR XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME
 unset AI_MEMORY_RUN_ID AI_MEMORY_MANAGED_WORKSTREAM_ID AI_MEMORY_MANAGED_WORKSTREAM_NAME
-unset AI_MEMORY_AUTO_HANDOFF
+unset AI_MEMORY_AUTO_HANDOFF AI_MEMORY_SESSION_ID AI_MEMORY_CAPTURE_OWNER
 HTTP_PID=""
 trap '[ -z "$HTTP_PID" ] || { kill "$HTTP_PID" 2>/dev/null || true; wait "$HTTP_PID" 2>/dev/null || true; }; rm -rf "$TMP"; HOME=$ORIG_HOME' EXIT
 
@@ -1940,6 +1940,207 @@ assert_eq "a resume source is not a compaction start" "no" \
     "$(ai_memory_is_compaction_start '{"source":"resume","x":"compact"}' && printf yes || printf no)"
 assert_eq "a payload without a source is not a compaction start" "no" \
     "$(ai_memory_is_compaction_start '{"session_id":"s"}' && printf yes || printf no)"
+
+# --- Devin session-id pin and native session-id parity (#2256) --------
+devin_has_sid() {
+    if ai_memory_payload_has_session_id "$1"; then printf 'yes'; else printf 'no'; fi
+}
+for _am_key in session_id sessionId sessionID session conversationId taskId; do
+    _am_sample="{\"$_am_key\":\"sid-$_am_key\"}"
+    assert_eq "top-level $_am_key counts as native session id" "yes" "$(devin_has_sid "$_am_sample")"
+    assert_eq "top-level $_am_key extracts value" "sid-$_am_key" \
+        "$(ai_memory_payload_session_id "$_am_sample" || true)"
+done
+assert_eq "whitespace native session id is ignored" "no" \
+    "$(devin_has_sid '{"session_id":"  \t "}')"
+assert_eq "escaped backslash-t native session id counts as present" "yes" \
+    "$(devin_has_sid '{"session_id":"\\t"}')"
+assert_eq "whitespace primary key falls through to taskId" "t-1" \
+    "$(ai_memory_payload_session_id '{"session_id":"  \n\r\t ","taskId":"t-1"}' || true)"
+assert_eq "nested session_id inside tool_input does not count as native" "no" \
+    "$(devin_has_sid '{"tool_input":{"session_id":"nested"},"cwd":"/work"}')"
+assert_eq "quoted taskId inside tool_response does not count as native" "no" \
+    "$(devin_has_sid '{"tool_response":"{\"taskId\":\"quoted\"}","cwd":"/work"}')"
+assert_eq "top-level session_id wins after nested session_id" "real-top" \
+    "$(ai_memory_payload_session_id '{"tool_input":{"session_id":"nested"},"session_id":"real-top"}' || true)"
+
+DEVIN_REPO="$TMP/devin-repo"
+DEVIN_DATA="$TMP/devin-data"
+DEVIN_SLOT="$DEVIN_DATA/hook-state/devin-session-id"
+mkdir -p "$DEVIN_REPO" "$DEVIN_DATA/hook-state"
+DEVIN_BARE="{\"cwd\":\"$DEVIN_REPO\"}"
+DEVIN_NATIVE="{\"cwd\":\"$DEVIN_REPO\",\"session_id\":\"devin-native-1\"}"
+DEVIN_TASK="{\"cwd\":\"$DEVIN_REPO\",\"taskId\":\"devin-task-1\"}"
+DEVIN_NESTED="{\"cwd\":\"$DEVIN_REPO\",\"tool_input\":{\"session_id\":\"nested\"}}"
+
+run_devin_hook() {
+    _rdh_script="$1"
+    _rdh_payload="$2"
+    _rdh_pin="${3-}"
+    _rdh_pin_set="${4-unset}"
+    _rdh_owner="${5-}"
+    rm -f "$FAKE_CURL_LOG"
+    printf '%s' "$_rdh_payload" | (
+        unset AI_MEMORY_SESSION_ID AI_MEMORY_CAPTURE_OWNER DEVIN_PROJECT_DIR
+        if [ "$_rdh_pin_set" = "set" ]; then
+            AI_MEMORY_SESSION_ID="$_rdh_pin"
+            export AI_MEMORY_SESSION_ID
+        fi
+        if [ -n "$_rdh_owner" ]; then
+            AI_MEMORY_CAPTURE_OWNER="$_rdh_owner"
+            export AI_MEMORY_CAPTURE_OWNER
+        fi
+        PATH="$FAKE_CURL_BIN:$PATH"
+        AI_MEMORY_CURL_LOG="$FAKE_CURL_LOG"
+        AI_MEMORY_DATA_DIR="$DEVIN_DATA"
+        AI_MEMORY_HOOK_URL='http://memory.test'
+        export PATH AI_MEMORY_CURL_LOG AI_MEMORY_DATA_DIR AI_MEMORY_HOOK_URL
+        sh "$_rdh_script"
+    ) >/dev/null
+}
+
+curl_hook_lines() { grep '/hook?' "$FAKE_CURL_LOG" 2>/dev/null || true; }
+curl_handoff_lines() { grep '/handoff?' "$FAKE_CURL_LOG" 2>/dev/null || true; }
+
+# 1. Pinned AI_MEMORY_SESSION_ID + bare payload preserves slot across session-end.
+printf 'stale-slot' >"$DEVIN_SLOT"
+run_devin_hook hooks/devin/session-start.sh "$DEVIN_BARE" "devin-pin-1" set ""
+assert_eq "devin sh pinned start POSTs pinned session_id" "yes" \
+    "$(curl_hook_lines | grep -Fq '&session_id=devin-pin-1' && printf yes || printf no)"
+assert_eq "devin sh pinned start handoff GET sends pinned session_id" "yes" \
+    "$(curl_handoff_lines | grep -Fq '&session_id=devin-pin-1' && printf yes || printf no)"
+run_devin_hook hooks/devin/session-end.sh "$DEVIN_BARE" "devin-pin-1" set ""
+assert_eq "devin sh pinned end preserves devin-session-id" "stale-slot" \
+    "$([ -f "$DEVIN_SLOT" ] && cat "$DEVIN_SLOT" || printf missing)"
+run_devin_hook hooks/devin/session-end.sh "$DEVIN_BARE" "devin-pin-1" set external
+assert_eq "devin sh pinned owned end makes no HTTP call" "0" \
+    "$([ -f "$FAKE_CURL_LOG" ] && wc -l <"$FAKE_CURL_LOG" | tr -d ' ' || printf '0')"
+assert_eq "devin sh pinned owned end preserves devin-session-id" "stale-slot" \
+    "$([ -f "$DEVIN_SLOT" ] && cat "$DEVIN_SLOT" || printf missing)"
+
+# 2. Pinned + native payload clears slot on session-end (unowned and external).
+run_devin_hook hooks/devin/session-start.sh "$DEVIN_NATIVE" "devin-pin-1" set ""
+assert_eq "devin sh native payload suppresses pin on /hook" "no" \
+    "$(curl_hook_lines | grep -Fq 'session_id=' && printf yes || printf no)"
+assert_eq "devin sh native payload sends native id on /handoff" "yes" \
+    "$(curl_handoff_lines | grep -Fq '&session_id=devin-native-1' && printf yes || printf no)"
+run_devin_hook hooks/devin/session-end.sh "$DEVIN_NATIVE" "devin-pin-1" set external
+assert_eq "devin sh native owned end clears devin-session-id" "missing" \
+    "$([ -e "$DEVIN_SLOT" ] && printf present || printf missing)"
+printf 'stale-slot' >"$DEVIN_SLOT"
+run_devin_hook hooks/devin/session-end.sh "$DEVIN_NATIVE" "devin-pin-1" set ""
+assert_eq "devin sh native unowned end suppresses pin on /hook" "no" \
+    "$(curl_hook_lines | grep -Fq 'session_id=' && printf yes || printf no)"
+assert_eq "devin sh native unowned end clears devin-session-id" "missing" \
+    "$([ -e "$DEVIN_SLOT" ] && printf present || printf missing)"
+
+# 3. taskId and nested fake session_id handling.
+printf 'stale-slot' >"$DEVIN_SLOT"
+run_devin_hook hooks/devin/session-start.sh "$DEVIN_TASK" "devin-pin-1" set ""
+assert_eq "devin sh taskId suppresses pin on /hook" "no" \
+    "$(curl_hook_lines | grep -Fq 'session_id=' && printf yes || printf no)"
+assert_eq "devin sh taskId sends taskId on /handoff" "yes" \
+    "$(curl_handoff_lines | grep -Fq '&session_id=devin-task-1' && printf yes || printf no)"
+run_devin_hook hooks/devin/session-end.sh "$DEVIN_TASK" "devin-pin-1" set ""
+assert_eq "devin sh taskId end clears devin-session-id" "missing" \
+    "$([ -e "$DEVIN_SLOT" ] && printf present || printf missing)"
+
+printf 'stale-slot' >"$DEVIN_SLOT"
+run_devin_hook hooks/devin/session-start.sh "$DEVIN_NESTED" "devin-pin-1" set ""
+assert_eq "devin sh nested session_id keeps pin on /hook" "yes" \
+    "$(curl_hook_lines | grep -Fq '&session_id=devin-pin-1' && printf yes || printf no)"
+run_devin_hook hooks/devin/session-end.sh "$DEVIN_NESTED" "devin-pin-1" set ""
+assert_eq "devin sh nested session_id preserves slot on end" "stale-slot" \
+    "$([ -f "$DEVIN_SLOT" ] && cat "$DEVIN_SLOT" || printf missing)"
+
+# 4. Whitespace pin does not pin or preserve the slot.
+printf 'stale-slot' >"$DEVIN_SLOT"
+run_devin_hook hooks/devin/session-start.sh "$DEVIN_BARE" "   	" set ""
+_am_ws_minted=$(cat "$DEVIN_SLOT" 2>/dev/null || true)
+_am_ws_fresh=no
+case "$_am_ws_minted" in
+    devin-*) [ "$_am_ws_minted" != "stale-slot" ] && _am_ws_fresh=yes ;;
+esac
+assert_eq "devin sh whitespace pin mints fresh fallback session id" "yes" "$_am_ws_fresh"
+assert_eq "devin sh whitespace pin sends minted id on /hook" "yes" \
+    "$(curl_hook_lines | grep -Fq "&session_id=$_am_ws_minted" && printf yes || printf no)"
+assert_eq "devin sh whitespace pin sends minted id on /handoff" "yes" \
+    "$(curl_handoff_lines | grep -Fq "&session_id=$_am_ws_minted" && printf yes || printf no)"
+run_devin_hook hooks/devin/post-tool-use.sh "$DEVIN_BARE" "   	" set ""
+assert_eq "devin sh whitespace pin reuses fallback id mid-session" "yes" \
+    "$(curl_hook_lines | grep -Fq "&session_id=$_am_ws_minted" && printf yes || printf no)"
+run_devin_hook hooks/devin/session-end.sh "$DEVIN_BARE" "   	" set ""
+assert_eq "devin sh whitespace pin clears slot on session-end" "missing" \
+    "$([ -e "$DEVIN_SLOT" ] && printf present || printf missing)"
+
+# 5. Every Devin POSIX script forwards payloads consistently.
+DEVIN_SCRIPT_COUNT=0
+for _am_devin_script in hooks/devin/*.sh; do
+    DEVIN_SCRIPT_COUNT=$((DEVIN_SCRIPT_COUNT + 1))
+    _am_dname=$(basename "$_am_devin_script")
+    run_devin_hook "$_am_devin_script" "$DEVIN_BARE" "devin-pin-all" set ""
+    assert_eq "devin/$_am_dname sends pin when bare" "yes" \
+        "$(curl_hook_lines | grep -Fq '&session_id=devin-pin-all' && printf yes || printf no)"
+    run_devin_hook "$_am_devin_script" "$DEVIN_NATIVE" "devin-pin-all" set ""
+    assert_eq "devin/$_am_dname suppresses pin when native" "no" \
+        "$(curl_hook_lines | grep -Fq 'session_id=' && printf yes || printf no)"
+done
+assert_eq "all 7 Devin shell scripts covered" "7" "$DEVIN_SCRIPT_COUNT"
+
+# 6. PowerShell Devin parity, under Invoke-WebRequest shadow where PowerShell exists.
+if [ -n "$PSH" ]; then
+    PS_DEVIN_DATA="$TMP/ps-devin-data"
+    PS_DEVIN_SLOT="$PS_DEVIN_DATA/hook-state/devin-session-id"
+    PS_DEVIN_LOG="$TMP/ps-devin.log"
+    PS_DEVIN_REPO=$(host_path "$DEVIN_REPO")
+    PS_DEVIN_REPO_ESC=$(printf '%s' "$PS_DEVIN_REPO" | sed 's/\\/\\\\/g')
+    mkdir -p "$PS_DEVIN_DATA/hook-state"
+    ps_devin_hook() {
+        _pd_event="$1"; _pd_payload="$2"; _pd_pin="${3-}"; _pd_pin_set="${4-unset}"; _pd_owner="${5-}"
+        _pd_extra=""
+        [ "$_pd_event" = "session-start" ] && _pd_extra=" -FetchHandoff -SessionStartEnvelope"
+        rm -f "$PS_DEVIN_LOG"
+        printf '%s' "$_pd_payload" | (
+            unset AI_MEMORY_SESSION_ID AI_MEMORY_CAPTURE_OWNER
+            if [ "$_pd_pin_set" = "set" ]; then
+                AI_MEMORY_SESSION_ID="$_pd_pin"
+                export AI_MEMORY_SESSION_ID
+            fi
+            if [ -n "$_pd_owner" ]; then
+                AI_MEMORY_CAPTURE_OWNER="$_pd_owner"
+                export AI_MEMORY_CAPTURE_OWNER
+            fi
+            HOME="$TMP"
+            USERPROFILE="$TMP"
+            AI_MEMORY_DATA_DIR="$(host_path "$PS_DEVIN_DATA")"
+            AI_MEMORY_TEST_LOG="$(host_path "$PS_DEVIN_LOG")"
+            export HOME USERPROFILE AI_MEMORY_DATA_DIR AI_MEMORY_TEST_LOG
+            "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+                ". '$PS_LIB'; function Invoke-WebRequest { param([switch] \$UseBasicParsing, [switch] \$NoProxy, [int] \$TimeoutSec, [int] \$MaximumRedirection, [string] \$Method = 'Get', [string] \$Uri, \$Headers, [string] \$ContentType, \$Body) Add-Content -LiteralPath \$env:AI_MEMORY_TEST_LOG -Value ('{0} {1}' -f \$Method.ToUpperInvariant(), \$Uri); if (\$Method -eq 'Post') { return \$null }; return [pscustomobject]@{ Content = 'HANDOFF'; StatusCode = 200 } }; Invoke-AiMemoryHook -Event '$_pd_event' -Agent 'devin'$_pd_extra"
+        ) >/dev/null 2>&1 || true
+    }
+    PS_BARE="{\"cwd\":\"$PS_DEVIN_REPO_ESC\"}"
+    PS_NATIVE="{\"cwd\":\"$PS_DEVIN_REPO_ESC\",\"session_id\":\"ps-native-1\"}"
+
+    printf 'stale-slot' >"$PS_DEVIN_SLOT"
+    ps_devin_hook session-start "$PS_BARE" "ps-pin-1" set ""
+    assert_eq "powershell devin pinned bare sends pin on /hook" "yes" \
+        "$(grep -Fq 'POST ' "$PS_DEVIN_LOG" && grep 'POST ' "$PS_DEVIN_LOG" | grep -Fq '&session_id=ps-pin-1' && printf yes || printf no)"
+    assert_eq "powershell devin pinned bare sends pin on /handoff" "yes" \
+        "$(grep -Fq 'GET ' "$PS_DEVIN_LOG" && grep 'GET ' "$PS_DEVIN_LOG" | grep -Fq '&session_id=ps-pin-1' && printf yes || printf no)"
+    ps_devin_hook session-end "$PS_BARE" "ps-pin-1" set ""
+    assert_eq "powershell devin pinned bare preserves slot on end" "stale-slot" \
+        "$([ -f "$PS_DEVIN_SLOT" ] && cat "$PS_DEVIN_SLOT" || printf missing)"
+
+    ps_devin_hook session-start "$PS_NATIVE" "ps-pin-1" set ""
+    assert_eq "powershell devin pinned native suppresses pin on /hook" "no" \
+        "$(grep 'POST ' "$PS_DEVIN_LOG" 2>/dev/null | grep -Fq 'session_id=' && printf yes || printf no)"
+    assert_eq "powershell devin pinned native sends native id on /handoff" "yes" \
+        "$(grep 'GET ' "$PS_DEVIN_LOG" 2>/dev/null | grep -Fq '&session_id=ps-native-1' && printf yes || printf no)"
+    ps_devin_hook session-end "$PS_NATIVE" "ps-pin-1" set external
+    assert_eq "powershell devin pinned native owned end clears slot" "missing" \
+        "$([ -e "$PS_DEVIN_SLOT" ] && printf present || printf missing)"
+fi
 
 # --- summary ----------------------------------------------------------
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

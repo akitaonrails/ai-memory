@@ -16,6 +16,32 @@ version in [`docs/changelog/`](docs/changelog/):
 - `memory_patch_page` now separates an inserted section body from a heading
   at end of file even when the heading has no final newline. Previously,
   replacing such a section silently appended the body to the heading text.
+
+## [3.4.7] - 2026-11-15
+
+### Fixed
+
+- A `move-project` true move now re-resolves project-only cross-project links
+  (`[[project:path]]` with the workspace omitted) in the source and destination
+  workspaces, so the moved project's edges rebind to the destination workspace
+  and the live graph matches a clean reindex of the unchanged Markdown.
+  Previously the restamp left those edges pointing at the old workspace's
+  target. Explicit workspace-qualified and bare same-project edges are
+  unaffected. (#2264)
+
+- Cross-project message `evidence` within the 1 000-character MCP/admin budget
+  is no longer silently truncated at the store boundary, and the
+  `memory_message_send` truncation notice on longer inputs is preserved. The
+  store evidence cap was left at 1 000 bytes after #2241, cutting multibyte
+  strings and `[message evidence truncated; ...]` suffixes short; it is now
+  4 KiB. (#2283)
+
+- `ai-memory uninstall` now sweeps Hermes skill directories (`.hermes/skills`,
+  `~/.hermes/skills`, `$HERMES_HOME/skills`, and the Windows `%LOCALAPPDATA%`
+  default) alongside the other supported Agent Skill roots. Previously none of
+  the Hermes skill roots were scanned, leaving managed skills behind on
+  uninstall. (#2285)
+
 - The TypeScript SDK's `pages.update` preserves profile entry stack filters
   and enforcement metadata when editing the body. (#2207)
 
@@ -31,6 +57,38 @@ version in [`docs/changelog/`](docs/changelog/):
   if the source project was purged; query signals and entity links similarly
   stayed on the source scope. `PagesMode::Regenerate` continues to leave
   retired `is_latest = 0` versions' historical rows in source. (#2254)
+- The SessionEnd consolidation worker no longer replaces a session page the
+  agent writes with `memory_write_page` while the worker's completion is
+  running. It checked for the agent's page once, before the completion, and
+  then wrote unconditionally, so the agent's page survived only as a
+  superseded version. The worker now writes conditional on the page version it
+  read before that check and keeps the agent's page when it lands in between;
+  a rule-based summary or checkpoint landing in between is still replaced, as
+  before. (#2275)
+- A Claude Code subagent's compaction is no longer treated as the session's.
+  Since Claude Code 2.1.323 a subagent's `PreCompact` and post-compaction
+  `SessionStart` carry its `agent_id` under the parent's session id, and
+  ai-memory injected the session's post-compaction anchor into the subagent
+  (the parent's prompts as the source of truth for its task), rewrote
+  `sessions/<id>.md` as a checkpoint, and let the recap start at the
+  subagent's compaction. A compaction that names an `agent_id` now gets no
+  anchor and no checkpoint and is stored as a `subagent pre-compact` event;
+  the session's own compaction is unchanged. (#2301)
+- Zero-LLM session pages now get the duplicate-title collision backstop the
+  LLM consolidation and `memory_write_page` paths already apply (#926): when a
+  rule-based `sessions/<id>.md` write (SessionEnd, the compaction checkpoint,
+  or the idle-end tick) takes a title that already names another of the
+  project's latest pages, it suffixes the session short id. A resume habit that
+  opens every session with the same phrase ("where were we?") no longer gives
+  every page one title and trips ai-memory's own `duplicate_title` curator
+  finding. (#2300)
+- Devin POSIX shell (`hooks/_lib.sh`, `hooks/devin/*.sh`) and PowerShell
+  (`hooks/lib/ai-memory-hook.ps1`) hooks now match native `ai-memory hook`
+  behavior (#2237) for `AI_MEMORY_SESSION_ID`: whitespace-only values are
+  ignored, top-level native payload session IDs take precedence over both
+  `AI_MEMORY_SESSION_ID` and `<data-dir>/hook-state/devin-session-id` (and are
+  forwarded on PowerShell handoff requests when missing), and a pinned bare
+  `session-end` keeps the fallback `devin-session-id` slot intact. (#2256)
 - `export-okf` no longer silently drops a concept page that occupies an
   OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
   hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
@@ -44,9 +102,15 @@ version in [`docs/changelog/`](docs/changelog/):
   section's own heading is refused (`section_content_repeats_heading`) rather
   than written, which used to leave two identical headings that no later edit
   could target. (#2239)
+- `memory_patch_page` now preserves blank-line padding around nonempty section
+  bodies in CRLF Markdown and avoids adding an LF-only boundary. Previously,
+  the padding was lost when the section was replaced. (#2281)
 - Fixed project activity timestamps and default ordering ignoring newer
   sessions or page updates whenever an older observation existed. Project
   lists now use the latest of all three activity sources. (#2266)
+- Retrieval benchmarks no longer inherit unreported `AI_MEMORY_*` settings
+  from the evaluator's environment. Pass server settings explicitly with
+  `--server-env` or `--candidate-server-env` so the report records them. (#2282)
 - The document importer now preserves DOCX nonbreaking hyphens encoded as
   `w:noBreakHyphen` elements. It previously dropped them and joined the
   surrounding text, turning `Profit‑loss` into `Profitloss`. (#2234)
@@ -145,6 +209,43 @@ version in [`docs/changelog/`](docs/changelog/):
   rejection-reason table, which keeps only the top N reasons, so with
   `--top-limit 1` three human rejections hid two eval-gate failures. The
   report now reads a separate eval-gate count that ignores the limit. (#2263)
+- `ai-memory-eval retrieval` no longer prints credential `--server-env` and
+  `--candidate-server-env` values in its reports. The run's config line,
+  which lands in `report.md`, `report.json` and the log, copied every
+  `KEY=VALUE` pair as given, so a reranker provider key passed the way the
+  evals README describes ended up in a report meant for `docs/benchmarks/`.
+  A variable whose name has a `KEY`, `APIKEY`, `TOKEN`, `SECRET`,
+  `PASSWORD`, `PASSWD`, `CREDENTIALS` or `HEADERS` word now shows as
+  `env:NAME=<redacted>`; the eval server still receives the real value.
+  Values the line keeps, and `--query-arg` values, also pass through the
+  built-in sanitizer, so a password inside a URL or a provider key under an
+  unrelated name is redacted too. (#2274)
+- `memory_handoff_accept` no longer claims the latest eligible handoff when
+  `handoff_id` is explicitly empty or whitespace-only, and `memory_write_page`
+  and `memory_delete_page` no longer drop a blank `expected_page_id` and write
+  or delete unconditionally. A blank id in either place is now refused with
+  invalid params and changes nothing, as message ids already are (#2244).
+  Leaving the argument out keeps the latest-handoff and unconditional
+  defaults, and a valid id with surrounding whitespace still selects its
+  row. (#2298)
+
+### Security
+
+- The eval QA grader no longer reuses the answerer's API key, key-env, or
+  auth file when it is pointed at a different provider or base URL. A grader
+  at a different endpoint must supply its own credential (or the run skips),
+  so an answerer key is never sent to an endpoint it was not issued for.
+  (GHSA-5xw9-4g32-84fr)
+- The macOS menu bar app no longer keeps sending a retained bearer after a
+  failed credential update. When a keychain save failed while the user was
+  pointing the app at a new server, the old token stayed in the keychain
+  while the binding had already moved to the new server, so it was sent there
+  and re-adopted on the next launch. A failed save now clears both the stored
+  token and its binding, and the failure is surfaced in Settings. A rarer
+  double fault, where that follow-up clear also fails and leaves the old token
+  in the keychain, is now recorded so the next launch keeps it unbound (and
+  unsent) instead of re-adopting it to the current server.
+  (GHSA-xj78-fp6w-8r74, #2289)
 
 ## [3.4.6] - 2026-11-13
 
@@ -5282,7 +5383,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.6...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.7...HEAD
+[3.4.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.7
 [3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6
 [3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
 [3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
