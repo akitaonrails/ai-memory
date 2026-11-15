@@ -12913,6 +12913,17 @@ model = "gpt-5"
             written.contains("hook --event session-start --agent codex"),
             "{written}"
         );
+        // An interrupted turn runs Interrupt instead of Stop, through the
+        // same stop command.
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let command = |event: &str| {
+            parsed
+                .pointer(&format!("/hooks/{event}/0/hooks/0/command"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        assert!(command("Interrupt").is_some(), "{written}");
+        assert_eq!(command("Interrupt"), command("Stop"), "{written}");
     }
 
     /// #552, the regression guard: `--apply` must persist the bearer under the
