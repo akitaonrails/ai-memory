@@ -11747,6 +11747,30 @@ mod tests {
         ));
     }
 
+    /// Claude Code 2.1.323 sends `agent_id` on a subagent's compaction, and
+    /// the session anchor is the parent's, so no agent injects it there. A
+    /// main session started with `--agent` carries `agent_type` alone and
+    /// keeps its anchor; a blank `agent_id` marks nothing.
+    #[test]
+    fn a_subagent_compaction_gets_no_anchor() {
+        let subagent = serde_json::json!({
+            "source": "compact",
+            "agent_id": "a7",
+            "agent_type": "Explore",
+        });
+        let main_with_agent = serde_json::json!({ "source": "compact", "agent_type": "reviewer" });
+        let blank_id = serde_json::json!({ "source": "compact", "agent_id": " " });
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Droid] {
+            assert!(!injects_compaction_anchor(agent, &subagent), "{agent:?}");
+            assert!(
+                injects_compaction_anchor(agent, &main_with_agent),
+                "{agent:?}"
+            );
+            assert!(injects_compaction_anchor(agent, &blank_id), "{agent:?}");
+        }
+        assert!(is_compaction_session_start(&subagent));
+    }
+
     /// A compaction `SessionStart` from an agent without a verified anchor
     /// contract (Muse, or Cursor running Claude Code's settings) is still
     /// mid-session: it must not claim a pending handoff, recovery snapshot or
