@@ -1739,13 +1739,20 @@ pub(crate) struct HookProfile {
 /// root-session-only event that runs synchronously during thread
 /// teardown. Codex still has no `SubagentStart`/`SubagentStop` in a
 /// first-party-supported form here, so those stay Claude-Code-only.
-pub(crate) const CODEX_EVENTS: [(&str, &str); 7] = [
+///
+/// `Interrupt` runs instead of `Stop` when the user interrupts the turn, with
+/// the common fields only (`codex-rs/hooks/src/schema.rs`,
+/// `InterruptCommandInput`, rust-v0.169.0; already accepted by the hooks
+/// file in rust-v0.154.0, whose event map ignores names it does not know).
+/// It reuses the stop script and the server reads it from the payload.
+pub(crate) const CODEX_EVENTS: [(&str, &str); 8] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("Interrupt", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
 ];
 
