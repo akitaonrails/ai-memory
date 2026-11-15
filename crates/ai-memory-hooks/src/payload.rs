@@ -2019,6 +2019,22 @@ mod tests {
         }
     }
 
+    /// `StopFailure` (Claude Code 2.1.78, Qwen Code, Kimi Code) and
+    /// `Interrupt` (Kimi Code, Codex) fire instead of `Stop`, so they end the
+    /// turn like it.
+    #[test]
+    fn parses_abnormal_turn_ends_as_stop() {
+        for name in [
+            "StopFailure",
+            "stop-failure",
+            "stop_failure",
+            "Interrupt",
+            "interrupt",
+        ] {
+            assert_eq!(HookEvent::parse(name), HookEvent::Stop, "{name}");
+        }
+    }
+
     #[test]
     fn parses_known_events() {
         assert_eq!(HookEvent::parse("session-start"), HookEvent::SessionStart);
