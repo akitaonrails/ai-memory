@@ -347,16 +347,21 @@ configure ai-memory@ai-memory`:
   `install-mcp`, `install-skills`) to add them anyway.
 - Folderless sessions (a desktop scratch workspace with no project folder)
   are not captured through the plugin.
-- Ten events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `SessionEnd`,
-  `SubagentStart` and `SubagentStop`. Claude Code fires `PostToolUseFailure`
-  *instead of* `PostToolUse` when a tool fails (a non-zero exit, a thrown
-  error, an MCP error result). The observation records `outcome: error` and
-  the error text, bounded like any tool excerpt and never the tool's
-  arguments; the session page counts failed calls and quotes the newest one;
-  the automatic handoff adds a `Last failed tool call` line. An install made
-  before this fix has nine events; re-run `ai-memory install-hooks --agent
-  claude-code --apply` (or `ai-memory setup`) to add the tenth.
+- Eleven events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `StopFailure`,
+  `SessionEnd`, `SubagentStart` and `SubagentStop`. Claude Code fires
+  `PostToolUseFailure` *instead of* `PostToolUse` when a tool fails (a
+  non-zero exit, a thrown error, an MCP error result). The observation records
+  `outcome: error` and the error text, bounded like any tool excerpt and never
+  the tool's arguments; the session page counts failed calls and quotes the
+  newest one; the automatic handoff adds a `Last failed tool call` line. It
+  fires `StopFailure` *instead of* `Stop` when an API error ends the turn (a
+  rate limit, an exhausted balance, an overloaded server); that turn end is
+  stored as `stop failure: <error>` with the error and its details, and the
+  error text Claude Code puts in `last_assistant_message` is never captured as
+  a reply. An install made before these fixes has nine or ten events; re-run
+  `ai-memory install-hooks --agent claude-code --apply` (or `ai-memory setup`)
+  to add the rest. `ai-memory upgrade` refreshes the hooks the same way.
 - Factory Droid can install this plugin through its Claude marketplace
   fallback. Its events are recorded as `droid`, and when `install-hooks
   --agent droid` hooks deliver the same event (`~/.factory/hooks.json`, or
