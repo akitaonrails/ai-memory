@@ -11,6 +11,8 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+## [3.4.7] - 2026-11-15
+
 ### Fixed
 
 - A `move-project` true move now re-resolves project-only cross-project links
@@ -5375,7 +5377,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.6...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.7...HEAD
+[3.4.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.7
 [3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6
 [3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
 [3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
