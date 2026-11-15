@@ -4977,6 +4977,19 @@ async fn process(
     }
 }
 
+/// Whether a compaction event is a subagent's own rather than the session's.
+/// Claude Code reports a subagent's `PreCompact` under the parent's
+/// `session_id` and, since v2.1.323, with the subagent's `agent_id`
+/// (changelog: "Fixed `PreCompact`, `PostCompact` and post-compaction
+/// `SessionStart` hooks not receiving `agent_id` and `agent_type` when a
+/// subagent compacts"). The session's own context was not compacted, so such
+/// an event must not checkpoint the session page the way its own compaction
+/// does.
+fn is_subagent_compaction(env: &HookEnvelope) -> bool {
+    matches!(env.event, HookEvent::PreCompact | HookEvent::PostCompaction)
+        && body_is_subagent(env.agent, &env.raw)
+}
+
 /// Durable body for a hook observation: scrub the **full** excerpt first,
 /// then apply the per-event ceiling to the redacted text.
 ///
@@ -5510,7 +5523,11 @@ async fn process_authorized(
     // that captures the state after compaction. Does NOT end the session
     // and does NOT create a handoff. The eventual SessionEnd supersedes
     // this page.
+    //
+    // A subagent's compaction left the session's context alone, so it writes
+    // no checkpoint, as a subagent's Stop writes no turn checkpoint below.
     let checkpoint_label = match env.event {
+        _ if is_subagent_compaction(&env) => None,
         HookEvent::PreCompact => Some("pre-compact"),
         HookEvent::PostCompaction => Some("post-compaction"),
         _ => None,
