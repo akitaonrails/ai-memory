@@ -994,9 +994,12 @@ install (every fresh `init`) writes a stdio `ai-memory mcp-bridge
 --no-session-id` entry instead of embedding the bearer, so Qwen is a static
 client: project-scoped calls still need `workspace` and `project`.
 
-The hook installer registers ten events: `SessionStart`, `UserPromptSubmit`,
+The hook installer registers eleven events: `SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`,
-`SessionEnd`, `SubagentStart` and `SubagentStop`. Definitions use an empty
+`StopFailure`, `SessionEnd`, `SubagentStart` and `SubagentStop`. `StopFailure`
+fires instead of `Stop` when an API error or loop detection ends the turn and
+runs the stop event; the turn end is stored as `stop failure: <error>`.
+Definitions use an empty
 `matcher`, which Qwen treats as match-all. Each command receives Qwen's
 Claude-shaped JSON on stdin (`session_id`, `cwd`, `tool_name`, `tool_input`,
 `tool_use_id`) and enforces capture exclusions over Qwen's Gemini-like
