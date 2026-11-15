@@ -17561,6 +17561,114 @@ pub(crate) mod tests {
         );
     }
 
+    /// A subagent's compaction between the session's own two compactions is
+    /// stored as a subagent event, so the recap still covers everything since
+    /// the session's previous compaction instead of starting at the subagent's.
+    #[tokio::test]
+    async fn a_subagent_compaction_is_no_recap_boundary() {
+        use axum::response::IntoResponse as _;
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0b8";
+        let fire = |name: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "session_id": sid });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: name.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        let subagent = serde_json::json!({ "agent_id": "a7", "agent_type": "Explore" });
+        for (event, extra) in [
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "BEFORE-WINDOW" }),
+            ),
+            ("pre-compact", serde_json::json!({})),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "WINDOW-PROMPT" }),
+            ),
+            ("pre-compact", subagent),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "STILL-IN-WINDOW" }),
+            ),
+            ("pre-compact", serde_json::json!({})),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "AFTER-WINDOW" }),
+            ),
+        ] {
+            process(&state, fire(event, extra), None, Vec::new())
+                .await
+                .unwrap();
+        }
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let rows = state
+            .reader
+            .session_observations_scoped(
+                state.workspace_id,
+                state.project_id,
+                session_id,
+                ai_memory_store::ObservationPage {
+                    limit: 50,
+                    offset: 0,
+                    order: ai_memory_store::ObservationOrder::Asc,
+                    kinds: None,
+                    query: None,
+                },
+            )
+            .await
+            .unwrap()
+            .records;
+        let compactions: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|r| r.title.contains("pre-compact"))
+            .map(|r| (r.kind.as_str(), r.title.as_str()))
+            .collect();
+        assert_eq!(
+            compactions,
+            [
+                ("pre-compact", "pre-compact"),
+                ("other", "subagent pre-compact"),
+                ("pre-compact", "pre-compact"),
+            ],
+            "{rows:?}"
+        );
+
+        let response = crate::recap::handle_recap(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(crate::recap::RecapQuery {
+                agent: Some("claude-code".into()),
+                session_id: Some(sid.into()),
+                budget: None,
+                mode: None,
+            }),
+            None,
+            None,
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        for inside in ["WINDOW-PROMPT", "STILL-IN-WINDOW"] {
+            assert!(body.contains(inside), "{inside}: {body}");
+        }
+        for outside in ["BEFORE-WINDOW", "AFTER-WINDOW"] {
+            assert!(!body.contains(outside), "{outside}: {body}");
+        }
+    }
+
     /// A compaction checkpoint keeps the agent's page as SessionEnd does,
     /// and still replaces a page no agent wrote (control).
     #[tokio::test]
