@@ -99,6 +99,8 @@ Writes and handoff creation may create the explicit scope if it is missing.
 Reads fail closed on missing or partial scope. A handoff is claimed once. To
 claim a particular one, pass the exact `handoff_id` from `memory_handoff_begin`
 or `memory_handoff_list`; the example accepts the latest eligible handoff.
+Leave `handoff_id` out for that default: an empty or whitespace-only id is
+refused with `invalid_params` and claims nothing.
 If SessionStart already owns delivery, let that hook claim it.
 [usage.md](usage.md) describes ownership and handoff states.
 
