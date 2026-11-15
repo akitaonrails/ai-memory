@@ -28728,5 +28728,40 @@ mod tests {
                 assert_precondition_failed(&err, None);
             }
         }
+
+        /// A blank `expected_page_id` on a delete is refused and the page
+        /// stays; omitting the field still deletes unconditionally.
+        #[tokio::test]
+        async fn a_blank_expected_page_id_never_deletes_the_page() {
+            let (_tmp, server) = server(true).await;
+            let id = put(&server, write("notes/a.md", "# A", "scratch"))
+                .await
+                .unwrap();
+            for blank in ["", "  "] {
+                let err = server
+                    .memory_delete_page(
+                        Parameters(delete("notes/a.md", Some(blank))),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+                assert!(err.message.contains("expected_page_id is blank"), "{err:?}");
+                assert_eq!(
+                    read(&server, "notes/a.md").await["page_id"],
+                    id.as_str(),
+                    "blank {blank:?}"
+                );
+            }
+
+            let deleted = server
+                .memory_delete_page(
+                    Parameters(delete("notes/a.md", None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(json(&deleted)["deleted"], true);
+        }
     }
 }
