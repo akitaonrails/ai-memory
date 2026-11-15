@@ -233,8 +233,11 @@ version in [`docs/changelog/`](docs/changelog/):
   pointing the app at a new server, the old token stayed in the keychain
   while the binding had already moved to the new server, so it was sent there
   and re-adopted on the next launch. A failed save now clears both the stored
-  token and its binding, and the failure is surfaced in Settings.
-  (GHSA-xj78-fp6w-8r74)
+  token and its binding, and the failure is surfaced in Settings. A rarer
+  double fault, where that follow-up clear also fails and leaves the old token
+  in the keychain, is now recorded so the next launch keeps it unbound (and
+  unsent) instead of re-adopting it to the current server.
+  (GHSA-xj78-fp6w-8r74, #2289)
 
 ## [3.4.6] - 2026-11-13
 

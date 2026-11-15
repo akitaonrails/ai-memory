@@ -7,17 +7,26 @@ public struct AppSettings: Equatable, Sendable {
     /// only when this matches the current server, so a later URL change does
     /// not carry it to another host. `nil` means no bound token.
     public var tokenOrigin: ServerOrigin?
+    /// Set when a token edit cleared the binding but the follow-up Keychain
+    /// `clear` also failed, so a stale bearer is still in the Keychain with no
+    /// binding. ``adoptUnboundToken()`` must not re-bind that token to the
+    /// current server on the next launch, so `init` skips adoption while this
+    /// is set, keeping the stale token unbound and therefore unsent. A later
+    /// successful save or clear resolves it (GHSA-xj78 follow-up, #2289).
+    public var pendingClearFailed: Bool
 
     public static let defaultServerURL = URL(string: "http://127.0.0.1:49374")!
 
     public init(
         serverURL: URL = defaultServerURL,
         dataDirOverride: URL? = nil,
-        tokenOrigin: ServerOrigin? = nil
+        tokenOrigin: ServerOrigin? = nil,
+        pendingClearFailed: Bool = false
     ) {
         self.serverURL = serverURL
         self.dataDirOverride = dataDirOverride
         self.tokenOrigin = tokenOrigin
+        self.pendingClearFailed = pendingClearFailed
     }
 
     public var resolvedDataDir: URL {
@@ -41,7 +50,13 @@ public struct AppSettings: Equatable, Sendable {
         }
         let tokenOrigin = defaults.string(forKey: Keys.tokenOrigin)
             .flatMap { ServerOrigin.of(canonical: $0) }
-        return AppSettings(serverURL: url, dataDirOverride: override, tokenOrigin: tokenOrigin)
+        let pendingClearFailed = defaults.bool(forKey: Keys.pendingClearFailed)
+        return AppSettings(
+            serverURL: url,
+            dataDirOverride: override,
+            tokenOrigin: tokenOrigin,
+            pendingClearFailed: pendingClearFailed
+        )
     }
 
     public func save(defaults: UserDefaults = .standard) {
@@ -55,6 +70,11 @@ public struct AppSettings: Equatable, Sendable {
             defaults.set(tokenOrigin.canonical, forKey: Keys.tokenOrigin)
         } else {
             defaults.removeObject(forKey: Keys.tokenOrigin)
+        }
+        if pendingClearFailed {
+            defaults.set(true, forKey: Keys.pendingClearFailed)
+        } else {
+            defaults.removeObject(forKey: Keys.pendingClearFailed)
         }
     }
 
@@ -117,6 +137,7 @@ public struct AppSettings: Equatable, Sendable {
             do {
                 try store.clear()
                 clearTokenBinding()
+                pendingClearFailed = false
                 return nil
             } catch {
                 return error
@@ -127,10 +148,23 @@ public struct AppSettings: Equatable, Sendable {
         guard !value.isEmpty else { return nil }
         do {
             try store.save(value)
+            pendingClearFailed = false
             return nil
         } catch {
-            try? store.clear()
-            clearTokenBinding()
+            // The stale token is still in the keychain and the binding now
+            // points at the configured server. Clear both so nothing stale is
+            // sent or re-adopted. If that clear ALSO fails, the keychain keeps
+            // the stale token unbound: record it so the next launch's
+            // ``adoptUnboundToken()`` does not re-bind it to the current server
+            // (GHSA-xj78 follow-up, #2289).
+            do {
+                try store.clear()
+                clearTokenBinding()
+                pendingClearFailed = false
+            } catch {
+                clearTokenBinding()
+                pendingClearFailed = true
+            }
             return error
         }
     }
@@ -139,5 +173,6 @@ public struct AppSettings: Equatable, Sendable {
         static let serverURL = "serverURL"
         static let dataDir = "dataDirOverride"
         static let tokenOrigin = "tokenOrigin"
+        static let pendingClearFailed = "pendingClearFailed"
     }
 }

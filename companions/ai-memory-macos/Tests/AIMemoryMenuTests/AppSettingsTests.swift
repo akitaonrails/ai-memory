@@ -135,6 +135,90 @@ struct AppSettingsTests {
         #expect(settings.tokenOrigin == nil)
     }
 
+    @Test func aDoubleKeychainFaultDoesNotReadoptTheStaleBearerOnNextLaunch() throws {
+        // A failed save is followed by a clear that ALSO fails, so the keychain
+        // still holds the old bearer while the binding is cleared. Left alone,
+        // the next launch sees `tokenConfigured && tokenOrigin == nil` and
+        // re-binds that stale token to the now-current server — the exact shape
+        // GHSA-xj78 targets. The pending-clear-failed marker stops it (#2289).
+        let store = FakeTokenStore(value: "old-secret")
+        store.failSave = true
+        store.failClear = true
+        var settings = AppSettings(
+            serverURL: url("https://old.example.com"),
+            tokenOrigin: origin("https://old.example.com")
+        )
+        settings.applyEdit(
+            serverURLString: "https://new.example.com",
+            dataDirOverride: "",
+            tokenInEdit: "new-secret"
+        )
+
+        let err = settings.commitTokenEdit(clearToken: false, token: "new-secret", to: store)
+
+        #expect(err != nil)
+        // The stale token could not be removed, so it is still in the keychain,
+        // but it is unbound and the double fault is recorded.
+        #expect(store.read() == "old-secret")
+        #expect(settings.tokenOrigin == nil)
+        #expect(settings.pendingClearFailed)
+        // In-session it is unbound, so nothing is sent.
+        #expect(
+            DataDirToken.effective(
+                saved: store.read(),
+                savedOrigin: settings.tokenOrigin,
+                serverURL: url("https://new.example.com"),
+                dataDir: noDataDir
+            ) == nil
+        )
+
+        // The marker persists across a relaunch, and AppModel.init's adoption
+        // guard skips adoption while it is set, so the stale bearer stays
+        // unbound and unsent. Without the `!pendingClearFailed` term, the guard
+        // would re-bind it to the new server here.
+        let name = "ai-memory-menu-settings-test-\(UUID().uuidString)"
+        let suite = try #require(UserDefaults(suiteName: name))
+        defer { suite.removePersistentDomain(forName: name) }
+        settings.save(defaults: suite)
+        var reloaded = AppSettings.load(defaults: suite)
+        #expect(reloaded.pendingClearFailed)
+        let tokenConfigured = store.read()?.isEmpty == false
+        if tokenConfigured, reloaded.tokenOrigin == nil, !reloaded.pendingClearFailed {
+            reloaded.adoptUnboundToken()
+        }
+        #expect(reloaded.tokenOrigin == nil, "the stale bearer must stay unbound")
+        #expect(
+            DataDirToken.effective(
+                saved: store.read(),
+                savedOrigin: reloaded.tokenOrigin,
+                serverURL: url("https://new.example.com"),
+                dataDir: noDataDir
+            ) == nil,
+            "the stale bearer must stay unsent after a relaunch"
+        )
+    }
+
+    @Test func aSuccessfulSaveClearsAPriorPendingClearMarker() throws {
+        // A later successful token save resolves a recorded double fault, so a
+        // legitimate re-adoption is not suppressed forever.
+        let store = FakeTokenStore(value: "old-secret")
+        store.failSave = true
+        store.failClear = true
+        var settings = AppSettings(
+            serverURL: url("https://a.example.com"),
+            tokenOrigin: origin("https://a.example.com")
+        )
+        _ = settings.commitTokenEdit(clearToken: false, token: "new-secret", to: store)
+        #expect(settings.pendingClearFailed)
+
+        store.failSave = false
+        store.failClear = false
+        let err = settings.commitTokenEdit(clearToken: false, token: "new-secret", to: store)
+        #expect(err == nil)
+        #expect(store.read() == "new-secret")
+        #expect(!settings.pendingClearFailed)
+    }
+
     @Test func aSuccessfulTokenSaveBindsAndSendsTheNewBearer() {
         let store = FakeTokenStore(value: "old-secret")
         var settings = AppSettings(
