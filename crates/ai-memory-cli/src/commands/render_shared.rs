@@ -84,12 +84,18 @@ pub(crate) const GROK_EVENTS: [(&str, &str); 9] = [
 /// leaving room for a slow local spool fsync without making other hooks wait.
 pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
 
-/// Kimi Code lifecycle events ai-memory hooks: the same ten events as
-/// Claude Code (`CLAUDE_CODE_EVENTS`), `PostToolUseFailure` included. Kimi
-/// Code fires `PostToolUse` on successful calls only and reports failures
-/// separately. The failure entry reuses the post-tool-use script — the
-/// server aliases `PostToolUseFailure` to `PostToolUse` and reads the
-/// outcome from the payload.
+/// Kimi Code lifecycle events ai-memory hooks: Claude Code's events
+/// (`CLAUDE_CODE_EVENTS`), `PostToolUseFailure` and `StopFailure` included,
+/// plus `Interrupt`. Kimi Code fires `PostToolUse` on successful calls only
+/// and reports failures separately. The failure entry reuses the
+/// post-tool-use script: the server aliases `PostToolUseFailure` to
+/// `PostToolUse` and reads the outcome from the payload.
+///
+/// `StopFailure` (an error ended the turn, `error_type` and `error_message`)
+/// and `Interrupt` (the user cut it short, with a `reason`) fire in place of
+/// `Stop` (<https://github.com/MoonshotAI/kimi-code/blob/6a8493df3e1d796a63f7c7ca0de76c1e690cd943/docs/en/customization/hooks.md#L129-L130>),
+/// so both reuse the stop script and the server reads which it was from the
+/// payload.
 ///
 /// Kimi Code wires hooks as `[[hooks]]` entries in
 /// `$KIMI_CODE_HOME/config.toml` (TOML) instead of a JSON settings file,
@@ -100,7 +106,7 @@ pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
 /// `.sh` and `.ps1` files under `hooks/kimi-code/` (a reused script like
 /// post-tool-use needs no new file). The install-hooks parity test fails
 /// if the bundle drifts.
-pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
+pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 12] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -108,6 +114,8 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
     ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("StopFailure", "stop.sh"),
+    ("Interrupt", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
     ("SubagentStart", "subagent-start.sh"),
     ("SubagentStop", "subagent-stop.sh"),
