@@ -658,3 +658,82 @@ async fn handoff_accept_returns_the_claimed_row() {
         "bob borrowed alice's harness: {got}"
     );
 }
+
+/// An explicitly blank `handoff_id` names no baton. Read as omitted, it
+/// claimed the latest eligible one, which may be the baton a parallel harness
+/// was told to accept, and a claim cannot be undone. It is refused instead and
+/// both batons stay open. A valid id with surrounding whitespace still claims
+/// exactly its row, and omitting the id still claims the latest.
+#[tokio::test]
+async fn a_blank_handoff_id_claims_no_baton() {
+    let h = harness(None, false).await;
+    let root = root_headers();
+    let mut ids = Vec::new();
+    for summary in ["older-baton", "newer-baton"] {
+        let begun = call(
+            &h.http,
+            "memory_handoff_begin",
+            json!({ "workspace": "default", "project": "scratch", "summary": summary }),
+            &root,
+        )
+        .await;
+        ids.push(begun["handoff_id"].as_str().expect("handoff_id").to_owned());
+    }
+    let state = |rows: &std::collections::HashMap<String, ai_memory_core::Handoff>,
+                 summary: &str| rows[summary].lifecycle.state;
+
+    for blank in ["", " \t\n "] {
+        let refused = call_raw(
+            &h.http,
+            "memory_handoff_accept",
+            json!({ "workspace": "default", "project": "scratch", "handoff_id": blank }),
+            &root,
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], -32602, "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("invalid handoff_id")),
+            "{refused}"
+        );
+        let rows = handoffs_by_summary(&h).await;
+        for summary in ["older-baton", "newer-baton"] {
+            assert_eq!(
+                state(&rows, summary),
+                ai_memory_core::HandoffState::Open,
+                "a blank handoff_id {blank:?} claimed {summary}",
+            );
+        }
+    }
+
+    let claimed = call(
+        &h.http,
+        "memory_handoff_accept",
+        json!({
+            "workspace": "default",
+            "project": "scratch",
+            "handoff_id": format!(" {}\n", ids[0]),
+        }),
+        &root,
+    )
+    .await;
+    assert_eq!(claimed["status"], "claimed", "{claimed}");
+    assert_eq!(claimed["handoff"]["summary"], "older-baton", "{claimed}");
+    let rows = handoffs_by_summary(&h).await;
+    assert_eq!(
+        state(&rows, "newer-baton"),
+        ai_memory_core::HandoffState::Open,
+        "naming the older baton must leave the newer one open",
+    );
+
+    let latest = call(
+        &h.http,
+        "memory_handoff_accept",
+        json!({ "workspace": "default", "project": "scratch" }),
+        &root,
+    )
+    .await;
+    assert_eq!(latest["status"], "claimed", "{latest}");
+    assert_eq!(latest["handoff"]["summary"], "newer-baton", "{latest}");
+}
