@@ -478,6 +478,31 @@ mod tests {
         assert!(transform_for_client(&mut raw, AgentKind::ClaudeCode, HookEvent::Stop).captured);
     }
 
+    /// A forged or stale marker on a `StopFailure` (a client that predates the
+    /// check above) is consumed and refused: the failure body stays, and the
+    /// error text is never stored as the reply.
+    #[test]
+    fn backstop_refuses_a_failed_turns_marker() {
+        let protocol = serde_json::json!({
+            "version": ASSISTANT_PROTOCOL_VERSION,
+            "excerpt": "API Error: Rate limit reached",
+        });
+        let mut env = stop_env(
+            serde_json::json!({
+                "hook_event_name": "StopFailure",
+                "error": "rate_limit",
+                ASSISTANT_MARKER_KEY: protocol,
+            }),
+            true,
+        );
+        apply_assistant_backstop(&mut env, true);
+        assert_eq!(env.body_excerpt.as_deref(), Some("error: rate_limit"));
+        assert!(
+            env.raw.get(ASSISTANT_MARKER_KEY).is_none(),
+            "marker persisted"
+        );
+    }
+
     #[test]
     fn backstop_populates_body_when_all_gates_pass() {
         let mut raw = serde_json::json!({ "last_assistant_message": "done" });
