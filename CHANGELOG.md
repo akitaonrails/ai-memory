@@ -19,7 +19,7 @@ version in [`docs/changelog/`](docs/changelog/):
   observation evidence or bypasses the configured budget. An input budget
   too small for the complete request now records an `input_budget_too_small`
   skip without calling the provider; an explicit session ID can rerun the
-  review after adjusting the budget. (#2309)
+  review after adjusting the budget. (#2313)
 
 ## [3.4.7] - 2026-11-15
 
