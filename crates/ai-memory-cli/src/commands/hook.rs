@@ -11800,4 +11800,34 @@ mod tests {
             assert!(recap_requests(&seen).is_empty(), "{name}: {seen:?}");
         }
     }
+
+    /// A subagent's compaction `SessionStart` (Claude Code 2.1.323 adds the
+    /// subagent's `agent_id`) never fetches or prints the parent's anchor and
+    /// claims nothing, while the compaction itself still reaches the server.
+    #[tokio::test]
+    async fn subagent_compact_session_start_fetches_no_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
+        let mut payload = session_start_payload(tmp.path(), "compacted-session", "compact");
+        payload["agent_id"] = "a7".into();
+        payload["agent_type"] = "Explore".into();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("session-start", &base),
+            payload,
+        )
+        .await;
+        let stdout = String::from_utf8_lossy(&stdout);
+        assert!(!stdout.contains("post-compaction anchor"), "{stdout}");
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|r| r.starts_with("GET /handoff")),
+            "a compaction must not claim a handoff: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|r| r.starts_with("POST /hook")),
+            "the compaction itself is still captured: {seen:?}"
+        );
+    }
 }
