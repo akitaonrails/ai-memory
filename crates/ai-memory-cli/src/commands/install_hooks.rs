@@ -10010,6 +10010,15 @@ mod tests {
         let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
+        // Qwen fires StopFailure instead of Stop when an API error or its loop
+        // detection ends the turn; it runs the stop event.
+        let stop_failure = root["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("StopFailure is wired");
+        assert!(
+            stop_failure.contains(" hook --event stop --agent qwen-code "),
+            "{stop_failure}"
+        );
     }
 
     #[test]
