@@ -9077,7 +9077,18 @@ fn page_precondition(
     expected_page_id: Option<&str>,
     create_only: bool,
 ) -> Result<Option<ai_memory_store::PagePrecondition>, McpError> {
-    let expected = expected_page_id.map(str::trim).filter(|id| !id.is_empty());
+    let expected = expected_page_id.map(str::trim);
+    // A supplied precondition must name a version. Reading a blank one as
+    // omitted would quietly turn a conditional write or delete into an
+    // unconditional one, the lost update the precondition exists to stop.
+    // Message and handoff ids follow the same rule (#2244).
+    if expected == Some("") {
+        return Err(McpError::invalid_params(
+            "expected_page_id is blank; pass the page_id you read, or omit it to change the \
+             page unconditionally",
+            None,
+        ));
+    }
     match (expected, create_only) {
         (Some(_), true) => Err(McpError::invalid_params(
             "expected_page_id and create_only cannot be combined",
