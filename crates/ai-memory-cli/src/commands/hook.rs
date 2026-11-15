@@ -1347,12 +1347,31 @@ fn is_compaction_session_start(raw: &serde_json::Value) -> bool {
 /// Muse reports a `compact` source but publishes no output contract for it,
 /// and Cursor runs Claude Code's settings with unverified handling of the
 /// envelope, so neither gets an anchor.
+///
+/// A subagent's compaction gets none either: the anchor quotes the session's
+/// own prompts as the source of truth for the task, and in a subagent that is
+/// the parent's task, not the one it was given.
 fn injects_compaction_anchor(agent: AgentKind, raw: &serde_json::Value) -> bool {
     matches!(
         agent,
         AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid
     ) && is_compaction_session_start(raw)
         && ai_memory_hooks::agent_from_payload(raw) != Some(AgentKind::Cursor)
+        && !fired_in_a_subagent(raw)
+}
+
+/// Whether a hook fired inside a subagent (or an in-process teammate) rather
+/// than in the session's own agent, which share one `session_id`. Claude Code
+/// names it with `agent_id` (<https://code.claude.com/docs/en/hooks>, common
+/// input fields) and sends it on a subagent's `PreCompact` and post-compaction
+/// `SessionStart` since v2.1.323 (changelog: "Fixed `PreCompact`, `PostCompact`
+/// and post-compaction `SessionStart` hooks not receiving `agent_id` and
+/// `agent_type` when a subagent compacts"). `agent_type` alone marks nothing:
+/// it is also set on a main session started with `--agent`.
+fn fired_in_a_subagent(raw: &serde_json::Value) -> bool {
+    raw.get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
 }
 
 /// `GET /recap?mode=anchor`: the session's first and latest operator prompts,
