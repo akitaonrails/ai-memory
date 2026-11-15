@@ -17583,6 +17583,18 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
                 .pointer("/hooks/PostToolUse/0/hooks/0/command")
                 .and_then(serde_json::Value::as_str)
         );
+        // A turn an API error ends runs StopFailure instead of Stop, through
+        // the same stop handler.
+        let stop_failure = parsed
+            .pointer("/hooks/StopFailure/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .expect("StopFailure command should be present");
+        assert_eq!(
+            Some(stop_failure),
+            parsed
+                .pointer("/hooks/Stop/0/hooks/0/command")
+                .and_then(serde_json::Value::as_str)
+        );
     }
 
     #[test]
