@@ -16,7 +16,7 @@
 use ai_memory_core::{AgentKind, Sanitizer, truncate_utf8_bytes};
 use serde::{Deserialize, Serialize};
 
-use crate::payload::{HookEnvelope, HookEvent};
+use crate::payload::{HookEnvelope, HookEvent, abnormal_turn_end};
 
 /// Synthetic body key carrying the opt-in, sanitized assistant excerpt from the
 /// client to the server. Distinct from the raw `last_assistant_message` field,
@@ -121,8 +121,13 @@ pub fn transform_for_client(
     agent: AgentKind,
     event: HookEvent,
 ) -> ClientAssistantTransform {
-    // Read the eligible value BEFORE stripping removes the field.
-    let candidate = assistant_message_field(agent, event).and_then(|field| {
+    // Read the eligible value BEFORE stripping removes the field. A failed
+    // turn's `last_assistant_message` is the harness's rendered error text,
+    // not a reply (Claude Code and Qwen Code `StopFailure`), and an
+    // interrupted turn has no reply, so neither is a candidate.
+    let reply_field =
+        assistant_message_field(agent, event).filter(|_| abnormal_turn_end(raw).is_none());
+    let candidate = reply_field.and_then(|field| {
         raw.as_object()
             .and_then(|object| object.get(field))
             .and_then(serde_json::Value::as_str)
@@ -181,7 +186,8 @@ pub fn apply_assistant_backstop(env: &mut HookEnvelope, server_enabled: bool) {
 
     let eligible = server_enabled
         && env.capture_assistant_requested
-        && assistant_message_field(env.agent, env.event).is_some();
+        && assistant_message_field(env.agent, env.event).is_some()
+        && abnormal_turn_end(&env.raw).is_none();
     if !eligible {
         return;
     }
