@@ -2055,7 +2055,10 @@ still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.
 
-Codex and Antigravity `Stop` events are not session ends. Codex's hook install
+Codex and Antigravity `Stop` events are not session ends, and neither is the
+`Interrupt` Codex fires instead of `Stop` when the user interrupts the turn:
+the hook install wires it to the same stop hook and it is stored as an
+`interrupt` turn end. Codex's hook install
 registers native `SessionEnd` for CLI 0.145.0 and later; Antigravity still needs
 explicit finalization. `ai-memory finalize-session` defaults to Codex for older
 clients or a missed native end, while `--agent antigravity-cli` selects
