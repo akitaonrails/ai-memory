@@ -255,11 +255,14 @@ pub(crate) const DSH_EVENTS: [(&str, &str); 7] = [
 /// Qwen Code's hook vocabulary is Claude Code's plus `PostToolUseFailure`
 /// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
 /// `PostToolUseFailure` fires instead of `PostToolUse` when a tool throws
-/// and is aliased to `post-tool-use`. Subagent events are included: Qwen
+/// and is aliased to `post-tool-use`. `StopFailure` fires instead of `Stop`
+/// when an API error or loop detection ends the turn
+/// (<https://github.com/QwenLM/qwen-code/blob/f35dde84157f992bc324c0a3f59b1119344a683d/docs/users/features/hooks.md#L1020-L1034>)
+/// and runs `stop` the same way. Subagent events are included: Qwen
 /// documents `SubagentStart`/`SubagentStop` for user-spawned agents
 /// (`Bash`, `Explorer`, `Plan`). Qwen fires a real `SessionEnd`, so no
 /// `finalize-session` step is needed.
-pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 10] = [
+pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 11] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -267,6 +270,7 @@ pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 10] = [
     ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("StopFailure", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
     ("SubagentStart", "subagent-start.sh"),
     ("SubagentStop", "subagent-stop.sh"),
@@ -5493,7 +5497,7 @@ if (inheritOnly) {
             Some("repo-root"),
         );
 
-        assert_eq!(value["hooks"].as_object().unwrap().len(), 10);
+        assert_eq!(value["hooks"].as_object().unwrap().len(), 11);
         for (event, script) in QWEN_CODE_EVENTS {
             let definition = &value["hooks"][event][0];
             assert_eq!(definition["matcher"], "", "event: {event}");
