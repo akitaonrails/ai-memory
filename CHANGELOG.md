@@ -18,7 +18,7 @@ version in [`docs/changelog/`](docs/changelog/):
   includes the system prompt, response schema and framing, with the same
   80% estimate headroom as bootstrap. A budget too small for the session
   context skips the provider call without advancing the scheduler cadence.
-  Previously only per-item caps bounded the prompt. (#2309)
+  Previously only per-item caps bounded the prompt. (#2312, #2309)
 
 ## [3.4.7] - 2026-11-15
 
