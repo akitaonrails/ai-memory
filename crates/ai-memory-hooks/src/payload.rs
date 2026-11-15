@@ -511,7 +511,11 @@ impl HookEvent {
             }
             "post-compaction" | "post_compaction" | "PostCompaction" => Self::PostCompaction,
             "notification" | "Notification" => Self::Notification,
-            "stop" | "Stop" | "AfterAgent" => Self::Stop,
+            // `StopFailure` (an API error ended the turn) and `Interrupt` (the
+            // user cut it short) fire instead of `Stop`, and end the turn all
+            // the same; the payload's `hook_event_name` says which it was.
+            "stop" | "Stop" | "AfterAgent" | "stop-failure" | "stop_failure" | "StopFailure"
+            | "Interrupt" | "interrupt" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
             "subagent-start" | "subagent_start" | "SubagentStart" | "subagentStart" => {
                 Self::SubagentStart
