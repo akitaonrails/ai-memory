@@ -5771,11 +5771,7 @@ mod tests {
         ));
         notify.notify_one();
 
-        wait_for_worker_settled(
-            &completed,
-            "worker should complete the owned checkpoint",
-        )
-        .await;
+        wait_for_worker_settled(&completed, "worker should complete the owned checkpoint").await;
         cancel.cancel();
         task.await.unwrap();
 
