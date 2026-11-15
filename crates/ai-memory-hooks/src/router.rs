@@ -17475,6 +17475,80 @@ pub(crate) mod tests {
         );
     }
 
+    /// Claude Code 2.1.323 reports a subagent's `PreCompact` under the parent's
+    /// session id with the subagent's `agent_id`. The session's own context
+    /// was not compacted, so no checkpoint page is written; the session's own
+    /// `PreCompact` afterwards still writes it (control).
+    #[tokio::test]
+    async fn a_subagent_compaction_writes_no_session_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0a7";
+        let fire = |name: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "session_id": sid,
+                "prompt": "keep this working state"
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: name.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        process(
+            &state,
+            fire("user-prompt-submit", serde_json::json!({})),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire(
+                "pre-compact",
+                serde_json::json!({ "agent_id": "a7", "agent_type": "Explore" }),
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let path = format!("sessions/{session_id}.md");
+        let page = || async {
+            state
+                .reader
+                .page_body_by_ids(state.workspace_id, state.project_id, &path)
+                .await
+                .unwrap()
+        };
+        assert!(
+            page().await.is_none(),
+            "a subagent's PreCompact must not checkpoint the session page"
+        );
+
+        process(
+            &state,
+            fire("pre-compact", serde_json::json!({})),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            page().await.is_some(),
+            "the session's own PreCompact still writes the checkpoint"
+        );
+    }
+
     /// A compaction checkpoint keeps the agent's page as SessionEnd does,
     /// and still replaces a page no agent wrote (control).
     #[tokio::test]
