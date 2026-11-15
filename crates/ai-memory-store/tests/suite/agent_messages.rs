@@ -904,3 +904,56 @@ async fn message_evidence_within_character_budget_is_not_truncated() {
         Some(four_byte_capped.as_str())
     );
 }
+
+#[tokio::test]
+async fn list_messages_after_pages_without_gaps_or_overlap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    for i in 0..5 {
+        store
+            .writer
+            .insert_message(message(a, b, &format!("message {i}")))
+            .await
+            .unwrap();
+    }
+    let all = store
+        .reader
+        .list_messages(b.0, b.1, MessageBox::Inbox, 50)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 5);
+
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .reader
+            .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, after)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "the page ignored its limit");
+        after = page.last().map(|m| m.id);
+        paged.extend(page.into_iter().map(|m| m.id));
+    }
+    assert_eq!(
+        paged,
+        all.iter().map(|m| m.id).collect::<Vec<_>>(),
+        "paging must cover the queue once, in order"
+    );
+
+    let unknown = ai_memory_core::MessageId::new();
+    let empty = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, Some(unknown))
+        .await
+        .unwrap();
+    assert!(
+        empty.is_empty(),
+        "an unknown cursor must not page another mailbox"
+    );
+}

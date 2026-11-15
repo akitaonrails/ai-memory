@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `messages.list` accepts `afterId` (sent as `after_id`) to page the pending
+  queue with the last id from the previous page. (#2295)
 - `observations` documents the server's new `session_id: "current"`: the
   server resolves it only for a request carrying the caller's hook session
   id, which this client does not send, so SDK callers pass the id. (#1983)

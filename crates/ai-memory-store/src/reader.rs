@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ai_memory_core::{
     AgentKind, AgentMessage, AutoImproveProposalId, AutoImproveRunId, FAILED_TOOL_OUTCOME_LINE,
     Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin, HandoffScope,
-    HandoffState, IdentityKey, ManagedRunId, MessageBox, Observation, ObservationId,
+    HandoffState, IdentityKey, ManagedRunId, MessageBox, MessageId, Observation, ObservationId,
     ObservationKind, OwnerFilter, PageId, PagePath, ProjectId, SessionId,
     TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, User, UserId, WorkspaceId, WorkstreamEvent,
     WorkstreamId,
@@ -9647,6 +9647,25 @@ impl ReaderPool {
         mailbox: MessageBox,
         limit: usize,
     ) -> StoreResult<Vec<AgentMessage>> {
+        self.list_messages_after(workspace_id, project_id, mailbox, limit, None)
+            .await
+    }
+
+    /// Page pending messages after `after` (exclusive), ordered by
+    /// `(created_at, id)`. `None` starts at the oldest pending message. A
+    /// cursor that names no pending message in this mailbox yields an empty
+    /// page, so a foreign or stale id cannot read another project's mail.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_messages_after(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        mailbox: MessageBox,
+        limit: usize,
+        after: Option<MessageId>,
+    ) -> StoreResult<Vec<AgentMessage>> {
         let limit = limit.clamp(1, 200);
         self.with_conn(move |conn| {
             // Scope by the coordinate that owns this side of the mailbox: a
@@ -9655,20 +9674,46 @@ impl ReaderPool {
                 MessageBox::Inbox => "to_workspace_id = ?1 AND to_project_id = ?2",
                 MessageBox::Outbox => "from_workspace_id = ?1 AND from_project_id = ?2",
             };
-            let sql = format!(
-                "SELECT {cols} FROM agent_messages \
-                 WHERE {predicate} AND state = 'pending' \
-                 ORDER BY created_at ASC LIMIT {limit}",
-                cols = crate::ops::MESSAGE_COLUMNS,
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
-                crate::ops::row_to_agent_message,
-            )?;
             let mut out = Vec::new();
-            for row in rows {
-                out.push(row??);
+            match after {
+                Some(after) => {
+                    let sql = format!(
+                        "SELECT {cols} FROM agent_messages \
+                         WHERE {predicate} AND state = 'pending' \
+                           AND (created_at, id) > (SELECT created_at, id FROM agent_messages \
+                               WHERE id = ?3 AND {predicate} AND state = 'pending') \
+                         ORDER BY created_at ASC, id ASC LIMIT {limit}",
+                        cols = crate::ops::MESSAGE_COLUMNS,
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt.query_map(
+                        params![
+                            workspace_id.as_bytes(),
+                            project_id.as_bytes(),
+                            &after.as_bytes()[..]
+                        ],
+                        crate::ops::row_to_agent_message,
+                    )?;
+                    for row in rows {
+                        out.push(row??);
+                    }
+                }
+                None => {
+                    let sql = format!(
+                        "SELECT {cols} FROM agent_messages \
+                         WHERE {predicate} AND state = 'pending' \
+                         ORDER BY created_at ASC, id ASC LIMIT {limit}",
+                        cols = crate::ops::MESSAGE_COLUMNS,
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt.query_map(
+                        params![workspace_id.as_bytes(), project_id.as_bytes()],
+                        crate::ops::row_to_agent_message,
+                    )?;
+                    for row in rows {
+                        out.push(row??);
+                    }
+                }
             }
             Ok(out)
         })
