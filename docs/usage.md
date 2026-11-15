@@ -152,6 +152,13 @@ version. After
 compaction, the agent can recover the summary via `memory_recent` even
 though its raw chat history was compacted away.
 
+A subagent compacts its own context, not the session's. Since Claude Code
+2.1.323, a subagent's `PreCompact` arrives under the parent's session id with
+the subagent's `agent_id`. It writes no checkpoint page and is stored as a
+`subagent pre-compact` event (kind `other`, like `SubagentStart` and
+`SubagentStop`), so the recap below never mistakes it for the session's own
+compaction.
+
 Generated session pages carry `session_id` and `agent` in frontmatter. The
 `agent` value is the originating harness stored on the session (for example,
 `claude-code` or `codex`), not the client or operator that later requested a
