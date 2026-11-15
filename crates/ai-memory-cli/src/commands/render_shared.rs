@@ -36,12 +36,18 @@ use crate::commands::path_util::strip_windows_verbatim_prefix;
 /// post-tool-use script: the server aliases the event and reads the outcome
 /// from the payload.
 ///
+/// `StopFailure` runs instead of `Stop` when an API error (a rate limit, an
+/// exhausted balance, an overloaded server) ends the turn (same page, since
+/// v2.1.78), so without it such a turn had no end in the record. It reuses
+/// the stop script the same way, and the server reads the error from the
+/// payload.
+///
 /// Adding a hook event means updating this list AND adding the matching `.sh`
 /// and `.ps1` files under `hooks/claude-code/` (a reused script like
 /// post-tool-use needs no new file). Agents with different vocabularies keep
 /// their own event arrays below. The install-hooks parity test fails if a
 /// bundle drifts.
-pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 10] = [
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 11] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -49,6 +55,7 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 10] = [
     ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("StopFailure", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
     // Subagent boundaries — let the server seed/forget a subagent session id so
     // `drop_subagent_captures` can drop the whole nested session (Claude Code +
