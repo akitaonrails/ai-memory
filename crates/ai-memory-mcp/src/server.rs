@@ -7108,15 +7108,25 @@ impl AiMemoryServer {
                 None => ai_memory_core::OwnerFilter::Unattributed,
             }
         };
-        // Blank means omitted, as for `handoff_id`: an empty path has no
-        // directory inside it, so it would hide every automatic handoff.
+        // A blank cwd means omitted: an empty path has no directory inside
+        // it, so it would hide every automatic handoff.
         let receiving_cwd = args.cwd.filter(|cwd| !cwd.trim().is_empty());
+        // A supplied id must name a handoff. Reading a blank one as omitted
+        // would claim the latest eligible baton instead, possibly the one a
+        // parallel harness is about to accept, and a claim cannot be undone.
+        // Message ids follow the same rule (#2244).
         let requested_id = args
             .handoff_id
             .as_deref()
             .map(str::trim)
-            .filter(|id| !id.is_empty())
             .map(|id| {
+                if id.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "invalid handoff_id: it is blank; omit it to claim the latest \
+                         eligible handoff",
+                        None,
+                    ));
+                }
                 HandoffId::from_str(id)
                     .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))
             })
