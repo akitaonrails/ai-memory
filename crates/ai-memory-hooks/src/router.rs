@@ -4984,7 +4984,7 @@ async fn process(
 /// `SessionStart` hooks not receiving `agent_id` and `agent_type` when a
 /// subagent compacts"). The session's own context was not compacted, so such
 /// an event must not checkpoint the session page the way its own compaction
-/// does.
+/// does, nor mark where that compaction cut the session for the recap.
 fn is_subagent_compaction(env: &HookEnvelope) -> bool {
     matches!(env.event, HookEvent::PreCompact | HookEvent::PostCompaction)
         && body_is_subagent(env.agent, &env.raw)
@@ -5256,6 +5256,10 @@ async fn process_authorized(
     // Keep the successful keyed-ingest gate until every downstream effect has
     // completed. A replay that observes `ResumePending` must not race the first
     // delivery's page, handoff, consolidation, or key-completion tail.
+    // A subagent's compaction is stored like its other lifecycle events, as
+    // `other` (see `HookEvent::to_observation_kind`), so the recap never takes
+    // it for a boundary of the session's own compaction.
+    let subagent_compaction = is_subagent_compaction(&env);
     let (admission, log_title, _ingest_guard) = loop {
         // Rebuild both records on retry: the store validates and persists this
         // exact scope pair atomically with the keyed observation claim.
@@ -5268,7 +5272,18 @@ async fn process_authorized(
             actor_user: owner_stamp.clone(),
             occurred_at: env.occurred_at_micros(),
         };
-        let kind = env.event.to_observation_kind();
+        let kind = if subagent_compaction {
+            ObservationKind::Other
+        } else {
+            env.event.to_observation_kind()
+        };
+        let title = if subagent_compaction {
+            format!("subagent {}", env.event.to_observation_kind().as_str())
+        } else {
+            env.title_hint
+                .clone()
+                .unwrap_or_else(|| kind.as_str().to_string())
+        };
         let raw_obs = NewObservation {
             session_id,
             workspace_id: ws,
@@ -5276,10 +5291,7 @@ async fn process_authorized(
             kind,
             extension: env.extension.clone(),
             source_event: env.source_event.clone(),
-            title: env
-                .title_hint
-                .clone()
-                .unwrap_or_else(|| kind.as_str().to_string()),
+            title,
             body: durable_body(env.event, env.body_excerpt.as_deref(), &state.sanitizer),
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
