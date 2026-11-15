@@ -451,6 +451,33 @@ mod tests {
         );
     }
 
+    /// Claude Code and Qwen Code put the rendered API error in
+    /// `last_assistant_message` on `StopFailure`, which parses as a Stop. The
+    /// client never takes it as the reply, and still strips it; an interrupted
+    /// turn is no candidate either. A normal Stop still captures (control).
+    #[test]
+    fn client_transform_never_captures_a_failed_or_interrupted_turn() {
+        for (agent, hook_event_name) in [
+            (AgentKind::ClaudeCode, "StopFailure"),
+            (AgentKind::Codex, "Interrupt"),
+        ] {
+            let mut raw = serde_json::json!({
+                "hook_event_name": hook_event_name,
+                "error": "rate_limit",
+                "last_assistant_message": "API Error: Rate limit reached",
+            });
+            let out = transform_for_client(&mut raw, agent, HookEvent::Stop);
+            assert!(!out.captured, "{hook_event_name}");
+            assert!(raw.get("last_assistant_message").is_none(), "{raw}");
+            assert!(raw.get(ASSISTANT_MARKER_KEY).is_none(), "{raw}");
+        }
+        let mut raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "last_assistant_message": "fixed the bug",
+        });
+        assert!(transform_for_client(&mut raw, AgentKind::ClaudeCode, HookEvent::Stop).captured);
+    }
+
     #[test]
     fn backstop_populates_body_when_all_gates_pass() {
         let mut raw = serde_json::json!({ "last_assistant_message": "done" });
