@@ -1347,12 +1347,31 @@ fn is_compaction_session_start(raw: &serde_json::Value) -> bool {
 /// Muse reports a `compact` source but publishes no output contract for it,
 /// and Cursor runs Claude Code's settings with unverified handling of the
 /// envelope, so neither gets an anchor.
+///
+/// A subagent's compaction gets none either: the anchor quotes the session's
+/// own prompts as the source of truth for the task, and in a subagent that is
+/// the parent's task, not the one it was given.
 fn injects_compaction_anchor(agent: AgentKind, raw: &serde_json::Value) -> bool {
     matches!(
         agent,
         AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Droid
     ) && is_compaction_session_start(raw)
         && ai_memory_hooks::agent_from_payload(raw) != Some(AgentKind::Cursor)
+        && !fired_in_a_subagent(raw)
+}
+
+/// Whether a hook fired inside a subagent (or an in-process teammate) rather
+/// than in the session's own agent, which share one `session_id`. Claude Code
+/// names it with `agent_id` (<https://code.claude.com/docs/en/hooks>, common
+/// input fields) and sends it on a subagent's `PreCompact` and post-compaction
+/// `SessionStart` since v2.1.323 (changelog: "Fixed `PreCompact`, `PostCompact`
+/// and post-compaction `SessionStart` hooks not receiving `agent_id` and
+/// `agent_type` when a subagent compacts"). `agent_type` alone marks nothing:
+/// it is also set on a main session started with `--agent`.
+fn fired_in_a_subagent(raw: &serde_json::Value) -> bool {
+    raw.get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
 }
 
 /// `GET /recap?mode=anchor`: the session's first and latest operator prompts,
@@ -11728,6 +11747,30 @@ mod tests {
         ));
     }
 
+    /// Claude Code 2.1.323 sends `agent_id` on a subagent's compaction, and
+    /// the session anchor is the parent's, so no agent injects it there. A
+    /// main session started with `--agent` carries `agent_type` alone and
+    /// keeps its anchor; a blank `agent_id` marks nothing.
+    #[test]
+    fn a_subagent_compaction_gets_no_anchor() {
+        let subagent = serde_json::json!({
+            "source": "compact",
+            "agent_id": "a7",
+            "agent_type": "Explore",
+        });
+        let main_with_agent = serde_json::json!({ "source": "compact", "agent_type": "reviewer" });
+        let blank_id = serde_json::json!({ "source": "compact", "agent_id": " " });
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Droid] {
+            assert!(!injects_compaction_anchor(agent, &subagent), "{agent:?}");
+            assert!(
+                injects_compaction_anchor(agent, &main_with_agent),
+                "{agent:?}"
+            );
+            assert!(injects_compaction_anchor(agent, &blank_id), "{agent:?}");
+        }
+        assert!(is_compaction_session_start(&subagent));
+    }
+
     /// A compaction `SessionStart` from an agent without a verified anchor
     /// contract (Muse, or Cursor running Claude Code's settings) is still
     /// mid-session: it must not claim a pending handoff, recovery snapshot or
@@ -11756,5 +11799,35 @@ mod tests {
             );
             assert!(recap_requests(&seen).is_empty(), "{name}: {seen:?}");
         }
+    }
+
+    /// A subagent's compaction `SessionStart` (Claude Code 2.1.323 adds the
+    /// subagent's `agent_id`) never fetches or prints the parent's anchor and
+    /// claims nothing, while the compaction itself still reaches the server.
+    #[tokio::test]
+    async fn subagent_compact_session_start_fetches_no_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, mut requests) = serve_requests("200 OK", ANCHOR_SAMPLE).await;
+        let mut payload = session_start_payload(tmp.path(), "compacted-session", "compact");
+        payload["agent_id"] = "a7".into();
+        payload["agent_type"] = "Explore".into();
+        let stdout = run_hook(
+            &tmp.path().join("data"),
+            claude_args("session-start", &base),
+            payload,
+        )
+        .await;
+        let stdout = String::from_utf8_lossy(&stdout);
+        assert!(!stdout.contains("post-compaction anchor"), "{stdout}");
+        let seen = all_requests(&mut requests).await;
+        assert!(recap_requests(&seen).is_empty(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|r| r.starts_with("GET /handoff")),
+            "a compaction must not claim a handoff: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|r| r.starts_with("POST /hook")),
+            "the compaction itself is still captured: {seen:?}"
+        );
     }
 }

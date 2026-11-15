@@ -4977,6 +4977,19 @@ async fn process(
     }
 }
 
+/// Whether a compaction event is a subagent's own rather than the session's.
+/// Claude Code reports a subagent's `PreCompact` under the parent's
+/// `session_id` and, since v2.1.323, with the subagent's `agent_id`
+/// (changelog: "Fixed `PreCompact`, `PostCompact` and post-compaction
+/// `SessionStart` hooks not receiving `agent_id` and `agent_type` when a
+/// subagent compacts"). The session's own context was not compacted, so such
+/// an event must not checkpoint the session page the way its own compaction
+/// does, nor mark where that compaction cut the session for the recap.
+fn is_subagent_compaction(env: &HookEnvelope) -> bool {
+    matches!(env.event, HookEvent::PreCompact | HookEvent::PostCompaction)
+        && body_is_subagent(env.agent, &env.raw)
+}
+
 /// Durable body for a hook observation: scrub the **full** excerpt first,
 /// then apply the per-event ceiling to the redacted text.
 ///
@@ -5243,6 +5256,10 @@ async fn process_authorized(
     // Keep the successful keyed-ingest gate until every downstream effect has
     // completed. A replay that observes `ResumePending` must not race the first
     // delivery's page, handoff, consolidation, or key-completion tail.
+    // A subagent's compaction is stored like its other lifecycle events, as
+    // `other` (see `HookEvent::to_observation_kind`), so the recap never takes
+    // it for a boundary of the session's own compaction.
+    let subagent_compaction = is_subagent_compaction(&env);
     let (admission, log_title, _ingest_guard) = loop {
         // Rebuild both records on retry: the store validates and persists this
         // exact scope pair atomically with the keyed observation claim.
@@ -5255,7 +5272,18 @@ async fn process_authorized(
             actor_user: owner_stamp.clone(),
             occurred_at: env.occurred_at_micros(),
         };
-        let kind = env.event.to_observation_kind();
+        let kind = if subagent_compaction {
+            ObservationKind::Other
+        } else {
+            env.event.to_observation_kind()
+        };
+        let title = if subagent_compaction {
+            format!("subagent {}", env.event.to_observation_kind().as_str())
+        } else {
+            env.title_hint
+                .clone()
+                .unwrap_or_else(|| kind.as_str().to_string())
+        };
         let raw_obs = NewObservation {
             session_id,
             workspace_id: ws,
@@ -5263,10 +5291,7 @@ async fn process_authorized(
             kind,
             extension: env.extension.clone(),
             source_event: env.source_event.clone(),
-            title: env
-                .title_hint
-                .clone()
-                .unwrap_or_else(|| kind.as_str().to_string()),
+            title,
             body: durable_body(env.event, env.body_excerpt.as_deref(), &state.sanitizer),
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
@@ -5510,7 +5535,11 @@ async fn process_authorized(
     // that captures the state after compaction. Does NOT end the session
     // and does NOT create a handoff. The eventual SessionEnd supersedes
     // this page.
+    //
+    // A subagent's compaction left the session's context alone, so it writes
+    // no checkpoint, as a subagent's Stop writes no turn checkpoint below.
     let checkpoint_label = match env.event {
+        _ if is_subagent_compaction(&env) => None,
         HookEvent::PreCompact => Some("pre-compact"),
         HookEvent::PostCompaction => Some("post-compaction"),
         _ => None,
@@ -17456,6 +17485,188 @@ pub(crate) mod tests {
                 .is_none(),
             "zero-LLM PreCompact must not insert a consolidation job"
         );
+    }
+
+    /// Claude Code 2.1.323 reports a subagent's `PreCompact` under the parent's
+    /// session id with the subagent's `agent_id`. The session's own context
+    /// was not compacted, so no checkpoint page is written; the session's own
+    /// `PreCompact` afterwards still writes it (control).
+    #[tokio::test]
+    async fn a_subagent_compaction_writes_no_session_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0a7";
+        let fire = |name: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "session_id": sid,
+                "prompt": "keep this working state"
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: name.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        process(
+            &state,
+            fire("user-prompt-submit", serde_json::json!({})),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire(
+                "pre-compact",
+                serde_json::json!({ "agent_id": "a7", "agent_type": "Explore" }),
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let path = format!("sessions/{session_id}.md");
+        let page = || async {
+            state
+                .reader
+                .page_body_by_ids(state.workspace_id, state.project_id, &path)
+                .await
+                .unwrap()
+        };
+        assert!(
+            page().await.is_none(),
+            "a subagent's PreCompact must not checkpoint the session page"
+        );
+
+        process(
+            &state,
+            fire("pre-compact", serde_json::json!({})),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            page().await.is_some(),
+            "the session's own PreCompact still writes the checkpoint"
+        );
+    }
+
+    /// A subagent's compaction between the session's own two compactions is
+    /// stored as a subagent event, so the recap still covers everything since
+    /// the session's previous compaction instead of starting at the subagent's.
+    #[tokio::test]
+    async fn a_subagent_compaction_is_no_recap_boundary() {
+        use axum::response::IntoResponse as _;
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0b8";
+        let fire = |name: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "session_id": sid });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: name.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        let subagent = serde_json::json!({ "agent_id": "a7", "agent_type": "Explore" });
+        for (event, extra) in [
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "BEFORE-WINDOW" }),
+            ),
+            ("pre-compact", serde_json::json!({})),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "WINDOW-PROMPT" }),
+            ),
+            ("pre-compact", subagent),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "STILL-IN-WINDOW" }),
+            ),
+            ("pre-compact", serde_json::json!({})),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "AFTER-WINDOW" }),
+            ),
+        ] {
+            process(&state, fire(event, extra), None, Vec::new())
+                .await
+                .unwrap();
+        }
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let rows = state
+            .reader
+            .session_observations_scoped(
+                state.workspace_id,
+                state.project_id,
+                session_id,
+                ai_memory_store::ObservationPage {
+                    limit: 50,
+                    offset: 0,
+                    order: ai_memory_store::ObservationOrder::Asc,
+                    kinds: None,
+                    query: None,
+                },
+            )
+            .await
+            .unwrap()
+            .records;
+        let compactions: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|r| r.title.contains("pre-compact"))
+            .map(|r| (r.kind.as_str(), r.title.as_str()))
+            .collect();
+        assert_eq!(
+            compactions,
+            [
+                ("pre-compact", "pre-compact"),
+                ("other", "subagent pre-compact"),
+                ("pre-compact", "pre-compact"),
+            ],
+            "{rows:?}"
+        );
+
+        let response = crate::recap::handle_recap(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(crate::recap::RecapQuery {
+                agent: Some("claude-code".into()),
+                session_id: Some(sid.into()),
+                budget: None,
+                mode: None,
+            }),
+            None,
+            None,
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        for inside in ["WINDOW-PROMPT", "STILL-IN-WINDOW"] {
+            assert!(body.contains(inside), "{inside}: {body}");
+        }
+        for outside in ["BEFORE-WINDOW", "AFTER-WINDOW"] {
+            assert!(!body.contains(outside), "{outside}: {body}");
+        }
     }
 
     /// A compaction checkpoint keeps the agent's page as SessionEnd does,
