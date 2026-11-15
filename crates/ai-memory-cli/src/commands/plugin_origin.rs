@@ -392,6 +392,58 @@ mod tests {
         ));
     }
 
+    /// Adversarial: settings an older install wrote, wiring only `Stop`, must
+    /// not drop the plugin's `StopFailure` copy, which also runs `stop`.
+    /// Controls: the plugin's `Stop` copy is dropped, and so is its
+    /// `StopFailure` copy once the settings wire that event too.
+    #[test]
+    fn a_plugin_stop_failure_copy_is_dropped_only_when_settings_deliver_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = temp.path().join("settings.json");
+        let cwd = Some("/work/repo");
+        let files = vec![(settings.clone(), HooksFileShape::HooksKey)];
+        let entry = |event: &str| {
+            format!(
+                r#""{event}":[{{"matcher":"","hooks":[{{"type":"command","command":"/usr/bin/ai-memory hook --event stop --agent claude-code --server-url http://127.0.0.1:49374"}}]}}]"#
+            )
+        };
+        std::fs::write(&settings, format!(r#"{{"hooks":{{{}}}}}"#, entry("Stop"))).unwrap();
+        assert!(
+            !drops_plugin_event(
+                PluginOrigin::ClaudeCode,
+                "stop",
+                Some("StopFailure"),
+                cwd,
+                &files
+            ),
+            "settings deliver only Stop: the plugin keeps the StopFailure copy"
+        );
+        assert!(drops_plugin_event(
+            PluginOrigin::ClaudeCode,
+            "stop",
+            Some("Stop"),
+            cwd,
+            &files
+        ));
+
+        std::fs::write(
+            &settings,
+            format!(
+                r#"{{"hooks":{{{},{}}}}}"#,
+                entry("Stop"),
+                entry("StopFailure")
+            ),
+        )
+        .unwrap();
+        assert!(drops_plugin_event(
+            PluginOrigin::ClaudeCode,
+            "stop",
+            Some("StopFailure"),
+            cwd,
+            &files
+        ));
+    }
+
     /// Adversarial: a settings hook narrowed by a matcher (one tool) must not
     /// suppress the plugin copy for every other tool. Controls: an empty,
     /// `*` or absent matcher catches everything and drops the plugin copy.
