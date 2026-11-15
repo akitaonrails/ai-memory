@@ -195,6 +195,14 @@ version in [`docs/changelog/`](docs/changelog/):
   Values the line keeps, and `--query-arg` values, also pass through the
   built-in sanitizer, so a password inside a URL or a provider key under an
   unrelated name is redacted too. (#2274)
+- `memory_handoff_accept` no longer claims the latest eligible handoff when
+  `handoff_id` is explicitly empty or whitespace-only, and `memory_write_page`
+  and `memory_delete_page` no longer drop a blank `expected_page_id` and write
+  or delete unconditionally. A blank id in either place is now refused with
+  invalid params and changes nothing, as message ids already are (#2244).
+  Leaving the argument out keeps the latest-handoff and unconditional
+  defaults, and a valid id with surrounding whitespace still selects its
+  row. (#2298)
 
 ### Security
 
