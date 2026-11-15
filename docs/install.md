@@ -1774,12 +1774,13 @@ install writes a stdio `ai-memory mcp-bridge --no-session-id` entry instead of
 putting the bearer in `headers`. Hooks are merged into the root `hooks`
 object, preserving other settings and handlers. Each entry runs the native
 `ai-memory hook --event … --agent qwen-code` command with an empty matcher;
-there is no script bundle. Ten events are wired: `SessionStart`,
+there is no script bundle. Eleven events are wired: `SessionStart`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` (Qwen
 fires it instead of `PostToolUse` when a tool throws), `PreCompact`, `Stop`,
-`SessionEnd`, `SubagentStart` and `SubagentStop`. Capture exclusions apply to
-Qwen's Gemini-like tools (`write_file`, `read_file`, `run_shell_command`,
-`grep_search`, `glob`). User-prompt capture uses only Qwen's
+`StopFailure` (fired instead of `Stop` when an API error or loop detection
+ends the turn), `SessionEnd`, `SubagentStart` and `SubagentStop`. Capture
+exclusions apply to Qwen's Gemini-like tools (`write_file`, `read_file`,
+`run_shell_command`, `grep_search`, `glob`). User-prompt capture uses only Qwen's
 provenance-bearing `submitted_prompt`; automated continuation or retry content
 that appears only in `prompt` is not stored or interpreted as a reload request.
 
