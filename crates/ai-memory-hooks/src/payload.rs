@@ -2107,6 +2107,98 @@ mod tests {
         }
     }
 
+    /// Each harness's own shape for a failed or interrupted turn, as its docs
+    /// and source give it, turns into a titled stop row; the rendered error
+    /// text in `last_assistant_message` never reaches the body. A normal `Stop`
+    /// is unchanged (control).
+    #[test]
+    fn abnormal_turn_ends_are_titled_and_described() {
+        let stop = |agent: &str, body: serde_json::Value| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        let cases = [
+            (
+                "claude-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error": "rate_limit",
+                    "error_details": "429 Too Many Requests",
+                    "last_assistant_message": "API Error: Rate limit reached",
+                }),
+                Some("stop failure: rate_limit"),
+                Some("error: rate_limit\ndetails: 429 Too Many Requests"),
+            ),
+            (
+                "qwen-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error": "loop_detected",
+                    "error_details": "tool_call_loop",
+                }),
+                Some("stop failure: loop_detected"),
+                Some("error: loop_detected\ndetails: tool_call_loop"),
+            ),
+            (
+                "kimi-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error_type": "ChatProviderError",
+                    "error_message": "rate limited",
+                }),
+                Some("stop failure: ChatProviderError"),
+                Some("error: ChatProviderError\ndetails: rate limited"),
+            ),
+            (
+                "kimi-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "Interrupt",
+                    "turn_id": "t1",
+                    "reason": "cancelled",
+                }),
+                Some("interrupt"),
+                Some("reason: cancelled"),
+            ),
+            (
+                "codex",
+                serde_json::json!({
+                    "session_id": "s",
+                    "turn_id": "t1",
+                    "hook_event_name": "Interrupt",
+                    "model": "gpt-5",
+                }),
+                Some("interrupt"),
+                None,
+            ),
+            (
+                "claude-code",
+                serde_json::json!({ "session_id": "s", "hook_event_name": "Stop" }),
+                None,
+                None,
+            ),
+        ];
+        for (agent, body, title, excerpt) in cases {
+            let env = stop(agent, body.clone());
+            assert_eq!(env.event, HookEvent::Stop, "{agent}: {body}");
+            assert_eq!(env.title_hint.as_deref(), title, "{agent}: {body}");
+            assert_eq!(env.body_excerpt.as_deref(), excerpt, "{agent}: {body}");
+            assert!(
+                !env.body_excerpt.unwrap_or_default().contains("API Error"),
+                "{agent}: the rendered error text stays out of the body"
+            );
+        }
+    }
+
     #[test]
     fn parses_known_events() {
         assert_eq!(HookEvent::parse("session-start"), HookEvent::SessionStart);
