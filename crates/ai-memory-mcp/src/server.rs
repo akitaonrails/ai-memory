@@ -20618,6 +20618,44 @@ mod tests {
         assert!(duplicate.message.contains("duplicate batch path"));
     }
 
+    /// A batch entry whose `expected_page_id` is blank is refused for that
+    /// reason, the way a single write is, and nothing is written.
+    #[tokio::test]
+    async fn memory_write_pages_batch_refuses_a_blank_expected_page_id() {
+        let (tmp, store, server, ws, project) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let refused = server
+            .memory_write_pages_batch(
+                Parameters(BatchWritePagesArgs {
+                    workspace: "default".into(),
+                    project: None,
+                    project_id: Some(project.to_string()),
+                    pages: vec![batch_entry("imported/a.md", "# A", false, Some(" "))],
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "{refused:?}"
+        );
+        assert!(
+            refused.message.contains("expected_page_id is blank"),
+            "{refused:?}"
+        );
+        assert!(
+            store
+                .reader
+                .existing_latest_paths(ws, project, vec!["imported/a.md".into()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused batch writes no page"
+        );
+    }
+
     #[tokio::test]
     async fn memory_write_page_metadata_roundtrip() {
         let tmp = TempDir::new().unwrap();
