@@ -17297,6 +17297,18 @@ process.exit(0);
                 entries[i].1
             );
         }
+        // StopFailure and Interrupt fire in place of Stop and run exactly its
+        // command, whatever the platform renders it as.
+        let command_of = |name: &str| {
+            entries
+                .iter()
+                .find(|(event, _)| event.as_str() == name)
+                .map(|(_, command)| command.clone())
+                .unwrap_or_else(|| panic!("{name} is wired"))
+        };
+        for abnormal in ["StopFailure", "Interrupt"] {
+            assert_eq!(command_of(abnormal), command_of("Stop"), "{abnormal}");
+        }
         // Only the allowed keys are written — Kimi Code rejects unknown
         // fields by failing the whole config load.
         let doc: toml_edit::DocumentMut =
