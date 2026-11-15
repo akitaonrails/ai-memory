@@ -5774,13 +5774,22 @@ async fn process_authorized(
         // The writer observed substantive work when it answered `Substantive`,
         // so the digest cannot still satisfy the lifecycle-only predicate.
         debug_assert!(substantive || digest.is_substantive());
-        let new_page = synthesize_session_page(
+        let mut new_page = synthesize_session_page(
             page_ws,
             page_proj,
             session_id,
             admitted.agent_kind(),
             &digest,
         );
+        // Zero-LLM session pages get the same title-collision backstop the LLM
+        // and `memory_write_page` paths already apply (#2300).
+        crate::synth::disambiguate_session_page_title(
+            &state.reader,
+            &session_actor,
+            session_id,
+            &mut new_page,
+        )
+        .await;
         let track_page_write = turn_checkpoint && outcome == HookProcessingOutcome::Resumed;
         let previous_page_id = if track_page_write {
             state
@@ -6506,8 +6515,12 @@ async fn write_checkpoint_page(
     if !digest.is_substantive() {
         return Ok(false);
     }
-    let new_page =
+    let mut new_page =
         synthesize_session_page(workspace_id, project_id, session_id, agent_kind, &digest);
+    // Same title-collision backstop as the SessionEnd write (#2300): the
+    // checkpoint page carries the session's rule-based title too.
+    crate::synth::disambiguate_session_page_title(&state.reader, &actor, session_id, &mut new_page)
+        .await;
     // With a provider this page is the first half of a consolidation, so it
     // carries the `consolidate` admission operation the inline LLM write
     // used to: a policy refusing consolidation for this actor or scope fails
@@ -17348,6 +17361,83 @@ pub(crate) mod tests {
         assert!(
             !body.contains("Compiled by the agent's own model"),
             "{body}"
+        );
+    }
+
+    /// Zero-LLM SessionEnd pages whose titles collide get the session short id
+    /// suffixed, the same backstop (#926) the LLM consolidation and
+    /// `memory_write_page` paths already apply, so a resume habit that opens
+    /// every session with one phrase ("where were we?") no longer gives every
+    /// page one title and trips ai-memory's own `duplicate_title` curator
+    /// finding (#2300). The first page keeps the bare title; the second,
+    /// written while the first is the project's latest, is disambiguated.
+    /// With the backstop removed both titles are identical and the second
+    /// assertion fails.
+    #[tokio::test]
+    async fn zero_llm_session_pages_disambiguate_a_colliding_title() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sids = [
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        ];
+        for sid in sids {
+            let fire = |event: &str, body: serde_json::Value| {
+                let mut full = serde_json::json!({ "session_id": sid });
+                full.as_object_mut()
+                    .unwrap()
+                    .extend(body.as_object().unwrap().clone());
+                HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                    full,
+                )
+            };
+            for env in [
+                fire("session-start", serde_json::json!({})),
+                fire(
+                    "user-prompt-submit",
+                    serde_json::json!({ "prompt": "where were we?" }),
+                ),
+                fire(
+                    "post-tool-use",
+                    serde_json::json!({
+                        "tool_name": "Read",
+                        "tool_input": { "file_path": "notes.md" },
+                        "tool_response": "dummy"
+                    }),
+                ),
+                fire("session-end", serde_json::json!({ "reason": "other" })),
+            ] {
+                process(&state, env, None, Vec::new()).await.unwrap();
+            }
+        }
+        let title_of = async |sid: &str| {
+            let path = format!("sessions/{sid}.md");
+            state
+                .reader
+                .page_body_by_ids(state.workspace_id, state.project_id, &path)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("session page {path} must exist"))
+                .title
+        };
+        let first = title_of(sids[0]).await;
+        let second = title_of(sids[1]).await;
+        assert_eq!(
+            first, "where were we?",
+            "the first page keeps the bare title"
+        );
+        assert_ne!(
+            second, first,
+            "the colliding second title must be disambiguated"
+        );
+        assert!(
+            second.starts_with("where were we?") && second.contains("(session "),
+            "unexpected disambiguated title: {second:?}"
         );
     }
 

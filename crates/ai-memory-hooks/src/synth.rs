@@ -18,10 +18,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ai_memory_core::{
-    AgentKind, FAILED_TOOL_OUTCOME_LINE, NewPage, Observation, ObservationKind, PagePath,
-    ProjectId, SessionId, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, Tier, WorkspaceId,
-    looks_like_machine_turn, looks_like_markup_block, looks_like_scaffolding, truncate_for_title,
-    truncate_utf8_bytes,
+    ActorContext, AgentKind, FAILED_TOOL_OUTCOME_LINE, NewPage, Observation, ObservationKind,
+    PagePath, ProjectId, SessionId, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, Tier,
+    WorkspaceId, looks_like_machine_turn, looks_like_markup_block, looks_like_scaffolding,
+    truncate_for_title, truncate_utf8_bytes,
 };
 use ai_memory_store::{
     ObservationOrder, ReaderPool, SessionKindSummary, SessionLine, SessionObservationSnapshot,
@@ -93,6 +93,48 @@ pub fn synthesize_session_page(
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+    }
+}
+
+/// Apply the shared session-title collision backstop (#926) to a synthesized
+/// page before the zero-LLM hook write path stores it (#2300).
+///
+/// The LLM consolidation paths and `memory_write_page` with a `session_id`
+/// already suffix the session short id when the title names another latest
+/// page, but the rule-based hook writers (`SessionEnd`, the compaction
+/// checkpoint, and the idle-end tick) wrote the first prompt verbatim. A
+/// resume habit that opens every session with the same phrase then gave every
+/// page one title, tripping ai-memory's own `duplicate_title` curator finding.
+///
+/// Reads the project's existing session-page titles under the session owner's
+/// own owner filter — the same visibility the MCP write path disambiguates
+/// against — and rewrites the page's title, its `title` frontmatter, and a
+/// matching leading H1 only on a collision. A failed title query skips the
+/// backstop (logged) rather than blocking the write, and a session never
+/// collides with its own earlier version (that path is excluded).
+pub async fn disambiguate_session_page_title(
+    reader: &ReaderPool,
+    actor: &ActorContext,
+    session_id: SessionId,
+    page: &mut NewPage,
+) {
+    let existing = ai_memory_consolidate::existing_session_page_titles(
+        reader,
+        page.workspace_id,
+        page.project_id,
+        actor,
+        session_id,
+    )
+    .await;
+    if let Some((new_title, new_body)) = ai_memory_consolidate::disambiguate_colliding_session_title(
+        &page.title,
+        &page.body,
+        &existing,
+        session_id,
+    ) {
+        page.frontmatter_json["title"] = serde_json::Value::String(new_title.clone());
+        page.title = new_title;
+        page.body = new_body;
     }
 }
 

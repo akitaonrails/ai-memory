@@ -66,6 +66,14 @@ version in [`docs/changelog/`](docs/changelog/):
   subagent's compaction. A compaction that names an `agent_id` now gets no
   anchor and no checkpoint and is stored as a `subagent pre-compact` event;
   the session's own compaction is unchanged. (#2301)
+- Zero-LLM session pages now get the duplicate-title collision backstop the
+  LLM consolidation and `memory_write_page` paths already apply (#926): when a
+  rule-based `sessions/<id>.md` write (SessionEnd, the compaction checkpoint,
+  or the idle-end tick) takes a title that already names another of the
+  project's latest pages, it suffixes the session short id. A resume habit that
+  opens every session with the same phrase ("where were we?") no longer gives
+  every page one title and trips ai-memory's own `duplicate_title` curator
+  finding. (#2300)
 - Devin POSIX shell (`hooks/_lib.sh`, `hooks/devin/*.sh`) and PowerShell
   (`hooks/lib/ai-memory-hook.ps1`) hooks now match native `ai-memory hook`
   behavior (#2237) for `AI_MEMORY_SESSION_ID`: whitespace-only values are
