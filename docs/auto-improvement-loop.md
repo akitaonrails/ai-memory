@@ -33,6 +33,20 @@ operation (create or patch), a confidence like `0.86`, the rationale,
 bounded evidence quotes from the session, and the exact body or edits.
 That is enough to approve or reject without opening anything else.
 
+Session reviews enforce `[auto_improve] max_input_tokens`, using an
+approximate UTF-8 bytes/4 estimate. The budget includes the rendered user
+prompt, system prompt, response schema and an envelope reserve. Recent-page
+context and observation evidence share that budget; oversized context is
+truncated before review. This remains an estimate, not an exact tokenizer or
+a guarantee of a provider's context limit.
+
+If the complete request still cannot fit, the reviewer makes no LLM call and
+returns `provider = "none"`, with rejection reason `input_budget_too_small`.
+Like an observation/duration preflight skip, a scheduled run records this in
+the audit trail and advances past the session instead of retrying the same
+infeasible configuration. After raising the input budget, rerun with an
+explicit session ID to review that session again.
+
 The rest of this page is the original design research plus
 implementation notes, kept for depth.
 

@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Bounded complete per-session auto-improvement requests, including the system
+  prompt, response schema and envelope reserve. Oversized recent-page context
+  no longer crowds out
+  observation evidence or bypasses the configured budget. An input budget
+  too small for the complete request now records an `input_budget_too_small`
+  skip without calling the provider; an explicit session ID can rerun the
+  review after adjusting the budget. (#2309)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed

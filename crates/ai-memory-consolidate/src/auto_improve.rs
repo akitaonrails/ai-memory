@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use ai_memory_core::{PagePath, ProjectId, Sanitizer, SessionId, WorkspaceId};
@@ -157,7 +158,7 @@ pub struct AutoImproveReviewConfig {
     pub min_session_duration_secs: u64,
     /// Minimum model confidence accepted by validation.
     pub min_confidence: f32,
-    /// Approximate input token budget, using chars/4.
+    /// Approximate total input budget, using bytes/4.
     pub max_input_tokens: usize,
     /// Maximum validated proposals returned from one run.
     pub max_proposals_per_run: usize,
@@ -500,11 +501,12 @@ pub struct AutoImproveReport {
     pub observations_considered: usize,
     /// Approximate session span, first observation to last observation.
     pub session_duration_secs: u64,
-    /// Approximate prompt tokens sent to the LLM, chars/4.
+    /// Approximate input tokens, bytes/4. Session reviews include their system
+    /// prompt, schema and envelope reserve, including when the budget skips the call.
     pub estimated_input_tokens: usize,
-    /// LLM provider name, or `none` when the preflight filter skipped the call.
+    /// LLM provider name, or `none` when preflight or the input budget skipped the call.
     pub provider: String,
-    /// LLM model, or `none` when the preflight filter skipped the call.
+    /// LLM model, or `none` when preflight or the input budget skipped the call.
     pub model: String,
     /// Configured confidence floor used by validation.
     pub min_confidence: f32,
@@ -705,7 +707,7 @@ pub async fn run_auto_improve_review(
             duration,
             projected,
         } => {
-            let prompt_input = build_prompt_input(
+            let mut prompt_input = build_prompt_input(
                 session_id,
                 &projected,
                 projected.total_count,
@@ -720,7 +722,39 @@ pub async fn run_auto_improve_review(
                 .collect();
             let existing_index =
                 ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
-            let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
+            let estimated_input_tokens = reviewer_estimated_input_tokens(&prompt_input.prompt);
+            let input_budget = cfg.max_input_tokens;
+            if estimated_input_tokens > input_budget {
+                prompt_input
+                    .rejected_candidates
+                    .push(AutoImproveRejectedCandidate {
+                        reason: "input_budget_too_small".into(),
+                        evidence: format!(
+                            "estimated request input {estimated_input_tokens} tokens exceeds the \
+                             configured {input_budget}-token input budget",
+                        ),
+                        target_path: None,
+                        kind: None,
+                        operation: None,
+                        edit_mode: None,
+                    });
+                return Ok(AutoImproveReport {
+                    session_id: session_id.to_string(),
+                    observations_considered: total,
+                    session_duration_secs: duration,
+                    estimated_input_tokens,
+                    provider: "none".into(),
+                    model: "none".into(),
+                    min_confidence: cfg.min_confidence,
+                    proposal_actor: cfg.proposal_actor,
+                    pending_path: cfg.pending_path,
+                    summary: "session skipped by input budget".into(),
+                    proposals: Vec::new(),
+                    rejected_candidates: prompt_input.rejected_candidates,
+                    warnings: prompt_input.warnings,
+                    eval_results: Vec::new(),
+                });
+            }
             let request = ChatRequest {
                 system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
                 messages: vec![ChatMessage {
@@ -1522,6 +1556,19 @@ pub(crate) fn auto_improve_prompt_sections(
     let usable_chars = usable_tokens.saturating_mul(CHARS_PER_TOKEN);
 
     let recent = render_recent_pages(recent_pages);
+    // Schema and system text consume input even when the provider receives
+    // them separately from the user message. Keep nominal/margin arithmetic
+    // independent of this complete-request accounting.
+    let usable_chars = usable_chars.saturating_sub(reviewer_fixed_input_bytes());
+    let rendered_recent_bytes = recent.len();
+    let recent = truncate_to_budget(
+        &recent,
+        usable_chars / 8,
+        " [recent context truncated by input budget]",
+    );
+    if recent.len() < rendered_recent_bytes {
+        warnings.push("recent page context truncated by input budget".into());
+    }
     let patchable_budget = usable_chars / 4;
     let patchable = render_patchable_pages(
         patchable_pages,
@@ -2445,6 +2492,24 @@ fn session_duration_from_span(first: Option<i64>, last: Option<i64>) -> u64 {
 
 pub(crate) fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(CHARS_PER_TOKEN)
+}
+
+fn reviewer_fixed_input_bytes() -> usize {
+    static FIXED_BYTES: LazyLock<usize> = LazyLock::new(|| {
+        AUTO_IMPROVE_SYSTEM_PROMPT.len()
+            + schemars::schema_for!(AutoImproveLlmResponse)
+                .as_value()
+                .to_string()
+                .len()
+            + crate::consolidator::PROMPT_ENVELOPE_RESERVE_CHARS
+    });
+    *FIXED_BYTES
+}
+
+fn reviewer_estimated_input_tokens(prompt: &str) -> usize {
+    reviewer_fixed_input_bytes()
+        .saturating_add(prompt.len())
+        .div_ceil(CHARS_PER_TOKEN)
 }
 
 const AUTO_IMPROVE_SYSTEM_PROMPT: &str = r#"You are ai-memory's review-gated auto-improvement reviewer.
@@ -3984,7 +4049,7 @@ mod tests {
             &patchable,
             &[],
             &AutoImproveReviewConfig {
-                max_input_tokens: 2_500,
+                max_input_tokens: 6_000,
                 max_patchable_body_chars: 512,
                 ..cfg()
             },
@@ -4086,7 +4151,7 @@ mod tests {
             })
             .collect();
         let cfg = AutoImproveReviewConfig {
-            max_input_tokens: 2_500,
+            max_input_tokens: 6_000,
             ..cfg()
         };
 
@@ -4111,6 +4176,7 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\n\nConsolidated session page").next())
             .expect("prompt includes rejection section");
+        let usable_chars = usable_chars.saturating_sub(reviewer_fixed_input_bytes());
         assert!(rejection_section.len() <= rejection_context_char_budget(usable_chars));
         assert!(rejection_section.contains("[truncated]"));
         assert!(rejection_section.contains("[rejection context truncated]"));

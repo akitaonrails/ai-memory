@@ -17,7 +17,7 @@ use crate::auto_improve::auto_improve_oracle::{
 };
 use crate::auto_improve::{
     MAX_OBSERVATION_BODY_CHARS, PatchablePageContext, PromptSections, REVIEW_INTERPOSE,
-    auto_improve_prompt_sections, estimate_tokens, load_patchable_pages, load_rejection_context,
+    auto_improve_prompt_sections, load_patchable_pages, load_rejection_context,
 };
 use crate::consolidator::PromptBudgets;
 use crate::consolidator::consolidator_oracle::{oracle_batch_request, oracle_single_request};
@@ -66,6 +66,21 @@ fn first_diff(a: &str, b: &str) -> String {
 /// structured payload for whichever shape the caller asked for.
 struct CapturingLlm {
     requests: Arc<Mutex<Vec<ChatRequest>>>,
+}
+
+fn reviewer_request_estimate(request: &ChatRequest) -> usize {
+    let schema = schemars::schema_for!(crate::AutoImproveLlmResponse)
+        .as_value()
+        .to_string();
+    (request.system.as_ref().map_or(0, String::len)
+        + request
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>()
+        + schema.len()
+        + crate::consolidator::PROMPT_ENVELOPE_RESERVE_CHARS)
+        .div_ceil(4)
 }
 
 #[async_trait::async_trait]
@@ -536,10 +551,11 @@ async fn batch_prompt_is_byte_identical_to_the_old_full_load_path() {
     }
 }
 
-/// The auto-improve review prompt and report are byte-identical to the old
+/// With a non-binding input budget, the auto-improve prompt is byte-identical to the old
 /// full-load path: above the sample limit (streaming), at the limit with a
 /// session page (48, fetch-all) and at the limit without one (72, fetch-all),
-/// and the preflight rejection report agrees on a tiny session.
+/// and the preflight rejection report agrees on a tiny session. The request
+/// estimate now also counts the system prompt, schema and envelope reserve.
 #[tokio::test]
 async fn auto_improve_prompt_and_report_match_the_old_full_load_path() {
     for (count, session_page) in [(300usize, true), (48, true), (72, false)] {
@@ -547,7 +563,7 @@ async fn auto_improve_prompt_and_report_match_the_old_full_load_path() {
         let (store, _wiki, ws, proj, sid) =
             seeded_fixture(tmp.path(), count, false, session_page).await;
         let cfg = AutoImproveReviewConfig {
-            max_input_tokens: 12_000,
+            max_input_tokens: 24_000,
             ..AutoImproveReviewConfig::default()
         };
 
@@ -607,7 +623,8 @@ async fn auto_improve_prompt_and_report_match_the_old_full_load_path() {
             first_diff(&captured[0].messages[0].content, &old_prompt.prompt)
         );
 
-        // Report fields the old path computed from the full load.
+        // Population and duration still come from the full load; the estimate
+        // includes the full request rather than only its user message.
         assert_eq!(report.session_id, sid.to_string());
         assert_eq!(
             report.observations_considered,
@@ -617,7 +634,7 @@ async fn auto_improve_prompt_and_report_match_the_old_full_load_path() {
         assert_eq!(report.session_duration_secs, duration);
         assert_eq!(
             report.estimated_input_tokens,
-            estimate_tokens(&old_prompt.prompt)
+            reviewer_request_estimate(&captured[0])
         );
         assert_eq!(report.provider, "capturing");
         assert_eq!(report.model, "capturing");
@@ -688,6 +705,145 @@ async fn auto_improve_prompt_and_report_match_the_old_full_load_path() {
     assert_eq!(
         report2.rejected_candidates[0].evidence,
         old_rejection.evidence
+    );
+}
+
+#[tokio::test]
+async fn reviewer_request_counts_the_complete_input_budget() {
+    let tmp = TempDir::new().unwrap();
+    let (store, _wiki, ws, proj, sid) = seeded_fixture(tmp.path(), 300, true, true).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let llm = CapturingLlm {
+        requests: requests.clone(),
+    };
+    let report = run_auto_improve_review(
+        &store.reader,
+        &llm,
+        ws,
+        proj,
+        sid,
+        AutoImproveReviewConfig {
+            max_input_tokens: 8_000,
+            ..AutoImproveReviewConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let estimated = reviewer_request_estimate(&captured[0]);
+    assert!(
+        estimated <= 8_000,
+        "reviewer sent {} estimated input tokens at an 8,000-token limit (report: {})",
+        estimated,
+        report.estimated_input_tokens,
+    );
+    assert_eq!(report.estimated_input_tokens, estimated);
+}
+
+#[tokio::test]
+async fn reviewer_bounds_oversized_recent_page_titles() {
+    let tmp = TempDir::new().unwrap();
+    let (store, wiki, ws, proj, sid) = seeded_fixture(tmp.path(), 20, false, true).await;
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new("concepts/oversized-title.md").unwrap(),
+        frontmatter: json!({"title": "Decisão 🦀 ".repeat(8_000)}),
+        body: "# Concept\n\nPreserve the transaction boundary.".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: None,
+        admission_ctx: None,
+        author_id: None,
+        actor: ActorContext::anonymous(),
+        evidence: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let llm = CapturingLlm {
+        requests: requests.clone(),
+    };
+    let report = run_auto_improve_review(
+        &store.reader,
+        &llm,
+        ws,
+        proj,
+        sid,
+        AutoImproveReviewConfig {
+            max_input_tokens: 8_000,
+            ..AutoImproveReviewConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1, "a large title must leave evidence room");
+    let estimated = reviewer_request_estimate(&captured[0]);
+    assert!(
+        estimated <= 8_000,
+        "oversized recent context sent {} estimated input tokens at an 8,000-token limit",
+        estimated,
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("recent"))
+    );
+    assert!(
+        captured[0].messages[0]
+            .content
+            .contains("Please fix the regression")
+    );
+}
+
+#[tokio::test]
+async fn reviewer_final_guard_counts_rendered_configuration_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let (store, _wiki, ws, proj, sid) = seeded_fixture(tmp.path(), 20, false, true).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let llm = CapturingLlm {
+        requests: requests.clone(),
+    };
+    let control = run_auto_improve_review(
+        &store.reader,
+        &llm,
+        ws,
+        proj,
+        sid,
+        AutoImproveReviewConfig {
+            max_input_tokens: 8_000,
+            ..AutoImproveReviewConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(control.provider, "capturing");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    requests.lock().unwrap().clear();
+    let report = run_auto_improve_review(
+        &store.reader,
+        &llm,
+        ws,
+        proj,
+        sid,
+        AutoImproveReviewConfig {
+            max_input_tokens: 8_000,
+            pending_path: format!("_pending/{}", "metadata".repeat(8_000)),
+            ..AutoImproveReviewConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(report.provider, "none");
+    assert!(
+        report
+            .rejected_candidates
+            .iter()
+            .any(|candidate| { candidate.reason == "input_budget_too_small" })
     );
 }
 
@@ -1016,14 +1172,11 @@ async fn auto_improve_review_of_a_rowless_session_with_preflight_off() {
     );
 }
 
-/// The zero-observation-budget early return must reach the streaming path:
-/// above the sample cap with a token budget that leaves the observation
-/// dump no budget at all, the prompt must carry the old no-budget marker
-/// byte-for-byte like the old full-load path, not an empty dump. (The
-/// budget override reaches the production caller through the MCP server's
-/// `max_input_tokens` override.)
+/// The old builder sent a prompt with no evidence when the request budget
+/// could not even fit its system prompt and schema. The new budget guard
+/// intentionally skips that call and reports the reason for the audit trail.
 #[tokio::test]
-async fn zero_budget_streaming_path_keeps_the_old_no_budget_marker() {
+async fn too_small_budget_skips_the_old_empty_projection_request() {
     let tmp = TempDir::new().unwrap();
     let (store, _wiki, ws, proj, sid) = seeded_fixture(tmp.path(), 300, false, true).await;
     let cfg = AutoImproveReviewConfig {
@@ -1066,8 +1219,8 @@ async fn zero_budget_streaming_path_keeps_the_old_no_budget_marker() {
         "the fixture must hit the zero-budget marker on the old path"
     );
 
-    // New path: 300 rows stream past the sample cap with the same zero
-    // budget and must render the same marker.
+    // The frozen oracle stays unchanged: this is an intentional policy change,
+    // not a projection drift to paper over by changing the historical builder.
     let requests = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn LlmProvider> = Arc::new(CapturingLlm {
         requests: requests.clone(),
@@ -1077,18 +1230,17 @@ async fn zero_budget_streaming_path_keeps_the_old_no_budget_marker() {
         .unwrap();
 
     let captured = requests.lock().unwrap();
-    assert_eq!(captured.len(), 1, "one LLM call for the review");
-    assert_eq!(
-        captured[0].messages[0].content,
-        old_prompt.prompt,
-        "zero-budget prompt drift: {}",
-        first_diff(&captured[0].messages[0].content, &old_prompt.prompt)
-    );
     assert!(
-        captured[0].messages[0]
-            .content
-            .contains("no projection budget"),
-        "the streaming path must keep the old no-budget marker"
+        captured.is_empty(),
+        "an infeasible budget must not call the provider"
+    );
+    assert_eq!(report.provider, "none");
+    assert_eq!(report.summary, "session skipped by input budget");
+    assert!(
+        report
+            .rejected_candidates
+            .iter()
+            .any(|candidate| candidate.reason == "input_budget_too_small")
     );
     assert_eq!(report.observations_considered, 300);
 }
@@ -2054,7 +2206,8 @@ mod slow {
             // (c) The auto-improve oracle: same guarantee for the review
             // prompt and its report fields.
             let cfg = AutoImproveReviewConfig {
-                max_input_tokens: 12_000,
+                // This test checks selection equivalence, not byte-budget policy.
+                max_input_tokens: 24_000,
                 ..AutoImproveReviewConfig::default()
             };
             let duration = oracle_session_duration_secs(&observations);
