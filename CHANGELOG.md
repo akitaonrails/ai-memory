@@ -57,6 +57,15 @@ version in [`docs/changelog/`](docs/changelog/):
   read before that check and keeps the agent's page when it lands in between;
   a rule-based summary or checkpoint landing in between is still replaced, as
   before. (#2275)
+- A Claude Code subagent's compaction is no longer treated as the session's.
+  Since Claude Code 2.1.323 a subagent's `PreCompact` and post-compaction
+  `SessionStart` carry its `agent_id` under the parent's session id, and
+  ai-memory injected the session's post-compaction anchor into the subagent
+  (the parent's prompts as the source of truth for its task), rewrote
+  `sessions/<id>.md` as a checkpoint, and let the recap start at the
+  subagent's compaction. A compaction that names an `agent_id` now gets no
+  anchor and no checkpoint and is stored as a `subagent pre-compact` event;
+  the session's own compaction is unchanged. (#2301)
 - Devin POSIX shell (`hooks/_lib.sh`, `hooks/devin/*.sh`) and PowerShell
   (`hooks/lib/ai-memory-hook.ps1`) hooks now match native `ai-memory hook`
   behavior (#2237) for `AI_MEMORY_SESSION_ID`: whitespace-only values are
