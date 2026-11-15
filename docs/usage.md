@@ -200,7 +200,11 @@ for a tight context. The anchor covers the whole session, so it still works
 after the fifth compaction. It is read-only: a compaction claims no handoff
 and does not re-send the session-start packet, digest or brief. When the
 server is slow or unreachable the hook prints nothing and the harness carries
-on without it.
+on without it. A subagent's compaction gets no anchor: its post-compaction
+`SessionStart` carries the subagent's `agent_id` (Claude Code 2.1.323 and
+later), and the session's prompts are the parent's task, not the one the
+subagent was given. `agent_type` alone does not count, because Claude Code
+also sets it on a main session started with `--agent`.
 
 The anchor comes from the native `ai-memory hook` only. Any `SessionStart`
 with source `compact`, from any harness, claims nothing: the native hook and
