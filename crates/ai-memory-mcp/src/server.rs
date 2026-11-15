@@ -28635,6 +28635,36 @@ mod tests {
             }
         }
 
+        /// A blank `expected_page_id` is refused, never read as omitted: the
+        /// write it guarded would land on whatever version is latest. The newer
+        /// version stays, and omitting the field still writes unconditionally.
+        #[tokio::test]
+        async fn a_blank_expected_page_id_never_overwrites_the_newer_version() {
+            let (_tmp, server) = server(true).await;
+            let first = put(&server, write("notes/a.md", "# A\n\none", "scratch"))
+                .await
+                .unwrap();
+            let mut next = write("notes/a.md", "# A\n\ntwo", "scratch");
+            next.expected_page_id = Some(first);
+            let second = put(&server, next).await.unwrap();
+
+            for blank in ["", " \t\n "] {
+                let mut stale = write("notes/a.md", "# A\n\nblank", "scratch");
+                stale.expected_page_id = Some(blank.into());
+                let err = put(&server, stale).await.unwrap_err();
+                assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+                assert!(err.message.contains("expected_page_id is blank"), "{err:?}");
+                let page = read(&server, "notes/a.md").await;
+                assert_eq!(page["page_id"], second.as_str(), "blank {blank:?}");
+                assert!(page["body"].as_str().unwrap().contains("two"), "{page}");
+            }
+
+            let third = put(&server, write("notes/a.md", "# A\n\nthree", "scratch"))
+                .await
+                .unwrap();
+            assert_eq!(read(&server, "notes/a.md").await["page_id"], third.as_str());
+        }
+
         /// A version id from another project never matches: the precondition
         /// is checked against the resolved scope's own latest row.
         #[tokio::test]
