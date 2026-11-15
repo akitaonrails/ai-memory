@@ -651,7 +651,7 @@ fn build_plan(
     Ok(plan)
 }
 
-fn skill_roots(
+pub(super) fn skill_roots(
     cwd: &Path,
     home: Option<&Path>,
     appdata: Option<&Path>,
