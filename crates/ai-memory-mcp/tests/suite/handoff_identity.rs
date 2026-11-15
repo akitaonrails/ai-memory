@@ -111,6 +111,28 @@ async fn harness(root_username: Option<&str>, proxy: bool) -> Harness {
 }
 
 async fn call(router: &Router, name: &str, arguments: Value, headers: &[(&str, &str)]) -> Value {
+    let v = call_raw(router, name, arguments, headers).await;
+    if let Some(err) = v.get("error") {
+        panic!("JSON-RPC error: {err}\nfull: {v}");
+    }
+    let joined = v
+        .pointer("/result/content")
+        .and_then(|c| c.as_array())
+        .unwrap_or_else(|| panic!("missing result.content: {v}"))
+        .iter()
+        .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(&joined).unwrap_or_else(|e| panic!("tool text not JSON: {joined}: {e}"))
+}
+
+/// The whole JSON-RPC response to one tool call, an `error` member included.
+async fn call_raw(
+    router: &Router,
+    name: &str,
+    arguments: Value,
+    headers: &[(&str, &str)],
+) -> Value {
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -135,19 +157,7 @@ async fn call(router: &Router, name: &str, arguments: Value, headers: &[(&str, &
         .await
         .expect("body");
     let text = String::from_utf8(bytes.to_vec()).expect("utf8");
-    let v: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("non-JSON: {text}: {e}"));
-    if let Some(err) = v.get("error") {
-        panic!("JSON-RPC error: {err}\nfull: {text}");
-    }
-    let joined = v
-        .pointer("/result/content")
-        .and_then(|c| c.as_array())
-        .unwrap_or_else(|| panic!("missing result.content: {text}"))
-        .iter()
-        .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    serde_json::from_str(&joined).unwrap_or_else(|e| panic!("tool text not JSON: {joined}: {e}"))
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("non-JSON: {text}: {e}"))
 }
 
 fn root_headers() -> Vec<(&'static str, &'static str)> {
