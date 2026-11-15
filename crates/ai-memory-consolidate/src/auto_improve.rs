@@ -34,6 +34,26 @@ use crate::projection::{
 const CHARS_PER_TOKEN: usize = 4;
 const PROMPT_RESERVE_TOKENS: usize = 1_000;
 const MAX_PROPOSAL_BODY_CHARS: usize = 32_000;
+
+/// Percent of the nominal char budget an auto-improve prompt actually fills.
+///
+/// [`CHARS_PER_TOKEN`] undercounts denser text: non-English prose and source
+/// code tokenize well above a bytes ÷ 4 estimate, so a nominal budget the
+/// estimate calls a fit can overflow the provider's `max_input_tokens`.
+/// Filling 80% buys that headroom back — the same margin consolidation (#884)
+/// and bootstrap (#937) already apply; the auto-improve path had none.
+const ESTIMATE_BUDGET_PERCENT: usize = 80;
+
+/// Usable input-char budget for an auto-improve prompt: the configured token
+/// limit less the prompt reserve, at [`CHARS_PER_TOKEN`], shrunk by
+/// [`ESTIMATE_BUDGET_PERCENT`] so the ÷4 undercount leaves headroom.
+fn usable_input_chars(max_input_tokens: usize) -> usize {
+    max_input_tokens
+        .saturating_sub(PROMPT_RESERVE_TOKENS)
+        .saturating_mul(CHARS_PER_TOKEN)
+        .saturating_mul(ESTIMATE_BUDGET_PERCENT)
+        / 100
+}
 /// Default number of existing pages included as patchable context.
 pub const DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES: usize = 8;
 
@@ -1518,8 +1538,7 @@ pub(crate) fn auto_improve_prompt_sections(
     cfg: &AutoImproveReviewConfig,
 ) -> PromptSections {
     let mut warnings = Vec::new();
-    let usable_tokens = cfg.max_input_tokens.saturating_sub(PROMPT_RESERVE_TOKENS);
-    let usable_chars = usable_tokens.saturating_mul(CHARS_PER_TOKEN);
+    let usable_chars = usable_input_chars(cfg.max_input_tokens);
 
     let recent = render_recent_pages(recent_pages);
     let patchable_budget = usable_chars / 4;
@@ -2484,6 +2503,25 @@ mod tests {
     /// Body a fake provider returns in the redaction tests; the summary must
     /// never contain it.
     const AUTO_IMPROVE_REDACTION_SENTINEL: &str = "SENTINEL_PRIVATE_BODY";
+
+    #[test]
+    fn usable_input_chars_leaves_headroom_for_the_token_undercount() {
+        // 24_000 tokens − 1_000 reserve = 23_000; × 4 chars = 92_000 nominal;
+        // × 80% margin = 73_600 — the headroom #884/#937 add so a bundle the
+        // ÷4 estimate calls a fit stays inside the provider window on denser
+        // (non-English, code) corpora.
+        assert_eq!(usable_input_chars(24_000), 73_600);
+        assert!(
+            usable_input_chars(24_000)
+                < 24_000usize
+                    .saturating_sub(PROMPT_RESERVE_TOKENS)
+                    .saturating_mul(CHARS_PER_TOKEN),
+            "the budget must shrink below the nominal ÷4 estimate"
+        );
+        // At or below the prompt reserve the budget floors at zero.
+        assert_eq!(usable_input_chars(PROMPT_RESERVE_TOKENS), 0);
+        assert_eq!(usable_input_chars(0), 0);
+    }
 
     /// The summary is the only failure text the `memory_auto_improve` MCP
     /// call returns, so it must expose class/status and drop the provider
@@ -4101,10 +4139,7 @@ mod tests {
             &cfg,
         );
 
-        let usable_chars = cfg
-            .max_input_tokens
-            .saturating_sub(PROMPT_RESERVE_TOKENS)
-            .saturating_mul(CHARS_PER_TOKEN);
+        let usable_chars = usable_input_chars(cfg.max_input_tokens);
         let rejection_section = prompt
             .prompt
             .split("Recent rejected auto-improvement attempts for this workspace/project. Avoid repeating these target/reason/fingerprint patterns unless the session provides clearly new evidence:\n")

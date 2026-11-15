@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The auto-improve review prompt now shrinks its input-char budget by the same
+  80% estimate margin that consolidation (#884) and bootstrap (#937) already
+  apply, so a bundle the `bytes ÷ 4` estimate calls a fit stays inside the
+  provider's `max_input_tokens` on denser (non-English prose, source code)
+  corpora, which tokenize well above `÷4`. The per-session reviewer sized its
+  budget with the flat estimate and no margin, the one path of the three that
+  still could overflow on input alone. (#2309)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
