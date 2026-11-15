@@ -116,6 +116,16 @@ version in [`docs/changelog/`](docs/changelog/):
   without a native session id. Explicitly pinned executions now keep their own
   capture identity instead of sharing the fallback session. A pinned Devin
   session end leaves the unrelated fallback slot intact. (#2237)
+- A turn that ends without a normal `Stop` now leaves a turn end. Claude Code
+  and Qwen Code fire `StopFailure` instead when an API error (a rate limit, an
+  exhausted balance) ends the turn, Kimi Code fires `StopFailure` or
+  `Interrupt`, and Codex fires `Interrupt` when the user interrupts it; none of
+  them was wired, and a posted one was stored as an empty `other` row. They now
+  run the stop hook and are stored as `stop failure: <error>` (with the error
+  and its details) or `interrupt`. The rendered error text Claude Code and Qwen
+  put in `last_assistant_message` is never captured as the assistant's reply.
+  Re-run `install-hooks` (or `ai-memory upgrade`) to add the new entries.
+  (#2303)
 - Fixed wikisync exports silently omitting pages beyond a legacy server's
   100-page `recent` limit. The fallback now fetches the full `pages` listing
   before planning any file changes. (#2252)
