@@ -16,6 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - `memory_patch_page` now separates an inserted section body from a heading
   at end of file even when the heading has no final newline. Previously,
   replacing such a section silently appended the body to the heading text.
+  (#2239)
 
 ## [3.4.7] - 2026-11-15
 
