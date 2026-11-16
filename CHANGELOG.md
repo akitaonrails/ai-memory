@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Pinned `restore-page` Git revisions before saving the pre-restore checkpoint.
+  Restoring `HEAD` or `HEAD~1` with a dirty wiki no longer reads a different
+  checkpoint after the safety backup advances HEAD. (#2317)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
