@@ -122,7 +122,7 @@ fn run_replacement_refresh(exe: &Path, data_dir: &Path, config_path: Option<&Pat
 /// so it cannot drop an argument (`--config`), and each word is quoted for
 /// the native shell; canonical Windows paths lose their `\\?\` prefix.
 fn refresh_failed(status: impl std::fmt::Display, command: &Command) -> anyhow::Error {
-    let rerun = std::iter::once(command.get_program())
+    let mut rerun = std::iter::once(command.get_program())
         .chain(command.get_args())
         .map(|word| {
             super::render_shared::native_shell_quote(
@@ -131,6 +131,11 @@ fn refresh_failed(status: impl std::fmt::Display, command: &Command) -> anyhow::
         })
         .collect::<Vec<_>>()
         .join(" ");
+    // PowerShell reads a leading quoted word as a string expression, so a
+    // quoted program only runs behind the call operator (#1462).
+    if cfg!(windows) && rerun.starts_with('\'') {
+        rerun.insert_str(0, "& ");
+    }
     anyhow::anyhow!(
         "the new binary was installed, but its hook refresh exited with {status}; \
          run `{rerun}`"
@@ -1484,10 +1489,13 @@ mod tests {
 
         let error = refresh_failed("exit code: 1", &command).to_string();
 
+        // PowerShell reads a leading quoted word as a string, not a command,
+        // so a quoted program needs the call operator there (#1462).
+        let call = if cfg!(windows) { "& " } else { "" };
         assert!(
-            error.ends_with(
-                r"run `'C:\Users\Ana Maria\bin\ai-memory.exe' --data-dir 'C:\Users\Ana Maria\ai-memory' --config 'C:\Users\Ana Maria\ai-memory\config.toml' upgrade-refresh-hooks`"
-            ),
+            error.ends_with(&format!(
+                r"run `{call}'C:\Users\Ana Maria\bin\ai-memory.exe' --data-dir 'C:\Users\Ana Maria\ai-memory' --config 'C:\Users\Ana Maria\ai-memory\config.toml' upgrade-refresh-hooks`"
+            )),
             "{error}"
         );
     }
