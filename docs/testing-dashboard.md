@@ -89,6 +89,7 @@ guessed coordinates.
 | Private/malformed response ids are refused; private model labels are scrubbed before the 64-character bound | Hooks `live_token_calls_scrub_private_labels_before_truncating` checks a private value crossing the limit, with a public-label control |
 | Light/dark selection persists; system mode follows OS changes; palettes differ | Browser `themes` |
 | Navigation remains visible with usable targets and no page overflow at 320, 390 and 768 px | Browser `responsive` |
+| Markdown section links, footnote references/backlinks and the skip link keep the current path and query under default, custom-prefix and root web mounts; cross-page and external links retain their destinations | Browser `fragment-navigation` |
 | Bundled guide HTML/Markdown/JSON, search, release selection, mount prefixes, traversal refusal | `tests/suite/documentation.rs`; browser `documentation` uses the real authenticated server |
 | Changing a release loads its notes without a button, keeps links/history/reload consistent and works with manual submission without JavaScript | Browser `documentation` |
 

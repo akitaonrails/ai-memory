@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed fragment-only links in wiki page bodies and footnotes navigating to
+  the web root instead of the current page. Navigation now preserves the
+  page path and query under default, custom-prefix, and root web mounts. (#2318)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
