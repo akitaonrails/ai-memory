@@ -14844,6 +14844,92 @@ impl ReaderPool {
             .await?;
         Ok(ctx.authorize(need))
     }
+
+    /// Load all persisted wiki file fingerprints for watcher reconcile seeding.
+    pub async fn load_wiki_file_fingerprints(&self) -> StoreResult<Vec<WikiFileFingerprintRow>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, \
+                        inode, ctime_secs, ctime_nanos \
+                 FROM wiki_file_fingerprints",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let ws_bytes: Vec<u8> = row.get(0)?;
+                let proj_bytes: Vec<u8> = row.get(1)?;
+                let path: String = row.get(2)?;
+                let file_len: i64 = row.get(3)?;
+                let mtime_secs: i64 = row.get(4)?;
+                let mtime_nanos: i64 = row.get(5)?;
+                let inode: i64 = row.get(6)?;
+                let ctime_secs: i64 = row.get(7)?;
+                let ctime_nanos: i64 = row.get(8)?;
+                Ok((
+                    ws_bytes,
+                    proj_bytes,
+                    path,
+                    file_len,
+                    mtime_secs,
+                    mtime_nanos,
+                    inode,
+                    ctime_secs,
+                    ctime_nanos,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                let (
+                    ws_bytes,
+                    proj_bytes,
+                    path,
+                    file_len,
+                    mtime_secs,
+                    mtime_nanos,
+                    inode,
+                    ctime_secs,
+                    ctime_nanos,
+                ) = r?;
+                let workspace_id = WorkspaceId::from_slice(&ws_bytes)?;
+                let project_id = ProjectId::from_slice(&proj_bytes)?;
+                let path = PagePath::new(path)?;
+                out.push(WikiFileFingerprintRow {
+                    workspace_id,
+                    project_id,
+                    path,
+                    file_len: u64::try_from(file_len).unwrap_or(0),
+                    mtime_secs,
+                    mtime_nanos: u32::try_from(mtime_nanos).unwrap_or(0),
+                    inode: u64::try_from(inode).unwrap_or(0),
+                    ctime_secs,
+                    ctime_nanos,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+}
+
+/// Persisted filesystem fingerprint for one wiki page file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikiFileFingerprintRow {
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Project-relative page path.
+    pub path: PagePath,
+    /// File length in bytes.
+    pub file_len: u64,
+    /// Modification time seconds relative to `UNIX_EPOCH`.
+    pub mtime_secs: i64,
+    /// Modification time subsecond nanoseconds.
+    pub mtime_nanos: u32,
+    /// Unix inode (0 on non-Unix).
+    pub inode: u64,
+    /// Unix ctime seconds (0 on non-Unix).
+    pub ctime_secs: i64,
+    /// Unix ctime nanoseconds (0 on non-Unix).
+    pub ctime_nanos: i64,
 }
 
 /// Build the per-agent session count query for one scope.
@@ -16855,6 +16941,9 @@ mod tests {
             .unwrap();
         assert_eq!(cache_size, -65_536);
         assert_eq!(temp_store, 2);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(mmap_size, 1_073_741_824);
+        #[cfg(not(target_pointer_width = "64"))]
         assert_eq!(mmap_size, 268_435_456);
     }
 

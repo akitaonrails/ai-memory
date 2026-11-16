@@ -1171,6 +1171,25 @@ impl Wiki {
         Ok(())
     }
 
+    /// Load persisted watcher file fingerprints from the store, if a reader is attached.
+    pub(crate) async fn load_file_fingerprints(
+        &self,
+    ) -> WikiResult<Vec<ai_memory_store::WikiFileFingerprintRow>> {
+        let Some(reader) = &self.store_reader else {
+            return Ok(Vec::new());
+        };
+        Ok(reader.load_wiki_file_fingerprints().await?)
+    }
+
+    /// Persist the current watcher file fingerprints to the store.
+    pub(crate) async fn replace_file_fingerprints(
+        &self,
+        rows: Vec<ai_memory_store::WikiFileFingerprintRow>,
+    ) -> WikiResult<()> {
+        self.writer.replace_wiki_file_fingerprints(rows).await?;
+        Ok(())
+    }
+
     /// Write the workspace and project `_meta.md` manifests the first time
     /// this process writes into a scope, so a project that first materializes
     /// *while the server is up* is rebuildable immediately instead of only
