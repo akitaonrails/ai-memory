@@ -229,6 +229,19 @@ async fn namespace_or_not_found(
         return not_found_response(i18n);
     }
     let prefix = format!("{namespace}/");
+    // Ask whether the namespace holds a live page before loading the
+    // project's pages. The answer for an unmatched path is no, and answering
+    // "not found" by listing every page in the project made each stale link
+    // or probe cost a full read.
+    match state
+        .reader
+        .has_unexpired_page_under_prefix(workspace, project, &prefix)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return not_found_response(i18n),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
     let all = match state.reader.list_unexpired_pages(workspace, project).await {
         Ok(p) => p,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),

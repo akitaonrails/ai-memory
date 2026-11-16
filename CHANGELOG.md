@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The `/web` namespace route decides whether a directory-shaped path has any
+  pages with a scoped `LIMIT 1` probe instead of listing the project. Every
+  unmatched path used to read every page row in the project before answering
+  404, so a stale link, a mistyped URL or a fast series of probes cost a full
+  table read each time. A real listing is unchanged.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed

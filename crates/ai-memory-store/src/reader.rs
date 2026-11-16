@@ -12210,6 +12210,49 @@ impl ReaderPool {
         .await
     }
 
+    /// Whether `(workspace, project)` holds a live page whose path starts with
+    /// `prefix`.
+    ///
+    /// The `/web` namespace route answers a directory-shaped path with a
+    /// listing and everything else with a 404. Deciding which by loading the
+    /// project's whole page table made any unmatched path, including a stale
+    /// link or a probe, cost a full read of every page in the project. The
+    /// question is asked on its own here, with `LIMIT 1`.
+    ///
+    /// `prefix` is a literal path prefix, normally `"<namespace>/"`. The
+    /// pattern escapes `%`, `_` and `\`, so a namespace like `notes_2026`
+    /// matches its own name and not `notesX2026`. Expired pages do not count,
+    /// the same way [`Self::list_unexpired_pages`] hides them.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn has_unexpired_page_under_prefix(
+        &self,
+        workspace: &str,
+        project: &str,
+        prefix: &str,
+    ) -> StoreResult<bool> {
+        let workspace = workspace.to_owned();
+        let project = project.to_owned();
+        let pattern = format!("{}%", like_escape(prefix));
+        self.with_conn(move |conn| {
+            let ttl = not_expired("pg", "?4");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT 1 FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = pg.workspace_id \
+                 WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1{ttl} \
+                   AND pg.path LIKE ?3 ESCAPE '\\' \
+                 LIMIT 1"
+            ))?;
+            let now = now_us();
+            let bound: Vec<&dyn rusqlite::ToSql> = vec![&workspace, &project, &pattern, &now];
+            let found = stmt.exists(params_from_iter(bound.iter()))?;
+            Ok(found)
+        })
+        .await
+    }
+
     /// Latest unexpired page summaries for the legacy JSON recent route.
     ///
     /// The caller authorizes the scope IDs. Requiring the exact URL names

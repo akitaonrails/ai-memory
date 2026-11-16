@@ -6123,6 +6123,88 @@ mod tests {
         );
     }
 
+    /// The `/web` namespace route asks this before it loads a listing, so an
+    /// unmatched path costs one indexed probe instead of a full project read.
+    /// The answer has to respect the scope, the TTL and `LIKE`
+    /// metacharacters in a path, and a foreign project or workspace must not
+    /// be able to satisfy it.
+    #[tokio::test]
+    async fn prefix_probe_is_scoped_ttl_aware_and_escapes_like() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let scratch = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let other = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let elsewhere = store
+            .writer
+            .get_or_create_workspace("elsewhere")
+            .await
+            .unwrap();
+        let elsewhere_scratch = store
+            .writer
+            .get_or_create_project(elsewhere, "scratch", None)
+            .await
+            .unwrap();
+        let now = jiff::Timestamp::now().as_second();
+        for (workspace, project, path) in [
+            (ws, scratch, "notes/a.md"),
+            (ws, scratch, "notes_deep/b.md"),
+            (ws, scratch, "notesX2026/z.md"),
+            (ws, other, "sibling/c.md"),
+            (elsewhere, elsewhere_scratch, "solo/d.md"),
+        ] {
+            store
+                .writer
+                .upsert_page(sample_page(workspace, project, path, "body"))
+                .await
+                .unwrap();
+        }
+        let mut expired = sample_page(ws, scratch, "stale/e.md", "body");
+        expired.expires_at = Some(jiff::Timestamp::from_second(now - 60).unwrap());
+        store.writer.upsert_page(expired).await.unwrap();
+
+        let probe = |project: &'static str, prefix: &'static str| {
+            store
+                .reader
+                .has_unexpired_page_under_prefix("default", project, prefix)
+        };
+        // Control: the namespace the route is about to list.
+        assert!(
+            probe("scratch", "notes/").await.unwrap(),
+            "notes/ holds a live page"
+        );
+        // An unmatched path answers without a listing.
+        assert!(!probe("scratch", "missing/").await.unwrap());
+        // A namespace whose only page expired is not a namespace.
+        assert!(!probe("scratch", "stale/").await.unwrap());
+        // A sibling namespace answers for itself, not for `notes/`.
+        assert!(probe("scratch", "notes_deep/").await.unwrap());
+        // `_` is a LIKE wildcard, so an unescaped pattern would treat
+        // `notes_2026/` as a match for `notesX2026/z.md`.
+        assert!(
+            !probe("scratch", "notes_2026/").await.unwrap(),
+            "the underscore in a namespace name is a literal, not a wildcard"
+        );
+        // Another project's namespace does not answer for this one, and the
+        // owning project still does.
+        assert!(!probe("scratch", "sibling/").await.unwrap());
+        assert!(probe("other", "sibling/").await.unwrap());
+        // Same project name, different workspace.
+        assert!(!probe("scratch", "solo/").await.unwrap());
+    }
+
     #[tokio::test]
     async fn reader_page_kinds_follow_canonical_paths_across_surfaces() {
         const CASES: [(&str, &str); 9] = [
