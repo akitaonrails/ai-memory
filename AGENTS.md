@@ -208,7 +208,7 @@ or prompt routing for learning review.
   workspace resolver 3. The authoritative workspace version is
   `workspace.package.version` in `Cargo.toml`.
 - **Async runtime:** `tokio` (full features).
-- **MCP/HTTP:** `rmcp` 3.8 (server SDK; MCP 2026-07-28 plus the legacy
+- **MCP/HTTP:** `rmcp` 3.9 (server SDK; MCP 2026-07-28 plus the legacy
   initialize handshake) + `axum` 0.8 for MCP HTTP, hooks,
   admin, `/api/v1`, and the built-in `/web` UI; `tower` / `tower-http`.
 - **Store:** `rusqlite` (bundled SQLite, backup API), `refinery`

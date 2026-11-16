@@ -817,7 +817,7 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-The MCP transport is rmcp 3.8 and serves both protocol lifecycles: MCP
+The MCP transport is rmcp 3.9 and serves both protocol lifecycles: MCP
 2026-07-28 clients start with `server/discover` and carry version metadata
 per request, while older clients still complete the `initialize`
 handshake. HTTP requests remain stateless by default; `--http-stateful`
