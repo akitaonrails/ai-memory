@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Corrected the wikisync top-level page allowlist example to include the `.md`
+  suffix. The documented stem-only value matched no such page and could make
+  `sync --check` report an omitted repository page as already in sync. (#2315)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
