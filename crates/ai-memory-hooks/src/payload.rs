@@ -3,6 +3,7 @@
 use ai_memory_core::{
     AgentKind, FilePathOutcome, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer,
     TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
+    truncate_utf8_bytes_head_tail,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1528,10 +1529,17 @@ pub fn cap_lifecycle_body_for_client(raw: &mut serde_json::Value, event: HookEve
     let Some((keys, max_bytes)) = core_body_cap(event) else {
         return false;
     };
-    let mut changed = cap_candidate_group(raw, keys, max_bytes);
+    // A trailing user correction must survive the first durable write. Other
+    // lifecycle fields keep their existing prefix-only selection.
+    let truncate: fn(&str, usize) -> String = if event == HookEvent::UserPrompt {
+        truncate_utf8_bytes_head_tail
+    } else {
+        truncate_utf8_bytes
+    };
+    let mut changed = cap_candidate_group(raw, keys, max_bytes, truncate);
     for container in ["payload", "event"] {
         if let Some(nested) = raw.get_mut(container) {
-            changed |= cap_candidate_group(nested, keys, max_bytes);
+            changed |= cap_candidate_group(nested, keys, max_bytes, truncate);
         }
     }
     changed
@@ -1555,23 +1563,33 @@ fn core_body_cap(event: HookEvent) -> Option<(&'static [&'static str], usize)> {
     }
 }
 
-fn cap_candidate_group(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
-    let mut changed = cap_object_fields(value, keys, max_bytes);
+fn cap_candidate_group(
+    value: &mut serde_json::Value,
+    keys: &[&str],
+    max_bytes: usize,
+    truncate: fn(&str, usize) -> String,
+) -> bool {
+    let mut changed = cap_object_fields(value, keys, max_bytes, truncate);
     if let Some(properties) = value.get_mut("properties") {
-        changed |= cap_object_fields(properties, keys, max_bytes);
+        changed |= cap_object_fields(properties, keys, max_bytes, truncate);
         if let Some(info) = properties.get_mut("info") {
-            changed |= cap_object_fields(info, keys, max_bytes);
+            changed |= cap_object_fields(info, keys, max_bytes, truncate);
         }
     }
     for container in ["info", "path"] {
         if let Some(nested) = value.get_mut(container) {
-            changed |= cap_object_fields(nested, keys, max_bytes);
+            changed |= cap_object_fields(nested, keys, max_bytes, truncate);
         }
     }
     changed
 }
 
-fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
+fn cap_object_fields(
+    value: &mut serde_json::Value,
+    keys: &[&str],
+    max_bytes: usize,
+    truncate: fn(&str, usize) -> String,
+) -> bool {
     let Some(object) = value.as_object_mut() else {
         return false;
     };
@@ -1592,7 +1610,7 @@ fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: us
             // unmatchable prefix (#1114), the class #980 / #1109 fixed.
             // Same order as `assistant_capture::transform_for_client`.
             let scrubbed = Sanitizer::builtin().scrub(&text);
-            *field = serde_json::Value::String(truncate_utf8_bytes(&scrubbed, max_bytes));
+            *field = serde_json::Value::String(truncate(&scrubbed, max_bytes));
             changed = true;
         }
     }
@@ -3638,7 +3656,7 @@ mod tests {
         ] {
             let text = value.as_str().expect("oversized value flattened to text");
             assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
-            assert!(text.ends_with('…'));
+            assert!(text.contains("...[truncated "));
         }
         assert!(!cap_lifecycle_body_for_client(
             &mut raw,
@@ -3648,6 +3666,81 @@ mod tests {
             &mut raw,
             HookEvent::SessionStart
         ));
+    }
+
+    #[test]
+    fn client_prompt_selection_preserves_corrections_in_every_candidate_shape() {
+        let beginning = "INITIAL_REQUEST: inspect the parser.\n";
+        let ending = "\nFINAL_CORRECTION: inspect the lexer. PRIVATE_PROSE_LIMITATION";
+        let prompt = format!(
+            "{beginning}{}OMITTED_MIDDLE_CORRECTION{}{ending}",
+            "é🧪".repeat(2_000),
+            "é🧪".repeat(2_000),
+        );
+        for key in ["prompt", "message", "text", "submitted_prompt"] {
+            for pointer in [
+                "",
+                "/properties",
+                "/properties/info",
+                "/info",
+                "/path",
+                "/payload",
+                "/payload/properties",
+                "/payload/properties/info",
+                "/payload/info",
+                "/payload/path",
+                "/event",
+                "/event/properties",
+                "/event/properties/info",
+                "/event/info",
+                "/event/path",
+            ] {
+                let mut container = serde_json::json!({(key): [{"type": "text", "text": prompt}]});
+                for part in pointer.split('/').filter(|part| !part.is_empty()).rev() {
+                    container = serde_json::json!({(part): container});
+                }
+                assert!(cap_lifecycle_body_for_client(
+                    &mut container,
+                    HookEvent::UserPrompt
+                ));
+                let text = container
+                    .pointer(&format!("{pointer}/{key}"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap();
+                assert!(text.starts_with(beginning), "{pointer}/{key}");
+                assert!(text.ends_with(ending), "{pointer}/{key}: correction lost");
+                assert!(text.contains("...[truncated "));
+                assert!(!text.contains("OMITTED_MIDDLE_CORRECTION"));
+                assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+                assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+                assert!(!cap_lifecycle_body_for_client(
+                    &mut container,
+                    HookEvent::UserPrompt
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn client_prompt_selection_scrubs_secrets_across_both_cuts() {
+        let secret = format!("AKIA{}", "Z".repeat(16));
+        let half = (USER_PROMPT_EXCERPT_MAX_BYTES - 48) / 2;
+        for start in [half - 10, 24_000 - half - 10] {
+            let mut prompt = "x".repeat(24_000);
+            prompt.replace_range(start - 1..start, " ");
+            prompt.replace_range(start..start + secret.len(), &secret);
+            prompt.replace_range(start + secret.len()..start + secret.len() + 1, " ");
+            let mut raw = serde_json::json!({"prompt": prompt});
+            assert!(cap_lifecycle_body_for_client(
+                &mut raw,
+                HookEvent::UserPrompt
+            ));
+            let text = raw["prompt"].as_str().unwrap();
+            assert!(!text.contains("AKIA"), "secret prefix at {start}");
+            assert!(!text.contains('Z'), "secret suffix at {start}");
+            assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+        }
     }
 
     /// Regression for #1114 (client side): an oversized lifecycle body is
@@ -3706,7 +3799,10 @@ mod tests {
             "submitted_prompt exceeds the per-event cap: {} bytes",
             capped.len()
         );
-        assert!(capped.ends_with('…'), "submitted_prompt not truncated");
+        assert!(
+            capped.contains("...[truncated "),
+            "submitted_prompt not truncated"
+        );
         assert!(
             !capped.contains("AKIA"),
             "unredacted secret fragment survived the cap: {capped:?}"
@@ -3746,7 +3842,7 @@ mod tests {
         ));
         let capped = raw["prompt"].as_str().expect("oversized prompt capped");
         assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
-        assert!(capped.ends_with('…'));
+        assert!(capped.contains("...[truncated "));
 
         let mut notification = serde_json::json!({
             "message": "y".repeat(NOTIFICATION_EXCERPT_MAX_BYTES + 1),
