@@ -17,6 +17,7 @@ version in [`docs/changelog/`](docs/changelog/):
   assistant Stop excerpts, so trailing corrections and final results survive
   client capping. Full-input sanitization, existing byte limits and server
   opt-in checks are unchanged; an explicit marker identifies omitted middle text.
+  ([#2342](https://github.com/akitaonrails/ai-memory/pull/2342))
 
 ## [3.4.7] - 2026-11-15
 
