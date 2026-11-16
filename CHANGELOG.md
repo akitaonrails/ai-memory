@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The confirmation command that `ai-memory handoffs --expire-all` prints
+  without `--confirm` now quotes the workspace and project for the native
+  shell, as the `purge-project` and `move-project` confirmations already do.
+  Workspace names may contain spaces, and the pasted command used to split
+  them into separate arguments.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
