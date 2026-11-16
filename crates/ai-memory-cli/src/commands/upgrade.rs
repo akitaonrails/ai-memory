@@ -112,14 +112,29 @@ fn run_replacement_refresh(exe: &Path, data_dir: &Path, config_path: Option<&Pat
         .status()
         .with_context(|| format!("starting replacement executable {}", exe.display()))?;
     if !status.success() {
-        bail!(
-            "the new binary was installed, but its hook refresh exited with {status}; \
-             run `{} --data-dir {} upgrade-refresh-hooks`",
-            exe.display(),
-            data_dir.display()
-        );
+        return Err(refresh_failed(status, &command));
     }
     Ok(())
+}
+
+/// The error for a replacement refresh that ran and failed, naming the
+/// command to rerun by hand. The hint is rendered from the command that ran,
+/// so it cannot drop an argument (`--config`), and each word is quoted for
+/// the native shell; canonical Windows paths lose their `\\?\` prefix.
+fn refresh_failed(status: impl std::fmt::Display, command: &Command) -> anyhow::Error {
+    let rerun = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|word| {
+            super::render_shared::native_shell_quote(
+                &super::path_util::strip_windows_verbatim_prefix(&word.to_string_lossy()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    anyhow::anyhow!(
+        "the new binary was installed, but its hook refresh exited with {status}; \
+         run `{rerun}`"
+    )
 }
 
 fn replacement_refresh_command(exe: &Path, data_dir: &Path, config_path: Option<&Path>) -> Command {
@@ -1454,6 +1469,26 @@ mod tests {
                 data.as_os_str(),
                 "upgrade-refresh-hooks".as_ref(),
             ]
+        );
+    }
+
+    /// The rerun hint must be the command that ran, pasteable as is: every
+    /// argument it was given (`--config` included), each quoted for the
+    /// native shell, and canonical Windows paths without the `\\?\` prefix.
+    #[test]
+    fn a_failed_refresh_names_the_exact_command_to_rerun() {
+        let exe = Path::new(r"\\?\C:\Users\Ana Maria\bin\ai-memory.exe");
+        let data = Path::new(r"\\?\C:\Users\Ana Maria\ai-memory");
+        let config = Path::new(r"C:\Users\Ana Maria\ai-memory\config.toml");
+        let command = replacement_refresh_command(exe, data, Some(config));
+
+        let error = refresh_failed("exit code: 1", &command).to_string();
+
+        assert!(
+            error.ends_with(
+                r"run `'C:\Users\Ana Maria\bin\ai-memory.exe' --data-dir 'C:\Users\Ana Maria\ai-memory' --config 'C:\Users\Ana Maria\ai-memory\config.toml' upgrade-refresh-hooks`"
+            ),
+            "{error}"
         );
     }
 

@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- When `ai-memory upgrade` installs the new binary but its hook refresh
+  fails, the command it tells you to rerun is now the command that ran:
+  it keeps `--config` when one was loaded, quotes each path for the native
+  shell, and drops the Windows `\\?\` prefix from the canonical binary and
+  data-dir paths. Previously the hint lost `--config` and printed both
+  paths unquoted, so a path with a space could not be pasted.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
