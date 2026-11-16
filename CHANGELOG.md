@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- A page path that begins with one of the engine's own staging prefixes
+  (`.ai-memory-tmp.` or `.ai-memory-delete.`) is refused at write time. The
+  watcher skips those names and the checkpoint never stages them, so such a
+  page was written and indexed while never reaching the markdown tree, which is
+  the source of truth for it. The rule matches the file name the way the
+  watcher does, so `.ai-memory-tmpX.md` and `my.ai-memory-tmp.md` stay ordinary
+  pages, and existing rows remain readable.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed

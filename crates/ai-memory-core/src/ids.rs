@@ -1236,6 +1236,29 @@ pub fn is_git_reserved_component(component: &str) -> bool {
         || (b.len() == 5 && b[..4].eq_ignore_ascii_case(b"git~") && (b'1'..=b'4').contains(&b[4]))
 }
 
+/// Prefixes the engine gives its own staging files: `.ai-memory-tmp.` for a
+/// write still in flight (`atomic.rs`, `wiki.rs`) and `.ai-memory-delete.` for
+/// a page parked during a delete (`wiki.rs`).
+///
+/// The watcher and the checkpoint both skip them by file name
+/// (`watcher.rs` `is_tempfile`, `git.rs` `is_in_flight_write`), because each
+/// exists only between a write starting and its rename. A *page* under one of
+/// these names would therefore be written and indexed, then never indexed from
+/// disk and never committed: the markdown tree is the source of truth, and a
+/// page the engine refuses to look at is not in it.
+const ENGINE_STAGING_PREFIXES: &[&str] = &[".ai-memory-tmp.", ".ai-memory-delete."];
+
+/// Returns true when a path component carries one of the engine's staging
+/// prefixes, matched the way the watcher and the checkpoint match it: on the
+/// whole file name, so `.ai-memory-tmpX.md` and `my.ai-memory-tmp.md` are
+/// ordinary pages.
+#[must_use]
+pub fn is_engine_reserved_component(component: &str) -> bool {
+    ENGINE_STAGING_PREFIXES
+        .iter()
+        .any(|prefix| component.starts_with(prefix))
+}
+
 fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryError> {
     let invalid = |reason: &str| {
         Err(MemoryError::InvalidPagePath(format!(
@@ -1286,6 +1309,14 @@ fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryEr
     if is_git_reserved_component(component) {
         return invalid("is reserved by Git for repository metadata and refused in tree entries");
     }
+    // The engine's own staging names are invisible to the watcher and to the
+    // checkpoint, so a page that uses one exists on disk and in the index while
+    // remaining absent from the markdown tree's only durable copy.
+    if is_engine_reserved_component(component) {
+        return invalid(
+            "carries one of the engine's staging prefixes, which the watcher and the checkpoint ignore",
+        );
+    }
     Ok(())
 }
 
@@ -1326,6 +1357,42 @@ mod portable_page_path_tests {
             assert!(
                 path.ensure_portable().is_err(),
                 "{raw:?} is not portable and must be refused at write time"
+            );
+        }
+    }
+
+    /// The engine's own staging prefixes are skipped by the watcher
+    /// (`is_tempfile`) and by the checkpoint (`is_in_flight_write`), so a page
+    /// created under one is written and indexed but never committed: the
+    /// markdown tree stops being the source of truth for it.
+    #[test]
+    fn engine_staging_prefixes_are_rejected() {
+        for raw in [
+            ".ai-memory-tmp.evil.md",
+            "notes/.ai-memory-tmp.notes.md",
+            ".ai-memory-delete.gone.md",
+            "notes/.ai-memory-delete.gone.md",
+            // The checkpoint matches the prefix before the extension too.
+            ".ai-memory-tmp.md.bak",
+        ] {
+            let path = PagePath::new(raw).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} carries an engine staging prefix and must be refused at write time"
+            );
+        }
+        // Only the leading run is reserved: a name that merely contains the
+        // text, or drops the separator dot, is an ordinary page.
+        for raw in [
+            "notes/ai-memory-tmp.md",
+            "notes/my.ai-memory-tmp.md",
+            "notes/.ai-memory-tmpX.md",
+            "notes/.ai-memory-deleted.md",
+        ] {
+            let path = PagePath::new(raw).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "{raw:?} is an ordinary page and must stay writable"
             );
         }
     }
