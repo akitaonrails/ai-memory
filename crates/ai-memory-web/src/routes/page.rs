@@ -9,7 +9,7 @@ use askama::Template;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 
 use crate::markdown;
 use crate::state::WebState;
@@ -184,7 +184,7 @@ pub(crate) async fn handler(
     }
     .render())
     {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -298,7 +298,7 @@ async fn namespace_or_not_found(
     }
     .render())
     {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -351,7 +351,9 @@ pub(crate) fn not_found_response(i18n: &ai_memory_core::i18n::Localizer) -> Resp
     let html = NotFoundView { i18n: i18n.clone() }
         .render()
         .unwrap_or_else(|_| "<h1>Not found</h1>".to_owned());
-    (StatusCode::NOT_FOUND, Html(html)).into_response()
+    let mut response = super::private_page(html);
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response
 }
 
 #[cfg(test)]

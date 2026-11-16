@@ -7200,3 +7200,80 @@ async fn search_alias_links_require_a_grant_and_refuse_ambiguous_names() {
     assert_eq!(status, StatusCode::OK, "{html}");
     assert!(html.contains("notes/alias.md"), "{html}");
 }
+
+/// A `/web` page is rendered per request: the session cookie, the viewer's
+/// grants, the project's access mode and the memory itself decide what it
+/// shows. Every page therefore refuses browser caching, the same promise
+/// `/api/v1` makes. Static assets are the deliberate exception.
+#[tokio::test]
+async fn web_pages_refuse_browser_caching() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(new_page(
+            ws,
+            proj,
+            "concepts/retrieval.md",
+            "Retrieval",
+            "body",
+        ))
+        .await
+        .unwrap();
+    let app = router(store.reader.clone(), wiki.clone());
+
+    for uri in [
+        "/",
+        "/w/default/scratch",
+        "/w/default/scratch/p/concepts/retrieval.md",
+        "/w/default/scratch/h/concepts/retrieval.md",
+        "/search?q=retrieval",
+        "/inbox",
+        // The not-found page renders the same chrome, so it carries the same
+        // header.
+        "/w/default/scratch/p/no/such/page.md",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "{uri} must refuse browser caching (status {})",
+            resp.status()
+        );
+    }
+
+    // Control: an asset carries no identity, so it keeps its own caching and
+    // must not be dragged under the page rule.
+    let asset = app
+        .oneshot(
+            Request::builder()
+                .uri("/static/tailwind.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        asset
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-store"),
+        "a static asset keeps its own caching"
+    );
+}
