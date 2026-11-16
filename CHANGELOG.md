@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Changed
+
+- The cold-cluster dream pass prompt now resolves temporal state evolution
+  and prioritizes explicit operator decisions, demoting superseded facts to
+  history instead of retaining opposing statements as ambiguous conflicts. (#2297)
+
 ### Fixed
 
 - A `move-project` true move now re-resolves project-only cross-project links
