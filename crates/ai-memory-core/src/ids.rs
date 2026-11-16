@@ -1198,10 +1198,13 @@ mod tests {
 /// Names Windows reserves regardless of extension: `CON.md` is still the
 /// console device. Windows also treats the superscript digits `¹ ² ³` as
 /// port numbers, so `COM¹` is a serial port too.
+///
+/// The console aliases `CONIN$` and `CONOUT$` are reserved the same way: a
+/// write to `CONOUT$.md` opens the console handle and never creates a file.
 const DOS_DEVICE_NAMES: &[&str] = &[
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
     "com9", "com¹", "com²", "com³", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8",
-    "lpt9", "lpt¹", "lpt²", "lpt³",
+    "lpt9", "conin$", "conout$", "lpt¹", "lpt²", "lpt³",
 ];
 
 /// Whether `stem` (a file name without its extension) is a DOS device name
@@ -1321,6 +1324,18 @@ mod portable_page_path_tests {
             "notes/a*b.md",
             "notes/a:b.md",
             "notes/a\u{1}b.md",
+            // Windows treats the superscript digits as port numbers too, so
+            // these stay beside the ASCII forms above; deleting them as
+            // "duplicates" would reopen the gap they close.
+            "notes/COM\u{00B9}.md",
+            "notes/com\u{00B2}.md",
+            "notes/LPT\u{00B3}.md",
+            "notes/lpt\u{00B9}.md",
+            // The console aliases resolve to devices on Windows even with an
+            // extension, like the port names above.
+            "notes/CONIN$.md",
+            "notes/CONOUT$.md",
+            "notes/conout$.txt",
         ] {
             let path = PagePath::new(raw).expect("still constructible: reads must keep working");
             assert!(
@@ -1375,6 +1390,13 @@ mod portable_page_path_tests {
             "notes/.gitattributes",
             "notes/github.md",
             "git-notes/index.md",
+            // Only the reserved forms are refused: `com0` is not a port,
+            // `clock$` is an ordinary name on current Windows, and the
+            // console aliases are reserved only with their trailing `$`.
+            "notes/com0.md",
+            "notes/lpt0.md",
+            "notes/clock$.md",
+            "notes/conin.md",
         ] {
             let path = PagePath::new(raw).expect("valid path");
             assert!(
