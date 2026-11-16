@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- SessionStart now delivers the handoff snapshot captured by its claim
+  transaction. A delayed turn checkpoint could previously refresh a quiet
+  session's handoff during admission, leaving the updated row accepted while
+  the receiving agent got the older checkpoint text. (#2340)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed

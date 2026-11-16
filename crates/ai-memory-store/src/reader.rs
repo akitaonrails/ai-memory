@@ -16407,7 +16407,7 @@ fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Op
 /// Reading the row here (instead of destructuring it into a long positional
 /// argument list) keeps the column order defined in exactly one place next to
 /// the `SELECT`s that produce it.
-fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
+pub(crate) fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
     let id_bytes: Vec<u8> = row.get(0)?;
     let ws_bytes: Vec<u8> = row.get(1)?;
     let pj_bytes: Vec<u8> = row.get(2)?;
