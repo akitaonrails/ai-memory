@@ -10,6 +10,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
+| `data_dir` | Platform local data directory + `ai-memory` (`dirs::data_local_dir()`) | `AI_MEMORY_DATA_DIR` | Root directory holding `wiki/`, `raw/`, `db/`, `models/` and `logs/`. The config file lives inside it, so `config.default.toml` omits the key by design; `--data-dir` sets it too. |
 | `language` | `"en"` | `AI_MEMORY_LANGUAGE` | Human-facing CLI language (`en` or `pt-BR`); overridden by `--language`. Browser language is per request. |
 | `bind` | `127.0.0.1:49374` (`DEFAULT_BIND`) | `AI_MEMORY_BIND` | HTTP bind address used by `ai-memory serve`. |
 | `tcp_keepalive_secs` | `60` (`DEFAULT_TCP_KEEPALIVE_SECS`) | `AI_MEMORY_TCP_KEEPALIVE_SECS` | Idle seconds before TCP keepalive probes start on an accepted connection. 0 disables keepalive. |
