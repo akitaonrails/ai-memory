@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The `finalize-session` command `ai-memory run` prints when it cannot
+  finalize a hookless session now quotes the workspace and project for the
+  native shell, as the `purge-project` and `move-project` confirmations do.
+  It used POSIX quoting, so on Windows a scope name with an apostrophe
+  (`'Levi'\''s work'`) did not paste into PowerShell.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed

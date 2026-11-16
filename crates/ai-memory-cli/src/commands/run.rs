@@ -1654,6 +1654,7 @@ async fn run_once_with_wiring(
                     .as_ref()
                     .and_then(|status| status.native_session_id.as_deref())
             {
+                let (quoted_workspace, quoted_project) = finalize_scope_args(&workspace, &project);
                 eprintln!(
                     "{}",
                     diagnostic(
@@ -1663,8 +1664,8 @@ async fn run_once_with_wiring(
                             harness.as_str(),
                             harness.agent_kind().as_str(),
                             SessionId::from_native(linked),
-                            super::render_shared::shell_quote(&workspace),
-                            super::render_shared::shell_quote(&project)
+                            quoted_workspace,
+                            quoted_project
                         )
                     )
                 );
@@ -1935,17 +1936,19 @@ async fn run_once_with_wiring(
             // scope: its hooks are not installed or never fired, or they
             // filed it under another workspace/project.
             Ok(_) => {}
-            Err(error) => eprintln!(
-                "{}",
-                diagnostic(
-                    &config.i18n,
-                    format!(
-                        "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
-                        super::render_shared::shell_quote(&workspace),
-                        super::render_shared::shell_quote(&project)
+            Err(error) => {
+                let (quoted_workspace, quoted_project) = finalize_scope_args(&workspace, &project);
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+                            quoted_workspace, quoted_project
+                        )
                     )
-                )
-            ),
+                );
+            }
         }
     }
     Ok(RunOutcome {
@@ -5564,6 +5567,15 @@ fn choose_native_session(
     }
 }
 
+/// The `--workspace` and `--project` values of a printed `finalize-session`
+/// command, quoted for the shell the operator pastes it into.
+fn finalize_scope_args(workspace: &str, project: &str) -> (String, String) {
+    (
+        super::render_shared::native_shell_quote(workspace),
+        super::render_shared::native_shell_quote(project),
+    )
+}
+
 /// Render a native session id for terminal output, bounded so a long id
 /// cannot flood the line. CodeQL's `rust/cleartext-logging` barrier model
 /// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
@@ -6256,6 +6268,21 @@ mod tests {
 
     fn plan(warn: bool, mode: JailMode) -> JailPlan {
         JailPlan { warn, mode }
+    }
+
+    /// The printed `finalize-session` command is pasted into the operator's
+    /// own shell. POSIX `'\''` escaping is not PowerShell's, so a scope with an
+    /// apostrophe must be quoted the native way, as the destructive
+    /// confirmations already are.
+    #[test]
+    fn finalize_scope_args_quote_for_the_native_shell() {
+        let (workspace, project) = finalize_scope_args("Levi's work", "api");
+        assert_eq!(project, "api");
+        if cfg!(windows) {
+            assert_eq!(workspace, "'Levi''s work'");
+        } else {
+            assert_eq!(workspace, r"'Levi'\''s work'");
+        }
     }
 
     /// Every harness a journal entry can name.
