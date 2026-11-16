@@ -758,11 +758,16 @@ function Write-AiMemorySpoolEvent {
             body = $Body
             created_ms = $now
         }
-        if ($env:AI_MEMORY_AUTH_TOKEN) {
-            # The credential this hook's own POST would have carried, stored
-            # in the 0600 entry rather than on any command line.
+        # The credential this hook's own POST would have carried, stored in
+        # the 0600 entry rather than on any command line. A hook installed
+        # without a baked token authenticates from the token file (#2134), so
+        # the spooled entry has to resolve the same way: an entry that says
+        # "none" here drains anonymously, takes a 401, and is retired.
+        $SpoolToken = $env:AI_MEMORY_AUTH_TOKEN
+        if (-not $SpoolToken) { $SpoolToken = Get-AiMemoryStoredToken }
+        if ($SpoolToken) {
             $entry["auth_mode"] = "static"
-            $entry["token"] = $env:AI_MEMORY_AUTH_TOKEN
+            $entry["token"] = $SpoolToken
         } else {
             $entry["auth_mode"] = "none"
         }

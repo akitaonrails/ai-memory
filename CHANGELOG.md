@@ -11,6 +11,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- A PowerShell hook that spooled an event while its server was unreachable
+  recorded `auth_mode: "none"` even when the hook authenticates from
+  `<data_dir>/auth-tokens/default`. On a default install, where no
+  `AI_MEMORY_AUTH_TOKEN` is set, the drain then posted anonymously, the
+  server answered 401, and the drain retired the entry as a terminal 4xx, so
+  the events it held were lost without a diagnostic. The spool now resolves
+  the same credential its own POST would have carried, which is what the
+  shell bundle and the native spooler already do (#2134).
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
