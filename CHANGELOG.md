@@ -11,6 +11,16 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `ai-memory uninstall --only mcp`, `--only skills` and `--only instructions`
+  no longer delete the hook credentials they leave behind. The server-profile
+  token sweep ran unconditionally while the install-token sweep beside it was
+  gated on whether the hooks were removed, so a partial uninstall kept the hook
+  bundles but removed every token under `<data_dir>/auth-tokens/`, and capture
+  started failing with 401 on the next session. Both sweeps now share one
+  decision.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
