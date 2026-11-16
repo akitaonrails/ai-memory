@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept relay session-to-agent pins alive after the first delivery of events
+  queued offline longer than 30 days. Delivery attempts now refresh the matching
+  pin atomically without resetting the event's first-attempt retry deadline. (#2316)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
