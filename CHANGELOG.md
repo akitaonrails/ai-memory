@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The `repair-split` and `merge-project` commands that `ai-memory run` prints
+  for a resumed session held by another project now quote the workspace and
+  the archive name for the native shell. Workspace names may contain spaces,
+  and so may a folder-name project, which the archive name is built from; the
+  pasted command used to split them into separate arguments.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
