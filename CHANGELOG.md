@@ -11,6 +11,15 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Security
+
+- The post-login redirect target rejects control characters. A URL parser
+  removes ASCII tab and newline characters before it reads the scheme, so
+  `?next=/%09/evil.example` reached the browser as `//evil.example` and sent
+  an operator off-site straight after a successful local login. Deployments
+  that mount the wiki at the host root were affected; the default `/web`
+  slug already refused the payload.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
