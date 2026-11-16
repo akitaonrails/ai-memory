@@ -171,6 +171,20 @@ pub struct Store {
     db_path: PathBuf,
 }
 
+/// Per-connection SQLite page cache budget: 64 MiB (negative = KiB).
+const SQLITE_CACHE_SIZE_KIB: i64 = -65_536;
+/// Per-connection memory-mapped I/O window: 256 MiB.
+const SQLITE_MMAP_SIZE_BYTES: i64 = 268_435_456;
+
+/// Apply performance and concurrency PRAGMAs shared by writer and reader connections.
+pub(crate) fn apply_connection_pragmas(conn: &Connection) -> StoreResult<()> {
+    conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
+    conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;
+    conn.pragma_update(None, "mmap_size", SQLITE_MMAP_SIZE_BYTES)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(())
+}
+
 impl Store {
     /// Open an existing backup snapshot, applying any outstanding migrations.
     /// Unlike [`Self::open`], this refuses to initialize an absent or blank
@@ -232,7 +246,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
+        apply_connection_pragmas(&conn)?;
         // Writer transactions start IMMEDIATE: a deferred transaction that
         // has already read cannot wait through the busy handler when it
         // upgrades to write, so another process holding the write lock (an
@@ -248,6 +262,8 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "OFF")?;
         migrations::run(&mut conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "analysis_limit", 400)?;
+        conn.execute_batch("PRAGMA optimize;")?;
 
         // One-shot, idempotent entity-index backfill (docs/temporal.md).
         // Populates entities/entity_page_links from existing frontmatter
