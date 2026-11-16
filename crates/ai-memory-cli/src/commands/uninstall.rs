@@ -1010,8 +1010,22 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     // reasoning applies; the registry of URLs stays. The root bearer the
     // server itself reads (`[auth].bearer_token_file`) is not a hook's and
     // stays with the server's config.
+    // An environment override skips resolving that file during config load,
+    // but the next server start without the override still needs it.
+    let root_token_file = config
+        .auth
+        .token_file_path()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            config
+                .auth
+                .bearer_token_file
+                .as_ref()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| config.data_dir.join(path))
+        });
     if let Err(error) =
-        crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
+        crate::server_profiles::clear_tokens(&config.data_dir, root_token_file.as_deref())
     {
         eprintln!(
             "{}",

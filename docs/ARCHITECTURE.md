@@ -1851,6 +1851,11 @@ sees the host path read the same file. A configured file that is missing or
 blank leaves no bearer, and `serve` then refuses to start. Env:
 `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`.
 
+`uninstall` keeps the server's configured token file when clearing hook and
+server-profile credentials. This also applies when `AI_MEMORY_AUTH_TOKEN`
+overrides the file for that command: a later server start still needs the
+configured file when the override is absent.
+
 `ai-memory init` mints the token (32 random bytes, hex, `0600` under a `0700`
 `auth-tokens/`) only on a fresh data dir: no config file and no database yet,
 and no bearer supplied another way. An existing install keeps the loopback

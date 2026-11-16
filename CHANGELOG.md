@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved the server's configured `auth.bearer_token_file` during uninstall
+  when `AI_MEMORY_AUTH_TOKEN` overrides it for that command. Previously the
+  credential cleanup deleted a root token under `auth-tokens/`, leaving the
+  unchanged config unable to start the server without the override. (#2323)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
