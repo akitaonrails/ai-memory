@@ -208,6 +208,16 @@ version in [`docs/changelog/`](docs/changelog/):
   watcher does, so `.ai-memory-tmpX.md` and `my.ai-memory-tmp.md` stay ordinary
   pages, and existing rows remain readable.
 
+### Fixed
+
+- Page paths that name the Windows console devices `CONIN$` and `CONOUT$` are
+  now refused at write time, like the DOS port names they sit beside. Windows
+  resolves both to a device even with an extension, so the write passed
+  validation, opened the console handle, and failed partway through the atomic
+  write with an OS error instead of a clean `InvalidPagePath`; a page created
+  under such a name on Linux or macOS was then unusable from Windows.
+  Follow-up to #462.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
