@@ -286,8 +286,6 @@ version in [`docs/changelog/`](docs/changelog/):
   pages, from the selected project or from every project the viewer can read.
   It used to show only an empty prompt. (#2226)
 
-### Changed
-
 - The cold-cluster dream pass prompt now resolves temporal state evolution
   and prioritizes explicit operator decisions, demoting superseded facts to
   history instead of retaining opposing statements as ambiguous conflicts. (#2297)
