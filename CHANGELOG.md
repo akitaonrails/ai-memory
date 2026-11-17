@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Preserved the beginning and ending of long native user prompts and opted-in
+  assistant Stop excerpts, so trailing corrections and final results survive
+  client capping. Full-input sanitization, existing byte limits and server
+  opt-in checks are unchanged; an explicit marker identifies omitted middle text.
+  ([#2342](https://github.com/akitaonrails/ai-memory/pull/2342))
 - Preserved reported wiki writes and required full-tree walks after a confinement
   refusal. Once the entry is repaired, the next checkpoint includes the earlier
   writes even when another write was reported in the meantime, instead of waiting

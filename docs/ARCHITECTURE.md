@@ -611,7 +611,14 @@ limit. User prompts and post-compaction summaries are capped UTF-8-safely at
 and transport, and the server repeats it when parsing every request so direct
 and older clients cannot bypass it. The typed sanitizer boundary then applies a
 16 KiB backstop to every durable observation body after redaction. The
-separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
+separately gated Claude Code, Codex and OpenCode assistant/Stop excerpt remains
+capped at 2 KB. Native clients scrub the complete admitted text before retaining
+both the beginning and ending of oversized user prompts and assistant excerpts,
+with an explicit omitted-byte marker between them. Assistant inputs over 64 KiB
+remain rejected. Notification and post-compaction selection is unchanged.
+This positional selection can omit an important middle passage and can retain
+private prose that does not match a sanitizer rule; it does not rank importance
+or recover text from earlier captures.
 
 An optional RFC 3339 `occurred_at` on the hook body lets a client supply the
 event's own original time. Currently only `ai-memory backfill` does this,
