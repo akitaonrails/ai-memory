@@ -1969,7 +1969,7 @@ fn truncate_with_marker(input: &str, max_bytes: usize, marker: &str) -> (String,
     (out, true)
 }
 
-fn truncate_to_budget(input: &str, max_bytes: usize, marker: &str) -> String {
+pub(crate) fn truncate_to_budget(input: &str, max_bytes: usize, marker: &str) -> String {
     if input.len() <= max_bytes {
         return input.to_string();
     }

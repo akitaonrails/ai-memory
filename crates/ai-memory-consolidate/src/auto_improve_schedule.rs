@@ -1726,6 +1726,38 @@ mod tests {
             .into(),
             ..Default::default()
         };
+        let mut tiny_budget = settings.clone();
+        tiny_budget.review.max_input_tokens = 128;
+        let skipped = run_auto_improve_scheduler_tick(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &LlmProviders {
+                overrides: [(
+                    LlmWorkload::Experience,
+                    Arc::new(PanicLlm) as Arc<dyn LlmProvider>,
+                )]
+                .into(),
+                ..Default::default()
+            },
+            &tiny_budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(skipped.experience_runs, 0, "{skipped:?}");
+        assert_eq!(skipped.errors, 0, "{skipped:?}");
+        assert!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, project, None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an input-budget skip must not stage a run"
+        );
+
+        // Raising the budget retries the same completed sessions: the skipped
+        // pass must not advance the scheduler's cadence anchor.
         let outcome =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llms, &settings)
                 .await

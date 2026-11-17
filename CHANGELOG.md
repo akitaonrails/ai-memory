@@ -238,6 +238,15 @@ version in [`docs/changelog/`](docs/changelog/):
   skip without calling the provider; an explicit session ID can rerun the
   review after adjusting the budget. (#2313)
 
+### Fixed
+
+- The cross-session experience pass now honors `[auto_improve].max_input_tokens`
+  when assembling summaries and optional wiki context. Its estimated request
+  includes the system prompt, response schema and framing, with the same
+  80% estimate headroom as bootstrap. A budget too small for the session
+  context skips the provider call without advancing the scheduler cadence.
+  Previously only per-item caps bounded the prompt. (#2312, #2309)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
