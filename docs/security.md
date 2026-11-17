@@ -199,8 +199,10 @@ explicitly so you don't add setup you don't need.
 than one human shares a server, ai-memory attributes each write to a
 named user. Humans sign in with username/password; agents and CLIs use
 `Authorization: Bearer` (`AI_MEMORY_AUTH_TOKEN` for root automation, or
-an `aim_` key from `ai-memory api-key add`). Data stays single-tenant:
-there is no per-page RBAC. A
+an `aim_` key from `ai-memory api-key add`). Data stays single-tenant and
+there is no per-page RBAC, though a project can be **restricted** so only root,
+its creator, and users with an explicit grant reach it (see
+[per-project authorization](design-per-project-authz.md)). A
 `[auth].token_pepper` is required for DB-user authentication, but creating the
 first user row is what immediately switches every `/admin/*` endpoint to
 root-only, including status/search/read-page and user-management routes.

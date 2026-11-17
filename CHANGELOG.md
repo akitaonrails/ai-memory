@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Corrected `docs/users.md` and `docs/security.md`, which still said every
+  authenticated request sees the same pages and there is no project permission
+  model. Per-project authorization (`#708`, slices 2–3) has shipped: a project
+  can be `restricted` so only root, its creator, and explicitly granted users
+  read or write it, while open projects stay open. Both docs now point to
+  `docs/design-per-project-authz.md`. (#2343)
 - CJK substring search now repairs a derived index row that an offline
   maintenance edit removed, even after the startup backfill watermark (#2337)
   has advanced past it. A direct SQL `UPDATE` of a page's or an observation's

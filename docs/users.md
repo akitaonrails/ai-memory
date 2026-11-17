@@ -4,9 +4,16 @@
 > native `aim_` API credentials are the current shipped contract.
 
 ai-memory is **single-tenant wiki data** with **optional multi-user
-attribution**. Every authenticated request sees the same wiki pages;
-there is no per-page RBAC or group permission model. Operational handoffs and
-open-session recovery are owner-scoped so one operator cannot accidentally
+attribution** and **opt-in per-project access control**. There is no per-page
+RBAC or group permission model, and every project is **open** by default, so an
+authenticated request sees its wiki pages. A project can be marked
+**restricted** (`ai-memory project access`, or `[auth] new_projects_restricted`
+for new projects); from then on only root, the project's creator, and users
+holding an explicit grant (`ai-memory user grant` / `ai-memory project grants`)
+read or write it, and unrelated open projects are untouched. The model and its
+choke point are described in
+[per-project authorization](design-per-project-authz.md). Operational handoffs
+and open-session recovery are owner-scoped so one operator cannot accidentally
 consume or finalize another's live context. What multi-user mode also adds is
 *who-did-this*: every write
 attributes to a named user, audit-log rows carry that identity, and the
