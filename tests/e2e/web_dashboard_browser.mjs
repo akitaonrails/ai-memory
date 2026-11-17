@@ -32,6 +32,7 @@ const mutations = {
   'disable-session-live-refresh': {test: 'session-live-usage', from: 'timer=setTimeout(refresh,10000);', to: 'timer=0;'},
   'drop-usage-query': {test: 'call-history', from: 'new FormData(form).forEach(function(value,key){url.searchParams.set(key,value);});', to: 'void form;'},
   'forget-theme': {test: 'themes', from: 'localStorage.setItem(key,selected)', to: 'void selected'},
+  'resolve-fragments-at-mount': {test: 'fragment-navigation', from: 'link.href=currentPage+link.getAttribute("href")', to: 'link.href=document.baseURI+link.getAttribute("href")'},
   'steal-browser-shortcut': {test: 'tabs', from: 'if(event.altKey||event.ctrlKey||event.metaKey)return;', to: ''},
   'enable-send-while-pending': {test: 'delivery', from: 'button.disabled=sending||!toAgent', to: 'button.disabled=!toAgent'},
   'enable-send-for-empty-project-after-request': {test: 'delivery', from: 'sending=false;updateSendButton();result.focus()', to: 'sending=false;button.disabled=false;result.focus()'},
@@ -580,6 +581,40 @@ async function main() {
       assert.equal(claimed.status, 0);assert.equal(JSON.parse(claimed.stdout).message.id, ids[1], 'Reading must leave the queued message available to its agent');
       await cdp.reload();
       assert(await cdp.evaluate(`document.querySelector('.mail-overview').textContent.includes('2 queued')&&document.querySelector('[data-mailbox-workspace="other"]').textContent.includes('1 queued')`), 'Collected messages must leave the queued counts');
+    },
+    async 'fragment-navigation'() {
+      for (const mount of [{origin:base,prefix:'',slug:'/web'},{prefix:'/proxy',slug:'/notes'},{prefix:'',slug:'/'}]) {
+        if (!mount.origin) {
+          const socket=net.createServer();await new Promise(resolve=>socket.listen(0,'127.0.0.1',resolve));
+          const port=socket.address().port;await new Promise(resolve=>socket.close(resolve));
+          mount.origin=`http://127.0.0.1:${port}`;
+          const child=launch(binary,['--data-dir',path.join(artifacts,'fragment-server-'+port),'serve','--transport','http','--bind',`127.0.0.1:${port}`,'--enable-web','--no-watcher','--base-path',mount.prefix,'--web-slug',mount.slug,'--workspace','team','--project','app'],env,'fragment-server-'+port+'.log');
+          await until(async()=>{assert(child.exitCode===null,'Fragment fixture server exited');try{return(await fetch(mount.origin+mount.prefix+'/healthz')).ok;}catch{return false;}},'Fragment fixture server failed to start');
+        }
+        const body='# Fragment fixture\n\n## Start\n\n[section link](#section) [other page](concepts/other.md#section) [external](https://example.invalid/#section)\n\nFootnote[^note].\n\n## Section\n\nSection content.\n\n[^note]: Footnote text. [return](#start)\n';
+        const response=await fetch(mount.origin+mount.prefix+'/admin/write-page',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json','X-Ai-Memory-UI':'1'},body:JSON.stringify({workspace:'team',project:'app',path:'concepts/anchors.md',title:'Fragment fixture',body})});
+        assert(response.ok,'Fragment fixture page write failed');
+        await cdp.send('Network.setCookie',{name:'ai_memory_auth',value:token,url:mount.origin,httpOnly:true,sameSite:'Strict'});
+        const web=mount.prefix+(mount.slug==='/'?'':mount.slug);
+        const current=mount.origin+web+'/w/team/app/p/concepts/anchors.md?fixture=kept%23value';
+        await cdp.goto(current,'#section');
+        const links=await cdp.evaluate(`Object.fromEntries(Array.from(document.querySelectorAll('article a')).map(a=>[a.textContent,a.href]))`);
+        assert.equal(links['section link'],current+'#section','A body fragment must stay on the current page');
+        assert.equal(links['other page'],mount.origin+web+'/w/team/app/p/concepts/other.md#section','Cross-page anchors must keep their target');
+        assert.equal(links.external,'https://example.invalid/#section','External links must remain external');
+        assert.equal(links.return,current+'#start','A footnote backlink must stay on its page');
+        assert.equal(await cdp.evaluate('document.querySelector(".footnote-reference a").href'),current+'#note','A footnote reference must stay on its page');
+        assert.equal(await cdp.evaluate('document.getElementById("skip-link").href'),current+'#main-content');
+        await cdp.evaluate(`window.fragmentNavigationMarker=true;Array.from(document.querySelectorAll('article a')).find(a=>a.textContent==='section link').click()`);
+        await until(()=>cdp.evaluate(`location.href===${literal(current+'#section')}&&document.querySelector(':target')?.id==='section'`),'Body anchor did not navigate to the section');
+        await cdp.evaluate('document.querySelector(".footnote-reference a").click()');
+        await until(()=>cdp.evaluate(`location.href===${literal(current+'#note')}&&document.querySelector(':target')?.id==='note'`),'Footnote reference did not navigate to its definition');
+        await cdp.evaluate(`Array.from(document.querySelectorAll('article a')).find(a=>a.textContent==='return').click()`);
+        await until(()=>cdp.evaluate(`location.href===${literal(current+'#start')}&&document.querySelector(':target')?.id==='start'`),'Footnote backlink did not navigate back');
+        await cdp.evaluate('document.getElementById("skip-link").click()');
+        await until(()=>cdp.evaluate(`location.href===${literal(current+'#main-content')}&&document.querySelector(':target')?.id==='main-content'`),'Skip link did not navigate to content');
+        assert(await cdp.evaluate('window.fragmentNavigationMarker===true'),'Fragment navigation must not replace the document');
+      }
     },
     async responsive() {
       await cdp.goto(project, '#project-panel-overview');

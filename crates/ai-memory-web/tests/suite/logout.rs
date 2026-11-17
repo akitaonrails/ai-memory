@@ -41,6 +41,7 @@ global.document = {
   cookie: scenario.cookie,
   body: element("body"),
   addEventListener() {},
+  querySelectorAll() { return []; },
   getElementById(id) {
     if (id === "ai-memory-logout-error") return notes.find((n) => !n.removed) || null;
     return (elements[id] = elements[id] || element(id));

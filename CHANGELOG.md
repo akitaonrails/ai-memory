@@ -29,6 +29,12 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed OKF export links pointing at a different filename when a literal
   wikilink path contained an HTML character reference such as `&copy;`. (#2279)
 
+### Fixed
+
+- Fixed fragment-only links in wiki page bodies and footnotes navigating to
+  the web root instead of the current page. Navigation now preserves the
+  page path and query under default, custom-prefix, and root web mounts. (#2318)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed

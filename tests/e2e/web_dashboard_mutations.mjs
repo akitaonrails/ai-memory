@@ -17,6 +17,7 @@ const faults = [
   ['disable-session-live-refresh', 'session-live-usage'],
   ['drop-usage-query', 'call-history'],
   ['forget-theme', 'themes'],
+  ['resolve-fragments-at-mount', 'fragment-navigation'],
   ['steal-browser-shortcut', 'tabs'],
   ['enable-send-while-pending', 'delivery'],
   ['enable-send-for-empty-project-after-request', 'delivery'],
