@@ -282,6 +282,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- `ai-memory uninstall` now sweeps WorkBuddy MCP config (`~/.workbuddy/mcp.json`)
+  and skill directories (`.workbuddy/skills`, `~/.workbuddy/skills`) alongside
+  the other supported clients. Previously `install-mcp --client workbuddy` and
+  `install-skills --agent workbuddy` entries were left behind. (#2306)
 - Pi assistant capture (`--capture-assistant`) no longer lets the native Stop
   overtake the turn's own prompt and tool events: `postPiStop` now drains the
   direct-hook queue before it spawns the native Stop, matching OpenCode 2. The
