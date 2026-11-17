@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Corrected `docs/users.md` and `docs/security.md`, which still said every
+  authenticated request sees the same pages and there is no project permission
+  model. Per-project authorization (`#708`, slices 2–3) has shipped: a project
+  can be `restricted` so only root, its creator, and explicitly granted users
+  read or write it, while open projects stay open. Both docs now point to
+  `docs/design-per-project-authz.md`. (#2343)
 - Kept canonical project names ambiguous when a legacy twin holds sent or
   received messages, including retained history. Name-based mailbox access and
   writes no longer skip that project as empty, and startup no longer reports
