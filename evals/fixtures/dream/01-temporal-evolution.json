@@ -1,0 +1,37 @@
+{
+  "name": "dream-temporal-evolution-cluster",
+  "description": "Cluster of near-duplicate cold memory pages spanning multiple sessions where an initial pattern and trial-and-error are superseded by an explicit user decision.",
+  "cluster_members": [
+    {
+      "path": "backend/auth-setup.md",
+      "body": "## Local Authentication Setup\nThe backend authentication service runs on port 3000.\nWe sign local JWT tokens using HMAC-SHA256 with a shared secret.\nConfigured in `src/auth.rs`."
+    },
+    {
+      "path": "backend/auth-port-issue.md",
+      "body": "## Port Binding Conflict\nAttempted to change auth service port to 8080 to align with staging.\nFailed: port 8080 conflicts with local Docker compose services.\nReverted temporarily to port 3000."
+    },
+    {
+      "path": "backend/auth-migration.md",
+      "body": "## Asymmetric Key Migration and Official Port\nUser decision (2026-11-10): Official auth service port for all local and dev services is 8000.\nMigrated from symmetric HMAC-SHA256 to asymmetric Ed25519 keypairs so downstream services can verify tokens independently without sharing the signing secret.\nOld symmetric secret revoked."
+    }
+  ],
+  "expected_evaluation": {
+    "must_contain": [
+      "8000",
+      "Ed25519",
+      "`src/auth.rs`"
+    ],
+    "authoritative_state": {
+      "port": "8000",
+      "auth_type": "Ed25519"
+    },
+    "historical_state": {
+      "port_3000": "previous/superseded",
+      "port_8080": "discarded attempt due to Docker conflict",
+      "jwt_hmac": "revoked/migrated"
+    },
+    "must_not_contain": [
+      "unresolved conflict between port 3000 and 8000"
+    ]
+  }
+}
