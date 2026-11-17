@@ -140,6 +140,12 @@ version in [`docs/changelog/`](docs/changelog/):
   Restoring `HEAD` or `HEAD~1` with a dirty wiki no longer reads a different
   checkpoint after the safety backup advances HEAD. (#2317)
 
+### Fixed
+
+- Kept relay session-to-agent pins alive after the first delivery of events
+  queued offline longer than 30 days. Delivery attempts now refresh the matching
+  pin atomically without resetting the event's first-attempt retry deadline. (#2316)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
