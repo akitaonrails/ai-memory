@@ -138,8 +138,9 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
     let mut targets = HashSet::new();
     let mut added = HashSet::new();
     let mut changes = Vec::with_capacity(edits.len());
+    let mut repaired_unterminated_heading = false;
     for edit in edits {
-        let change = match edit {
+        let mut change = match edit {
             PagePatchEdit::Append {
                 target: AppendTarget::EndOfPage,
                 anchor,
@@ -232,7 +233,49 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 }
             }
         };
+        // An unterminated heading at EOF has an empty content range directly
+        // after the heading text. Separate an inserted body from that heading.
+        if matches!(edit, PagePatchEdit::ReplaceSection { .. })
+            && change.range.start == body.len()
+            && !body.ends_with('\n')
+            && !change.replacement.is_empty()
+        {
+            let newline = if change
+                .heading
+                .is_some_and(|start| body[..start].ends_with("\r\n"))
+            {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            if newline == "\r\n"
+                && change.replacement.ends_with('\n')
+                && !change.replacement.ends_with("\r\n")
+            {
+                change.replacement.pop();
+                change.replacement.push_str(newline);
+            }
+            change.replacement.insert_str(0, newline);
+            repaired_unterminated_heading = true;
+        }
         changes.push(change);
+    }
+
+    // Two section insertions at an unterminated heading's EOF have no
+    // unambiguous order: an ancestor append and the new section body resolve
+    // to the same byte, regardless of the request order. Refuse the batch.
+    if repaired_unterminated_heading
+        && changes
+            .iter()
+            .filter(|change| {
+                change.placement == Placement::Section
+                    && change.range.start == body.len()
+                    && change.range.is_empty()
+            })
+            .count()
+            > 1
+    {
+        return Err(PatchError::Overlapping);
     }
 
     // A replacement deletes every section nested in it, so no other edit may
@@ -267,6 +310,18 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 .insert_str(0, blank_line_before(preceding));
         }
         if joins_previous && let Some(previous) = merged.last_mut() {
+            // The section insertion now supplies the missing EOF separator;
+            // an end-of-page append computed against the old body must not
+            // add it a second time.
+            if change.placement == Placement::EndOfPage
+                && previous.placement == Placement::Section
+                && repaired_unterminated_heading
+                && !body.ends_with('\n')
+                && previous.replacement.ends_with('\n')
+                && change.replacement.starts_with('\n')
+            {
+                change.replacement.remove(0);
+            }
             previous.replacement.push_str(&change.replacement);
             continue;
         }
@@ -1016,5 +1071,135 @@ mod tests {
             patched,
             "# T\n## Notes on C#\nold\nmore\n## Tail ##\nend\n\n## F#\n\nnew\n"
         );
+    }
+    #[test]
+    fn replace_section_at_unterminated_heading_adds_a_separator() {
+        for (body, content, expected) in [
+            ("# T\n## One", "new", "# T\n## One\nnew\n"),
+            ("# T\r\n## One", "new", "# T\r\n## One\r\nnew\r\n"),
+            ("# T\r\n## One", "new\r\n", "# T\r\n## One\r\nnew\r\n"),
+            ("## One", "new\n", "## One\nnew\n"),
+            ("# T\n## One", "", "# T\n## One"),
+            ("# T\n## One", "\n\n", "# T\n## One"),
+        ] {
+            let section = section_hashes(body)
+                .0
+                .into_iter()
+                .find(|s| s.anchor == "One")
+                .unwrap();
+            let edit = PagePatchEdit::ReplaceSection {
+                anchor: "One".into(),
+                section_sha256: section.sha256,
+                content: content.into(),
+            };
+            assert_eq!(
+                apply(body, &[edit]).unwrap(),
+                expected,
+                "{body:?} {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_unterminated_heading_and_append_at_eof_are_ordered() {
+        let body = "# T\n## One";
+        let section = section_hashes(body)
+            .0
+            .into_iter()
+            .find(|s| s.anchor == "One")
+            .unwrap();
+        let replace = PagePatchEdit::ReplaceSection {
+            anchor: "One".into(),
+            section_sha256: section.sha256,
+            content: "new".into(),
+        };
+        let append = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append.clone()],
+            vec![append.clone(), replace.clone()],
+        ] {
+            assert_eq!(apply(body, &edits).unwrap(), "# T\n## One\nnew\nfooter\n");
+        }
+        let add = PagePatchEdit::AddSection {
+            anchor: "## Next".into(),
+            content: "end".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append.clone(), add.clone()],
+            vec![replace.clone(), add.clone(), append.clone()],
+            vec![append.clone(), replace.clone(), add.clone()],
+            vec![append.clone(), add.clone(), replace.clone()],
+            vec![add.clone(), replace.clone(), append.clone()],
+            vec![add, append, replace],
+        ] {
+            assert_eq!(
+                apply(body, &edits).unwrap(),
+                "# T\n## One\nnew\nfooter\n\n## Next\n\nend\n"
+            );
+        }
+    }
+    #[test]
+    fn append_section_and_eof_keep_existing_spacing() {
+        for (body, expected) in [
+            ("# T\n## One\nold", "# T\n## One\nold\nsection\n\nfooter\n"),
+            ("# T\n## One", "# T\n## One\nsection\n\nfooter\n"),
+            ("# T\n## One\n", "# T\n## One\nsection\nfooter\n"),
+        ] {
+            let section = PagePatchEdit::Append {
+                target: AppendTarget::Section,
+                anchor: Some("One".into()),
+                content: "section".into(),
+            };
+            let footer = PagePatchEdit::Append {
+                target: AppendTarget::EndOfPage,
+                anchor: None,
+                content: "footer".into(),
+            };
+            for edits in [
+                vec![section.clone(), footer.clone()],
+                vec![footer.clone(), section.clone()],
+            ] {
+                assert_eq!(apply(body, &edits).unwrap(), expected, "{body:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_unterminated_heading_refuses_an_ancestor_append_at_same_eof() {
+        let body = "# T\n## Parent\ntext\n### One";
+        let section = section_hashes(body)
+            .0
+            .into_iter()
+            .find(|s| s.anchor == "One")
+            .unwrap();
+        let replace = PagePatchEdit::ReplaceSection {
+            anchor: "One".into(),
+            section_sha256: section.sha256,
+            content: "new".into(),
+        };
+        let append_parent = PagePatchEdit::Append {
+            target: AppendTarget::Section,
+            anchor: Some("Parent".into()),
+            content: "parent".into(),
+        };
+        let append_eof = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append_parent.clone(), append_eof.clone()],
+            vec![replace.clone(), append_eof.clone(), append_parent.clone()],
+            vec![append_parent.clone(), replace.clone(), append_eof.clone()],
+            vec![append_parent.clone(), append_eof.clone(), replace.clone()],
+            vec![append_eof.clone(), replace.clone(), append_parent.clone()],
+            vec![append_eof, append_parent, replace],
+        ] {
+            assert_eq!(apply(body, &edits), Err(PatchError::Overlapping));
+        }
     }
 }

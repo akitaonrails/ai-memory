@@ -174,6 +174,13 @@ version in [`docs/changelog/`](docs/changelog/):
   session's handoff during admission, leaving the updated row accepted while
   the receiving agent got the older checkpoint text. (#2340)
 
+### Fixed
+
+- `memory_patch_page` now separates an inserted section body from a heading
+  at end of file even when the heading has no final newline. Previously,
+  replacing such a section silently appended the body to the heading text.
+  (#2311)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
