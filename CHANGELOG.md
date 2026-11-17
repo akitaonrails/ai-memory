@@ -62,6 +62,13 @@ version in [`docs/changelog/`](docs/changelog/):
   404, so a stale link, a mistyped URL or a fast series of probes cost a full
   table read each time. A real listing is unchanged.
 
+### Fixed
+
+- When the OpenCode version probe times out, the `--version` command it tells
+  you to run is now pasteable: the executable is quoted for the native shell
+  (behind PowerShell's `&` call operator on Windows) instead of printed bare,
+  so an npm install under a profile path with a space no longer splits.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
