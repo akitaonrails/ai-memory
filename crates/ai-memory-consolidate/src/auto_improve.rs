@@ -2509,10 +2509,6 @@ fn session_duration_from_span(first: Option<i64>, last: Option<i64>) -> u64 {
     u64::try_from(diff_us / 1_000_000).unwrap_or(0)
 }
 
-pub(crate) fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(CHARS_PER_TOKEN)
-}
-
 fn reviewer_fixed_input_bytes() -> usize {
     static FIXED_BYTES: LazyLock<usize> = LazyLock::new(|| {
         AUTO_IMPROVE_SYSTEM_PROMPT.len()
