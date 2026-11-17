@@ -541,6 +541,7 @@ jobs:
           --ignore GHSA-m665-v7pm-7grj
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0320
+          --ignore RUSTSEC-2026-0543
       - run: cargo audit --file companions/ai-memory-relay/Cargo.lock
       - run: cargo audit --file companions/ai-memory-importer/Cargo.lock
       - run: cargo audit --file companions/ai-memory-client/Cargo.lock

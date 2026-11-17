@@ -299,6 +299,41 @@ version in [`docs/changelog/`](docs/changelog/):
 - The cold-cluster dream pass prompt now resolves temporal state evolution
   and prioritizes explicit operator decisions, demoting superseded facts to
   history instead of retaining opposing statements as ambiguous conflicts. (#2297)
+- Every `/web` page now sends `Cache-Control: private, no-store`, the promise
+  `/api/v1` already made. Six handlers set it while the page-rendering
+  handlers did not, so the project page, a page body, its history, the session
+  timeline, search results and the inbox could be replayed from a shared
+  browser profile's cache or bfcache after the viewer had signed out. Static
+  assets are the deliberate exception: they carry no identity and keep their
+  own caching. (#2328)
+- The post-login redirect target rejects control characters. A URL parser
+  removes ASCII tab and newline characters before it reads the scheme, so
+  `?next=/%09/evil.example` reached the browser as `//evil.example` and sent
+  an operator off-site straight after a successful local login. Deployments
+  that mount the wiki at the host root were affected; the default `/web`
+  slug already refused the payload. (#2321)
+- A flag-based `ai-jail` launch forwards only the provider credentials the
+  launched harness reads, which is what the ai-jail wrapper contract already
+  did. On an ai-jail older than 3.0.1, or for a harness ai-jail has no preset
+  for, `ai-memory run --jail` handed the sandbox every provider key set in the
+  operator's environment, so a Codex session could read `ANTHROPIC_API_KEY`
+  and the other providers' tokens. An automatically chosen harness still
+  forwards what is set, because it is only resolved after the re-exec. (#2322)
+- The event relay warns when it would send `AI_MEMORY_AUTH_TOKEN` over plain
+  `http` to a host other than loopback. The token is the root bearer, and the
+  relay attached it to every batch without looking at the scheme, so an `http`
+  destination on a LAN or the internet published it to anything on the path.
+  Loopback `http` and every `https` destination stay quiet, and the deployment
+  is not refused; the warning names the destination so the operator can decide. (#2324)
+- Updated the locked `libz-sys` to the patched `1.1.33`, clearing
+  RUSTSEC-2026-0544 (a zlib heap buffer overflow in `gz_vacate()` reachable
+  through `git2`'s vendored libgit2) from the dependency gate. The transitive
+  `chrono` maintenance advisory RUSTSEC-2026-0543 (unmaintained, no patched
+  release, pulled through the MCP SDK and `schemars`) is a documented policy
+  exception in `deny.toml` and the CI audit until the SDK/schema dependencies
+  drop it; no vulnerability is demonstrated. (#2347)
+
+## [3.4.7] - 2026-11-15
 
 ### Fixed
 
