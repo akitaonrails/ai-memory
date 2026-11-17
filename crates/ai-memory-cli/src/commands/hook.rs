@@ -34,11 +34,11 @@ use crate::server_profiles::{self, ProfileName, Route as HookRoute};
 use sha2::{Digest as _, Sha256};
 
 use super::hook_capture::{
-    HookScope, build_client, canonical_context, capture_policy, extract_cwd, get_handoff,
-    hook_scope, inbox_notice_query_suffix, marker_capture_policy, marker_query_suffix,
-    marker_query_suffix_for_subagent_brief, marker_query_suffix_without_briefing,
-    marker_requests_briefing, marker_requests_inbox_notice, marker_requests_subagent_briefing,
-    resolve_cwd_with_fallbacks, url_encode,
+    HookScope, attach_fingerprint_suffix, build_client, canonical_context, capture_policy,
+    extract_cwd, get_handoff, hook_scope, inbox_notice_query_suffix, marker_capture_policy,
+    marker_query_suffix, marker_query_suffix_for_subagent_brief,
+    marker_query_suffix_without_briefing, marker_requests_briefing, marker_requests_inbox_notice,
+    marker_requests_subagent_briefing, resolve_cwd_with_fallbacks, url_encode,
 };
 use super::hook_drain_process;
 use super::hook_spool;
@@ -2262,8 +2262,20 @@ where
                 || session_qs.clone(),
                 |session_id| format!("&session_id={}", url_encode(session_id)),
             );
+            // Hook-driven workstream attach (#2113) is Claude-only for now and
+            // needs the host-computed repository fingerprints the server cannot
+            // derive. Compute them only here, on the once-per-session SessionStart
+            // fetch, never on the per-event hot path (they shell out to git).
+            let attach_fp_qs = if agent_kind == AgentKind::ClaudeCode {
+                policy_cwd
+                    .as_deref()
+                    .map(attach_fingerprint_suffix)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let handoff_url = format!(
-                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}",
+                "{base}/handoff?agent={}{qs}{managed_qs}{native_session_qs}{attach_fp_qs}",
                 args.agent
             );
             if let Some(handoff) =

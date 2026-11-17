@@ -433,6 +433,48 @@ fn marker_requests_briefing_with_home(cwd: &str, home: Option<&Path>, key: Brief
         .is_some_and(|value| is_truthy(&value))
 }
 
+/// Whether the nearest settings marker opted this checkout into hook-driven
+/// managed-workstream attach (`[workstream] attach_direct_launches`, #2113).
+/// Mirrors the `attach_on` read in [`build_marker_query_suffix`] so the
+/// fingerprint forwarding fires on exactly the checkouts that forward the flag.
+pub fn marker_requests_workstream_attach(cwd: &str) -> bool {
+    marker_requests_workstream_attach_with_home(cwd, home_dir().as_deref())
+}
+
+fn marker_requests_workstream_attach_with_home(cwd: &str, home: Option<&Path>) -> bool {
+    crate::marker::routing_selection_with_home(cwd, cwd, home, false)
+        .ok()
+        .flatten()
+        .and_then(|selection| {
+            crate::marker::parse_toml_section_flag(
+                &selection.path,
+                "workstream",
+                "attach_direct_launches",
+            )
+        })
+        .is_some_and(|value| crate::marker::is_truthy(&value))
+}
+
+/// The host-computed repository fingerprints for a hook-driven attach, as query
+/// flags (`&ws_repo_fp=…&ws_worktree_fp=…`), or empty when the checkout did not
+/// opt in or has no resolvable fingerprints. The server has no checkout, so it
+/// cannot derive these; attach fails closed without them. Computed ONLY on the
+/// Claude SessionStart handoff fetch — it shells out to git, so it must never
+/// ride the per-event hot path (bounded-hook invariant).
+pub fn attach_fingerprint_suffix(cwd: &str) -> String {
+    if !marker_requests_workstream_attach(cwd) {
+        return String::new();
+    }
+    match ai_memory_workstream::inspect_repository_fingerprints(Path::new(cwd)) {
+        Ok(fingerprints) => format!(
+            "&ws_repo_fp={}&ws_worktree_fp={}",
+            url_encode(&fingerprints.repo_fingerprint),
+            url_encode(&fingerprints.worktree_fingerprint),
+        ),
+        Err(_) => String::new(),
+    }
+}
+
 /// Host-side routing hints sent with native lifecycle events.
 /// Missing names are left to the server; this inspection creates no scope.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]

@@ -1893,6 +1893,68 @@ pub struct HandoffQuery {
     /// ignores it; the clients also send `handoff=0&recovery=0&profile_digest=0`
     /// so that server still returns only the notice.
     pub inbox_only: Option<String>,
+    /// `[workstream] attach_direct_launches` opt-in (#2113): a truthy value on
+    /// a SessionStart with no `managed_run` id lets a directly launched session
+    /// join a managed workstream using only its hooks. Paired with `ws_select`,
+    /// `ws_idle`, `ws_repo_fp`, `ws_worktree_fp`. Claude Code only for now.
+    pub ws_attach: Option<String>,
+    /// Which workstream a hook attach targets (`newest` / `new` / name).
+    pub ws_select: Option<String>,
+    /// Idle lease seconds for a hook attach, clamped server-side.
+    pub ws_idle: Option<String>,
+    /// Repository fingerprint the host hook computed for this checkout, required
+    /// to key the attached workstream. The server has no checkout of its own, so
+    /// attach fails closed unless the host forwards a well-formed sha256 here.
+    pub ws_repo_fp: Option<String>,
+    /// Worktree fingerprint the host hook computed for this checkout. Same
+    /// contract as `ws_repo_fp`.
+    pub ws_worktree_fp: Option<String>,
+}
+
+impl HandoffQuery {
+    /// The hook-driven attach request on this SessionStart, with the host-side
+    /// repository fingerprints, or `None` when the project did not opt in or the
+    /// fingerprints are missing/malformed (fail closed — the server never
+    /// derives them). Never returns a request for a non-Claude agent.
+    fn workstream_attach(&self, agent: AgentKind) -> Option<HookAttachRequest> {
+        if agent != AgentKind::ClaudeCode {
+            return None;
+        }
+        let params = crate::payload::AttachParams::parse(
+            self.ws_attach.as_deref(),
+            self.ws_select.as_deref(),
+            self.ws_idle.as_deref(),
+        )?;
+        let repo_fingerprint = accept_fingerprint(self.ws_repo_fp.as_deref())?;
+        let worktree_fingerprint = accept_fingerprint(self.ws_worktree_fp.as_deref())?;
+        Some(HookAttachRequest {
+            params,
+            repo_fingerprint,
+            worktree_fingerprint,
+        })
+    }
+}
+
+/// A validated hook-driven attach request: the parsed marker intent plus the
+/// host-computed repository fingerprints needed to key the workstream (#2113).
+#[derive(Debug, Clone)]
+struct HookAttachRequest {
+    params: crate::payload::AttachParams,
+    repo_fingerprint: String,
+    worktree_fingerprint: String,
+}
+
+/// Accept a forwarded repository/worktree fingerprint only when it is a lowercase
+/// hex sha256 (64 hex chars) — the exact shape `inspect_repository_fingerprints`
+/// produces. Anything else is a malformed or hostile value and attach fails
+/// closed rather than keying a workstream off attacker-chosen bytes.
+fn accept_fingerprint(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+    .then(|| value.to_string())
 }
 
 impl HandoffQuery {
@@ -2969,6 +3031,21 @@ async fn fetch_managed_context(
     actor: Option<&IdentityKey>,
 ) -> anyhow::Result<Option<PendingManagedContext>> {
     let Some(raw_run_id) = query.managed_run.as_deref() else {
+        // No wrapper run id. A directly launched session may still opt into a
+        // managed workstream through its hooks (#2113); the attach path derives
+        // the run from the native session id and the host-forwarded fingerprints.
+        if let Some(attach) = query.workstream_attach(agent) {
+            return fetch_attached_context(
+                state,
+                query,
+                agent,
+                workspace_id,
+                project_id,
+                actor,
+                attach,
+            )
+            .await;
+        }
         return Ok(None);
     };
     let Ok(run_id) = ManagedRunId::from_str(raw_run_id) else {
@@ -3072,6 +3149,251 @@ async fn fetch_managed_context(
     );
     Ok(Some(PendingManagedContext {
         run_id: selected_run_id,
+        markdown: rendered,
+    }))
+}
+
+/// Open or resume a hook-driven managed-workstream attach for a directly
+/// launched session (#2113), and render its start packet.
+///
+/// A re-delivered SessionStart is idempotent: when this native session already
+/// owns an active attached run in its own scope, the lease is renewed and that
+/// run's (still-undelivered) context is returned, never a second run. Only a
+/// genuinely new session opens a run, keyed by the host-forwarded fingerprints,
+/// and never steals another session's live workstream lease — a busy `newest`
+/// falls back to a fresh workstream instead.
+async fn fetch_attached_context(
+    state: &HookState,
+    query: &HandoffQuery,
+    agent: AgentKind,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    actor: Option<&IdentityKey>,
+    attach: HookAttachRequest,
+) -> anyhow::Result<Option<PendingManagedContext>> {
+    let Some(native_session_id) = query
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("hook attach SessionStart has no native session id");
+        return Ok(None);
+    };
+    let native_identity =
+        match ai_memory_core::NativeSessionIdentity::parse(native_session_id, &state.sanitizer) {
+            Ok(id) => id.into_string(),
+            Err(_) => {
+                warn!("hook attach SessionStart native identity is UNKNOWN; attach refused");
+                return Ok(None);
+            }
+        };
+    let Some(cwd) = query
+        .cwd
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("hook attach SessionStart has no checkout cwd");
+        return Ok(None);
+    };
+    let owner_user = crate::workstream::managed_run_owner_stamp(
+        &state.reader,
+        actor,
+        state.trusted_proxy_identity,
+    )
+    .await?;
+    let idle_micros = attach.params.lease_idle_secs.saturating_mul(1_000_000);
+
+    // Idempotent re-delivery: a native session already attached in this scope
+    // renews its own lease and returns that run's context. The owner+scope
+    // filter in `renew_attached_lease` fails a foreign operator closed.
+    if let Some(renewed) = state
+        .writer
+        .renew_attached_lease(
+            workspace_id,
+            project_id,
+            agent,
+            native_identity.clone(),
+            owner_user.clone(),
+            idle_micros,
+        )
+        .await?
+    {
+        return attached_run_packet(state, renewed.run_id, agent).await;
+    }
+
+    // Fresh attach. The run is created with the wrapper's 90s bootstrap lease,
+    // the native session is linked, then the lease is extended to the project's
+    // idle budget in the same way every later event will renew it.
+    let lease_owner = format!("hook-attach:{}", short_id(&native_identity));
+    let generated_name = attach_workstream_name(&native_identity);
+    let selection = match &attach.params.select {
+        crate::payload::AttachSelect::New => {
+            ai_memory_store::WorkstreamSelection::New(generated_name.clone())
+        }
+        crate::payload::AttachSelect::Named(name) => {
+            ai_memory_store::WorkstreamSelection::Named(name.clone())
+        }
+        crate::payload::AttachSelect::Newest => ai_memory_store::WorkstreamSelection::Current,
+    };
+    let make_input = |selection| ai_memory_store::PrepareWorkstreamRun {
+        workspace_id,
+        project_id,
+        scope_by_id: false,
+        repo_fingerprint: attach.repo_fingerprint.clone(),
+        worktree_fingerprint: attach.worktree_fingerprint.clone(),
+        cwd: cwd.to_owned(),
+        agent,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection,
+        lease_owner: lease_owner.clone(),
+    };
+    let prepared = match state
+        .writer
+        .prepare_workstream_run_owned(make_input(selection), owner_user.clone())
+        .await
+    {
+        Ok(prepared) => prepared,
+        // `newest` must never steal a live workstream lease held by a parallel
+        // session: fall back to a fresh workstream (the baton stays owned, #16).
+        Err(ai_memory_store::StoreError::WorkstreamBusy(_))
+            if matches!(attach.params.select, crate::payload::AttachSelect::Newest) =>
+        {
+            open_fresh_attach_workstream(state, make_input, &generated_name, owner_user.clone())
+                .await?
+        }
+        // A named workstream that does not exist yet is created, matching
+        // `run --new NAME` by-name semantics.
+        Err(ai_memory_store::StoreError::NotFound(_))
+            if matches!(attach.params.select, crate::payload::AttachSelect::Named(_)) =>
+        {
+            let name = match &attach.params.select {
+                crate::payload::AttachSelect::Named(name) => name.clone(),
+                _ => unreachable!("guarded by the matches! above"),
+            };
+            match state
+                .writer
+                .prepare_workstream_run_owned(
+                    make_input(ai_memory_store::WorkstreamSelection::New(name.clone())),
+                    owner_user.clone(),
+                )
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    warn!(error = %error, "hook attach could not create named workstream");
+                    return Ok(None);
+                }
+            }
+        }
+        Err(error) => {
+            warn!(error = %error, "hook attach could not open a run");
+            return Ok(None);
+        }
+    };
+
+    let linked = state
+        .writer
+        .link_or_adopt_managed_run_session(ai_memory_store::LinkOrAdoptManagedRunSession {
+            supplied_run_id: prepared.run_id,
+            workspace_id,
+            project_id,
+            cwd: cwd.to_owned(),
+            agent,
+            native_session_id: native_identity.clone(),
+            owner_user: owner_user.clone(),
+        })
+        .await?;
+    if !matches!(linked, ai_memory_store::ManagedRunSessionLink::Exact(_)) {
+        warn!(run = %prepared.run_id, link = ?linked, "hook attach could not link its native session");
+        return Ok(None);
+    }
+    // Extend the bootstrap lease to the project's idle budget.
+    state
+        .writer
+        .renew_attached_lease(
+            workspace_id,
+            project_id,
+            agent,
+            native_identity,
+            owner_user,
+            idle_micros,
+        )
+        .await?;
+    attached_run_packet(state, prepared.run_id, agent).await
+}
+
+/// Create a fresh attach workstream when `newest` found the current one busy.
+/// A name collision (a prior run of this same session that never linked) is
+/// resolved by selecting that existing workstream rather than failing.
+async fn open_fresh_attach_workstream(
+    state: &HookState,
+    make_input: impl Fn(ai_memory_store::WorkstreamSelection) -> ai_memory_store::PrepareWorkstreamRun,
+    generated_name: &str,
+    owner_user: Option<String>,
+) -> anyhow::Result<ai_memory_store::PreparedWorkstreamRun> {
+    match state
+        .writer
+        .prepare_workstream_run_owned(
+            make_input(ai_memory_store::WorkstreamSelection::New(
+                generated_name.to_owned(),
+            )),
+            owner_user.clone(),
+        )
+        .await
+    {
+        Ok(prepared) => Ok(prepared),
+        Err(ai_memory_store::StoreError::Duplicate(_)) => Ok(state
+            .writer
+            .prepare_workstream_run_owned(
+                make_input(ai_memory_store::WorkstreamSelection::Named(
+                    generated_name.to_owned(),
+                )),
+                owner_user,
+            )
+            .await?),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A shape-valid, per-session workstream name for an auto-created attach
+/// (`select = "new"`, or a `newest` no-steal fallback). Derived from the native
+/// session id so two sessions never collide and a retry of one reuses its name.
+fn attach_workstream_name(native_session_id: &str) -> String {
+    let token: String = native_session_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(16)
+        .collect();
+    if token.is_empty() {
+        "attach".to_string()
+    } else {
+        format!("attach-{token}")
+    }
+}
+
+/// Render the start packet for an attached run, or `None` when its context was
+/// already delivered or the run is no longer active.
+async fn attached_run_packet(
+    state: &HookState,
+    run_id: ManagedRunId,
+    agent: AgentKind,
+) -> anyhow::Result<Option<PendingManagedContext>> {
+    let Some(context) = state.reader.managed_run_context(run_id, 256).await? else {
+        return Ok(None);
+    };
+    if context.agent != agent || context.context_delivered {
+        return Ok(None);
+    }
+    let rendered = render_managed_context(
+        &context.events,
+        &context.workstream_name,
+        context.workstream_id,
+        context.sync_after,
+        context.previous_native_session.as_ref(),
+    );
+    Ok(Some(PendingManagedContext {
+        run_id,
         markdown: rendered,
     }))
 }
@@ -6742,6 +7064,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         }
     }
 
@@ -20150,6 +20473,7 @@ pub(crate) mod tests {
                     identity_src: None,
                     identity_style: None,
                     aliases: None,
+                    ..Default::default()
                 }),
                 Some(axum::Extension(ai_memory_core::ActorContext {
                     issuer: Some("https://idp.example".into()),
@@ -20779,6 +21103,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
         let state = Arc::new(state);
         let session_start = |viewer: Option<ai_memory_core::UserId>| {
@@ -20871,6 +21196,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
 
         let state = Arc::new(state);
@@ -20982,6 +21308,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
         let (status, body) = read_handoff_response(
             handle_handoff(
@@ -21180,6 +21507,7 @@ pub(crate) mod tests {
                     identity_src: None,
                     identity_style: None,
                     aliases: None,
+                    ..Default::default()
                 }),
                 None,
                 None,
@@ -22286,6 +22614,7 @@ pub(crate) mod tests {
                 identity_src: None,
                 identity_style: None,
                 aliases: None,
+                ..Default::default()
             },
             None,
             Vec::new(),
@@ -22372,6 +22701,7 @@ pub(crate) mod tests {
                 identity_src: None,
                 identity_style: None,
                 aliases: None,
+                ..Default::default()
             },
             None,
             Vec::new(),
@@ -22450,6 +22780,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
         let empty_sid = "empty-native-session";
         let rendered = fetch_and_accept_handoff(&state, query(empty_sid), None, Vec::new(), None)
@@ -22611,6 +22942,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
         let rendered = fetch_and_accept_handoff(&state, query.clone(), None, Vec::new(), None)
             .await
@@ -22652,6 +22984,211 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none(),
             "the combined handoff and managed packet must be delivered only once"
+        );
+    }
+
+    // ── #2113: hook-driven managed-workstream attach (SessionStart branch) ──
+
+    /// Build a Claude SessionStart handoff query that opts into hook attach, with
+    /// valid host-side fingerprints. `repo`/`tree` are the forwarded sha256s.
+    fn attach_query(
+        cwd: &str,
+        session_id: &str,
+        select: Option<&str>,
+        repo: &str,
+        tree: &str,
+    ) -> HandoffQuery {
+        HandoffQuery {
+            agent: Some("claude-code".into()),
+            cwd: Some(cwd.into()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            session_id: Some(session_id.into()),
+            ws_attach: Some("1".into()),
+            ws_select: select.map(Into::into),
+            ws_idle: Some("900".into()),
+            ws_repo_fp: Some(repo.into()),
+            ws_worktree_fp: Some(tree.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_attach_opens_and_links_a_workstream_for_a_direct_launch() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let repo = "a".repeat(64);
+        let tree = "b".repeat(64);
+
+        // No managed_run id (a direct launch), but the marker opted in: a brand
+        // new managed run is created and the native session linked to it.
+        let _ = fetch_and_accept_handoff(
+            &state,
+            attach_query(&cwd, "claude-fresh", Some("newest"), &repo, &tree),
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let active = state
+            .reader
+            .active_managed_run_native_session_ids()
+            .await
+            .unwrap();
+        assert_eq!(
+            active,
+            vec!["claude-fresh".to_string()],
+            "a hook attach must open and link exactly one managed run"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_attach_is_idempotent_across_redelivery() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let repo = "c".repeat(64);
+        let tree = "d".repeat(64);
+
+        for _ in 0..3 {
+            let _ = fetch_and_accept_handoff(
+                &state,
+                attach_query(&cwd, "claude-dup", Some("newest"), &repo, &tree),
+                None,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let active = state
+            .reader
+            .active_managed_run_native_session_ids()
+            .await
+            .unwrap();
+        assert_eq!(
+            active,
+            vec!["claude-dup".to_string()],
+            "a re-delivered SessionStart must renew, never fork a second run"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_attach_without_fingerprints_does_not_attach() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        // Opted in, but the host forwarded no (or malformed) fingerprints. The
+        // server cannot key a workstream and must fail closed — no run.
+        let mut query = attach_query(&cwd, "claude-nofp", Some("newest"), "", "");
+        query.ws_repo_fp = None;
+        query.ws_worktree_fp = Some("NOT-A-SHA".into());
+        let _ = fetch_and_accept_handoff(&state, query, None, Vec::new(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            state
+                .reader
+                .active_managed_run_native_session_ids()
+                .await
+                .unwrap()
+                .is_empty(),
+            "attach must fail closed without well-formed host fingerprints"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_attach_refuses_a_non_claude_agent() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let repo = "e".repeat(64);
+        let tree = "f".repeat(64);
+
+        let mut query = attach_query(&cwd, "codex-nope", Some("newest"), &repo, &tree);
+        query.agent = Some("codex".into());
+        let _ = fetch_and_accept_handoff(&state, query, None, Vec::new(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            state
+                .reader
+                .active_managed_run_native_session_ids()
+                .await
+                .unwrap()
+                .is_empty(),
+            "hook attach is Claude-only for now; a non-Claude agent must not attach"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_attach_newest_never_steals_a_busy_workstream() {
+        use ai_memory_store::{PrepareWorkstreamRun, WorkstreamSelection};
+
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let repo = "1".repeat(64);
+        let tree = "2".repeat(64);
+
+        // A parallel session already holds the current workstream for this exact
+        // checkout, with a live lease.
+        let busy = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: false,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: repo.clone(),
+                worktree_fingerprint: tree.clone(),
+                cwd: cwd.clone(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "busy:1".into(),
+            })
+            .await
+            .unwrap();
+
+        // `newest` finds the current workstream busy and must open a fresh one
+        // rather than steal the live lease (#16: batons are owned).
+        let _ = fetch_and_accept_handoff(
+            &state,
+            attach_query(&cwd, "claude-newest", Some("newest"), &repo, &tree),
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let attached = state
+            .reader
+            .managed_run_status(busy.run_id)
+            .await
+            .unwrap()
+            .expect("the busy run must still exist");
+        assert_eq!(
+            attached.state, "active",
+            "the pre-existing live lease must not be stolen by a hook attach"
+        );
+        let active = state
+            .reader
+            .active_managed_run_native_session_ids()
+            .await
+            .unwrap();
+        assert_eq!(
+            active,
+            vec!["claude-newest".to_string()],
+            "the attach must link its own fresh workstream, leaving the busy one untouched"
         );
     }
 
@@ -22734,6 +23271,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
 
         let named = ai_memory_core::ActorContext {
@@ -22821,6 +23359,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
 
         let rendered =
@@ -23254,6 +23793,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
 
         // Non-truthy opt-in: no handoff pending, nothing to inject.
@@ -23423,6 +23963,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         };
 
         let rendered =
@@ -24281,6 +24822,7 @@ pub(crate) mod tests {
                 identity_src: None,
                 identity_style: None,
                 aliases: None,
+                ..Default::default()
             },
             None,
             Vec::new(),
@@ -28564,6 +29106,7 @@ pub(crate) mod tests {
             identity_src: None,
             identity_style: None,
             aliases: None,
+            ..Default::default()
         }
     }
 
