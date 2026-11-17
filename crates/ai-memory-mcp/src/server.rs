@@ -12346,6 +12346,7 @@ mod tests {
             server
                 .memory_message_list(
                     Parameters(MessageListArgs {
+                        after_id: None,
                         r#box: None,
                         limit: None,
                         project: None,
@@ -12519,6 +12520,7 @@ mod tests {
             server
                 .memory_message_list(
                     Parameters(MessageListArgs {
+                        after_id: None,
                         r#box: None,
                         limit: None,
                         project: Some("project-b".into()),
@@ -12564,6 +12566,7 @@ mod tests {
             server
                 .memory_message_list(
                     Parameters(MessageListArgs {
+                        after_id: None,
                         r#box: None,
                         limit: None,
                         project: Some("project-b".into()),
@@ -12607,6 +12610,7 @@ mod tests {
             server
                 .memory_message_list(
                     Parameters(MessageListArgs {
+                        after_id: None,
                         r#box: None,
                         limit: None,
                         project: Some("project-b".into()),
@@ -12652,6 +12656,7 @@ mod tests {
             server
                 .memory_message_list(
                     Parameters(MessageListArgs {
+                        after_id: None,
                         r#box: None,
                         limit: None,
                         project: Some("project-b".into()),
@@ -12694,6 +12699,7 @@ mod tests {
             server
                 .memory_message_list(
                     Parameters(MessageListArgs {
+                        after_id: None,
                         r#box: None,
                         limit: None,
                         project: Some("scratch".into()),
@@ -12758,6 +12764,7 @@ mod tests {
             server
                 .memory_message_list(
                     Parameters(MessageListArgs {
+                        after_id: None,
                         r#box: None,
                         limit: None,
                         project: Some("project-b".into()),
