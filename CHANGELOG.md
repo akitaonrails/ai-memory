@@ -17,6 +17,13 @@ version in [`docs/changelog/`](docs/changelog/):
   received messages, including retained history. Name-based mailbox access and
   writes no longer skip that project as empty, and startup no longer reports
   it as an empty twin. (#2348, follow-up to #2018.)
+- CJK substring search now repairs a derived index row that an offline
+  maintenance edit removed, even after the startup backfill watermark (#2337)
+  has advanced past it. A direct SQL `UPDATE` of a page's or an observation's
+  indexed columns fires the defensive `_au` trigger that deletes the row's CJK
+  entry; the trigger now lowers that index's backfill watermark to the edited
+  row, so the next open rebuilds it instead of resuming past the hole. An idle
+  restart with no such edit keeps the O(1) resume. (#2344, follow-up to #2337)
 - Preserved the beginning and ending of long native user prompts and opted-in
   assistant Stop excerpts, so trailing corrections and final results survive
   client capping. Full-input sanitization, existing byte limits and server

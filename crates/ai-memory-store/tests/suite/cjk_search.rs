@@ -237,6 +237,110 @@ async fn superseded_cjk_text_is_hidden_and_startup_repairs_missing_index_rows() 
     assert_eq!(after_rebuild[0].path.as_str(), "repair.md");
 }
 
+/// #2344: once the startup backfill has persisted its watermark (#2337), an
+/// offline maintenance edit that fires a V87 `_au` trigger removes a derived
+/// CJK row at or below that watermark. The trigger lowers the matching CJK
+/// backfill watermark to the edited rowid, so the next open rebuilds the row
+/// and CJK substring search finds the new content again. Without the watermark
+/// lowering the reopen resumes past the hole and the search returns nothing —
+/// the regression that shipped unrepaired with #2337. This exercises the real
+/// maintenance mechanism (a direct source `UPDATE`), not a bare derived-row
+/// delete, so the trigger that owns the repair signal is the one under test.
+#[tokio::test]
+async fn startup_repairs_cjk_rows_edited_offline_past_the_watermark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "app").await;
+    store
+        .writer
+        .upsert_page(page(ws, project, "state.md", "状态", "旧版支付服务"))
+        .await
+        .unwrap();
+    let session_id = session(&store, ws, project).await;
+    observe(&store, ws, project, session_id, "旧版微信支付回调").await;
+    store.close().await;
+    drop(store);
+
+    // A warm open/close persists the backfill watermark at the current max
+    // rowid of each source table — the precondition #2337 introduced.
+    let warmed = Store::open(tmp.path()).unwrap();
+    warmed.close().await;
+    drop(warmed);
+
+    // Offline maintenance edits of a page and an observation. Each UPDATE fires
+    // the V87 `_au` trigger, which deletes the stale derived CJK row and (with
+    // the V105 fix) lowers that index's watermark to the edited rowid.
+    {
+        let db = rusqlite::Connection::open(tmp.path().join("db/memory.sqlite")).unwrap();
+        let page_rowid: i64 = db
+            .query_row(
+                "SELECT rowid FROM pages WHERE path = 'state.md' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "UPDATE pages SET body = '新版支付服务上线' WHERE rowid = ?1",
+            rusqlite::params![page_rowid],
+        )
+        .unwrap();
+        let obs_rowid: i64 = db
+            .query_row(
+                "SELECT rowid FROM observations WHERE body = '旧版微信支付回调' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "UPDATE observations SET body = '新版微信支付回调' WHERE rowid = ?1",
+            rusqlite::params![obs_rowid],
+        )
+        .unwrap();
+        // The triggers removed the derived rows: the holes the reopen must fill.
+        for (table, rowid) in [
+            ("pages_cjk_fts", page_rowid),
+            ("observations_cjk_fts", obs_rowid),
+        ] {
+            let present: bool = db
+                .query_row(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE rowid = ?1)"),
+                    rusqlite::params![rowid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                !present,
+                "the _au trigger must delete the stale {table} row"
+            );
+        }
+    }
+
+    store = Store::open(tmp.path()).unwrap();
+    let repaired_page = store
+        .reader
+        .search_pages_for_project(ws, project, "新版支付".into(), 10, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        repaired_page.len(),
+        1,
+        "a page edited offline was not repaired"
+    );
+    assert_eq!(repaired_page[0].path.as_str(), "state.md");
+
+    let repaired_obs = store
+        .reader
+        .search_observations_for_project(ws, project, "新版微信".into(), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        repaired_obs.len(),
+        1,
+        "an observation edited offline was not repaired"
+    );
+    assert_eq!(repaired_obs[0].session_id, session_id);
+}
+
 #[tokio::test]
 async fn cjk_stream_does_not_fuse_back_a_not_excluded_term() {
     let tmp = tempfile::tempdir().unwrap();
