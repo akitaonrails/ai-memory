@@ -37,7 +37,7 @@ pub(crate) async fn global_handler(
 ) -> Response {
     let viewer_id = viewer.map(|axum::Extension(viewer)| viewer.user());
     match render_global(&i18n, &state, viewer_id).await {
-        Ok(html) => html.into_response(),
+        Ok(Html(body)) => super::private_page(body),
         Err(status) => status.into_response(),
     }
 }
@@ -63,7 +63,7 @@ pub(crate) async fn project_handler(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     match render_project(&i18n, &workspace, &project, graph) {
-        Ok(html) => html.into_response(),
+        Ok(Html(body)) => super::private_page(body),
         Err(status) => status.into_response(),
     }
 }

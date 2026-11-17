@@ -1912,8 +1912,10 @@ the server URL is loopback and no `default` server profile is registered.
   a concurrent write replaced stays visible (invariant #16). TTL expiry still
   applies: an expired version is neither listed nor readable by id, and a page
   whose live version expired shows no history, since the forget sweep deletes
-  every row at its path. The link graph is a circular SVG plus an edge table;
-  larger layouts and interactive clustering remain open. See
+  every row at its path. The link graph is a circular SVG plus an edge table.
+  Both graph views send `Cache-Control: private, no-store`, as the other
+  viewer-dependent HTML pages do.
+  Larger layouts and interactive clustering remain open. See
   [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
 * **Retrieval measurement gaps.** The LongMemEval-S harness ships in
   `evals/` (pipeline, component and decomposition modes; results in

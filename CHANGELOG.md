@@ -17,6 +17,11 @@ version in [`docs/changelog/`](docs/changelog/):
   refusal. Once the entry is repaired, the next checkpoint includes the earlier
   writes even when another write was reported in the meantime, instead of waiting
   for the periodic sweep. (#2345, follow-up to #2337.)
+- Applied the rendered-page `Cache-Control: private, no-store` policy to both
+  wiki graph views (`/web/graph` and `/web/w/<workspace>/<project>/graph`).
+  These viewer-dependent HTML responses had been omitted from that policy.
+  (#2346, follow-up to #2328)
+
 - A turn that ends without a normal `Stop` now leaves a turn end. Claude Code
   and Qwen Code fire `StopFailure` instead when an API error (a rate limit, an
   exhausted balance) ends the turn, Kimi Code fires `StopFailure` or
