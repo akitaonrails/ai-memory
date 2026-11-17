@@ -213,6 +213,13 @@ version in [`docs/changelog/`](docs/changelog/):
   destination on a LAN or the internet published it to anything on the path.
   Loopback `http` and every `https` destination stay quiet, and the deployment
   is not refused; the warning names the destination so the operator can decide. (#2324)
+- A native transcript read refuses anything that is not a regular file, so a
+  symlink planted at the session file it was about to open is no longer
+  followed. The lookup validated the path and then reopened it by name, which
+  left a window for the file to be swapped between the two, and a FIFO put
+  there could stall the read. The open now uses `O_NOFOLLOW` with a descriptor
+  comparison, the way the Antigravity transcript reader already did; a
+  transcript reached through a symlinked home still reads.
 
 ## [3.4.7] - 2026-11-15
 
