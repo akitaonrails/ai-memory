@@ -1958,6 +1958,130 @@ async fn a_canonical_name_shadowed_by_an_empty_twin_reaches_the_repository_owner
     );
 }
 
+#[tokio::test]
+async fn canonical_twin_with_pending_inbox_keeps_coordinate_ambiguous() {
+    assert_messages_keep_canonical_twin_nonempty(ai_memory_core::MessageBox::Inbox).await;
+}
+
+#[tokio::test]
+async fn canonical_twin_with_pending_outbox_keeps_coordinate_ambiguous() {
+    assert_messages_keep_canonical_twin_nonempty(ai_memory_core::MessageBox::Outbox).await;
+}
+
+async fn assert_messages_keep_canonical_twin_nonempty(mailbox: ai_memory_core::MessageBox) {
+    use ai_memory_core::{MessageNature, NewAgentMessage};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, owner, twin) = owner_and_empty_canonical_twin(&store).await;
+    let peer = store
+        .writer
+        .get_or_create_project(ws, "peer", None)
+        .await
+        .unwrap();
+    let message = |sender, recipient| NewAgentMessage {
+        from_workspace_id: ws,
+        from_project_id: sender,
+        from_agent: AgentKind::Codex,
+        from_session_id: None,
+        from_owner_user: None,
+        to_workspace_id: ws,
+        to_project_id: recipient,
+        to_agent: None,
+        subject: Some("pending work".into()),
+        body: "The legacy project still owns this message.".into(),
+        nature: MessageNature::Unknown,
+        evidence: None,
+    };
+    let unrelated = store
+        .writer
+        .insert_message(message(owner, peer))
+        .await
+        .unwrap();
+    assert_eq!(
+        lookup_existing_scope(&store.reader, "default", "acme-api")
+            .await
+            .unwrap()
+            .project_id,
+        owner,
+        "unrelated messages must not make an empty twin ambiguous"
+    );
+    let (sender, recipient) = match mailbox {
+        ai_memory_core::MessageBox::Inbox => (peer, twin),
+        ai_memory_core::MessageBox::Outbox => (twin, peer),
+    };
+    let own = store
+        .writer
+        .insert_message(message(sender, recipient))
+        .await
+        .unwrap();
+    let direct = store
+        .reader
+        .list_messages(ws, twin, mailbox, 10)
+        .await
+        .unwrap();
+    assert_eq!(direct.len(), 1);
+    let error = lookup_existing_scope(&store.reader, "default", "acme-api")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ScopeResolutionError::ProjectNameAmbiguous { .. }
+    ));
+    let error =
+        create_explicit_scope_guarded(&store.reader, &store.writer, "default", "acme-api", None)
+            .await
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        ScopeResolutionError::ProjectNameAmbiguous { .. }
+    ));
+    assert_eq!(
+        store
+            .reader
+            .list_messages(ws, twin, mailbox, 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "refusing the ambiguous coordinate must preserve the message"
+    );
+    assert_eq!(
+        lookup_existing_scope(&store.reader, "default", "api")
+            .await
+            .unwrap()
+            .project_id,
+        owner,
+        "the repository owner's own name still reaches it"
+    );
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let projects: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        projects, 3,
+        "a refused lookup must not create another project"
+    );
+    conn.execute("DELETE FROM agent_messages WHERE id = ?1", [own.as_bytes()])
+        .unwrap();
+    let retained: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_messages WHERE id = ?1",
+            [unrelated.as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1, "the unrelated message remains as a control");
+    assert_eq!(
+        lookup_existing_scope(&store.reader, "default", "acme-api")
+            .await
+            .unwrap()
+            .project_id,
+        owner,
+        "removing the twin's message restores empty-twin routing"
+    );
+}
+
 /// Adversarial: a twin that holds data, or any restricted candidate, keeps the
 /// name ambiguous. The refusal says which project owns the repository, which
 /// is empty, what to pass instead and how to move an empty one aside, and
