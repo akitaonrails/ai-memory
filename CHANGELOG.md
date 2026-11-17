@@ -213,6 +213,13 @@ version in [`docs/changelog/`](docs/changelog/):
   destination on a LAN or the internet published it to anything on the path.
   Loopback `http` and every `https` destination stay quiet, and the deployment
   is not refused; the warning names the destination so the operator can decide. (#2324)
+- Updated the locked `libz-sys` to the patched `1.1.33`, clearing
+  RUSTSEC-2026-0544 (a zlib heap buffer overflow in `gz_vacate()` reachable
+  through `git2`'s vendored libgit2) from the dependency gate. The transitive
+  `chrono` maintenance advisory RUSTSEC-2026-0543 (unmaintained, no patched
+  release, pulled through the MCP SDK and `schemars`) is a documented policy
+  exception in `deny.toml` and the CI audit until the SDK/schema dependencies
+  drop it; no vulnerability is demonstrated. (#2347)
 
 ## [3.4.7] - 2026-11-15
 

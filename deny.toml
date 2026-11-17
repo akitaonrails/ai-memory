@@ -21,6 +21,12 @@ ignore = [
     # embeddings); no runtime code ships from it. Revisit when candle
     # replaces it upstream.
     "RUSTSEC-2024-0436",
+    # RUSTSEC-2026-0543: `chrono` is flagged unmaintained, with no patched
+    # release available. It is pulled transitively through `rmcp` (the MCP SDK)
+    # and `schemars`; nothing in this repository depends on it directly, and no
+    # vulnerability is demonstrated — this is a maintenance advisory only.
+    # Revisit when the SDK/schema dependencies drop or replace chrono upstream.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
