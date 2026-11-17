@@ -155,6 +155,13 @@ const fn journal_rewrites_in_place(harness: ManagedHarness) -> bool {
 struct SqlCursor {
     updated: i64,
     id: String,
+    // OpenCode's native stores stamp `time_updated` with millisecond
+    // `Date.now()`, not a unique revision number, so an in-place update keeps
+    // the same `(updated, id)` pair. The boundary fingerprints every record at
+    // `updated` so a same-millisecond revision is detected as changed instead
+    // of silently skipped. Legacy cursors omit it and fall back to id ordering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    boundary: Vec<RecordRevision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -162,13 +169,30 @@ struct CrushCursor {
     updated: i64,
     id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    boundary: Vec<CrushRevision>,
+    boundary: Vec<RecordRevision>,
 }
 
+/// A record's id paired with a content fingerprint, so a cursor can tell an
+/// unchanged boundary record from an in-place revision at the same timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct CrushRevision {
+struct RecordRevision {
     id: String,
     digest: String,
+}
+
+/// Whether a boundary already acknowledges `revision`: an exact fingerprint
+/// match when fingerprints were captured, else the legacy id-ordering fallback
+/// for a cursor persisted before boundaries existed.
+fn boundary_acknowledges(
+    boundary: &[RecordRevision],
+    boundary_id: &str,
+    revision: &RecordRevision,
+) -> bool {
+    if boundary.is_empty() {
+        revision.id.as_str() <= boundary_id
+    } else {
+        boundary.iter().any(|known| known == revision)
+    }
 }
 
 /// Export unseen visible transcript records for one native session.
@@ -532,31 +556,18 @@ fn transcript_baseline_blocking(
     session_dir: Option<&Path>,
     native_session_id: &str,
 ) -> Result<String> {
-    let sql_cursor = |db: PathBuf, sql: &str| -> Result<String> {
-        let connection = Connection::open_with_flags(
-            &db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        let cursor = connection
-            .query_row(sql, params![native_session_id], |row| {
-                Ok(SqlCursor {
-                    updated: row.get(0)?,
-                    id: row.get(1)?,
-                })
-            })
-            .optional()?
-            .unwrap_or_default();
-        Ok(serde_json::to_string(&cursor)?)
-    };
+    let sql_cursor =
+        |db: PathBuf, capture: &dyn Fn(&Connection, &str) -> Result<SqlCursor>| -> Result<String> {
+            let connection = Connection::open_with_flags(
+                &db,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            let cursor = capture(&connection, native_session_id)?;
+            Ok(serde_json::to_string(&cursor)?)
+        };
     match harness {
-        ManagedHarness::OpenCode => sql_cursor(
-            opencode_db(home, session_dir),
-            "SELECT p.time_updated, p.id FROM part p WHERE p.session_id = ?1 ORDER BY p.time_updated DESC, p.id DESC LIMIT 1",
-        ),
-        ManagedHarness::OpenCode2 => sql_cursor(
-            opencode_db(home, session_dir),
-            "SELECT time_updated, id FROM session_message WHERE session_id = ?1 ORDER BY time_updated DESC, id DESC LIMIT 1",
-        ),
+        ManagedHarness::OpenCode => sql_cursor(opencode_db(home, session_dir), &opencode_cursor),
+        ManagedHarness::OpenCode2 => sql_cursor(opencode_db(home, session_dir), &opencode2_cursor),
         ManagedHarness::Crush => crush_cursor(
             &Connection::open_with_flags(
                 crush_db(home, cwd, session_dir),
@@ -3455,6 +3466,63 @@ fn export_opencode(
     export_opencode_range(home, session_dir, session, source_cursor, None)
 }
 
+/// Fingerprint one OpenCode part so a same-millisecond in-place revision is
+/// distinguishable from the record the cursor already acknowledged.
+fn opencode_revision(id: &str, part: &str) -> RecordRevision {
+    let seed = format!("{id}\0{part}");
+    RecordRevision {
+        id: id.to_owned(),
+        digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
+    }
+}
+
+/// Capture OpenCode's end-of-session cursor, fingerprinting every part sharing
+/// the newest `time_updated` so a later in-place revision at that millisecond is
+/// still emitted. Pins one read snapshot when the caller holds none.
+fn opencode_cursor(connection: &Connection, session: &str) -> Result<SqlCursor> {
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let newest = connection
+        .query_row(
+            "SELECT p.time_updated, p.id FROM part p WHERE p.session_id = ?1 \
+             ORDER BY p.time_updated DESC, p.id DESC LIMIT 1",
+            [session],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((updated, id)) = newest else {
+        return Ok(SqlCursor::default());
+    };
+    let mut statement = connection.prepare(
+        "SELECT p.id, p.data FROM part p WHERE p.session_id = ?1 AND p.time_updated = ?2 \
+         ORDER BY p.id LIMIT ?3",
+    )?;
+    let boundary = statement
+        .query_map(
+            params![session, updated, (MAX_SOURCE_RECORDS + 1) as i64],
+            |row| {
+                Ok(opencode_revision(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if boundary.len() > MAX_SOURCE_RECORDS {
+        return Err(anyhow!(
+            "OpenCode cursor boundary exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+        ));
+    }
+    Ok(SqlCursor {
+        updated,
+        id,
+        boundary,
+    })
+}
+
 fn export_opencode_range(
     home: &Path,
     session_dir: Option<&Path>,
@@ -3473,6 +3541,9 @@ fn export_opencode_range(
             db.display()
         )
     })?;
+    // The event query and the recomputed cursor must share one snapshot so a
+    // native WAL commit between them cannot advance the cursor past unseen rows.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
@@ -3483,26 +3554,35 @@ fn export_opencode_range(
         .unwrap_or(SqlCursor {
             updated: i64::MAX,
             id: "\u{10ffff}".to_string(),
+            boundary: Vec::new(),
         });
+    // A boundary-carrying cursor re-reads every part at its timestamp and
+    // re-emits only the revisions whose fingerprint changed; a legacy cursor
+    // without one keeps the strict id-ordering scan.
+    let revisit_boundary = i64::from(!cursor.boundary.is_empty());
+    let query_limit = MAX_SOURCE_RECORDS
+        .checked_add(cursor.boundary.len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("OpenCode transcript query limit overflow"))?;
     let mut statement = connection.prepare(
         "SELECT p.id, p.time_updated, length(m.data), length(p.data), m.data, p.data
          FROM part p JOIN message m ON m.id = p.message_id
-         WHERE p.session_id = ?1 AND (p.time_updated > ?2 OR (p.time_updated = ?2 AND p.id > ?3))
-           AND (p.time_updated < ?4 OR (p.time_updated = ?4 AND p.id <= ?5))
+         WHERE p.session_id = ?1
+           AND (p.time_updated > ?2 OR (p.time_updated = ?2 AND (?3 = 1 OR p.id > ?4)))
+           AND p.time_updated <= ?5
          ORDER BY p.time_updated, p.id
          LIMIT ?6",
     )?;
     let mut rows = statement.query(params![
         session,
         cursor.updated,
+        revisit_boundary,
         cursor.id,
         upper.updated,
-        upper.id,
-        (MAX_SOURCE_RECORDS + 1) as i64
+        query_limit as i64
     ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
-    let mut next_cursor = cursor;
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
@@ -3527,10 +3607,16 @@ fn export_opencode_range(
         let id = row.get::<_, String>(0)?;
         let message_raw = row.get::<_, String>(4)?;
         let part_raw = row.get::<_, String>(5)?;
-        next_cursor = SqlCursor {
-            updated,
-            id: id.clone(),
-        };
+        let revision = opencode_revision(&id, &part_raw);
+        if updated == cursor.updated
+            && boundary_acknowledges(&cursor.boundary, &cursor.id, &revision)
+        {
+            continue;
+        }
+        if updated == upper.updated && !boundary_acknowledges(&upper.boundary, &upper.id, &revision)
+        {
+            continue;
+        }
         let Ok(message) = serde_json::from_str::<Value>(&message_raw) else {
             losses.push(format!("malformed OpenCode message for part {id}"));
             continue;
@@ -3548,6 +3634,11 @@ fn export_opencode_range(
             0,
         )?;
     }
+    let next_cursor = if final_cursor.is_some() {
+        upper
+    } else {
+        opencode_cursor(&connection, session)?
+    };
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
         source_cursor: Some(serde_json::to_string(&next_cursor)?),
@@ -3567,9 +3658,9 @@ fn export_crush(
     export_crush_range(home, cwd, session_dir, session, source_cursor, None)
 }
 
-fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> CrushRevision {
+fn crush_revision(id: &str, role: &str, parts: &str, is_summary: i64) -> RecordRevision {
     let seed = format!("{id}\0{role}\0{is_summary}\0{parts}");
-    CrushRevision {
+    RecordRevision {
         id: id.to_owned(),
         digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
     }
@@ -3639,20 +3730,12 @@ fn crush_cursor_inner(
     })
 }
 
-fn crush_revision_is_known(cursor: &CrushCursor, revision: &CrushRevision) -> bool {
-    if cursor.boundary.is_empty() {
-        revision.id <= cursor.id
-    } else {
-        cursor.boundary.iter().any(|known| known == revision)
-    }
+fn crush_revision_is_known(cursor: &CrushCursor, revision: &RecordRevision) -> bool {
+    boundary_acknowledges(&cursor.boundary, &cursor.id, revision)
 }
 
-fn crush_revision_is_within(cursor: &CrushCursor, revision: &CrushRevision) -> bool {
-    if cursor.boundary.is_empty() {
-        revision.id <= cursor.id
-    } else {
-        cursor.boundary.iter().any(|known| known == revision)
-    }
+fn crush_revision_is_within(cursor: &CrushCursor, revision: &RecordRevision) -> bool {
+    boundary_acknowledges(&cursor.boundary, &cursor.id, revision)
 }
 
 fn export_crush_range(
@@ -5909,6 +5992,64 @@ fn export_opencode2(
     export_opencode2_range(home, session_dir, session, source_cursor, None)
 }
 
+/// Fingerprint one OpenCode 2 message so a same-millisecond in-place revision is
+/// distinguishable from the record the cursor already acknowledged.
+fn opencode2_revision(id: &str, message_type: &str, data: &str) -> RecordRevision {
+    let seed = format!("{id}\0{message_type}\0{data}");
+    RecordRevision {
+        id: id.to_owned(),
+        digest: format!("{:x}", Sha256::digest(seed.as_bytes())),
+    }
+}
+
+/// Capture OpenCode 2's end-of-session cursor, fingerprinting every message
+/// sharing the newest `time_updated`. Pins one read snapshot when the caller
+/// holds none.
+fn opencode2_cursor(connection: &Connection, session: &str) -> Result<SqlCursor> {
+    let _snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let newest = connection
+        .query_row(
+            "SELECT time_updated, id FROM session_message WHERE session_id = ?1 \
+             ORDER BY time_updated DESC, id DESC LIMIT 1",
+            [session],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((updated, id)) = newest else {
+        return Ok(SqlCursor::default());
+    };
+    let mut statement = connection.prepare(
+        "SELECT id, type, data FROM session_message \
+         WHERE session_id = ?1 AND time_updated = ?2 ORDER BY id LIMIT ?3",
+    )?;
+    let boundary = statement
+        .query_map(
+            params![session, updated, (MAX_SOURCE_RECORDS + 1) as i64],
+            |row| {
+                Ok(opencode2_revision(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    &row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if boundary.len() > MAX_SOURCE_RECORDS {
+        return Err(anyhow!(
+            "OpenCode cursor boundary exceeds the {MAX_SOURCE_RECORDS} source-record limit"
+        ));
+    }
+    Ok(SqlCursor {
+        updated,
+        id,
+        boundary,
+    })
+}
+
 fn export_opencode2_range(
     home: &Path,
     session_dir: Option<&Path>,
@@ -5927,6 +6068,9 @@ fn export_opencode2_range(
             db.display()
         )
     })?;
+    // The event query and the recomputed cursor must share one snapshot so a
+    // native WAL commit between them cannot advance the cursor past unseen rows.
+    let _snapshot = connection.unchecked_transaction()?;
     let cursor = source_cursor
         .and_then(|raw| serde_json::from_str::<SqlCursor>(raw).ok())
         .unwrap_or_default();
@@ -5937,24 +6081,33 @@ fn export_opencode2_range(
         .unwrap_or(SqlCursor {
             updated: i64::MAX,
             id: "\u{10ffff}".to_string(),
+            boundary: Vec::new(),
         });
+    // A boundary-carrying cursor re-reads every message at its timestamp and
+    // re-emits only the revisions whose fingerprint changed; a legacy cursor
+    // without one keeps the strict id-ordering scan.
+    let revisit_boundary = i64::from(!cursor.boundary.is_empty());
+    let query_limit = MAX_SOURCE_RECORDS
+        .checked_add(cursor.boundary.len())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow!("OpenCode transcript query limit overflow"))?;
     let mut statement = connection.prepare(
         "SELECT id, time_updated, type, length(data), data FROM session_message \
-         WHERE session_id = ?1 AND (time_updated > ?2 OR (time_updated = ?2 AND id > ?3)) \
-           AND (time_updated < ?4 OR (time_updated = ?4 AND id <= ?5)) \
+         WHERE session_id = ?1 \
+           AND (time_updated > ?2 OR (time_updated = ?2 AND (?3 = 1 OR id > ?4))) \
+           AND time_updated <= ?5 \
          ORDER BY time_updated, id LIMIT ?6",
     )?;
     let mut rows = statement.query(params![
         session,
         cursor.updated,
+        revisit_boundary,
         cursor.id,
         upper.updated,
-        upper.id,
-        (MAX_SOURCE_RECORDS + 1) as i64
+        query_limit as i64
     ])?;
     let mut events = Vec::new();
     let mut losses = Vec::new();
-    let mut next_cursor = cursor;
     let mut source_bytes = 0_usize;
     let mut checked_events = 0_usize;
     let mut event_bytes = 0_usize;
@@ -5978,10 +6131,16 @@ fn export_opencode2_range(
         let updated = row.get::<_, i64>(1)?;
         let message_type = row.get::<_, String>(2)?;
         let data_raw = row.get::<_, String>(4)?;
-        next_cursor = SqlCursor {
-            updated,
-            id: id.clone(),
-        };
+        let revision = opencode2_revision(&id, &message_type, &data_raw);
+        if updated == cursor.updated
+            && boundary_acknowledges(&cursor.boundary, &cursor.id, &revision)
+        {
+            continue;
+        }
+        if updated == upper.updated && !boundary_acknowledges(&upper.boundary, &upper.id, &revision)
+        {
+            continue;
+        }
         let Ok(data) = serde_json::from_str::<Value>(&data_raw) else {
             losses.push(format!("malformed OpenCode 2 message {id}"));
             continue;
@@ -5995,6 +6154,11 @@ fn export_opencode2_range(
             0,
         )?;
     }
+    let next_cursor = if final_cursor.is_some() {
+        upper
+    } else {
+        opencode2_cursor(&connection, session)?
+    };
     Ok(ExportedTranscript {
         native_session_id: session.to_string(),
         source_cursor: Some(serde_json::to_string(&next_cursor)?),
@@ -9849,6 +10013,132 @@ mod tests {
         assert_eq!(events[0].role.as_deref(), Some("tool"));
         assert!(events[0].content.contains("file contents"));
         assert_eq!(events[0].metadata["tool"], "read");
+    }
+
+    #[test]
+    fn opencode_cursor_keeps_same_millisecond_revisions() {
+        check_opencode_cursor_revisions(ManagedHarness::OpenCode);
+    }
+
+    #[test]
+    fn opencode2_cursor_keeps_same_millisecond_revisions() {
+        check_opencode_cursor_revisions(ManagedHarness::OpenCode2);
+    }
+
+    /// OpenCode's native stores stamp `time_updated` with millisecond
+    /// `Date.now()`, so updating a record in place keeps the same `(updated, id)`
+    /// pair. The incremental cursor must still re-emit that revision (and a
+    /// same-millisecond insert) without replaying unchanged records, keep exact
+    /// recovery intervals, and stay compatible with pair-only legacy cursors.
+    fn check_opencode_cursor_revisions(harness: ManagedHarness) {
+        let home = tempfile::tempdir().unwrap();
+        let db = opencode_db(home.path(), None);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, data TEXT);\
+                 CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,\
+                                   time_updated INTEGER, data TEXT);\
+                 CREATE TABLE session_message(id TEXT PRIMARY KEY, session_id TEXT, type TEXT,\
+                                             time_updated INTEGER, data TEXT);\
+                 INSERT INTO message VALUES ('m', 's', '{\"role\":\"assistant\"}');",
+            )
+            .unwrap();
+        let write = |id: &str, updated: i64, text: &str| {
+            let (sql, data) = if harness == ManagedHarness::OpenCode {
+                (
+                    "INSERT OR REPLACE INTO part VALUES (?1, 'm', 's', ?2, ?3)",
+                    json!({"type":"text", "text":text}),
+                )
+            } else {
+                (
+                    "INSERT OR REPLACE INTO session_message VALUES (?1, 's', 'assistant', ?2, ?3)",
+                    json!({"content":[{"type":"text", "text":text}]}),
+                )
+            };
+            connection
+                .execute(sql, params![id, updated, data.to_string()])
+                .unwrap();
+        };
+        let export = |start: Option<&str>, end: Option<&str>| {
+            export_transcript_blocking(harness, home.path(), home.path(), None, "s", start, end)
+                .unwrap()
+        };
+
+        // An empty session has no revision to acknowledge, so its baseline stays
+        // the pair-only shape old installs already persisted.
+        let empty =
+            transcript_baseline_blocking(harness, home.path(), home.path(), None, "s").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&empty).unwrap(),
+            json!({"updated":0, "id":""})
+        );
+
+        write("2000", 100, "unchanged");
+        write("f000", 100, "first");
+        let first = export(Some(&empty), None);
+        // The incremental export from the empty cursor matches a full export.
+        assert_eq!(
+            transcript_interval_digests(&first.events),
+            transcript_interval_digests(&export(None, None).events)
+        );
+        assert_eq!(exported_texts(&first), ["unchanged", "first"]);
+        // The returned cursor equals a standalone baseline of the same snapshot.
+        let baseline =
+            transcript_baseline_blocking(harness, home.path(), home.path(), None, "s").unwrap();
+        assert_eq!(first.source_cursor.as_deref(), Some(baseline.as_str()));
+
+        // A lower-id insert and an in-place update, both at the saved timestamp.
+        write("1000", 100, "same-millisecond insert");
+        write("f000", 100, "same-millisecond update");
+        let second = export(Some(&baseline), None);
+        assert_eq!(
+            exported_texts(&second),
+            ["same-millisecond insert", "same-millisecond update"],
+            "the lower-id insert and the same-(timestamp, id) update must both surface"
+        );
+        // Re-exporting the acknowledged snapshot replays nothing: the unchanged
+        // boundary record is not re-emitted.
+        assert!(
+            export(second.source_cursor.as_deref(), None)
+                .events
+                .is_empty()
+        );
+
+        // Exact ranges still bound by the captured endpoints, old and new.
+        assert_eq!(
+            exported_texts(&export(None, Some(&baseline))),
+            ["unchanged"]
+        );
+        let exact = export(Some(&baseline), second.source_cursor.as_deref());
+        assert_eq!(exported_texts(&exact), exported_texts(&second));
+
+        // A later millisecond advances past the recovered boundary cleanly.
+        write("g000", 101, "next-millisecond control");
+        let third = export(second.source_cursor.as_deref(), None);
+        assert_eq!(exported_texts(&third), ["next-millisecond control"]);
+        assert!(
+            export(third.source_cursor.as_deref(), None)
+                .events
+                .is_empty()
+        );
+
+        // A legacy pair-only cursor (no boundary) still deserializes and keeps
+        // its original strict id-ordering semantics at the boundary timestamp.
+        let legacy = json!({"updated":100, "id":"f000"}).to_string();
+        assert_eq!(
+            exported_texts(&export(Some(&legacy), None)),
+            ["next-millisecond control"]
+        );
+        assert_eq!(
+            exported_texts(&export(None, Some(&legacy))),
+            [
+                "same-millisecond insert",
+                "unchanged",
+                "same-millisecond update"
+            ]
+        );
     }
 
     #[test]

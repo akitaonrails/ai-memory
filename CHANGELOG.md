@@ -11,6 +11,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- OpenCode and OpenCode 2 incremental transcript exports no longer silently drop
+  a visible record revision whose `time_updated` equals the saved cursor
+  timestamp. Both native stores stamp `time_updated` with millisecond
+  `Date.now()` rather than a unique revision number, so an in-place update kept
+  the same `(time_updated, id)` pair and the strict-greater cursor predicate
+  returned no event. The cursor now fingerprints every record in the newest
+  millisecond bucket, re-emitting same-millisecond revisions and lower-id
+  inserts without replaying unchanged records, preserving exact recovery
+  intervals and single-snapshot reads, and still accepting the pair-only cursors
+  earlier installs persisted. (#2338)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
