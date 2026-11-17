@@ -161,6 +161,12 @@ version in [`docs/changelog/`](docs/changelog/):
   suffix. The documented stem-only value matched no such page and could make
   `sync --check` report an omitted repository page as already in sync. (#2315)
 
+### Fixed
+
+- Preserved quoted full-text search phrases as contiguous, ordered terms
+  instead of matching their words independently. Quoted CJK queries use the
+  primary FTS stream so substring expansion cannot widen the phrase. (#2278)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
