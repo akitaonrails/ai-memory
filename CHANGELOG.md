@@ -118,6 +118,13 @@ version in [`docs/changelog/`](docs/changelog/):
   when `AI_MEMORY_AUTH_TOKEN` overrides it for that command. Previously the
   credential cleanup deleted a root token under `auth-tokens/`, leaving the
   unchanged config unable to start the server without the override. (#2339)
+- Preserved the configured root bearer during uninstall when
+  `auth.bearer_token_file` names a file below a subdirectory of `auth-tokens`,
+  or an absolute path that reaches it through a directory alias (on macOS,
+  `/var/...` and `/private/var/...` are one file). The credential sweep now
+  matches the kept file by same-file identity and walks the directory
+  recursively, instead of comparing only top-level names and removing an
+  enclosing subdirectory wholesale. (#2341)
 - `ai-memory uninstall --only mcp`, `--only skills` and `--only instructions`
   no longer delete the hook credentials they leave behind. The server-profile
   token sweep ran unconditionally while the install-token sweep beside it was
