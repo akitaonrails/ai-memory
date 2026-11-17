@@ -783,6 +783,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exported_wikilink_destinations_preserve_literal_character_references() {
+        let page = PagePath::new("source.md").unwrap();
+        for target in [
+            "notes/a&copy;.md",
+            "notes/a&amp;.md",
+            "notes/a&b.md",
+            "notes/a%26copy;&copy;.md",
+        ] {
+            let exported =
+                ai_memory_wiki::rewrite_local_wikilinks(&format!("[[{target}]]"), &page, "proj");
+            let destination = Parser::new_ext(&exported, options())
+                .find_map(|event| match event {
+                    Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url),
+                    _ => None,
+                })
+                .expect("exported wikilink is an ordinary Markdown link");
+            assert_eq!(
+                ai_memory_wiki::decode_markdown_destination_path(&destination)
+                    .expect("valid URL path"),
+                target,
+                "{exported} must target the literal filename after Markdown parsing"
+            );
+        }
+    }
+
+    #[test]
     fn renders_basic_markdown() {
         let html = render("# Hello\n\nworld", "default", "scratch");
         assert!(html.contains(r#"<h1 id="hello">Hello</h1>"#));
