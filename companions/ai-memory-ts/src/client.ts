@@ -770,9 +770,10 @@ export class MessagesNamespace {
     if (a.box !== undefined && a.box !== "inbox" && a.box !== "outbox") {
       throw new ArgumentError(`${where}: box must be "inbox" or "outbox"`);
     }
+    if (a.afterId !== undefined) requireText(a.afterId, "afterId", where);
     const decoded = await this.#core.invoke(
       "memory_message_list",
-      wire({ ...scopeWire(scope), box: a.box, limit: a.limit }),
+      wire({ ...scopeWire(scope), box: a.box, limit: a.limit, after_id: a.afterId }),
       false,
       options,
     );

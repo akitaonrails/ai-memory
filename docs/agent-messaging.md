@@ -53,7 +53,7 @@ Four MCP tools (documented in the installed `ai-memory-messaging` skill):
 | Tool | Role |
 |---|---|
 | `memory_message_send` | Send to `to_workspace` + `to_project`'s inbox; optional `to_agent` restricts claiming to a registered harness. The same project is a valid recipient. |
-| `memory_message_list` | List pending mail. `box="inbox"` (default) or `box="outbox"`. Read-only. |
+| `memory_message_list` | List pending mail. `box="inbox"` (default) or `box="outbox"`. Read-only. Pass `after_id` with the last id from one page to read the next; an unknown or foreign id returns an empty page. |
 | `memory_message_pop` | Claim the next inbox message (oldest, or a specific `message_id`). |
 | `memory_message_cancel` | Retract a sent message (`message_id`), or clear the whole outbox. |
 

@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- `memory_message_list` accepts an optional `after_id` cursor and pages the
+  pending queue by `(created_at, id)`. An inbox can hold 256 pending messages
+  while one list call returns at most 200, so the tail could not be seen without
+  consuming it. Pass the last id from one page to read the next; an unknown or
+  foreign cursor returns an empty page rather than another project's mail. The
+  TypeScript SDK exposes it as `messages.list({ afterId })`. (#2295)
 - Added the `vertex` LLM provider: the same Gemini models as `gemini`, called
   through Vertex AI so usage is billed to a Google Cloud project and Google
   Cloud credits pay for it (they do not cover AI Studio). It authenticates with
