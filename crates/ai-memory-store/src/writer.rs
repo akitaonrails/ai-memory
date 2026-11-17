@@ -575,6 +575,11 @@ pub(crate) enum WriteCmd {
     Close {
         reply: oneshot::Sender<()>,
     },
+    /// Atomically replace the persisted wiki file fingerprints table.
+    ReplaceWikiFileFingerprints {
+        rows: Vec<crate::WikiFileFingerprintRow>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     /// Test seam: read `PRAGMA journal_size_limit` off the writer's own
     /// connection, the only place the pragma is set.
     #[cfg(test)]
@@ -2757,6 +2762,17 @@ impl WriterHandle {
             // dropped sender means the actor stopped without answering.
             let _ = rx.await;
         }
+    }
+
+    /// Atomically replace all persisted wiki file fingerprints.
+    pub async fn replace_wiki_file_fingerprints(
+        &self,
+        rows: Vec<crate::WikiFileFingerprintRow>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReplaceWikiFileFingerprints { rows, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
     /// `PRAGMA journal_size_limit` as the writer's connection reports it.
@@ -4944,6 +4960,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 while rx.blocking_recv().is_some() {}
                 break;
             }
+            WriteCmd::ReplaceWikiFileFingerprints { rows, reply } => {
+                let result = replace_wiki_file_fingerprints_tx(&mut conn, &rows);
+                send_or_warn(reply, result, "replace_wiki_file_fingerprints");
+            }
             #[cfg(test)]
             WriteCmd::JournalSizeLimit { reply } => {
                 let result = conn
@@ -5566,6 +5586,36 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
         }
     }
     tracing::debug!("writer thread exiting cleanly");
+}
+
+fn replace_wiki_file_fingerprints_tx(
+    conn: &mut Connection,
+    rows: &[crate::WikiFileFingerprintRow],
+) -> StoreResult<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM wiki_file_fingerprints", [])?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO wiki_file_fingerprints \
+             (workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for row in rows {
+            stmt.execute(rusqlite::params![
+                row.workspace_id.as_bytes(),
+                row.project_id.as_bytes(),
+                row.path.as_str(),
+                i64::try_from(row.file_len).unwrap_or(i64::MAX),
+                row.mtime_secs,
+                i64::from(row.mtime_nanos),
+                i64::try_from(row.inode).unwrap_or(i64::MAX),
+                row.ctime_secs,
+                row.ctime_nanos,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]

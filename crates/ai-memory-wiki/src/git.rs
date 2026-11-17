@@ -557,8 +557,7 @@ impl GitAdapter {
         // the walk's own vanish tolerance.
         let mut slot = self.writing();
         let git_dir = crate::confinement::inspect_git_directory(&self.root)?;
-        crate::confinement::inspect_tree_except(&self.root, &[git_dir.as_path()])?;
-        match self.commit_all_git2(&mut slot, message) {
+        match self.commit_all_git2(&mut slot, message, &git_dir) {
             Ok(result) => Ok(result),
             Err(CommitGit2Error::Open(error)) => commit_open_error_with_fallback_on(
                 cfg!(windows),
@@ -578,6 +577,7 @@ impl GitAdapter {
         &self,
         slot: &mut Option<Open>,
         message: &str,
+        git_dir: &Path,
     ) -> Result<Option<git2::Oid>, CommitGit2Error> {
         if slot.is_none() {
             let repo = open_validated_repository(&self.root).map_err(|error| match error {
@@ -598,6 +598,16 @@ impl GitAdapter {
             self.written().walk_needed = true;
         }
         let staging = self.take_staging();
+        match &staging {
+            Staging::Everything => {
+                crate::confinement::inspect_tree_except(&self.root, &[git_dir])
+                    .map_err(CommitGit2Error::Wiki)?;
+            }
+            Staging::Paths(paths) => {
+                crate::confinement::inspect_scoped_paths(&self.root, paths)
+                    .map_err(CommitGit2Error::Wiki)?;
+            }
+        }
         let mut attempt = 0u32;
         let result = loop {
             attempt += 1;

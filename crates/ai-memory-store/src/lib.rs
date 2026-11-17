@@ -112,8 +112,8 @@ pub use reader::{
     SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
     SessionPromptTitles, SessionSummary, SessionToolTitles, SessionUsageView, SettledPage,
     StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
-    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WorkspaceScopeRow,
-    WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
+    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WikiFileFingerprintRow,
+    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
     project_name_fold_key,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
@@ -169,6 +169,23 @@ pub struct Store {
     /// Cloneable handle for read-only queries.
     pub reader: ReaderPool,
     db_path: PathBuf,
+}
+
+/// Per-connection SQLite page cache budget: 64 MiB (negative = KiB).
+const SQLITE_CACHE_SIZE_KIB: i64 = -65_536;
+/// Per-connection memory-mapped I/O window: 1 GiB on 64-bit, 256 MiB on 32-bit.
+#[cfg(target_pointer_width = "64")]
+const SQLITE_MMAP_SIZE_BYTES: i64 = 1_073_741_824;
+#[cfg(not(target_pointer_width = "64"))]
+const SQLITE_MMAP_SIZE_BYTES: i64 = 268_435_456;
+
+/// Apply performance and concurrency PRAGMAs shared by writer and reader connections.
+pub(crate) fn apply_connection_pragmas(conn: &Connection) -> StoreResult<()> {
+    conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
+    conn.pragma_update(None, "cache_size", SQLITE_CACHE_SIZE_KIB)?;
+    conn.pragma_update(None, "mmap_size", SQLITE_MMAP_SIZE_BYTES)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    Ok(())
 }
 
 impl Store {
@@ -232,7 +249,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5_000)?; // ms
+        apply_connection_pragmas(&conn)?;
         // Writer transactions start IMMEDIATE: a deferred transaction that
         // has already read cannot wait through the busy handler when it
         // upgrades to write, so another process holding the write lock (an
@@ -248,6 +265,8 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "OFF")?;
         migrations::run(&mut conn)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "analysis_limit", 400)?;
+        conn.execute_batch("PRAGMA optimize;")?;
 
         // One-shot, idempotent entity-index backfill (docs/temporal.md).
         // Populates entities/entity_page_links from existing frontmatter
