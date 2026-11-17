@@ -244,6 +244,15 @@ version in [`docs/changelog/`](docs/changelog/):
   topped-up primary takes over again without a restart. `ai-memory status`
   names an exhausted primary and the fallback answering for it, and each
   candidate in the health payload carries a `circuit_reason`. (#2227)
+- `ai-memory doctor` reports a data directory, or a parent of it, that other
+  local accounts can write. Capture state and the root bearer live behind that
+  directory: the hook spool's entries carry the token, so an account that can
+  write the directory can replace the spool and read it out, and one that can
+  write the parent can rename the directory away and put its own in place. The
+  warning names the mode it found, and stays quiet for the owner-only default
+  every install creates; a sticky parent is not reported, since it stops
+  another account renaming an entry it does not own. Windows reports no mode
+  here — its access control lists are not what these bits describe.
 
 ### Changed
 
