@@ -1977,7 +1977,7 @@ pub struct MaintenanceSettings {
     /// Defaults to off because it may call a paid provider.
     pub embedding_backfill_interval_secs: u64,
     /// Opt-in reconcile-delete safety net (#929). When `true`, the watcher's
-    /// 30s reconcile pass tombstones (`is_latest = 0` + `superseded_at`, never
+    /// 300s reconcile pass tombstones (`is_latest = 0` + `superseded_at`, never
     /// a filesystem touch or a BLOCKING admission dispatch) an OKF-imported
     /// content page (session summary pages are excluded — a same-workspace
     /// `move-session` re-home can leave one with a correct row and no file, a

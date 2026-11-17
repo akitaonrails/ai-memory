@@ -177,7 +177,7 @@ so any later rewrite of an affected page (a restore, a hand edit, a
 
 ## Reconcile-delete safety net (opt-in, #929)
 
-The watcher's 30s reconcile pass only ever reindexes create/modify events by
+The watcher's 300s reconcile pass only ever reindexes create/modify events by
 default: a page whose file disappears from disk stays indexed until
 `ai-memory delete-page` removes it explicitly. `[maintenance]
 reconcile_tombstones_deleted_pages` (default `false`) opts into a background

@@ -3690,7 +3690,7 @@ remains opt-in and keeps its interval-only behavior (no startup catch-up).
 
 `reconcile_tombstones_deleted_pages` (default `false`, also under
 `[maintenance]`) is a separate, experimental opt-in: it lets the watcher's
-own 30s reconcile pass (not the scheduled jobs above) tombstone an
+own 300s reconcile pass (not the scheduled jobs above) tombstone an
 OKF-imported content page (session summary pages are excluded; see
 `docs/okf.md`) whose file has disappeared from disk, after it has been
 missing on two consecutive passes and survived a circuit breaker that
