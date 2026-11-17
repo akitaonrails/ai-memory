@@ -299,7 +299,8 @@ directions are family-scoped and dry-run by default.
   `--on-merge apply`; never `--prefer`) and `uninstall-hook` removes only
   that block.
 - `--include FAMILY` is an explicit, repeatable allowlist of top-level
-  wiki directories; at least one is required and a bare `*` is refused.
+  wiki directories or exact top-level Markdown filenames (for example,
+  `--include roadmap.md`); at least one is required and a bare `*` is refused.
 - Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` only;
   tokens are never logged or persisted.
 - Each file is the server body under a fixed frontmatter of the fields a

@@ -135,7 +135,10 @@ An acknowledgement can also mean the server deliberately dropped an event, for
 example because of capture policy or a session identity collision. A drained
 queue does not prove that every event became an observation. The relay catches
 a native session changing agents within one queue, but server ownership checks
-still apply across queues and producers.
+still apply across queues and producers. Session-to-agent pins are refreshed
+when an event is enqueued or durably marked for delivery, so an event held
+offline longer than 30 days does not lose its pin just after its first delivery.
+The first-attempt retry deadline is unchanged.
 
 The server's ingest keys expire after 30 days. The relay records the first
 attempt before sending and retains expired pending events without replaying

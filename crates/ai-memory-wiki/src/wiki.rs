@@ -593,6 +593,22 @@ impl Wiki {
         .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?
     }
 
+    /// Resolve a checkpoint revision to its immutable commit OID.
+    ///
+    /// Callers that save a pre-operation checkpoint use this before advancing
+    /// HEAD, so a symbolic or relative source keeps its original meaning.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the repository is not confined or `rev` does
+    /// not resolve to a commit.
+    pub async fn resolve_checkpoint_rev(&self, rev: &str) -> WikiResult<String> {
+        let git = self.git.clone();
+        let rev = rev.to_owned();
+        tokio::task::spawn_blocking(move || git.resolve_commit(&rev))
+            .await
+            .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?
+    }
+
     /// Parse one page as stored at checkpoint `rev`, without touching the
     /// live tree or the index.
     ///
@@ -1168,6 +1184,25 @@ impl Wiki {
         self.writer
             .ensure_project_workspace(workspace_id, project_id)
             .await?;
+        Ok(())
+    }
+
+    /// Load persisted watcher file fingerprints from the store, if a reader is attached.
+    pub(crate) async fn load_file_fingerprints(
+        &self,
+    ) -> WikiResult<Vec<ai_memory_store::WikiFileFingerprintRow>> {
+        let Some(reader) = &self.store_reader else {
+            return Ok(Vec::new());
+        };
+        Ok(reader.load_wiki_file_fingerprints().await?)
+    }
+
+    /// Persist the current watcher file fingerprints to the store.
+    pub(crate) async fn replace_file_fingerprints(
+        &self,
+        rows: Vec<ai_memory_store::WikiFileFingerprintRow>,
+    ) -> WikiResult<()> {
+        self.writer.replace_wiki_file_fingerprints(rows).await?;
         Ok(())
     }
 

@@ -7055,10 +7055,13 @@ impl ReaderPool {
         dim: u32,
     ) -> StoreResult<Vec<StoredEmbedding>> {
         self.with_conn(move |conn| {
+            // CROSS JOIN pins `pages` as the outer loop so we only touch the
+            // target project's latest pages and probe `page_embeddings` by PK,
+            // instead of scanning every project's embeddings via provider index.
             let mut stmt = conn.prepare_cached(
                 "SELECT page_embeddings.page_id, page_embeddings.vector, pages.path \
-                 FROM page_embeddings \
-                 JOIN pages ON pages.id = page_embeddings.page_id \
+                 FROM pages \
+                 CROSS JOIN page_embeddings ON page_embeddings.page_id = pages.id \
                  WHERE pages.workspace_id = ?1 \
                    AND pages.project_id = ?2 \
                    AND pages.is_latest = 1 \
@@ -11799,16 +11802,16 @@ impl ReaderPool {
                         p.name AS project_name, \
                         COUNT(pg.id) AS page_count, \
                         MAX(pg.updated_at) AS last_updated_us, \
-                        (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id), \
+                        (SELECT COUNT(*) FROM sessions s WHERE s.workspace_id = w.id AND s.project_id = p.id), \
                         (SELECT COUNT(*) FROM observations o WHERE o.project_id = p.id), \
-                        (SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id AND s.ended_at IS NULL), \
+                        (SELECT COUNT(*) FROM sessions s WHERE s.workspace_id = w.id AND s.project_id = p.id AND s.ended_at IS NULL), \
                         (SELECT MAX(column1) FROM (VALUES \
-                            ((SELECT MAX(o.created_at) FROM observations o WHERE o.project_id = p.id)), \
-                            ((SELECT MAX(s.started_at) FROM sessions s WHERE s.project_id = p.id)), \
+                            ((SELECT MAX(o.created_at) FROM observations o WHERE o.workspace_id = w.id AND o.project_id = p.id)), \
+                            ((SELECT MAX(s.started_at) FROM sessions s WHERE s.workspace_id = w.id AND s.project_id = p.id)), \
                             (MAX(pg.updated_at)))) AS last_activity \
                  FROM workspaces w \
                  JOIN projects p ON p.workspace_id = w.id \
-                 LEFT JOIN pages pg ON pg.project_id = p.id AND pg.is_latest = 1{ttl} \
+                 LEFT JOIN pages pg ON pg.workspace_id = w.id AND pg.project_id = p.id AND pg.is_latest = 1{ttl} \
                  WHERE (?1 IS NULL OR w.name = ?1){visible} \
                  GROUP BY w.id, p.id \
                  ORDER BY last_activity DESC NULLS LAST"
@@ -12206,6 +12209,49 @@ impl ReaderPool {
             }
             let rows = stmt.query_map(params_from_iter(bound.iter()), PageSummary::from_row)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Whether `(workspace, project)` holds a live page whose path starts with
+    /// `prefix`.
+    ///
+    /// The `/web` namespace route answers a directory-shaped path with a
+    /// listing and everything else with a 404. Deciding which by loading the
+    /// project's whole page table made any unmatched path, including a stale
+    /// link or a probe, cost a full read of every page in the project. The
+    /// question is asked on its own here, with `LIMIT 1`.
+    ///
+    /// `prefix` is a literal path prefix, normally `"<namespace>/"`. The
+    /// pattern escapes `%`, `_` and `\`, so a namespace like `notes_2026`
+    /// matches its own name and not `notesX2026`. Expired pages do not count,
+    /// the same way [`Self::list_unexpired_pages`] hides them.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn has_unexpired_page_under_prefix(
+        &self,
+        workspace: &str,
+        project: &str,
+        prefix: &str,
+    ) -> StoreResult<bool> {
+        let workspace = workspace.to_owned();
+        let project = project.to_owned();
+        let pattern = format!("{}%", like_escape(prefix));
+        self.with_conn(move |conn| {
+            let ttl = not_expired("pg", "?4");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT 1 FROM pages pg \
+                 JOIN projects p ON p.id = pg.project_id \
+                 JOIN workspaces w ON w.id = pg.workspace_id \
+                 WHERE w.name = ?1 AND p.name = ?2 AND pg.is_latest = 1{ttl} \
+                   AND pg.path LIKE ?3 ESCAPE '\\' \
+                 LIMIT 1"
+            ))?;
+            let now = now_us();
+            let bound: Vec<&dyn rusqlite::ToSql> = vec![&workspace, &project, &pattern, &now];
+            let found = stmt.exists(params_from_iter(bound.iter()))?;
+            Ok(found)
         })
         .await
     }
@@ -14841,6 +14887,92 @@ impl ReaderPool {
             .await?;
         Ok(ctx.authorize(need))
     }
+
+    /// Load all persisted wiki file fingerprints for watcher reconcile seeding.
+    pub async fn load_wiki_file_fingerprints(&self) -> StoreResult<Vec<WikiFileFingerprintRow>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, \
+                        inode, ctime_secs, ctime_nanos \
+                 FROM wiki_file_fingerprints",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let ws_bytes: Vec<u8> = row.get(0)?;
+                let proj_bytes: Vec<u8> = row.get(1)?;
+                let path: String = row.get(2)?;
+                let file_len: i64 = row.get(3)?;
+                let mtime_secs: i64 = row.get(4)?;
+                let mtime_nanos: i64 = row.get(5)?;
+                let inode: i64 = row.get(6)?;
+                let ctime_secs: i64 = row.get(7)?;
+                let ctime_nanos: i64 = row.get(8)?;
+                Ok((
+                    ws_bytes,
+                    proj_bytes,
+                    path,
+                    file_len,
+                    mtime_secs,
+                    mtime_nanos,
+                    inode,
+                    ctime_secs,
+                    ctime_nanos,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                let (
+                    ws_bytes,
+                    proj_bytes,
+                    path,
+                    file_len,
+                    mtime_secs,
+                    mtime_nanos,
+                    inode,
+                    ctime_secs,
+                    ctime_nanos,
+                ) = r?;
+                let workspace_id = WorkspaceId::from_slice(&ws_bytes)?;
+                let project_id = ProjectId::from_slice(&proj_bytes)?;
+                let path = PagePath::new(path)?;
+                out.push(WikiFileFingerprintRow {
+                    workspace_id,
+                    project_id,
+                    path,
+                    file_len: u64::try_from(file_len).unwrap_or(0),
+                    mtime_secs,
+                    mtime_nanos: u32::try_from(mtime_nanos).unwrap_or(0),
+                    inode: u64::try_from(inode).unwrap_or(0),
+                    ctime_secs,
+                    ctime_nanos,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+}
+
+/// Persisted filesystem fingerprint for one wiki page file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikiFileFingerprintRow {
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Project-relative page path.
+    pub path: PagePath,
+    /// File length in bytes.
+    pub file_len: u64,
+    /// Modification time seconds relative to `UNIX_EPOCH`.
+    pub mtime_secs: i64,
+    /// Modification time subsecond nanoseconds.
+    pub mtime_nanos: u32,
+    /// Unix inode (0 on non-Unix).
+    pub inode: u64,
+    /// Unix ctime seconds (0 on non-Unix).
+    pub ctime_secs: i64,
+    /// Unix ctime nanoseconds (0 on non-Unix).
+    pub ctime_nanos: i64,
 }
 
 /// Build the per-agent session count query for one scope.
@@ -16407,7 +16539,7 @@ fn select_open_handoff(candidates: Vec<Handoff>, cwd_filter: Option<&str>) -> Op
 /// Reading the row here (instead of destructuring it into a long positional
 /// argument list) keeps the column order defined in exactly one place next to
 /// the `SELECT`s that produce it.
-fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
+pub(crate) fn row_to_handoff(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<Handoff>> {
     let id_bytes: Vec<u8> = row.get(0)?;
     let ws_bytes: Vec<u8> = row.get(1)?;
     let pj_bytes: Vec<u8> = row.get(2)?;
@@ -16829,12 +16961,153 @@ fn open_read_only(path: &Path) -> StoreResult<Connection> {
         | OpenFlags::SQLITE_OPEN_URI
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
-    conn.pragma_update(None, "busy_timeout", 5_000)?;
+    crate::apply_connection_pragmas(&conn)?;
     Ok(conn)
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn reader_connections_configure_cache_mmap_and_temp_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (cache_size, temp_store, mmap_size): (i64, i64, i64) = store
+            .reader
+            .with_conn(|conn| {
+                let cache_size: i64 = conn.pragma_query_value(None, "cache_size", |r| r.get(0))?;
+                let temp_store: i64 = conn.pragma_query_value(None, "temp_store", |r| r.get(0))?;
+                let mmap_size: i64 = conn.pragma_query_value(None, "mmap_size", |r| r.get(0))?;
+                Ok((cache_size, temp_store, mmap_size))
+            })
+            .await
+            .unwrap();
+        assert_eq!(cache_size, -65_536);
+        assert_eq!(temp_store, 2);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(mmap_size, 1_073_741_824);
+        #[cfg(not(target_pointer_width = "64"))]
+        assert_eq!(mmap_size, 268_435_456);
+    }
+
+    #[tokio::test]
+    async fn v102_indexes_and_stat1_are_used_by_interrupted_session_query() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("local").await.unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let sql = crate::reader::latest_interrupted_session_candidate_sql(
+            &ai_memory_core::OwnerFilter::Any,
+            false,
+        );
+        let plan: (Vec<String>, Vec<String>) = store
+            .reader
+            .with_conn(move |conn| {
+                let explain = format!("EXPLAIN QUERY PLAN {sql}");
+                let mut stmt = conn.prepare(&explain)?;
+                let rows = stmt.query_map(
+                    rusqlite::named_params! {
+                        ":ws": ws.as_bytes(),
+                        ":proj": project.as_bytes(),
+                    },
+                    |r| r.get::<_, String>(3),
+                )?;
+                let open_plan: Vec<String> = conn
+                    .prepare(
+                        "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM sessions WHERE workspace_id = ?1 AND project_id = ?2 AND ended_at IS NULL",
+                    )?
+                    .query_map([ws.as_bytes(), project.as_bytes()], |r| r.get::<_, String>(3))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((rows.collect::<Result<Vec<_>, _>>()?, open_plan))
+            })
+            .await
+            .unwrap();
+        let joined = plan.0.join("\n");
+        let open_joined = plan.1.join("\n");
+        assert!(
+            open_joined.contains("idx_sessions_open_started"),
+            "expected idx_sessions_open_started in plan:\n{open_joined}"
+        );
+        assert!(
+            joined.contains("idx_handoffs_from_session"),
+            "expected idx_handoffs_from_session in plan:\n{joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_stats_and_load_embeddings_use_scoped_indexes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("local").await.unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(ws, "app", None)
+            .await
+            .unwrap();
+        let (stats_plan, emb_plan): (Vec<String>, Vec<String>) = store
+            .reader
+            .with_conn(move |conn| {
+                let stats = conn
+                    .prepare(
+                        "EXPLAIN QUERY PLAN SELECT w.id, p.id, COUNT(pg.id), MAX(pg.updated_at), \
+                         (SELECT COUNT(*) FROM sessions s WHERE s.workspace_id = w.id AND s.project_id = p.id AND s.ended_at IS NULL), \
+                         (SELECT MAX(o.created_at) FROM observations o WHERE o.workspace_id = w.id AND o.project_id = p.id), \
+                         (SELECT MAX(s.started_at) FROM sessions s WHERE s.workspace_id = w.id AND s.project_id = p.id) \
+                         FROM workspaces w JOIN projects p ON p.workspace_id = w.id \
+                         LEFT JOIN pages pg ON pg.workspace_id = w.id AND pg.project_id = p.id AND pg.is_latest = 1 \
+                         GROUP BY w.id, p.id",
+                    )?
+                    .query_map([], |r| r.get::<_, String>(3))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let emb = conn
+                    .prepare(
+                        "EXPLAIN QUERY PLAN SELECT page_embeddings.page_id, page_embeddings.vector, pages.path \
+                         FROM pages CROSS JOIN page_embeddings ON page_embeddings.page_id = pages.id \
+                         WHERE pages.workspace_id = ?1 AND pages.project_id = ?2 AND pages.is_latest = 1 \
+                           AND page_embeddings.provider = ?3 AND page_embeddings.model = ?4 AND page_embeddings.dim = ?5",
+                    )?
+                    .query_map(
+                        rusqlite::params![
+                            ws.as_bytes(),
+                            project.as_bytes(),
+                            "local",
+                            "all-MiniLM-L6-v2",
+                            384i64
+                        ],
+                        |r| r.get::<_, String>(3),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((stats, emb))
+            })
+            .await
+            .unwrap();
+        let stats_joined = stats_plan.join("\n");
+        let emb_joined = emb_plan.join("\n");
+        assert!(
+            stats_joined.contains("idx_observations_project_created"),
+            "expected idx_observations_project_created in stats plan:\n{stats_joined}"
+        );
+        assert!(
+            stats_joined.contains("idx_sessions_recent"),
+            "expected idx_sessions_recent in stats plan:\n{stats_joined}"
+        );
+        assert!(
+            stats_joined.contains("idx_sessions_open_started"),
+            "expected idx_sessions_open_started in stats plan:\n{stats_joined}"
+        );
+        assert!(
+            emb_joined.contains("sqlite_autoindex_page_embeddings_1"),
+            "expected PK probe on page_embeddings in emb plan:\n{emb_joined}"
+        );
+        assert!(
+            !emb_joined.contains("idx_page_embeddings_provider"),
+            "must not scan idx_page_embeddings_provider across all projects:\n{emb_joined}"
+        );
+    }
 
     #[tokio::test]
     async fn answer_evidence_metadata_uses_session_time_only_in_the_same_scope() {

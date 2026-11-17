@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::extract::{Query, State};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::html_auth::{HtmlAuthRedirectConfig, sanitize_next};
@@ -45,7 +45,7 @@ pub(crate) async fn change_password(
 
 fn render(view: impl Template) -> Response {
     match view.render() {
-        Ok(body) => Html(body).into_response(),
+        Ok(body) => super::private_page(body),
         Err(_) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "template render error\n",

@@ -59,7 +59,10 @@
   <footer class="app-footer"><span>ai-memory <span aria-hidden="true">·</span> {{ i18n.text("web-project-memory-agent-operations") }}</span>{% block footer_version %}<span>v{{ crate::templates::VERSION }}</span>{% endblock %}</footer>
   <script>
   (function(){
-    document.getElementById("skip-link").href=location.href.split("#")[0]+"#main-content";
+    // Fragment-only links otherwise resolve against <base href>, not this page.
+    // https://html.spec.whatwg.org/multipage/urls-and-fetching.html#document-base-urls
+    var currentPage=location.href.split("#")[0];
+    document.querySelectorAll('a[href^="#"]').forEach(function(link){link.href=currentPage+link.getAttribute("href");});
     var toggle=document.getElementById("nav-toggle"),backdrop=document.getElementById("nav-backdrop"),nav=document.getElementById("app-navigation");
     function close(){document.body.classList.remove("nav-open");toggle.setAttribute("aria-expanded","false");backdrop.hidden=true;}
     toggle.addEventListener("click",function(){var open=toggle.getAttribute("aria-expanded")!=="true";document.body.classList.toggle("nav-open",open);toggle.setAttribute("aria-expanded",String(open));backdrop.hidden=!open;if(open)nav.querySelector("a").focus();});

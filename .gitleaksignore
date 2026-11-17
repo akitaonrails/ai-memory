@@ -49,3 +49,8 @@ b19ee0c040fb766a5c7405c9e22159fdbc1e2ef4:companions/ai-memory-importer/src/agent
 05477cd44a86c923eeeb1b70352bf612fd8c60ac:crates/ai-memory-core/src/sanitize.rs:generic-api-key:2393
 1fb318c891cc3c7e1f9ed22cdc061a9470812bd2:tests/fixtures/sanitizer_vectors.json:generic-api-key:12
 f269b640037ad48de6b90feb7d1088e64f9e4cb6:crates/ai-memory-core/src/sanitize.rs:stripe-access-token:1176
+# Throwaway RSA key generated with `openssl genpkey` for the Vertex
+# service-account token-exchange tests (#2288); it was never a Google key.
+# release/3.5 allowlists it in .gitleaks.toml, but the scheduled full-history
+# scan runs main's config over every branch, so main needs the fingerprint.
+abc9dc843abb60129d41bf639e401c6cbf9cb6bf:crates/ai-memory-llm/tests/support/vertex_test_service_account_key.pem:private-key:1

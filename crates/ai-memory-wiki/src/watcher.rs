@@ -46,7 +46,7 @@ use crate::error::{WikiError, WikiResult};
 use crate::wiki::Wiki;
 
 /// Reconciliation tick interval.
-pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How recent a file's mtime or change time may be, relative to the start of
 /// the reconcile pass that walked it, before the pass refuses to trust its
@@ -184,6 +184,7 @@ async fn run_loop(
     // pass-to-pass memory, not shared server state.
     let mut missing_streaks: MissingStreaks = HashMap::new();
     let mut indexed_fingerprints: IndexedFingerprints = HashMap::new();
+    let mut fingerprints_seeded = false;
 
     loop {
         tokio::select! {
@@ -196,7 +197,11 @@ async fn run_loop(
                 handle_event(&wiki, event).await;
             }
             _ = tick.tick() => {
-                match reconcile(&wiki, &mut missing_streaks, &mut indexed_fingerprints).await {
+                if !fingerprints_seeded {
+                    seed_fingerprints_from_store(&wiki, &mut indexed_fingerprints).await;
+                    fingerprints_seeded = true;
+                }
+                match reconcile_and_persist(&wiki, &mut missing_streaks, &mut indexed_fingerprints).await {
                     Ok(_) => {
                         if consecutive_failures > 0 {
                             tracing::info!(
@@ -461,6 +466,73 @@ impl FileFingerprint {
         }
         false
     }
+
+    fn to_row(
+        self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+    ) -> ai_memory_store::WikiFileFingerprintRow {
+        let (mtime_secs, mtime_nanos) = system_time_to_unix(self.modified);
+        #[cfg(unix)]
+        let (inode, ctime_secs, ctime_nanos) = (self.inode, self.changed.0, self.changed.1);
+        #[cfg(not(unix))]
+        let (inode, ctime_secs, ctime_nanos) = (0, 0, 0);
+        ai_memory_store::WikiFileFingerprintRow {
+            workspace_id,
+            project_id,
+            path,
+            file_len: self.len,
+            mtime_secs,
+            mtime_nanos,
+            inode,
+            ctime_secs,
+            ctime_nanos,
+        }
+    }
+
+    fn from_row(row: &ai_memory_store::WikiFileFingerprintRow) -> Option<Self> {
+        let modified = unix_to_system_time(row.mtime_secs, row.mtime_nanos)?;
+        Some(Self {
+            len: row.file_len,
+            modified,
+            #[cfg(unix)]
+            inode: row.inode,
+            #[cfg(unix)]
+            changed: (row.ctime_secs, row.ctime_nanos),
+        })
+    }
+}
+
+fn system_time_to_unix(t: std::time::SystemTime) -> (i64, u32) {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_nanos(),
+        ),
+        Err(e) => {
+            let d = e.duration();
+            let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+            if d.subsec_nanos() == 0 {
+                (-secs, 0)
+            } else {
+                (-secs - 1, 1_000_000_000 - d.subsec_nanos())
+            }
+        }
+    }
+}
+
+fn unix_to_system_time(secs: i64, nanos: u32) -> Option<std::time::SystemTime> {
+    if secs >= 0 {
+        std::time::UNIX_EPOCH.checked_add(Duration::new(secs as u64, nanos))
+    } else {
+        let abs_secs = secs.unsigned_abs();
+        if nanos == 0 {
+            std::time::UNIX_EPOCH.checked_sub(Duration::from_secs(abs_secs))
+        } else {
+            std::time::UNIX_EPOCH.checked_sub(Duration::new(abs_secs - 1, 1_000_000_000 - nanos))
+        }
+    }
 }
 
 /// Per-`(workspace, project, path)` fingerprint of each file as of the
@@ -703,6 +775,56 @@ async fn reconcile_missing_pages(
     }
 }
 
+async fn seed_fingerprints_from_store(wiki: &Wiki, indexed_fingerprints: &mut IndexedFingerprints) {
+    match wiki.load_file_fingerprints().await {
+        Ok(rows) => {
+            for row in rows {
+                if let Some(fp) = FileFingerprint::from_row(&row) {
+                    indexed_fingerprints.insert((row.workspace_id, row.project_id, row.path), fp);
+                }
+            }
+        }
+        Err(error) => {
+            warn!(%error, "failed to load persisted wiki file fingerprints; starting cold");
+        }
+    }
+}
+
+async fn reconcile_and_persist(
+    wiki: &Wiki,
+    missing_streaks: &mut MissingStreaks,
+    indexed_fingerprints: &mut IndexedFingerprints,
+) -> WikiResult<ReconcileStats> {
+    reconcile_and_persist_at(
+        wiki,
+        missing_streaks,
+        indexed_fingerprints,
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+async fn reconcile_and_persist_at(
+    wiki: &Wiki,
+    missing_streaks: &mut MissingStreaks,
+    indexed_fingerprints: &mut IndexedFingerprints,
+    pass_started: std::time::SystemTime,
+) -> WikiResult<ReconcileStats> {
+    let prev_len = indexed_fingerprints.len();
+    let stats = reconcile_at(wiki, missing_streaks, indexed_fingerprints, pass_started).await?;
+    if stats.indexed > 0 || indexed_fingerprints.len() != prev_len {
+        let rows: Vec<_> = indexed_fingerprints
+            .iter()
+            .map(|((ws, proj, path), fp)| fp.to_row(*ws, *proj, path.clone()))
+            .collect();
+        if let Err(error) = wiki.replace_file_fingerprints(rows).await {
+            warn!(%error, "failed to persist wiki file fingerprints");
+        }
+    }
+    Ok(stats)
+}
+
+#[cfg(test)]
 async fn reconcile(
     wiki: &Wiki,
     missing_streaks: &mut MissingStreaks,
@@ -3128,5 +3250,46 @@ mod tests {
             Some(page_id),
             "the orphaned-by-move-session page must survive untouched",
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_persists_fingerprints_across_restart_and_skips_unchanged_files() {
+        let (tmp, _store, wiki, ws, proj) = setup().await;
+        let dir = proj_dir(&tmp, ws, proj);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "alpha page content\n").unwrap();
+        std::fs::write(dir.join("b.md"), "beta page content\n").unwrap();
+
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        let first = reconcile_and_persist_at(&wiki, &mut streaks, &mut fingerprints, later)
+            .await
+            .unwrap();
+        assert_eq!((first.indexed, first.skipped_unchanged), (2, 0));
+
+        // Simulate server restart: fresh in-memory map seeded from SQLite.
+        let mut restarted_fingerprints = IndexedFingerprints::new();
+        seed_fingerprints_from_store(&wiki, &mut restarted_fingerprints).await;
+        let second =
+            reconcile_and_persist_at(&wiki, &mut streaks, &mut restarted_fingerprints, later)
+                .await
+                .unwrap();
+        assert_eq!((second.indexed, second.skipped_unchanged), (0, 2));
+
+        // Simulate offline edit while server was stopped: must still be detected!
+        std::fs::write(dir.join("a.md"), "alpha page content updated offline\n").unwrap();
+        let mut after_edit_fingerprints = IndexedFingerprints::new();
+        seed_fingerprints_from_store(&wiki, &mut after_edit_fingerprints).await;
+        let even_later = later + Duration::from_secs(60);
+        let third = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut after_edit_fingerprints,
+            even_later,
+        )
+        .await
+        .unwrap();
+        assert_eq!((third.indexed, third.skipped_unchanged), (1, 1));
     }
 }

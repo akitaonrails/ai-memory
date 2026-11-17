@@ -410,7 +410,10 @@ transcript normalizer excludes a marked packet if Claude persists and reads it
 back, preventing delivered history from recursively re-entering the ledger.
 An explicitly pending handoff is considered before the managed event range.
 By default their single-use delivery claims share one writer transaction after
-the complete startup response has been assembled. With server-wide
+the fallible startup reads complete. That transaction also captures the claimed
+handoff row: the hook renders this snapshot, so a delayed turn checkpoint that
+refreshes the row during admission is delivered without an additional read after
+the single-use claim commits. With server-wide
 `[handoff].claim_on_session_start = false`, SessionStart instead emits a
 metadata-only notice naming the exact handoff id and leaves the row open for
 an explicit `memory_handoff_accept`; the managed event range is still claimed.
@@ -670,7 +673,7 @@ prunable rather than only after it ages in place.
 | `workspaces`, `projects` | Top of the 3-tuple identity coordinate. `projects.identity` / `identity_source` (V70, #708) hold the repository identity a project routes by (an explicit marker `identity` or a normalised git remote, resolved client-side), unique per workspace when set; empty until a capture claims the project. Phase-5 clients explicitly send `IdentityStyle::Path` (#1033) for remote-backed projects, naming them from the full repository path without the host (`acme-api`), and send explicit `host_path` for the pre-v3 opt-out. Server-side omission remains `HostPath` because old clients omitted that historical default; no new wire field is needed. Creation or authorized capture promotion uses that canonical name only when no different hostful identity claims it; otherwise resolution falls back to the existing hostful/legacy-safe name. V76 stores indexed canonical and v2-basename keys derived from that full identity: reads are no-create/no-rename, while an authorized explicit write through the canonical name promotes only `projects.name` in the same resolve-or-create writer transaction and preserves the UUID. Project `_meta.md` carries the optional full identity/source plus derived keys; clean reindex validates them and rebuilds the same UUID/name/coordinate lookup, while older manifests without identity remain valid. Ambiguous cross-forge or multi-candidate keys fail closed. A local marker may additionally send up to 16 validated former names as one transient `aliases` JSON-array query value: lookup stays inside its selected workspace, requires the checkout's full hostful git-remote identity to equal the stored row, returns reads without rename, and lets capture perform only the same authorized UUID-preserving canonical promotion. Aliases are not stored and remain distinct in the hook routing cache. The exact operator-home marker may additionally define bounded `[routes.identity."host/path"]` and `[routes.path."absolute-or-tilde-path"]` blocks: an exact hostful remote match wins the longest component-wise lexical path match, any reachable non-home local settings marker wins both, malformed or ambiguous route maps fail closed, and selected fields reuse the existing marker wire without a server/schema change. `AI_MEMORY_HOME` is authoritative for native callers; portable clients use `HOME`/`USERPROFILE`, and Docker compares its forwarded host cwd. See `docs/marker-file.md#repository-identity`. `projects.access_mode` (V68; `open` default / `restricted`) decides whether any authenticated user or only root, the creator (`projects.created_by`, V69) and grant holders (`project_grants`, V68) reach it, decided by `ai_memory_store::authorize_project` (see `docs/users.md#per-project-access`). `projects.profile_contribute` / `profile_consume` (V74) record the marker's `[profile]` opt-outs, forwarded at session start; `profile_candidates`, `profile_harvest_marks` and `profile_entry_ledger` (V75) hold the profile pass's evidence, per-project read position and the entries it wrote. Reserved projects: `scratch`, `_global` (shared preferences; holds the single-user profile under `profile/`), `_profile` (a workspace profile) and `_profile.<user id>` (a private profile, always `restricted`); capture is never attributed to any of them (see `docs/cross-project-profile.md`). |
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, and decay-only tombstone marker `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. V36: `expires_at` (frontmatter TTL). V37: `salience` (NULL = `salience_default`; derived from `page_feedback`). |
 | `pages_fts` | FTS5 virtual table over `(title, body, path_search)` plus the `title_parts` / `body_parts` spellings that turn `-`/`_` into spaces (V100, #2013), so a hyphenated token and each of its words both match; auto-synced by triggers. |
-| `pages_cjk_fts` | Derived unigram/bigram FTS5 index over the CJK runs in page title, body, and path. The writer updates it in the page transaction; startup repairs missing rows after an upgrade. Queried only when the bounded query contains Han, Kana, or Hangul. |
+| `pages_cjk_fts` | Derived unigram/bigram FTS5 index over the CJK runs in page title, body, and path. The writer updates it in the page transaction; startup repairs missing rows after an upgrade. Queried only when the bounded query contains Han, Kana, or Hangul; quoted phrases and `AND`/`NOT`/`NEAR` queries stay on the primary FTS stream to preserve their constraints. |
 | `sessions`, `observations` | Sanitized, bounded lifecycle-hook projections. `sessions.ended_observation_count` is the stable generation watermark for resumed-session re-end eligibility; wall clocks are not used for that decision. They are an operational audit trail, not a complete native transcript. |
 | `session_consolidation_jobs` | Durable, observation-generation-idempotent queue for automatic LLM consolidation. PreCompact / PostCompaction checkpoint jobs are queued whether or not the session has ended (a resumed session keeps `ended_at`); opt-in SessionEnd jobs need an *ended* session, and observation generations order the two. One bounded server worker leases jobs, retries provider failures with backoff, and recovers expired leases after restart. The worker starts whenever a consolidator is configured; SessionEnd enqueue stays behind `AI_MEMORY_CONSOLIDATE_ON_SESSION_END`. A manual `memory_consolidate` writes its page out-of-band and then reconciles this table (flipping a `failed`/`pending`/`superseded` row for the session to `completed`, never touching a live `running` lease), so the operator does not see a `failed` job for a session that is in fact consolidated. |
 | `observations_fts` | FTS5 virtual table over raw observation `(title, body)` with the same `title_parts` / `body_parts` spellings (V100, #2013). Feeds the bounded `raw_hits` fallback and, through `[retrieval] observation_stream` (on by default), the observation-evidence RRF stream that votes for session pages. |
@@ -824,7 +827,7 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-The MCP transport is rmcp 3.8 and serves both protocol lifecycles: MCP
+The MCP transport is rmcp 3.9 and serves both protocol lifecycles: MCP
 2026-07-28 clients start with `server/discover` and carry version metadata
 per request, while older clients still complete the `initialize`
 handshake. HTTP requests remain stateless by default; `--http-stateful`
@@ -1858,6 +1861,11 @@ sees the host path read the same file. A configured file that is missing or
 blank leaves no bearer, and `serve` then refuses to start. Env:
 `AI_MEMORY_AUTH__BEARER_TOKEN_FILE`.
 
+`uninstall` keeps the server's configured token file when clearing hook and
+server-profile credentials. This also applies when `AI_MEMORY_AUTH_TOKEN`
+overrides the file for that command: a later server start still needs the
+configured file when the override is absent.
+
 `ai-memory init` mints the token (32 random bytes, hex, `0600` under a `0700`
 `auth-tokens/`) only on a fresh data dir: no config file and no database yet,
 and no bearer supplied another way. An existing install keeps the loopback
@@ -1911,8 +1919,10 @@ the server URL is loopback and no `default` server profile is registered.
   a concurrent write replaced stays visible (invariant #16). TTL expiry still
   applies: an expired version is neither listed nor readable by id, and a page
   whose live version expired shows no history, since the forget sweep deletes
-  every row at its path. The link graph is a circular SVG plus an edge table;
-  larger layouts and interactive clustering remain open. See
+  every row at its path. The link graph is a circular SVG plus an edge table.
+  Both graph views send `Cache-Control: private, no-store`, as the other
+  viewer-dependent HTML pages do.
+  Larger layouts and interactive clustering remain open. See
   [`docs/frontend-api.md`](frontend-api.md#10-known-gaps-and-deliberate-non-goals).
 * **Retrieval measurement gaps.** The LongMemEval-S harness ships in
   `evals/` (pipeline, component and decomposition modes; results in

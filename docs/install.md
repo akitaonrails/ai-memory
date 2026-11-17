@@ -347,16 +347,21 @@ configure ai-memory@ai-memory`:
   `install-mcp`, `install-skills`) to add them anyway.
 - Folderless sessions (a desktop scratch workspace with no project folder)
   are not captured through the plugin.
-- Ten events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `SessionEnd`,
-  `SubagentStart` and `SubagentStop`. Claude Code fires `PostToolUseFailure`
-  *instead of* `PostToolUse` when a tool fails (a non-zero exit, a thrown
-  error, an MCP error result). The observation records `outcome: error` and
-  the error text, bounded like any tool excerpt and never the tool's
-  arguments; the session page counts failed calls and quotes the newest one;
-  the automatic handoff adds a `Last failed tool call` line. An install made
-  before this fix has nine events; re-run `ai-memory install-hooks --agent
-  claude-code --apply` (or `ai-memory setup`) to add the tenth.
+- Eleven events are wired: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `StopFailure`,
+  `SessionEnd`, `SubagentStart` and `SubagentStop`. Claude Code fires
+  `PostToolUseFailure` *instead of* `PostToolUse` when a tool fails (a
+  non-zero exit, a thrown error, an MCP error result). The observation records
+  `outcome: error` and the error text, bounded like any tool excerpt and never
+  the tool's arguments; the session page counts failed calls and quotes the
+  newest one; the automatic handoff adds a `Last failed tool call` line. It
+  fires `StopFailure` *instead of* `Stop` when an API error ends the turn (a
+  rate limit, an exhausted balance, an overloaded server); that turn end is
+  stored as `stop failure: <error>` with the error and its details, and the
+  error text Claude Code puts in `last_assistant_message` is never captured as
+  a reply. An install made before these fixes has nine or ten events; re-run
+  `ai-memory install-hooks --agent claude-code --apply` (or `ai-memory setup`)
+  to add the rest. `ai-memory upgrade` refreshes the hooks the same way.
 - Factory Droid can install this plugin through its Claude marketplace
   fallback. Its events are recorded as `droid`, and when `install-hooks
   --agent droid` hooks deliver the same event (`~/.factory/hooks.json`, or
@@ -1636,11 +1641,13 @@ ai-memory install-hooks --agent kimi-code --apply \
 ```
 
 `install-hooks` merges `[[hooks]]` entries into `config.toml`, preserving the
-provider/model settings the same file holds. Entries cover 10 events
+provider/model settings the same file holds. Entries cover 12 events
 (`SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `PostToolUseFailure` (Kimi Code reports tool failures separately from
-successful calls; it reuses the post-tool-use handler), `Stop`,
-`SubagentStart`, `SubagentStop`, and `PreCompact`) and default to
+successful calls; it reuses the post-tool-use handler), `Stop`, `StopFailure`
+and `Interrupt` (both fire in place of `Stop` when an error ends the turn or
+the user interrupts it, and reuse the stop handler), `SubagentStart`,
+`SubagentStop`, and `PreCompact`) and default to
 native `ai-memory hook --event … --agent kimi-code` commands on local installs
 (local spool plus batched delivery, capture-policy v1 enforced); the staged
 script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
@@ -1767,12 +1774,13 @@ install writes a stdio `ai-memory mcp-bridge --no-session-id` entry instead of
 putting the bearer in `headers`. Hooks are merged into the root `hooks`
 object, preserving other settings and handlers. Each entry runs the native
 `ai-memory hook --event … --agent qwen-code` command with an empty matcher;
-there is no script bundle. Ten events are wired: `SessionStart`,
+there is no script bundle. Eleven events are wired: `SessionStart`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` (Qwen
 fires it instead of `PostToolUse` when a tool throws), `PreCompact`, `Stop`,
-`SessionEnd`, `SubagentStart` and `SubagentStop`. Capture exclusions apply to
-Qwen's Gemini-like tools (`write_file`, `read_file`, `run_shell_command`,
-`grep_search`, `glob`). User-prompt capture uses only Qwen's
+`StopFailure` (fired instead of `Stop` when an API error or loop detection
+ends the turn), `SessionEnd`, `SubagentStart` and `SubagentStop`. Capture
+exclusions apply to Qwen's Gemini-like tools (`write_file`, `read_file`,
+`run_shell_command`, `grep_search`, `glob`). User-prompt capture uses only Qwen's
 provenance-bearing `submitted_prompt`; automated continuation or retry content
 that appears only in `prompt` is not stored or interpreted as a reload request.
 
@@ -3605,6 +3613,7 @@ Re-running the command is safe. If a project still has the old long ai-memory
 block between line-anchored markers, the refresh replaces that block in place
 with the slim snippet, leaves unrelated instructions before and after it alone,
 and writes a timestamped `.bak-*` backup before changing an existing file.
+Updates within the same second add a numeric suffix to keep each prior version.
 Managed skill files contain an ai-memory ownership marker; same-name user skills
 without that marker are preserved unless you explicitly force replacement.
 Their embedded payloads use LF line endings on every release platform, so CLI

@@ -167,7 +167,8 @@ ai-memory profile apply --remove    # take it out again
   block only.
 - **Backups.** The previous version of the file goes to
   `<data dir>/backups/profile-apply/`, never next to the file, so nothing extra
-  shows up in `git status`.
+  shows up in `git status`. Updates within the same second keep separate
+  numbered backups rather than replacing an earlier copy.
 - **Opt-outs.** A project with `[profile] consume = false` refuses `apply`.
 
 It is the only command that writes a file in your repository, and it only runs

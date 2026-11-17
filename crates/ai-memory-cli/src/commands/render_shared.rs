@@ -36,12 +36,18 @@ use crate::commands::path_util::strip_windows_verbatim_prefix;
 /// post-tool-use script: the server aliases the event and reads the outcome
 /// from the payload.
 ///
+/// `StopFailure` runs instead of `Stop` when an API error (a rate limit, an
+/// exhausted balance, an overloaded server) ends the turn (same page, since
+/// v2.1.78), so without it such a turn had no end in the record. It reuses
+/// the stop script the same way, and the server reads the error from the
+/// payload.
+///
 /// Adding a hook event means updating this list AND adding the matching `.sh`
 /// and `.ps1` files under `hooks/claude-code/` (a reused script like
 /// post-tool-use needs no new file). Agents with different vocabularies keep
 /// their own event arrays below. The install-hooks parity test fails if a
 /// bundle drifts.
-pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 10] = [
+pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 11] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -49,6 +55,7 @@ pub(crate) const CLAUDE_CODE_EVENTS: [(&str, &str); 10] = [
     ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("StopFailure", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
     // Subagent boundaries — let the server seed/forget a subagent session id so
     // `drop_subagent_captures` can drop the whole nested session (Claude Code +
@@ -77,12 +84,18 @@ pub(crate) const GROK_EVENTS: [(&str, &str); 9] = [
 /// leaving room for a slow local spool fsync without making other hooks wait.
 pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
 
-/// Kimi Code lifecycle events ai-memory hooks: the same ten events as
-/// Claude Code (`CLAUDE_CODE_EVENTS`), `PostToolUseFailure` included. Kimi
-/// Code fires `PostToolUse` on successful calls only and reports failures
-/// separately. The failure entry reuses the post-tool-use script — the
-/// server aliases `PostToolUseFailure` to `PostToolUse` and reads the
-/// outcome from the payload.
+/// Kimi Code lifecycle events ai-memory hooks: Claude Code's events
+/// (`CLAUDE_CODE_EVENTS`), `PostToolUseFailure` and `StopFailure` included,
+/// plus `Interrupt`. Kimi Code fires `PostToolUse` on successful calls only
+/// and reports failures separately. The failure entry reuses the
+/// post-tool-use script: the server aliases `PostToolUseFailure` to
+/// `PostToolUse` and reads the outcome from the payload.
+///
+/// `StopFailure` (an error ended the turn, `error_type` and `error_message`)
+/// and `Interrupt` (the user cut it short, with a `reason`) fire in place of
+/// `Stop` (<https://github.com/MoonshotAI/kimi-code/blob/6a8493df3e1d796a63f7c7ca0de76c1e690cd943/docs/en/customization/hooks.md#L129-L130>),
+/// so both reuse the stop script and the server reads which it was from the
+/// payload.
 ///
 /// Kimi Code wires hooks as `[[hooks]]` entries in
 /// `$KIMI_CODE_HOME/config.toml` (TOML) instead of a JSON settings file,
@@ -93,7 +106,7 @@ pub(crate) const CLAUDE_SESSION_END_TIMEOUT_SECS: u64 = 15;
 /// `.sh` and `.ps1` files under `hooks/kimi-code/` (a reused script like
 /// post-tool-use needs no new file). The install-hooks parity test fails
 /// if the bundle drifts.
-pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
+pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 12] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -101,6 +114,8 @@ pub(crate) const KIMI_CODE_EVENTS: [(&str, &str); 10] = [
     ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("StopFailure", "stop.sh"),
+    ("Interrupt", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
     ("SubagentStart", "subagent-start.sh"),
     ("SubagentStop", "subagent-stop.sh"),
@@ -248,11 +263,14 @@ pub(crate) const DSH_EVENTS: [(&str, &str); 7] = [
 /// Qwen Code's hook vocabulary is Claude Code's plus `PostToolUseFailure`
 /// (<https://qwenlm.github.io/qwen-code-docs/en/users/features/hooks/>).
 /// `PostToolUseFailure` fires instead of `PostToolUse` when a tool throws
-/// and is aliased to `post-tool-use`. Subagent events are included: Qwen
+/// and is aliased to `post-tool-use`. `StopFailure` fires instead of `Stop`
+/// when an API error or loop detection ends the turn
+/// (<https://github.com/QwenLM/qwen-code/blob/f35dde84157f992bc324c0a3f59b1119344a683d/docs/users/features/hooks.md#L1020-L1034>)
+/// and runs `stop` the same way. Subagent events are included: Qwen
 /// documents `SubagentStart`/`SubagentStop` for user-spawned agents
 /// (`Bash`, `Explorer`, `Plan`). Qwen fires a real `SessionEnd`, so no
 /// `finalize-session` step is needed.
-pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 10] = [
+pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 11] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
@@ -260,6 +278,7 @@ pub(crate) const QWEN_CODE_EVENTS: [(&str, &str); 10] = [
     ("PostToolUseFailure", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("StopFailure", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
     ("SubagentStart", "subagent-start.sh"),
     ("SubagentStop", "subagent-stop.sh"),
@@ -1720,13 +1739,20 @@ pub(crate) struct HookProfile {
 /// root-session-only event that runs synchronously during thread
 /// teardown. Codex still has no `SubagentStart`/`SubagentStop` in a
 /// first-party-supported form here, so those stay Claude-Code-only.
-pub(crate) const CODEX_EVENTS: [(&str, &str); 7] = [
+///
+/// `Interrupt` runs instead of `Stop` when the user interrupts the turn, with
+/// the common fields only (`codex-rs/hooks/src/schema.rs`,
+/// `InterruptCommandInput`, rust-v0.169.0; already accepted by the hooks
+/// file in rust-v0.154.0, whose event map ignores names it does not know).
+/// It reuses the stop script and the server reads it from the payload.
+pub(crate) const CODEX_EVENTS: [(&str, &str); 8] = [
     ("SessionStart", "session-start.sh"),
     ("UserPromptSubmit", "user-prompt-submit.sh"),
     ("PreToolUse", "pre-tool-use.sh"),
     ("PostToolUse", "post-tool-use.sh"),
     ("PreCompact", "pre-compact.sh"),
     ("Stop", "stop.sh"),
+    ("Interrupt", "stop.sh"),
     ("SessionEnd", "session-end.sh"),
 ];
 
@@ -5486,7 +5512,7 @@ if (inheritOnly) {
             Some("repo-root"),
         );
 
-        assert_eq!(value["hooks"].as_object().unwrap().len(), 10);
+        assert_eq!(value["hooks"].as_object().unwrap().len(), 11);
         for (event, script) in QWEN_CODE_EVENTS {
             let definition = &value["hooks"][event][0];
             assert_eq!(definition["matcher"], "", "event: {event}");

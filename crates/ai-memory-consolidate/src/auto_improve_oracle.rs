@@ -33,8 +33,10 @@ pub(crate) fn oracle_build_prompt_input(
 ) -> PromptInput {
     let mut warnings = Vec::new();
     let mut rejected_candidates = Vec::new();
-    let usable_tokens = cfg.max_input_tokens.saturating_sub(PROMPT_RESERVE_TOKENS);
-    let usable_chars = usable_tokens.saturating_mul(CHARS_PER_TOKEN);
+    // Shares production's budget helper so the equivalence tests keep comparing
+    // the bounded projection on an identical input budget; the frozen part of
+    // this oracle is the projection, not the token arithmetic.
+    let usable_chars = usable_input_chars(cfg.max_input_tokens);
 
     let recent = render_recent_pages(recent_pages);
     let patchable_budget = usable_chars / 4;

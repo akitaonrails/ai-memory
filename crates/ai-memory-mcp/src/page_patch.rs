@@ -126,6 +126,12 @@ pub(crate) fn section_hashes(body: &str) -> (Vec<SectionHash>, bool) {
 
 pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, PatchError> {
     validate_bounds(edits)?;
+    // #2290: the boundaries the append and add-section builders insert follow
+    // the page's dominant line ending, so a CRLF page stays CRLF instead of
+    // gaining lone `\n` boundaries. #2281 made the replace-section path
+    // symmetric this way.
+    let newline = page_line_ending(body);
+    let page_crlf = newline == "\r\n";
     let sections = parse_sections(body);
     let mut by_anchor: HashMap<&str, Vec<&Section>> = HashMap::new();
     for section in &sections {
@@ -138,8 +144,9 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
     let mut targets = HashSet::new();
     let mut added = HashSet::new();
     let mut changes = Vec::with_capacity(edits.len());
+    let mut repaired_unterminated_heading = false;
     for edit in edits {
-        let change = match edit {
+        let mut change = match edit {
             PagePatchEdit::Append {
                 target: AppendTarget::EndOfPage,
                 anchor,
@@ -156,7 +163,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 }
                 Change {
                     range: body.len()..body.len(),
-                    replacement: appended(body, content),
+                    replacement: appended(body, content, newline),
                     placement: Placement::EndOfPage,
                     heading: None,
                 }
@@ -173,7 +180,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 }
                 Change {
                     range: section.whole.end..section.whole.end,
-                    replacement: appended(&body[section.whole.clone()], content),
+                    replacement: appended(&body[section.whole.clone()], content, newline),
                     placement: Placement::Section,
                     heading: Some(section.whole.start),
                 }
@@ -189,7 +196,7 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 let heading = format!("{} {}", "#".repeat(level as usize), title);
                 Change {
                     range: body.len()..body.len(),
-                    replacement: new_section(&heading, content),
+                    replacement: new_section(&heading, content, newline),
                     placement: Placement::NewSection,
                     heading: None,
                 }
@@ -232,7 +239,49 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 }
             }
         };
+        // An unterminated heading at EOF has an empty content range directly
+        // after the heading text. Separate an inserted body from that heading.
+        if matches!(edit, PagePatchEdit::ReplaceSection { .. })
+            && change.range.start == body.len()
+            && !body.ends_with('\n')
+            && !change.replacement.is_empty()
+        {
+            let newline = if change
+                .heading
+                .is_some_and(|start| body[..start].ends_with("\r\n"))
+            {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            if newline == "\r\n"
+                && change.replacement.ends_with('\n')
+                && !change.replacement.ends_with("\r\n")
+            {
+                change.replacement.pop();
+                change.replacement.push_str(newline);
+            }
+            change.replacement.insert_str(0, newline);
+            repaired_unterminated_heading = true;
+        }
         changes.push(change);
+    }
+
+    // Two section insertions at an unterminated heading's EOF have no
+    // unambiguous order: an ancestor append and the new section body resolve
+    // to the same byte, regardless of the request order. Refuse the batch.
+    if repaired_unterminated_heading
+        && changes
+            .iter()
+            .filter(|change| {
+                change.placement == Placement::Section
+                    && change.range.start == body.len()
+                    && change.range.is_empty()
+            })
+            .count()
+            > 1
+    {
+        return Err(PatchError::Overlapping);
     }
 
     // A replacement deletes every section nested in it, so no other edit may
@@ -264,9 +313,24 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
             };
             change
                 .replacement
-                .insert_str(0, blank_line_before(preceding));
+                .insert_str(0, blank_line_before(preceding, page_crlf));
         }
         if joins_previous && let Some(previous) = merged.last_mut() {
+            // The section insertion now supplies the missing EOF separator;
+            // an end-of-page append computed against the old body must not
+            // add it a second time. The separator is CRLF on a CRLF page.
+            if change.placement == Placement::EndOfPage
+                && previous.placement == Placement::Section
+                && repaired_unterminated_heading
+                && !body.ends_with('\n')
+                && previous.replacement.ends_with('\n')
+            {
+                if let Some(rest) = change.replacement.strip_prefix("\r\n") {
+                    change.replacement = rest.to_owned();
+                } else if let Some(rest) = change.replacement.strip_prefix('\n') {
+                    change.replacement = rest.to_owned();
+                }
+            }
             previous.replacement.push_str(&change.replacement);
             continue;
         }
@@ -434,33 +498,44 @@ fn normalize_anchor(raw: &str) -> String {
         .to_lowercase()
 }
 
-fn appended(existing: &str, content: &str) -> String {
+/// The page's dominant line ending, used for the boundaries the append and
+/// add-section builders insert. A page that uses CRLF for at least half of
+/// its line breaks is CRLF; a pure-LF or newline-free page stays LF.
+fn page_line_ending(body: &str) -> &'static str {
+    let crlf = body.matches("\r\n").count();
+    let lf = body.matches('\n').count() - crlf;
+    if crlf > 0 && crlf >= lf { "\r\n" } else { "\n" }
+}
+
+fn appended(existing: &str, content: &str, newline: &str) -> String {
     let prefix = if existing.is_empty() || existing.ends_with('\n') {
         ""
     } else {
-        "\n"
+        newline
     };
-    let suffix = if content.ends_with('\n') { "" } else { "\n" };
+    let suffix = if content.ends_with('\n') { "" } else { newline };
     format!("{prefix}{content}{suffix}")
 }
 
 /// A new section's heading, a blank line, then its text (MD022). The blank
 /// line before the heading depends on what precedes it, so the merge step
-/// adds it.
-fn new_section(heading: &str, content: &str) -> String {
-    let content = content.trim_start_matches('\n');
+/// adds it. `newline` is the page's dominant line ending.
+fn new_section(heading: &str, content: &str, newline: &str) -> String {
+    let content = content.trim_start_matches(['\r', '\n']);
     if content.is_empty() {
-        return format!("{heading}\n");
+        return format!("{heading}{newline}");
     }
-    let suffix = if content.ends_with('\n') { "" } else { "\n" };
-    format!("{heading}\n\n{content}{suffix}")
+    let suffix = if content.ends_with('\n') { "" } else { newline };
+    format!("{heading}{newline}{newline}{content}{suffix}")
 }
 
-fn blank_line_before(preceding: &str) -> &'static str {
-    if preceding.is_empty() || preceding.ends_with("\n\n") {
+fn blank_line_before(preceding: &str, crlf: bool) -> &'static str {
+    if preceding.is_empty() || preceding.ends_with("\n\n") || preceding.ends_with("\r\n\r\n") {
         ""
     } else if preceding.ends_with('\n') {
-        "\n"
+        if crlf { "\r\n" } else { "\n" }
+    } else if crlf {
+        "\r\n\r\n"
     } else {
         "\n\n"
     }
@@ -1016,5 +1091,293 @@ mod tests {
             patched,
             "# T\n## Notes on C#\nold\nmore\n## Tail ##\nend\n\n## F#\n\nnew\n"
         );
+    }
+    #[test]
+    fn replace_section_at_unterminated_heading_adds_a_separator() {
+        for (body, content, expected) in [
+            ("# T\n## One", "new", "# T\n## One\nnew\n"),
+            ("# T\r\n## One", "new", "# T\r\n## One\r\nnew\r\n"),
+            ("# T\r\n## One", "new\r\n", "# T\r\n## One\r\nnew\r\n"),
+            ("## One", "new\n", "## One\nnew\n"),
+            ("# T\n## One", "", "# T\n## One"),
+            ("# T\n## One", "\n\n", "# T\n## One"),
+        ] {
+            let section = section_hashes(body)
+                .0
+                .into_iter()
+                .find(|s| s.anchor == "One")
+                .unwrap();
+            let edit = PagePatchEdit::ReplaceSection {
+                anchor: "One".into(),
+                section_sha256: section.sha256,
+                content: content.into(),
+            };
+            assert_eq!(
+                apply(body, &[edit]).unwrap(),
+                expected,
+                "{body:?} {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_unterminated_heading_and_append_at_eof_are_ordered() {
+        let body = "# T\n## One";
+        let section = section_hashes(body)
+            .0
+            .into_iter()
+            .find(|s| s.anchor == "One")
+            .unwrap();
+        let replace = PagePatchEdit::ReplaceSection {
+            anchor: "One".into(),
+            section_sha256: section.sha256,
+            content: "new".into(),
+        };
+        let append = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append.clone()],
+            vec![append.clone(), replace.clone()],
+        ] {
+            assert_eq!(apply(body, &edits).unwrap(), "# T\n## One\nnew\nfooter\n");
+        }
+        let add = PagePatchEdit::AddSection {
+            anchor: "## Next".into(),
+            content: "end".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append.clone(), add.clone()],
+            vec![replace.clone(), add.clone(), append.clone()],
+            vec![append.clone(), replace.clone(), add.clone()],
+            vec![append.clone(), add.clone(), replace.clone()],
+            vec![add.clone(), replace.clone(), append.clone()],
+            vec![add, append, replace],
+        ] {
+            assert_eq!(
+                apply(body, &edits).unwrap(),
+                "# T\n## One\nnew\nfooter\n\n## Next\n\nend\n"
+            );
+        }
+    }
+    #[test]
+    fn append_section_and_eof_keep_existing_spacing() {
+        for (body, expected) in [
+            ("# T\n## One\nold", "# T\n## One\nold\nsection\n\nfooter\n"),
+            ("# T\n## One", "# T\n## One\nsection\n\nfooter\n"),
+            ("# T\n## One\n", "# T\n## One\nsection\nfooter\n"),
+        ] {
+            let section = PagePatchEdit::Append {
+                target: AppendTarget::Section,
+                anchor: Some("One".into()),
+                content: "section".into(),
+            };
+            let footer = PagePatchEdit::Append {
+                target: AppendTarget::EndOfPage,
+                anchor: None,
+                content: "footer".into(),
+            };
+            for edits in [
+                vec![section.clone(), footer.clone()],
+                vec![footer.clone(), section.clone()],
+            ] {
+                assert_eq!(apply(body, &edits).unwrap(), expected, "{body:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_unterminated_heading_refuses_an_ancestor_append_at_same_eof() {
+        let body = "# T\n## Parent\ntext\n### One";
+        let section = section_hashes(body)
+            .0
+            .into_iter()
+            .find(|s| s.anchor == "One")
+            .unwrap();
+        let replace = PagePatchEdit::ReplaceSection {
+            anchor: "One".into(),
+            section_sha256: section.sha256,
+            content: "new".into(),
+        };
+        let append_parent = PagePatchEdit::Append {
+            target: AppendTarget::Section,
+            anchor: Some("Parent".into()),
+            content: "parent".into(),
+        };
+        let append_eof = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        for edits in [
+            vec![replace.clone(), append_parent.clone(), append_eof.clone()],
+            vec![replace.clone(), append_eof.clone(), append_parent.clone()],
+            vec![append_parent.clone(), replace.clone(), append_eof.clone()],
+            vec![append_parent.clone(), append_eof.clone(), replace.clone()],
+            vec![append_eof.clone(), replace.clone(), append_parent.clone()],
+            vec![append_eof, append_parent, replace],
+        ] {
+            assert_eq!(apply(body, &edits), Err(PatchError::Overlapping));
+        }
+    }
+
+    /// No boundary inserted by any builder may leave a bare `\r` (a `\r` not
+    /// followed by `\n`) or a trailing `\r`. #2281 asserts this for
+    /// replace_section; #2290 extends it to append and add-section.
+    fn assert_no_stray_cr(actual: &str) {
+        assert!(
+            !actual
+                .as_bytes()
+                .windows(2)
+                .any(|pair| pair[0] == b'\r' && pair[1] != b'\n'),
+            "bare \\r in {actual:?}"
+        );
+        assert!(!actual.ends_with('\r'), "trailing \\r in {actual:?}");
+    }
+
+    /// #2290: appending to a section emits `\r\n` boundaries on a CRLF page,
+    /// `\n` on an LF page, and never a bare or trailing `\r` on a mixed page.
+    #[test]
+    fn append_to_section_matches_the_page_line_ending() {
+        for (body, expected) in [
+            // Pure LF.
+            ("# T\n## One\nold\n", Some("# T\n## One\nold\nnew\n")),
+            // Pure CRLF.
+            (
+                "# T\r\n## One\r\nold\r\n",
+                Some("# T\r\n## One\r\nold\r\nnew\r\n"),
+            ),
+            // CRLF with an unterminated section at EOF: the inserted
+            // separator and suffix are both CRLF.
+            (
+                "# T\r\n## One\r\nold",
+                Some("# T\r\n## One\r\nold\r\nnew\r\n"),
+            ),
+            // Mixed (CRLF-dominant): invariant only, asserted below.
+            ("# T\r\n## One\r\nold\nmore\r\n", None),
+        ] {
+            let edit = PagePatchEdit::Append {
+                target: AppendTarget::Section,
+                anchor: Some("One".into()),
+                content: "new".into(),
+            };
+            let actual = apply(body, &[edit]).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(actual, expected, "body: {body:?}");
+            }
+            assert_no_stray_cr(&actual);
+        }
+    }
+
+    /// #2290: appending at end of page follows the page's line ending.
+    #[test]
+    fn append_end_of_page_matches_the_page_line_ending() {
+        for (body, expected) in [
+            ("# T\n## One\nold\n", Some("# T\n## One\nold\nfoot\n")),
+            (
+                "# T\r\n## One\r\nold\r\n",
+                Some("# T\r\n## One\r\nold\r\nfoot\r\n"),
+            ),
+            // Unterminated CRLF EOF: the inserted leading separator is CRLF.
+            (
+                "# T\r\n## One\r\nold",
+                Some("# T\r\n## One\r\nold\r\nfoot\r\n"),
+            ),
+            ("# T\r\n## One\r\nold\nmore\r\n", None),
+        ] {
+            let edit = PagePatchEdit::Append {
+                target: AppendTarget::EndOfPage,
+                anchor: None,
+                content: "foot".into(),
+            };
+            let actual = apply(body, &[edit]).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(actual, expected, "body: {body:?}");
+            }
+            assert_no_stray_cr(&actual);
+        }
+    }
+
+    /// #2290: a new section's heading, its blank separators and its body all
+    /// use the page's line ending.
+    #[test]
+    fn add_section_matches_the_page_line_ending() {
+        for (body, expected) in [
+            (
+                "# T\n\n## One\n\nold\n",
+                Some("# T\n\n## One\n\nold\n\n## Two\n\nnew\n"),
+            ),
+            (
+                "# T\r\n\r\n## One\r\n\r\nold\r\n",
+                Some("# T\r\n\r\n## One\r\n\r\nold\r\n\r\n## Two\r\n\r\nnew\r\n"),
+            ),
+            // No trailing newline on a CRLF page: a full CRLF blank line is
+            // inserted before the new heading.
+            ("# T\r\nx", Some("# T\r\nx\r\n\r\n## Two\r\n\r\nnew\r\n")),
+            ("# T\r\n## One\r\nold\nmore\r\n", None),
+        ] {
+            let edit = PagePatchEdit::AddSection {
+                anchor: "## Two".into(),
+                content: "new".into(),
+            };
+            let actual = apply(body, &[edit]).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(actual, expected, "body: {body:?}");
+            }
+            assert_no_stray_cr(&actual);
+        }
+    }
+
+    /// #2290: an append to a section, an end-of-page append and a new section
+    /// in one batch all stay CRLF on a CRLF page, including when the page ends
+    /// in an unterminated heading repaired by #2281/#2311.
+    #[test]
+    fn crlf_append_and_add_section_in_one_batch_stay_crlf() {
+        let section = PagePatchEdit::Append {
+            target: AppendTarget::Section,
+            anchor: Some("Log".into()),
+            content: "entry".into(),
+        };
+        let footer = PagePatchEdit::Append {
+            target: AppendTarget::EndOfPage,
+            anchor: None,
+            content: "footer".into(),
+        };
+        let add = PagePatchEdit::AddSection {
+            anchor: "## Decisions".into(),
+            content: "d1".into(),
+        };
+        let body = "# Status\r\n## Log\r\nold\r\n";
+        let actual = apply(body, &[section.clone(), footer.clone(), add.clone()]).unwrap();
+        assert_eq!(
+            actual,
+            "# Status\r\n## Log\r\nold\r\nentry\r\nfooter\r\n\r\n## Decisions\r\n\r\nd1\r\n"
+        );
+        assert_no_stray_cr(&actual);
+
+        // Unterminated CRLF heading repaired by a replace, then an end-of-page
+        // append: the footer follows directly, with a CRLF boundary and no
+        // doubled separator.
+        let unterminated = "# T\r\n## One";
+        let one = section_hashes(unterminated)
+            .0
+            .into_iter()
+            .find(|s| s.anchor == "One")
+            .unwrap();
+        let replace = PagePatchEdit::ReplaceSection {
+            anchor: "One".into(),
+            section_sha256: one.sha256,
+            content: "new".into(),
+        };
+        for edits in [
+            vec![replace.clone(), footer.clone()],
+            vec![footer.clone(), replace.clone()],
+        ] {
+            let actual = apply(unterminated, &edits).unwrap();
+            assert_eq!(actual, "# T\r\n## One\r\nnew\r\nfooter\r\n");
+            assert_no_stray_cr(&actual);
+        }
     }
 }

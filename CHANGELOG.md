@@ -18,6 +18,206 @@ version in [`docs/changelog/`](docs/changelog/):
   client capping. Full-input sanitization, existing byte limits and server
   opt-in checks are unchanged; an explicit marker identifies omitted middle text.
   ([#2342](https://github.com/akitaonrails/ai-memory/pull/2342))
+- Preserved reported wiki writes and required full-tree walks after a confinement
+  refusal. Once the entry is repaired, the next checkpoint includes the earlier
+  writes even when another write was reported in the meantime, instead of waiting
+  for the periodic sweep. (#2345, follow-up to #2337.)
+- Applied the rendered-page `Cache-Control: private, no-store` policy to both
+  wiki graph views (`/web/graph` and `/web/w/<workspace>/<project>/graph`).
+  These viewer-dependent HTML responses had been omitted from that policy.
+  (#2346, follow-up to #2328)
+
+- A turn that ends without a normal `Stop` now leaves a turn end. Claude Code
+  and Qwen Code fire `StopFailure` instead when an API error (a rate limit, an
+  exhausted balance) ends the turn, Kimi Code fires `StopFailure` or
+  `Interrupt`, and Codex fires `Interrupt` when the user interrupts it; none of
+  them was wired, and a posted one was stored as an empty `other` row. They now
+  run the stop hook and are stored as `stop failure: <error>` (with the error
+  and its details) or `interrupt`. The rendered error text Claude Code and Qwen
+  put in `last_assistant_message` is never captured as the assistant's reply.
+  Re-run `install-hooks` (or `ai-memory upgrade`) to add the new entries.
+  (#2303)
+- OpenCode and OpenCode 2 incremental transcript exports no longer silently drop
+  a visible record revision whose `time_updated` equals the saved cursor
+  timestamp. Both native stores stamp `time_updated` with millisecond
+  `Date.now()` rather than a unique revision number, so an in-place update kept
+  the same `(time_updated, id)` pair and the strict-greater cursor predicate
+  returned no event. The cursor now fingerprints every record in the newest
+  millisecond bucket, re-emitting same-millisecond revisions and lower-id
+  inserts without replaying unchanged records, preserving exact recovery
+  intervals and single-snapshot reads, and still accepting the pair-only cursors
+  earlier installs persisted. (#2338)
+- The `ai-memory-wikisync` companion now shell-quotes the destination in the
+  suggested `git add` and `git rm` hints, so a `--dest` containing spaces or an
+  apostrophe is copied into a POSIX shell (`/bin/sh`, or Git Bash on Windows) as
+  a single argument instead of splitting into multiple pathspecs or raising an
+  unmatched-quote error. (#2314)
+- `memory_patch_page` now keeps a CRLF page's line endings on the append-to-
+  section, append-end-of-page and add-section paths, which previously injected
+  lone `\n` boundaries into a CRLF page and left it with mixed line endings.
+  The boundaries a patch inserts follow the page's dominant line ending, as the
+  replace-section path already did. (#2290)
+- Fixed OKF export links pointing at a different filename when a literal
+  wikilink path contained an HTML character reference such as `&copy;`. (#2279)
+- Fixed fragment-only links in wiki page bodies and footnotes navigating to
+  the web root instead of the current page. Navigation now preserves the
+  page path and query under default, custom-prefix, and root web mounts. (#2318)
+- The `/web` namespace route decides whether a directory-shaped path has any
+  pages with a scoped `LIMIT 1` probe instead of listing the project. Every
+  unmatched path used to read every page row in the project before answering
+  404, so a stale link, a mistyped URL or a fast series of probes cost a full
+  table read each time. A real listing is unchanged. (#2327)
+- When the OpenCode version probe times out, the `--version` command it tells
+  you to run is now pasteable: the executable is quoted for the native shell
+  (behind PowerShell's `&` call operator on Windows) instead of printed bare,
+  so an npm install under a profile path with a space no longer splits. (#2336)
+- The `finalize-session` command `ai-memory run` prints when it cannot
+  finalize a hookless session now quotes the workspace and project for the
+  native shell, as the `purge-project` and `move-project` confirmations do.
+  It used POSIX quoting, so on Windows a scope name with an apostrophe
+  (`'Levi'\''s work'`) did not paste into PowerShell. (#2334)
+- When `ai-memory upgrade` installs the new binary but its hook refresh
+  fails, the command it tells you to rerun is now the command that ran:
+  it keeps `--config` when one was loaded, quotes each path for the native
+  shell (behind PowerShell's `&` call operator on Windows), and drops the
+  Windows `\\?\` prefix from the canonical binary and data-dir paths.
+  Previously the hint lost `--config` and printed both paths unquoted, so a
+  path with a space could not be pasted. (#2333)
+- The `repair-split` and `merge-project` commands that `ai-memory run` prints
+  for a resumed session held by another project now quote the workspace and
+  the archive name for the native shell. Workspace names may contain spaces,
+  and so may a folder-name project, which the archive name is built from; the
+  pasted command used to split them into separate arguments. (#2332)
+- The confirmation command that `ai-memory handoffs --expire-all` prints
+  without `--confirm` now quotes the workspace and project for the native
+  shell, as the `purge-project` and `move-project` confirmations already do.
+  Workspace names may contain spaces, and the pasted command used to split
+  them into separate arguments. (#2331)
+- The wrapper's self-upgrade keeps the mode `ai-memory` was installed with.
+  `mktemp` creates the staging file 0600 on GNU and BSD alike, and only
+  `chmod +x` was applied before the rename, so a successful upgrade installed a
+  0700 wrapper: the operator who ran it kept working while anyone else running
+  that wrapper from a shared directory could no longer execute it. The staging
+  file now takes the installed mode, falling back to 0755 when neither `stat`
+  form is available. (#2330)
+- A PowerShell hook that spooled an event while its server was unreachable
+  recorded `auth_mode: "none"` even when the hook authenticates from
+  `<data_dir>/auth-tokens/default`. On a default install, where no
+  `AI_MEMORY_AUTH_TOKEN` is set, the drain then posted anonymously, the
+  server answered 401, and the drain retired the entry as a terminal 4xx, so
+  the events it held were lost without a diagnostic. The spool now resolves
+  the same credential its own POST would have carried, which is what the
+  shell bundle and the native spooler already do (#2134). (#2320)
+- Pinned `restore-page` Git revisions before saving the pre-restore checkpoint.
+  Restoring `HEAD` or `HEAD~1` with a dirty wiki no longer reads a different
+  checkpoint after the safety backup advances HEAD. (#2317)
+- Kept relay session-to-agent pins alive after the first delivery of events
+  queued offline longer than 30 days. Delivery attempts now refresh the matching
+  pin atomically without resetting the event's first-attempt retry deadline. (#2316)
+- Corrected the wikisync top-level page allowlist example to include the `.md`
+  suffix. The documented stem-only value matched no such page and could make
+  `sync --check` report an omitted repository page as already in sync. (#2315)
+- Preserved quoted full-text search phrases as contiguous, ordered terms
+  instead of matching their words independently. Quoted CJK queries use the
+  primary FTS stream so substring expansion cannot widen the phrase. (#2278)
+- SessionStart now delivers the handoff snapshot captured by its claim
+  transaction. A delayed turn checkpoint could previously refresh a quiet
+  session's handoff during admission, leaving the updated row accepted while
+  the receiving agent got the older checkpoint text. (#2340)
+- `memory_patch_page` now separates an inserted section body from a heading
+  at end of file even when the heading has no final newline. Previously,
+  replacing such a section silently appended the body to the heading text.
+  (#2311)
+- Preserved the server's configured `auth.bearer_token_file` during uninstall
+  when `AI_MEMORY_AUTH_TOKEN` overrides it for that command. Previously the
+  credential cleanup deleted a root token under `auth-tokens/`, leaving the
+  unchanged config unable to start the server without the override. (#2339)
+- Preserved the configured root bearer during uninstall when
+  `auth.bearer_token_file` names a file below a subdirectory of `auth-tokens`,
+  or an absolute path that reaches it through a directory alias (on macOS,
+  `/var/...` and `/private/var/...` are one file). The credential sweep now
+  matches the kept file by same-file identity and walks the directory
+  recursively, instead of comparing only top-level names and removing an
+  enclosing subdirectory wholesale. (#2341)
+- `ai-memory uninstall --only mcp`, `--only skills` and `--only instructions`
+  no longer delete the hook credentials they leave behind. The server-profile
+  token sweep ran unconditionally while the install-token sweep beside it was
+  gated on whether the hooks were removed, so a partial uninstall kept the hook
+  bundles but removed every token under `<data_dir>/auth-tokens/`, and capture
+  started failing with 401 on the next session. Both sweeps now share one
+  decision. (#2323)
+- A page path that begins with one of the engine's own staging prefixes
+  (`.ai-memory-tmp.` or `.ai-memory-delete.`) is refused at write time. The
+  watcher skips those names and the checkpoint never stages them, so such a
+  page was written and indexed while never reaching the markdown tree, which is
+  the source of truth for it. The rule matches the file name the way the
+  watcher does, so `.ai-memory-tmpX.md` and `my.ai-memory-tmp.md` stay ordinary
+  pages, and existing rows remain readable. (#2329)
+- Page paths that name the Windows console devices `CONIN$` and `CONOUT$` are
+  now refused at write time, like the DOS port names they sit beside. Windows
+  resolves both to a device even with an extension, so the write passed
+  validation, opened the console handle, and failed partway through the atomic
+  write with an OS error instead of a clean `InvalidPagePath`; a page created
+  under such a name on Linux or macOS was then unusable from Windows.
+  Follow-up to #462. (#2319)
+- The auto-improve review prompt now shrinks its input-char budget by the same
+  80% estimate margin that consolidation (#884) and bootstrap (#937) already
+  apply, so a bundle the `bytes ÷ 4` estimate calls a fit stays inside the
+  provider's `max_input_tokens` on denser (non-English prose, source code)
+  corpora, which tokenize well above `÷4`. The per-session reviewer sized its
+  budget with the flat estimate and no margin, the one path of the three that
+  still could overflow on input alone. (#2309)
+- Bounded complete per-session auto-improvement requests, including the system
+  prompt, response schema and envelope reserve. Oversized recent-page context
+  no longer crowds out
+  observation evidence or bypasses the configured budget. An input budget
+  too small for the complete request now records an `input_budget_too_small`
+  skip without calling the provider; an explicit session ID can rerun the
+  review after adjusting the budget. (#2313)
+- The cross-session experience pass now honors `[auto_improve].max_input_tokens`
+  when assembling summaries and optional wiki context. Its estimated request
+  includes the system prompt, response schema and framing, with the same
+  80% estimate headroom as bootstrap. A budget too small for the session
+  context skips the provider call without advancing the scheduler cadence.
+  Previously only per-item caps bounded the prompt. (#2312, #2309)
+- Hot read paths do fewer disk reads, and the wiki backfill that rebuilds
+  the CJK, entity and page-window indexes is now restart-safe: it records a
+  per-pass watermark and persists wiki-file fingerprints, so a restart
+  rescans only new or changed files instead of the whole tree. The
+  missed-event reconcile sweep interval moved from 30s to 300s; live edits
+  are still caught immediately by the file watcher. (#2337)
+- Preserved separate installer and profile-apply backups when multiple updates
+  happen in the same second, instead of overwriting the earlier recovery copy. (#2280)
+
+
+### Security
+
+- Every `/web` page now sends `Cache-Control: private, no-store`, the promise
+  `/api/v1` already made. Six handlers set it while the page-rendering
+  handlers did not, so the project page, a page body, its history, the session
+  timeline, search results and the inbox could be replayed from a shared
+  browser profile's cache or bfcache after the viewer had signed out. Static
+  assets are the deliberate exception: they carry no identity and keep their
+  own caching. (#2328)
+- The post-login redirect target rejects control characters. A URL parser
+  removes ASCII tab and newline characters before it reads the scheme, so
+  `?next=/%09/evil.example` reached the browser as `//evil.example` and sent
+  an operator off-site straight after a successful local login. Deployments
+  that mount the wiki at the host root were affected; the default `/web`
+  slug already refused the payload. (#2321)
+- A flag-based `ai-jail` launch forwards only the provider credentials the
+  launched harness reads, which is what the ai-jail wrapper contract already
+  did. On an ai-jail older than 3.0.1, or for a harness ai-jail has no preset
+  for, `ai-memory run --jail` handed the sandbox every provider key set in the
+  operator's environment, so a Codex session could read `ANTHROPIC_API_KEY`
+  and the other providers' tokens. An automatically chosen harness still
+  forwards what is set, because it is only resolved after the re-exec. (#2322)
+- The event relay warns when it would send `AI_MEMORY_AUTH_TOKEN` over plain
+  `http` to a host other than loopback. The token is the root bearer, and the
+  relay attached it to every batch without looking at the scheme, so an `http`
+  destination on a LAN or the internet published it to anything on the path.
+  Loopback `http` and every `https` destination stay quiet, and the deployment
+  is not refused; the warning names the destination so the operator can decide. (#2324)
 
 ## [3.4.7] - 2026-11-15
 

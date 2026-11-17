@@ -59,8 +59,17 @@ proposal.
 
 ## What it costs and what guards it
 
-One LLM call per project per cadence trigger, prompt-bounded like the
-per-session reviewer. Every proposal flows through the **identical**
+One LLM call per project per cadence trigger. The pass uses
+`[auto_improve].max_input_tokens` as an approximate bytes/4 input budget,
+keeping 20% headroom for estimation error as bootstrap does. System text,
+response schema, framing and truncation markers count toward that estimate.
+Session summaries retain at least half of the available content allowance;
+recent titles, patchable context and rejected proposals share the rest.
+The configured per-session page cap still applies. Truncation is reported
+in warnings. If the budget cannot carry the configured session population,
+the pass skips its provider call and leaves the cadence anchor unchanged so
+a later tick can retry. This heuristic is not a tokenizer or a guarantee of
+a provider's exact token count. Every proposal flows through the **identical**
 machinery: JSON-schema constrained output, validation, the confidence
 floor, the eval gate, the rejection buffer (rejected ideas are shown to
 later runs so they are not re-proposed), and pending-writes staging with

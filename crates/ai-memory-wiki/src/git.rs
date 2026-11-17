@@ -557,8 +557,7 @@ impl GitAdapter {
         // the walk's own vanish tolerance.
         let mut slot = self.writing();
         let git_dir = crate::confinement::inspect_git_directory(&self.root)?;
-        crate::confinement::inspect_tree_except(&self.root, &[git_dir.as_path()])?;
-        match self.commit_all_git2(&mut slot, message) {
+        match self.commit_all_git2(&mut slot, message, &git_dir) {
             Ok(result) => Ok(result),
             Err(CommitGit2Error::Open(error)) => commit_open_error_with_fallback_on(
                 cfg!(windows),
@@ -578,6 +577,7 @@ impl GitAdapter {
         &self,
         slot: &mut Option<Open>,
         message: &str,
+        git_dir: &Path,
     ) -> Result<Option<git2::Oid>, CommitGit2Error> {
         if slot.is_none() {
             let repo = open_validated_repository(&self.root).map_err(|error| match error {
@@ -598,21 +598,35 @@ impl GitAdapter {
             self.written().walk_needed = true;
         }
         let staging = self.take_staging();
-        let mut attempt = 0u32;
-        let result = loop {
-            attempt += 1;
-            match self.commit_staged(open, message, &staging) {
-                // A writer outside the lock was mid-write; it settles in
-                // milliseconds.
-                Err(CommitGit2Error::Other(e))
-                    if is_racy_read(&e) && attempt < RACY_READ_ATTEMPTS =>
-                {
-                    debug!(attempt, "a file changed under the commit; retrying");
-                    std::thread::sleep(RACY_READ_BACKOFF);
+        // Inspection consumes the same staging request as the commit. Every
+        // failure below must restore it through keep_pending before returning.
+        let result = (|| {
+            match &staging {
+                Staging::Everything => {
+                    crate::confinement::inspect_tree_except(&self.root, &[git_dir])
+                        .map_err(CommitGit2Error::Wiki)?;
                 }
-                other => break other,
+                Staging::Paths(paths) => {
+                    crate::confinement::inspect_scoped_paths(&self.root, paths)
+                        .map_err(CommitGit2Error::Wiki)?;
+                }
             }
-        };
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match self.commit_staged(open, message, &staging) {
+                    // A writer outside the lock was mid-write; it settles in
+                    // milliseconds.
+                    Err(CommitGit2Error::Other(e))
+                        if is_racy_read(&e) && attempt < RACY_READ_ATTEMPTS =>
+                    {
+                        debug!(attempt, "a file changed under the commit; retrying");
+                        std::thread::sleep(RACY_READ_BACKOFF);
+                    }
+                    other => break other,
+                }
+            }
+        })();
         if let Ok(oid) = &result {
             open.head = oid.or(head_now);
         }
@@ -895,6 +909,24 @@ impl GitAdapter {
             }
         }
         Ok(out)
+    }
+
+    /// Resolve a revision once so later checkpoints cannot retarget it.
+    pub(crate) fn resolve_commit(&self, rev: &str) -> WikiResult<String> {
+        let repo = match open_validated_repository(&self.root) {
+            Ok(repo) => repo,
+            Err(OpenRepositoryError::Git(error)) => {
+                #[cfg(windows)]
+                if should_try_commit_cli_fallback(&error) {
+                    return resolve_commit_fallback(&self.root, rev);
+                }
+                return Err(map_git_err(error));
+            }
+            Err(OpenRepositoryError::Wiki(error)) => return Err(error),
+        };
+        let object = repo.revparse_single(rev).map_err(map_git_err)?;
+        let commit = object.peel_to_commit().map_err(map_git_err)?;
+        Ok(commit.id().to_string())
     }
 
     /// Read `path` as it existed at `rev`.
@@ -1337,6 +1369,18 @@ fn recent_checkpoints_fallback(
     Ok(checkpoints)
 }
 
+#[cfg(any(windows, test))]
+fn resolve_commit_fallback(root: &Path, rev: &str) -> WikiResult<String> {
+    validate_cli_fallback_root(root)?;
+    // Require a commit-ish and keep caller text out of option parsing:
+    // https://git-scm.com/docs/git-rev-parse#Documentation/git-rev-parse.txt---verify
+    let commit = format!("{rev}^{{commit}}");
+    let out = git_output(root, ["rev-parse", "--verify", "--end-of-options", &commit])?;
+    let oid =
+        git2::Oid::from_str(String::from_utf8_lossy(&out.stdout).trim()).map_err(map_git_err)?;
+    Ok(oid.to_string())
+}
+
 #[cfg(windows)]
 fn file_at_rev_fallback(
     root: &Path,
@@ -1520,7 +1564,7 @@ fn run_git_with_stdin<const N: usize>(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<std::process::Output> {
     let output = git_command(root)
         .args(args)
@@ -1960,6 +2004,8 @@ mod tests {
     #[test]
     fn checkpoint_and_revision_reads_refuse_a_replaced_git_directory() {
         let (_tmp, root, adapter) = committed(&[("a.md", "one")]);
+        assert!(adapter.resolve_commit("HEAD").is_ok());
+        assert!(resolve_commit_fallback(&root, "HEAD").is_ok());
         adapter.close();
         let original = root.join(".git-original");
         std::fs::rename(root.join(".git"), &original).unwrap();
@@ -1980,6 +2026,14 @@ mod tests {
         ));
         assert!(matches!(
             adapter.file_at_rev("HEAD", Path::new("a.md")),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            adapter.resolve_commit("HEAD"),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            resolve_commit_fallback(&root, "HEAD"),
             Err(WikiError::Confinement { .. })
         ));
         assert!(matches!(
@@ -2140,6 +2194,33 @@ mod tests {
         }
         adapter.commit_all("initial").unwrap();
         (tmp, root, adapter)
+    }
+
+    #[test]
+    fn revision_resolution_pins_commits_and_refuses_non_commit_objects() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "one")]);
+        let first = adapter.resolve_commit("HEAD").unwrap();
+        adapter.write_atomic(&root.join("a.md"), b"two").unwrap();
+        adapter.commit_all("second").unwrap();
+        let second = adapter.resolve_commit("HEAD").unwrap();
+        for (rev, expected) in [
+            ("HEAD~1", &first),
+            (first.as_str(), &first),
+            ("HEAD", &second),
+        ] {
+            assert_eq!(adapter.resolve_commit(rev).unwrap(), *expected);
+            assert_eq!(resolve_commit_fallback(&root, rev).unwrap(), *expected);
+        }
+        for rev in ["HEAD^{tree}", "HEAD:a.md", "no-such-revision", "--help"] {
+            assert!(adapter.resolve_commit(rev).is_err(), "{rev}");
+            assert!(resolve_commit_fallback(&root, rev).is_err(), "{rev}");
+        }
+        adapter.write_atomic(&root.join("a.md"), b"three").unwrap();
+        adapter.commit_all("third").unwrap();
+        assert_eq!(
+            adapter.file_at_rev(&second, Path::new("a.md")).unwrap(),
+            b"two"
+        );
     }
 
     /// `apply_batch` keeps one `.ai-memory-tmp.*` staging file per page on disk
@@ -2889,6 +2970,81 @@ mod tests {
         assert!(adapter.commit_all("retry").unwrap().is_some());
         assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a2"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_recovers_reported_paths_after_confinement_refusal() {
+        assert_checkpoint_recovers_after_confinement_refusal(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_recovers_required_walk_after_confinement_refusal() {
+        assert_checkpoint_recovers_after_confinement_refusal(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_checkpoint_recovers_after_confinement_refusal(full_walk: bool) {
+        let (tmp, root, adapter) = committed(&[("a.md", "a0"), ("b.md", "b0")]);
+        write(&root, "a.md", "a1");
+        write(&root, "b.md", "b1");
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "outside remains untouched").unwrap();
+        if full_walk {
+            // An untrusted report requires a walk independently of the sweep
+            // timer. The initial checkpoint's last walk is still recent.
+            adapter.mark_written(&outside);
+        } else {
+            adapter.mark_written(Path::new("a.md"));
+            adapter.mark_written(Path::new("b.md"));
+        }
+        std::fs::remove_file(root.join("a.md")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a.md")).unwrap();
+        assert!(matches!(
+            adapter.commit_all("refused checkpoint"),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a0"));
+        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b0"));
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside remains untouched"
+        );
+        if full_walk {
+            assert!(
+                adapter.written().walk_needed,
+                "a refused full inspection must preserve the required walk"
+            );
+        } else {
+            assert_eq!(
+                adapter.written_paths(),
+                ["a.md", "b.md"].map(PathBuf::from).to_vec(),
+                "a refused scoped inspection must preserve every reported path"
+            );
+        }
+
+        // Legitimate control: repair the refused entry, then report a new
+        // write. The next checkpoint must include the earlier writes too.
+        std::fs::remove_file(root.join("a.md")).unwrap();
+        write(&root, "a.md", "a1");
+        write(&root, "c.md", "c1");
+        adapter.mark_written(Path::new("c.md"));
+        assert!(
+            adapter
+                .commit_all("checkpoint after repair")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a1"));
+        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b1"));
+        assert_eq!(head_blob(&adapter, "c.md").as_deref(), Some("c1"));
+        assert_clean_from_outside(&root, "after the repaired checkpoint");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside remains untouched"
+        );
+    }
+
     /// The stat cache's blind spot: a file rewritten with the same size and
     /// an mtime no newer than the index looks unchanged by stat alone. git
     /// treats an entry whose mtime is not older than the index as "racy"

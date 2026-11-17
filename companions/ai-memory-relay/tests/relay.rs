@@ -797,6 +797,117 @@ fn a_session_pinned_to_one_agent_refuses_a_second_agent() {
 }
 
 #[test]
+fn an_offline_session_pin_survives_its_first_delivery_window() {
+    let root = fixture("offline-session-pin");
+    let dir = bind(&root, "http://127.0.0.1:9/");
+    let mut queue = Queue::open(&dir).unwrap();
+    let first = valid("first", "claude-code", "session-start", "offline-session");
+    queue.enqueue(std::slice::from_ref(&first), 0).unwrap();
+    let delivered_at = identity::RETRY_WINDOW_MS + 100;
+
+    queue.prune(delivered_at).unwrap();
+    assert_eq!(queue.stats(delivered_at).unwrap().known_sessions, 1);
+    queue
+        .stamp_attempt(std::slice::from_ref(&first.ingest_key), delivered_at)
+        .unwrap();
+    queue
+        .confirm(&[(first.ingest_key, "stored")], delivered_at)
+        .unwrap();
+    drop(queue);
+
+    let mut queue = Queue::open(&dir).unwrap();
+    queue.prune(delivered_at + 1).unwrap();
+    assert_eq!(queue.stats(delivered_at + 1).unwrap().receipts, 1);
+    assert_eq!(
+        queue.stats(delivered_at + 1).unwrap().known_sessions,
+        1,
+        "a fresh delivery receipt must not outlive its session-to-agent pin"
+    );
+    let foreign = valid("foreign", "codex", "user-prompt-submit", "offline-session");
+    let error = queue.enqueue(&[foreign], delivered_at + 1).unwrap_err();
+    assert!(error.to_string().contains("session identity conflict"));
+    assert_eq!(queue.stats(delivered_at + 1).unwrap().pending_items, 0);
+
+    let same = valid(
+        "same",
+        "claude-code",
+        "user-prompt-submit",
+        "offline-session",
+    );
+    queue
+        .enqueue(std::slice::from_ref(&same), delivered_at + 1)
+        .unwrap();
+    assert_eq!(queue.stats(delivered_at + 1).unwrap().pending_items, 1);
+    queue
+        .stamp_attempt(std::slice::from_ref(&same.ingest_key), delivered_at + 2)
+        .unwrap();
+    queue
+        .confirm(&[(same.ingest_key, "stored")], delivered_at + 2)
+        .unwrap();
+    let expired_at = delivered_at + 2 + identity::RETRY_WINDOW_MS + 1;
+    queue.prune(expired_at).unwrap();
+    assert_eq!(queue.stats(expired_at).unwrap().known_sessions, 0);
+    assert_eq!(queue.stats(expired_at).unwrap().receipts, 0);
+}
+
+#[test]
+fn delivery_attempt_refreshes_only_its_matching_agent_pin_monotonically() {
+    let root = fixture("attempt-pin");
+    let dir = bind(&root, "http://127.0.0.1:9/");
+    let mut queue = Queue::open(&dir).unwrap();
+    let first = valid("first", "claude-code", "session-start", "first-session");
+    let other = valid("other", "codex", "session-start", "other-session");
+    queue.enqueue(&[first.clone(), other], 100).unwrap();
+    queue
+        .stamp_attempt(std::slice::from_ref(&first.ingest_key), 200)
+        .unwrap();
+    queue
+        .stamp_attempt(std::slice::from_ref(&first.ingest_key), 150)
+        .unwrap();
+    queue
+        .stamp_attempt(&["missing-key".to_string()], 300)
+        .unwrap();
+
+    let conn = rusqlite::Connection::open(queue.path()).unwrap();
+    let pins: Vec<(String, i64)> = conn
+        .prepare("SELECT session_id,last_seen_ms FROM session_agent ORDER BY session_id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        pins,
+        [("first-session".into(), 200), ("other-session".into(), 100)]
+    );
+    let attempt: (i64, i64) = conn
+        .query_row(
+            "SELECT first_attempt_ms,attempts FROM pending WHERE ingest_key=?1",
+            [&first.ingest_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(attempt, (200, 2), "the retry clock must not be reset");
+
+    conn.execute(
+        "UPDATE session_agent SET agent='codex' WHERE session_id='first-session'",
+        [],
+    )
+    .unwrap();
+    queue
+        .stamp_attempt(std::slice::from_ref(&first.ingest_key), 400)
+        .unwrap();
+    let seen: i64 = conn
+        .query_row(
+            "SELECT last_seen_ms FROM session_agent WHERE session_id='first-session'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(seen, 200, "another agent's pin must not be refreshed");
+}
+
+#[test]
 fn an_invalid_envelope_is_refused_with_zero_side_effects() {
     let root = fixture("invalid-envelope");
     let dir = bind(&root, "http://127.0.0.1:9/");

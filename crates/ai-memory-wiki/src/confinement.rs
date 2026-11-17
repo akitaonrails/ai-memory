@@ -194,6 +194,46 @@ pub(crate) fn inspect_tree_if_present(root: &Path) -> WikiResult<()> {
     }
 }
 
+/// Confine only `paths` (relative to `root`) and their ancestor directories
+/// under `root`, without walking unrelated subtrees.
+pub(crate) fn inspect_scoped_paths(
+    root: &Path,
+    paths: &std::collections::BTreeSet<PathBuf>,
+) -> WikiResult<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) => require_directory(root, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let mut checked_ancestors = std::collections::HashSet::new();
+    for rel in paths {
+        let mut cursor = root.to_path_buf();
+        let mut components = rel.components().peekable();
+        while let Some(comp) = components.next() {
+            cursor.push(comp);
+            if components.peek().is_some() {
+                if !checked_ancestors.insert(cursor.clone()) {
+                    continue;
+                }
+                match std::fs::symlink_metadata(&cursor) {
+                    Ok(metadata) => require_directory(&cursor, &metadata)?,
+                    Err(error) if is_transient_churn(&error) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                match std::fs::symlink_metadata(&cursor) {
+                    Ok(metadata) if metadata.is_dir() => inspect_tree_if_present(&cursor)?,
+                    Ok(metadata) if is_link_like(&metadata) => return Err(confined(&cursor)),
+                    Ok(_) => {}
+                    Err(error) if is_transient_churn(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn inspect_tree_except(root: &Path, excluded_roots: &[&Path]) -> WikiResult<()> {
     // lgtm [rust/path-injection]
     match std::fs::symlink_metadata(root) {
@@ -451,6 +491,39 @@ mod tests {
             if link_directory(&outside, &linked) {
                 assert!(matches!(
                     inspect_final(&linked),
+                    Err(WikiError::Confinement { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_path_confinement_skips_unrelated_subtrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("wiki");
+        let target_dir = root.join("ws").join("proj").join("sessions");
+        let unrelated_dir = root.join("other-ws").join("huge-proj");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::create_dir_all(&unrelated_dir).unwrap();
+        std::fs::write(target_dir.join("note.md"), b"ok").unwrap();
+
+        #[cfg(any(unix, windows))]
+        {
+            let outside = temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            // A link inside an unrelated subtree does not cause a scoped
+            // check for `ws/proj/sessions/note.md` to walk `other-ws`,
+            // whereas a link on the scoped path itself is still refused.
+            if link_directory(&outside, &unrelated_dir.join("escape")) {
+                let mut paths = std::collections::BTreeSet::new();
+                paths.insert(PathBuf::from("ws/proj/sessions/note.md"));
+                assert!(inspect_scoped_paths(&root, &paths).is_ok());
+            }
+            if link_directory(&outside, &target_dir.join("linked.md")) {
+                let mut paths = std::collections::BTreeSet::new();
+                paths.insert(PathBuf::from("ws/proj/sessions/linked.md"));
+                assert!(matches!(
+                    inspect_scoped_paths(&root, &paths),
                     Err(WikiError::Confinement { .. })
                 ));
             }

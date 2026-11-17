@@ -4839,11 +4839,12 @@ async fn handle_restore_page(
         }
     };
 
-    if version_id.is_none() {
-        state
-            .wiki
-            .page_at_checkpoint(ws, proj, &path, &restore_source)
-            .await
+    let pinned_revision = if version_id.is_none() {
+        Some(async {
+            let rev = state.wiki.resolve_checkpoint_rev(&restore_source).await?;
+            state.wiki.page_at_checkpoint(ws, proj, &path, &rev).await?;
+            Ok::<_, WikiError>(rev)
+        }.await
             .map_err(|error| match error {
                 WikiError::GitOwner(_) => internal_err(error.to_string()),
                 _ => (
@@ -4852,8 +4853,10 @@ async fn handle_restore_page(
                         "error": format!("cannot read {} at {restore_source}: {error}", path.as_str())
                     })),
                 ),
-            })?;
-    }
+            })?)
+    } else {
+        None
+    };
 
     let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
@@ -4865,10 +4868,10 @@ async fn handle_restore_page(
         ),
     )?;
 
-    let page_id = if version_id.is_none() {
+    let page_id = if let Some(rev) = pinned_revision {
         state
             .wiki
-            .restore_page_from_checkpoint(ws, proj, path.clone(), &restore_source)
+            .restore_page_from_checkpoint(ws, proj, path.clone(), &rev)
             .await
             .map_err(|error| match error {
                 WikiError::Store(StoreError::SessionPurged(_)) => (

@@ -1769,7 +1769,7 @@ pub struct AutoImproveSettings {
     pub min_session_duration_secs: u64,
     /// Minimum model confidence accepted by validation.
     pub min_confidence: f32,
-    /// Approximate chars/4 prompt budget for review input.
+    /// Approximate bytes/4 budget for the complete reviewer input.
     pub max_input_tokens: usize,
     /// Maximum validated proposals returned from one run.
     pub max_proposals_per_run: usize,

@@ -10,6 +10,7 @@ Defaults that come from a named constant or from another crate say so in the Def
 
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
+| `data_dir` | Platform local data directory + `ai-memory` (`dirs::data_local_dir()`) | `AI_MEMORY_DATA_DIR` | Root directory holding `wiki/`, `raw/`, `db/`, `models/` and `logs/`. The config file lives inside it, so `config.default.toml` omits the key by design; `--data-dir` sets it too. |
 | `language` | `"en"` | `AI_MEMORY_LANGUAGE` | Human-facing CLI language (`en` or `pt-BR`); overridden by `--language`. Browser language is per request. |
 | `bind` | `127.0.0.1:49374` (`DEFAULT_BIND`) | `AI_MEMORY_BIND` | HTTP bind address used by `ai-memory serve`. |
 | `tcp_keepalive_secs` | `60` (`DEFAULT_TCP_KEEPALIVE_SECS`) | `AI_MEMORY_TCP_KEEPALIVE_SECS` | Idle seconds before TCP keepalive probes start on an accepted connection. 0 disables keepalive. |
@@ -227,7 +228,7 @@ The defaults named `DEFAULT_AUTO_IMPROVE_*` are constants in `ai-memory-consolid
 | `min_observations` | `8` (`DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS`) | `AI_MEMORY_AUTO_IMPROVE__MIN_OBSERVATIONS` | Observations a session needs before it is reviewed. |
 | `min_session_duration_secs` | `120` (`DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS`) | `AI_MEMORY_AUTO_IMPROVE__MIN_SESSION_DURATION_SECS` | Minimum span between first and last observation before review. |
 | `min_confidence` | `0.75` (`DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE`) | `AI_MEMORY_AUTO_IMPROVE__MIN_CONFIDENCE` | Lowest model confidence validation accepts. |
-| `max_input_tokens` | `24000` (`DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS`) | `AI_MEMORY_AUTO_IMPROVE__MAX_INPUT_TOKENS` | Approximate prompt budget for one review. |
+| `max_input_tokens` | `24000` (`DEFAULT_AUTO_IMPROVE_MAX_INPUT_TOKENS`) | `AI_MEMORY_AUTO_IMPROVE__MAX_INPUT_TOKENS` | Approximate bytes/4 budget for one complete session-review input, including the system prompt, response schema and envelope reserve. |
 | `max_proposals_per_run` | `5` (`DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS`) | `AI_MEMORY_AUTO_IMPROVE__MAX_PROPOSALS_PER_RUN` | Validated proposals returned from one run. |
 | `max_patchable_pages` | `8` (`DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES`) | `AI_MEMORY_AUTO_IMPROVE__MAX_PATCHABLE_PAGES` | Existing pages included as context for patch proposals. |
 | `patchable_page_prefixes` | `["_rules/", "procedures/"]` (`DEFAULT_AUTO_IMPROVE_PATCHABLE_PAGE_PREFIXES`) | `AI_MEMORY_AUTO_IMPROVE__PATCHABLE_PAGE_PREFIXES` | Wiki folder prefixes whose page bodies the reviewer may read. |

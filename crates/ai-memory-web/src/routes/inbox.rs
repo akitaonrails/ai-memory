@@ -17,7 +17,7 @@ use axum::{
     Json,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
@@ -308,7 +308,7 @@ pub(crate) async fn handler(
         inbox,
     };
     match view.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

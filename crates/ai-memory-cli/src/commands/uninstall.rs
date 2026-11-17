@@ -868,6 +868,16 @@ fn remove_dir_if_empty(i18n: &ai_memory_core::i18n::Localizer, path: &Path) -> R
     Ok(())
 }
 
+/// Whether this uninstall may remove the credentials the installed hooks
+/// authenticate with.
+///
+/// `--only mcp`, `--only skills` and `--only instructions` leave the hook
+/// bundles in place, so their tokens have to survive the run; only a full
+/// uninstall, or one that removes the hooks themselves, may clear them.
+fn clears_hook_credentials(only: Option<crate::cli::UninstallOnly>) -> bool {
+    only.is_none() || only == Some(crate::cli::UninstallOnly::Hooks)
+}
+
 /// Run the `uninstall` subcommand.
 ///
 /// # Errors
@@ -910,6 +920,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     }
     let remove_service = matches!(&service, Some((_, user_service::Removal::Removed(_))));
     let hooks_removed = args.only.is_none() || args.only == Some(crate::cli::UninstallOnly::Hooks);
+    let clears_credentials = clears_hook_credentials(args.only);
     if hooks_removed {
         // Only the current checkout's project file is reachable from here.
         println!(
@@ -991,7 +1002,7 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
     // otherwise succeeded.
     let bridge_keeps_key = args.only == Some(crate::cli::UninstallOnly::Hooks)
         && install_mcp::bridge_entry_remains(name.as_deref().unwrap_or("ai-memory"));
-    if hooks_removed
+    if clears_credentials
         && !bridge_keeps_key
         && let Err(error) = crate::config::clear_hook_auth_token(&config.data_dir)
     {
@@ -1007,11 +1018,28 @@ pub fn run(config: &Config, args: UninstallArgs) -> anyhow::Result<()> {
         );
     }
     // Server-profile tokens (#992) are read by the same hooks, so the same
-    // reasoning applies; the registry of URLs stays. The root bearer the
-    // server itself reads (`[auth].bearer_token_file`) is not a hook's and
-    // stays with the server's config.
-    if let Err(error) =
-        crate::server_profiles::clear_tokens(&config.data_dir, config.auth.token_file_path())
+    // reasoning applies: `--only mcp` and `--only skills` leave the hooks
+    // installed, and clearing these would leave them unable to authenticate.
+    // The registry of URLs stays. The root bearer the server itself reads
+    // (`[auth].bearer_token_file`) is not a hook's and stays with the server's
+    // config.
+    // An environment override skips resolving that file during config load,
+    // but the next server start without the override still needs it.
+    let root_token_file = config
+        .auth
+        .token_file_path()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            config
+                .auth
+                .bearer_token_file
+                .as_ref()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| config.data_dir.join(path))
+        });
+    if clears_credentials
+        && let Err(error) =
+            crate::server_profiles::clear_tokens(&config.data_dir, root_token_file.as_deref())
     {
         eprintln!(
             "{}",
@@ -2088,6 +2116,27 @@ mod tests {
     use ai_memory_core::MARKER_START;
     #[cfg(unix)]
     use std::time::Duration;
+
+    /// A partial uninstall keeps the hook bundles, so it must keep the
+    /// credentials they read. The server-profile token sweep once ran
+    /// unconditionally, which left `--only mcp` and `--only skills` installs
+    /// with hooks that could no longer authenticate.
+    #[test]
+    fn only_a_full_or_hooks_only_uninstall_clears_hook_credentials() {
+        use crate::cli::UninstallOnly;
+        assert!(clears_hook_credentials(None));
+        assert!(clears_hook_credentials(Some(UninstallOnly::Hooks)));
+        for kept in [
+            UninstallOnly::Mcp,
+            UninstallOnly::Skills,
+            UninstallOnly::Instructions,
+        ] {
+            assert!(
+                !clears_hook_credentials(Some(kept)),
+                "{kept:?} leaves the hooks installed and their tokens in place"
+            );
+        }
+    }
 
     /// Answers `systemctl`/`launchctl` from a script and records each call.
     struct ServiceRunner {

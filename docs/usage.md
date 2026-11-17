@@ -538,6 +538,11 @@ immediately before patching, then call `memory_patch_page` with that required
 }
 ```
 
+When a section heading is the last line and has no final newline, a nonempty
+`replace_section` body is inserted on a new line after the heading. A batch
+that also appends to an ancestor section at the same EOF is refused as
+overlapping; submit those edits separately.
+
 Use `target: "end_of_page"` with no anchor to append at EOF. `add_section`
 requires an ATX level 2-6 heading such as `## Decisions` and rejects a heading
 that already exists after whitespace/case normalization. Edits that land at the
@@ -546,9 +551,11 @@ in `edits`: an append to the last section stays in that section, an
 `end_of_page` append follows it, and new sections come last. So
 `end_of_page` is the end of the page you read, before any section the same
 batch adds; text meant to follow a new heading goes in that `add_section`'s
-`content`. A new heading gets a blank line before and after it. When replacing
-a nonempty section body, the blank-line padding around it is preserved for LF
-and CRLF pages. The replacement also removes sections nested in it, so another
+`content`. A new heading gets a blank line before and after it. Every boundary
+a patch inserts follows the page's dominant line ending: on a CRLF page the
+appends, the new section and its blank lines use CRLF, and replacing a nonempty
+section body preserves the blank-line padding around it for both LF and CRLF
+pages. The replacement also removes sections nested in it, so another
 edit to one of those is an overlapping target. Duplicate headings, stale page
 or section tokens, overlapping targets, failed admission, or a concurrent
 writer reject the whole batch. Existing frontmatter is preserved; the final
