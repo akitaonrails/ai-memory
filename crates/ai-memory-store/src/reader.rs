@@ -9652,9 +9652,11 @@ impl ReaderPool {
     }
 
     /// Page pending messages after `after` (exclusive), ordered by
-    /// `(created_at, id)`. `None` starts at the oldest pending message. A
-    /// cursor that names no pending message in this mailbox yields an empty
-    /// page, so a foreign or stale id cannot read another project's mail.
+    /// `(created_at, id)`. `None` starts at the oldest pending message. The
+    /// cursor keeps its place once its own message is popped, cancelled or
+    /// taken for editing, because the list hands out exactly the ids those
+    /// calls consume. A cursor that names no message in this mailbox yields an
+    /// empty page, so a foreign id cannot read another project's mail.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -9681,7 +9683,7 @@ impl ReaderPool {
                         "SELECT {cols} FROM agent_messages \
                          WHERE {predicate} AND state = 'pending' \
                            AND (created_at, id) > (SELECT created_at, id FROM agent_messages \
-                               WHERE id = ?3 AND {predicate} AND state = 'pending') \
+                               WHERE id = ?3 AND {predicate}) \
                          ORDER BY created_at ASC, id ASC LIMIT {limit}",
                         cols = crate::ops::MESSAGE_COLUMNS,
                     );
