@@ -28,6 +28,11 @@ version in [`docs/changelog/`](docs/changelog/):
   apostrophe is copied into a POSIX shell (`/bin/sh`, or Git Bash on Windows) as
   a single argument instead of splitting into multiple pathspecs or raising an
   unmatched-quote error. (#2314)
+- `memory_patch_page` now keeps a CRLF page's line endings on the append-to-
+  section, append-end-of-page and add-section paths, which previously injected
+  lone `\n` boundaries into a CRLF page and left it with mixed line endings.
+  The boundaries a patch inserts follow the page's dominant line ending, as the
+  replace-section path already did. (#2290)
 
 ### Fixed
 
