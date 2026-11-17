@@ -1248,7 +1248,7 @@ language = "en"                    # human-facing terminal language: "en" or "pt
                                    # content keep their format (docs/localization.md)
 bind = "127.0.0.1:49374"
 log_level = "info"                 # default filter also pins `rmcp=warn` (the MCP SDK's
-                                   # per-request info logs) and drops the 30s reconcile
+                                   # per-request info logs) and drops the 300s reconcile
                                    # summary to debug (#894). Restore either via log_level
                                    # (e.g. "info,rmcp=info", "debug") or RUST_LOG;
                                    # `tracing_appender=warn` stays forced (feedback-loop guard)
@@ -1314,7 +1314,7 @@ forget_sweep_interval_secs = 86400 # retention forget sweep; 0 disables. Cadence
 lint_interval_secs = 86400         # rule-based wiki lint; 0 disables (same persistence)
 embedding_backfill_interval_secs = 0  # embedding backfill; 0 = off (may call a paid provider)
 reconcile_tombstones_deleted_pages = false
-                                   # opt-in (#929/#964): the 30s reconcile pass soft-tombstones
+                                   # opt-in (#929/#964): the 300s reconcile pass soft-tombstones
                                    # (is_latest=0 + superseded_at — never a filesystem write) an
                                    # OKF-imported content page whose file has been missing on
                                    # two consecutive passes, behind a circuit breaker and with
