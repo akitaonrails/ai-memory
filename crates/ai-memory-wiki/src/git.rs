@@ -897,6 +897,24 @@ impl GitAdapter {
         Ok(out)
     }
 
+    /// Resolve a revision once so later checkpoints cannot retarget it.
+    pub(crate) fn resolve_commit(&self, rev: &str) -> WikiResult<String> {
+        let repo = match open_validated_repository(&self.root) {
+            Ok(repo) => repo,
+            Err(OpenRepositoryError::Git(error)) => {
+                #[cfg(windows)]
+                if should_try_commit_cli_fallback(&error) {
+                    return resolve_commit_fallback(&self.root, rev);
+                }
+                return Err(map_git_err(error));
+            }
+            Err(OpenRepositoryError::Wiki(error)) => return Err(error),
+        };
+        let object = repo.revparse_single(rev).map_err(map_git_err)?;
+        let commit = object.peel_to_commit().map_err(map_git_err)?;
+        Ok(commit.id().to_string())
+    }
+
     /// Read `path` as it existed at `rev`.
     ///
     /// `path` is relative to the wiki repo root. The returned bytes are the
@@ -1337,6 +1355,18 @@ fn recent_checkpoints_fallback(
     Ok(checkpoints)
 }
 
+#[cfg(any(windows, test))]
+fn resolve_commit_fallback(root: &Path, rev: &str) -> WikiResult<String> {
+    validate_cli_fallback_root(root)?;
+    // Require a commit-ish and keep caller text out of option parsing:
+    // https://git-scm.com/docs/git-rev-parse#Documentation/git-rev-parse.txt---verify
+    let commit = format!("{rev}^{{commit}}");
+    let out = git_output(root, ["rev-parse", "--verify", "--end-of-options", &commit])?;
+    let oid =
+        git2::Oid::from_str(String::from_utf8_lossy(&out.stdout).trim()).map_err(map_git_err)?;
+    Ok(oid.to_string())
+}
+
 #[cfg(windows)]
 fn file_at_rev_fallback(
     root: &Path,
@@ -1520,7 +1550,7 @@ fn run_git_with_stdin<const N: usize>(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<std::process::Output> {
     let output = git_command(root)
         .args(args)
@@ -1960,6 +1990,8 @@ mod tests {
     #[test]
     fn checkpoint_and_revision_reads_refuse_a_replaced_git_directory() {
         let (_tmp, root, adapter) = committed(&[("a.md", "one")]);
+        assert!(adapter.resolve_commit("HEAD").is_ok());
+        assert!(resolve_commit_fallback(&root, "HEAD").is_ok());
         adapter.close();
         let original = root.join(".git-original");
         std::fs::rename(root.join(".git"), &original).unwrap();
@@ -1980,6 +2012,14 @@ mod tests {
         ));
         assert!(matches!(
             adapter.file_at_rev("HEAD", Path::new("a.md")),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            adapter.resolve_commit("HEAD"),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert!(matches!(
+            resolve_commit_fallback(&root, "HEAD"),
             Err(WikiError::Confinement { .. })
         ));
         assert!(matches!(
@@ -2140,6 +2180,33 @@ mod tests {
         }
         adapter.commit_all("initial").unwrap();
         (tmp, root, adapter)
+    }
+
+    #[test]
+    fn revision_resolution_pins_commits_and_refuses_non_commit_objects() {
+        let (_tmp, root, adapter) = committed(&[("a.md", "one")]);
+        let first = adapter.resolve_commit("HEAD").unwrap();
+        adapter.write_atomic(&root.join("a.md"), b"two").unwrap();
+        adapter.commit_all("second").unwrap();
+        let second = adapter.resolve_commit("HEAD").unwrap();
+        for (rev, expected) in [
+            ("HEAD~1", &first),
+            (first.as_str(), &first),
+            ("HEAD", &second),
+        ] {
+            assert_eq!(adapter.resolve_commit(rev).unwrap(), *expected);
+            assert_eq!(resolve_commit_fallback(&root, rev).unwrap(), *expected);
+        }
+        for rev in ["HEAD^{tree}", "HEAD:a.md", "no-such-revision", "--help"] {
+            assert!(adapter.resolve_commit(rev).is_err(), "{rev}");
+            assert!(resolve_commit_fallback(&root, rev).is_err(), "{rev}");
+        }
+        adapter.write_atomic(&root.join("a.md"), b"three").unwrap();
+        adapter.commit_all("third").unwrap();
+        assert_eq!(
+            adapter.file_at_rev(&second, Path::new("a.md")).unwrap(),
+            b"two"
+        );
     }
 
     /// `apply_batch` keeps one `.ai-memory-tmp.*` staging file per page on disk
