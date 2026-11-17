@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Applied the rendered-page `Cache-Control: private, no-store` policy to both
+  wiki graph views (`/web/graph` and `/web/w/<workspace>/<project>/graph`).
+  These viewer-dependent HTML responses had been omitted from that policy.
+  (#2328)
+
 - A turn that ends without a normal `Stop` now leaves a turn end. Claude Code
   and Qwen Code fire `StopFailure` instead when an API error (a rate limit, an
   exhausted balance) ends the turn, Kimi Code fires `StopFailure` or

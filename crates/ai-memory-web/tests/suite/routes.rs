@@ -5242,6 +5242,26 @@ async fn metadata_shows_only_what_the_viewer_may_read() {
         }
         let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        if content_type.is_some_and(|value| value.starts_with("text/html")) {
+            assert_eq!(
+                resp.headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("private, no-store"),
+                "{viewer:?} must not reuse another viewer's HTML at {uri}"
+            );
+            assert_eq!(content_type, Some("text/html; charset=utf-8"));
+            assert_eq!(
+                resp.headers()
+                    .get(header::VARY)
+                    .and_then(|value| value.to_str().ok()),
+                Some("Accept-Language, Cookie")
+            );
+        }
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -7207,6 +7227,8 @@ async fn search_alias_links_require_a_grant_and_refuse_ambiguous_names() {
 /// `/api/v1` makes. Static assets are the deliberate exception.
 #[tokio::test]
 async fn web_pages_refuse_browser_caching() {
+    use ai_memory_web::{WebMountSpec, split_web_routers};
+
     let (_tmp, store, wiki) = setup().await;
     let ws = store
         .writer
@@ -7218,18 +7240,33 @@ async fn web_pages_refuse_browser_caching() {
         .get_or_create_project(ws, "scratch", None)
         .await
         .unwrap();
-    store
-        .writer
-        .upsert_page(new_page(
-            ws,
-            proj,
-            "concepts/retrieval.md",
-            "Retrieval",
-            "body",
-        ))
-        .await
-        .unwrap();
-    let app = router(store.reader.clone(), wiki.clone());
+    wiki.write_page(wiki_req(
+        ws,
+        proj,
+        "concepts/retrieval.md",
+        "# Retrieval\n\nA stored page.",
+    ))
+    .await
+    .unwrap();
+    let split = split_web_routers(
+        true,
+        store.reader.clone(),
+        wiki,
+        WebMountSpec {
+            enable_api: false,
+            web_ui_dir: None,
+            cors_origins: &[],
+            web_slug: "",
+            base_href: "/",
+            base_path: "",
+            trusted_proxy_identity: false,
+            recall: ai_memory_web::Recall::default(),
+            runtime: None,
+            health: None,
+        },
+    )
+    .unwrap();
+    let app = split.protected.merge(split.public);
 
     for uri in [
         "/",
@@ -7238,6 +7275,8 @@ async fn web_pages_refuse_browser_caching() {
         "/w/default/scratch/h/concepts/retrieval.md",
         "/search?q=retrieval",
         "/inbox",
+        "/graph",
+        "/w/default/scratch/graph",
         // The not-found page renders the same chrome, so it carries the same
         // header.
         "/w/default/scratch/p/no/such/page.md",
@@ -7247,6 +7286,26 @@ async fn web_pages_refuse_browser_caching() {
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
+        let expected_status = if uri.ends_with("/p/no/such/page.md") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(resp.status(), expected_status, "{uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8"),
+            "{uri}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|value| value.to_str().ok()),
+            Some("Accept-Language, Cookie"),
+            "{uri}"
+        );
         assert_eq!(
             resp.headers()
                 .get(header::CACHE_CONTROL)
@@ -7268,12 +7327,20 @@ async fn web_pages_refuse_browser_caching() {
         )
         .await
         .unwrap();
-    assert_ne!(
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/css; charset=utf-8")
+    );
+    assert_eq!(
         asset
             .headers()
             .get(header::CACHE_CONTROL)
             .and_then(|value| value.to_str().ok()),
-        Some("private, no-store"),
+        None,
         "a static asset keeps its own caching"
     );
 }
