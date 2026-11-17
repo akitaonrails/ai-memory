@@ -23,6 +23,11 @@ version in [`docs/changelog/`](docs/changelog/):
   inserts without replaying unchanged records, preserving exact recovery
   intervals and single-snapshot reads, and still accepting the pair-only cursors
   earlier installs persisted. (#2338)
+- The `ai-memory-wikisync` companion now shell-quotes the destination in the
+  suggested `git add` and `git rm` hints, so a `--dest` containing spaces or an
+  apostrophe is copied into a POSIX shell (`/bin/sh`, or Git Bash on Windows) as
+  a single argument instead of splitting into multiple pathspecs or raising an
+  unmatched-quote error. (#2314)
 
 ### Fixed
 

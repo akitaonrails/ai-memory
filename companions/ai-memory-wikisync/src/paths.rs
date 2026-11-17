@@ -252,9 +252,74 @@ pub fn prepare_dest(dest: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Quote one argument for a POSIX shell so a printed git hint can be copied
+/// verbatim into `/bin/sh` (or Git Bash on Windows, the documented shells).
+///
+/// A destination with a space otherwise splits into two pathspecs, and one
+/// with an apostrophe produces an unmatched-quote error. Conservative
+/// shell-safe characters are left unquoted; anything else is wrapped in
+/// single quotes with embedded `'` escaped as `'\''`, matching the main
+/// crate's `shell_quote`.
+pub fn posix_shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ',')
+        })
+    {
+        return s.to_string();
+    }
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posix_shell_quote_wraps_spaces_and_apostrophes() {
+        // Control: a plain destination stays unquoted and unchanged, so the
+        // common case prints exactly as before.
+        assert_eq!(posix_shell_quote("plain-wiki"), "plain-wiki");
+        assert_eq!(posix_shell_quote("team/wiki.d"), "team/wiki.d");
+
+        // A space must reach git as one argument, not split into two
+        // pathspecs.
+        assert_eq!(posix_shell_quote("team wiki"), "'team wiki'");
+
+        // An apostrophe must not close the quote early; it is escaped as
+        // '\'' so the whole destination remains a single argument.
+        assert_eq!(posix_shell_quote("team's wiki"), "'team'\\''s wiki'");
+
+        // The escaped form, parsed by a POSIX shell, round-trips to the
+        // original single argument.
+        assert_eq!(unquote_posix_single("'team wiki'"), "team wiki");
+        assert_eq!(unquote_posix_single("'team'\\''s wiki'"), "team's wiki");
+    }
+
+    /// Minimal POSIX single-quote evaluator for the test: concatenates
+    /// single-quoted runs and bare characters, so `'a'\''b'` becomes `a'b`.
+    /// It models how `/bin/sh` collapses one shell word, proving the quoting
+    /// yields exactly one argument.
+    fn unquote_posix_single(s: &str) -> String {
+        let mut out = String::new();
+        let mut in_quote = false;
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' if !in_quote => in_quote = true,
+                '\'' if in_quote => in_quote = false,
+                '\\' if !in_quote => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
 
     #[test]
     fn accepts_portable_page_paths() {

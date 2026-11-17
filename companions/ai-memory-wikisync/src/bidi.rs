@@ -1008,13 +1008,13 @@ async fn import_one(
 }
 
 fn print_git_rm_hint(args: &RunArgs, deleted: &[String]) {
-    let dest = args.dest.display();
+    let dest = args.dest.to_string_lossy();
     let files: Vec<String> = deleted
         .iter()
-        .map(|path| format!("{dest}/{path}"))
+        .map(|path| paths::posix_shell_quote(&format!("{dest}/{path}")))
         .collect();
     println!(
-        "this tool never runs git; to commit the deletes you may run:\
+        "this tool never runs git; to commit the deletes you may run (POSIX sh / Git Bash):\
          \n  git rm --quiet --ignore-unmatch -- {}",
         files.join(" ")
     );

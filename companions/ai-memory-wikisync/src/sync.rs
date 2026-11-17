@@ -640,11 +640,11 @@ fn print_report(args: &RunArgs, report: &Report, mode: Mode, families: &[String]
 
 pub(crate) fn print_git_hints(args: &RunArgs) {
     println!(
-        "this tool never runs git; to commit the export you may run:\
+        "this tool never runs git; to commit the export you may run (POSIX sh / Git Bash):\
          \n  git add -- {}\
          \n  git commit -m \"chore(wikisync): export team wiki from {}/{}\"\
          \n  git push",
-        args.dest.display(),
+        paths::posix_shell_quote(&args.dest.to_string_lossy()),
         args.workspace,
         args.project
     );

@@ -59,7 +59,10 @@ ai-memory-wikisync sync ... --apply --propagate-deletes
 - `plan` never writes, not even the state file.
 - `export --apply` writes/updates markdown files under `--dest` and prints
   the `git add` / `git commit` / `git push` commands you may run yourself.
-  The tool never runs git, never commits, and never pushes.
+  The tool never runs git, never commits, and never pushes. The printed
+  commands are quoted for a POSIX shell (`/bin/sh`, or Git Bash on Windows),
+  so a `--dest` containing spaces or an apostrophe stays a single argument
+  when copied.
 - `--include FAMILY` is a strict, explicit allowlist of top-level wiki
   families: a directory (`_rules`, `decisions`, …) or the exact filename of a
   top-level Markdown page (`--include roadmap.md` selects `roadmap.md`;
