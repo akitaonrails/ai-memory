@@ -146,6 +146,15 @@ version in [`docs/changelog/`](docs/changelog/):
   queued offline longer than 30 days. Delivery attempts now refresh the matching
   pin atomically without resetting the event's first-attempt retry deadline. (#2316)
 
+### Security
+
+- The event relay warns when it would send `AI_MEMORY_AUTH_TOKEN` over plain
+  `http` to a host other than loopback. The token is the root bearer, and the
+  relay attached it to every batch without looking at the scheme, so an `http`
+  destination on a LAN or the internet published it to anything on the path.
+  Loopback `http` and every `https` destination stay quiet, and the deployment
+  is not refused; the warning names the destination so the operator can decide.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
