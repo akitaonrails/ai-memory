@@ -66,6 +66,17 @@
         ]
       }
     ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/scripts/ai-memory-hook\" codex stop",
+            "commandWindows": "ai-memory hook --event stop --agent codex"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [

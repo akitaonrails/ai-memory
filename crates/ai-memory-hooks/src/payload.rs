@@ -326,6 +326,52 @@ pub(crate) fn body_is_subagent(agent: AgentKind, raw: &serde_json::Value) -> boo
     SUBAGENT_MARKER_KEYS.iter().copied().any(marked)
 }
 
+/// How a turn ended when it did not end normally, for a payload that parsed as
+/// [`HookEvent::Stop`]. The harness's own `hook_event_name` tells it apart:
+///
+/// - `StopFailure` runs instead of `Stop` when an API error ends the turn.
+///   Claude Code sends `error` (`rate_limit`, `billing_error`, ...), an
+///   optional `error_details`, and the rendered error text as
+///   `last_assistant_message` (<https://code.claude.com/docs/en/hooks>,
+///   StopFailure, v2.1.78); Qwen Code sends the same fields
+///   (<https://github.com/QwenLM/qwen-code/blob/f35dde84157f992bc324c0a3f59b1119344a683d/docs/users/features/hooks.md#L1020-L1034>);
+///   Kimi Code sends `error_type` and `error_message`
+///   (<https://github.com/MoonshotAI/kimi-code/blob/6a8493df3e1d796a63f7c7ca0de76c1e690cd943/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts#L424-L435>,
+///   delivered in snake case).
+/// - `Interrupt` runs instead of `Stop` when the user cuts the turn short. Kimi
+///   Code adds a `reason`
+///   (<https://github.com/MoonshotAI/kimi-code/blob/6a8493df3e1d796a63f7c7ca0de76c1e690cd943/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts#L419-L421>);
+///   Codex sends only the common fields
+///   (<https://github.com/openai/codex/blob/d32063f96c2dff1dc96af839b3952abb6acfeda4/codex-rs/hooks/src/schema.rs#L628-L639>).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AbnormalTurnEnd {
+    /// An API error ended the turn: its type and details, when sent.
+    Failed {
+        error: Option<String>,
+        details: Option<String>,
+    },
+    /// The user interrupted the turn, with the harness's reason when sent.
+    Interrupted { reason: Option<String> },
+}
+
+/// The abnormal end a `Stop`-shaped payload reports, `None` for a normal turn
+/// end. See [`AbnormalTurnEnd`].
+pub(crate) fn abnormal_turn_end(raw: &serde_json::Value) -> Option<AbnormalTurnEnd> {
+    match raw
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("StopFailure") => Some(AbnormalTurnEnd::Failed {
+            error: extract_string(raw, &["error", "error_type"]).and_then(first_line),
+            details: extract_string(raw, &["error_details", "error_message"]).and_then(first_line),
+        }),
+        Some("Interrupt") => Some(AbnormalTurnEnd::Interrupted {
+            reason: extract_string(raw, &["reason"]).and_then(first_line),
+        }),
+        _ => None,
+    }
+}
+
 /// Truthy interpretation of a query-string flag (`1`/`true`/`yes`/`on`,
 /// case-insensitive). Used for the per-project `drop_subagent` opt-in the
 /// host-side hook forwards from a project's `.ai-memory.toml`.
@@ -511,7 +557,11 @@ impl HookEvent {
             }
             "post-compaction" | "post_compaction" | "PostCompaction" => Self::PostCompaction,
             "notification" | "Notification" => Self::Notification,
-            "stop" | "Stop" | "AfterAgent" => Self::Stop,
+            // `StopFailure` (an API error ended the turn) and `Interrupt` (the
+            // user cut it short) fire instead of `Stop`, and end the turn all
+            // the same; the payload's `hook_event_name` says which it was.
+            "stop" | "Stop" | "AfterAgent" | "stop-failure" | "stop_failure" | "StopFailure"
+            | "Interrupt" | "interrupt" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
             "subagent-start" | "subagent_start" | "SubagentStart" | "subagentStart" => {
                 Self::SubagentStart
@@ -1386,6 +1436,13 @@ fn best_title_hint(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) 
         }
         HookEvent::Notification => extract_string(raw, &["message", "text"]).and_then(first_line),
         HookEvent::PostCompaction => extract_string(raw, &["summary"]).and_then(first_line),
+        HookEvent::Stop => abnormal_turn_end(raw).map(|end| match end {
+            AbnormalTurnEnd::Failed {
+                error: Some(error), ..
+            } => format!("stop failure: {error}"),
+            AbnormalTurnEnd::Failed { error: None, .. } => "stop failure".to_owned(),
+            AbnormalTurnEnd::Interrupted { .. } => "interrupt".to_owned(),
+        }),
         _ => None,
     }
 }
@@ -1494,6 +1551,25 @@ fn best_body_excerpt(
         HookEvent::SessionEnd => extract_string(raw, &["reason"])
             .and_then(first_line)
             .map(|reason| format!("reason: {reason}")),
+        // A turn an API error ended, or the user interrupted, says so in a few
+        // first-line fields. The harness's rendered error text in
+        // `last_assistant_message` is not used: it stays stripped like any
+        // assistant message.
+        HookEvent::Stop => abnormal_turn_end(raw).and_then(|end| match end {
+            AbnormalTurnEnd::Failed { error, details } => {
+                let lines: Vec<String> = [
+                    error.map(|error| format!("error: {error}")),
+                    details.map(|details| format!("details: {details}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                (!lines.is_empty()).then(|| lines.join("\n"))
+            }
+            AbnormalTurnEnd::Interrupted { reason } => {
+                reason.map(|reason| format!("reason: {reason}"))
+            }
+        }),
         _ => None,
     }
 }
@@ -2012,6 +2088,114 @@ mod tests {
             ("PreCompress", HookEvent::PreCompact),
         ] {
             assert_eq!(HookEvent::parse(name), event, "{name}");
+        }
+    }
+
+    /// `StopFailure` (Claude Code 2.1.78, Qwen Code, Kimi Code) and
+    /// `Interrupt` (Kimi Code, Codex) fire instead of `Stop`, so they end the
+    /// turn like it.
+    #[test]
+    fn parses_abnormal_turn_ends_as_stop() {
+        for name in [
+            "StopFailure",
+            "stop-failure",
+            "stop_failure",
+            "Interrupt",
+            "interrupt",
+        ] {
+            assert_eq!(HookEvent::parse(name), HookEvent::Stop, "{name}");
+        }
+    }
+
+    /// Each harness's own shape for a failed or interrupted turn, as its docs
+    /// and source give it, turns into a titled stop row; the rendered error
+    /// text in `last_assistant_message` never reaches the body. A normal `Stop`
+    /// is unchanged (control).
+    #[test]
+    fn abnormal_turn_ends_are_titled_and_described() {
+        let stop = |agent: &str, body: serde_json::Value| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        let cases = [
+            (
+                "claude-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error": "rate_limit",
+                    "error_details": "429 Too Many Requests",
+                    "last_assistant_message": "API Error: Rate limit reached",
+                }),
+                Some("stop failure: rate_limit"),
+                Some("error: rate_limit\ndetails: 429 Too Many Requests"),
+            ),
+            (
+                "qwen-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error": "loop_detected",
+                    "error_details": "tool_call_loop",
+                }),
+                Some("stop failure: loop_detected"),
+                Some("error: loop_detected\ndetails: tool_call_loop"),
+            ),
+            (
+                "kimi-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error_type": "ChatProviderError",
+                    "error_message": "rate limited",
+                }),
+                Some("stop failure: ChatProviderError"),
+                Some("error: ChatProviderError\ndetails: rate limited"),
+            ),
+            (
+                "kimi-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "Interrupt",
+                    "turn_id": "t1",
+                    "reason": "cancelled",
+                }),
+                Some("interrupt"),
+                Some("reason: cancelled"),
+            ),
+            (
+                "codex",
+                serde_json::json!({
+                    "session_id": "s",
+                    "turn_id": "t1",
+                    "hook_event_name": "Interrupt",
+                    "model": "gpt-5",
+                }),
+                Some("interrupt"),
+                None,
+            ),
+            (
+                "claude-code",
+                serde_json::json!({ "session_id": "s", "hook_event_name": "Stop" }),
+                None,
+                None,
+            ),
+        ];
+        for (agent, body, title, excerpt) in cases {
+            let env = stop(agent, body.clone());
+            assert_eq!(env.event, HookEvent::Stop, "{agent}: {body}");
+            assert_eq!(env.title_hint.as_deref(), title, "{agent}: {body}");
+            assert_eq!(env.body_excerpt.as_deref(), excerpt, "{agent}: {body}");
+            assert!(
+                !env.body_excerpt.unwrap_or_default().contains("API Error"),
+                "{agent}: the rendered error text stays out of the body"
+            );
         }
     }
 

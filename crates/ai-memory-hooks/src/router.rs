@@ -17527,6 +17527,57 @@ pub(crate) mod tests {
 
     /// Zero-LLM PreCompact still writes the synth page and must not insert a
     /// consolidation job.
+    /// A Claude Code `StopFailure`, posted by the stop hook as `event=stop`,
+    /// is stored as the turn's `stop` row naming the error, and the rendered
+    /// error text in `last_assistant_message` is not stored at all.
+    #[tokio::test]
+    async fn a_stop_failure_is_stored_as_a_stop_naming_the_error() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0f1";
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "stop".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid,
+                "hook_event_name": "StopFailure",
+                "error": "rate_limit",
+                "error_details": "429 Too Many Requests",
+                "last_assistant_message": "API Error: Rate limit reached",
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let rows = state
+            .reader
+            .session_observations_scoped(
+                state.workspace_id,
+                state.project_id,
+                session_id,
+                ai_memory_store::ObservationPage {
+                    limit: 10,
+                    offset: 0,
+                    order: ai_memory_store::ObservationOrder::Asc,
+                    kinds: Some(vec![ObservationKind::Stop]),
+                    query: None,
+                },
+            )
+            .await
+            .unwrap()
+            .records;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].title, "stop failure: rate_limit");
+        assert_eq!(
+            rows[0].body,
+            "error: rate_limit\ndetails: 429 Too Many Requests"
+        );
+        assert!(!format!("{rows:?}").contains("API Error"), "{rows:?}");
+    }
+
     #[tokio::test]
     async fn compaction_checkpoint_writes_synth_without_a_job_when_no_provider() {
         let tmp = TempDir::new().unwrap();

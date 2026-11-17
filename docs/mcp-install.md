@@ -994,9 +994,12 @@ install (every fresh `init`) writes a stdio `ai-memory mcp-bridge
 --no-session-id` entry instead of embedding the bearer, so Qwen is a static
 client: project-scoped calls still need `workspace` and `project`.
 
-The hook installer registers ten events: `SessionStart`, `UserPromptSubmit`,
+The hook installer registers eleven events: `SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`,
-`SessionEnd`, `SubagentStart` and `SubagentStop`. Definitions use an empty
+`StopFailure`, `SessionEnd`, `SubagentStart` and `SubagentStop`. `StopFailure`
+fires instead of `Stop` when an API error or loop detection ends the turn and
+runs the stop event; the turn end is stored as `stop failure: <error>`.
+Definitions use an empty
 `matcher`, which Qwen treats as match-all. Each command receives Qwen's
 Claude-shaped JSON on stdin (`session_id`, `cwd`, `tool_name`, `tool_input`,
 `tool_use_id`) and enforces capture exclusions over Qwen's Gemini-like
@@ -1554,9 +1557,11 @@ ai-memory install-hooks --agent kimi-code --apply \
     --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-The installed entries cover 10 events (`SessionStart`, `SessionEnd`,
+The installed entries cover 12 events (`SessionStart`, `SessionEnd`,
 `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`
 (Kimi Code fires `PostToolUse` on successful calls only), `Stop`,
+`StopFailure` and `Interrupt` (fired in place of `Stop` when an error ends the
+turn or the user interrupts it, stored as failed or interrupted turn ends),
 `SubagentStart`, `SubagentStop`, and `PreCompact`) with a Kimi Code-specific
 script bundle /
 native `ai-memory hook --event … --agent kimi-code` commands (native is the
@@ -2050,7 +2055,10 @@ still-active sessions from `dispose` during normal plugin teardown; abrupt
 process exits can still lose that fallback, so `session.deleted` remains the
 primary close path.
 
-Codex and Antigravity `Stop` events are not session ends. Codex's hook install
+Codex and Antigravity `Stop` events are not session ends, and neither is the
+`Interrupt` Codex fires instead of `Stop` when the user interrupts the turn:
+the hook install wires it to the same stop hook and it is stored as an
+`interrupt` turn end. Codex's hook install
 registers native `SessionEnd` for CLI 0.145.0 and later; Antigravity still needs
 explicit finalization. `ai-memory finalize-session` defaults to Codex for older
 clients or a missed native end, while `--agent antigravity-cli` selects
