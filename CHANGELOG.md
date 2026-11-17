@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Preserved reported wiki writes and required full-tree walks after a confinement
   refusal. Once the entry is repaired, the next checkpoint includes the earlier
   writes even when another write was reported in the meantime, instead of waiting
-  for the periodic sweep. (Follow-up to #2337.)
+  for the periodic sweep. (#2345, follow-up to #2337.)
 - A turn that ends without a normal `Stop` now leaves a turn end. Claude Code
   and Qwen Code fire `StopFailure` instead when an API error (a rate limit, an
   exhausted balance) ends the turn, Kimi Code fires `StopFailure` or
