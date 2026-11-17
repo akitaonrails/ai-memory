@@ -299,41 +299,6 @@ version in [`docs/changelog/`](docs/changelog/):
 - The cold-cluster dream pass prompt now resolves temporal state evolution
   and prioritizes explicit operator decisions, demoting superseded facts to
   history instead of retaining opposing statements as ambiguous conflicts. (#2297)
-- Every `/web` page now sends `Cache-Control: private, no-store`, the promise
-  `/api/v1` already made. Six handlers set it while the page-rendering
-  handlers did not, so the project page, a page body, its history, the session
-  timeline, search results and the inbox could be replayed from a shared
-  browser profile's cache or bfcache after the viewer had signed out. Static
-  assets are the deliberate exception: they carry no identity and keep their
-  own caching. (#2328)
-- The post-login redirect target rejects control characters. A URL parser
-  removes ASCII tab and newline characters before it reads the scheme, so
-  `?next=/%09/evil.example` reached the browser as `//evil.example` and sent
-  an operator off-site straight after a successful local login. Deployments
-  that mount the wiki at the host root were affected; the default `/web`
-  slug already refused the payload. (#2321)
-- A flag-based `ai-jail` launch forwards only the provider credentials the
-  launched harness reads, which is what the ai-jail wrapper contract already
-  did. On an ai-jail older than 3.0.1, or for a harness ai-jail has no preset
-  for, `ai-memory run --jail` handed the sandbox every provider key set in the
-  operator's environment, so a Codex session could read `ANTHROPIC_API_KEY`
-  and the other providers' tokens. An automatically chosen harness still
-  forwards what is set, because it is only resolved after the re-exec. (#2322)
-- The event relay warns when it would send `AI_MEMORY_AUTH_TOKEN` over plain
-  `http` to a host other than loopback. The token is the root bearer, and the
-  relay attached it to every batch without looking at the scheme, so an `http`
-  destination on a LAN or the internet published it to anything on the path.
-  Loopback `http` and every `https` destination stay quiet, and the deployment
-  is not refused; the warning names the destination so the operator can decide. (#2324)
-- Updated the locked `libz-sys` to the patched `1.1.33`, clearing
-  RUSTSEC-2026-0544 (a zlib heap buffer overflow in `gz_vacate()` reachable
-  through `git2`'s vendored libgit2) from the dependency gate. The transitive
-  `chrono` maintenance advisory RUSTSEC-2026-0543 (unmaintained, no patched
-  release, pulled through the MCP SDK and `schemars`) is a documented policy
-  exception in `deny.toml` and the CI audit until the SDK/schema dependencies
-  drop it; no vulnerability is demonstrated. (#2347)
-
-## [3.4.7] - 2026-11-15
 
 ### Fixed
 
@@ -347,11 +312,34 @@ version in [`docs/changelog/`](docs/changelog/):
   ordering is online-only; an offline spool backlog is recovered on a separate
   drain, and that order is a documented boundary
   ([`docs/external-lifecycle.md`](docs/external-lifecycle.md)). (#2272)
-- `[[llm_fallbacks]]` chains no longer stop when a provider reports that the
-  account is out of credit, quota or billing: the chain now advances to the
-  next candidate instead of failing the whole request, and the exhausted
-  provider is skipped for `llm_quota_cooldown_secs` before it is retried. See
-  [`docs/llm-provider-fallback.md`](docs/llm-provider-fallback.md). (#2227)
+- Pi assistant-response capture (`--agent pi --capture-assistant`) now
+  forwards `--project-strategy` when spawning the native `stop` hook, matching
+  the OpenCode integrations. Previously, `postPiStop` omitted
+  `--project-strategy` even when `repo-root` was configured for all direct-HTTP
+  events, splitting assistant stops into the current folder's project name in
+  subdirectories or worktrees without `.ai-memory.toml`. (#2270)
+- `move-project`, `merge-project`, and `move-session` now re-stamp
+  `retrieval_history` rows to the target scope alongside other project and
+  session records. They previously left those rows on the old scope, so
+  `merge-project` cascade-deleted source retrieval history (and its
+  `retrieval_history_hits`), while `move-project` and `move-session` hid
+  moved session history from `/retrievals` and exposed it to cascade deletion
+  when the source workspace or project was removed. (#2268)
+
+### Security
+
+- Updated the locked `libz-sys` to the patched `1.1.33`, clearing
+  RUSTSEC-2026-0544 (a zlib heap buffer overflow in `gz_vacate()` reachable
+  through `git2`'s vendored libgit2) from the dependency gate. The transitive
+  `chrono` maintenance advisory RUSTSEC-2026-0543 (unmaintained, no patched
+  release, pulled through the MCP SDK and `schemars`) is a documented policy
+  exception in `deny.toml` and the CI audit until the SDK/schema dependencies
+  drop it; no vulnerability is demonstrated. (#2347)
+
+## [3.4.7] - 2026-11-15
+
+### Fixed
+
 - A `move-project` true move now re-resolves project-only cross-project links
   (`[[project:path]]` with the workspace omitted) in the source and destination
   workspaces, so the moved project's edges rebind to the destination workspace
@@ -396,6 +384,23 @@ version in [`docs/changelog/`](docs/changelog/):
   read before that check and keeps the agent's page when it lands in between;
   a rule-based summary or checkpoint landing in between is still replaced, as
   before. (#2275)
+- A Claude Code subagent's compaction is no longer treated as the session's.
+  Since Claude Code 2.1.323 a subagent's `PreCompact` and post-compaction
+  `SessionStart` carry its `agent_id` under the parent's session id, and
+  ai-memory injected the session's post-compaction anchor into the subagent
+  (the parent's prompts as the source of truth for its task), rewrote
+  `sessions/<id>.md` as a checkpoint, and let the recap start at the
+  subagent's compaction. A compaction that names an `agent_id` now gets no
+  anchor and no checkpoint and is stored as a `subagent pre-compact` event;
+  the session's own compaction is unchanged. (#2301)
+- Zero-LLM session pages now get the duplicate-title collision backstop the
+  LLM consolidation and `memory_write_page` paths already apply (#926): when a
+  rule-based `sessions/<id>.md` write (SessionEnd, the compaction checkpoint,
+  or the idle-end tick) takes a title that already names another of the
+  project's latest pages, it suffixes the session short id. A resume habit that
+  opens every session with the same phrase ("where were we?") no longer gives
+  every page one title and trips ai-memory's own `duplicate_title` curator
+  finding. (#2300)
 - Devin POSIX shell (`hooks/_lib.sh`, `hooks/devin/*.sh`) and PowerShell
   (`hooks/lib/ai-memory-hook.ps1`) hooks now match native `ai-memory hook`
   behavior (#2237) for `AI_MEMORY_SESSION_ID`: whitespace-only values are
@@ -471,19 +476,6 @@ version in [`docs/changelog/`](docs/changelog/):
 - Updated the root, importer and relay lockfiles to `quinn-udp` 0.5.16,
   resolving RUSTSEC-2026-0538 in dependency audits, and the relay lockfile
   to `quinn-proto` 0.11.19 for RUSTSEC-2026-0523 and RUSTSEC-2026-0524. (#2242)
-- `export-okf` no longer silently drops a concept page that occupies an
-  OKF-reserved filename (`index.md` or `log.md`) at any depth, such as a
-  hand-authored `notes/index.md`. OKF v0.2 §3.1 reserves both names
-  throughout the hierarchy, so the export now refuses with the page's path
-  and asks you to rename it, instead of returning a `200` bundle that is
-  missing the page. A frontmatter-less file at a reserved name (the raw event
-  ledger) is still skipped. (#2233)
-- `memory_patch_page` `replace_section` now keeps the blank line after a
-  section's heading and before the next heading, instead of collapsing
-  `## H\n\nbody\n\n` into `## H\nbody\n`. A `content` that repeats the
-  section's own heading is refused (`section_content_repeats_heading`) rather
-  than written, which used to leave two identical headings that no later edit
-  could target. (#2239)
 - A cross-project message whose body is within the published 8 000-character
   budget is no longer silently truncated at the store boundary. The store
   field cap reused the 16 KiB handoff budget, so a body of mostly multibyte
@@ -547,19 +539,14 @@ version in [`docs/changelog/`](docs/changelog/):
   Values the line keeps, and `--query-arg` values, also pass through the
   built-in sanitizer, so a password inside a URL or a provider key under an
   unrelated name is redacted too. (#2274)
-- Pi assistant-response capture (`--agent pi --capture-assistant`) now
-  forwards `--project-strategy` when spawning the native `stop` hook, matching
-  the OpenCode integrations. Previously, `postPiStop` omitted
-  `--project-strategy` even when `repo-root` was configured for all direct-HTTP
-  events, splitting assistant stops into the current folder's project name in
-  subdirectories or worktrees without `.ai-memory.toml`. (#2270)
-- `move-project`, `merge-project`, and `move-session` now re-stamp
-  `retrieval_history` rows to the target scope alongside other project and
-  session records. They previously left those rows on the old scope, so
-  `merge-project` cascade-deleted source retrieval history (and its
-  `retrieval_history_hits`), while `move-project` and `move-session` hid
-  moved session history from `/retrievals` and exposed it to cascade deletion
-  when the source workspace or project was removed. (#2268)
+- `memory_handoff_accept` no longer claims the latest eligible handoff when
+  `handoff_id` is explicitly empty or whitespace-only, and `memory_write_page`
+  and `memory_delete_page` no longer drop a blank `expected_page_id` and write
+  or delete unconditionally. A blank id in either place is now refused with
+  invalid params and changes nothing, as message ids already are (#2244).
+  Leaving the argument out keeps the latest-handoff and unconditional
+  defaults, and a valid id with surrounding whitespace still selects its
+  row. (#2298)
 
 ### Security
 
@@ -573,8 +560,11 @@ version in [`docs/changelog/`](docs/changelog/):
   pointing the app at a new server, the old token stayed in the keychain
   while the binding had already moved to the new server, so it was sent there
   and re-adopted on the next launch. A failed save now clears both the stored
-  token and its binding, and the failure is surfaced in Settings.
-  (GHSA-xj78-fp6w-8r74)
+  token and its binding, and the failure is surfaced in Settings. A rarer
+  double fault, where that follow-up clear also fails and leaves the old token
+  in the keychain, is now recorded so the next launch keeps it unbound (and
+  unsent) instead of re-adopting it to the current server.
+  (GHSA-xj78-fp6w-8r74, #2289)
 
 ## [3.4.6] - 2026-11-13
 
@@ -5712,7 +5702,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.6...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.7...HEAD
+[3.4.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.7
 [3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6
 [3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
 [3.4.4]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.4
