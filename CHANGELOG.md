@@ -103,6 +103,16 @@ version in [`docs/changelog/`](docs/changelog/):
   Workspace names may contain spaces, and the pasted command used to split
   them into separate arguments.
 
+### Security
+
+- A flag-based `ai-jail` launch forwards only the provider credentials the
+  launched harness reads, which is what the ai-jail wrapper contract already
+  did. On an ai-jail older than 3.0.1, or for a harness ai-jail has no preset
+  for, `ai-memory run --jail` handed the sandbox every provider key set in the
+  operator's environment, so a Codex session could read `ANTHROPIC_API_KEY`
+  and the other providers' tokens. An automatically chosen harness still
+  forwards what is set, because it is only resolved after the re-exec.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
