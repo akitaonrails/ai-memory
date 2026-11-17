@@ -35,6 +35,16 @@ version in [`docs/changelog/`](docs/changelog/):
   the web root instead of the current page. Navigation now preserves the
   page path and query under default, custom-prefix, and root web mounts. (#2318)
 
+### Security
+
+- Every `/web` page now sends `Cache-Control: private, no-store`, the promise
+  `/api/v1` already made. Six handlers set it while the page-rendering
+  handlers did not, so the project page, a page body, its history, the session
+  timeline, search results and the inbox could be replayed from a shared
+  browser profile's cache or bfcache after the viewer had signed out. Static
+  assets are the deliberate exception: they carry no identity and keep their
+  own caching.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed

@@ -11,7 +11,7 @@ use askama::Template;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -94,7 +94,7 @@ pub(crate) async fn handler(
         card,
     };
     match view.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
