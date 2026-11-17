@@ -219,7 +219,7 @@ version in [`docs/changelog/`](docs/changelog/):
   left a window for the file to be swapped between the two, and a FIFO put
   there could stall the read. The open now uses `O_NOFOLLOW` with a descriptor
   comparison, the way the Antigravity transcript reader already did; a
-  transcript reached through a symlinked home still reads.
+  transcript reached through a symlinked home still reads. (#2351)
 
 ## [3.4.7] - 2026-11-15
 
