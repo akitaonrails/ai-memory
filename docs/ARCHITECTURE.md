@@ -410,7 +410,10 @@ transcript normalizer excludes a marked packet if Claude persists and reads it
 back, preventing delivered history from recursively re-entering the ledger.
 An explicitly pending handoff is considered before the managed event range.
 By default their single-use delivery claims share one writer transaction after
-the complete startup response has been assembled. With server-wide
+the fallible startup reads complete. That transaction also captures the claimed
+handoff row: the hook renders this snapshot, so a delayed turn checkpoint that
+refreshes the row during admission is delivered without an additional read after
+the single-use claim commits. With server-wide
 `[handoff].claim_on_session_start = false`, SessionStart instead emits a
 metadata-only notice naming the exact handoff id and leaves the row open for
 an explicit `memory_handoff_accept`; the managed event range is still claimed.

@@ -1180,3 +1180,138 @@ async fn a_session_start_claim_is_confirmed_only_to_its_own_live_session() {
         "an ended session must not be told the baton is in its context",
     );
 }
+
+#[tokio::test]
+async fn startup_claim_snapshots_only_the_handoff_its_scope_owner_and_receiver_can_accept() {
+    use ai_memory_core::{HandoffState, NewSession, SessionId};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let foreign_ws = store
+        .writer
+        .get_or_create_workspace("foreign")
+        .await
+        .unwrap();
+    let foreign_proj = store
+        .writer
+        .get_or_create_project(foreign_ws, "team-app", None)
+        .await
+        .unwrap();
+    let source = store
+        .writer
+        .insert_handoff(handoff(
+            ws,
+            proj,
+            "alice's current checkpoint",
+            Some("alice"),
+        ))
+        .await
+        .unwrap();
+    let alice = SessionId::new();
+    let bob = SessionId::new();
+    let foreign_receiver = SessionId::new();
+    for (id, workspace_id, project_id, owner) in [
+        (alice, ws, proj, "alice"),
+        (bob, ws, proj, "bob"),
+        (foreign_receiver, foreign_ws, foreign_proj, "alice"),
+    ] {
+        store
+            .writer
+            .begin_session(NewSession {
+                id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: Some(operator(owner)),
+                occurred_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    for (workspace_id, project_id, owner, receiver) in [
+        (ws, proj, "bob", Some(bob)),
+        (foreign_ws, foreign_proj, "alice", None),
+    ] {
+        let result = store
+            .writer
+            .accept_startup_context(
+                Some(HandoffAcceptance {
+                    accepting_session: receiver,
+                    ..acceptance(
+                        source,
+                        workspace_id,
+                        project_id,
+                        Some(operator(owner)),
+                        filter_for(owner),
+                        None,
+                    )
+                }),
+                None,
+                None,
+                jiff::Timestamp::now(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.handoff_accepted);
+        assert!(
+            result.handoff.is_none(),
+            "a refused claim must return no snapshot"
+        );
+    }
+    let mut own = acceptance(
+        source,
+        ws,
+        proj,
+        Some(operator("alice")),
+        filter_for("alice"),
+        None,
+    );
+    own.accepting_session = Some(foreign_receiver);
+    assert!(
+        store
+            .writer
+            .accept_startup_context(Some(own.clone()), None, None, jiff::Timestamp::now())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .reader
+            .handoff_by_id(source)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle
+            .state,
+        HandoffState::Open
+    );
+
+    own.accepting_session = Some(alice);
+    let accepted = store
+        .writer
+        .accept_startup_context(Some(own.clone()), None, None, jiff::Timestamp::now())
+        .await
+        .unwrap();
+    assert!(accepted.handoff_accepted);
+    let snapshot = accepted
+        .handoff
+        .expect("the successful claimant receives its snapshot");
+    assert_eq!(snapshot.scope.id, source);
+    assert_eq!(snapshot.content.summary, "alice's current checkpoint");
+    assert_eq!(snapshot.lifecycle.state, HandoffState::Accepted);
+    assert_eq!(snapshot.lifecycle.accepted_by_session, Some(alice));
+    assert_eq!(snapshot.lifecycle.accepted_by_user, Some(operator("alice")));
+    assert!(snapshot.lifecycle.accepted_at.is_some());
+    let replay = store
+        .writer
+        .accept_startup_context(Some(own), None, None, jiff::Timestamp::now())
+        .await
+        .unwrap();
+    assert!(!replay.handoff_accepted);
+    assert!(
+        replay.handoff.is_none(),
+        "a replay must not deliver the snapshot twice"
+    );
+}

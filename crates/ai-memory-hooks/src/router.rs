@@ -2101,9 +2101,6 @@ async fn fetch_and_accept_handoff_at(
         None
     };
     let claude_capped = agent == AgentKind::ClaudeCode;
-    let handoff_md = handoff.as_ref().map(|handoff| {
-        render_handoff_markdown_with_budget(handoff, claude_capped.then_some(CLAUDE_HANDOFF_CHARS))
-    });
     // A harness can disappear at a quota boundary, process kill, or machine
     // restart without ever emitting SessionEnd. Its observations are durable,
     // but no handoff row exists. Build a bounded, read-only recovery packet on
@@ -2154,7 +2151,7 @@ async fn fetch_and_accept_handoff_at(
     // Handoff right after the profile digest: it is a short curated pointer
     // and must not be buried under a ledger that can run tens of KB. The
     // existing ledger-then-brief order is preserved. Claim both single-use inputs only after every
-    // fallible read and render has succeeded, and in one transaction so a
+    // fallible read has succeeded, and in one transaction so a
     // failed or racing managed claim cannot consume the handoff by itself.
     // Same reasoning as the SessionEnd insert: the session-start claim is how
     // most handoffs are consumed, so a webhook must be able to see it. Two
@@ -2292,7 +2289,7 @@ async fn fetch_and_accept_handoff_at(
     } else {
         ai_memory_store::StartupContextAcceptance::default()
     };
-    let handoff_md = if acceptance.handoff_accepted {
+    let handoff_md = if let Some(claimed) = acceptance.handoff.as_ref() {
         // The claim is durable now, so the observers can be told about it. A
         // racing session that won the row leaves `handoff_accepted` false, and
         // then nothing is dispatched: a mirror is only ever told about a baton
@@ -2300,7 +2297,10 @@ async fn fetch_and_accept_handoff_at(
         if let Some(ctx) = &admission_ctx {
             state.wiki.notify_operation_observers(ctx);
         }
-        handoff_md
+        Some(render_handoff_markdown_with_budget(
+            claimed,
+            claude_capped.then_some(CLAUDE_HANDOFF_CHARS),
+        ))
     } else {
         None
     };
@@ -18648,6 +18648,160 @@ pub(crate) mod tests {
                 "a consumed or superseded baton must not reappear"
             );
         }
+    }
+
+    async fn startup_checkpoint_snapshot_race(source_busy: bool, allow_claim: bool) {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = arrived.clone();
+        let proceed = release.clone();
+        let app = axum::Router::new().route(
+            "/admission",
+            axum::routing::post(move || {
+                let seen = seen.clone();
+                let proceed = proceed.clone();
+                async move {
+                    seen.notify_one();
+                    proceed.notified().await;
+                    if allow_claim {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chain = ai_memory_wiki::AdmissionChain::new(vec![ai_memory_wiki::WebhookConfig {
+            name: "checkpoint-barrier".into(),
+            url: format!("http://{addr}/admission"),
+            timeout_ms: 700,
+            failure_policy: ai_memory_wiki::FailurePolicy::Reject,
+            events: vec![ai_memory_wiki::AdmissionOp::HandoffAccept],
+            blocking: true,
+        }])
+        .unwrap();
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state_with_admission(&tmp, chain).await;
+        state.skip_wiki_checkpoints = true;
+        let source = "startup-checkpoint-snapshot-source";
+        let timestamped_event = |event: &str, text: &str, at: &str| {
+            let mut env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("opencode2".into()),
+                    capture_assistant: Some("1".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": source,
+                    "prompt": text,
+                    "turn_checkpoint": true,
+                    "occurred_at": at,
+                    "_ai_memory_assistant": { "version": 1, "excerpt": text },
+                }),
+            );
+            crate::assistant_capture::apply_assistant_backstop(&mut env, true);
+            env
+        };
+        for (event, text, at) in [
+            ("user-prompt", "Complete the work", "2020-01-01T00:00:00Z"),
+            ("stop", "STALE-ASSISTANT-CHECKPOINT", "2020-01-01T00:01:00Z"),
+        ] {
+            process(&state, timestamped_event(event, text, at), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        let before = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            before
+                .content
+                .summary
+                .contains("STALE-ASSISTANT-CHECKPOINT")
+        );
+        let now = Timestamp::now();
+        let query = HandoffQuery {
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            agent: Some("codex".into()),
+            session_id: Some("startup-checkpoint-snapshot-receiver".into()),
+            recovery: Some("0".into()),
+            profile_digest: Some("0".into()),
+            ..Default::default()
+        };
+        let (rendered, ()) = tokio::join!(
+            fetch_and_accept_handoff_at(&state, query, None, Vec::new(), None, now),
+            async {
+                tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+                    .await
+                    .expect("startup must reach the admission barrier");
+                // The hook supports original event timestamps. A delayed turn
+                // can refresh a checkpoint while its source remains quiet.
+                let at = if source_busy {
+                    now.to_string()
+                } else {
+                    "2020-01-01T00:02:00Z".into()
+                };
+                process(
+                    &state,
+                    timestamped_event("stop", "FRESH-ASSISTANT-CHECKPOINT", &at),
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+                release.notify_one();
+            }
+        );
+        server.abort();
+        let body = rendered.unwrap().unwrap_or_default();
+        let after = state
+            .reader
+            .handoff_by_id(before.scope.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.content.summary.contains("FRESH-ASSISTANT-CHECKPOINT"));
+        if allow_claim && !source_busy {
+            assert_eq!(
+                after.lifecycle.state,
+                ai_memory_core::HandoffState::Accepted
+            );
+            assert!(
+                body.contains("FRESH-ASSISTANT-CHECKPOINT"),
+                "the claimed row's newest checkpoint must be delivered: {body}"
+            );
+            assert!(!body.contains("STALE-ASSISTANT-CHECKPOINT"), "{body}");
+        } else {
+            assert_eq!(after.lifecycle.state, ai_memory_core::HandoffState::Open);
+            assert!(
+                body.is_empty(),
+                "a refused claim must deliver no snapshot: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_delivers_the_checkpoint_snapshot_it_actually_claimed() {
+        startup_checkpoint_snapshot_race(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn startup_checkpoint_snapshot_still_respects_busy_source_and_admission() {
+        startup_checkpoint_snapshot_race(true, true).await;
+        startup_checkpoint_snapshot_race(false, false).await;
     }
 
     // Live incident: parallel OpenCode sessions in one directory. Every

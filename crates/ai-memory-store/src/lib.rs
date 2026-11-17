@@ -8069,6 +8069,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_context_snapshot_failure_rolls_back_both_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "startup-snapshot-failure").await;
+        let run = store
+            .writer
+            .prepare_workstream_run(managed_prepare_input(ws, proj, "test:1"))
+            .await
+            .unwrap();
+        let id = store
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: ws,
+                project_id: proj,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "continue".into(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        conn.execute(
+            "UPDATE handoffs SET next_steps = 'invalid-json' WHERE id = ?1",
+            rusqlite::params![id.as_bytes()],
+        )
+        .unwrap();
+        let result = store
+            .writer
+            .accept_startup_context(
+                Some(HandoffAcceptance {
+                    handoff_id: id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    accepting_agent: AgentKind::Codex,
+                    accepting_session: None,
+                    accepting_user: None,
+                    owner_filter: ai_memory_core::OwnerFilter::Any,
+                    receiving_cwd: None,
+                }),
+                Some(run.run_id),
+                None,
+                jiff::Timestamp::now(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "an unreadable snapshot must refuse the whole claim"
+        );
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM handoffs WHERE id = ?1",
+                rusqlite::params![id.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "open", "snapshot decoding must precede the commit");
+        assert!(
+            store
+                .writer
+                .accept_managed_run_context(run.run_id)
+                .await
+                .unwrap(),
+            "the failed snapshot must leave the managed packet claimable too"
+        );
+    }
+
+    #[tokio::test]
     async fn startup_context_claim_is_atomic_and_single_use() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -8113,13 +8186,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            accepted,
-            StartupContextAcceptance {
-                handoff_accepted: true,
-                managed_context_accepted: true,
-            }
-        );
+        assert!(accepted.handoff_accepted);
+        assert!(accepted.managed_context_accepted);
+        let snapshot = accepted.handoff.unwrap();
+        assert_eq!(snapshot.scope.id, first_handoff);
+        assert_eq!(snapshot.lifecycle.state, HandoffState::Accepted);
+        assert_eq!(snapshot.lifecycle.accepted_by, Some(AgentKind::Codex));
+        assert!(snapshot.lifecycle.accepted_at.is_some());
         assert!(
             store
                 .reader
@@ -8140,11 +8213,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            rejected,
-            StartupContextAcceptance::default(),
+        assert!(
+            !rejected.handoff_accepted && !rejected.managed_context_accepted,
             "an already-delivered managed packet must reject the whole claim"
         );
+        assert!(rejected.handoff.is_none());
         assert_eq!(
             store
                 .reader
@@ -8208,7 +8281,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rejected_auto, StartupContextAcceptance::default());
+        assert!(!rejected_auto.handoff_accepted && !rejected_auto.managed_context_accepted);
+        assert!(rejected_auto.handoff.is_none());
         for handoff_id in [stale_auto, selected_auto] {
             assert_eq!(
                 store

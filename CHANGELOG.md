@@ -167,6 +167,13 @@ version in [`docs/changelog/`](docs/changelog/):
   instead of matching their words independently. Quoted CJK queries use the
   primary FTS stream so substring expansion cannot widen the phrase. (#2278)
 
+### Fixed
+
+- SessionStart now delivers the handoff snapshot captured by its claim
+  transaction. A delayed turn checkpoint could previously refresh a quiet
+  session's handoff during admission, leaving the updated row accepted while
+  the receiving agent got the older checkpoint text. (#2340)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
