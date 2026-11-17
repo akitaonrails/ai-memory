@@ -165,6 +165,9 @@ version in [`docs/changelog/`](docs/changelog/):
   rescans only new or changed files instead of the whole tree. The
   missed-event reconcile sweep interval moved from 30s to 300s; live edits
   are still caught immediately by the file watcher. (#2337)
+- Preserved separate installer and profile-apply backups when multiple updates
+  happen in the same second, instead of overwriting the earlier recovery copy. (#2280)
+
 
 ### Security
 
@@ -194,11 +197,6 @@ version in [`docs/changelog/`](docs/changelog/):
   destination on a LAN or the internet published it to anything on the path.
   Loopback `http` and every `https` destination stay quiet, and the deployment
   is not refused; the warning names the destination so the operator can decide. (#2324)
-
-### Fixed
-
-- Preserved separate installer and profile-apply backups when multiple updates
-  happen in the same second, instead of overwriting the earlier recovery copy. (#2280)
 
 ## [3.4.7] - 2026-11-15
 
