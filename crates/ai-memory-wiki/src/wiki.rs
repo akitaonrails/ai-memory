@@ -524,6 +524,63 @@ impl Wiki {
         self.git.commit_all(message)
     }
 
+    /// Stage a consistent online backup as an uncompressed, rewound tar file.
+    ///
+    /// Page mutations are paused through the SQLite snapshot and wiki copy;
+    /// ledger appends and checkpoints are paused through the git adapter lock.
+    /// The caller can compress the returned private file after writes resume.
+    /// External filesystem/SQL writers and config edits are not coordinated.
+    ///
+    /// # Errors
+    /// Propagates snapshot, confinement, archive, I/O and reader-pool failures.
+    pub async fn snapshot_archive(&self, reader: &ReaderPool) -> WikiResult<std::fs::File> {
+        self.snapshot_archive_with(reader, || {}).await
+    }
+
+    async fn snapshot_archive_with<F>(
+        &self,
+        reader: &ReaderPool,
+        after_database: F,
+    ) -> WikiResult<std::fs::File>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let guard = self.mutation_lock.clone().write_owned().await;
+        let wiki = self.clone();
+        reader
+            .with_conn(move |conn| {
+                // The blocking task owns both guards, including after cancellation.
+                let _guard = guard;
+                Ok(wiki.git.with_locked_tree(|| -> WikiResult<std::fs::File> {
+                    use std::io::Seek as _;
+                    wiki.inspect_wiki_tree()?;
+                    let staging = tempfile::tempdir()?;
+                    let database = staging.path().join("memory.sqlite");
+                    conn.backup(c"main", &database, None::<fn(_)>)
+                        .map_err(ai_memory_store::StoreError::from)?;
+                    after_database();
+                    let mut file = tempfile::tempfile()?;
+                    let mut archive = tar::Builder::new(&mut file);
+                    archive.mode(tar::HeaderMode::Deterministic);
+                    archive.follow_symlinks(false);
+                    wiki.inspect_wiki_tree()?;
+                    archive.append_dir_all("wiki", &wiki.root)?;
+                    archive.append_path_with_name(&database, "db/memory.sqlite")?;
+                    if let Some(data_dir) = wiki.root.parent() {
+                        let config = data_dir.join("config.toml");
+                        if config.is_file() {
+                            archive.append_path_with_name(&config, "config.toml")?;
+                        }
+                    }
+                    archive.finish()?;
+                    drop(archive);
+                    file.rewind()?;
+                    Ok(file)
+                }))
+            })
+            .await?
+    }
+
     /// Append `bytes` to `<project root>/<file_name>` (the hook ledger)
     /// and report the write.
     ///
@@ -4669,6 +4726,155 @@ mod tests {
     fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
         std::os::unix::fs::symlink(target, link).unwrap();
         true
+    }
+
+    #[tokio::test]
+    async fn online_snapshot_restores_one_state_during_concurrent_wiki_mutations() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("backup")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "pages", None)
+            .await
+            .unwrap();
+        for path in ["edit.md", "delete.md"] {
+            wiki.write_page(req(
+                ws,
+                proj,
+                path,
+                "before snapshot",
+                serde_json::json!({"title":"Snapshot"}),
+            ))
+            .await
+            .unwrap();
+        }
+        wiki.commit_all("before snapshot").unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let snapshot_wiki = wiki.clone();
+        let reader = store.reader.clone();
+        let snapshot = tokio::spawn(async move {
+            snapshot_wiki
+                .snapshot_archive_with(&reader, move || {
+                    let _ = started.send(());
+                    let _ = wait.recv();
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut edit = Box::pin(wiki.write_page(req(
+            ws,
+            proj,
+            "edit.md",
+            "after snapshot",
+            serde_json::json!({"title":"Snapshot"}),
+        )));
+        let deleted = PagePath::new("delete.md").unwrap();
+        let mut delete = Box::pin(wiki.delete_page(ws, proj, &deleted, None, None));
+        let checkpoint_wiki = wiki.clone();
+        let mut checkpoint = tokio::task::spawn_blocking(move || {
+            checkpoint_wiki.commit_all("concurrent checkpoint")
+        });
+        let ledger_wiki = wiki.clone();
+        let mut ledger = tokio::task::spawn_blocking(move || {
+            ledger_wiki.append_under_project(ws, proj, "log.md", b"after snapshot")
+        });
+        let short = std::time::Duration::from_millis(20);
+        assert!(tokio::time::timeout(short, &mut edit).await.is_err());
+        assert!(tokio::time::timeout(short, &mut delete).await.is_err());
+        assert!(tokio::time::timeout(short, &mut checkpoint).await.is_err());
+        assert!(tokio::time::timeout(short, &mut ledger).await.is_err());
+        drop(release);
+        let file = snapshot.await.unwrap().unwrap();
+        edit.await.unwrap();
+        delete.await.unwrap();
+        checkpoint.await.unwrap().unwrap();
+        ledger.await.unwrap().unwrap();
+
+        let restored = TempDir::new().unwrap();
+        tar::Archive::new(file).unpack(restored.path()).unwrap();
+        let restored_store = Store::open(restored.path()).unwrap();
+        let restored_wiki = Wiki::new(restored.path(), restored_store.writer.clone()).unwrap();
+        for path in ["edit.md", "delete.md"] {
+            let raw =
+                std::fs::read_to_string(restored_wiki.project_root(ws, proj).join(path)).unwrap();
+            assert_eq!(parse(&raw).unwrap().body.trim(), "before snapshot");
+        }
+        let indexed = restored_store
+            .reader
+            .search_pages_for_project(ws, proj, "before snapshot".into(), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(indexed.len(), 2);
+        assert!(
+            restored_store
+                .reader
+                .search_pages_for_project(ws, proj, "after".into(), 10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!restored_wiki.project_root(ws, proj).join("log.md").exists());
+        let relative = PathBuf::from(ws.to_string())
+            .join(proj.to_string())
+            .join("delete.md");
+        assert!(
+            !restored_wiki
+                .git()
+                .file_at_rev("HEAD", &relative)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!wiki.project_root(ws, proj).join("delete.md").exists());
+        assert!(
+            std::fs::read_to_string(wiki.project_root(ws, proj).join("edit.md"))
+                .unwrap()
+                .contains("after snapshot")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_online_snapshot_retains_the_mutation_guard_in_its_worker() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let snapshot_wiki = wiki.clone();
+        let reader = store.reader.clone();
+        let snapshot = tokio::spawn(async move {
+            snapshot_wiki
+                .snapshot_archive_with(&reader, move || {
+                    let _ = started.send(());
+                    let _ = wait.recv();
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        snapshot.abort();
+        assert!(snapshot.await.unwrap_err().is_cancelled());
+        let mut guard = Box::pin(wiki.mutation_lock.write());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut guard)
+                .await
+                .is_err()
+        );
+        drop(release);
+        let _guard = tokio::time::timeout(std::time::Duration::from_secs(5), guard)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

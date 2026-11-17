@@ -987,6 +987,11 @@ impl GitAdapter {
         self.commit_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    pub(crate) fn with_locked_tree<T>(&self, snapshot: impl FnOnce() -> T) -> T {
+        let _writing = self.writing();
+        snapshot()
+    }
+
     /// Write `bytes` to `path` atomically (tmp, rename, fsync).
     ///
     /// # Errors
