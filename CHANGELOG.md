@@ -16,7 +16,7 @@ version in [`docs/changelog/`](docs/changelog/):
 - Kept canonical project names ambiguous when a legacy twin holds sent or
   received messages, including retained history. Name-based mailbox access and
   writes no longer skip that project as empty, and startup no longer reports
-  it as an empty twin. (Follow-up to #2018.)
+  it as an empty twin. (#2348, follow-up to #2018.)
 - Preserved reported wiki writes and required full-tree walks after a confinement
   refusal. Once the entry is repaired, the next checkpoint includes the earlier
   writes even when another write was reported in the meantime, instead of waiting
