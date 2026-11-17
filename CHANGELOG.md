@@ -195,6 +195,11 @@ version in [`docs/changelog/`](docs/changelog/):
   Loopback `http` and every `https` destination stay quiet, and the deployment
   is not refused; the warning names the destination so the operator can decide. (#2324)
 
+### Fixed
+
+- Preserved separate installer and profile-apply backups when multiple updates
+  happen in the same second, instead of overwriting the earlier recovery copy. (#2280)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
