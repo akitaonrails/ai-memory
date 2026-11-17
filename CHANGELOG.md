@@ -252,7 +252,7 @@ version in [`docs/changelog/`](docs/changelog/):
   warning names the mode it found, and stays quiet for the owner-only default
   every install creates; a sticky parent is not reported, since it stops
   another account renaming an entry it does not own. Windows reports no mode
-  here — its access control lists are not what these bits describe.
+  here, since its access control lists are not what these bits describe. (#2352)
 
 ### Changed
 
