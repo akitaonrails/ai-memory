@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Staged online backups under the wiki mutation and git locks so concurrent
   page writes, deletions and checkpoints cannot mix SQLite and wiki states.
-  Released those locks before compressing the private staged archive.
+  Released those locks before compressing the private staged archive. (#2361)
 
 - CJK substring search now repairs a derived index row that an offline
   maintenance edit removed, even after the startup backfill watermark (#2337)
