@@ -15,7 +15,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 - Updated the transitive `libz-sys` dependency to 1.1.33, which packages
   corrected zlib 1.4 for bundled builds, addressing RUSTSEC-2026-0544
-  (CVE-2026-85091).
+  (CVE-2026-85091). (#2349)
 - Preserved reported wiki writes and required full-tree walks after a confinement
   refusal. Once the entry is repaired, the next checkpoint includes the earlier
   writes even when another write was reported in the meantime, instead of waiting
