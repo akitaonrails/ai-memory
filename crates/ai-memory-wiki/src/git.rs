@@ -598,31 +598,35 @@ impl GitAdapter {
             self.written().walk_needed = true;
         }
         let staging = self.take_staging();
-        match &staging {
-            Staging::Everything => {
-                crate::confinement::inspect_tree_except(&self.root, &[git_dir])
-                    .map_err(CommitGit2Error::Wiki)?;
-            }
-            Staging::Paths(paths) => {
-                crate::confinement::inspect_scoped_paths(&self.root, paths)
-                    .map_err(CommitGit2Error::Wiki)?;
-            }
-        }
-        let mut attempt = 0u32;
-        let result = loop {
-            attempt += 1;
-            match self.commit_staged(open, message, &staging) {
-                // A writer outside the lock was mid-write; it settles in
-                // milliseconds.
-                Err(CommitGit2Error::Other(e))
-                    if is_racy_read(&e) && attempt < RACY_READ_ATTEMPTS =>
-                {
-                    debug!(attempt, "a file changed under the commit; retrying");
-                    std::thread::sleep(RACY_READ_BACKOFF);
+        // Inspection consumes the same staging request as the commit. Every
+        // failure below must restore it through keep_pending before returning.
+        let result = (|| {
+            match &staging {
+                Staging::Everything => {
+                    crate::confinement::inspect_tree_except(&self.root, &[git_dir])
+                        .map_err(CommitGit2Error::Wiki)?;
                 }
-                other => break other,
+                Staging::Paths(paths) => {
+                    crate::confinement::inspect_scoped_paths(&self.root, paths)
+                        .map_err(CommitGit2Error::Wiki)?;
+                }
             }
-        };
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match self.commit_staged(open, message, &staging) {
+                    // A writer outside the lock was mid-write; it settles in
+                    // milliseconds.
+                    Err(CommitGit2Error::Other(e))
+                        if is_racy_read(&e) && attempt < RACY_READ_ATTEMPTS =>
+                    {
+                        debug!(attempt, "a file changed under the commit; retrying");
+                        std::thread::sleep(RACY_READ_BACKOFF);
+                    }
+                    other => break other,
+                }
+            }
+        })();
         if let Ok(oid) = &result {
             open.head = oid.or(head_now);
         }
@@ -2966,6 +2970,81 @@ mod tests {
         assert!(adapter.commit_all("retry").unwrap().is_some());
         assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a2"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_recovers_reported_paths_after_confinement_refusal() {
+        assert_checkpoint_recovers_after_confinement_refusal(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_recovers_required_walk_after_confinement_refusal() {
+        assert_checkpoint_recovers_after_confinement_refusal(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_checkpoint_recovers_after_confinement_refusal(full_walk: bool) {
+        let (tmp, root, adapter) = committed(&[("a.md", "a0"), ("b.md", "b0")]);
+        write(&root, "a.md", "a1");
+        write(&root, "b.md", "b1");
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "outside remains untouched").unwrap();
+        if full_walk {
+            // An untrusted report requires a walk independently of the sweep
+            // timer. The initial checkpoint's last walk is still recent.
+            adapter.mark_written(&outside);
+        } else {
+            adapter.mark_written(Path::new("a.md"));
+            adapter.mark_written(Path::new("b.md"));
+        }
+        std::fs::remove_file(root.join("a.md")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a.md")).unwrap();
+        assert!(matches!(
+            adapter.commit_all("refused checkpoint"),
+            Err(WikiError::Confinement { .. })
+        ));
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a0"));
+        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b0"));
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside remains untouched"
+        );
+        if full_walk {
+            assert!(
+                adapter.written().walk_needed,
+                "a refused full inspection must preserve the required walk"
+            );
+        } else {
+            assert_eq!(
+                adapter.written_paths(),
+                ["a.md", "b.md"].map(PathBuf::from).to_vec(),
+                "a refused scoped inspection must preserve every reported path"
+            );
+        }
+
+        // Legitimate control: repair the refused entry, then report a new
+        // write. The next checkpoint must include the earlier writes too.
+        std::fs::remove_file(root.join("a.md")).unwrap();
+        write(&root, "a.md", "a1");
+        write(&root, "c.md", "c1");
+        adapter.mark_written(Path::new("c.md"));
+        assert!(
+            adapter
+                .commit_all("checkpoint after repair")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(head_blob(&adapter, "a.md").as_deref(), Some("a1"));
+        assert_eq!(head_blob(&adapter, "b.md").as_deref(), Some("b1"));
+        assert_eq!(head_blob(&adapter, "c.md").as_deref(), Some("c1"));
+        assert_clean_from_outside(&root, "after the repaired checkpoint");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside remains untouched"
+        );
+    }
+
     /// The stat cache's blind spot: a file rewritten with the same size and
     /// an mtime no newer than the index looks unchanged by stat alone. git
     /// treats an entry whose mtime is not older than the index as "racy"
