@@ -93,6 +93,19 @@ pub(super) fn render(report: &DoctorReport, terminal: &crate::terminal::Terminal
         terminal.line(format_args!("{}", problem.render_human()));
     }
 
+    if let Some(shared) = &report.data_dir_shared {
+        terminal.line(format_args!(
+            "{}",
+            i18n.format(
+                "cli-doctor-shared-data-dir",
+                &[
+                    ("path", terminal_text(&shared.path)),
+                    ("mode", shared.mode.clone())
+                ]
+            )
+        ));
+    }
+
     if let Some(problem) = &report.marker_capture_problem {
         terminal.line(format_args!(
             "{}", crate::localization::format(i18n, "cli-presentation-the-settings-marker-has-an-invalid-capture-section-it-fails-closed-file-and", &[("value0", problem.classification.to_string())])));
