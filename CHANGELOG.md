@@ -220,6 +220,13 @@ version in [`docs/changelog/`](docs/changelog/):
   release, pulled through the MCP SDK and `schemars`) is a documented policy
   exception in `deny.toml` and the CI audit until the SDK/schema dependencies
   drop it; no vulnerability is demonstrated. (#2347)
+- A native transcript read refuses anything that is not a regular file, so a
+  symlink planted at the session file it was about to open is no longer
+  followed. The lookup validated the path and then reopened it by name, which
+  left a window for the file to be swapped between the two, and a FIFO put
+  there could stall the read. The open now uses `O_NOFOLLOW` with a descriptor
+  comparison, the way the Antigravity transcript reader already did; a
+  transcript reached through a symlinked home still reads. (#2351)
 
 ## [3.4.7] - 2026-11-15
 
