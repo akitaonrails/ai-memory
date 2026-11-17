@@ -61,8 +61,9 @@ ai-memory-wikisync sync ... --apply --propagate-deletes
   the `git add` / `git commit` / `git push` commands you may run yourself.
   The tool never runs git, never commits, and never pushes.
 - `--include FAMILY` is a strict, explicit allowlist of top-level wiki
-  families: a directory (`_rules`, `decisions`, …) or a top-level Markdown
-  page with that stem (`roadmap` selects `roadmap.md`). At least one is
+  families: a directory (`_rules`, `decisions`, …) or the exact filename of a
+  top-level Markdown page (`--include roadmap.md` selects `roadmap.md`;
+  `--include roadmap` does not). At least one is
   required and a bare `*` is refused: only what you name is exported.
 - Auth is a bearer token via `--token` or `AI_MEMORY_AUTH_TOKEN` (plus
   `AI_MEMORY_SERVER_URL` for the server origin). Tokens are never logged

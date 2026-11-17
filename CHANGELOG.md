@@ -155,6 +155,12 @@ version in [`docs/changelog/`](docs/changelog/):
   Loopback `http` and every `https` destination stay quiet, and the deployment
   is not refused; the warning names the destination so the operator can decide.
 
+### Fixed
+
+- Corrected the wikisync top-level page allowlist example to include the `.md`
+  suffix. The documented stem-only value matched no such page and could make
+  `sync --check` report an omitted repository page as already in sync. (#2315)
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed
