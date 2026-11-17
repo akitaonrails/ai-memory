@@ -113,6 +113,16 @@ version in [`docs/changelog/`](docs/changelog/):
   and the other providers' tokens. An automatically chosen harness still
   forwards what is set, because it is only resolved after the re-exec.
 
+### Fixed
+
+- The wrapper's self-upgrade keeps the mode `ai-memory` was installed with.
+  `mktemp` creates the staging file 0600 on GNU and BSD alike, and only
+  `chmod +x` was applied before the rename, so a successful upgrade installed a
+  0700 wrapper: the operator who ran it kept working while anyone else running
+  that wrapper from a shared directory could no longer execute it. The staging
+  file now takes the installed mode, falling back to 0755 when neither `stat`
+  form is available.
+
 ## [3.4.7] - 2026-11-15
 
 ### Fixed

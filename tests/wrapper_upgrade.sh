@@ -613,4 +613,59 @@ cmp -s "${VERIFY_ROOT}/fixture/archive.tar.gz" "${REFRESH_ARCHIVE}" \
   || fail "successful native-client refresh did not advance last-check"
 printf 'wrapper native-client refresh retry checks passed\n'
 
+# ---- the self-upgrade keeps the mode the wrapper was installed with --------
+# `mktemp` creates the staging file 0600 on GNU and BSD alike, so replacing the
+# wrapper after only `chmod +x` installed a 0700 script: the operator who ran
+# the upgrade kept working, while anyone else running that wrapper from a
+# shared directory could no longer execute it.
+SELF_ROOT="${TMP_ROOT}/self-upgrade"
+SELF_STUB="${SELF_ROOT}/bin"
+SELF_WRAPPER="${SELF_ROOT}/ai-memory"
+mkdir -p "${SELF_STUB}" "${SELF_ROOT}/home" "${SELF_ROOT}/cache" "${SELF_ROOT}/data"
+cat >"${SELF_ROOT}/released" <<'RELEASED'
+#!/usr/bin/env bash
+printf 'released wrapper ran\n'
+exit 0
+RELEASED
+SELF_DIGEST="$(sha256sum "${SELF_ROOT}/released" | awk '{ print $1 }')"
+cat >"${SELF_STUB}/curl" <<CURL
+#!/usr/bin/env bash
+set -euo pipefail
+url=""; out=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="\$1"; shift ;;
+  esac
+done
+case "\${url}" in
+  *.sha256) printf '%s  released\n' "${SELF_DIGEST}" >"\${out}" ;;
+  *) cp "${SELF_ROOT}/released" "\${out}" ;;
+esac
+CURL
+chmod 0755 "${SELF_STUB}/curl"
+cp "${ROOT}/bin/ai-memory" "${SELF_WRAPPER}"
+chmod 0755 "${SELF_WRAPPER}"
+SELF_MODE_BEFORE="$(stat -c '%a' "${SELF_WRAPPER}" 2>/dev/null || stat -f '%Lp' "${SELF_WRAPPER}")"
+(
+  cd "${SELF_ROOT}"
+  PATH="${SELF_STUB}:${PATH}" \
+  HOME="${SELF_ROOT}/home" \
+  XDG_CACHE_HOME="${SELF_ROOT}/cache" \
+  XDG_DATA_HOME="${SELF_ROOT}/data" \
+  AI_MEMORY_DOCKER="${FAKE_DOCKER_NO_CONTAINER}" \
+  AI_MEMORY_NATIVE_BIN="" \
+  AI_MEMORY_WRAPPER_URL="http://fixture.invalid/ai-memory-wrapper" \
+  AI_MEMORY_WRAPPER_SHA256_URL="http://fixture.invalid/ai-memory-wrapper.sha256" \
+    "${SELF_WRAPPER}" upgrade >"${SELF_ROOT}/output.log" 2>&1
+)
+assert_contains "${SELF_ROOT}/output.log" "released wrapper ran"
+cmp -s "${SELF_ROOT}/released" "${SELF_WRAPPER}" \
+  || fail "the self-upgrade did not install the released wrapper"
+SELF_MODE_AFTER="$(stat -c '%a' "${SELF_WRAPPER}" 2>/dev/null || stat -f '%Lp' "${SELF_WRAPPER}")"
+[ "${SELF_MODE_AFTER}" = "${SELF_MODE_BEFORE}" ] \
+  || fail "self-upgrade changed the wrapper mode from ${SELF_MODE_BEFORE} to ${SELF_MODE_AFTER}"
+printf 'wrapper self-upgrade mode checks passed\n'
+
 printf 'wrapper upgrade ownership checks passed\n'

@@ -197,7 +197,7 @@ maybe_warn_outdated() {
 self_upgrade_script() {
   command -v curl >/dev/null 2>&1 || { echo "  curl not found; skipping wrapper self-upgrade" >&2; return 0; }
   # Portable script-path resolution (works without GNU readlink/realpath).
-  local script_dir script_path tmp checksum_file expected_sum actual_sum
+  local script_dir script_path tmp checksum_file expected_sum actual_sum installed_mode
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
   echo "→ checking for wrapper script updates (${script_path})"
@@ -241,7 +241,18 @@ self_upgrade_script() {
     rm -f "${tmp}"
     return 0
   fi
-  chmod +x "${tmp}"
+  # Keep the mode the installed wrapper had. `mktemp` creates the staging file
+  # 0600 on GNU and BSD alike, so `chmod +x` alone would install a 0700
+  # wrapper: invisible to the operator who ran the upgrade, fatal for anyone
+  # else who runs that wrapper from a shared directory. Packaged installs are
+  # 0755, which is also the mode the permission-denied branch below suggests.
+  installed_mode="$(stat -c '%a' "${script_path}" 2>/dev/null || stat -f '%Lp' "${script_path}" 2>/dev/null || true)"
+  case "${installed_mode}" in
+    [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7])
+      chmod "${installed_mode}" "${tmp}" 2>/dev/null || chmod 0755 "${tmp}"
+      ;;
+    *) chmod 0755 "${tmp}" ;;
+  esac
   if ! mv "${tmp}" "${script_path}" 2>/dev/null; then
     echo "  could not replace ${script_path} (permission denied?)"
     echo "  rerun with: sudo install -m 0755 ${tmp} ${script_path}"
