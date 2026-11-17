@@ -17,6 +17,11 @@ version in [`docs/changelog/`](docs/changelog/):
   received messages, including retained history. Name-based mailbox access and
   writes no longer skip that project as empty, and startup no longer reports
   it as an empty twin. (#2348, follow-up to #2018.)
+- Preserved the beginning and ending of long native user prompts and opted-in
+  assistant Stop excerpts, so trailing corrections and final results survive
+  client capping. Full-input sanitization, existing byte limits and server
+  opt-in checks are unchanged; an explicit marker identifies omitted middle text.
+  ([#2342](https://github.com/akitaonrails/ai-memory/pull/2342))
 - Preserved reported wiki writes and required full-tree walks after a confinement
   refusal. Once the entry is repaired, the next checkpoint includes the earlier
   writes even when another write was reported in the meantime, instead of waiting
@@ -217,6 +222,20 @@ version in [`docs/changelog/`](docs/changelog/):
   destination on a LAN or the internet published it to anything on the path.
   Loopback `http` and every `https` destination stay quiet, and the deployment
   is not refused; the warning names the destination so the operator can decide. (#2324)
+- Updated the locked `libz-sys` to the patched `1.1.33`, clearing
+  RUSTSEC-2026-0544 (a zlib heap buffer overflow in `gz_vacate()` reachable
+  through `git2`'s vendored libgit2) from the dependency gate. The transitive
+  `chrono` maintenance advisory RUSTSEC-2026-0543 (unmaintained, no patched
+  release, pulled through the MCP SDK and `schemars`) is a documented policy
+  exception in `deny.toml` and the CI audit until the SDK/schema dependencies
+  drop it; no vulnerability is demonstrated. (#2347)
+- A native transcript read refuses anything that is not a regular file, so a
+  symlink planted at the session file it was about to open is no longer
+  followed. The lookup validated the path and then reopened it by name, which
+  left a window for the file to be swapped between the two, and a FIFO put
+  there could stall the read. The open now uses `O_NOFOLLOW` with a descriptor
+  comparison, the way the Antigravity transcript reader already did; a
+  transcript reached through a symlinked home still reads. (#2351)
 
 ## [3.4.7] - 2026-11-15
 

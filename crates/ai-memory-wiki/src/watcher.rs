@@ -7,7 +7,7 @@
 //!    disk, parse the frontmatter, and `reindex_page` against the store.
 //!    Own-writes are absorbed by the store's sha256 short-circuit, so
 //!    the loop terminates after one no-op reindex.
-//! 2. **Reconciliation tick** every 30s walks the entire wiki tree and
+//! 2. **Reconciliation tick** every 300s walks the entire wiki tree and
 //!    reindexes page markdown files (excluding `_meta.md`, bootstrap files,
 //!    raw event ledgers, and symlinks). Catches any events the OS dropped
 //!    (basic-memory #580 — file watchers go stale under FSEvents buffer
@@ -173,7 +173,7 @@ async fn run_loop(
     // surface a clear "watcher is degraded" event after a streak, in
     // addition to the per-failure error log. Without this, a broken
     // disk → store bridge can stay broken indefinitely with only a
-    // line per 30s in the warn stream — easy to miss in busy logs.
+    // line per 300s in the warn stream — easy to miss in busy logs.
     let mut consecutive_failures: u32 = 0;
     const DEGRADED_AFTER: u32 = 5;
 
@@ -344,7 +344,7 @@ async fn reindex_project_dir(
     // project directory reaches the indexer. A filesystem event on a rowless
     // directory would otherwise walk it and warn once per page, which is the
     // behaviour that pass was about — quieter here only because it needs an
-    // event rather than firing every 30s. Checking once per directory also
+    // event rather than firing every 300s. Checking once per directory also
     // saves walking a tree whose every page is going to fail scope resolution.
     //
     // Rows only, for the same reason `reconcile` uses this form: the guard
@@ -562,7 +562,7 @@ const RECONCILE_DELETE_BREAKER_MIN_CANDIDATES: usize = 3;
 
 /// Reconcile-delete circuit breaker (design item #4): fraction floor, applied
 /// alongside the absolute floor above. Half (or more) of a scope's candidate
-/// pages vanishing inside one 30s reconcile window is far more likely a
+/// pages vanishing inside one 300s reconcile window is far more likely a
 /// walk/mount problem — an unmounted volume, a git checkout mid-walk, a
 /// project directory being renamed — than that many genuine deletions
 /// landing in the same pass, so the pass is treated as suspect and nothing
@@ -1750,7 +1750,7 @@ mod tests {
         std::fs::write(&target, "I existed first.\n").unwrap();
 
         let handle = WatcherHandle::start(wiki.clone()).unwrap();
-        // Hit reconcile manually instead of waiting 30s.
+        // Hit reconcile manually instead of waiting 300s.
         reconcile(
             &wiki,
             &mut MissingStreaks::new(),

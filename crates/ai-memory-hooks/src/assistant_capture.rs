@@ -13,7 +13,7 @@
 //! opt-in path that re-introduces a sanitized, capped excerpt: the client-side
 //! [`transform_for_client`] and the server-side [`apply_assistant_backstop`].
 
-use ai_memory_core::{AgentKind, Sanitizer, truncate_utf8_bytes};
+use ai_memory_core::{AgentKind, Sanitizer, truncate_utf8_bytes, truncate_utf8_bytes_head_tail};
 use serde::{Deserialize, Serialize};
 
 use crate::payload::{HookEnvelope, HookEvent, abnormal_turn_end};
@@ -108,8 +108,8 @@ pub struct ClientAssistantTransform {
 ///
 /// Reads the candidate assistant message for `(agent, event)`, unconditionally
 /// strips the raw field, and — when the value is a non-empty, in-bounds string —
-/// sanitizes it with the built-in `Sanitizer`, truncates it to
-/// [`ASSISTANT_EXCERPT_MAX_BYTES`] on a UTF-8 boundary, and splices the versioned
+/// sanitizes it with the built-in `Sanitizer`, retains its beginning and ending
+/// within [`ASSISTANT_EXCERPT_MAX_BYTES`] on UTF-8 boundaries, and splices the versioned
 /// [`AssistantCaptureProtocol`] into the body under [`ASSISTANT_MARKER_KEY`].
 ///
 /// Scrub happens BEFORE truncation (a secret straddling the cap must be redacted
@@ -144,7 +144,7 @@ pub fn transform_for_client(
         };
     };
     let scrubbed = Sanitizer::builtin().scrub(&value);
-    let excerpt = truncate_utf8_bytes(&scrubbed, ASSISTANT_EXCERPT_MAX_BYTES);
+    let excerpt = truncate_utf8_bytes_head_tail(&scrubbed, ASSISTANT_EXCERPT_MAX_BYTES);
     if excerpt.is_empty() {
         return ClientAssistantTransform {
             changed,
@@ -380,6 +380,53 @@ mod tests {
     }
 
     #[test]
+    fn client_selection_preserves_both_ends_and_omits_middle() {
+        let beginning = "INITIAL_DECISION: inspect the parser.\n";
+        let ending = "\nFINAL_RESULT: fixed the parser. PRIVATE_PROSE_LIMITATION";
+        let message = format!(
+            "{beginning}{}OMITTED_MIDDLE_DECISION{}{ending}",
+            "é🧪".repeat(400),
+            "é🧪".repeat(400),
+        );
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode] {
+            let mut raw = serde_json::json!({
+                "session_id": "same-session",
+                "last_assistant_message": message,
+            });
+            assert!(transform_for_client(&mut raw, agent, HookEvent::Stop).captured);
+            let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
+            assert!(excerpt.starts_with(beginning), "{agent:?}");
+            assert!(excerpt.ends_with(ending), "{agent:?}: final result lost");
+            assert!(excerpt.contains("...[truncated "));
+            assert!(!excerpt.contains("OMITTED_MIDDLE_DECISION"));
+            assert!(excerpt.len() <= ASSISTANT_EXCERPT_MAX_BYTES);
+            assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
+            assert!(raw.get("last_assistant_message").is_none());
+            assert_eq!(raw["session_id"], "same-session");
+        }
+    }
+
+    #[test]
+    fn client_selection_scrubs_secrets_across_both_cuts() {
+        let secret = format!("AKIA{}", "Z".repeat(16));
+        // The existing helper reserves 48 bytes, leaving 976 bytes at each end.
+        // Each raw cut crosses a fake key; slicing first would leak a fragment.
+        let half = (ASSISTANT_EXCERPT_MAX_BYTES - 48) / 2;
+        for start in [half - 10, 6_000 - half - 10] {
+            let mut message = "x".repeat(6_000);
+            message.replace_range(start - 1..start, " ");
+            message.replace_range(start..start + secret.len(), &secret);
+            message.replace_range(start + secret.len()..start + secret.len() + 1, " ");
+            let mut raw = serde_json::json!({"last_assistant_message": message});
+            assert!(transform_for_client(&mut raw, AgentKind::Codex, HookEvent::Stop).captured);
+            let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
+            assert!(!excerpt.contains("AKIA"), "secret prefix at {start}");
+            assert!(!excerpt.contains('Z'), "secret suffix at {start}");
+            assert!(excerpt.len() <= ASSISTANT_EXCERPT_MAX_BYTES);
+        }
+    }
+
+    #[test]
     fn client_transform_truncates_multibyte_within_cap() {
         let big = "é".repeat(ASSISTANT_EXCERPT_MAX_BYTES); // 2 bytes each → 2x the cap
         let mut raw = serde_json::json!({ "last_assistant_message": big });
@@ -387,7 +434,11 @@ mod tests {
         assert!(out.captured);
         let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
         assert!(excerpt.len() <= ASSISTANT_EXCERPT_MAX_BYTES, "over cap");
-        assert!(excerpt.ends_with('…'), "truncation marker missing");
+        assert!(
+            excerpt.contains("...[truncated "),
+            "truncation marker missing"
+        );
+        assert!(excerpt.starts_with('é') && excerpt.ends_with('é'));
         // Valid UTF-8 (no split codepoint): re-parsing as str succeeds by construction.
         assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
     }

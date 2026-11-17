@@ -702,7 +702,7 @@ mid_session = "follow-cwd"
 # delay. Embedding backfill is off by default because it may call a paid
 # provider.
 #
-# reconcile_tombstones_deleted_pages (#929, docs/okf.md) lets the watcher's 30s
+# reconcile_tombstones_deleted_pages (#929, docs/okf.md) lets the watcher's 300s
 # reconcile pass tombstone an OKF-imported content page whose file was missing
 # on two consecutive passes. Session summary pages are excluded. A circuit
 # breaker skips a scope where more than max(3, 50%) of the candidate pages look

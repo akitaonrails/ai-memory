@@ -4442,7 +4442,68 @@ fn cursor_path(harness: ManagedHarness, path: &Path) -> PathBuf {
 /// Open a transcript for sequential reads, decompressing a compressed Codex
 /// rollout.
 fn open_transcript(harness: ManagedHarness, path: &Path) -> std::io::Result<Box<dyn BufRead>> {
-    transcript_reader(harness, path, File::open(path)?)
+    transcript_reader(harness, path, open_regular_transcript(path)?)
+}
+
+/// Open `path` only when it is a regular file and still the same file once
+/// open. A transcript location is derived from a harness home and a native
+/// session id, so the caller's earlier checks race a symlink swapped in
+/// afterwards; `O_NOFOLLOW` refuses a final-component symlink, `O_NONBLOCK`
+/// keeps a FIFO swapped in from blocking the read forever, and the descriptor
+/// comparison refuses a path whose ancestor became a symlink in the meantime.
+fn open_regular_transcript(path: &Path) -> std::io::Result<File> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() {
+        return Err(not_a_regular_file(path));
+    }
+    let file = open_no_follow(path)?;
+    let after = file.metadata()?;
+    if !after.is_file() {
+        return Err(not_a_regular_file(path));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Err(not_a_regular_file(path));
+        }
+    }
+    // The descriptor's own path is the one the checks above admitted; an
+    // ancestor swapped for a symlink after them would still resolve here.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        if fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .is_ok_and(|opened| opened != path)
+        {
+            return Err(not_a_regular_file(path));
+        }
+    }
+    Ok(file)
+}
+
+fn not_a_regular_file(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{} is not a regular file", path.display()),
+    )
+}
+
+/// `O_NOFOLLOW` refuses a final-component symlink and `O_NONBLOCK` a FIFO, the
+/// way the Antigravity transcript reader opens its own files. Reads of a
+/// regular file are unaffected.
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 /// [`open_transcript`] over a file already opened at `path`.
@@ -6685,6 +6746,49 @@ fn deduplicate_losses(losses: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transcript location is derived from a harness home and a native
+    /// session id, so the file itself can be a symlink planted after the
+    /// caller's checks. A directory is refused on every platform; the real
+    /// file still opens.
+    #[test]
+    fn a_non_regular_transcript_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("session.jsonl");
+        std::fs::write(&real, b"{\"type\":\"user\"}\n").unwrap();
+        assert!(
+            open_regular_transcript(&real).is_ok(),
+            "the file a session names still opens"
+        );
+        let error =
+            open_regular_transcript(dir.path()).expect_err("a directory is not a transcript");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
+    /// A symlink, a dangling link and a link reached through `open_transcript`
+    /// are refused. Unix-only, like the Antigravity reader's own symlink tests:
+    /// Windows needs a privilege to create the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_transcript_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("session.jsonl");
+        std::fs::write(&real, b"{\"type\":\"user\"}\n").unwrap();
+
+        let link = dir.path().join("link.jsonl");
+        symlink(&real, &link).unwrap();
+        let error = open_regular_transcript(&link).expect_err("a symlink must be refused");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(
+            open_transcript(ManagedHarness::Codex, &link).is_err(),
+            "the refusal holds through open_transcript"
+        );
+
+        let dangling = dir.path().join("dangling.jsonl");
+        symlink(dir.path().join("missing.jsonl"), &dangling).unwrap();
+        assert!(open_regular_transcript(&dangling).is_err());
+    }
 
     #[test]
     fn the_event_cut_drops_a_token_it_lands_inside() {

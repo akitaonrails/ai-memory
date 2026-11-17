@@ -586,16 +586,145 @@ fn oversized_core_bodies_are_capped_before_the_local_spool() {
             String::from_utf8_lossy(&output.stderr)
         );
         let body = spooled_body(tmp.path());
-        assert!(
-            !body.contains("TAIL_SENTINEL"),
-            "{event} spool was not capped"
-        );
         let json: serde_json::Value =
             serde_json::from_str(&body).expect("spooled body remains JSON");
         let excerpt = json[field].as_str().expect("body field is text");
         assert!(excerpt.len() <= cap, "{event} exceeded {cap} bytes");
-        assert!(excerpt.ends_with('…'));
+        if event == "user-prompt-submit" {
+            assert!(excerpt.ends_with("TAIL_SENTINEL"));
+            assert!(excerpt.contains("...[truncated "));
+        } else {
+            assert!(!excerpt.contains("TAIL_SENTINEL"));
+            assert!(excerpt.ends_with('…'));
+        }
     }
+}
+
+#[test]
+fn native_capture_selection_preserves_late_results_and_prompt_corrections() {
+    for (agent, event, field, cap) in [
+        ("claude-code", "stop", "last_assistant_message", 2_000),
+        ("codex", "stop", "last_assistant_message", 2_000),
+        ("opencode", "stop", "last_assistant_message", 2_000),
+        ("claude-code", "user-prompt-submit", "prompt", 16_384),
+        ("codex", "user-prompt-submit", "prompt", 16_384),
+        ("opencode", "user-prompt-submit", "prompt", 16_384),
+        (
+            "qwen-code",
+            "user-prompt-submit",
+            "submitted_prompt",
+            16_384,
+        ),
+        ("kimi-code", "user-prompt-submit", "prompt", 16_384),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let text = format!(
+            "INITIAL_DECISION\n{}\nFINAL_CORRECTION",
+            "é🧪".repeat(cap / 3)
+        );
+        let value = if agent == "kimi-code" {
+            serde_json::json!([{"type": "text", "text": text}])
+        } else {
+            serde_json::json!(text)
+        };
+        let payload =
+            serde_json::json!({"session_id": "selected-text", (field): value}).to_string();
+        let output = run_hook_full_agent(
+            tmp.path(),
+            agent,
+            event,
+            payload.as_bytes(),
+            event == "stop",
+        );
+        assert!(output.status.success(), "{agent}/{event}");
+        let entry = spooled_entry(tmp.path());
+        let body: serde_json::Value =
+            serde_json::from_str(entry["body"].as_str().unwrap()).unwrap();
+        let selected = if event == "stop" {
+            assert!(body.get("last_assistant_message").is_none());
+            assert_eq!(body["_ai_memory_assistant"]["version"], 1);
+            assert!(
+                entry["url"]
+                    .as_str()
+                    .unwrap()
+                    .contains("capture_assistant=1")
+            );
+            body["_ai_memory_assistant"]["excerpt"].as_str().unwrap()
+        } else {
+            body[field].as_str().unwrap()
+        };
+        assert!(selected.starts_with("INITIAL_DECISION"), "{agent}/{event}");
+        assert!(selected.ends_with("FINAL_CORRECTION"), "{agent}/{event}");
+        assert!(selected.contains("...[truncated "));
+        assert!(selected.len() <= cap);
+        assert_eq!(body["session_id"], "selected-text");
+    }
+}
+
+#[test]
+fn transcript_prompt_selection_keeps_the_trailing_user_correction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("repo");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join(".ai-memory.toml"), "").unwrap();
+    let conversation = "capture-selection-conversation";
+    let logs = tmp
+        .path()
+        .join(".gemini/antigravity/brain")
+        .join(conversation)
+        .join(".system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript.jsonl");
+    let text = format!("INITIAL_REQUEST\n{}\nFINAL_CORRECTION", "x".repeat(20_000));
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+                "created_at": "2026-10-18T10:00:00Z", "content": text,
+            })
+        ),
+    )
+    .unwrap();
+    let payload = serde_json::json!({
+        "conversationId": conversation, "workspacePaths": [workspace], "transcriptPath": transcript,
+        "artifactDirectoryPath": logs.parent().unwrap().parent().unwrap(),
+        "executionNum": 0, "terminationReason": "NO_TOOL_CALL", "fullyIdle": true,
+    })
+    .to_string();
+    let output = run_hook_full_agent(
+        tmp.path(),
+        "antigravity-cli",
+        "stop",
+        payload.as_bytes(),
+        false,
+    );
+    assert!(output.status.success());
+    let entries: Vec<serde_json::Value> = spool_entries(tmp.path())
+        .iter()
+        .map(|e| serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap())
+        .collect();
+    let prompts: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["url"].as_str().unwrap().contains("event=user-prompt&"))
+        .collect();
+    assert_eq!(prompts.len(), 1, "one transcript prompt per source record");
+    let body: serde_json::Value =
+        serde_json::from_str(prompts[0]["body"].as_str().unwrap()).unwrap();
+    let selected = body["prompt"].as_str().unwrap();
+    assert!(selected.starts_with("INITIAL_REQUEST") && selected.ends_with("FINAL_CORRECTION"));
+    assert!(selected.contains("...[truncated "));
+    assert!(selected.len() <= ai_memory_hooks::USER_PROMPT_EXCERPT_MAX_BYTES);
+    assert_eq!(body["conversationId"], conversation);
+    assert_eq!(body["occurred_at"], "2026-10-18T10:00:00Z");
+    assert!(body.get("transcriptPath").is_none());
+    assert!(
+        prompts[0]["url"]
+            .as_str()
+            .unwrap()
+            .contains("ingest_key=agy_")
+    );
 }
 
 #[test]

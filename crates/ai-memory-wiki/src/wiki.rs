@@ -2875,7 +2875,7 @@ impl Wiki {
         // the only place that can embed a page an external editor created or
         // rewrote. Resolve the pre-upsert latest id (when an embedder and a
         // store reader are both available) so a no-op reindex — the
-        // reconcile pass walks every page every 30s — never re-embeds a
+        // reconcile pass walks every page every 300s — never re-embeds a
         // stable tree; only a genuine new/rewritten version, recognised by
         // `upsert_page` minting a fresh id, does.
         //
