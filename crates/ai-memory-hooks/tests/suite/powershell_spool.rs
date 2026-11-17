@@ -241,6 +241,53 @@ fn powershell_hook_spools_when_server_unreachable() {
     );
 }
 
+/// A hook installed without `AI_MEMORY_AUTH_TOKEN` authenticates its POST
+/// from `<data_dir>/auth-tokens/default` (#2134). The spooled entry has to
+/// carry that same credential, or the drain posts anonymously, takes a 401,
+/// and retires the event as a terminal 4xx.
+#[test]
+fn powershell_spool_records_the_stored_token_for_the_drain() {
+    let refusing = ai_memory_test_support::refusing_port();
+    let server = refusing.url();
+
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = home.path().join("data");
+    let tokens = data_dir.join("auth-tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    std::fs::write(tokens.join("default"), "stored-hook-token\n").unwrap();
+    let payload = r#"{"session_id":"ps-spool-token","prompt":"outage capture"}"#;
+    let program = format!(
+        ". '{lib}'; function Read-AiMemoryStdin {{ $env:AI_MEMORY_TEST_PAYLOAD }}; \
+         Invoke-AiMemoryHook -Event 'user-prompt' -Agent 'codex'",
+        lib = hook_lib()
+    );
+    let output = run_powershell(
+        &program,
+        home.path(),
+        &[
+            ("AI_MEMORY_HOOK_URL", server.as_str()),
+            ("AI_MEMORY_TEST_PAYLOAD", payload),
+            ("AI_MEMORY_DATA_DIR", data_dir.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "PowerShell hook failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let files = spool_files(&data_dir);
+    assert_eq!(files.len(), 1, "one spool entry after a refused POST");
+    let entry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+    assert_eq!(
+        entry["auth_mode"].as_str(),
+        Some("static"),
+        "the spooled entry must authenticate the way its POST would"
+    );
+    assert_eq!(entry["token"].as_str(), Some("stored-hook-token"));
+}
+
 #[test]
 fn powershell_drain_delivers_and_retires_entries() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
