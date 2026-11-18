@@ -119,8 +119,7 @@ pub use reader::{
     SessionUsageView, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
     StreamTimings, TokenCallOrder, TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery,
     WikiFileFingerprintRow, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
-    highlighted_snippet_html, plain_snippet,
-    project_name_fold_key,
+    highlighted_snippet_html, plain_snippet, project_name_fold_key,
 };
 pub use retrieval_criteria::{MAX_RESULT_LIMIT, RetrievalCriteria};
 pub use retrieval_history::{

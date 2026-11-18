@@ -1231,6 +1231,7 @@ async fn startup_claim_snapshots_only_the_handoff_its_scope_owner_and_receiver_c
                 cwd: None,
                 actor_user: Some(operator(owner)),
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();

@@ -3106,4 +3106,75 @@ mod tests {
             "the old version {old_page} stays unrecorded"
         );
     }
+
+    /// A 3.4.x database (schema at V105, the last migration the 3.4 patch line
+    /// shipped) upgrades cleanly to the 3.5 schema. The seven migrations
+    /// renumbered above V105 for 3.5 apply without a divergent- or
+    /// missing-version abort, and `idx_sessions_open_started` — which V102
+    /// creates and the V107 WorkBuddy table rebuild drops and must recreate —
+    /// survives the upgrade exactly as it exists on a fresh install.
+    #[test]
+    fn v105_database_upgrades_to_current_and_keeps_open_sessions_index() {
+        fn open_sessions_index_present(conn: &Connection) -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_sessions_open_started' AND tbl_name='sessions'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0
+        }
+        let applied_max = |conn: &Connection| -> i32 {
+            conn.query_row(
+                "SELECT MAX(version) FROM refinery_schema_history",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Stop at the last migration the 3.4 patch line shipped.
+        let mut upgraded = Connection::open_in_memory().unwrap();
+        run_to(&mut upgraded, 105).unwrap();
+        assert!(
+            open_sessions_index_present(&upgraded),
+            "V102 must create idx_sessions_open_started by V105"
+        );
+
+        // Applying the remaining migrations is the 3.4.x -> 3.5 upgrade. The
+        // frozen V102-V105 checksums must still match (no divergence), the new
+        // V106-V112 must apply, and the sessions rebuild must restore the index.
+        migrations::runner()
+            .set_abort_divergent(true)
+            .set_abort_missing(true)
+            .run(&mut upgraded)
+            .expect("3.4.x -> 3.5 upgrade applies without divergence");
+        assert!(
+            open_sessions_index_present(&upgraded),
+            "V107 WorkBuddy rebuild must recreate idx_sessions_open_started"
+        );
+
+        // A fresh install reaches the same schema with the same index.
+        let mut fresh = Connection::open_in_memory().unwrap();
+        migrations::runner()
+            .set_abort_divergent(true)
+            .set_abort_missing(true)
+            .run(&mut fresh)
+            .unwrap();
+        assert!(
+            open_sessions_index_present(&fresh),
+            "a fresh install must have idx_sessions_open_started"
+        );
+        assert_eq!(
+            applied_max(&upgraded),
+            applied_max(&fresh),
+            "upgrade and fresh install reach the same schema version"
+        );
+        assert_eq!(
+            applied_max(&fresh),
+            max_supported_version(),
+            "the fresh install is at the newest embedded migration"
+        );
+    }
 }
