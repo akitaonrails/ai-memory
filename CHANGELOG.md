@@ -11,6 +11,18 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Code's Code Mode results are no longer stored as user prompts. When
+  code can run in the background, as in auto mode, Claude Code hands each
+  result of its `REPL` tool back as a `UserPromptSubmit` with
+  `source: "poll_event"`, and every one was captured as something the user
+  typed: the handoff told the next session to continue from a code result, and
+  the session's prompt list, post-compaction anchor and profile harvest read
+  code output as the user's words. The server now accepts these events (202)
+  and stores nothing, before they spend any ingest capacity; the calls the
+  code made are still captured as their own tool events. (#2366)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
