@@ -2,7 +2,7 @@
 //! compact JSON (`payload::value_to_text`), so its quotes and line breaks reach
 //! the sanitizer as `\"` and `\n`; the rules must redact through them (#1963).
 
-use ai_memory_core::{ObservationKind, SessionId};
+use ai_memory_core::{OBSERVATION_BODY_MAX_BYTES, ObservationKind, SessionId};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tempfile::TempDir;
@@ -257,7 +257,15 @@ async fn selected_lifecycle_ends_survive_the_unchanged_router_and_store() {
             );
             assert!(stored.ends_with("FINAL_CORRECTION"), "{agent:?}/{event:?}");
             assert!(stored.contains("...[truncated "));
-            assert!(selected.len() <= cap && stored.len() <= cap);
+            // `stored` is trimmed to the configured server cap; `selected` is
+            // the client excerpt, bounded by the 16 KiB client ceiling and the
+            // server cap only applies at the persistence boundary (#2118). Both
+            // retain head and tail, which the start/end assertions above prove.
+            assert!(stored.len() <= cap, "{agent:?}/{event:?} stored over cap");
+            assert!(
+                selected.len() <= OBSERVATION_BODY_MAX_BYTES,
+                "{agent:?}/{event:?} selected over the client ceiling"
+            );
         }
     }
 }
@@ -278,8 +286,16 @@ async fn selected_stop_still_requires_both_server_and_client_opt_ins() {
         )
         .await;
         if server && requested {
-            assert_eq!(stored, selected);
+            // Both opt-ins on: the excerpt is stored with both ends retained.
+            // The client sends up to the 16 KiB ceiling and the server trims to
+            // the configured cap at the persistence boundary (#2118), so
+            // `stored` is a head+tail excerpt of `selected`, not equal to it.
+            assert!(!stored.is_empty());
             assert!(stored.starts_with("INITIAL_DECISION") && stored.ends_with("FINAL_RESULT"));
+            assert!(selected.starts_with("INITIAL_DECISION") && selected.ends_with("FINAL_RESULT"));
+            assert!(
+                stored.len() <= selected.len() && stored.len() <= state.assistant_excerpt_max_bytes
+            );
         } else {
             assert!(stored.is_empty(), "server={server} requested={requested}");
         }
