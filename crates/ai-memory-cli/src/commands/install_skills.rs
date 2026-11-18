@@ -1035,6 +1035,7 @@ mod tests {
                     | InstallSkillsAgent::Agents
                     | InstallSkillsAgent::Devin
                     | InstallSkillsAgent::Antigravity
+                    | InstallSkillsAgent::WorkBuddy
                     | InstallSkillsAgent::Both => None,
                 };
                 for &scope in InstallSkillsScope::value_variants() {
