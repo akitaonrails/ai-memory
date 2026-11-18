@@ -602,10 +602,15 @@ fn oversized_core_bodies_are_capped_before_the_local_spool() {
 
 #[test]
 fn native_capture_selection_preserves_late_results_and_prompt_corrections() {
+    // The native client truncates both the assistant excerpt and the prompt at
+    // the 16 KiB client ceiling (OBSERVATION_BODY_MAX_BYTES); the configured
+    // stored-excerpt cap (#2118) is a server-side trim the spooled client body
+    // does not see. Drive every case past that ceiling so the client truncates
+    // head+tail and the preserved-both-ends assertions below bite.
     for (agent, event, field, cap) in [
-        ("claude-code", "stop", "last_assistant_message", 2_000),
-        ("codex", "stop", "last_assistant_message", 2_000),
-        ("opencode", "stop", "last_assistant_message", 2_000),
+        ("claude-code", "stop", "last_assistant_message", 16_384),
+        ("codex", "stop", "last_assistant_message", 16_384),
+        ("opencode", "stop", "last_assistant_message", 16_384),
         ("claude-code", "user-prompt-submit", "prompt", 16_384),
         ("codex", "user-prompt-submit", "prompt", 16_384),
         ("opencode", "user-prompt-submit", "prompt", 16_384),

@@ -164,12 +164,21 @@ fn install_hooks_replaces_handwritten_home_command() {
         .into_iter()
         .filter(|command| command.contains("hook --event stop"))
         .collect();
-    assert_eq!(stop_commands.len(), 1, "{stop_commands:?}");
-    assert!(
-        stop_commands[0].starts_with(&format!("\"$HOME/{}\" ", binary_file_name())),
-        "{}",
-        stop_commands[0]
-    );
+    // The handwritten command is recognized and replaced: every `--event stop`
+    // command is now the canonical home-relative installed form, and the
+    // handwritten native-runner path is gone. The stop command legitimately
+    // appears under more than one event key (Stop plus the abnormal-end
+    // StopFailure/Interrupt keys that run the same handler), so assert the
+    // replacement invariant rather than a single occurrence.
+    assert!(!stop_commands.is_empty(), "no stop hook written");
+    let expected_start = format!("\"$HOME/{}\" ", binary_file_name());
+    for command in &stop_commands {
+        assert!(command.starts_with(&expected_start), "{command}");
+        assert!(
+            !command.contains("native-runner"),
+            "handwritten command survived: {command}"
+        );
+    }
 }
 
 #[test]
