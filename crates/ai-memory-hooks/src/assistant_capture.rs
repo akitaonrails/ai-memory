@@ -14,8 +14,7 @@
 //! [`transform_for_client`] and the server-side [`apply_assistant_backstop`].
 
 use ai_memory_core::{
-    AgentKind, OBSERVATION_BODY_MAX_BYTES, Sanitizer, truncate_utf8_bytes,
-    truncate_utf8_bytes_head_tail,
+    AgentKind, OBSERVATION_BODY_MAX_BYTES, Sanitizer, truncate_utf8_bytes_head_tail,
 };
 use serde::{Deserialize, Serialize};
 

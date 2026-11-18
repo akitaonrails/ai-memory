@@ -19288,6 +19288,8 @@ pub(crate) mod tests {
             failure_policy: ai_memory_wiki::FailurePolicy::Reject,
             events: vec![ai_memory_wiki::AdmissionOp::HandoffAccept],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap();
         let tmp = TempDir::new().unwrap();
@@ -19310,7 +19312,11 @@ pub(crate) mod tests {
                     "_ai_memory_assistant": { "version": 1, "excerpt": text },
                 }),
             );
-            crate::assistant_capture::apply_assistant_backstop(&mut env, true);
+            crate::assistant_capture::apply_assistant_backstop(
+                &mut env,
+                true,
+                crate::assistant_capture::ASSISTANT_EXCERPT_MAX_BYTES,
+            );
             env
         };
         for (event, text, at) in [
