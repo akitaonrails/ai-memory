@@ -33,6 +33,7 @@ struct Harness {
     http: Router,
     store: Store,
     shared: ProjectId,
+    secret: ProjectId,
     _tmp: TempDir,
 }
 
@@ -100,12 +101,29 @@ async fn harness() -> Harness {
         http,
         store,
         shared,
+        secret,
         _tmp: tmp,
     }
 }
 
 /// Mint a DB user with an `aim_` token; `write_on` grants write on a project.
 async fn db_user(h: &Harness, username: &str, write_on: Option<ProjectId>) -> String {
+    db_user_with_grant(
+        h,
+        username,
+        write_on.map(|project| (project, GrantLevel::Write)),
+    )
+    .await
+}
+
+/// Mint a DB user with an `aim_` token and an optional one-project grant at the
+/// given level. A `Read` grant is how a caller who may see a restricted project
+/// but must not change it is built.
+async fn db_user_with_grant(
+    h: &Harness,
+    username: &str,
+    grant: Option<(ProjectId, GrantLevel)>,
+) -> String {
     let token = generate_api_key().expect("token");
     let id = h
         .store
@@ -133,10 +151,10 @@ async fn db_user(h: &Harness, username: &str, write_on: Option<ProjectId>) -> St
         )
         .await
         .expect("credential");
-    if let Some(project) = write_on {
+    if let Some((project, level)) = grant {
         h.store
             .writer
-            .grant_memory(id, project, GrantLevel::Write, None)
+            .grant_memory(id, project, level, None)
             .await
             .expect("grant");
     }
@@ -486,4 +504,91 @@ async fn memory_delete_page_acks_an_absent_page() {
         json!(true),
         "memory_delete_page must ack deleted:true for an already-absent page"
     );
+}
+
+/// The delete path resolves its scope through the same write choke point as
+/// `memory_write_page`, so a caller who may only READ a restricted project must
+/// not be able to delete a page in it, and a caller with no grant on that
+/// project must not reach it at all. Root's delete is the control that proves
+/// the refusals were not a blanket deny, and the page survives both of them.
+#[tokio::test]
+async fn a_read_only_caller_cannot_delete_a_page() {
+    let h = harness().await;
+    let alice = db_user_with_grant(&h, "alice", Some((h.secret, GrantLevel::Read))).await;
+    let mallory = db_user_with_grant(&h, "mallory", None).await;
+
+    call(
+        &h.http,
+        ROOT_TOKEN,
+        "memory_write_page",
+        scoped(
+            "secret",
+            json!({ "path": "notes/keep.md", "body": "# Keep\n\nmust outlive them" }),
+        ),
+    )
+    .await
+    .expect("root writes the restricted page");
+
+    // Alice's grant is real: she reads the restricted project.
+    let read = call(
+        &h.http,
+        &alice,
+        "memory_read_page",
+        scoped("secret", json!({ "path": "notes/keep.md" })),
+    )
+    .await
+    .expect("a read grant lets alice read the restricted project");
+    assert!(
+        read["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("must outlive them")),
+        "{read}"
+    );
+
+    // A read grant is not a write grant.
+    let refused = call(
+        &h.http,
+        &alice,
+        "memory_delete_page",
+        scoped("secret", json!({ "path": "notes/keep.md" })),
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a read-only caller must not delete: {refused:?}"
+    );
+
+    // Nor does a caller with no grant on the restricted project reach it, and
+    // the refusal must not name the page it could not read.
+    let refused = call(
+        &h.http,
+        &mallory,
+        "memory_delete_page",
+        scoped("secret", json!({ "path": "notes/keep.md" })),
+    )
+    .await;
+    let refused = refused.expect_err("a foreign restricted project must be refused");
+    assert!(
+        !refused.contains("must outlive them"),
+        "the refusal must not leak the page: {refused}"
+    );
+
+    assert!(
+        root_reads(&h, "secret", "notes/keep.md")
+            .await
+            .is_some_and(|body| body.contains("must outlive them")),
+        "neither refused delete may remove the page"
+    );
+
+    // Control: the same delete by root takes effect.
+    let deleted = call(
+        &h.http,
+        ROOT_TOKEN,
+        "memory_delete_page",
+        scoped("secret", json!({ "path": "notes/keep.md" })),
+    )
+    .await
+    .expect("root deletes the page");
+    assert_eq!(deleted["deleted"], json!(true), "{deleted}");
+    assert_eq!(root_reads(&h, "secret", "notes/keep.md").await, None);
 }
