@@ -8823,6 +8823,81 @@ pub(crate) mod tests {
         assert_eq!(ordinary, HookProcessingOutcome::Stored);
     }
 
+    /// A Code Mode result as Claude Code hands it to `UserPromptSubmit` (#2366).
+    const CODE_MODE_RESULT: &str =
+        "<event kind=\"repl-eval\" eval=\"1\" status=\"settled\">\n<result>ok</result>\n</event>";
+
+    /// Claude Code's Code Mode hands each code result back to the model as a
+    /// `UserPromptSubmit` with `source: "poll_event"` (#2366). It is accepted
+    /// and stored nowhere, so it never becomes the session's latest request,
+    /// while the typed prompt of the same session is still captured. The field
+    /// is Claude Code's: another agent's prompt carrying it is kept.
+    #[tokio::test]
+    async fn claude_code_mode_results_are_accepted_and_stored_nowhere() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let capture = |agent: &'static str, body: serde_json::Value| {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt-submit".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                body,
+            );
+            let state = state.clone();
+            async move {
+                process_authorized(
+                    &state,
+                    env,
+                    None,
+                    ai_memory_core::AuthLevel::User,
+                    Vec::new(),
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let session = SessionId::new().to_string();
+        let cwd = tmp.path().join("repo");
+        let typed = serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.to_string_lossy(),
+            "prompt": "run the tests",
+        });
+        let result = serde_json::json!({
+            "session_id": session,
+            "cwd": cwd.to_string_lossy(),
+            "prompt": CODE_MODE_RESULT,
+            "source": "poll_event",
+        });
+
+        assert_eq!(
+            capture("claude-code", typed).await,
+            HookProcessingOutcome::Stored
+        );
+        assert_eq!(
+            capture("claude-code", result.clone()).await,
+            HookProcessingOutcome::DroppedPolicy,
+            "a Code Mode result is not captured as a prompt"
+        );
+        let prompts: Vec<String> = state
+            .reader
+            .observations_for_session(session.parse().unwrap())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|obs| obs.kind == ObservationKind::UserPrompt)
+            .map(|obs| obs.body)
+            .collect();
+        assert_eq!(prompts, ["run the tests"]);
+
+        let mut other = result;
+        other["session_id"] = serde_json::json!(SessionId::new().to_string());
+        assert_eq!(capture("codex", other).await, HookProcessingOutcome::Stored);
+    }
+
     /// A git-remote capture whose marker asked for `identity_style`.
     async fn capture_styled(
         state: &HookState,
@@ -12058,6 +12133,70 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"queued");
+    }
+
+    /// A Code Mode session sends a result for every piece of code it runs
+    /// (#2366), so the drop comes before any ingest capacity is spent: with the
+    /// semaphore exhausted, the single route still answers 202 with the drop
+    /// reason and a batch still clears the result from the spool, while a
+    /// typed prompt is shed with 429.
+    #[tokio::test]
+    async fn code_mode_results_are_dropped_before_any_capacity_is_spent() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.ingest_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = Arc::new(state);
+        let result = serde_json::json!({
+            "session_id": "code-mode",
+            "prompt": CODE_MODE_RESULT,
+            "source": "poll_event",
+        });
+        let single = |body: serde_json::Value| {
+            handle_hook(
+                State(state.clone()),
+                Query(HookQuery {
+                    event: "user-prompt-submit".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                }),
+                None,
+                None,
+                None,
+                HeaderMap::new(),
+                Json(body),
+            )
+        };
+
+        let response = single(result.clone()).await.into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"code mode poll event dropped");
+        // Control: a typed prompt reaches the exhausted semaphore.
+        let prompt = serde_json::json!({ "session_id": "code-mode", "prompt": "hello" });
+        let typed = single(prompt).await.into_response();
+        assert_eq!(typed.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(vec![HookBatchItem {
+                url: "http://h/hook?event=user-prompt-submit&agent=claude-code".into(),
+                body: result,
+            }]),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 1, "a Code Mode result clears the spool");
     }
 
     #[tokio::test]
