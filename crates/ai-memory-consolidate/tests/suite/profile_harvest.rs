@@ -579,19 +579,20 @@ async fn claude_generated_prompt_wrappers_are_never_candidates() {
 
 /// An ADR's metadata fields (`**Status:** Accepted`, `**Date:**`) are never
 /// harvested as the page's statement, so `profile review` does not list them
-/// as habits waiting for promotion. The decision itself is the candidate, and
-/// a habit said in two projects is still admitted (controls).
+/// as habits waiting for promotion. The decision itself, stated as a rule, is
+/// the candidate, and a habit said in two projects is still admitted
+/// (controls).
 #[tokio::test]
 async fn page_metadata_fields_are_never_candidates() {
     let fx = fixture().await;
     let alpha = project(&fx, "alpha").await;
     let beta = project(&fx, "beta").await;
     for (proj, slug, context) in [
-        (alpha, "wal-mode", "Readers blocked the writer under load."),
+        (alpha, "wal-mode", "Always use WAL mode for the store."),
         (
             beta,
             "queue-backend",
-            "Jobs were lost when the broker restarted.",
+            "Never run jobs on a broker without persistence.",
         ),
     ] {
         fx.wiki
@@ -647,7 +648,7 @@ async fn page_metadata_fields_are_never_candidates() {
     assert!(
         statements
             .iter()
-            .any(|s| s == "Readers blocked the writer under load."),
+            .any(|s| s == "Always use WAL mode for the store."),
         "{statements:?}"
     );
 
@@ -1766,4 +1767,211 @@ async fn a_multi_user_server_harvests_nothing_by_default() {
     .await;
     assert_eq!(report.share, None);
     assert!(candidate_statements(&fx).is_empty());
+}
+
+async fn curated_page(fx: &Fixture, proj: ProjectId, path: &str, body: &str) {
+    fx.wiki
+        .write_page(WritePageRequest {
+            workspace_id: fx.ws,
+            project_id: proj,
+            path: PagePath::new(path.to_owned()).unwrap(),
+            frontmatter: serde_json::json!({}),
+            body: body.to_owned(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+}
+
+/// A decision log opens with an event record ("approved on <date>") or a
+/// pointer to the note it continues. Agents write that boilerplate in every
+/// project, so it met `min_projects` and a dated approval reached every
+/// session start as a "usual choice". A rule two projects keep is still
+/// admitted (control).
+#[tokio::test]
+async fn dated_records_and_pointers_on_pages_are_never_candidates() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let beta = project(&fx, "beta").await;
+    for (proj, date, previous, wording) in [
+        (alpha, "2026-11-12", "sessao-a", "Ler o veredito na fonte"),
+        (
+            beta,
+            "2026-11-13",
+            "sessao-b",
+            "Ler o veredito do teste na fonte",
+        ),
+    ] {
+        curated_page(
+            &fx,
+            proj,
+            &format!("decisions/node-{date}.md"),
+            &format!("# Node\n\nPlano aprovado pelo usuário em {date}.\n\n## Contexto\n\nx\n"),
+        )
+        .await;
+        curated_page(
+            &fx,
+            proj,
+            &format!("decisions/{previous}-release.md"),
+            &format!(
+                "# Release\n\nContinua [[decisions/{previous}]]. Armadilhas das lojas em \
+                 [[gotchas/app-store]].\n"
+            ),
+        )
+        .await;
+        curated_page(
+            &fx,
+            proj,
+            &format!("gotchas/capturas-{previous}.md"),
+            &format!(
+                "# Capturas\n\nVisto no app em 15/10/2026 ({previous}, interface nova do \
+                 painel da loja). Vale para qualquer app.\n"
+            ),
+        )
+        .await;
+        curated_page(
+            &fx,
+            proj,
+            "_rules/veredito.md",
+            &format!("# Veredito\n\n{wording}, nunca no exit code de um pipe.\n"),
+        )
+        .await;
+    }
+
+    let report = pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    for noise in ["Plano aprovado", "Continua", "Visto no"] {
+        assert!(
+            statements.iter().all(|s| !s.contains(noise)),
+            "a record became a candidate: {statements:?}"
+        );
+    }
+    let pages = profile_pages(&fx, "_global");
+    assert_eq!(pages.len(), 1, "{report:?} {pages:?}");
+    assert!(pages[0].1.contains("veredito"), "{pages:?}");
+}
+
+/// Text no one typed as a preference, each said in two projects on different
+/// days so it meets `min_projects`: an app-generated suggestion request, a
+/// desktop side-session footer with a Windows path, and a file attached to
+/// the prompt. Only the sentence the user typed next to the attachment, and
+/// repeated in the other project, becomes an entry (control).
+#[tokio::test]
+async fn app_generated_and_attached_text_never_reach_the_profile() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let beta = project(&fx, "beta").await;
+    for (proj, day, session) in [(alpha, 1, "local_abc"), (beta, 3, "local_def")] {
+        prompt(
+            &fx,
+            proj,
+            "This is an app-generated request for a suggested next user message. The user did \
+             not write this message.\n\n\
+             Choose the action and specific object that best continue that intent, rather than \
+             a generally useful follow-up.",
+            day,
+        )
+        .await;
+        prompt(
+            &fx,
+            proj,
+            &format!(
+                "Corrija a colheita.\n\n\
+                 Shared notes folder for this group of sessions (outside the repo; read \
+                 siblings' notes there, leave hand-over notes or large findings there instead \
+                 of pasting them into messages): \
+                 C:\\Users\\sam\\AppData\\Local\\Claude-Data\\claude_x\\side-session-notes\\{session}"
+            ),
+            day,
+        )
+        .await;
+        prompt(
+            &fx,
+            proj,
+            "[@praticas.md](file:///C:/notes/praticas.md)\n foi implementado?\n\
+             Prefiro commits pequenos em vez de grandes.\n\n\
+             <context ref=\"file:///C:/notes/praticas.md\">\n\
+             Diga isso com honestidade em vez de instalar por padrão.\n\
+             Use sempre conforme as instruções do fabricante.\n\
+             </context>\n",
+            day,
+        )
+        .await;
+    }
+
+    let report = pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    assert!(
+        statements.iter().all(|s| s.contains("commits pequenos")),
+        "text the user did not write became a candidate: {statements:?}"
+    );
+    let pages = profile_pages(&fx, "_global");
+    assert_eq!(pages.len(), 1, "{report:?} {pages:?}");
+    assert!(pages[0].1.contains("commits pequenos"), "{pages:?}");
+}
+
+/// The opening line agents repeat on every project's decision note, with no
+/// date in it, and a fact about one system under `gotchas/`: neither has the
+/// shape of a rule, so neither is a candidate. A rule both projects keep
+/// under `_rules/` is admitted whatever its wording, even when it cites the
+/// day it was decided (control).
+#[tokio::test]
+async fn pages_outside_the_rule_directories_need_the_shape_of_a_rule() {
+    let fx = fixture().await;
+    let alpha = project(&fx, "alpha").await;
+    let beta = project(&fx, "beta").await;
+    for (proj, slug, approval, rule) in [
+        (
+            alpha,
+            "a",
+            "Plano aprovado pelo usuário.",
+            "Ler o veredito na fonte",
+        ),
+        (
+            beta,
+            "b",
+            "Plano aprovado pelo usuário, sem ressalvas.",
+            "Ler o veredito do teste na fonte",
+        ),
+    ] {
+        curated_page(
+            &fx,
+            proj,
+            &format!("decisions/plano-{slug}.md"),
+            &format!("# Plano\n\n{approval}\n\n## Contexto\n\nx\n"),
+        )
+        .await;
+        curated_page(
+            &fx,
+            proj,
+            &format!("gotchas/rodape-{slug}.md"),
+            &format!("# Rodapé\n\nLinks de fundo claro no rodapé ficam invisíveis ({slug}).\n"),
+        )
+        .await;
+        curated_page(
+            &fx,
+            proj,
+            &format!("_rules/veredito-{slug}.md"),
+            &format!("# Veredito\n\n{rule}, no log do teste (decisão do time, 22/10/2026).\n"),
+        )
+        .await;
+    }
+
+    let report = pass(&fx, &single_user()).await;
+    let statements = candidate_statements(&fx);
+    for noise in ["Plano aprovado", "rodapé"] {
+        assert!(
+            statements.iter().all(|s| !s.contains(noise)),
+            "a line that states no rule became a candidate: {statements:?}"
+        );
+    }
+    let pages = profile_pages(&fx, "_global");
+    assert_eq!(pages.len(), 1, "{report:?} {pages:?}");
+    assert!(pages[0].1.contains("veredito"), "{pages:?}");
 }

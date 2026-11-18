@@ -11,6 +11,31 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Profile harvest no longer promotes five kinds of text that are not a habit
+  to "your usual choices". Three arrived as prompts: Codex's app-generated
+  request for a suggested next message, a Claude desktop sub-session brief
+  whose shared-notes footer ends in a Windows path (the #2041 check matched
+  `side-session-notes/` only, so the footer, its local path and a session id
+  became an entry), and the content of a file attached to a prompt in a
+  `<context ref="…">` block. Two came from curated pages: the opening line
+  agents repeat on every project's decision or session note ("Plan approved
+  by the user.", "Continues [[decisions/…]]."), and one page that reached a
+  second project, which counted as two projects once its copies were read
+  more than an hour apart. A page under `decisions/` or `gotchas/` now
+  contributes its statement only when it has the shape of a rule (a marker
+  such as *always* or *instead of*, plus an action or a comparison); pages
+  under `_rules/` and `procedures/` contribute as before. In any directory a
+  statement that opens with a pointer to another note, or that carries a full
+  date outside parentheses and no marker, is a record and is skipped; a rule
+  that cites a date in parentheses or ends on a link is kept. An entry you
+  removed also no
+  longer returns when the only thing admitting it is a `general` candidate
+  older than the removal. Entries an earlier version already wrote stay:
+  list them with `ai-memory profile review` and remove the ones you do not
+  want with `ai-memory profile forget <path>`.
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
