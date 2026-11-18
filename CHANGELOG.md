@@ -20,7 +20,7 @@ version in [`docs/changelog/`](docs/changelog/):
   the file now holds a different key, so a stale token never loops. ai-memory
   never writes the file. `[llm.<task>]` profiles that inherit the global key
   inherit the file too, and an ambient `LLM_API_KEY` is ignored by the chat
-  provider when the file is set. (#ISSUE)
+  provider when the file is set. (#2365)
 
 ## [3.5.0] - 2026-11-18
 
