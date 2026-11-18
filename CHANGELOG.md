@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Added the native OpenAI Decisions Choice reranker, selected with `reranker = "decisions-choice"` or `AI_MEMORY_RERANKER=decisions-choice`.
+  It requires `OPENAI_API_KEY` and an explicit `llm_model`, without a generative provider.
+  It sends one bounded Choice request per eligible query, retains local order on failure, and records validated usage even when an answer is refused.
+  Choice probabilities are relative to the candidate pool; leave `min_relevance` unset with this backend. (#2296)
+
 - `memory_message_list` accepts an optional `after_id` cursor and pages the
   pending queue by `(created_at, id)`. An inbox can hold 256 pending messages
   while one list call returns at most 200, so the tail could not be seen without

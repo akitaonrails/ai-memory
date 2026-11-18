@@ -4,6 +4,7 @@
 //! the result of calls the server was already going to make.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,7 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 1024;
 pub struct ProviderHealth {
     llm: ProviderRoleHealth,
     llm_workloads: LlmWorkloadHealth,
+    direct_rerank_recording: Arc<AtomicBool>,
     embedding: ProviderRoleHealth,
     /// The configured LLM provider, held only so `snapshot()` can read its
     /// [`LlmProvider::candidate_health`] — a plain provider always returns
@@ -65,13 +67,16 @@ impl ProviderHealth {
             })
             .collect();
         let llm = self.llm.snapshot();
-        let (llm_workloads, llm_workloads_started_ms) =
-            if llm.status == ProviderHealthStatus::Disabled && overrides.is_empty() {
-                (Vec::new(), None)
-            } else {
-                let (rows, started_ms) = self.llm_workloads.snapshot();
-                (rows, Some(started_ms))
-            };
+        let (llm_workloads, llm_workloads_started_ms) = if llm.status
+            == ProviderHealthStatus::Disabled
+            && overrides.is_empty()
+            && !self.direct_rerank_recording.load(Ordering::Relaxed)
+        {
+            (Vec::new(), None)
+        } else {
+            let (rows, started_ms) = self.llm_workloads.snapshot();
+            (rows, Some(started_ms))
+        };
         ProviderHealthSnapshot {
             llm,
             llm_candidates,
@@ -80,6 +85,26 @@ impl ProviderHealth {
             llm_workloads_started_ms,
             embedding: self.embedding.snapshot(),
         }
+    }
+
+    /// Record direct rerank consumption even when the answer is invalid or refused.
+    /// This does not configure or probe a generative provider.
+    pub fn record_rerank_result<T>(
+        &self,
+        elapsed: Duration,
+        estimated_input_tokens: u64,
+        result: &LlmResult<T>,
+        reported_usage: Option<Usage>,
+    ) {
+        self.direct_rerank_recording.store(true, Ordering::Relaxed);
+        self.llm_workloads.record_with_usage(
+            LlmWorkload::Rerank,
+            elapsed,
+            estimated_input_tokens,
+            result,
+            |_| 0,
+            reported_usage,
+        );
     }
 
     /// Mark the LLM role as configured and wrap it with passive recording.
@@ -532,6 +557,26 @@ impl LlmWorkloadHealth {
         estimated_output_tokens: impl FnOnce(&T) -> u64,
         reported_usage: impl FnOnce(&T) -> Option<Usage>,
     ) {
+        let usage = result.as_ref().ok().and_then(reported_usage);
+        self.record_with_usage(
+            workload,
+            elapsed,
+            estimated_input_tokens,
+            result,
+            estimated_output_tokens,
+            usage,
+        );
+    }
+
+    fn record_with_usage<T>(
+        &self,
+        workload: LlmWorkload,
+        elapsed: Duration,
+        estimated_input_tokens: u64,
+        result: &LlmResult<T>,
+        estimated_output_tokens: impl FnOnce(&T) -> u64,
+        reported_usage: Option<Usage>,
+    ) {
         let now = Timestamp::now();
         let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
         let mut counters = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -548,21 +593,21 @@ impl LlmWorkloadHealth {
             .estimated_input_tokens
             .saturating_add(estimated_input_tokens);
         state.last_call_at = Some(now);
+        if let Some(usage) = reported_usage {
+            state.usage_reported_calls = state.usage_reported_calls.saturating_add(1);
+            state.reported_input_tokens = state
+                .reported_input_tokens
+                .saturating_add(u64::from(usage.input_tokens));
+            state.reported_output_tokens = state
+                .reported_output_tokens
+                .saturating_add(u64::from(usage.output_tokens));
+        }
         match result {
             Ok(output) => {
                 state.successes = state.successes.saturating_add(1);
                 state.estimated_output_tokens = state
                     .estimated_output_tokens
                     .saturating_add(estimated_output_tokens(output));
-                if let Some(usage) = reported_usage(output) {
-                    state.usage_reported_calls = state.usage_reported_calls.saturating_add(1);
-                    state.reported_input_tokens = state
-                        .reported_input_tokens
-                        .saturating_add(u64::from(usage.input_tokens));
-                    state.reported_output_tokens = state
-                        .reported_output_tokens
-                        .saturating_add(u64::from(usage.output_tokens));
-                }
                 state.status = ProviderHealthStatus::Ok;
                 state.last_success_at = Some(now);
             }

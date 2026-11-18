@@ -31,11 +31,11 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `pi_tool_exposure` | `"direct"` | `AI_MEMORY_PI_TOOL_EXPOSURE` | How the generated Pi extension registers ai-memory's MCP tools: `direct` (declared to the model) or `codemode` (reached through Pi's codemode tool). |
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
-| `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`. The only value is `llm`, which needs an LLM provider. |
+| `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`: `llm` needs a generative provider; `decisions-choice` needs `OPENAI_API_KEY` and explicit `llm_model`, without a generative provider. Case-insensitive; other values refuse startup. Choice probabilities are relative: leave `min_relevance` unset. |
 | `rerank_timeout_secs` | `20` (`ai_memory_llm::reranker::RERANK_TIMEOUT`) | `AI_MEMORY_RERANK_TIMEOUT_SECS` | Seconds one rerank call may take before `memory_query` keeps the pre-rerank order. Must be at least 1. |
 | `llm_provider` | unset | `AI_MEMORY_LLM_PROVIDER` | LLM provider: `anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `anthropic-oauth`, `codex`, `copilot`, `opencode`, `cursor` or `vertex`. |
-| `llm_model` | unset | `AI_MEMORY_LLM_MODEL` | Model override for the LLM provider. |
-| `llm_base_url` | unset | `AI_MEMORY_LLM_BASE_URL` | Endpoint override for the LLM provider. Required for `openai-compat`. |
+| `llm_model` | unset | `AI_MEMORY_LLM_MODEL` | Model override for the LLM provider; required explicitly by `decisions-choice`. |
+| `llm_base_url` | unset | `AI_MEMORY_LLM_BASE_URL` | Endpoint override for the LLM provider. Required for `openai-compat`; `decisions-choice` accepts only the canonical OpenAI origin or credential-free HTTP loopback IP origins. |
 | `llm_compat_strict` | `true` | `AI_MEMORY_LLM_COMPAT_STRICT` | Send `response_format=json_schema` (strict) to the `openai-compat` provider. |
 | `llm_compat_disable_thinking` | `false` | `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` | Send `chat_template_kwargs: {"enable_thinking": false}` on every `openai-compat` chat request. |
 | `llm_compat_stream` | unset | `AI_MEMORY_LLM_COMPAT_STREAM` | Set `false` to request non-streaming JSON from `openai-compat`; `true` is rejected because SSE is unsupported. |

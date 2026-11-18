@@ -36,7 +36,8 @@ unless the files are pre-seeded.
 - **A cloud LLM/embedding provider**, if you want AI-assisted consolidation,
   search, or provider-based embeddings. Skip this and use the `local`
   embedding provider (below) to stay fully offline.
-- **`capture_assistant`** and **`AI_MEMORY_RERANKER=llm`**, both off by
+- **`capture_assistant`** and **`AI_MEMORY_RERANKER=llm`** or
+  **`AI_MEMORY_RERANKER=decisions-choice`** (direct to OpenAI), all off by
   default; see `DATA_HANDLING.md`.
 
 ## Local embeddings without a network dependency

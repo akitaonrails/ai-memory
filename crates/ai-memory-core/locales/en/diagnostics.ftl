@@ -12,6 +12,7 @@ diag-building-profile = building LLM fallback provider { $item }
 diag-profile-api-key-unsupported = provider not configured: api_key_env is not supported by provider { $provider }
 diag-building-llm-provider-chains = building LLM provider chains from config
 diag-reranker-llm-provider-required = AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider
+diag-reranker-decisions-choice-requires-key-and-model = AI_MEMORY_RERANKER=decisions-choice requires OPENAI_API_KEY and llm_model
 diag-aborted-no-input = aborted (no input)
 diag-aborted = aborted
 diag-reading = reading { $value0 }

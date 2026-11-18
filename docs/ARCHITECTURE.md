@@ -204,6 +204,8 @@ from hook paths.
    fusion; it is limited to one call per query and four calls in flight, and any
    invalid, failed, timed-out, or saturated attempt preserves the local order.
    Global and supplemental global-preference results do not take this path.
+   `AI_MEMORY_RERANKER=decisions-choice` takes the same path with one direct
+   OpenAI Decisions Choice request instead of the generative provider.
    With `[retrieval] observation_stream` (on by default), project and `scopes`
    searches add one more RRF stream: full-text search over `observations_fts`
    in the same `(workspace, project)`, where each matching session votes once,
@@ -1717,7 +1719,7 @@ AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
                            Values are never logged. A header value cannot
                            contain a comma through the env var — use
                            `llm_headers = [...]` in config.toml for that.
-AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
+AI_MEMORY_RERANKER         optional `llm` or `decisions-choice`; reranks project/scopes query candidates
 AI_MEMORY_RERANK_TIMEOUT_SECS optional rerank budget in seconds (default 20, minimum 1)
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
 AI_MEMORY_CODEX_EXECUTABLE optional Codex executable; defaults to codex on PATH

@@ -6,6 +6,7 @@ mod anthropic_provider;
 mod copilot_embedder;
 mod copilot_provider;
 mod cursor_provider;
+mod decisions_reranker;
 mod embedder_retry_after;
 mod extra_headers_on_the_wire;
 mod fallback_provider;

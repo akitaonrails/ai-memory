@@ -171,7 +171,11 @@ what the project is and is not designed to defend against.
 
 - **Search reranking is an outbound-data opt-in.** Setting
   `AI_MEMORY_RERANKER=llm` sends each eligible live query plus bounded page
-  titles and search snippets to the configured LLM provider. Managed writes use
+  titles and search snippets to the configured LLM provider.
+  `AI_MEMORY_RERANKER=decisions-choice` sends those values directly to OpenAI Decisions, together with the candidate page-version IDs, which are time-ordered UUIDs that reveal each version's creation time.
+  Its API key goes only to `https://api.openai.com:443`; an HTTP loopback IP override never receives Authorization, and all redirects are rejected.
+  The client ignores inherited proxy settings so a proxy cannot forward a loopback request off-host.
+  Managed writes use
   ai-memory's sanitizer, but manually edited wiki files can contain unsanitized
   text; the live query is bounded but is not sanitized because redaction could
   change its meaning. JSON encoding, an explicit untrusted-data prompt, strict

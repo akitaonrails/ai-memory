@@ -3,6 +3,10 @@
 > Route ai-memory's LLM reranker to a Jev judge endpoint while keeping the
 > hosted LLM for everything else. Stdlib-only Python, no Rust changes.
 
+For OpenAI Decisions, `AI_MEMORY_RERANKER=decisions-choice` provides a [native Choice backend](llm-providers.md) with no adapter process.
+It needs `OPENAI_API_KEY` and an explicit `llm_model`, but no generative provider.
+This guide still applies to Jev endpoints.
+
 [`AI_MEMORY_RERANKER=llm`](llm-providers.md) reorders `memory_query`
 candidates with the configured chat provider. That works until the provider
 is a hosted reasoning model: the reranker prompt is long, a graded judgement

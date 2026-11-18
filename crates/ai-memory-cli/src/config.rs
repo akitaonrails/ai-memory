@@ -593,13 +593,11 @@ pub struct Config {
     /// `?flavor=gemini` marker on the MCP URL is the equivalent opt-in for one
     /// client.
     pub gemini_safe_schemas: bool,
-    /// Opt-in post-RRF reranker for `memory_query`. Only `"llm"` is
-    /// supported: LLM-as-judge over the configured LLM provider, so it
-    /// requires `AI_MEMORY_LLM_PROVIDER` too. Off by default — it puts
-    /// an LLM call on the search hot path, trading latency for recall
-    /// at the top of the ranking. On any error or timeout the query
-    /// preserves the fused, authority-adjusted order. Set with
-    /// `AI_MEMORY_RERANKER=llm`.
+    /// Opt-in post-RRF reranker for `memory_query`.
+    /// `llm` uses the configured generative provider; `decisions-choice` uses
+    /// OpenAI Decisions with OPENAI_API_KEY and an explicit llm_model.
+    /// Off by default; any failure preserves the fused, authority-adjusted order.
+    /// Set with `AI_MEMORY_RERANKER`.
     pub reranker: Option<String>,
     /// Wall-clock budget, in seconds, for one rerank call before the search
     /// answers from the pre-rerank order. Defaults to
@@ -2611,6 +2609,15 @@ fn apply_run_require_server_env(config: &mut Config, raw: Option<&str>) {
     }
 }
 
+/// Configured post-fusion reranking backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankerBackend {
+    /// Judge candidates through the configured generative provider.
+    Llm,
+    /// Compare candidates with one direct OpenAI Decisions Choice request.
+    DecisionsChoice,
+}
+
 impl Config {
     /// Load the merged configuration: defaults → file → env → CLI.
     ///
@@ -3467,23 +3474,24 @@ impl Config {
         ))
     }
 
-    /// Whether the operator opted into post-RRF reranking.
-    ///
-    /// Unknown values are rejected loudly at *startup* rather than
-    /// silently disabling the feature — a typo'd `AI_MEMORY_RERANKER`
-    /// should not look like "reranking is on" in the operator's head
-    /// while eligible queries keep their normal ranking.
+    /// Resolve the explicit post-RRF backend, rejecting unknown values at startup.
     ///
     /// # Errors
-    /// Returns [`LlmError::NotConfigured`] for any value other than
-    /// `llm` (case-insensitive) or empty.
-    pub fn reranker_choice(&self) -> LlmResult<bool> {
-        match non_empty(self.reranker.as_deref()).map(str::to_ascii_lowercase) {
-            None => Ok(false),
-            Some(v) if v == "llm" => Ok(true),
-            Some(other) => Err(LlmError::NotConfigured(format!(
-                "AI_MEMORY_RERANKER={other} is not supported (only `llm`)"
-            ))),
+    /// Returns [`LlmError::NotConfigured`] for values other than `llm`,
+    /// `decisions-choice` (case-insensitive), or empty.
+    pub fn reranker_choice(&self) -> LlmResult<Option<RerankerBackend>> {
+        match non_empty(self.reranker.as_deref()) {
+            None => Ok(None),
+            Some(value) if value.eq_ignore_ascii_case("llm") => Ok(Some(RerankerBackend::Llm)),
+            Some(value) if value.eq_ignore_ascii_case("decisions-choice") => {
+                Ok(Some(RerankerBackend::DecisionsChoice))
+            }
+            Some(other) => {
+                let other = other.to_ascii_lowercase();
+                Err(LlmError::NotConfigured(format!(
+                    "AI_MEMORY_RERANKER={other} is not supported (only `llm` or `decisions-choice`)"
+                )))
+            }
         }
     }
 
@@ -6665,14 +6673,14 @@ input_token_safety_margin = {margin}
                 reranker: value.map(str::to_string),
                 ..Config::default()
             };
-            assert!(!cfg.reranker_choice().unwrap());
+            assert_eq!(cfg.reranker_choice().unwrap(), None);
         }
         for value in ["llm", "LLM", " LlM "] {
             let cfg = Config {
                 reranker: Some(value.into()),
                 ..Config::default()
             };
-            assert!(cfg.reranker_choice().unwrap());
+            assert_eq!(cfg.reranker_choice().unwrap(), Some(RerankerBackend::Llm));
         }
         let cfg = Config {
             reranker: Some("cross-encoder".into()),

@@ -104,13 +104,17 @@ log_level = "info"
 # MCP URL. Env equivalent: `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`.
 # gemini_safe_schemas = false
 
-# Optional final LLM relevance pass for project/scopes memory_query calls.
-# Requires an LLM provider and adds at most one provider call per eligible
-# query. The bounded query, page titles, and search snippets are sent to that
-# provider as JSON-encoded untrusted data. Any failed or invalid response keeps
-# the normal ranking. Concurrent provider calls are capped at four; saturated
-# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER=llm`.
+# Optional final relevance pass for project/scopes memory_query calls.
+# The "llm" value requires a generative provider. Both backends add at most one
+# provider call per eligible query and send the bounded query, page titles,
+# and snippets as JSON-encoded untrusted data. Failed or invalid responses
+# keep the normal ranking. Concurrent calls are capped at four; saturated
+# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER`.
 # reranker = "llm"
+# The other value, "decisions-choice", uses OpenAI Decisions directly and needs
+# OPENAI_API_KEY plus an explicit llm_model, but no generative provider.
+# Choice probabilities are relative to the pool; leave min_relevance unset.
+#   reranker = "decisions-choice"
 
 # Seconds one reranker call may take before memory_query keeps its pre-rerank
 # order. Raise it when an LLM fallback chain answers slowly. Must be at least 1.
