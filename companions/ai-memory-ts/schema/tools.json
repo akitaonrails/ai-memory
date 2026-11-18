@@ -613,6 +613,12 @@
           "string"
         ]
       },
+      "scope": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "workspace": {
         "type": [
           "null",

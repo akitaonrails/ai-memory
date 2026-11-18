@@ -262,6 +262,8 @@ export type PagePatchEdit =
 
 /** Arguments of {@link PagesNamespace.patch}. */
 export interface PatchPageArgs extends ScopedArgs {
+  /** Patch a page in the reserved cross-project global scope. Cannot be combined with `scope`. */
+  global?: boolean;
   /** Existing page path. */
   path: string;
   /** Required latest page version returned by a read or mutation. */
