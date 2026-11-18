@@ -1387,7 +1387,8 @@ async fn handle_hook_batch(
             accepted_indices.push(idx);
             continue;
         }
-        // So is a Code Mode result spooled while the server was away (#2366).
+        // So is a Code Mode result (#2366). The native hook spools every
+        // prompt and delivers it through this route, not the single one.
         if is_code_mode_poll_event(&env) {
             HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
             results.push(HookBatchResult {
