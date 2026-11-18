@@ -1061,6 +1061,13 @@ async fn admit_hook(
             "harness self-maintenance session dropped",
         );
     }
+    // A Code Mode result is not a prompt the person typed (#2366). Dropped
+    // here, ahead of the semaphore and the rate limiter, because a Code Mode
+    // session sends one for every piece of code it runs.
+    if is_code_mode_poll_event(&env) {
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+        return (StatusCode::ACCEPTED, "code mode poll event dropped");
+    }
     // Capture request extensions before the spawned processor owns the event.
     let actor = actor_identity(actor_ext);
     let actor_storage_key = actor.as_ref().map(IdentityKey::storage_key);
@@ -1372,6 +1379,16 @@ async fn handle_hook_batch(
         // A harness's own background run is accepted and stored nowhere, the
         // same contract as the subagent drop above (#1674).
         if is_harness_self_maintenance(&env) {
+            HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+            results.push(HookBatchResult {
+                index: idx,
+                outcome: HookProcessingOutcome::DroppedPolicy,
+            });
+            accepted_indices.push(idx);
+            continue;
+        }
+        // So is a Code Mode result spooled while the server was away (#2366).
+        if is_code_mode_poll_event(&env) {
             HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
             results.push(HookBatchResult {
                 index: idx,
@@ -1812,6 +1829,22 @@ fn is_harness_self_maintenance(env: &HookEnvelope) -> bool {
     }
     user_prompt_text(&env.raw)
         .is_some_and(|prompt| ai_memory_core::looks_like_codex_memory_agent_prompt(&prompt))
+}
+
+/// Whether the event is a Claude Code Code Mode result rather than a prompt
+/// (#2366).
+///
+/// When code can run in the background, as in auto mode, Claude Code hands every
+/// result of its `REPL` tool back to the model as a `UserPromptSubmit` with
+/// `source: "poll_event"`, the text an `<event kind="repl-eval" …>` envelope.
+/// Stored, it became the session's latest "request": the handoff told the next
+/// session to continue from a code result. Nobody typed it, and the calls the
+/// code made arrive as their own tool events, so it is accepted (202) and
+/// stored nowhere. A typed prompt carries no `source`.
+fn is_code_mode_poll_event(env: &HookEnvelope) -> bool {
+    env.agent == AgentKind::ClaudeCode
+        && env.event == HookEvent::UserPrompt
+        && env.raw.get("source").and_then(serde_json::Value::as_str) == Some("poll_event")
 }
 
 /// Decide whether to accept-but-drop this event under `drop_subagent_captures`,
@@ -5330,6 +5363,11 @@ async fn process_authorized(
     // answers 202 and this gate keeps the drop true for every other caller
     // (#1674). Before scope resolution, so no project is created for it.
     if is_harness_self_maintenance(&env) {
+        HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
+        return Ok(HookProcessingOutcome::DroppedPolicy);
+    }
+    // Likewise a Code Mode result: no caller stores it as a prompt (#2366).
+    if is_code_mode_poll_event(&env) {
         HookProcessingOutcome::DroppedPolicy.record(&state.ingest_metrics);
         return Ok(HookProcessingOutcome::DroppedPolicy);
     }
