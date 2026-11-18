@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use ai_memory_core::{Observation, ObservationKind};
+use ai_memory_core::{Observation, ObservationId, ObservationKind};
 use ai_memory_store::{SessionObservationSnapshot, StoreError, StoreResult};
 
 use crate::{
@@ -88,6 +88,12 @@ pub struct ProjectedObservations {
     pub truncated_bodies: usize,
     /// Selected observation indices in chronological order.
     pub selected_indices: Vec<usize>,
+    /// The observations whose text is in [`Self::text`], in rendered order:
+    /// every rendered block and every verbatim-residue group that survived
+    /// the budget. A page compiled from this projection was compiled from
+    /// exactly these (`page_sources`, #2164). An observation the selection,
+    /// the character budget or the final clip left out is not listed.
+    pub source_ids: Vec<ObservationId>,
     /// Non-fatal budget and truncation notes.
     pub warnings: Vec<String>,
 }
@@ -127,6 +133,7 @@ impl ProjectionEarlyReturn {
                 omitted_count: 0,
                 truncated_bodies: 0,
                 selected_indices: Vec::new(),
+                source_ids: Vec::new(),
                 warnings: Vec::new(),
             }),
             Self::NoBudget(projected) => Some(projected),
@@ -156,6 +163,7 @@ fn projection_early_return(
             omitted_count: total,
             truncated_bodies: 0,
             selected_indices: Vec::new(),
+            source_ids: Vec::new(),
             warnings: vec![format!(
                 "{} observation projection omitted by input budget",
                 context_label(cfg)
@@ -321,8 +329,18 @@ fn project_from_rows<'a>(
     let omitted_count = total.saturating_sub(selected.len());
     let mut text = rendered.text;
     let mut warnings = Vec::new();
+    // Where each source's text starts, in characters, so the final clip
+    // below can drop the sources it cuts off entirely.
+    let mut source_starts: Vec<(ObservationId, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    for &(observation_id, chars) in &rendered.blocks {
+        source_starts.push((observation_id, cursor));
+        cursor = cursor.saturating_add(chars);
+    }
     if omitted_count > 0 {
-        text.push_str(&omission_marker(total, selected.len(), cfg));
+        let marker = omission_marker(total, selected.len(), cfg);
+        cursor = cursor.saturating_add(marker.chars().count());
+        text.push_str(&marker);
         warnings.push(format!(
             "{} observation input sampled {} of {} observations",
             context_label(cfg),
@@ -353,8 +371,14 @@ fn project_from_rows<'a>(
             observation_blocks_pruned = residue_pruned_blocks,
             "verbatim observation residue added to consolidation prompt"
         );
+        cursor = cursor.saturating_add(RESIDUE_HEADER.chars().count());
+        for group in &residue.groups {
+            source_starts.push((group.observation_id, cursor));
+            cursor = cursor.saturating_add(group.text.chars().count());
+        }
         text.push_str(&residue.render());
     }
+    let mut kept_chars = usize::MAX;
     if text.chars().count() > cfg.max_total_chars {
         warnings.push(format!(
             "{} projection exceeded max_total_chars after mandatory markers/anchors ({} > {})",
@@ -362,11 +386,16 @@ fn project_from_rows<'a>(
             text.chars().count(),
             cfg.max_total_chars
         ));
-        text = fit_text_to_budget(
-            &text,
-            cfg.max_total_chars,
-            "[projection text truncated to budget; full originals remain in SQLite by observation id]",
-        );
+        const CLIP_MARKER: &str = "[projection text truncated to budget; full originals remain in SQLite by observation id]";
+        kept_chars = budget_keep_chars(cfg.max_total_chars, CLIP_MARKER);
+        text = fit_text_to_budget(&text, cfg.max_total_chars, CLIP_MARKER);
+    }
+    let mut source_ids: Vec<ObservationId> = Vec::with_capacity(source_starts.len());
+    for (observation_id, start) in source_starts {
+        // An observation can hold both a truncated block and a residue group.
+        if start < kept_chars && !source_ids.contains(&observation_id) {
+            source_ids.push(observation_id);
+        }
     }
 
     ProjectedObservations {
@@ -376,6 +405,7 @@ fn project_from_rows<'a>(
         omitted_count,
         truncated_bodies: rendered.truncated_bodies,
         selected_indices,
+        source_ids,
         warnings,
     }
 }
@@ -733,6 +763,7 @@ fn omission_marker(total: usize, selected: usize, cfg: &ObservationProjectionCon
 }
 
 struct ResidueGroup {
+    observation_id: ObservationId,
     text: String,
     tokens: usize,
 }
@@ -1065,6 +1096,7 @@ fn residue_group(
         rendered.push('\n');
     }
     Some(ResidueGroup {
+        observation_id: observation.id,
         text: rendered,
         tokens: accepted.len(),
     })
@@ -1104,6 +1136,8 @@ fn context_label(cfg: &ObservationProjectionConfig) -> &str {
 struct RenderedProjection {
     text: String,
     truncated_bodies: usize,
+    /// Each rendered block's observation and character length, in order.
+    blocks: Vec<(ObservationId, usize)>,
 }
 
 fn render_projection_rows<'a>(
@@ -1114,6 +1148,7 @@ fn render_projection_rows<'a>(
 ) -> RenderedProjection {
     let mut text = String::new();
     let mut truncated_bodies = 0usize;
+    let mut blocks = Vec::with_capacity(selected.len());
     for idx in selected {
         let Some(obs) = row_at(*idx) else {
             continue;
@@ -1122,11 +1157,13 @@ fn render_projection_rows<'a>(
         if block.truncated {
             truncated_bodies += 1;
         }
+        blocks.push((obs.id, block.text.chars().count()));
         text.push_str(&block.text);
     }
     RenderedProjection {
         text,
         truncated_bodies,
+        blocks,
     }
 }
 
@@ -1191,15 +1228,21 @@ fn fit_text_to_budget(text: &str, max_chars: usize, marker: &str) -> String {
     if max_chars == 0 {
         return String::new();
     }
+    let keep = budget_keep_chars(max_chars, marker);
     let marker = format!("\n{marker}");
-    let marker_len = marker.chars().count();
-    if marker_len >= max_chars {
+    if keep == 0 {
         return marker.chars().take(max_chars).collect();
     }
-    let keep = max_chars.saturating_sub(marker_len);
     let mut out: String = text.chars().take(keep).collect();
     out.push_str(&marker);
     out
+}
+
+/// How many leading characters of an over-budget text [`fit_text_to_budget`]
+/// keeps ahead of its marker: none when the marker alone fills the budget.
+fn budget_keep_chars(max_chars: usize, marker: &str) -> usize {
+    // The marker is written on its own line, hence the extra character.
+    max_chars.saturating_sub(marker.chars().count().saturating_add(1))
 }
 
 /// The shared selection key both paths rank rows by: the base score plus
@@ -1983,5 +2026,154 @@ mod tests {
             assert!(group.chars().count() + 2 <= MAX_RESIDUE_GROUP_CHARS);
         }
         assert!(projected.text.ends_with('\n'));
+    }
+
+    /// The observations whose text is in a projection, read back from the
+    /// text itself: a rendered block prints the full id, a residue group the
+    /// id's last twelve characters.
+    fn ids_in_text(observations: &[Observation], text: &str) -> Vec<ObservationId> {
+        observations
+            .iter()
+            .filter(|obs| {
+                let id = obs.id.to_string();
+                text.contains(&format!("\nid: {id}\n"))
+                    || text.contains(&format!(" \u{2026}{}\n", &id[id.len() - 12..]))
+            })
+            .map(|obs| obs.id)
+            .collect()
+    }
+
+    fn sorted_ids(mut ids: Vec<ObservationId>) -> Vec<String> {
+        ids.sort_by_key(ToString::to_string);
+        ids.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn source_ids_name_every_observation_of_a_session_that_fits() {
+        let observations = vec![
+            obs(0, ObservationKind::SessionStart, "start", "cwd", 1),
+            obs(1, ObservationKind::UserPrompt, "prompt", "do the thing", 5),
+            obs(2, ObservationKind::SessionEnd, "end", "done", 1),
+        ];
+        let projected = project_observations(
+            &observations,
+            &ObservationProjectionConfig::new(10_000, 10, 3_000),
+        );
+        assert_eq!(
+            projected.source_ids,
+            observations.iter().map(|o| o.id).collect::<Vec<_>>(),
+            "rendered order"
+        );
+    }
+
+    #[test]
+    fn source_ids_leave_out_what_the_selection_and_the_budget_omitted() {
+        let observations: Vec<_> = (0..80)
+            .map(|idx| obs(idx, ObservationKind::PostToolUse, "routine", "boring", 3))
+            .collect();
+        // The selection cap omits most rows; the character budget then prunes
+        // more of the selected blocks.
+        for cfg in [
+            ObservationProjectionConfig::new(100_000, 12, 3_000),
+            ObservationProjectionConfig::new(900, 12, 3_000),
+        ] {
+            let projected = project_observations(&observations, &cfg);
+            assert!(projected.omitted_count > 0);
+            assert_eq!(projected.source_ids.len(), projected.selected_count);
+            assert!(projected.source_ids.len() < observations.len());
+            assert_eq!(
+                sorted_ids(projected.source_ids.clone()),
+                sorted_ids(ids_in_text(&observations, &projected.text)),
+                "sources are exactly the observations in the prompt text"
+            );
+        }
+    }
+
+    #[test]
+    fn source_ids_include_an_omitted_observation_the_residue_quotes() {
+        let observations = vec![
+            obs(0, ObservationKind::SessionStart, "start", "cwd", 1),
+            obs(
+                1,
+                ObservationKind::PostToolUse,
+                "tool",
+                "tool_family: shell\n---\nsrc/only-in-omitted.rs",
+                1,
+            ),
+            obs(2, ObservationKind::PostToolUse, "routine", "nothing", 1),
+            obs(3, ObservationKind::SessionEnd, "end", "done", 1),
+        ];
+        let base = ObservationProjectionConfig::new(10_000, 2, 3_000);
+        let off = project_observations(&observations, &base);
+        let on = project_observations(&observations, &base.clone().with_verbatim_residue(true));
+
+        // Without residue only the two anchors reach the prompt.
+        assert_eq!(off.source_ids, vec![observations[0].id, observations[3].id]);
+        // With it, the omitted tool result's path is in the prompt, so the
+        // page was compiled from that observation too. The row that
+        // contributed no token stays out.
+        assert!(on.text.contains("  src/only-in-omitted.rs\n"));
+        assert_eq!(
+            on.source_ids,
+            vec![observations[0].id, observations[3].id, observations[1].id]
+        );
+        assert_eq!(
+            sorted_ids(on.source_ids.clone()),
+            sorted_ids(ids_in_text(&observations, &on.text))
+        );
+    }
+
+    #[test]
+    fn source_ids_drop_what_the_final_clip_cut_off() {
+        // The marker alone fills the budget: nothing of the observation is
+        // in the prompt, so it is not a source.
+        let lone = vec![obs(
+            0,
+            ObservationKind::UserPrompt,
+            "prompt",
+            &"x".repeat(1_000),
+            5,
+        )];
+        let projected = project_observations(&lone, &ObservationProjectionConfig::new(80, 10, 500));
+        assert!(projected.text.contains("projection text truncated"));
+        assert!(projected.source_ids.is_empty());
+
+        // Two anchors that cannot be pruned overflow the budget; the clip
+        // keeps the first block's start and cuts the second off entirely.
+        let pair = vec![
+            obs(
+                0,
+                ObservationKind::UserPrompt,
+                "first",
+                &"x".repeat(1_000),
+                5,
+            ),
+            obs(
+                1,
+                ObservationKind::UserPrompt,
+                "second",
+                &"y".repeat(1_000),
+                5,
+            ),
+        ];
+        let projected =
+            project_observations(&pair, &ObservationProjectionConfig::new(700, 10, 500));
+        assert!(projected.text.contains("projection text truncated"));
+        assert_eq!(projected.selected_count, 2);
+        assert!(!projected.text.contains(&pair[1].id.to_string()));
+        assert_eq!(projected.source_ids, vec![pair[0].id]);
+    }
+
+    #[test]
+    fn source_ids_are_empty_without_rows_or_budget() {
+        let cfg = ObservationProjectionConfig::new(10_000, 10, 3_000);
+        assert!(project_observations(&[], &cfg).source_ids.is_empty());
+        let observations = vec![obs(0, ObservationKind::UserPrompt, "prompt", "text", 5)];
+        let no_budget = project_observations(
+            &observations,
+            &ObservationProjectionConfig::new(0, 10, 3_000),
+        );
+        assert!(no_budget.text.contains("no projection budget"));
+        assert!(no_budget.source_ids.is_empty());
     }
 }

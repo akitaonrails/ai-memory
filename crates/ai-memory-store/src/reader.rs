@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ai_memory_core::{
     AgentKind, AgentMessage, AutoImproveProposalId, AutoImproveRunId, FAILED_TOOL_OUTCOME_LINE,
     Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin, HandoffScope,
-    HandoffState, IdentityKey, ManagedRunId, MessageBox, Observation, ObservationId,
+    HandoffState, IdentityKey, ManagedRunId, MessageBox, MessageId, Observation, ObservationId,
     ObservationKind, OwnerFilter, PageId, PagePath, ProjectId, SessionId,
     TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, User, UserId, WorkspaceId, WorkstreamEvent,
     WorkstreamId,
@@ -1586,6 +1586,9 @@ pub struct SessionActivity {
 pub struct SessionSummary {
     /// Session id.
     pub session_id: SessionId,
+    /// Harness label in the session's own scope, for the dashboard.
+    #[serde(skip)]
+    pub display_name: Option<String>,
     /// Captured session cwd, if available.
     pub cwd: Option<String>,
     /// `AgentKind` as stored (`claude-code`, `cursor`, ...).
@@ -2379,6 +2382,89 @@ pub struct BriefingSnapshot {
     /// shape byte-for-byte.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned: Vec<BriefingPage>,
+    /// The project's latest lint report, from `_lint/report.md` (#2021).
+    /// Project-scoped briefings only; omitted when the project has no report
+    /// or the report predates the counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lint: Option<LintSummary>,
+}
+
+/// Counts from a project's `_lint/report.md`, written by every lint run
+/// (scheduled or manual) into the report's frontmatter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LintSummary {
+    /// Always `_lint/report.md`; read it for the findings themselves.
+    pub report_path: String,
+    /// ISO-8601 time the report was written.
+    pub updated_at: String,
+    /// Findings of `warning` severity.
+    pub warnings: u64,
+    /// All findings, `info` included.
+    pub findings: u64,
+    /// The first few distinct pages the warnings name.
+    pub warning_pages: Vec<String>,
+}
+
+/// Path of the per-project lint report; matches `ai-memory-consolidate`'s
+/// `REPORT_PATH`.
+const LINT_REPORT_PATH: &str = "_lint/report.md";
+/// Upper bound on `LintSummary::warning_pages`, whatever the frontmatter
+/// holds: the report is an ordinary page and can be edited by hand.
+const LINT_WARNING_PAGES_MAX: usize = 5;
+
+/// The project's lint summary, or `None` when no current report carries the
+/// counts.
+fn lint_summary_in(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    now_us: i64,
+) -> StoreResult<Option<LintSummary>> {
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            &format!(
+                "SELECT frontmatter_json, updated_at FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 \
+                 AND is_latest = 1{not_expired}",
+                not_expired = not_expired("pages", "?4"),
+            ),
+            params![
+                workspace_id.as_bytes(),
+                project_id.as_bytes(),
+                LINT_REPORT_PATH,
+                now_us
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((frontmatter, updated_at)) = row else {
+        return Ok(None);
+    };
+    let Ok(frontmatter) = serde_json::from_str::<serde_json::Value>(&frontmatter) else {
+        return Ok(None);
+    };
+    let count = |key: &str| frontmatter.get(key).and_then(serde_json::Value::as_u64);
+    let (Some(warnings), Some(findings)) = (count("warnings"), count("findings")) else {
+        return Ok(None);
+    };
+    let warning_pages = frontmatter
+        .get("warning_pages")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .take(LINT_WARNING_PAGES_MAX)
+        .map(str::to_owned)
+        .collect();
+    Ok(Some(LintSummary {
+        report_path: LINT_REPORT_PATH.to_owned(),
+        updated_at: jiff::Timestamp::from_microsecond(updated_at)
+            .map(|ts| ts.to_string())
+            .unwrap_or_default(),
+        warnings,
+        findings,
+        warning_pages,
+    }))
 }
 
 /// Trimmed page view for the briefing — path, title, kind, updated_at
@@ -6296,6 +6382,7 @@ impl ReaderPool {
                     model,
                     row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<u32>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
                 ))
             })?;
             let mut out = Vec::new();
@@ -6315,6 +6402,7 @@ impl ReaderPool {
                     model,
                     state,
                     attempts,
+                    display_name,
                 ) = row?;
                 let started_at = jiff::Timestamp::from_microsecond(started_us)
                     .map(|ts| ts.to_string())
@@ -6336,6 +6424,7 @@ impl ReaderPool {
                 });
                 out.push(SessionSummary {
                     session_id: SessionId::from_slice(&id_bytes)?,
+                    display_name,
                     cwd,
                     agent_kind,
                     started_at,
@@ -9561,6 +9650,27 @@ impl ReaderPool {
         mailbox: MessageBox,
         limit: usize,
     ) -> StoreResult<Vec<AgentMessage>> {
+        self.list_messages_after(workspace_id, project_id, mailbox, limit, None)
+            .await
+    }
+
+    /// Page pending messages after `after` (exclusive), ordered by
+    /// `(created_at, id)`. `None` starts at the oldest pending message. The
+    /// cursor keeps its place once its own message is popped, cancelled or
+    /// taken for editing, because the list hands out exactly the ids those
+    /// calls consume. A cursor that names no message in this mailbox yields an
+    /// empty page, so a foreign id cannot read another project's mail.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn list_messages_after(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        mailbox: MessageBox,
+        limit: usize,
+        after: Option<MessageId>,
+    ) -> StoreResult<Vec<AgentMessage>> {
         let limit = limit.clamp(1, 200);
         self.with_conn(move |conn| {
             // Scope by the coordinate that owns this side of the mailbox: a
@@ -9569,20 +9679,46 @@ impl ReaderPool {
                 MessageBox::Inbox => "to_workspace_id = ?1 AND to_project_id = ?2",
                 MessageBox::Outbox => "from_workspace_id = ?1 AND from_project_id = ?2",
             };
-            let sql = format!(
-                "SELECT {cols} FROM agent_messages \
-                 WHERE {predicate} AND state = 'pending' \
-                 ORDER BY created_at ASC LIMIT {limit}",
-                cols = crate::ops::MESSAGE_COLUMNS,
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes()],
-                crate::ops::row_to_agent_message,
-            )?;
             let mut out = Vec::new();
-            for row in rows {
-                out.push(row??);
+            match after {
+                Some(after) => {
+                    let sql = format!(
+                        "SELECT {cols} FROM agent_messages \
+                         WHERE {predicate} AND state = 'pending' \
+                           AND (created_at, id) > (SELECT created_at, id FROM agent_messages \
+                               WHERE id = ?3 AND {predicate}) \
+                         ORDER BY created_at ASC, id ASC LIMIT {limit}",
+                        cols = crate::ops::MESSAGE_COLUMNS,
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt.query_map(
+                        params![
+                            workspace_id.as_bytes(),
+                            project_id.as_bytes(),
+                            &after.as_bytes()[..]
+                        ],
+                        crate::ops::row_to_agent_message,
+                    )?;
+                    for row in rows {
+                        out.push(row??);
+                    }
+                }
+                None => {
+                    let sql = format!(
+                        "SELECT {cols} FROM agent_messages \
+                         WHERE {predicate} AND state = 'pending' \
+                         ORDER BY created_at ASC, id ASC LIMIT {limit}",
+                        cols = crate::ops::MESSAGE_COLUMNS,
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows = stmt.query_map(
+                        params![workspace_id.as_bytes(), project_id.as_bytes()],
+                        crate::ops::row_to_agent_message,
+                    )?;
+                    for row in rows {
+                        out.push(row??);
+                    }
+                }
             }
             Ok(out)
         })
@@ -9680,6 +9816,27 @@ impl ReaderPool {
                 });
             }
             Ok(out)
+        })
+        .await
+    }
+
+    /// The project's lint summary (#2021): counts from the frontmatter of
+    /// its current `_lint/report.md`, or `None` when there is none.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn lint_summary(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<Option<LintSummary>> {
+        self.with_conn(move |conn| {
+            lint_summary_in(
+                conn,
+                workspace_id,
+                project_id,
+                jiff::Timestamp::now().as_microsecond(),
+            )
         })
         .await
     }
@@ -10031,6 +10188,7 @@ impl ReaderPool {
                 // The pinned standing-context list is a project-scoped signal;
                 // an aggregate current/workspace briefing leaves it empty.
                 pinned: Vec::new(),
+                lint: None,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -10292,6 +10450,7 @@ impl ReaderPool {
                 cross_project_dependencies,
                 settled,
                 pinned,
+                lint: lint_summary_in(conn, workspace_id, project_id, now_us)?,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -10751,6 +10910,7 @@ impl ReaderPool {
                 // The pinned standing-context list is a project-scoped signal;
                 // an aggregate current/workspace briefing leaves it empty.
                 pinned: Vec::new(),
+                lint: None,
             };
             filter_briefing_slots(&mut snapshot, &slot_visibility);
             Ok(snapshot)
@@ -14689,6 +14849,51 @@ impl ReaderPool {
         .await
     }
 
+    /// The `[retrieval]` criteria stored on a project (all-inherit when it has
+    /// none). The query path layers this over the global default and the call
+    /// argument; see [`crate::RetrievalCriteria`].
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn project_retrieval_criteria(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> StoreResult<crate::RetrievalCriteria> {
+        self.with_conn(move |conn| {
+            crate::retrieval_criteria::project_retrieval_criteria(conn, workspace_id, project_id)
+        })
+        .await
+    }
+
+    /// One page of a session's opt-in retrieval history (#2038), newest first,
+    /// strictly scoped to `(workspace_id, project_id, session_id)`. The caller
+    /// must have already passed the session-visibility (owner) gate the session
+    /// timeline uses; this read enforces only the project/session isolation.
+    ///
+    /// # Errors
+    /// Propagates SQL or pool errors.
+    pub async fn retrieval_history_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        offset: i64,
+        limit: i64,
+    ) -> StoreResult<crate::RetrievalHistoryPage> {
+        self.with_conn(move |conn| {
+            crate::retrieval_history::retrieval_history_page(
+                conn,
+                workspace_id,
+                project_id,
+                session_id,
+                offset,
+                limit,
+            )
+        })
+        .await
+    }
+
     /// Projects whose marker keeps them out of the profile.
     ///
     /// # Errors
@@ -14734,6 +14939,7 @@ impl ReaderPool {
         project_id: ProjectId,
         mark: crate::ProfileHarvestMark,
         limit: usize,
+        skip_automation: bool,
     ) -> StoreResult<(
         Vec<crate::ProfilePromptRow>,
         Vec<crate::ProfilePageRow>,
@@ -14747,6 +14953,7 @@ impl ReaderPool {
                     project_id,
                     mark.observations_until,
                     limit,
+                    skip_automation,
                 )?,
                 crate::profile::profile_pages_since(
                     conn,
@@ -15146,7 +15353,8 @@ fn sessions_for_scope_sql(
                  WHERE o.session_id = s.id \
                    AND o.workspace_id = :ws AND o.project_id = :proj) AS n, \
                 u.input_tokens, u.output_tokens, u.cache_write_tokens, u.cache_read_tokens, u.model, \
-                j.state, j.attempts \
+                j.state, j.attempts, \
+                CASE WHEN s.workspace_id = :ws AND s.project_id = :proj THEN s.display_name END \
          FROM sessions s \
          LEFT JOIN session_usage u ON u.session_id = s.id \
          LEFT JOIN session_consolidation_jobs j ON j.session_id = s.id \
@@ -18059,6 +18267,7 @@ mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(cwd.into()),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -18563,6 +18772,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -18577,6 +18787,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -18587,11 +18798,13 @@ mod tests {
         page.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: codex_session.to_string(),
+            observations: Default::default(),
         }];
         store.writer.upsert_page(page.clone()).await.unwrap();
         page.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: claude_session.to_string(),
+            observations: Default::default(),
         }];
         store.writer.upsert_page(page).await.unwrap();
 

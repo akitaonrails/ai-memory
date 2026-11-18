@@ -86,14 +86,14 @@ pub use message::{
 };
 pub use observation::{
     FAILED_TOOL_OUTCOME_LINE, FILE_PATH_MAX_CHARS, NewObservation, NewSession, NewSessionUsage,
-    Observation, ObservationKind, TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR,
-    TOOL_OUTCOME_LINE_PREFIX, TokenCall, TokenCallContext, TokenToolRef, TokenToolRelation,
-    valid_file_path_key,
+    Observation, ObservationKind, SessionDisplayName, SessionOrigin, TOOL_BODY_HEADER_MAX_CHARS,
+    TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX, TokenCall, TokenCallContext, TokenToolRef,
+    TokenToolRelation, valid_file_path_key,
 };
 pub use page::{
     FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
-    PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
-    normalize_entity, parse_expires_at_instant,
+    PageEvidenceKind, Relation, SourceObservations, Tier, frontmatter_entity_names,
+    normalize_entities, normalize_entity, parse_expires_at_instant,
 };
 pub use routing_snippet::{
     COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block,

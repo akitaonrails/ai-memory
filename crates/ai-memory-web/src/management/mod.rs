@@ -169,25 +169,14 @@ async fn secure(request: Request<Body>, next: Next) -> Response {
 }
 async fn asset(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
     let (mime, body): (&str, &[u8]) = match name.as_str() {
-        "instrument-sans-latin-wdth-normal.woff2" => (
-            "font/woff2",
-            include_bytes!("../../static/management/instrument-sans-latin-wdth-normal.woff2"),
-        ),
-        "bricolage-grotesque-latin-standard-normal.woff2" => (
-            "font/woff2",
-            include_bytes!(
-                "../../static/management/bricolage-grotesque-latin-standard-normal.woff2"
-            ),
-        ),
-        "commit-mono-latin-400-normal.woff2" => (
-            "font/woff2",
-            include_bytes!("../../static/management/commit-mono-latin-400-normal.woff2"),
-        ),
         "font-licenses.txt" => (
             "text/plain; charset=utf-8",
-            include_bytes!("../../static/management/font-licenses.txt"),
+            include_bytes!("../../static/fonts/font-licenses.txt"),
         ),
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        _ => match crate::routes::statics::font_file(&name) {
+            Some(font) => ("font/woff2", font),
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
     };
     ([(header::CONTENT_TYPE, mime)], body).into_response()
 }

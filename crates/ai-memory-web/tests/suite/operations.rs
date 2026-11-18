@@ -42,6 +42,7 @@ async fn fixture() -> (
             cwd: None,
             actor_user: None,
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -153,6 +154,7 @@ async fn operations_inbox_filters_initial_agents_by_both_project_coordinates() {
                     cwd: None,
                     actor_user: None,
                     occurred_at: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -237,6 +239,7 @@ async fn operations_browser_can_send_to_an_explicit_other_project() {
             cwd: None,
             actor_user: None,
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -297,6 +300,7 @@ async fn operations_inbox_queue_context_hides_foreign_projects_and_preserves_mai
                 cwd: None,
                 actor_user: None,
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -531,6 +535,7 @@ async fn operations_notifications_are_read_only_and_hide_restricted_projects() {
                     cwd: None,
                     actor_user: None,
                     occurred_at: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -957,6 +962,8 @@ async fn operations_browser_messages_use_the_configured_sanitizer_and_admission(
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::MessageSend],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let wiki = wiki
@@ -1064,6 +1071,7 @@ async fn operations_message_requires_write_access_to_both_project_coordinates() 
             cwd: None,
             actor_user: None,
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1152,6 +1160,7 @@ async fn operations_agent_aggregates_and_drilldowns_apply_ownership_before_total
                 cwd: None,
                 actor_user: Some(owner),
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1229,6 +1238,7 @@ async fn operations_root_drilldowns_reach_every_users_sessions_and_users_stay_ow
                 cwd: None,
                 actor_user: Some(ai_memory_core::IdentityKey::User(name.into()).storage_key()),
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();

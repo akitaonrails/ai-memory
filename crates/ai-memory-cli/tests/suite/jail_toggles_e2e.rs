@@ -863,6 +863,132 @@ async fn resume_yolo_displays_picker_without_scanning_git_status() {
     handle.abort();
 }
 
+/// `resume` returns to its own picker after a selected harness exits normally
+/// or exits in response to Ctrl+C. Esc then leaves the picker.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_returns_to_picker_after_harness_exit_or_ctrl_c() {
+    use std::io::Write as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    for interrupt in [false, true] {
+        let fixture = Fixture::new(HELP_2_4_1, true, None);
+        let mut harness = fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.bin.join("claude"))
+            .unwrap();
+        if interrupt {
+            writeln!(
+                harness,
+                "trap 'exit 130' INT\nprintf 'HARNESS_READY\\n'\nwhile :; do /bin/sleep 1; done"
+            )
+            .unwrap();
+        } else {
+            writeln!(harness, "printf 'HARNESS_READY\\n'").unwrap();
+        }
+        drop(harness);
+        let (server, requests, handle) = mock_server().await;
+        let runner = fixture.home.join("resume-runner.sh");
+        fs::write(&runner, "exec \"$JAIL_E2E_BINARY\" resume\n").unwrap();
+        let configured = command(&fixture, &server, &[]);
+        let mut terminal = std::process::Command::new("/usr/bin/script");
+        terminal.env_clear();
+        #[cfg(target_os = "macos")]
+        terminal.args(["-q", "/dev/null", "/bin/sh"]).arg(&runner);
+        #[cfg(target_os = "linux")]
+        terminal
+            .args(["-qec", "exec /bin/sh \"$JAIL_E2E_RUNNER\"", "/dev/null"])
+            .env("JAIL_E2E_RUNNER", &runner);
+        for (key, value) in configured.as_std().get_envs() {
+            if let Some(value) = value {
+                terminal.env(key, value);
+            }
+        }
+        for key in ["TERM", "USER", "LOGNAME"] {
+            if let Some(value) = std::env::var_os(key) {
+                terminal.env(key, value);
+            }
+        }
+        terminal
+            .env("HOME", &fixture.home)
+            .env("JAIL_E2E_BINARY", BIN)
+            .env("AI_MEMORY_RUN_AUTOWIRE", "false")
+            .current_dir(&fixture.repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = tokio::process::Command::from(terminal)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut output = Vec::new();
+        async fn wait_for(
+            stdout: &mut tokio::process::ChildStdout,
+            output: &mut Vec<u8>,
+            marker: &str,
+        ) {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let mut buf = [0; 4096];
+                while !String::from_utf8_lossy(output).contains(marker) {
+                    let n = stdout.read(&mut buf).await.unwrap();
+                    assert!(
+                        n > 0,
+                        "terminal closed before {marker}: {}",
+                        String::from_utf8_lossy(output)
+                    );
+                    output.extend_from_slice(&buf[..n]);
+                }
+            })
+            .await
+            .expect("terminal marker");
+        }
+        wait_for(&mut stdout, &mut output, "Resume workstream").await;
+        stdin.write_all(b"\x1b[C\r").await.unwrap();
+        stdin.flush().await.unwrap();
+        wait_for(&mut stdout, &mut output, "HARNESS_READY").await;
+        let marker = b"HARNESS_READY";
+        let end = output
+            .windows(marker.len())
+            .position(|part| part == marker)
+            .unwrap()
+            + marker.len();
+        output.drain(..end);
+        if interrupt {
+            stdin.write_all(b"\x03").await.unwrap();
+            stdin.flush().await.unwrap();
+        }
+        wait_for(&mut stdout, &mut output, "Resume workstream").await;
+        stdin.write_all(b"\x1b").await.unwrap();
+        stdin.flush().await.unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            status.success(),
+            "{status:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        let paths = requests.lock().unwrap();
+        assert!(
+            paths.iter().any(|path| path.ends_with("/finish")),
+            "{paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .filter(|path| *path == "/workstream/recent")
+                .count()
+                >= 2,
+            "{paths:?}"
+        );
+        drop(paths);
+        handle.abort();
+    }
+}
+
 /// Run `ai-memory <args>` under `script` so stdin and stderr are a real
 /// terminal, feed `input`, and return everything the terminal showed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]

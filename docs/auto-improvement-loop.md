@@ -281,6 +281,36 @@ the exact digest and provenance limits.
 Do not create new session pages from the auto-improvement loop. Session pages
 already come from session-end consolidation.
 
+## User Corrections
+
+A user who rejects, corrects, interrupts or undoes the agent's work and says
+why has shown exactly the mistake the next agent is likely to repeat. The
+reviewer turns that into a page. A standing preference or prohibition goes to
+`_rules/`, as a patch when a `_rules/` page on the topic already exists. An
+approach that failed for a technical reason goes to `gotchas/`. Either way the
+page says what to avoid, the user's reason and what to do instead, and its
+evidence quotes the user verbatim.
+
+The reviewer is told to recognize a correction by what it means, not by a
+keyword list, so the language the user writes in does not matter. Only the
+user's own words count, and those come from `user-prompt` observations. Agent
+text, tool output, file contents and commit messages never count, even when
+they claim to quote the user, and the agent correcting itself does not count
+either. A refusal with no reason is skipped, and so is a one-off choice such
+as a single rename.
+
+Limits:
+
+- Zero-LLM installs never run the reviewer, so no correction is learned there.
+- With the default `require_approval = false`, a misread correction that
+  passes validation (`min_confidence` and the optional eval gate) is written
+  straight to `_rules/`, and a project that turns on the on-start brief loads
+  it into every new session until someone reverts it. Shared servers should
+  keep `require_approval = true`.
+- An auto-approved page does not feed the cross-project profile; a
+  human-approved one does, in any language. The profile's own reading of
+  prompts still pre-filters sentences with English and Portuguese markers.
+
 ## Negative Filters
 
 The review prompt should explicitly reject these as durable learning:
@@ -293,6 +323,7 @@ The review prompt should explicitly reject these as durable learning:
 | Transient missing binaries, credentials, or setup state | These become stale false constraints. |
 | Broad negative tool claims | `tool X is broken` hardens into future refusals after the tool is fixed. |
 | One-off task narratives | Session pages already preserve chronology. |
+| Corrections with no reason that generalizes | A bare "no" or a single rename is task detail, not a rule. |
 | Resolved transient failures | Capture the retry or fix pattern, not the temporary failure. |
 | User-visible status only | Use handoff or `_slots/current-focus.md`, not durable semantic pages. |
 
@@ -426,6 +457,29 @@ matching every page.
 Note that `max_patchable_pages` still bounds how many of the matching pages are
 sent, and the recent-page list they are drawn from is ordered by recency, so a
 durable page that has not been updated recently can fall outside it.
+
+### Standing rules in the `_global` scope
+
+A rule written once in the reserved `_global` scope already applies to every
+project, but the reviewer reads only the reviewed project, so it can propose the
+same rule again as a project page. Set `include_global_titles = true` to list the
+`_global` scope's pages to the reviewer as well, one line each (path, title,
+kind, updated_at), with no body:
+
+```toml
+[auto_improve]
+include_global_titles = true
+```
+
+Validation then rejects a full-page proposal whose path or title matches a
+`_global` page, with the reason `duplicate_global_path` or
+`duplicate_global_title`. Those rejections feed the rejection context of later
+reviews like any other. The list is read-only: a `_global` page is never a patch
+target, and a review of the `_global` scope itself adds nothing, because its
+pages are already its own. Only `_global` is read. Every reader's default reads
+already include it, so no other project's pages reach the reviewer. The option
+is off by default, and with it off the prompt is unchanged. The per-session
+reviewer and the cross-session experience pass both follow it.
 
 
 `[auto_improve.scheduler]` controls whether and how often the server launches
@@ -575,7 +629,9 @@ can notice already exists, and therefore what it may redundantly re-propose:
   not sent to the reviewer in full unless their folder is added. Patch
   proposals stay limited to `_rules/` and `procedures/` either way.
 - **The "recent pages" list is recency-ordered, one line per page** (path,
-  title, kind, updated_at), drawn from the project briefing. Because it is a flat
+  title, kind, updated_at), drawn from the project briefing. With
+  `include_global_titles` on, a second list of the same shape carries up to 100
+  pages from the reserved `_global` scope. Because it is a flat
   bounded list, a project with many pages only shows the reviewer the most
   recently updated ones. To keep those slots for durable knowledge, the
   auto-improve reviewer excludes `sessions/` pages from *its* recent-page context

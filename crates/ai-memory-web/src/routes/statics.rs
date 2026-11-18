@@ -13,23 +13,45 @@ static TAILWIND_CSS: &str = include_str!(env!("AI_MEMORY_WEB_TAILWIND_CSS"));
 /// Logo (PNG), embedded at compile time from `docs/logo.png`.
 static LOGO: &[u8] = include_bytes!("../../../../docs/logo.png");
 
-/// Self-hosted fonts shared with the management surface.
+/// The Memory Archive faces (Latin subsets of `@fontsource` 5.3.0, OFL; see
+/// `static/fonts/font-licenses.txt`), by the file name the stylesheet's
+/// `@font-face` rules request. One table for `/web` and the management
+/// console; nothing outside it is served.
+pub(crate) fn font_file(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        "ibm-plex-sans-latin-400-normal.woff2" => {
+            include_bytes!("../../static/fonts/ibm-plex-sans-latin-400-normal.woff2")
+        }
+        "ibm-plex-sans-latin-500-normal.woff2" => {
+            include_bytes!("../../static/fonts/ibm-plex-sans-latin-500-normal.woff2")
+        }
+        "ibm-plex-sans-latin-600-normal.woff2" => {
+            include_bytes!("../../static/fonts/ibm-plex-sans-latin-600-normal.woff2")
+        }
+        "chakra-petch-latin-500-normal.woff2" => {
+            include_bytes!("../../static/fonts/chakra-petch-latin-500-normal.woff2")
+        }
+        "chakra-petch-latin-600-normal.woff2" => {
+            include_bytes!("../../static/fonts/chakra-petch-latin-600-normal.woff2")
+        }
+        "jetbrains-mono-latin-400-normal.woff2" => {
+            include_bytes!("../../static/fonts/jetbrains-mono-latin-400-normal.woff2")
+        }
+        "jetbrains-mono-latin-500-normal.woff2" => {
+            include_bytes!("../../static/fonts/jetbrains-mono-latin-500-normal.woff2")
+        }
+        _ => return None,
+    })
+}
+
+/// `GET /static/{font}`: self-hosted fonts shared with the management surface.
 pub(crate) async fn font(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    let bytes: &[u8] = match name.as_str() {
-        "instrument-sans-latin-wdth-normal.woff2" => {
-            include_bytes!("../../static/management/instrument-sans-latin-wdth-normal.woff2")
-        }
-        "bricolage-grotesque-latin-standard-normal.woff2" => include_bytes!(
-            "../../static/management/bricolage-grotesque-latin-standard-normal.woff2"
-        ),
-        "commit-mono-latin-400-normal.woff2" => {
-            include_bytes!("../../static/management/commit-mono-latin-400-normal.woff2")
-        }
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    ([(header::CONTENT_TYPE, "font/woff2")], bytes).into_response()
+    match font_file(&name) {
+        Some(bytes) => ([(header::CONTENT_TYPE, "font/woff2")], bytes).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// `GET /static/tailwind.css`
@@ -60,21 +82,23 @@ fn png_response(bytes: &'static [u8]) -> (StatusCode, HeaderMap, &'static [u8]) 
 
 #[cfg(test)]
 mod tests {
-    /// #2003: the three shipped faces are Latin subsets, so the Unicode
-    /// characters the templates use as icons fall through every text stack.
-    /// Each stack has to reach a symbol face, after `system-ui` so Latin text
-    /// keeps the platform font it had.
+    /// #2003: the shipped faces are Latin subsets, so the Unicode characters
+    /// the templates still show (arrows, separators) fall through every text
+    /// stack. Each stack has to reach a symbol face, after `system-ui` so
+    /// Latin text keeps the platform font it had. Rules read the stacks
+    /// through `--ma-font-sans` and `--ma-font-display`.
     #[test]
     fn text_font_stacks_reach_a_symbol_face_after_system_ui() {
-        let stacks: Vec<&str> = super::TAILWIND_CSS
-            .split("font-family:")
-            .skip(1)
-            .filter_map(|rest| rest.split([';', '}']).next())
-            .filter(|stack| {
-                stack.starts_with("Management Sans,") || stack.starts_with("Management Display,")
+        let stacks: Vec<&str> = ["--ma-font-sans:", "--ma-font-display:"]
+            .iter()
+            .filter_map(|property| {
+                super::TAILWIND_CSS
+                    .split(property)
+                    .nth(1)
+                    .and_then(|rest| rest.split([';', '}']).next())
             })
             .collect();
-        assert!(!stacks.is_empty(), "no text font stack in the stylesheet");
+        assert_eq!(stacks.len(), 2, "a text font stack is missing");
         for stack in stacks {
             let system_ui = stack.find("system-ui").unwrap_or_else(|| panic!("{stack}"));
             for face in [
@@ -89,5 +113,24 @@ mod tests {
                 assert!(system_ui < at, "{face} precedes system-ui in {stack}");
             }
         }
+    }
+
+    /// Each `@font-face` the stylesheet declares resolves to an embedded
+    /// file, so renaming a face in one place without the other fails here
+    /// rather than as a silent fallback font in the browser.
+    #[test]
+    fn every_stylesheet_font_is_embedded() {
+        let names: Vec<&str> = super::TAILWIND_CSS
+            .split("url(")
+            .skip(1)
+            .filter_map(|rest| rest.split(')').next())
+            .map(|url| url.trim_matches(['"', '\'']))
+            .filter(|url| url.ends_with(".woff2"))
+            .collect();
+        assert_eq!(names.len(), 7, "{names:?}");
+        for name in names {
+            assert!(super::font_file(name).is_some(), "{name} is not embedded");
+        }
+        assert!(super::font_file("../config.toml").is_none());
     }
 }

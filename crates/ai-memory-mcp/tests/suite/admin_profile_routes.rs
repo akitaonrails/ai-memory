@@ -60,6 +60,7 @@ async fn prompt(fx: &Fixture, project: &str, body: &str) -> ProjectId {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

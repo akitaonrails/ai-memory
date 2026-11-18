@@ -21,7 +21,7 @@ use crate::localization::diagnostic;
 use ai_memory_core::routing_skills::{
     AGENTS_SKILL_DIR, CLAUDE_SKILL_DIR, COPILOT_SKILL_DIR, DEVIN_SKILL_DIR, GITHUB_SKILL_DIR,
     GROK_HANDOFF_RULE_FILENAME, GROK_HANDOFF_RULE_MARKER, GROK_RULES_DIR, GROK_SKILL_DIR,
-    HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR,
+    HERMES_SKILL_DIR, MANAGED_MARKER, MANAGED_SKILLS, SKILLS_DIR, WORKBUDDY_SKILL_DIR,
 };
 use ai_memory_core::{MARKER_END, find_managed_block};
 use anyhow::{Context, Result};
@@ -299,6 +299,10 @@ fn build_plan(
                 HookConfigShape::NestedHooksKey,
             ),
             (
+                install_hooks::workbuddy_settings_path()?,
+                HookConfigShape::NestedHooksKey,
+            ),
+            (
                 install_hooks::ibm_bob_settings_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
@@ -509,6 +513,7 @@ fn build_plan(
             IbmBob,
             QwenCode,
             Qoder,
+            WorkBuddy,
             CopilotCli,
             Droid,
             Swival,
@@ -660,13 +665,14 @@ pub(super) fn skill_roots(
     claude_config_dir: Option<&Path>,
     hermes_home: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(16);
+    let mut roots = Vec::with_capacity(18);
     push_unique_skill_root(&mut roots, cwd.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(GITHUB_SKILL_DIR).join(SKILLS_DIR));
     push_unique_skill_root(&mut roots, cwd.join(HERMES_SKILL_DIR).join(SKILLS_DIR));
+    push_unique_skill_root(&mut roots, cwd.join(WORKBUDDY_SKILL_DIR).join(SKILLS_DIR));
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
@@ -680,6 +686,7 @@ pub(super) fn skill_roots(
             .unwrap_or_else(|| home.join(COPILOT_SKILL_DIR));
         push_unique_skill_root(&mut roots, copilot_root.join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(HERMES_SKILL_DIR).join(SKILLS_DIR));
+        push_unique_skill_root(&mut roots, home.join(WORKBUDDY_SKILL_DIR).join(SKILLS_DIR));
         for root in super::install_skills::antigravity_global_skill_roots(home) {
             push_unique_skill_root(&mut roots, root);
         }
@@ -1839,6 +1846,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::GeminiCli
         | McpClient::QwenCode
         | McpClient::Qoder
+        | McpClient::WorkBuddy
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::KimiCode
@@ -2407,6 +2415,58 @@ mod tests {
         );
     }
 
+    /// `install-mcp --client workbuddy` writes `~/.workbuddy/mcp.json`; that
+    /// file is only visited when `WorkBuddy` is in the MCP client loop.
+    #[test]
+    fn mcp_plan_strips_workbuddy_mcp_json() {
+        let home = tempfile::tempdir().unwrap();
+        let mcp_path = home.path().join(".workbuddy").join("mcp.json");
+        std::fs::create_dir_all(mcp_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mcp_path,
+            r#"{"mcpServers":{"ai-memory":{"type":"http","url":"http://127.0.0.1:49374/mcp"},"other":{"url":"http://x"}}}"#,
+        )
+        .unwrap();
+        let env = crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+            "HOME",
+            home.path().to_str().unwrap(),
+        )]);
+        let args = UninstallArgs {
+            apply: false,
+            purge_data: false,
+            only: Some(crate::cli::UninstallOnly::Mcp),
+            mcp_name: None,
+            mcp_url: crate::config::DEFAULT_MCP_URL.to_string(),
+            yes: false,
+            profile: None,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let plan = build_plan(
+            &ai_memory_core::i18n::Localizer::default(),
+            &args,
+            data.path(),
+            &env,
+        )
+        .unwrap();
+        assert!(
+            plan.iter().any(|change| matches!(
+                change,
+                PlannedChange::Rewrite { path, removed, .. }
+                    if *path == mcp_path && removed.iter().any(|name| name == "ai-memory")
+            )),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|change| match change {
+                PlannedChange::Rewrite { path, removed, .. } if *path == mcp_path => {
+                    !removed.iter().any(|name| name == "other")
+                }
+                _ => true,
+            }),
+            "{plan:?}"
+        );
+    }
+
     /// Each installed plugin is removed through its own harness CLI, and one
     /// failure does not stop the next.
     #[test]
@@ -2458,8 +2518,9 @@ mod tests {
         let without = skill_roots(cwd, Some(home), None, None, None, None, None);
         assert_eq!(
             without.len(),
-            14,
-            "no phantom root when APPDATA is unset (claude/agents/devin/grok/copilot/hermes × \
+            16,
+            "no phantom root when APPDATA is unset \
+             (claude/agents/devin/grok/copilot/hermes/workbuddy × \
              project+global, plus Antigravity's two global roots)"
         );
         assert!(
@@ -2670,6 +2731,29 @@ mod tests {
             .filter(|root| *root == Path::new("/home/alice/.hermes/skills"))
             .count();
         assert_eq!(home_hermes_count, 1);
+    }
+
+    /// `install-skills --agent workbuddy` writes `.workbuddy/skills` in the
+    /// project and `~/.workbuddy/skills` globally; uninstall must sweep both.
+    #[test]
+    fn skill_roots_sweep_workbuddy_project_and_home_roots() {
+        let roots = skill_roots(
+            Path::new("/repo"),
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/repo/.workbuddy/skills")),
+            "{roots:?}"
+        );
+        assert!(
+            roots.contains(&PathBuf::from("/home/alice/.workbuddy/skills")),
+            "{roots:?}"
+        );
     }
 
     #[test]

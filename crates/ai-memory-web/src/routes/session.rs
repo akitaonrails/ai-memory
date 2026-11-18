@@ -191,6 +191,11 @@ pub(crate) async fn handler(
         project: project.clone(),
         project_href: project_href(&workspace, &project),
         session_href: base.clone(),
+        retrievals_href: crate::templates::retrievals_href(
+            &workspace,
+            &project,
+            &session_id.to_string(),
+        ),
         session_id: session_id.to_string(),
         agent_kind: session.agent_kind,
         started_at: session.started_at,

@@ -438,6 +438,7 @@ mod tests {
                     agent_kind: agent,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -493,6 +494,7 @@ mod tests {
                     agent_kind: AgentKind::KiroCli,
                     cwd: Some(std::path::PathBuf::from("/tmp/target")),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -568,6 +570,7 @@ mod tests {
                 actor_user: None,
 
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();

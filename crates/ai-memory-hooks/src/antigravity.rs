@@ -400,7 +400,7 @@ pub fn antigravity_transcript_path(raw: &serde_json::Value, home: &Path) -> Opti
 
 /// Open `path` only if it is a regular file, not a symlink, FIFO or device,
 /// and is still the same file once open.
-fn open_regular_file(path: &Path) -> Option<File> {
+pub(crate) fn open_regular_file(path: &Path) -> Option<File> {
     let before = std::fs::symlink_metadata(path).ok()?;
     if !before.is_file() {
         return None;

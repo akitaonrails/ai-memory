@@ -652,6 +652,19 @@ assert_eq "auto handoff on sends nothing" "" "$(AI_MEMORY_AUTO_HANDOFF=on ai_mem
 assert_eq "auto handoff rides with the managed run" "&managed_run=r1&auto_handoff=0" \
     "$(AI_MEMORY_RUN_ID=r1 AI_MEMORY_AUTO_HANDOFF=0 ai_memory_managed_qs)"
 
+# AI_MEMORY_SESSION_ORIGIN=automation marks an orchestrator-launched session so
+# the profile harvester can skip its prompts (#2180); only the recognised token
+# is forwarded, between the managed run and the auto-handoff flag.
+assert_eq "session origin automation is forwarded" "&session_origin=automation" \
+    "$(AI_MEMORY_SESSION_ORIGIN=automation ai_memory_managed_qs)"
+assert_eq "session origin tolerates surrounding whitespace" "&session_origin=automation" \
+    "$(AI_MEMORY_SESSION_ORIGIN=' automation ' ai_memory_managed_qs)"
+assert_eq "an unknown session origin sends nothing" "" \
+    "$(AI_MEMORY_SESSION_ORIGIN=interactive ai_memory_managed_qs)"
+assert_eq "session origin rides with the managed run" \
+    "&managed_run=r1&session_origin=automation" \
+    "$(AI_MEMORY_RUN_ID=r1 AI_MEMORY_SESSION_ORIGIN=automation ai_memory_managed_qs)"
+
 # `[handoff] deliver_on_session_start = false` is sent as &handoff=0 only when
 # explicitly falsy, and a [handoff]-only marker is a settings boundary.
 mkdir -p "$TMP/handoff-off/inner" "$TMP/handoff-on"

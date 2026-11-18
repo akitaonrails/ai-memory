@@ -467,6 +467,9 @@ pub(super) fn render(terminal: &crate::terminal::Terminal, view: View<'_>) {
             "{}",
             i18n.text("cli-presentation-fallback-chain")
         ));
+        if let Some(headline) = fallback_chain_headline(&report.providers.llm_candidates) {
+            terminal.line(format_args!("      {headline}"));
+        }
         for candidate in &report.providers.llm_candidates {
             terminal.line(format_args!("      {}", fallback_candidate_line(candidate)));
         }
@@ -524,6 +527,7 @@ mod tests {
                 last_error_status: None,
                 last_error_class: None,
                 circuit_open_until: Some("2026-05-28T12:00:30Z".parse().unwrap()),
+                circuit_reason: None,
             }],
         }];
         let lines = task_chain_lines(&ai_memory_core::i18n::Localizer::default(), &chains);

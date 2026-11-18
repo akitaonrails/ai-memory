@@ -332,3 +332,66 @@ async fn project_tabs_script_finds_its_tablist_in_every_language() {
         }
     }
 }
+
+/// The language picker is styled by the dashboard stylesheet, not left to the
+/// browser's native control, and still switches language through the cookie.
+#[tokio::test]
+async fn language_picker_uses_the_dashboard_select_style() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+    let split = crate::split_web_routers(
+        true,
+        store.reader.clone(),
+        wiki,
+        crate::WebMountSpec {
+            enable_api: false,
+            web_ui_dir: None,
+            cors_origins: &[],
+            web_slug: "",
+            base_href: "/",
+            base_path: "",
+            trusted_proxy_identity: false,
+            recall: crate::Recall::default(),
+            runtime: None,
+            health: None,
+        },
+    )
+    .unwrap();
+    let page = split
+        .protected
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let html = body(page).await;
+    assert!(
+        html.contains("<select id=\"interface-language\" class=\"language-select\""),
+        "{html}"
+    );
+    assert!(html.contains("ai_memory_language="), "cookie switch kept");
+    let css = split
+        .public
+        .oneshot(
+            Request::builder()
+                .uri("/static/tailwind.css")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let css = body(css).await;
+    let rule = css
+        .split(".language-select{")
+        .nth(1)
+        .expect("stylesheet defines .language-select");
+    let rule = &rule[..rule.find('}').unwrap()];
+    for token in [
+        "appearance:none",
+        "var(--dash-line)",
+        "var(--dash-soft)",
+        "var(--dash-text)",
+    ] {
+        assert!(rule.contains(token), "{token} missing from {rule}");
+    }
+    assert!(css.contains(".language-select:focus-visible{border-color:var(--dash-accent)}"));
+}

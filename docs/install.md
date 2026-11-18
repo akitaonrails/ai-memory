@@ -20,7 +20,7 @@ RPM, macOS menu bar app). This page covers everything else:
 - [macOS menu bar app](#macos-menu-bar-app)
   (self-contained `.app` + LaunchAgent)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
+  (Codex, Command Code, IBM Bob, Devin CLI, OpenCode, OpenCode 2, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Qwen Code, Antigravity CLI, Grok Build CLI, GitHub Copilot CLI, Factory Droid, Meta Muse Code, CodeBuddy Code, WorkBuddy, Hermes Agent, Zero, ZCode, Kimi Code, Kiro CLI, Cline CLI, Pool, OpenClaw, FreeBuff, VS Code Copilot, Zed, and MCP-only recipes for Warp, Kilo Code, Goose and OpenHuman)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -565,6 +565,19 @@ project files from the checkout, not from the config dir. The
 Docker wrapper forwards the variable for config roots under its existing
 `$HOME` bind mount; use the native binary when the relocated root is outside
 `$HOME`.
+
+On macOS and Linux the native hook commands name the binary and the data dir
+relative to your home when they sit under it, as
+`"$HOME/.local/share/ai-memory/native-runner/ai-memory" --data-dir "$HOME/..."`,
+so a settings file kept in a dotfiles repo works for another user or machine
+with the same layout, and re-applying leaves it unchanged. A path outside
+`$HOME`, or one with `"`, `$`, `` ` `` or `\` in it, stays absolute. Pass
+`--absolute-paths` to `install-hooks` or `setup`, or set
+`AI_MEMORY_HOOK_ABSOLUTE_PATHS=1` (which `upgrade` also honours), to keep
+absolute paths everywhere. The agent must run the hook with `HOME` set, because
+the `"$HOME/..."` form expands it in the shell; if the agent cannot provide `HOME`,
+use `--absolute-paths`. Hermes and Pool always get absolute paths, because
+they do not run the command through a shell.
 
 The CLI commands (`bootstrap`, `status`, `search`, `lint`, `auto-improve`,
 `curator`, `pending-writes`, etc.) inherit the two env vars automatically. So do
@@ -1118,8 +1131,11 @@ each server once with `ai-memory server add <name> --url <url> --root <dir>
 --auth-token-stdin`, then set `server = "<name>"` in each repository's
 `.ai-memory.toml`. Repositories without the key keep using the server
 `install-hooks` configured. A profile that does not resolve drops the event
-instead of falling back. Native hook commands route profiles; the generated
-TypeScript integrations and the script hooks drop routed repositories. See
+instead of falling back. Native hook commands route profiles, and the generated
+OpenCode plugins (`opencode`, `opencode2`) route a profile repository through
+that native hook (passing `--expected-profile`, so a divergent walk or a missing
+binary drops rather than falls back); the other generated integrations and the
+script hooks still drop routed repositories. See
 [`marker-file.md`](marker-file.md#routing-capture-to-another-server-server).
 
 Some agent harnesses attach the assistant's final turn to their `Stop` event;
@@ -1140,6 +1156,9 @@ opt-in**: enable the server first, then the client:
    ai-memory install-hooks --agent claude-code --capture-assistant --apply
    # Codex is supported too — its Stop payload carries last_assistant_message:
    ai-memory install-hooks --agent codex --capture-assistant --apply
+   # Pi has no raw assistant field, so its extension funnels the reply through
+   # the native binary:
+   ai-memory install-hooks --agent pi --capture-assistant --apply
    ```
 
 The client sanitizes (built-in patterns) and truncates the excerpt before it
@@ -1147,9 +1166,13 @@ touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
 before storing. If either side is off, or the marker is malformed, the Stop
 stays empty. Re-running `install-hooks` without `--capture-assistant` preserves
 an existing opt-in. To remove it, run `ai-memory uninstall --only hooks
---apply --yes`, then reinstall without the flag. `--capture-assistant` is Claude Code, Codex and
-OpenCode 2 (`--agent opencode2`) on a native hook platform only; on any other agent or the script fallback the
-installer refuses it rather than enabling something that cannot take effect. Assistant text is
+--apply --yes`, then reinstall without the flag. `--capture-assistant` is Claude Code, Codex,
+OpenCode 2 (`--agent opencode2`) and Pi on a native hook platform only; on any other agent or the script fallback the
+installer refuses it rather than enabling something that cannot take effect. Pi reaches the reply
+differently from the others — it has no raw assistant field, so its extension reads the final
+`role: "assistant"` message from the saved session and pipes it through the native `ai-memory hook`
+binary (never over the extension's own HTTP), which is the only path that runs the sanitizer.
+Assistant text is
 privacy-sensitive. Read the `SECURITY.md` notes on what it can contain and where
 it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
 is configured) before enabling it.
@@ -2235,6 +2258,61 @@ CodeBuddy's hook documentation and the payloads reported on v2.164 to
 v2.167; the maintainers have not yet run it end to end. Start a new
 CodeBuddy session after installing so it loads the hooks.
 
+### WorkBuddy
+
+WorkBuddy (`workbuddy`), Tencent's coding agent, reads lifecycle hooks from
+the `hooks` key of `~/.workbuddy/settings.json` and MCP servers from the
+`mcpServers` map of `~/.workbuddy/mcp.json`. Both installers mimic their
+Tencent CodeBuddy and Claude Code counterparts:
+
+```bash
+ai-memory install-hooks --agent workbuddy --apply
+ai-memory install-mcp --client workbuddy --apply
+ai-memory install-skills --scope global --agent workbuddy
+```
+
+Without `--apply` each command prints the block to merge by hand, and
+`ai-memory setup-agent --agent workbuddy` prints the hook block for a host
+that runs WorkBuddy against a remote server. Running `--apply` again changes
+nothing.
+
+WorkBuddy takes CodeBuddy's Claude Code-shaped hook contract: it sends
+`session_id`, `cwd`, `tool_name`, `tool_input` and `tool_response` on stdin
+with Claude Code's tool names, so each entry runs the native
+`ai-memory hook --event … --agent workbuddy` command with an empty matcher.
+There is no script bundle; the local spool, bearer auth and
+`[capture] ignore_paths` apply. Six events are wired: `SessionStart`,
+`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact` and `Stop`.
+
+The `SessionStart` hook delivers the prior session's handoff through
+`hookSpecificOutput.additionalContext`, which WorkBuddy appends to the
+session. With nothing to deliver, the `SessionStart` and `UserPromptSubmit`
+hooks print nothing, since WorkBuddy appends their output too.
+
+**WorkBuddy never fires a `SessionEnd` event.** `Stop` is a turn boundary,
+not a session end, so an idle WorkBuddy session stays open. Close it with
+`ai-memory finalize-session --agent workbuddy` after the final turn; that
+writes the summary page and hands the baton to the next session. There is no
+managed workstream and no transcript backfill.
+
+The MCP entry uses Claude Code's HTTP shape (`type: "http"`, `url`, optional
+`headers`) under `mcpServers`. When the install's bearer comes from
+`[auth].bearer_token_file`, `install-mcp` writes the session-less `mcp-bridge`
+stdio entry instead, so the token never enters `mcp.json`; a client with a
+session id of its own is not assumed, so pass explicit `workspace` and
+`project` on project-scoped MCP calls.
+
+**The new server is not usable until WorkBuddy trusts it.** After
+`install-mcp --apply`, open WorkBuddy's **custom connector** settings
+(自定义连接器) and approve the newly added `ai-memory` MCP server. Until it is
+trusted, the entry sits in `mcp.json` but ai-memory's tools do not appear in
+the session.
+
+Skills go into `~/.workbuddy/skills` (global) or `.workbuddy/skills`
+(project). `ai-memory setup` wires WorkBuddy when `~/.workbuddy` exists, and
+`ai-memory uninstall` removes the hook entries. Start a new WorkBuddy session
+after installing so it loads the hooks.
+
 ### Hermes Agent (Nous Research)
 
 Hermes declares lifecycle hooks in the `hooks:` block of its home's
@@ -2556,6 +2634,30 @@ ai-memory install-mcp --client pi --server-url "http://homelab:49374/mcp"
 
 Restart Pi after installing or changing the extension. OMP / Oh My Pi remains
 separate and continues to use `.omp` paths.
+
+#### Pi codemode
+
+By default the extension declares every ai-memory tool to the model, schema
+included. To reach them through Pi's `codemode` tool instead, set this in
+ai-memory's `config.toml` (or `AI_MEMORY_PI_TOOL_EXPOSURE=codemode`) and
+regenerate the extension:
+
+```toml
+pi_tool_exposure = "codemode"
+```
+
+```bash
+ai-memory install-hooks --agent pi --apply
+```
+
+Each tool is then registered with Pi's
+[`exposure: "codemode"`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure):
+codemode scripts can list and call it, and the model no longer receives its
+schema unless you activate the tool yourself. Tool names, the session headers
+that route each call to the current project, and lifecycle capture stay the
+same. Preview output and every later `--apply` (including the refresh that
+`ai-memory upgrade` runs) read the same setting, so regenerating keeps your
+choice. Set it back to `direct`, or remove it, to return to the default.
 
 ### Bind mounts vs docker cp
 
@@ -3066,6 +3168,7 @@ ai-memory works in three intensity tiers:
 | **+ Codex credential reuse** | Same LLM features using the Codex CLI-owned login without copying or owning its refresh token | `AI_MEMORY_LLM_PROVIDER=codex` + an authenticated Codex CLI | Uses your ChatGPT subscription |
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ Cursor subscription** | Same LLM features using the logged-in Cursor Agent CLI. Read-only `--mode ask`; does not pass `--yolo` | `AI_MEMORY_LLM_PROVIDER=cursor` + `agent` on `PATH` (or `AI_MEMORY_CURSOR_AGENT`) | Uses your Cursor subscription |
+| **+ Google Cloud credits** | Same LLM features with Gemini through Vertex AI, billed to a Google Cloud project so Cloud credits pay for it | `AI_MEMORY_LLM_PROVIDER=vertex` + `gcloud auth application-default login` (or `GOOGLE_APPLICATION_CREDENTIALS`) + `GOOGLE_CLOUD_PROJECT` | Billed to your Google Cloud project |
 | **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
 | **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (or `EMBEDDING_API_KEY`) | ~$0.0001 / page on backfill |
 
@@ -3083,6 +3186,7 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=cursor` | `cursor-grok-4.6-high` | Cursor subscription via `agent --print --mode ask --trust`. No API key and no `--yolo`. This id is "Grok 4.6" in `agent --list-models`. Override the binary with `AI_MEMORY_CURSOR_AGENT`. Any other id from that list works as `AI_MEMORY_LLM_MODEL`. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
+| `AI_MEMORY_LLM_PROVIDER=vertex` | `gemini-3.5-flash` | The same Gemini models through Vertex AI, billed to a Google Cloud project (Cloud credits apply; they do not cover AI Studio). Authenticates with `gcloud auth application-default login` or a service-account key in `GOOGLE_APPLICATION_CREDENTIALS`. `GOOGLE_CLOUD_PROJECT` picks the project and `GOOGLE_CLOUD_LOCATION` the region (default `global`). See [LLM providers](llm-providers.md). |
 | `AI_MEMORY_LLM_PROVIDER=opencode` | `mimo-v2.6-flash` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1`, a cost-optimised model subset. Published Responses models, including GPT-5.6 Luna and GPT-6 Luna, use `/responses`; supported Claude and Qwen Messages models use `/messages`. MiniMax M3/M2.7 and Qwen3.8 Max use Messages on Go and Chat Completions on Zen; Go Muse Contributor models use Responses. Changing the base URL reselects the transport and preserves request settings. See the [Go](https://opencode.ai/docs/go/#endpoints) and [Zen](https://opencode.ai/docs/zen/#endpoints) endpoint tables. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it, such as `claude-sonnet-5-5`; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` (historical); it selects Go like the others, and the endpoint is chosen by the base URL, not the alias, with no automatic billing-product switch. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY` or `OPENAI_API_KEY`, with the OpenAI-compatible embedding client. |
@@ -3571,6 +3675,7 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `workstreams [--workspace NAME] [--project NAME] [--limit N] [--json]` | host wrapper or native binary | List recent workstreams selectable from the current checkout, including current selection and linked harnesses, without exposing paths or native session ids |
 | `rename-workstream (--from NAME \| --workstream-id ID) --to NAME [--workspace NAME] [--project NAME] [--json]` | host wrapper or native binary | Retitle one workstream selectable from the current checkout; metadata only, so the stable id, the ledger, the listing order, and the current selection are unaffected |
 | `workstream-search [query]` | managed child or thin HTTP client | Search the complete visible managed-workstream ledger; the managed child receives its workstream id automatically |
+| `call [tool] [json-arguments]` | thin HTTP client or native binary | Call any MCP tool of the configured server from a shell (`call memory_query '{"query":"wal mode"}'`), or list the tools and their input schemas when no tool is named |
 | `status` | `docker exec` | Counts, paths, derived-index diagnostics, and passive LLM/embedding provider health |
 | `search "<query>"` | `docker exec` | Wiki FTS5 search + bounded source authority; use MCP `memory_query` for entity/graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |

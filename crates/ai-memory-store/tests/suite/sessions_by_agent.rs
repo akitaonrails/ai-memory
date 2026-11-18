@@ -52,6 +52,7 @@ async fn session(
             agent_kind: agent,
             cwd: None,
             actor_user: owner,
+            origin: None,
         })
         .await
         .unwrap();

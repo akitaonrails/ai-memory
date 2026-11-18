@@ -160,7 +160,7 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
     status: "wrapped",
     methods: ["messages.list"],
     phase: 2,
-    sends: [...SCOPE, "box", "limit"],
+    sends: [...SCOPE, "box", "limit", "after_id"],
   },
   memory_message_pop: {
     status: "wrapped",

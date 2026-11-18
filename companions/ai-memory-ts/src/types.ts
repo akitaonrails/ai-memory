@@ -1010,6 +1010,11 @@ export interface ListMessagesArgs extends ScopedArgs {
   box?: "inbox" | "outbox";
   /** Maximum messages (default 50, clamped to 200). */
   limit?: number;
+  /**
+   * Page after this message id. Pass the last id from the previous page;
+   * omit it for the first page. An unknown or foreign id yields an empty page.
+   */
+  afterId?: string;
 }
 
 /** Result of {@link MessagesNamespace.list}. */

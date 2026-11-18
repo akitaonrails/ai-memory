@@ -160,6 +160,7 @@ async fn session(h: &Harness, owner: Option<&str>) -> SessionId {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: owner.map(|name| format!("user:{name}")),
+            origin: None,
         })
         .await
         .unwrap();
@@ -621,6 +622,8 @@ async fn management_purge_admission_rejection_preserves_rows_and_files() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::PurgeSession],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let h = harness_with_chain(Some(chain)).await;

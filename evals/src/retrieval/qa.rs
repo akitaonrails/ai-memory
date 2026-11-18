@@ -502,6 +502,12 @@ fn build_llm_provider(
             std::env::temp_dir(),
             &std::env::vars_os().collect::<Vec<_>>(),
         )),
+        AuthRequirement::GoogleAdc => ProviderAuth::vertex(
+            token_file.map(Into::into),
+            None,
+            "global".into(),
+            ai_memory_llm::CredentialSource::TokenFile,
+        ),
     };
 
     let config = ProviderConfig {
@@ -517,6 +523,7 @@ fn build_llm_provider(
         request_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
         reasoning_effort: None,
         extra_headers: ai_memory_llm::ExtraHeaders::default(),
+        request_metadata_headers: false,
     };
     ai_memory_llm::build_provider(config)
         .map_err(anyhow::Error::from)

@@ -28,16 +28,16 @@
     <a class="metric-card metric-link metric-attention" href="{{ project_href }}?tab=sessions&state=open#session-token-table"><span>{{ i18n.text("web-open-sessions") }}</span><strong>{{ stats.open_session_count }}</strong><small>{{ i18n.text("web-only-unfinished-sessions") }}</small></a>
     <a class="metric-card metric-link" href="{{ project_href }}?tab=tokens#token-usage"><span>{{ i18n.text("web-tokens-in-out") }}</span><strong style="font-size:23px">{{ stats.tokens_total }}</strong><small>{{ i18n.text("web-reported-session-totals") }}</small></a>
   </div>
-  <p class="mt-4 text-xs text-slate-500 dark:text-slate-400">
+  <p class="mt-4 text-xs text-muted">
     {% if stats.last_activity_relative != "" %}{{ i18n.one("web-last-capture-sentence", stats.last_activity_relative) }} {% endif %}
     {% if stats.open_session_count > 0 %}{{ i18n.text("web-open-means-no-sessionend-was-received-it-may-be-an-active-agent-or-an-interruption") }}{% else %}{{ i18n.text("web-no-currently-open-session-is-recorded") }}{% endif %}
   </p>
   {% if !by_agent.is_empty() %}
-  <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-200 dark:border-slate-800 pt-4">
-    <span class="text-xs text-slate-500 dark:text-slate-400">{{ i18n.text("web-agents-project") }}</span>
+  <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
+    <span class="text-xs text-muted">{{ i18n.text("web-agents-project") }}</span>
     {% for badge in by_agent %}
-    <span class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-100 dark:border-blue-900">
-      {{ badge.label }} <span class="text-blue-500 dark:text-blue-400">· {{ badge.count }}</span>
+    <span class="badge gap-1" data-hue="violet">
+      {{ badge.label }} <span>· {{ badge.count }}</span>
     </span>
     {% endfor %}
   </div>
@@ -45,34 +45,34 @@
 </section>
     <section class="surface panel-heading" aria-labelledby="mailbox-heading">
       <div class="flex items-center gap-2 mb-3">
-        <a href="{{ inbox_href }}" class="secondary-button" style="float:right">{{ i18n.text("web-open-inbox") }}</a><h2 id="mailbox-heading" class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">{{ i18n.text("web-mailbox") }}</h2>
+        <a href="{{ inbox_href }}" class="secondary-button order-last ml-auto">{{ i18n.text("web-open-inbox") }}</a><h2 id="mailbox-heading" class="section-label">{{ i18n.text("web-mailbox") }}</h2>
         {% if !mailbox.is_empty() %}
-        <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300">{% if mailbox_capped %}{{ i18n.two("web-mailbox-capped-pending", mailbox.len(), mailbox_total) }}{% else %}{{ i18n.one("web-mailbox-pending", mailbox_total) }}{% endif %}</span>
+        <span class="badge" data-hue="amber">{% if mailbox_capped %}{{ i18n.two("web-mailbox-capped-pending", mailbox.len(), mailbox_total) }}{% else %}{{ i18n.one("web-mailbox-pending", mailbox_total) }}{% endif %}</span>
         {% endif %}
       </div>
       {% if mailbox.is_empty() %}
-      <p class="text-sm text-slate-500 dark:text-slate-400">{{ i18n.text("web-no-pending-messages-for-this-project") }}</p>
+      <p class="text-sm text-muted">{{ i18n.text("web-no-pending-messages-for-this-project") }}</p>
       {% else %}
-      <ul class="divide-y divide-slate-100 dark:divide-slate-800">
+      <ul class="divide-y divide-line">
         {% for message in mailbox %}
         <li class="py-3 flex items-start justify-between gap-4">
           <div class="min-w-0">
-            <div class="text-sm font-medium text-slate-800 dark:text-slate-100 truncate">{{ message.subject }}</div>
+            <div class="text-sm font-medium text-text truncate">{{ message.subject }}</div>
             <div class="flex items-center gap-2 mt-1">
               {% if let Some(href) = message.sender_href %}
-              <a href="{{ href }}" class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 shrink-0">{{ i18n.text("web-from-project-2") }} {{ message.sender }}</a>
+              <a href="{{ href }}" class="badge shrink-0">{{ i18n.text("web-from-project-2") }} {{ message.sender }}</a>
               {% else %}
-              <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 shrink-0">{{ i18n.text("web-from-project-2") }} {{ message.sender }}</span>
+              <span class="badge shrink-0">{{ i18n.text("web-from-project-2") }} {{ message.sender }}</span>
               {% endif %}
-              <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 shrink-0">{{ message.nature }}</span>
-              <span class="text-xs text-slate-500 dark:text-slate-400 truncate">{{ message.snippet }}</span>
+              <span class="badge shrink-0">{{ message.nature }}</span>
+              <span class="text-xs text-muted truncate">{{ message.snippet }}</span>
             </div>
           </div>
-          <span class="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">{{ message.created_relative }}</span>
+          <span class="text-xs text-muted whitespace-nowrap shrink-0">{{ message.created_relative }}</span>
         </li>
         {% endfor %}
       </ul>
-      <p class="mt-2 text-xs text-slate-500 dark:text-slate-400">
+      <p class="mt-2 text-xs text-muted">
         {% if mailbox_capped %}{{ i18n.two("web-mailbox-oldest-shown", mailbox.len(), mailbox_total) }}; <code class="font-mono">ai-memory message list --workspace {{ workspace }} --project {{ project }} --limit 200</code> {{ i18n.text("web-lists-up-to-200") }} {% endif %}{{ i18n.rich("web-mailbox-agent-reads", "font-mono")|safe }}
       </p>
       {% endif %}
@@ -93,28 +93,28 @@
   </form>
   <!-- Sidebar: folder tree -->
   <aside aria-label="{{ i18n.text("web-project-pages") }}">
-    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-pages") }}</h2>
+    <h2 class="section-label mb-3">{{ i18n.text("web-pages") }}</h2>
     {% if folders.is_empty() %}
-    <p class="text-sm text-slate-400 dark:text-slate-600">{{ i18n.text("web-no-compiled-pages-yet") }}</p>
+    <p class="text-sm text-muted">{{ i18n.text("web-no-compiled-pages-yet") }}</p>
     {% else %}
     <ul class="space-y-1">
       {% for folder in folders %}
       <li>
-        <div class="text-xs font-medium text-slate-500 dark:text-slate-400 py-1 border-b border-slate-100 dark:border-slate-800 mb-1">
-          {% if let Some(href) = folder.href %}<a href="{{ href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ folder.name }}/</a>{% else %}{{ folder.name }}/{% endif %}
+        <div class="text-xs font-medium text-muted py-1 border-b border-line mb-1">
+          {% if let Some(href) = folder.href %}<a href="{{ href }}" class="hover:text-green">{{ folder.name }}/</a>{% else %}{{ folder.name }}/{% endif %}
           <span class="font-normal">({{ folder.total }})</span>
         </div>
         <ul class="space-y-0.5 pl-2">
           {% for page in folder.pages %}
           <li>
             <a href="{{ page.href }}"
-               class="block truncate text-sm text-slate-700 dark:text-slate-300 hover:text-blue-600 dark:hover:text-blue-400 py-0.5">
+               class="block truncate text-sm text-text hover:text-green py-0.5">
               {{ page.title }}
             </a>
           </li>
           {% endfor %}
           {% if let Some(href) = folder.href %}{% if folder.total > folder.pages.len() %}
-          <li><a href="{{ href }}" class="block text-xs text-blue-600 dark:text-blue-400 hover:underline py-0.5">{{ i18n.text("web-view-all") }} {{ folder.total }}</a></li>
+          <li><a href="{{ href }}" class="block text-xs text-green hover:underline py-0.5">{{ i18n.text("web-view-all") }} {{ folder.total }}</a></li>
           {% endif %}{% endif %}
         </ul>
       </li>
@@ -123,25 +123,25 @@
     {% endif %}
     {% if !system.is_empty() %}
     <details class="mt-6">
-      <summary class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 cursor-pointer select-none">{{ i18n.text("web-system") }}</summary>
+      <summary class="section-label cursor-pointer select-none">{{ i18n.text("web-system") }}</summary>
       <ul class="space-y-1 mt-3">
         {% for folder in system %}
         <li>
-          <div class="text-xs font-medium text-slate-500 dark:text-slate-400 py-1 border-b border-slate-100 dark:border-slate-800 mb-1">
-            {% if let Some(href) = folder.href %}<a href="{{ href }}" class="hover:text-blue-600 dark:hover:text-blue-400">{{ folder.name }}/</a>{% else %}{{ folder.name }}/{% endif %}
+          <div class="text-xs font-medium text-muted py-1 border-b border-line mb-1">
+            {% if let Some(href) = folder.href %}<a href="{{ href }}" class="hover:text-green">{{ folder.name }}/</a>{% else %}{{ folder.name }}/{% endif %}
             <span class="font-normal">({{ folder.total }})</span>
           </div>
           <ul class="space-y-0.5 pl-2">
             {% for page in folder.pages %}
             <li>
               <a href="{{ page.href }}"
-                 class="block truncate text-sm text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 py-0.5">
+                 class="block truncate text-sm text-muted hover:text-green py-0.5">
                 {{ page.title }}
               </a>
             </li>
             {% endfor %}
             {% if let Some(href) = folder.href %}{% if folder.total > folder.pages.len() %}
-            <li><a href="{{ href }}" class="block text-xs text-blue-600 dark:text-blue-400 hover:underline py-0.5">{{ i18n.text("web-view-all") }} {{ folder.total }}</a></li>
+            <li><a href="{{ href }}" class="block text-xs text-green hover:underline py-0.5">{{ i18n.text("web-view-all") }} {{ folder.total }}</a></li>
             {% endif %}{% endif %}
           </ul>
         </li>
@@ -153,10 +153,10 @@
 
   <!-- Main: recent pages -->
   <div class="flex-1 min-w-0">
-    <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-3">{{ i18n.text("web-recent-activity") }}</h2>
+    <h2 class="section-label mb-3">{{ i18n.text("web-recent-activity") }}</h2>
     {% if recent.is_empty() %}
-    <div class="rounded-lg border border-dashed border-slate-300 dark:border-slate-700 p-5 text-sm text-slate-500 dark:text-slate-400">
-      <p class="font-medium text-slate-700 dark:text-slate-200">{{ i18n.text("web-no-compiled-memory-pages-yet") }}</p>
+    <div class="rounded-lg border border-dashed border-line p-5 text-sm text-muted">
+      <p class="font-medium text-text">{{ i18n.text("web-no-compiled-memory-pages-yet") }}</p>
       {% if stats.session_count > 0 %}
       <p class="mt-2">{{ i18n.text("web-this-project-has") }} {{ stats.session_count }} {{ i18n.count("web-count-captured-session", stats.session_count) }} {{ i18n.text("web-and") }} {{ stats.observation_count }} {{ i18n.count("web-count-sanitized-event", stats.observation_count) }}{{ i18n.text("web-pages-appear-after-consolidation-agents-can-still-retrieve-current-context-through-mc") }}</p>
       {% else %}
@@ -164,27 +164,27 @@
       {% endif %}
     </div>
     {% else %}
-    <ul class="divide-y divide-slate-100 dark:divide-slate-800">
+    <ul class="divide-y divide-line">
       {% for page in recent %}
       <li class="py-3 flex items-start justify-between gap-4">
         <div class="min-w-0">
           <a href="{{ page.href }}"
-             class="text-sm font-medium text-slate-800 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400 truncate block">
+             class="text-sm font-medium text-text hover:text-green truncate block">
             {{ page.title }}
           </a>
           <div class="flex items-center gap-2 mt-1">
-            <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+            <span class="badge">
               {{ page.kind }}
             </span>
             {% if let Some(agent) = page.agent_label %}
-            <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300">
+            <span class="badge" data-hue="violet">
               {{ agent }}
             </span>
             {% endif %}
-            <span class="text-xs text-slate-400 dark:text-slate-500 truncate">{{ page.path }}</span>
+            <span class="text-xs text-muted truncate">{{ page.path }}</span>
           </div>
         </div>
-        <span class="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap shrink-0">{{ page.updated_relative }}</span>
+        <span class="text-xs text-muted whitespace-nowrap shrink-0">{{ page.updated_relative }}</span>
       </li>
       {% endfor %}
     </ul>
@@ -197,11 +197,11 @@
 <div id="session-token-table" class="surface section-block">
   <div class="section-heading panel-heading"><div><p class="eyebrow">{{ i18n.text("web-recent-activity-project") }}</p><h2>{{ i18n.text("web-sessions-agent") }}</h2><p>{{ i18n.text("web-open-a-session-to-inspect-its-model-responses-and-captured-events") }}</p></div></div>
   {% if sessions.is_empty() %}
-  <p class="text-sm text-slate-400 dark:text-slate-600">{{ i18n.text("web-no-sessions-recorded-yet") }}</p>
+  <p class="text-sm text-muted">{{ i18n.text("web-no-sessions-recorded-yet") }}</p>
   {% else %}
-  <div class="rounded-lg border border-slate-200 dark:border-slate-800 overflow-x-auto">
+  <div class="rounded-lg border border-line overflow-x-auto">
     <table class="sessions-table ops-table">
-      <thead class="border-b border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400">
+      <thead class="border-b border-line text-muted">
         <tr>
           <th>{{ i18n.text("web-agent") }}</th>
           <th>{{ i18n.text("web-started") }}</th>
@@ -210,18 +210,18 @@
           <th>{{ i18n.text("web-tokens") }}</th>
         </tr>
       </thead>
-      <tbody class="divide-y divide-slate-100 dark:divide-slate-800">
+      <tbody class="divide-y divide-line">
         {% for session in sessions %}
         <tr data-session-agent="{{ session.agent_kind }}">
           <td>
-            <span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300">
+            <span class="badge" data-hue="violet">
               <a href="{{ session.href }}" class="hover:underline">{{ session.agent_label }}</a>
             </span>
           </td>
-          <td class="text-slate-500 dark:text-slate-400">{{ session.started_relative }}</td>
-          <td class="text-slate-500 dark:text-slate-400">{{ session.duration }}</td>
-          <td class="text-slate-500 dark:text-slate-400">{{ session.observation_count }}</td>
-          <td class="text-slate-600 dark:text-slate-300">{{ session.tokens }}</td>
+          <td class="text-muted">{{ session.started_relative }}</td>
+          <td class="text-muted">{{ session.duration }}</td>
+          <td class="text-muted">{{ session.observation_count }}</td>
+          <td class="text-muted">{{ session.tokens }}</td>
         </tr>
         {% endfor %}
       </tbody>

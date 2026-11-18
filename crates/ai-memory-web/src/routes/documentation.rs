@@ -6,7 +6,7 @@ use crate::{
     templates::VERSION,
 };
 use crate::{features::FeatureState, state::WebState};
-use ai_memory_core::AuthLevel;
+use ai_memory_core::{AuthLevel, i18n::Language};
 use askama::Template;
 use axum::{
     Json,
@@ -45,12 +45,14 @@ struct DocumentView {
     doc: &'static Document,
     html: String,
     outline: Vec<markdown::OutlineEntry>,
+    source: &'static str,
     current_href: String,
     markdown_href: String,
     releases: Vec<ReleaseOption>,
     selected_release: String,
     sidebar: &'static [Document],
-    features: Vec<FeatureState>,
+    /// Each status card with the guide section it links to, in the reader's language.
+    features: Vec<(FeatureState, String)>,
 }
 
 fn response(body: impl IntoResponse) -> Response {
@@ -69,7 +71,7 @@ pub(crate) async fn index(
     if query.q.chars().count() > 200 {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let docs = documentation::search(&query.q);
+    let docs = documentation::search_in(&query.q, i18n.language());
     match (IndexView {
         i18n: i18n.clone(),
         query: query.q,
@@ -85,6 +87,7 @@ pub(crate) async fn index(
 fn selected<'a>(
     doc: &'a Document,
     requested: Option<&str>,
+    language: Language,
 ) -> Result<(&'a str, String, Vec<ReleaseOption>), StatusCode> {
     let releases = if doc.id.starts_with("changelog") {
         documentation::releases(doc.body)
@@ -95,7 +98,7 @@ fn selected<'a>(
         return if requested.is_some() {
             Err(StatusCode::BAD_REQUEST)
         } else {
-            Ok((doc.body, String::new(), Vec::new()))
+            Ok((doc.body_for(language), String::new(), Vec::new()))
         };
     }
     let id = requested.unwrap_or(releases[0].id);
@@ -135,10 +138,11 @@ pub(crate) async fn page(
     let Some(doc) = documentation::find(slug.strip_suffix(".md").unwrap_or(&slug)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let (body, selected_release, releases) = match selected(doc, query.release.as_deref()) {
-        Ok(s) => s,
-        Err(s) => return s.into_response(),
-    };
+    let (body, selected_release, releases) =
+        match selected(doc, query.release.as_deref(), i18n.language()) {
+            Ok(s) => s,
+            Err(s) => return s.into_response(),
+        };
     if raw {
         return response((
             [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
@@ -154,8 +158,9 @@ pub(crate) async fn page(
         )
     };
     let current_href = format!("docs/{}{suffix}", doc.id);
+    let source = doc.source_for(i18n.language());
     let rendered = markdown::render_reference_document(body, |url| {
-        documentation::link(doc, &current_href, url)
+        documentation::link_from(source, &current_href, url)
     });
     let features = match crate::features::states(&state, auth.map(|v| v.0)).await {
         Ok(rows) => rows,
@@ -171,12 +176,17 @@ pub(crate) async fn page(
                         .contains(&doc.id)
                     && ["capture", "tokens", "inbox", "external-clients"].contains(&f.id))
         })
+        .map(|f| {
+            let guide = documentation::localize_guide(f.guide, i18n.language());
+            (f, guide)
+        })
         .collect();
     let view = DocumentView {
         i18n: i18n.clone(),
         features,
         doc,
         html: rendered.html,
+        source,
         outline: rendered.outline,
         markdown_href: format!("docs/{}.md{suffix}", doc.id),
         current_href,
@@ -203,7 +213,8 @@ pub(crate) async fn api_page(Path(slug): Path<String>, Query(query): Query<DocsQ
     let Some(doc) = documentation::find(&slug) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let (body, release, options) = match selected(doc, query.release.as_deref()) {
+    let (body, release, options) = match selected(doc, query.release.as_deref(), Language::English)
+    {
         Ok(s) => s,
         Err(s) => return s.into_response(),
     };

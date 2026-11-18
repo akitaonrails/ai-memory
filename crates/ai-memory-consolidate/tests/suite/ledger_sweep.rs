@@ -437,6 +437,8 @@ async fn a_rejecting_admission_webhook_keeps_the_ledger_and_the_report_says_so()
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::DeleteEventLedger],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let fx = fixture_with_chain(Some(chain)).await;
@@ -498,6 +500,8 @@ async fn an_accepting_admission_webhook_is_told_after_the_file_is_gone() {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::DeleteEventLedger],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         },
         WebhookConfig {
             name: "ledger-mirror".into(),
@@ -506,6 +510,8 @@ async fn an_accepting_admission_webhook_is_told_after_the_file_is_gone() {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::DeleteEventLedger],
             blocking: false,
+            projects: Vec::new(),
+            headers: Vec::new(),
         },
     ])
     .unwrap();

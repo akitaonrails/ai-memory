@@ -1,4 +1,7 @@
-//! Google Gemini (Generative Language API) client.
+//! Google Gemini client, for the Generative Language API (AI Studio, API key)
+//! and for Vertex AI (Google Cloud, Application Default Credentials). Both
+//! take the same `generateContent` request and return the same response; only
+//! the URL and the credential differ.
 //!
 //! Structured-output strategy: ask for `responseMimeType:
 //! application/json` plus a `responseSchema` — Gemini's native JSON
@@ -16,7 +19,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::auth::VertexAuth;
 use crate::error::{LlmError, LlmResult};
+use crate::google_auth::GoogleAdcTokenSource;
 use crate::provider::LlmProvider;
 use crate::response::{provider_error, response_json_limited};
 use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Role, Usage};
@@ -24,10 +29,46 @@ use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Role, Usage};
 /// Default Gemini API base.
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
+/// Vertex AI host for `location`. `global` has no regional prefix.
+#[must_use]
+pub fn vertex_base_url(location: &str) -> String {
+    if location == "global" {
+        "https://aiplatform.googleapis.com".to_string()
+    } else {
+        format!("https://{location}-aiplatform.googleapis.com")
+    }
+}
+
+fn is_vertex_location(location: &str) -> bool {
+    !location.is_empty()
+        && location
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Project ids, project numbers and legacy domain-scoped ids (`example.com:p`).
+fn is_project_id(project: &str) -> bool {
+    !project.is_empty()
+        && project.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b':')
+        })
+}
+
+enum GeminiEndpoint {
+    AiStudio {
+        api_key: SecretString,
+    },
+    Vertex {
+        tokens: Box<GoogleAdcTokenSource>,
+        project: Option<String>,
+        location: String,
+    },
+}
+
 /// Gemini-backed provider.
 pub struct GeminiProvider {
     client: reqwest::Client,
-    api_key: SecretString,
+    endpoint: GeminiEndpoint,
     base_url: String,
     model: String,
     timeout: Duration,
@@ -46,8 +87,47 @@ impl GeminiProvider {
             .build()?;
         Ok(Self {
             client,
-            api_key,
+            endpoint: GeminiEndpoint::AiStudio { api_key },
             base_url: DEFAULT_BASE_URL.to_string(),
+            model: model.into(),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            extra_headers: ExtraHeaders::default(),
+        })
+    }
+
+    /// Construct a provider that calls Gemini through Vertex AI, billed to a
+    /// Google Cloud project.
+    ///
+    /// # Errors
+    /// Returns a `reqwest::Error` if an HTTP client cannot be built.
+    pub fn new_vertex(auth: VertexAuth, model: impl Into<String>) -> LlmResult<Self> {
+        // The location becomes part of the host name and the project part of
+        // the path; anything outside Google's own alphabets could move the
+        // bearer token to another host.
+        if !is_vertex_location(&auth.location) {
+            return Err(LlmError::NotConfigured(format!(
+                "GOOGLE_CLOUD_LOCATION={} is not a Vertex AI location (e.g. global, us-central1)",
+                auth.location
+            )));
+        }
+        if let Some(project) = &auth.project
+            && !is_project_id(project)
+        {
+            return Err(LlmError::NotConfigured(format!(
+                "GOOGLE_CLOUD_PROJECT={project} is not a Google Cloud project id"
+            )));
+        }
+        let client = reqwest::Client::builder()
+            .redirect(crate::redirect::same_origin_redirects())
+            .build()?;
+        Ok(Self {
+            client,
+            base_url: vertex_base_url(&auth.location),
+            endpoint: GeminiEndpoint::Vertex {
+                tokens: Box::new(GoogleAdcTokenSource::new(auth.credentials_file)?),
+                project: auth.project,
+                location: auth.location,
+            },
             model: model.into(),
             timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
             extra_headers: ExtraHeaders::default(),
@@ -164,7 +244,10 @@ struct GeminiUsage {
 #[async_trait]
 impl LlmProvider for GeminiProvider {
     fn name(&self) -> &'static str {
-        "gemini"
+        match self.endpoint {
+            GeminiEndpoint::AiStudio { .. } => "gemini",
+            GeminiEndpoint::Vertex { .. } => "vertex",
+        }
     }
 
     fn model(&self) -> &str {
@@ -258,21 +341,60 @@ impl GeminiProvider {
     }
 
     async fn post<B: Serialize, R: DeserializeOwned>(&self, body: &B) -> LlmResult<R> {
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent",
-            self.base_url.trim_end_matches('/'),
-            self.model
-        );
-        debug!(url, "POST gemini");
+        let base = self.base_url.trim_end_matches('/');
+        let builder = match &self.endpoint {
+            GeminiEndpoint::AiStudio { api_key } => {
+                let url = format!("{base}/v1beta/models/{}:generateContent", self.model);
+                debug!(url, "POST gemini");
+                self.client
+                    .post(&url)
+                    .header("x-goog-api-key", api_key.expose_secret())
+            }
+            GeminiEndpoint::Vertex {
+                tokens,
+                project,
+                location,
+            } => {
+                let project = match project {
+                    Some(project) => project.clone(),
+                    None => tokens.project().await?.ok_or_else(|| {
+                        LlmError::NotConfigured(format!(
+                            "GOOGLE_CLOUD_PROJECT: the vertex provider needs a Google Cloud \
+                             project and {} names none",
+                            tokens.credentials_file().display()
+                        ))
+                    })?,
+                };
+                if !is_project_id(&project) {
+                    return Err(LlmError::NotConfigured(format!(
+                        "{} names project {project}, which is not a Google Cloud project id; \
+                         set GOOGLE_CLOUD_PROJECT",
+                        tokens.credentials_file().display()
+                    )));
+                }
+                let url = format!(
+                    "{base}/v1/projects/{project}/locations/{location}/publishers/google/models/{}:generateContent",
+                    self.model
+                );
+                debug!(url, "POST vertex");
+                let token = tokens.access_token().await?;
+                self.client.post(&url).bearer_auth(token.expose_secret())
+            }
+        };
         let request = self.extra_headers.apply(
-            self.client
-                .post(&url)
+            builder
                 .timeout(self.timeout)
-                .header("x-goog-api-key", self.api_key.expose_secret())
                 .header("content-type", "application/json"),
         );
         let resp = request.json(body).send().await?;
         if !resp.status().is_success() {
+            // A revoked or rotated credential keeps failing until the next
+            // refresh; drop the cache so the next call re-reads the file.
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                && let GeminiEndpoint::Vertex { tokens, .. } = &self.endpoint
+            {
+                tokens.invalidate().await;
+            }
             return Err(provider_error(resp).await);
         }
         response_json_limited::<R>(resp).await

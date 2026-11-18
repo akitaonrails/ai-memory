@@ -602,10 +602,15 @@ fn oversized_core_bodies_are_capped_before_the_local_spool() {
 
 #[test]
 fn native_capture_selection_preserves_late_results_and_prompt_corrections() {
+    // The native client truncates both the assistant excerpt and the prompt at
+    // the 16 KiB client ceiling (OBSERVATION_BODY_MAX_BYTES); the configured
+    // stored-excerpt cap (#2118) is a server-side trim the spooled client body
+    // does not see. Drive every case past that ceiling so the client truncates
+    // head+tail and the preserved-both-ends assertions below bite.
     for (agent, event, field, cap) in [
-        ("claude-code", "stop", "last_assistant_message", 2_000),
-        ("codex", "stop", "last_assistant_message", 2_000),
-        ("opencode", "stop", "last_assistant_message", 2_000),
+        ("claude-code", "stop", "last_assistant_message", 16_384),
+        ("codex", "stop", "last_assistant_message", 16_384),
+        ("opencode", "stop", "last_assistant_message", 16_384),
         ("claude-code", "user-prompt-submit", "prompt", 16_384),
         ("codex", "user-prompt-submit", "prompt", 16_384),
         ("opencode", "user-prompt-submit", "prompt", 16_384),
@@ -891,6 +896,122 @@ fn codex_capture_off_does_not_capture_assistant_message() {
     );
     // Unrelated fields survive so the Codex Stop event is still ingested.
     assert!(body.contains("codex-off"), "session_id was dropped: {body}");
+}
+
+// --- Pi assistant-capture runtime (#2240) ----------------------------------
+//
+// Pi is on the direct-HTTP capture path (no native binary in its own hook
+// flow), so its generated extension funnels the Stop event back through
+// `ai-memory hook --agent pi --event stop --capture-assistant` with the reply
+// piped to stdin under `last_assistant_message`. That native invocation is the
+// only sanctioned path into the Rust sanitizer (invariant #6). These cases
+// prove that invocation end-to-end at the client spool — identical wire shape
+// to Codex, the only runtime difference being `--agent pi`.
+
+#[test]
+fn pi_opted_in_stop_captures_and_sanitizes_assistant_message() {
+    // With --capture-assistant, a Pi Stop event spools the sanitized protocol
+    // marker (NOT the raw field), carries capture_assistant=1 on a pi URL, and a
+    // planted secret in the assistant message is redacted before it is spooled.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // AWS access-key shape (AKIA + 16 chars) → redacted by the built-in sanitizer.
+    let secret = format!("AKIA{}", "A".repeat(16));
+    // A unique, non-secret phrase proves the excerpt actually persisted, so the
+    // secret-absence below reflects redaction rather than an empty capture.
+    let survivor = "pi wrapped up the refactor";
+    let payload = serde_json::json!({
+        "session_id": "pi-capture",
+        "cwd": "/tmp/project",
+        "last_assistant_message": format!("{survivor} using key {secret}")
+    })
+    .to_string();
+
+    let output = run_hook_full_agent(tmp.path(), "pi", "stop", payload.as_bytes(), true);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"{}\n");
+
+    let entry = spooled_entry(tmp.path());
+    let body = entry["body"].as_str().expect("spooled body");
+    let url = entry["url"].as_str().expect("spooled url");
+
+    // 1. Captured: the sanitized protocol marker is spliced in, the raw field is
+    //    gone, and the server-gating flag rides the pi URL.
+    assert!(
+        !body.contains("last_assistant_message"),
+        "raw assistant field survived: {body}"
+    );
+    assert!(
+        body.contains("_ai_memory_assistant"),
+        "protocol marker missing from pi capture: {body}"
+    );
+    assert!(
+        body.contains(survivor),
+        "non-secret excerpt did not persist (capture may be empty): {body}"
+    );
+    assert!(
+        url.contains("capture_assistant=1"),
+        "capture flag missing from pi url: {url}"
+    );
+    assert!(url.contains("agent=pi"), "pi agent missing from url: {url}");
+
+    // 2. Sanitized: the planted secret must not survive anywhere in the spool
+    //    file bytes, and the sanitizer's redaction marker must be present.
+    let entries = spool_entries(tmp.path());
+    assert_eq!(entries.len(), 1);
+    let raw_bytes = std::fs::read(entries[0].path()).expect("read spool entry");
+    let raw_text = String::from_utf8_lossy(&raw_bytes);
+    assert!(
+        !raw_text.contains(&secret),
+        "planted secret leaked into the pi spool file bytes"
+    );
+    assert!(
+        body.contains("[REDACTED:aws_key]"),
+        "secret was not redacted in the captured excerpt: {body}"
+    );
+}
+
+#[test]
+fn pi_capture_off_does_not_capture_assistant_message() {
+    // Opt-in gating for Pi: WITHOUT --capture-assistant, the raw field is
+    // stripped defensively, no protocol marker is spliced, and the URL carries no
+    // capture flag — proving the flag actually gates Pi capture.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"session_id":"pi-off","cwd":"/tmp/project","last_assistant_message":"SENTINEL_ASSISTANT_MESSAGE"}"#;
+
+    let output = run_hook_full_agent(tmp.path(), "pi", "stop", payload, false);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let entry = spooled_entry(tmp.path());
+    let body = entry["body"].as_str().expect("spooled body");
+    let url = entry["url"].as_str().expect("spooled url");
+    assert!(
+        !body.contains("SENTINEL_ASSISTANT_MESSAGE"),
+        "assistant message captured with capture OFF: {body}"
+    );
+    assert!(
+        !body.contains("last_assistant_message"),
+        "raw assistant field key survived: {body}"
+    );
+    assert!(
+        !body.contains("_ai_memory_assistant"),
+        "protocol marker spliced with capture OFF: {body}"
+    );
+    assert!(
+        !url.contains("capture_assistant=1"),
+        "capture flag present with capture OFF: {url}"
+    );
+    // Unrelated fields survive so the Pi Stop event is still ingested.
+    assert!(body.contains("pi-off"), "session_id was dropped: {body}");
 }
 
 // --- Lone UTF-16 surrogate escapes -----------------------------------------

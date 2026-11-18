@@ -73,6 +73,8 @@ async fn webhook_mutating_frontmatter_is_applied() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -99,6 +101,8 @@ async fn webhook_204_is_noop() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -127,6 +131,8 @@ async fn failure_policy_ignore_swallows_error() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -155,6 +161,8 @@ async fn failure_policy_reject_aborts_write() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -190,6 +198,8 @@ async fn skip_webhooks_short_circuits_named_hook() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -228,6 +238,8 @@ async fn op_filter_skips_webhook_not_subscribed_to_event() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::Consolidate],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -282,6 +294,8 @@ async fn chain_runs_in_order_each_sees_previous_mutation() {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         },
         WebhookConfig {
             name: "second".into(),
@@ -290,6 +304,8 @@ async fn chain_runs_in_order_each_sees_previous_mutation() {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         },
     ])
     .unwrap();
@@ -334,6 +350,8 @@ async fn x_memory_op_header_is_sent() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::Consolidate],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -369,6 +387,8 @@ async fn actor_context_is_propagated_in_payload() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -413,6 +433,8 @@ async fn webhook_can_mutate_body_too() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -439,6 +461,8 @@ async fn chain_rejects_more_than_max_admission_webhooks() {
             failure_policy: FailurePolicy::Ignore,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         })
         .collect();
     let err = AdmissionChain::new(too_many).expect_err("should refuse");
@@ -462,6 +486,8 @@ fn chain_rejects_non_http_webhook_urls_at_construction() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     };
     for bad in [
         "file:///etc/passwd",
@@ -512,6 +538,8 @@ async fn oversized_response_is_treated_as_noop() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -551,6 +579,8 @@ async fn workspace_and_project_names_propagate_in_payload() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -598,6 +628,8 @@ async fn notify_delete_sends_op_and_path() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::Delete],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -624,6 +656,8 @@ async fn notify_purge_has_op_and_no_path() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeProject],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -652,6 +686,8 @@ async fn notify_respects_op_subscription() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -692,6 +728,8 @@ async fn non_blocking_webhook_skipped_by_run_but_dispatched_async() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -760,6 +798,8 @@ async fn cross_origin_redirect_is_refused_without_forwarding_payload_or_mutating
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::WritePage, AdmissionOp::Delete],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -812,6 +852,8 @@ async fn cross_origin_redirect_is_refused_without_forwarding_payload_or_mutating
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 
@@ -861,6 +903,8 @@ async fn same_origin_redirect_still_reaches_the_webhook() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::WritePage],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
 

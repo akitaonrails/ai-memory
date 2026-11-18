@@ -23,9 +23,9 @@ use ai_memory_store::{ReaderPool, StoredPageBody};
 
 use crate::auto_improve::{
     AutoImproveError, AutoImproveLlmResponse, AutoImproveReport, AutoImproveResult,
-    AutoImproveReviewConfig, ExistingPageIndex, apply_eval_gate, load_patchable_pages,
-    load_rejection_context, render_patchable_pages, render_recent_pages, render_rejection_context,
-    truncate_to_budget,
+    AutoImproveReviewConfig, ExistingPageIndex, apply_eval_gate, load_global_pages,
+    load_patchable_pages, load_rejection_context, render_global_section, render_patchable_pages,
+    render_recent_pages, render_rejection_context, truncate_to_budget,
 };
 
 /// Settings for the cross-session pass.
@@ -45,6 +45,10 @@ pub struct ExperienceConfig {
     /// unchanged. Advisory (invariant #16): a skipped page is not consolidated,
     /// never deleted.
     pub entropy_filter: crate::entropy_filter::EntropyFilterConfig,
+    /// Optional operator override fixing the output language of generated
+    /// prose (`[consolidation] output_language`). `None` keeps the dominant
+    /// input-language behavior; evidence stays verbatim either way. (#2185)
+    pub output_language: Option<String>,
 }
 
 impl Default for ExperienceConfig {
@@ -54,6 +58,7 @@ impl Default for ExperienceConfig {
             min_new_sessions: 5,
             max_session_page_chars: 6_000,
             entropy_filter: crate::entropy_filter::EntropyFilterConfig::default(),
+            output_language: None,
         }
     }
 }
@@ -167,6 +172,7 @@ pub async fn run_experience_review(
     )
     .await?;
     let rejection_context = load_rejection_context(reader, workspace_id, project_id, &cfg).await?;
+    let global_pages = load_global_pages(reader, workspace_id, project_id, &cfg).await?;
 
     let mut warnings = Vec::new();
     if entropy_skipped > 0 {
@@ -225,6 +231,17 @@ pub async fn run_experience_review(
     if recent.len() < recent_pages.len() {
         warnings.push("recent page context truncated by input budget".into());
     }
+    // Standing `_global` page titles (#2248), read-only context the reviewer may
+    // not restate. Titles only, so the section stays bounded; it is still
+    // charged against the input budget below.
+    let global_section = if global_pages.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Standing _global pages (read-only, never restate)\n\n{}",
+            render_global_section(&global_pages)
+        )
+    };
     let rendered_patchable = render_patchable_pages(
         &patchable_pages,
         cfg.max_patchable_body_chars,
@@ -237,10 +254,11 @@ pub async fn run_experience_review(
     );
     let mut remaining = content_bytes
         .saturating_sub(recent.len())
+        .saturating_sub(global_section.len())
         .saturating_sub(rendered_patchable.text.len())
         .saturating_sub(rejection.len());
     let mut prompt = format!(
-        "{PREFIX}{recent}{PATCHABLE_HEADING}{}{REJECTION_HEADING}{rejection}{SESSION_HEADING}",
+        "{PREFIX}{recent}{global_section}{PATCHABLE_HEADING}{}{REJECTION_HEADING}{rejection}{SESSION_HEADING}",
         rendered_patchable.text,
     );
     for (index, ((_, _, page), header)) in session_pages.iter().zip(&session_headers).enumerate() {
@@ -283,9 +301,13 @@ pub async fn run_experience_review(
         .filter(|page| rendered_patchable.included_paths.contains(&page.path))
         .cloned()
         .collect();
-    let existing_index = ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable);
+    let existing_index = ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable)
+        .with_global_pages(&global_pages);
     let request = ChatRequest {
-        system: Some(EXPERIENCE_SYSTEM_PROMPT.to_string()),
+        system: Some(crate::with_output_language(
+            EXPERIENCE_SYSTEM_PROMPT,
+            experience.output_language.as_deref(),
+        )),
         messages: vec![ChatMessage {
             role: Role::User,
             content: prompt,
@@ -296,7 +318,8 @@ pub async fn run_experience_review(
     let raw: AutoImproveLlmResponse = complete_structured_with_operation_id(
         llm,
         request,
-        LlmOperationId::for_workload(LlmWorkload::Experience),
+        LlmOperationId::for_workload(LlmWorkload::Experience)
+            .with_subject(crate::llm_subject::scope(reader, workspace_id, Some(project_id)).await),
     )
     .await
     .map_err(AutoImproveError::from)?;
@@ -434,6 +457,19 @@ mod tests {
         );
         assert!(EXPERIENCE_SYSTEM_PROMPT.contains("do not make English the output language"));
         assert!(EXPERIENCE_SYSTEM_PROMPT.contains("evidence quotes verbatim"));
+    }
+
+    #[test]
+    fn output_language_override_extends_the_experience_prompt() {
+        assert_eq!(
+            crate::with_output_language(EXPERIENCE_SYSTEM_PROMPT, None),
+            EXPERIENCE_SYSTEM_PROMPT,
+            "default leaves the prompt unchanged"
+        );
+        let out = crate::with_output_language(EXPERIENCE_SYSTEM_PROMPT, Some("English"));
+        assert!(out.starts_with(EXPERIENCE_SYSTEM_PROMPT));
+        assert!(out.contains("## OUTPUT LANGUAGE — OPERATOR OVERRIDE"));
+        assert!(out.contains("rationale in English"));
     }
 
     #[test]

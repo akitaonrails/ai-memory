@@ -120,6 +120,7 @@ async fn session(store: &Store, ws: WorkspaceId, proj: ProjectId, n: u8, body: &
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .expect("begin session");

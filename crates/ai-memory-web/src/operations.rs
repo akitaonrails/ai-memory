@@ -63,6 +63,7 @@ pub(crate) fn session_row(
 ) -> SessionRow {
     let id = s.session_id.to_string();
     SessionRow {
+        display_name: s.display_name,
         agent_label: agent_label(AgentKind::from_wire(&s.agent_kind)),
         duration: duration_between(&s.started_at, s.ended_at.as_deref()),
         tokens: s

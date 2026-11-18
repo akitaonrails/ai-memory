@@ -55,6 +55,7 @@ fn seed_job(
                 agent_kind: AgentKind::Codex,
                 cwd: Some("/repo".into()),
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();

@@ -27,6 +27,7 @@
 //! that calls back into the engine (e.g. to write a derived page) opt out
 //! of being re-invoked on the recursive write.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -224,6 +225,135 @@ pub struct WebhookConfig {
     /// latency to writes.
     #[serde(default = "default_blocking")]
     pub blocking: bool,
+    /// Projects this webhook is told about, each `workspace/project`. Empty
+    /// (the default) means every project, as before the key existed. A
+    /// workspace-wide event (empty project) matches an entry by its workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
+    /// Extra request headers whose values live in files, so an endpoint that
+    /// wants `Authorization: Bearer …` is reachable without a relay and without
+    /// a secret in `config.toml`. Each file is read once, when the chain is
+    /// built; the value never reaches a log, an error or `Debug`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<WebhookHeader>,
+}
+
+/// One extra header for a webhook. The config holds only the file path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookHeader {
+    /// Header name, e.g. `Authorization`.
+    pub name: String,
+    /// File holding the value, trimmed of surrounding whitespace. A relative
+    /// path is resolved against the data dir when the config is loaded.
+    pub value_file: PathBuf,
+}
+
+/// Headers the engine sets itself (or the HTTP client derives); a configured
+/// header must not replace them.
+const RESERVED_WEBHOOK_HEADERS: [&str; 4] =
+    ["content-type", "content-length", "host", "x-memory-op"];
+
+/// A webhook with its `projects` parsed and its header files read: what the
+/// chain actually dispatches. Built once by [`AdmissionChain::new`].
+#[derive(Clone)]
+struct ChainHook {
+    config: WebhookConfig,
+    /// `(workspace, project)` pairs from [`WebhookConfig::projects`].
+    projects: Vec<(String, String)>,
+    /// Resolved values, each marked sensitive so `Debug` shows no value.
+    headers: reqwest::header::HeaderMap,
+}
+
+impl std::ops::Deref for ChainHook {
+    type Target = WebhookConfig;
+
+    fn deref(&self) -> &WebhookConfig {
+        &self.config
+    }
+}
+
+impl std::fmt::Debug for ChainHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainHook")
+            .field("config", &self.config)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChainHook {
+    fn resolve(config: WebhookConfig) -> WikiResult<Self> {
+        let invalid = |detail: String| {
+            WikiError::Io(std::io::Error::other(format!(
+                "admission webhook '{}' {detail}",
+                config.name
+            )))
+        };
+        let mut projects = Vec::with_capacity(config.projects.len());
+        for entry in &config.projects {
+            match entry.split_once('/') {
+                Some((ws, proj)) if !ws.is_empty() && !proj.is_empty() && !proj.contains('/') => {
+                    projects.push((ws.to_string(), proj.to_string()));
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "has an invalid projects entry '{entry}'; expected 'workspace/project'"
+                    )));
+                }
+            }
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        for header in &config.headers {
+            let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|_| invalid(format!("has an invalid header name '{}'", header.name)))?;
+            if RESERVED_WEBHOOK_HEADERS.contains(&name.as_str()) {
+                return Err(invalid(format!(
+                    "may not set the reserved header '{}'",
+                    header.name
+                )));
+            }
+            let path = header.value_file.display();
+            // Error text names the file, never its contents: the value is a
+            // secret, and an io::Error never quotes what it failed to read.
+            let raw = std::fs::read_to_string(&header.value_file).map_err(|e| {
+                invalid(format!(
+                    "cannot read the value of header '{}' from {path}: {}",
+                    header.name,
+                    e.kind()
+                ))
+            })?;
+            let value = raw.trim();
+            if value.is_empty() {
+                return Err(invalid(format!(
+                    "header '{}' value file {path} is empty",
+                    header.name
+                )));
+            }
+            let mut value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                invalid(format!(
+                    "header '{}' value in {path} is not a valid header value",
+                    header.name
+                ))
+            })?;
+            value.set_sensitive(true);
+            headers.insert(name, value);
+        }
+        Ok(Self {
+            config,
+            projects,
+            headers,
+        })
+    }
+
+    /// `true` when this webhook is told about `ctx`'s project: always without
+    /// a filter, else by an exact `workspace/project` match, or by workspace
+    /// for a workspace-wide event.
+    fn watches(&self, ctx: &AdmissionContext) -> bool {
+        self.projects.is_empty()
+            || self.projects.iter().any(|(ws, proj)| {
+                *ws == ctx.workspace && (ctx.project.is_empty() || *proj == ctx.project)
+            })
+    }
 }
 
 /// Per-write context passed to each webhook. Cheap to construct
@@ -266,6 +396,20 @@ pub struct AdmissionContext {
     /// callers set it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub partial_failure: bool,
+    /// `message_send` only: the queued message's id, so an observer (a bot
+    /// woken by this webhook) can pop exactly that message. Never the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// `message_send` only: the harness the message is addressed to; absent
+    /// for shared project mail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_agent: Option<ai_memory_core::AgentKind>,
+    /// `message_send` only: the sender's workspace name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_workspace: Option<String>,
+    /// `message_send` only: the sender's project name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_project: Option<String>,
     /// Names from `X-Memory-Skip-Admission-Chain` (CSV at the request layer);
     /// matched against [`WebhookConfig::name`] to short-circuit re-entrant writes.
     #[serde(default, skip_serializing)]
@@ -339,7 +483,7 @@ pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// The chain. Cloneable (cheap — `Arc<Vec<…>>` + `reqwest::Client`).
 #[derive(Clone, Debug)]
 pub struct AdmissionChain {
-    webhooks: Arc<Vec<WebhookConfig>>,
+    webhooks: Arc<Vec<ChainHook>>,
     client: reqwest::Client,
     async_semaphore: Arc<tokio::sync::Semaphore>,
 }
@@ -375,6 +519,11 @@ impl AdmissionChain {
             }
         }
 
+        let webhooks = webhooks
+            .into_iter()
+            .map(ChainHook::resolve)
+            .collect::<WikiResult<Vec<_>>>()?;
+
         let client = reqwest::Client::builder()
             .redirect(same_origin_redirects())
             .build()
@@ -409,13 +558,8 @@ impl AdmissionChain {
         ctx: &AdmissionContext,
     ) -> WikiResult<()> {
         for hook in self.webhooks.iter() {
-            // Caller-driven skip list (loop prevention via X-Memory-Skip-Admission-Chain).
-            if ctx.skip_webhooks.iter().any(|n| n == &hook.name) {
-                tracing::debug!(webhook = %hook.name, "admission skip (caller opt-out)");
-                continue;
-            }
-            // Webhook doesn't subscribe to this op.
-            if !hook.events.contains(&ctx.op) {
+            // Caller opt-out (loop prevention), op subscription and project filter.
+            if !self.subscribed(hook, ctx) {
                 continue;
             }
             // Non-blocking webhooks are fired fire-and-forget after the write
@@ -437,6 +581,7 @@ impl AdmissionChain {
             let result = self
                 .client
                 .post(&hook.url)
+                .headers(hook.headers.clone())
                 .header("X-Memory-Op", ctx.op.as_header_value())
                 .timeout(webhook_timeout(hook.timeout_ms))
                 .json(&payload)
@@ -594,19 +739,21 @@ impl AdmissionChain {
         }
     }
 
-    /// Shared filter: caller opt-out (loop prevention) plus op subscription.
-    fn subscribed(&self, hook: &WebhookConfig, ctx: &AdmissionContext) -> bool {
+    /// Shared filter: caller opt-out (loop prevention), op subscription and
+    /// the webhook's `projects` filter. Every dispatch path asks this one
+    /// question, so a filtered project never reaches the endpoint on any path.
+    fn subscribed(&self, hook: &ChainHook, ctx: &AdmissionContext) -> bool {
         if ctx.skip_webhooks.iter().any(|n| n == &hook.name) {
             tracing::debug!(webhook = %hook.name, "admission skip (caller opt-out)");
             return false;
         }
-        hook.events.contains(&ctx.op)
+        hook.events.contains(&ctx.op) && hook.watches(ctx)
     }
 
     /// One notify-style POST (no body to send or mutate).
     async fn notify_once(
         &self,
-        hook: &WebhookConfig,
+        hook: &ChainHook,
         page_path: Option<&str>,
         ctx: &AdmissionContext,
     ) -> WikiResult<()> {
@@ -622,6 +769,7 @@ impl AdmissionChain {
         let result = self
             .client
             .post(&hook.url)
+            .headers(hook.headers.clone())
             .header("X-Memory-Op", ctx.op.as_header_value())
             .timeout(webhook_timeout(hook.timeout_ms))
             .json(&payload)
@@ -677,10 +825,7 @@ impl AdmissionChain {
             if hook.blocking {
                 continue;
             }
-            if ctx.skip_webhooks.iter().any(|n| n == &hook.name) {
-                continue;
-            }
-            if !hook.events.contains(&ctx.op) {
+            if !self.subscribed(hook, ctx) {
                 continue;
             }
             self.spawn_webhook(hook, page_path, frontmatter, body, ctx);
@@ -691,7 +836,7 @@ impl AdmissionChain {
     /// in-flight permit (hook paths must not fan out unboundedly).
     fn spawn_webhook(
         &self,
-        hook: &WebhookConfig,
+        hook: &ChainHook,
         page_path: Option<&str>,
         frontmatter: &serde_json::Value,
         body: &str,
@@ -721,6 +866,7 @@ impl AdmissionChain {
         };
         let client = self.client.clone();
         let url = hook.url.clone();
+        let headers = hook.headers.clone();
         let name = hook.name.clone();
         let timeout = hook.timeout_ms;
         let op = ctx.op;
@@ -740,6 +886,7 @@ impl AdmissionChain {
             };
             match client
                 .post(&url)
+                .headers(headers)
                 .header("X-Memory-Op", op.as_header_value())
                 .timeout(webhook_timeout(timeout))
                 .json(&payload)

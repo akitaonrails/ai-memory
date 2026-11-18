@@ -1228,6 +1228,7 @@ fn claude_user_level_install_absent_at(path: PathBuf) -> Option<PathBuf> {
 
 fn apply_hooks_args(agent: AgentChoice) -> InstallHooksArgs {
     InstallHooksArgs {
+        absolute_paths: false,
         agent,
         hooks_dir: None,
         server_url: None,

@@ -59,6 +59,7 @@ async fn fixture(tmp: &std::path::Path) -> (Store, Wiki, SessionId) {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

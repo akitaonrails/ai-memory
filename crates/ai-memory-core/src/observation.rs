@@ -111,6 +111,15 @@ impl std::str::FromStr for ObservationKind {
     }
 }
 
+/// A sanitized harness label and the native revision that supplied it.
+#[derive(Debug, Clone)]
+pub struct SessionDisplayName {
+    /// Text shown next to the stable session id.
+    pub name: String,
+    /// Unix nanoseconds of the harness's name update, independent of activity.
+    pub updated_ns: i64,
+}
+
 /// Input for inserting an observation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewObservation {
@@ -176,6 +185,45 @@ pub struct Observation {
     pub created_at: Timestamp,
 }
 
+/// How a session was launched, when a launcher declares it. Absent (the
+/// common case) means an ordinary interactive session. The set is closed and
+/// parsed once at the hook boundary ([`SessionOrigin::parse_wire`]); only a
+/// recognised token is ever stored, so the `sessions.origin` column holds
+/// either a known value or NULL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOrigin {
+    /// An orchestrator or batch runner started this session non-interactively
+    /// (for example a nightly fan-out of agents), and set
+    /// `AI_MEMORY_SESSION_ORIGIN=automation` in the harness environment. The
+    /// profile harvester can be told to skip such sessions' prompts so a
+    /// generated brief is not mistaken for the operator's own preferences
+    /// (#2180). Capture, handoff and recall are unaffected.
+    Automation,
+}
+
+impl SessionOrigin {
+    /// The stored token for this origin.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Automation => "automation",
+        }
+    }
+
+    /// Parse a client-supplied origin token from the hook query string.
+    /// Returns `None` for an empty, unknown or malformed value, so an
+    /// unrecognised origin is treated exactly like an ordinary session rather
+    /// than stored verbatim.
+    #[must_use]
+    pub fn parse_wire(value: &str) -> Option<Self> {
+        match value.trim() {
+            "automation" => Some(Self::Automation),
+            _ => None,
+        }
+    }
+}
+
 /// Input for beginning a session row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewSession {
@@ -200,6 +248,12 @@ pub struct NewSession {
     /// store fills it in at write time.
     #[serde(default)]
     pub occurred_at: Option<i64>,
+    /// How the session was launched, when a launcher declared it (#2180).
+    /// `None` is an ordinary interactive session. Only set by the hook ingest
+    /// path, from a validated `AI_MEMORY_SESSION_ORIGIN`; absent everywhere
+    /// else.
+    #[serde(default)]
+    pub origin: Option<SessionOrigin>,
 }
 
 /// Reported cumulative token usage for one session (token-cost visibility).
@@ -261,6 +315,25 @@ mod tests {
             "PostCompaction".parse::<ObservationKind>().unwrap(),
             ObservationKind::PostCompaction,
         );
+    }
+
+    #[test]
+    fn session_origin_parses_only_the_closed_set() {
+        assert_eq!(
+            SessionOrigin::parse_wire("automation"),
+            Some(SessionOrigin::Automation),
+        );
+        // Surrounding whitespace is tolerated, as a hook query value may carry it.
+        assert_eq!(
+            SessionOrigin::parse_wire("  automation "),
+            Some(SessionOrigin::Automation),
+        );
+        // Anything outside the closed set is ignored, so an unknown origin is
+        // treated as an ordinary session rather than stored verbatim (#2180).
+        for unknown in ["", "Automation", "auto", "interactive", "batch", "1"] {
+            assert_eq!(SessionOrigin::parse_wire(unknown), None, "{unknown:?}");
+        }
+        assert_eq!(SessionOrigin::Automation.as_str(), "automation");
     }
 }
 

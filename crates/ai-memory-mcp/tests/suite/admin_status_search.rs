@@ -190,6 +190,7 @@ async fn status_carries_the_consolidation_queue_and_its_failed_sessions() {
             agent_kind: ai_memory_core::AgentKind::Codex,
             cwd: Some("/repo".into()),
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

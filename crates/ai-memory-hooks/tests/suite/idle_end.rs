@@ -70,6 +70,7 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         session_consolidation_notify: None,
         profile_notify: None,
         capture_assistant_enabled: false,
+        assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
         claim_handoff_on_session_start: true,
         create_handoff_on_session_end: true,
         subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
@@ -81,6 +82,7 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         )),
         ingest_gates: IngestGates::default(),
         session_agents: SessionAgents::default(),
+        project_briefs: ai_memory_hooks::ProjectBriefs::default(),
         cwd_probes: CwdProbes::default(),
         per_user_slots: false,
         mid_session_routing: ai_memory_core::MidSessionRouting::default(),
@@ -123,6 +125,7 @@ async fn begin(
             cwd: Some(CWD.into()),
             actor_user,
             occurred_at: Some(at),
+            origin: None,
         })
         .await
         .unwrap();

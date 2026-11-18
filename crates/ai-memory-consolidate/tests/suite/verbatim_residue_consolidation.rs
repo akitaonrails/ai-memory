@@ -67,6 +67,7 @@ async fn residue_changes_only_the_provider_request_not_the_stored_page() {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

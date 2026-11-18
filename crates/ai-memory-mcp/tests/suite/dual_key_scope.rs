@@ -176,6 +176,8 @@ fn rejecting_chain(address: std::net::SocketAddr, events: Vec<AdmissionOp>) -> A
         failure_policy: FailurePolicy::Reject,
         events,
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap()
 }

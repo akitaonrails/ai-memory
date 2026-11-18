@@ -230,6 +230,17 @@ mod slow {
                 }),
             ),
             post(
+                "messages send",
+                "/messages/send",
+                json!({
+                    "from_workspace": WORKSPACE,
+                    "from_project": PROJECT,
+                    "to_workspace": WORKSPACE,
+                    "to_project": PROJECT,
+                    "body": CANARY,
+                }),
+            ),
+            post(
                 "workstream prepare run",
                 "/workstream/runs",
                 json!({ "workspace": WORKSPACE, "project": EVIL_PROJECT, "note": CANARY }),

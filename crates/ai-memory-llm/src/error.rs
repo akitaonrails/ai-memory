@@ -94,7 +94,68 @@ pub enum LlmError {
     },
 }
 
+/// What a failed call means for retries and for an ordered fallback chain.
+///
+/// Computed by [`LlmError::failover_class`], the single classification used
+/// by the in-process retry loops ([`LlmError::is_transient`]) and by
+/// `FallbackLlmProvider` ([`LlmError::should_fail_over`]). See
+/// `docs/llm-provider-fallback.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FailoverClass {
+    /// A short, bounded retry on the same provider may succeed (`429` rate
+    /// limit, `5xx`, transport timeout or connect failure). The fallback
+    /// chain advances and opens a short circuit on this candidate.
+    Transient,
+    /// The provider account is out of credit, quota or billing, or is
+    /// disabled. Retrying the same provider is pointless until someone tops
+    /// up or the quota window resets; the fallback chain advances and keeps
+    /// this candidate out for the longer quota cooldown.
+    QuotaExhausted,
+    /// Deterministic for this request (bad request, invalid credential,
+    /// schema, malformed or truncated response). No retry and no failover.
+    Permanent,
+}
+
+impl FailoverClass {
+    /// Stable, redacted wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::QuotaExhausted => "quota-exhausted",
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
 impl LlmError {
+    /// Classify this failure for retries and fallback.
+    ///
+    /// A `Provider` error whose status and bounded, scrubbed body report
+    /// exhausted credit, quota or billing (see `quota.rs`) is
+    /// [`FailoverClass::QuotaExhausted`] whatever its status: Anthropic sends
+    /// `400`, OpenAI `429`, OpenRouter `402`. Otherwise a `429` or any `5xx`
+    /// and an `Http` timeout / connect failure are
+    /// [`FailoverClass::Transient`], and everything else is
+    /// [`FailoverClass::Permanent`].
+    #[must_use]
+    pub fn failover_class(&self) -> FailoverClass {
+        match self {
+            Self::Provider { status, body, .. } => {
+                if crate::quota::is_quota_exhaustion(*status, body) {
+                    FailoverClass::QuotaExhausted
+                } else if Self::status_is_transient(*status) {
+                    FailoverClass::Transient
+                } else {
+                    FailoverClass::Permanent
+                }
+            }
+            Self::Http(e) if e.is_timeout() || e.is_connect() => FailoverClass::Transient,
+            _ => FailoverClass::Permanent,
+        }
+    }
+
     /// Whether this failure is worth a short, bounded retry.
     ///
     /// True only for errors that a subsequent identical request could plausibly
@@ -102,22 +163,38 @@ impl LlmError {
     /// including Cloudflare's `52x`), or an `Http` transport timeout / connect
     /// failure. Everything else — auth, schema, a malformed-request `4xx`, a
     /// deserialization or unexpected-shape error — is deterministic: retrying
-    /// only burns another expensive call. Callers must keep the retry *short
-    /// and bounded* (a few attempts, seconds apart); this is not a license for
-    /// tenacity-style 8–128s backoff (see the cognee #2840 lesson in `lib.rs`).
+    /// only burns another expensive call. Exhausted credit or quota
+    /// ([`Self::is_quota_exhausted`]) is not transient either, even when it
+    /// arrives as a `429`: a retry seconds later hits the same empty balance.
+    /// Callers must keep the retry *short and bounded* (a few attempts,
+    /// seconds apart); this is not a license for tenacity-style 8–128s
+    /// backoff (see the cognee #2840 lesson in `lib.rs`).
     #[must_use]
     pub fn is_transient(&self) -> bool {
-        match self {
-            Self::Provider { status, .. } => Self::status_is_transient(*status),
-            Self::Http(e) => e.is_timeout() || e.is_connect(),
-            _ => false,
-        }
+        self.failover_class() == FailoverClass::Transient
+    }
+
+    /// Whether the provider reported exhausted credit, quota or billing, or
+    /// a disabled account. See [`FailoverClass::QuotaExhausted`].
+    #[must_use]
+    pub fn is_quota_exhausted(&self) -> bool {
+        self.failover_class() == FailoverClass::QuotaExhausted
+    }
+
+    /// Whether an ordered fallback chain should try its next candidate:
+    /// a transient failure or exhausted credit/quota, never a deterministic
+    /// one.
+    #[must_use]
+    pub fn should_fail_over(&self) -> bool {
+        self.failover_class() != FailoverClass::Permanent
     }
 
     /// The status half of [`Self::is_transient`], for a call site that must
     /// pick an error variant before one exists — a token endpoint answering
     /// `429`/`5xx` has not rejected the credential, so it must not become an
-    /// `Auth` error, which is deterministic.
+    /// `Auth` error, which is deterministic. It ignores the body, so a `429`
+    /// that reports exhausted quota still counts here; the resulting
+    /// `Provider` error is then classified by [`Self::failover_class`].
     #[must_use]
     pub fn status_is_transient(status: u16) -> bool {
         status == 429 || (500..=599).contains(&status)
@@ -144,11 +221,13 @@ impl LlmError {
     }
 
     /// Redacted error category used for health reporting and the fallback
-    /// chain's aggregate error — never a response body or secret.
+    /// chain's aggregate error — never a response body or secret. A provider
+    /// error that reports exhausted credit or quota is `quota-exhausted`.
     #[must_use]
-    pub const fn class(&self) -> &'static str {
+    pub fn class(&self) -> &'static str {
         match self {
             Self::Http(_) => "http",
+            Self::Provider { .. } if self.is_quota_exhausted() => "quota-exhausted",
             Self::Provider { .. } => "provider",
             Self::Serde(_) => "serde",
             Self::UnexpectedShape(_) => "unexpected-shape",
@@ -324,6 +403,60 @@ mod tests {
             assert_eq!(err.class(), *expected, "unexpected class for {err}");
             assert!(!err.class().contains("secret upstream body"));
         }
+    }
+
+    fn provider(status: u16, body: &str) -> LlmError {
+        LlmError::Provider {
+            status,
+            body: body.to_string(),
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn quota_exhaustion_fails_over_but_is_not_retried_in_place() {
+        let cases = [
+            provider(
+                400,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#,
+            ),
+            provider(
+                429,
+                r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+            ),
+            provider(
+                402,
+                r#"{"error":{"message":"Insufficient credits","code":402}}"#,
+            ),
+        ];
+        for err in cases {
+            assert_eq!(err.failover_class(), FailoverClass::QuotaExhausted, "{err}");
+            assert!(err.is_quota_exhausted(), "{err}");
+            assert!(err.should_fail_over(), "{err}");
+            assert!(!err.is_transient(), "{err}");
+            assert_eq!(err.class(), "quota-exhausted");
+        }
+    }
+
+    #[test]
+    fn failover_class_keeps_the_existing_transient_and_permanent_split() {
+        assert_eq!(
+            provider(429, "rate limited").failover_class(),
+            FailoverClass::Transient
+        );
+        assert_eq!(
+            provider(503, "overloaded").failover_class(),
+            FailoverClass::Transient
+        );
+        for status in [400, 401, 403, 404, 422] {
+            let err = provider(status, "invalid x-api-key");
+            assert_eq!(err.failover_class(), FailoverClass::Permanent, "{status}");
+            assert!(!err.should_fail_over(), "{status}");
+            assert_eq!(err.class(), "provider");
+        }
+        assert!(!LlmError::Auth("expired".into()).should_fail_over());
+        assert!(!LlmError::Schema("bad".into()).should_fail_over());
+        assert_eq!(FailoverClass::QuotaExhausted.as_str(), "quota-exhausted");
     }
 
     #[test]

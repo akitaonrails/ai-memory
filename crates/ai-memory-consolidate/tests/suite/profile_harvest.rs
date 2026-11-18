@@ -17,7 +17,10 @@ use ai_memory_core::{
     ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, NewUser, ObservationKind,
     PagePath, ProjectId, Sanitized, Sanitizer, SessionId, Tier, UserId, UserRole, WorkspaceId,
 };
-use ai_memory_llm::{ChatRequest, ChatResponse, LlmError, LlmProvider, LlmResult};
+use ai_memory_llm::{
+    ChatRequest, ChatResponse, LlmError, LlmOperationId, LlmProvider, LlmResult, LlmSubject,
+    LlmWorkload,
+};
 use ai_memory_store::{AccessMode, ProjectProfileFlags, Store};
 use ai_memory_wiki::{Wiki, WritePageRequest};
 use tempfile::TempDir;
@@ -97,6 +100,7 @@ async fn say(
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: owner.map(|name| IdentityKey::User(name.into()).storage_key()),
+            origin: None,
         })
         .await
         .unwrap();
@@ -1288,6 +1292,8 @@ struct FakeProfileLlm {
     truncate_from: Option<usize>,
     seen: Arc<Mutex<Vec<String>>>,
     budgets: Arc<Mutex<Vec<(String, u32)>>>,
+    /// `("classify" | "merge", operation id)` for every structured call.
+    operations: Arc<Mutex<Vec<(String, LlmOperationId)>>>,
     /// Sentence count of every classification call, in order.
     classify_sizes: Arc<Mutex<Vec<usize>>>,
 }
@@ -1366,6 +1372,123 @@ impl LlmProvider for FakeProfileLlm {
             }))
         }
     }
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        let operation = if request
+            .system
+            .as_deref()
+            .is_some_and(|system| system.contains("You classify sentences"))
+        {
+            "classify"
+        } else {
+            "merge"
+        };
+        self.operations
+            .lock()
+            .unwrap()
+            .push((operation.to_owned(), operation_id));
+        self.complete_structured_raw(request, schema).await
+    }
+}
+
+/// The subject of every `operation` call the fake recorded.
+fn subjects_of(
+    operations: &Mutex<Vec<(String, LlmOperationId)>>,
+    operation: &str,
+) -> Vec<Option<LlmSubject>> {
+    operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name == operation)
+        .inspect(|(_, id)| assert_eq!(id.workload(), LlmWorkload::Profile))
+        .map(|(_, id)| id.subject().cloned())
+        .collect()
+}
+
+/// Classification reads one project and names its author only when every
+/// sentence in the batch has the same one; a private profile's merge acts
+/// for its operator and reads no single scope.
+#[tokio::test]
+async fn profile_operations_name_only_a_single_scope_and_user() {
+    let fx = fixture().await;
+    user(&fx, "alice").await;
+    user(&fx, "bob").await;
+    let shared = project(&fx, "shared").await;
+    say(
+        &fx,
+        shared,
+        Some("alice"),
+        ObservationKind::UserPrompt,
+        "Always use pnpm in every project.",
+        1,
+    )
+    .await;
+    say(
+        &fx,
+        shared,
+        Some("bob"),
+        ObservationKind::UserPrompt,
+        "Always use yarn berry in every project.",
+        2,
+    )
+    .await;
+    let llm = FakeProfileLlm {
+        merge_statement: "Use pnpm for every JavaScript project.".into(),
+        ..FakeProfileLlm::default()
+    };
+    let operations = llm.operations.clone();
+    pass_with(&fx, &multi_user(ProfileShare::User), Arc::new(llm)).await;
+
+    assert_eq!(
+        subjects_of(&operations, "classify"),
+        vec![Some(LlmSubject {
+            workspace: Some("default".into()),
+            project: Some("shared".into()),
+            user: None,
+        })],
+        "a batch mixing operators names no user"
+    );
+    let mut merges = subjects_of(&operations, "merge");
+    merges.sort_by_key(|subject| subject.as_ref().and_then(|s| s.user.clone()));
+    assert_eq!(
+        merges,
+        ["alice", "bob"]
+            .map(|name| Some(LlmSubject {
+                user: Some(name.into()),
+                ..LlmSubject::default()
+            }))
+            .to_vec(),
+    );
+
+    // Control: a batch with one author names that author.
+    let fx = fixture().await;
+    user(&fx, "alice").await;
+    let solo = project(&fx, "solo").await;
+    say(
+        &fx,
+        solo,
+        Some("alice"),
+        ObservationKind::UserPrompt,
+        "Always use pnpm in every project.",
+        1,
+    )
+    .await;
+    let llm = FakeProfileLlm::default();
+    let operations = llm.operations.clone();
+    pass_with(&fx, &multi_user(ProfileShare::User), Arc::new(llm)).await;
+    assert_eq!(
+        subjects_of(&operations, "classify"),
+        vec![Some(LlmSubject {
+            workspace: Some("default".into()),
+            project: Some("solo".into()),
+            user: Some("alice".into()),
+        })],
+    );
 }
 
 /// With a provider, classification normalizes the statement and the merge

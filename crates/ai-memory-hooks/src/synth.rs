@@ -2243,6 +2243,7 @@ mod load_with_count_scopes {
                 cwd: None,
                 actor_user: None,
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -2312,6 +2313,7 @@ mod load_with_count_scopes {
                 cwd: None,
                 actor_user: None,
                 occurred_at: None,
+                origin: None,
             })
             .await
             .unwrap();

@@ -446,6 +446,7 @@ async fn sessions(
         .map(|s| {
             let id = s.session_id.to_string();
             SessionRow {
+                display_name: s.display_name,
                 agent_label: agent_label(ai_memory_core::AgentKind::from_wire(&s.agent_kind)),
                 duration: duration_between(&s.started_at, s.ended_at.as_deref()),
                 tokens: fmt_session_tokens(s.usage.as_ref()),
