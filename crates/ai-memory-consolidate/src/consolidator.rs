@@ -2147,7 +2147,7 @@ const CHARS_PER_TOKEN: usize = 3;
 
 /// Approximate chat-envelope overhead not represented by message content or
 /// the structured-output schema itself (roles, separators, provider framing).
-const PROMPT_ENVELOPE_RESERVE_CHARS: usize = 1_024;
+pub(crate) const PROMPT_ENVELOPE_RESERVE_CHARS: usize = 1_024;
 
 /// If JSON-schema serialization unexpectedly fails while sizing a prompt,
 /// consume a conservative part of the budget instead of treating the schema

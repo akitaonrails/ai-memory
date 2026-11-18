@@ -7,7 +7,7 @@ use std::sync::Arc;
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use jiff::Timestamp;
 
 use ai_memory_store::ResolvedScope;
@@ -78,7 +78,7 @@ async fn render(
     authorized: Option<ResolvedScope>,
     owner: ai_memory_core::OwnerFilter,
     query: crate::operations::UsageQuery,
-) -> Result<Html<String>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let calls_query = query.store_query()?;
     let session_view = query.session_view()?;
     let (pages, (mailbox, mailbox_total), sessions) = tokio::try_join!(
@@ -322,7 +322,7 @@ async fn render(
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Html(html))
+    Ok(super::private_page(html))
 }
 
 /// Turn grouped pages into sidebar folders: newest first, capped at

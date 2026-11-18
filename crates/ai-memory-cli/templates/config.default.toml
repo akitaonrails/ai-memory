@@ -574,6 +574,8 @@ require_approval = false
 min_observations = 8
 min_session_duration_secs = 120
 min_confidence = 0.75
+# Session reviews count the system prompt, response schema and an envelope
+# reserve within this approximate bytes/4 input budget.
 max_input_tokens = 24000
 max_proposals_per_run = 5
 include_raw_fallback = false
@@ -760,7 +762,7 @@ brief_on_project_change = false
 # is skipped with one warning. While it is on, the daily rule-based run keeps
 # the last LLM findings in `_lint/report.md` instead of dropping them.
 #
-# reconcile_tombstones_deleted_pages (#929, docs/okf.md) lets the watcher's 30s
+# reconcile_tombstones_deleted_pages (#929, docs/okf.md) lets the watcher's 300s
 # reconcile pass tombstone an OKF-imported content page whose file was missing
 # on two consecutive passes. Session summary pages are excluded. A circuit
 # breaker skips a scope where more than max(3, 50%) of the candidate pages look

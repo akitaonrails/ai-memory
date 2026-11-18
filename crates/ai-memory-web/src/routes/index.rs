@@ -6,7 +6,7 @@ use std::sync::Arc;
 use askama::Template;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::Html;
+use axum::response::Response;
 
 use crate::state::WebState;
 use crate::templates::{
@@ -36,7 +36,7 @@ pub(crate) async fn handler(
     level: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     viewer: Option<axum::Extension<ai_memory_core::AuthorizedViewer>>,
     Query(query): Query<IndexQuery>,
-) -> Result<Html<String>, StatusCode> {
+) -> Result<Response, StatusCode> {
     if !matches!(
         query.sort.as_str(),
         "" | "sessions" | "events" | "pages" | "open"
@@ -175,7 +175,7 @@ pub(crate) async fn handler(
     }
     .render()
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Html(html))
+    Ok(super::private_page(html))
 }
 
 /// The one-time migration explainer: rendered whenever a receipt

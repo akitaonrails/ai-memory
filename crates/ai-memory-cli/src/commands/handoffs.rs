@@ -152,8 +152,9 @@ async fn expire(
         // The copyable command is one value: it is never translated, and a
         // catalog template cannot split two adjacent values back apart.
         let command = format!(
-            "ai-memory handoffs --workspace {workspace} --project {project}{age} \
-             --expire-all --confirm"
+            "ai-memory handoffs --workspace {} --project {}{age} --expire-all --confirm",
+            super::render_shared::native_shell_quote(workspace),
+            super::render_shared::native_shell_quote(project),
         );
         anyhow::bail!(
             "--expire-all marks every open handoff in {workspace}/{project} expired.\n\
@@ -296,6 +297,38 @@ mod tests {
         assert!(
             report.contains(
                 "ai-memory handoffs --workspace default --project x --older-than-days 7 \
+                 --expire-all --confirm"
+            ),
+            "{report}"
+        );
+    }
+
+    /// Workspace names only refuse empty and `/`, so a free-form scope must
+    /// reach the pasted confirmation as one argument each, like the
+    /// `purge-project` and `move-project` confirmations.
+    #[tokio::test]
+    async fn expire_refusal_quotes_free_form_scope_names() {
+        let args = HandoffsArgs {
+            workspace: None,
+            project: None,
+            limit: 50,
+            json: false,
+            expire_all: true,
+            older_than_days: None,
+            confirm: false,
+        };
+        let endpoint = ServerEndpoint::from_pair(Some("http://127.0.0.1:9".to_owned()), None);
+        let english = Localizer::new(Language::English);
+        let error = expire(&endpoint, &english, "team space", "api; echo nope", &args)
+            .await
+            .expect_err("--expire-all without --confirm refuses");
+        let report = crate::localization::failure_report(&crate::localization::localize_failure(
+            error,
+            Language::English,
+        ));
+        assert!(
+            report.contains(
+                "ai-memory handoffs --workspace 'team space' --project 'api; echo nope' \
                  --expire-all --confirm"
             ),
             "{report}"

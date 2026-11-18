@@ -53,7 +53,7 @@ pub struct CompiledSourceObservation {
     pub created_at: i64,
 }
 
-/// One observation a page version was compiled from (`page_sources`, V108).
+/// One observation a page version was compiled from (`page_sources`, V112).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledSource {
     /// The observation the write named.

@@ -286,6 +286,15 @@ fn flush_locked(dir: &Path, options: &FlushOptions) -> Result<Report> {
     queue.prune(crate::now_ms())?;
     let token = Token::from_env()?;
     let authenticated = token.is_some();
+    if authenticated && crate::http::cleartext_bearer_risk(&binding.server_url) {
+        // The token is the root bearer. Plain http off loopback publishes it to
+        // anything on the path, so say so once per flush rather than leaving
+        // the operator to notice the scheme.
+        eprintln!(
+            "ai-memory-relay: warning: sending AI_MEMORY_AUTH_TOKEN over plain http to {}; use https or a loopback address",
+            binding.server_url
+        );
+    }
     let sender = Sender::new(binding.server_url.clone(), token, CONNECT_TIMEOUT)?;
 
     let started = Instant::now();

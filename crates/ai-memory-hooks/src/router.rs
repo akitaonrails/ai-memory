@@ -2203,9 +2203,6 @@ async fn fetch_and_accept_handoff_at(
         None
     };
     let claude_capped = agent == AgentKind::ClaudeCode;
-    let handoff_md = handoff.as_ref().map(|handoff| {
-        render_handoff_markdown_with_budget(handoff, claude_capped.then_some(CLAUDE_HANDOFF_CHARS))
-    });
     // A harness can disappear at a quota boundary, process kill, or machine
     // restart without ever emitting SessionEnd. Its observations are durable,
     // but no handoff row exists. Build a bounded, read-only recovery packet on
@@ -2259,7 +2256,7 @@ async fn fetch_and_accept_handoff_at(
     // Handoff right after the profile digest: it is a short curated pointer
     // and must not be buried under a ledger that can run tens of KB. The
     // existing ledger-then-brief order is preserved. Claim both single-use inputs only after every
-    // fallible read and render has succeeded, and in one transaction so a
+    // fallible read has succeeded, and in one transaction so a
     // failed or racing managed claim cannot consume the handoff by itself.
     // Same reasoning as the SessionEnd insert: the session-start claim is how
     // most handoffs are consumed, so a webhook must be able to see it. Two
@@ -2398,7 +2395,7 @@ async fn fetch_and_accept_handoff_at(
     } else {
         ai_memory_store::StartupContextAcceptance::default()
     };
-    let handoff_md = if acceptance.handoff_accepted {
+    let handoff_md = if let Some(claimed) = acceptance.handoff.as_ref() {
         // The claim is durable now, so the observers can be told about it. A
         // racing session that won the row leaves `handoff_accepted` false, and
         // then nothing is dispatched: a mirror is only ever told about a baton
@@ -2406,7 +2403,10 @@ async fn fetch_and_accept_handoff_at(
         if let Some(ctx) = &admission_ctx {
             state.wiki.notify_operation_observers(ctx);
         }
-        handoff_md
+        Some(render_handoff_markdown_with_budget(
+            claimed,
+            claude_capped.then_some(CLAUDE_HANDOFF_CHARS),
+        ))
     } else {
         None
     };
@@ -5254,6 +5254,19 @@ async fn process(
     }
 }
 
+/// Whether a compaction event is a subagent's own rather than the session's.
+/// Claude Code reports a subagent's `PreCompact` under the parent's
+/// `session_id` and, since v2.1.323, with the subagent's `agent_id`
+/// (changelog: "Fixed `PreCompact`, `PostCompact` and post-compaction
+/// `SessionStart` hooks not receiving `agent_id` and `agent_type` when a
+/// subagent compacts"). The session's own context was not compacted, so such
+/// an event must not checkpoint the session page the way its own compaction
+/// does, nor mark where that compaction cut the session for the recap.
+fn is_subagent_compaction(env: &HookEnvelope) -> bool {
+    matches!(env.event, HookEvent::PreCompact | HookEvent::PostCompaction)
+        && body_is_subagent(env.agent, &env.raw)
+}
+
 /// Durable body for a hook observation: scrub the **full** excerpt first,
 /// then apply the per-event ceiling to the redacted text.
 ///
@@ -5525,6 +5538,10 @@ async fn process_authorized(
     // Keep the successful keyed-ingest gate until every downstream effect has
     // completed. A replay that observes `ResumePending` must not race the first
     // delivery's page, handoff, consolidation, or key-completion tail.
+    // A subagent's compaction is stored like its other lifecycle events, as
+    // `other` (see `HookEvent::to_observation_kind`), so the recap never takes
+    // it for a boundary of the session's own compaction.
+    let subagent_compaction = is_subagent_compaction(&env);
     let (admission, log_title, _ingest_guard) = loop {
         // Rebuild both records on retry: the store validates and persists this
         // exact scope pair atomically with the keyed observation claim.
@@ -5538,7 +5555,18 @@ async fn process_authorized(
             occurred_at: env.occurred_at_micros(),
             origin: env.session_origin,
         };
-        let kind = env.event.to_observation_kind();
+        let kind = if subagent_compaction {
+            ObservationKind::Other
+        } else {
+            env.event.to_observation_kind()
+        };
+        let title = if subagent_compaction {
+            format!("subagent {}", env.event.to_observation_kind().as_str())
+        } else {
+            env.title_hint
+                .clone()
+                .unwrap_or_else(|| kind.as_str().to_string())
+        };
         let raw_obs = NewObservation {
             session_id,
             workspace_id: ws,
@@ -5546,10 +5574,7 @@ async fn process_authorized(
             kind,
             extension: env.extension.clone(),
             source_event: env.source_event.clone(),
-            title: env
-                .title_hint
-                .clone()
-                .unwrap_or_else(|| kind.as_str().to_string()),
+            title,
             body: durable_body(env.event, env.body_excerpt.as_deref(), &state.sanitizer),
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
@@ -5794,7 +5819,11 @@ async fn process_authorized(
     // that captures the state after compaction. Does NOT end the session
     // and does NOT create a handoff. The eventual SessionEnd supersedes
     // this page.
+    //
+    // A subagent's compaction left the session's context alone, so it writes
+    // no checkpoint, as a subagent's Stop writes no turn checkpoint below.
     let checkpoint_label = match env.event {
+        _ if is_subagent_compaction(&env) => None,
         HookEvent::PreCompact => Some("pre-compact"),
         HookEvent::PostCompaction => Some("post-compaction"),
         _ => None,
@@ -6030,13 +6059,22 @@ async fn process_authorized(
         // The writer observed substantive work when it answered `Substantive`,
         // so the digest cannot still satisfy the lifecycle-only predicate.
         debug_assert!(substantive || digest.is_substantive());
-        let new_page = synthesize_session_page(
+        let mut new_page = synthesize_session_page(
             page_ws,
             page_proj,
             session_id,
             admitted.agent_kind(),
             &digest,
         );
+        // Zero-LLM session pages get the same title-collision backstop the LLM
+        // and `memory_write_page` paths already apply (#2300).
+        crate::synth::disambiguate_session_page_title(
+            &state.reader,
+            &session_actor,
+            session_id,
+            &mut new_page,
+        )
+        .await;
         let track_page_write = turn_checkpoint && outcome == HookProcessingOutcome::Resumed;
         let previous_page_id = if track_page_write {
             state
@@ -6762,8 +6800,12 @@ async fn write_checkpoint_page(
     if !digest.is_substantive() {
         return Ok(false);
     }
-    let new_page =
+    let mut new_page =
         synthesize_session_page(workspace_id, project_id, session_id, agent_kind, &digest);
+    // Same title-collision backstop as the SessionEnd write (#2300): the
+    // checkpoint page carries the session's rule-based title too.
+    crate::synth::disambiguate_session_page_title(&state.reader, &actor, session_id, &mut new_page)
+        .await;
     // With a provider this page is the first half of a consolidation, so it
     // carries the `consolidate` admission operation the inline LLM write
     // used to: a policy refusing consolidation for this actor or scope fails
@@ -17860,6 +17902,83 @@ pub(crate) mod tests {
         );
     }
 
+    /// Zero-LLM SessionEnd pages whose titles collide get the session short id
+    /// suffixed, the same backstop (#926) the LLM consolidation and
+    /// `memory_write_page` paths already apply, so a resume habit that opens
+    /// every session with one phrase ("where were we?") no longer gives every
+    /// page one title and trips ai-memory's own `duplicate_title` curator
+    /// finding (#2300). The first page keeps the bare title; the second,
+    /// written while the first is the project's latest, is disambiguated.
+    /// With the backstop removed both titles are identical and the second
+    /// assertion fails.
+    #[tokio::test]
+    async fn zero_llm_session_pages_disambiguate_a_colliding_title() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sids = [
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        ];
+        for sid in sids {
+            let fire = |event: &str, body: serde_json::Value| {
+                let mut full = serde_json::json!({ "session_id": sid });
+                full.as_object_mut()
+                    .unwrap()
+                    .extend(body.as_object().unwrap().clone());
+                HookEnvelope::from_query_and_body(
+                    HookQuery {
+                        event: event.into(),
+                        agent: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                    full,
+                )
+            };
+            for env in [
+                fire("session-start", serde_json::json!({})),
+                fire(
+                    "user-prompt-submit",
+                    serde_json::json!({ "prompt": "where were we?" }),
+                ),
+                fire(
+                    "post-tool-use",
+                    serde_json::json!({
+                        "tool_name": "Read",
+                        "tool_input": { "file_path": "notes.md" },
+                        "tool_response": "dummy"
+                    }),
+                ),
+                fire("session-end", serde_json::json!({ "reason": "other" })),
+            ] {
+                process(&state, env, None, Vec::new()).await.unwrap();
+            }
+        }
+        let title_of = async |sid: &str| {
+            let path = format!("sessions/{sid}.md");
+            state
+                .reader
+                .page_body_by_ids(state.workspace_id, state.project_id, &path)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("session page {path} must exist"))
+                .title
+        };
+        let first = title_of(sids[0]).await;
+        let second = title_of(sids[1]).await;
+        assert_eq!(
+            first, "where were we?",
+            "the first page keeps the bare title"
+        );
+        assert_ne!(
+            second, first,
+            "the colliding second title must be disambiguated"
+        );
+        assert!(
+            second.starts_with("where were we?") && second.contains("(session "),
+            "unexpected disambiguated title: {second:?}"
+        );
+    }
+
     /// Compaction checkpoints write the heuristic page, enqueue the durable
     /// job, and return without calling the provider (#1229). Independent of
     /// the SessionEnd opt-in.
@@ -17946,6 +18065,57 @@ pub(crate) mod tests {
 
     /// Zero-LLM PreCompact still writes the synth page and must not insert a
     /// consolidation job.
+    /// A Claude Code `StopFailure`, posted by the stop hook as `event=stop`,
+    /// is stored as the turn's `stop` row naming the error, and the rendered
+    /// error text in `last_assistant_message` is not stored at all.
+    #[tokio::test]
+    async fn a_stop_failure_is_stored_as_a_stop_naming_the_error() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0f1";
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "stop".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid,
+                "hook_event_name": "StopFailure",
+                "error": "rate_limit",
+                "error_details": "429 Too Many Requests",
+                "last_assistant_message": "API Error: Rate limit reached",
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let rows = state
+            .reader
+            .session_observations_scoped(
+                state.workspace_id,
+                state.project_id,
+                session_id,
+                ai_memory_store::ObservationPage {
+                    limit: 10,
+                    offset: 0,
+                    order: ai_memory_store::ObservationOrder::Asc,
+                    kinds: Some(vec![ObservationKind::Stop]),
+                    query: None,
+                },
+            )
+            .await
+            .unwrap()
+            .records;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].title, "stop failure: rate_limit");
+        assert_eq!(
+            rows[0].body,
+            "error: rate_limit\ndetails: 429 Too Many Requests"
+        );
+        assert!(!format!("{rows:?}").contains("API Error"), "{rows:?}");
+    }
+
     #[tokio::test]
     async fn compaction_checkpoint_writes_synth_without_a_job_when_no_provider() {
         let tmp = TempDir::new().unwrap();
@@ -17994,6 +18164,188 @@ pub(crate) mod tests {
                 .is_none(),
             "zero-LLM PreCompact must not insert a consolidation job"
         );
+    }
+
+    /// Claude Code 2.1.323 reports a subagent's `PreCompact` under the parent's
+    /// session id with the subagent's `agent_id`. The session's own context
+    /// was not compacted, so no checkpoint page is written; the session's own
+    /// `PreCompact` afterwards still writes it (control).
+    #[tokio::test]
+    async fn a_subagent_compaction_writes_no_session_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0a7";
+        let fire = |name: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "session_id": sid,
+                "prompt": "keep this working state"
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: name.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        process(
+            &state,
+            fire("user-prompt-submit", serde_json::json!({})),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire(
+                "pre-compact",
+                serde_json::json!({ "agent_id": "a7", "agent_type": "Explore" }),
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let path = format!("sessions/{session_id}.md");
+        let page = || async {
+            state
+                .reader
+                .page_body_by_ids(state.workspace_id, state.project_id, &path)
+                .await
+                .unwrap()
+        };
+        assert!(
+            page().await.is_none(),
+            "a subagent's PreCompact must not checkpoint the session page"
+        );
+
+        process(
+            &state,
+            fire("pre-compact", serde_json::json!({})),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            page().await.is_some(),
+            "the session's own PreCompact still writes the checkpoint"
+        );
+    }
+
+    /// A subagent's compaction between the session's own two compactions is
+    /// stored as a subagent event, so the recap still covers everything since
+    /// the session's previous compaction instead of starting at the subagent's.
+    #[tokio::test]
+    async fn a_subagent_compaction_is_no_recap_boundary() {
+        use axum::response::IntoResponse as _;
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let sid = "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0b8";
+        let fire = |name: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "session_id": sid });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: name.into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        let subagent = serde_json::json!({ "agent_id": "a7", "agent_type": "Explore" });
+        for (event, extra) in [
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "BEFORE-WINDOW" }),
+            ),
+            ("pre-compact", serde_json::json!({})),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "WINDOW-PROMPT" }),
+            ),
+            ("pre-compact", subagent),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "STILL-IN-WINDOW" }),
+            ),
+            ("pre-compact", serde_json::json!({})),
+            (
+                "user-prompt-submit",
+                serde_json::json!({ "prompt": "AFTER-WINDOW" }),
+            ),
+        ] {
+            process(&state, fire(event, extra), None, Vec::new())
+                .await
+                .unwrap();
+        }
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let rows = state
+            .reader
+            .session_observations_scoped(
+                state.workspace_id,
+                state.project_id,
+                session_id,
+                ai_memory_store::ObservationPage {
+                    limit: 50,
+                    offset: 0,
+                    order: ai_memory_store::ObservationOrder::Asc,
+                    kinds: None,
+                    query: None,
+                },
+            )
+            .await
+            .unwrap()
+            .records;
+        let compactions: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|r| r.title.contains("pre-compact"))
+            .map(|r| (r.kind.as_str(), r.title.as_str()))
+            .collect();
+        assert_eq!(
+            compactions,
+            [
+                ("pre-compact", "pre-compact"),
+                ("other", "subagent pre-compact"),
+                ("pre-compact", "pre-compact"),
+            ],
+            "{rows:?}"
+        );
+
+        let response = crate::recap::handle_recap(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(crate::recap::RecapQuery {
+                agent: Some("claude-code".into()),
+                session_id: Some(sid.into()),
+                budget: None,
+                mode: None,
+            }),
+            None,
+            None,
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        for inside in ["WINDOW-PROMPT", "STILL-IN-WINDOW"] {
+            assert!(body.contains(inside), "{inside}: {body}");
+        }
+        for outside in ["BEFORE-WINDOW", "AFTER-WINDOW"] {
+            assert!(!body.contains(outside), "{outside}: {body}");
+        }
     }
 
     /// A compaction checkpoint keeps the agent's page as SessionEnd does,
@@ -18903,6 +19255,160 @@ pub(crate) mod tests {
                 "a consumed or superseded baton must not reappear"
             );
         }
+    }
+
+    async fn startup_checkpoint_snapshot_race(source_busy: bool, allow_claim: bool) {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = arrived.clone();
+        let proceed = release.clone();
+        let app = axum::Router::new().route(
+            "/admission",
+            axum::routing::post(move || {
+                let seen = seen.clone();
+                let proceed = proceed.clone();
+                async move {
+                    seen.notify_one();
+                    proceed.notified().await;
+                    if allow_claim {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let chain = ai_memory_wiki::AdmissionChain::new(vec![ai_memory_wiki::WebhookConfig {
+            name: "checkpoint-barrier".into(),
+            url: format!("http://{addr}/admission"),
+            timeout_ms: 700,
+            failure_policy: ai_memory_wiki::FailurePolicy::Reject,
+            events: vec![ai_memory_wiki::AdmissionOp::HandoffAccept],
+            blocking: true,
+        }])
+        .unwrap();
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state_with_admission(&tmp, chain).await;
+        state.skip_wiki_checkpoints = true;
+        let source = "startup-checkpoint-snapshot-source";
+        let timestamped_event = |event: &str, text: &str, at: &str| {
+            let mut env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("opencode2".into()),
+                    capture_assistant: Some("1".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": source,
+                    "prompt": text,
+                    "turn_checkpoint": true,
+                    "occurred_at": at,
+                    "_ai_memory_assistant": { "version": 1, "excerpt": text },
+                }),
+            );
+            crate::assistant_capture::apply_assistant_backstop(&mut env, true);
+            env
+        };
+        for (event, text, at) in [
+            ("user-prompt", "Complete the work", "2020-01-01T00:00:00Z"),
+            ("stop", "STALE-ASSISTANT-CHECKPOINT", "2020-01-01T00:01:00Z"),
+        ] {
+            process(&state, timestamped_event(event, text, at), None, Vec::new())
+                .await
+                .unwrap();
+        }
+        let before = state
+            .reader
+            .latest_open_handoff(
+                state.workspace_id,
+                state.project_id,
+                None,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            before
+                .content
+                .summary
+                .contains("STALE-ASSISTANT-CHECKPOINT")
+        );
+        let now = Timestamp::now();
+        let query = HandoffQuery {
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            agent: Some("codex".into()),
+            session_id: Some("startup-checkpoint-snapshot-receiver".into()),
+            recovery: Some("0".into()),
+            profile_digest: Some("0".into()),
+            ..Default::default()
+        };
+        let (rendered, ()) = tokio::join!(
+            fetch_and_accept_handoff_at(&state, query, None, Vec::new(), None, now),
+            async {
+                tokio::time::timeout(Duration::from_secs(2), arrived.notified())
+                    .await
+                    .expect("startup must reach the admission barrier");
+                // The hook supports original event timestamps. A delayed turn
+                // can refresh a checkpoint while its source remains quiet.
+                let at = if source_busy {
+                    now.to_string()
+                } else {
+                    "2020-01-01T00:02:00Z".into()
+                };
+                process(
+                    &state,
+                    timestamped_event("stop", "FRESH-ASSISTANT-CHECKPOINT", &at),
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+                release.notify_one();
+            }
+        );
+        server.abort();
+        let body = rendered.unwrap().unwrap_or_default();
+        let after = state
+            .reader
+            .handoff_by_id(before.scope.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.content.summary.contains("FRESH-ASSISTANT-CHECKPOINT"));
+        if allow_claim && !source_busy {
+            assert_eq!(
+                after.lifecycle.state,
+                ai_memory_core::HandoffState::Accepted
+            );
+            assert!(
+                body.contains("FRESH-ASSISTANT-CHECKPOINT"),
+                "the claimed row's newest checkpoint must be delivered: {body}"
+            );
+            assert!(!body.contains("STALE-ASSISTANT-CHECKPOINT"), "{body}");
+        } else {
+            assert_eq!(after.lifecycle.state, ai_memory_core::HandoffState::Open);
+            assert!(
+                body.is_empty(),
+                "a refused claim must deliver no snapshot: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_delivers_the_checkpoint_snapshot_it_actually_claimed() {
+        startup_checkpoint_snapshot_race(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn startup_checkpoint_snapshot_still_respects_busy_source_and_admission() {
+        startup_checkpoint_snapshot_race(true, true).await;
+        startup_checkpoint_snapshot_race(false, false).await;
     }
 
     // Live incident: parallel OpenCode sessions in one directory. Every

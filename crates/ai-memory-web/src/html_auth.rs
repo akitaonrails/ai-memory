@@ -68,7 +68,8 @@ fn join_root(web_root: &str, leaf: &str) -> String {
 /// Allow only same-origin relative paths under `web_root`.
 ///
 /// Rejects protocol-relative `//`, absolute URLs (`http:` / `https:`),
-/// backslashes, and paths outside the wiki slug. Default is the wiki root.
+/// backslashes, control characters, and paths outside the wiki slug. Default
+/// is the wiki root.
 #[must_use]
 pub fn sanitize_next(raw: Option<&str>, web_root: &str) -> String {
     let default = if web_root.is_empty() {
@@ -79,7 +80,14 @@ pub fn sanitize_next(raw: Option<&str>, web_root: &str) -> String {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return default;
     };
-    if raw.contains("://") || raw.starts_with("//") || raw.contains('\\') || raw.contains('\0') {
+    if raw.contains("://") || raw.starts_with("//") || raw.contains('\\') {
+        return default;
+    }
+    // A URL parser drops ASCII tab and newline characters before it reads the
+    // scheme, so `/<TAB>/host` reaches the browser as `//host`: the escaping
+    // form the checks above exist to refuse. Any other control character is
+    // equally unfit to be a redirect target.
+    if raw.chars().any(char::is_control) {
         return default;
     }
     if !raw.starts_with('/') {
@@ -246,6 +254,35 @@ mod tests {
         assert_eq!(sanitize_next(Some("/other"), "/web"), "/web");
         assert_eq!(sanitize_next(Some("/web/../admin"), "/web"), "/web");
         assert_eq!(sanitize_next(Some("web/foo"), "/web"), "/web");
+    }
+
+    /// A URL parser removes ASCII tab and newline characters before it reads
+    /// the scheme or host, so `/<TAB>/evil.example` becomes `//evil.example`
+    /// once the browser hands it to `location.assign`. Reject controls before
+    /// the redirect target can be stored, not only the `//` spelling.
+    #[test]
+    fn sanitize_next_rejects_control_characters() {
+        for raw in [
+            "/\t/evil.example",
+            "/\r/evil.example",
+            "/\n/evil.example",
+            "/\u{0}/evil.example",
+            "/web/\u{7f}evil",
+        ] {
+            assert_eq!(
+                sanitize_next(Some(raw), "/web"),
+                "/web",
+                "{raw:?} must not survive as a redirect target"
+            );
+            assert_eq!(
+                sanitize_next(Some(raw), ""),
+                "/",
+                "root-mounted {raw:?} must not survive either"
+            );
+        }
+        // The legitimate control: an ordinary path is still returned verbatim.
+        assert_eq!(sanitize_next(Some("/web/w/a"), "/web"), "/web/w/a");
+        assert_eq!(sanitize_next(Some("/w/a"), ""), "/w/a");
     }
 
     #[test]

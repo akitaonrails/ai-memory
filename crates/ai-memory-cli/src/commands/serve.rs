@@ -5624,6 +5624,22 @@ mod tests {
         );
     }
 
+    /// Hang detector around the worker's test-only `completed` notify.
+    /// The wait is that completion signal; the timeout only fails a stuck
+    /// worker. Five seconds is enough on Linux CI. A loaded
+    /// `windows-latest` runner has missed it (#2305).
+    const WORKER_SETTLE_TIMEOUT: Duration = if cfg!(windows) {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(5)
+    };
+
+    async fn wait_for_worker_settled(completed: &tokio::sync::Notify, what: &'static str) {
+        tokio::time::timeout(WORKER_SETTLE_TIMEOUT, completed.notified())
+            .await
+            .expect(what);
+    }
+
     #[tokio::test]
     async fn session_consolidation_worker_consumes_and_completes_durable_job() {
         let tmp = TempDir::new().unwrap();
@@ -5702,9 +5718,7 @@ mod tests {
         ));
         notify.notify_one();
 
-        tokio::time::timeout(Duration::from_secs(5), completed.notified())
-            .await
-            .expect("worker should complete the queued job");
+        wait_for_worker_settled(&completed, "worker should complete the queued job").await;
 
         let path = format!("sessions/{session_id}.md");
         assert!(
@@ -5810,9 +5824,11 @@ mod tests {
         ));
         notify.notify_one();
 
-        tokio::time::timeout(Duration::from_secs(5), completed.notified())
-            .await
-            .expect("worker should complete the open-session checkpoint");
+        wait_for_worker_settled(
+            &completed,
+            "worker should complete the open-session checkpoint",
+        )
+        .await;
 
         let path = format!("sessions/{session_id}.md");
         assert!(
@@ -5917,9 +5933,7 @@ mod tests {
         ));
         notify.notify_one();
 
-        tokio::time::timeout(Duration::from_secs(5), completed.notified())
-            .await
-            .expect("worker should complete the owned checkpoint");
+        wait_for_worker_settled(&completed, "worker should complete the owned checkpoint").await;
         cancel.cancel();
         task.await.unwrap();
 
@@ -6024,7 +6038,7 @@ mod tests {
         // while claimed, and settles with a `last_error` once the failure
         // lands.
         let db = rusqlite::Connection::open(store.db_path()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WORKER_SETTLE_TIMEOUT;
         let (state, last_error, completed_at) = loop {
             let row = db
                 .query_row(
@@ -6188,9 +6202,7 @@ mod tests {
             completed.clone(),
         ));
         notify.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), completed.notified())
-            .await
-            .expect("worker should settle the queued job");
+        wait_for_worker_settled(&completed, "worker should settle the queued job").await;
         cancel.cancel();
         task.await.unwrap();
         let now = jiff::Timestamp::now().as_microsecond();

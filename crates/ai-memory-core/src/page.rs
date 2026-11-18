@@ -107,7 +107,7 @@ pub struct PageEvidence {
     pub source_id: String,
     /// For a [`PageEvidenceKind::Session`] citation, which of that
     /// session's observations the page was compiled from (#2164). The
-    /// store records them in `page_sources` (V108) in the page-upsert
+    /// store records them in `page_sources` (V112) in the page-upsert
     /// transaction. Ignored for every other kind.
     #[serde(default)]
     pub observations: SourceObservations,

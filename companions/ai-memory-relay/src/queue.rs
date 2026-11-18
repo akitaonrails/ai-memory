@@ -554,6 +554,15 @@ impl Queue {
                   WHERE ingest_key = ?1",
                 params![key, now_ms],
             )?;
+            // An unsent event may have been queued longer than the retry
+            // window. Its agent pin must survive the attempt and receipt too.
+            tx.execute(
+                "UPDATE session_agent SET last_seen_ms = MAX(last_seen_ms, ?2)
+                   WHERE (session_id, agent) IN (
+                       SELECT session_id, agent FROM pending WHERE ingest_key = ?1
+                   )",
+                params![key, now_ms],
+            )?;
         }
         tx.commit()?;
         Ok(())

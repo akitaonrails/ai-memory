@@ -838,6 +838,7 @@ async fn run_once_with_wiring(
             JailLaunch {
                 support: &support,
                 contract: contract.as_ref(),
+                harness: requested_harness.is_some().then_some(provisional_harness),
             },
             &toggles,
             jail_facts.project_config,
@@ -1674,6 +1675,7 @@ async fn run_once_with_wiring(
                     .as_ref()
                     .and_then(|status| status.native_session_id.as_deref())
             {
+                let (quoted_workspace, quoted_project) = finalize_scope_args(&workspace, &project);
                 eprintln!(
                     "{}",
                     diagnostic(
@@ -1683,8 +1685,8 @@ async fn run_once_with_wiring(
                             harness.as_str(),
                             harness.agent_kind().as_str(),
                             SessionId::from_native(linked),
-                            super::render_shared::shell_quote(&workspace),
-                            super::render_shared::shell_quote(&project)
+                            quoted_workspace,
+                            quoted_project
                         )
                     )
                 );
@@ -1955,17 +1957,19 @@ async fn run_once_with_wiring(
             // scope: its hooks are not installed or never fired, or they
             // filed it under another workspace/project.
             Ok(_) => {}
-            Err(error) => eprintln!(
-                "{}",
-                diagnostic(
-                    &config.i18n,
-                    format!(
-                        "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
-                        super::render_shared::shell_quote(&workspace),
-                        super::render_shared::shell_quote(&project)
+            Err(error) => {
+                let (quoted_workspace, quoted_project) = finalize_scope_args(&workspace, &project);
+                eprintln!(
+                    "{}",
+                    diagnostic(
+                        &config.i18n,
+                        format!(
+                            "ai-memory: could not finalize the {agent} session {session} ({error:#}); run `ai-memory finalize-session --agent {agent} --reopen --session-id {session} --workspace {} --project {}`",
+                            quoted_workspace, quoted_project
+                        )
                     )
-                )
-            ),
+                );
+            }
         }
     }
     Ok(RunOutcome {
@@ -3732,6 +3736,7 @@ async fn confirm_yolo_and_maybe_reexec(
         JailLaunch {
             support: &support,
             contract: contract.as_ref(),
+            harness: Some(offer.harness),
         },
         &toggles,
         facts.project_config,
@@ -3774,6 +3779,10 @@ fn jail_contract_for(
 struct JailLaunch<'a> {
     support: &'a JailSupport,
     contract: Option<&'a ContractTarget>,
+    /// The harness this launch was asked for, when it is known before the
+    /// re-exec. `None` on an automatic choice, which the server resolves
+    /// later.
+    harness: Option<ManagedHarness>,
 }
 
 /// What a contract launch needs from [`exec_under_ai_jail`].
@@ -3945,25 +3954,48 @@ fn exec_under_ai_jail(
             folders,
         );
     }
-    // `--agent-state` is a bare toggle: enable it so the harness's own login
-    // state survives ai-jail's ephemeral private home (ai-jail derives the
-    // per-harness state location from the wrapped `run <harness>` it parses).
-    // `--no-save-config` keeps ai-jail from writing these transient flags into
-    // the project `.ai-jail` (see `build_ai_jail_invocation`).
-    let jail_args = build_ai_jail_invocation(
+    let jail_args = legacy_jail_argv(
         &exe,
         &forwarded,
         &present,
-        true,
+        launch.harness,
         launch.support.supports("no-save-config"),
+        toggles,
+        folders,
+    );
+    eprintln!("{}", jail_summary(toggles, project_config, folders));
+    reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
+}
+
+/// Assemble the flag-based ai-jail argv, used when ai-jail predates the
+/// wrapper contract or has no preset for this harness.
+///
+/// `--agent-state` is a bare toggle: enable it so the harness's own login
+/// state survives ai-jail's ephemeral private home (ai-jail derives the
+/// per-harness state location from the wrapped `run <harness>` it parses).
+/// `--no-save-config` keeps ai-jail from writing these transient flags into
+/// the project `.ai-jail` (see `build_ai_jail_invocation`).
+fn legacy_jail_argv(
+    exe: &Path,
+    forwarded: &[OsString],
+    present: &[&'static str],
+    harness: Option<ManagedHarness>,
+    no_save_config: bool,
+    toggles: &[JailToggleChoice],
+    folders: &[super::jail_folders::ExtraFolder],
+) -> Vec<OsString> {
+    build_ai_jail_invocation(
+        exe,
+        forwarded,
+        &jail_launch_env_names(harness, present),
+        true,
+        no_save_config,
         toggles,
         &folders
             .iter()
             .map(|folder| (folder.path.as_path(), folder.writable))
             .collect::<Vec<_>>(),
-    );
-    eprintln!("{}", jail_summary(toggles, project_config, folders));
-    reexec_under_ai_jail(ai_jail, &jail_args, &resolved)
+    )
 }
 
 fn jail_forwarded_args(
@@ -3986,6 +4018,25 @@ fn jail_forwarded_args(
         args.push(OsString::from("--no-exit-prompt"));
     }
     args
+}
+
+/// The forwarded variable names a jail launch may pass for `harness`.
+///
+/// The contract path filters provider credentials per harness in
+/// `harness_env_names`, so a Codex jail never receives an Anthropic key. The
+/// flag-based path has to apply the same rule: without it an old ai-jail, or
+/// a harness ai-jail has no preset for, receives every provider credential the
+/// operator's environment happens to hold.
+fn jail_launch_env_names(
+    harness: Option<ManagedHarness>,
+    present: &[&'static str],
+) -> Vec<&'static str> {
+    match harness {
+        Some(harness) => harness_env_names(harness, present),
+        // An automatically chosen harness is only known after the re-exec, so
+        // there is nothing to filter against yet.
+        None => present.to_vec(),
+    }
 }
 
 /// The [`FORWARDED_ENV_NAMES`] the re-exec passes with `--env NAME`: those set
@@ -5584,6 +5635,15 @@ fn choose_native_session(
     }
 }
 
+/// The `--workspace` and `--project` values of a printed `finalize-session`
+/// command, quoted for the shell the operator pastes it into.
+fn finalize_scope_args(workspace: &str, project: &str) -> (String, String) {
+    (
+        super::render_shared::native_shell_quote(workspace),
+        super::render_shared::native_shell_quote(project),
+    )
+}
+
 /// Render a native session id for terminal output, bounded so a long id
 /// cannot flood the line. CodeQL's `rust/cleartext-logging` barrier model
 /// (`.github/codeql/extensions/ai-memory-models/models/log-barriers.model.yml`)
@@ -6332,6 +6392,21 @@ mod tests {
 
     fn plan(warn: bool, mode: JailMode) -> JailPlan {
         JailPlan { warn, mode }
+    }
+
+    /// The printed `finalize-session` command is pasted into the operator's
+    /// own shell. POSIX `'\''` escaping is not PowerShell's, so a scope with an
+    /// apostrophe must be quoted the native way, as the destructive
+    /// confirmations already are.
+    #[test]
+    fn finalize_scope_args_quote_for_the_native_shell() {
+        let (workspace, project) = finalize_scope_args("Levi's work", "api");
+        assert_eq!(project, "api");
+        if cfg!(windows) {
+            assert_eq!(workspace, "'Levi''s work'");
+        } else {
+            assert_eq!(workspace, r"'Levi'\''s work'");
+        }
     }
 
     /// Every harness a journal entry can name.
@@ -7268,6 +7343,69 @@ mod tests {
             let original = ["--config", "/tmp/run", command].map(OsString::from);
             assert_eq!(jail_forwarded_args(&config, original.clone()), original);
         }
+    }
+
+    /// The contract path scopes provider credentials to the harness. The
+    /// flag-based argv has no contract, so it has to apply the same rule:
+    /// otherwise a Codex launch under an older ai-jail carries the operator's
+    /// Anthropic, Gemini, Copilot and OpenRouter keys as well.
+    #[test]
+    fn a_flag_based_launch_forwards_only_its_harness_provider_keys() {
+        const ALL: &[&str] = &[
+            "AI_MEMORY_SERVER_URL",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "COPILOT_GITHUB_TOKEN",
+            "OPENROUTER_API_KEY",
+        ];
+        let argv = legacy_jail_argv(
+            Path::new("/usr/local/bin/ai-memory"),
+            &[OsString::from("run"), OsString::from("codex")],
+            ALL,
+            Some(ManagedHarness::Codex),
+            true,
+            &[],
+            &[],
+        );
+        let rendered: Vec<String> = argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            rendered.iter().any(|arg| arg == "OPENAI_API_KEY"),
+            "a Codex jail keeps its own key: {rendered:?}"
+        );
+        for foreign in [
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "COPILOT_GITHUB_TOKEN",
+            "OPENROUTER_API_KEY",
+        ] {
+            assert!(
+                !rendered.iter().any(|arg| arg == foreign),
+                "a Codex jail must not receive {foreign}: {rendered:?}"
+            );
+        }
+
+        // An automatic harness is resolved after the re-exec, so it keeps
+        // forwarding what is set rather than guessing.
+        let automatic = legacy_jail_argv(
+            Path::new("/usr/local/bin/ai-memory"),
+            &[],
+            ALL,
+            None,
+            true,
+            &[],
+            &[],
+        );
+        let rendered: Vec<String> = automatic
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(rendered.iter().any(|arg| arg == "ANTHROPIC_API_KEY"));
     }
 
     #[test]

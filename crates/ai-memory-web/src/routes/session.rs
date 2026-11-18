@@ -14,7 +14,7 @@ use ai_memory_store::{ObservationOrder, ObservationPage};
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use super::api::{
@@ -229,7 +229,7 @@ pub(crate) async fn handler(
         observations: rows,
     };
     match view.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

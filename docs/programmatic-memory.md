@@ -99,6 +99,8 @@ Writes and handoff creation may create the explicit scope if it is missing.
 Reads fail closed on missing or partial scope. A handoff is claimed once. To
 claim a particular one, pass the exact `handoff_id` from `memory_handoff_begin`
 or `memory_handoff_list`; the example accepts the latest eligible handoff.
+Leave `handoff_id` out for that default: an empty or whitespace-only id is
+refused with `invalid_params` and claims nothing.
 If SessionStart already owns delivery, let that hook claim it.
 [usage.md](usage.md) describes ownership and handoff states.
 
@@ -115,7 +117,9 @@ page. When the page changed in between, nothing is written or deleted and the
 call fails with JSON-RPC `invalid_request` whose `data` is
 `{"reason": "precondition_failed", "path", "expected_page_id",
 "current_page_id"}`; re-read the page and decide. A caller without write access
-gets the usual authorization error, never the current version.
+gets the usual authorization error, never the current version. An empty or
+whitespace-only `expected_page_id` is refused with `invalid_params` and changes
+nothing; leave the field out for an unconditional write or delete.
 
 Exact `memory_read_page` and `memory_write_page` calls can select an existing
 destination by stable id with `workspace` + `project_id`. This is mutually

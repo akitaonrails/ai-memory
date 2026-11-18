@@ -70,6 +70,37 @@ pub fn normalize_server_url(raw: &str) -> Result<String> {
     Ok(format!("{}://{}{}", url.scheme(), authority, path))
 }
 
+/// Whether sending the bearer to `server_url` would put it on the wire in the
+/// clear.
+///
+/// `http` to loopback stays on this machine and is a normal single-host setup,
+/// so it is not worth a warning. Anything else carries the root bearer in
+/// plaintext, which `SECURITY.md` tells operators to avoid behind a TLS
+/// reverse proxy. The relay does not refuse the deployment: an operator may
+/// have a trusted network path, and the token may be one they minted for it.
+pub fn cleartext_bearer_risk(server_url: &str) -> bool {
+    let Ok(url) = Url::parse(server_url) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    let Some(raw_host) = url.host_str() else {
+        return false;
+    };
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(raw_host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    !host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 /// The `{url, body}` pair the batch endpoint expects.
 #[derive(Debug, serde::Serialize)]
 pub struct BatchItem {
@@ -204,5 +235,36 @@ fn transport_class(error: &reqwest::Error) -> &'static str {
         "request"
     } else {
         "io"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleartext_bearer_risk;
+
+    /// A token over `http` to anywhere but loopback is in the clear; every
+    /// other destination is either encrypted or stays on this machine.
+    #[test]
+    fn cleartext_bearer_risk_flags_only_off_loopback_http() {
+        for risky in [
+            "http://memory.internal:49374",
+            "http://10.0.0.5:49374",
+            "http://192.168.1.20/memory",
+            "http://[2001:db8::1]:49374",
+        ] {
+            assert!(
+                cleartext_bearer_risk(risky),
+                "{risky} sends the bearer in the clear"
+            );
+        }
+        for safe in [
+            "https://memory.example.com",
+            "https://10.0.0.5",
+            "http://127.0.0.1:49374",
+            "http://localhost:49374",
+            "http://[::1]:49374",
+        ] {
+            assert!(!cleartext_bearer_risk(safe), "{safe} needs no warning");
+        }
     }
 }

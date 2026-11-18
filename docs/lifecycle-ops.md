@@ -1132,7 +1132,9 @@ cannot restore a page in the checkout's project by accident.
 What happens:
 
 1. Server resolves `(workspace, project)` without auto-creating anything.
-2. Server validates the page path.
+2. Server validates the page path. A `--from` revision is resolved to an
+   immutable commit and checked for that page before taking a checkpoint, so
+   `HEAD` or `HEAD~1` keeps its original meaning when uncommitted changes exist.
 3. Server checkpoints the current wiki tree first (`pre-restore-page ...`) when
    there are uncommitted changes.
 4. Server reads either the exact markdown blob for that project/page from git

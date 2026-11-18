@@ -531,21 +531,60 @@ pub(crate) fn remove(data_dir: &Path, name: &ProfileName) -> Result<bool> {
 /// Propagates IO failures other than "not found".
 pub(crate) fn clear_tokens(data_dir: &Path, keep: Option<&Path>) -> std::io::Result<()> {
     let dir = data_dir.join(TOKEN_DIR);
-    let keep = keep.map(crate::marker::absolute_normalized);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
+    // The root bearer must be recognized at every spelling the configuration
+    // accepts: a file below a subdirectory of `auth-tokens`, or an absolute
+    // setting that reaches the same file through a directory alias (on macOS,
+    // `/var/...` and `/private/var/...` name one file; config load canonicalizes
+    // the data dir but keeps the token setting as supplied). We match by
+    // same-file identity — `canonicalize` on both sides, which resolves the
+    // alias symmetrically — and fall back to lexical normalization when the
+    // keep file is absent so an unresolvable setting still cannot sweep away a
+    // sibling. See #2341.
+    let keep_norm = keep.map(crate::marker::absolute_normalized);
+    let keep_canon = keep.and_then(|path| std::fs::canonicalize(path).ok());
+    let is_keep = |path: &Path| -> bool {
+        if let (Some(canonical), Ok(resolved)) = (keep_canon.as_ref(), std::fs::canonicalize(path))
+            && &resolved == canonical
+        {
+            return true;
+        }
+        keep_norm.as_ref() == Some(&crate::marker::absolute_normalized(path))
+    };
+    let kept = match clear_dir_preserving(&dir, &is_keep) {
+        Ok(kept) => kept,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
+    if kept {
+        return Ok(());
+    }
+    match std::fs::remove_dir(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove every token file under `dir` except the one `is_keep` matches,
+/// pruning each directory that ends up empty. Returns whether anything was
+/// kept — the keep file, or a directory still holding it at any depth, so a
+/// nested root bearer and its parent survive. Symlinked entries are unlinked,
+/// never followed, so the sweep stays inside `dir`.
+fn clear_dir_preserving(dir: &Path, is_keep: &dyn Fn(&Path) -> bool) -> std::io::Result<bool> {
     let mut kept = false;
-    for entry in entries {
-        let path = entry?.path();
-        if keep.as_ref() == Some(&crate::marker::absolute_normalized(&path)) {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if is_keep(&path) {
             kept = true;
             continue;
         }
-        let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
+        let removed = if entry.file_type()?.is_dir() {
+            if clear_dir_preserving(&path, is_keep)? {
+                kept = true;
+                continue;
+            }
+            std::fs::remove_dir(&path)
         } else {
             std::fs::remove_file(&path)
         };
@@ -555,14 +594,7 @@ pub(crate) fn clear_tokens(data_dir: &Path, keep: Option<&Path>) -> std::io::Res
             Err(e) => return Err(e),
         }
     }
-    if kept {
-        return Ok(());
-    }
-    match std::fs::remove_dir(&dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    Ok(kept)
 }
 
 /// Delete a profile's token file. Returns whether one was there.
@@ -1060,6 +1092,69 @@ mod tests {
         // token in the directory, and goes with the rest.
         clear_tokens(dd.path(), None).unwrap();
         assert!(!dd.path().join(TOKEN_DIR).exists());
+    }
+
+    /// #2341: a root bearer configured below a subdirectory of `auth-tokens`
+    /// must survive uninstall. The flat sweep used to `remove_dir_all` the
+    /// enclosing subdirectory because it only compared top-level entries.
+    #[test]
+    fn clear_tokens_keeps_a_nested_root_bearer() {
+        let dd = tempfile::tempdir().unwrap();
+        let root = dd.path().join(TOKEN_DIR).join("nested").join("root");
+        store_root_token(&root, "root-secret").unwrap();
+        add(
+            dd.path(),
+            &name("b"),
+            "https://b.example",
+            &[],
+            Some("tok-b"),
+        )
+        .unwrap();
+
+        clear_tokens(dd.path(), Some(&root)).unwrap();
+        assert_eq!(
+            read_token(dd.path(), &name("b")),
+            None,
+            "profile token removed"
+        );
+        assert_eq!(
+            crate::config::read_trimmed_secret(&root).as_deref(),
+            Some("root-secret"),
+            "the nested root bearer survives"
+        );
+
+        // Control: the same nested file is swept when it is not the configured
+        // root bearer.
+        clear_tokens(dd.path(), None).unwrap();
+        assert!(!dd.path().join(TOKEN_DIR).exists());
+    }
+
+    /// #2341: an absolute `bearer_token_file` that reaches the root through a
+    /// directory alias (the macOS `/var` → `/private/var` symlink) names the
+    /// same file as the canonicalized data dir. Same-file identity, not a
+    /// lexical string match, must keep it.
+    #[cfg(unix)]
+    #[test]
+    fn clear_tokens_keeps_a_root_bearer_reached_through_a_directory_alias() {
+        let dd = tempfile::tempdir().unwrap();
+        let real = dd.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = dd.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let root = root_token_path(&real);
+        store_root_token(&root, "root-secret").unwrap();
+        store_token(&real, &name("b"), "tok-b").unwrap();
+
+        // `keep` arrives through the alias; the files on disk live under `real`.
+        let keep_via_alias = root_token_path(&alias);
+        clear_tokens(&real, Some(&keep_via_alias)).unwrap();
+        assert_eq!(read_token(&real, &name("b")), None, "profile token removed");
+        assert_eq!(
+            crate::config::read_trimmed_secret(&root).as_deref(),
+            Some("root-secret"),
+            "the aliased root bearer survives"
+        );
     }
 
     #[test]

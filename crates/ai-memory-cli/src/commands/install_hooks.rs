@@ -10679,6 +10679,15 @@ mod tests {
         let pre = root["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["hooks"][0]["command"], "/usr/local/bin/guard.sh");
+        // Qwen fires StopFailure instead of Stop when an API error or its loop
+        // detection ends the turn; it runs the stop event.
+        let stop_failure = root["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("StopFailure is wired");
+        assert!(
+            stop_failure.contains(" hook --event stop --agent qwen-code "),
+            "{stop_failure}"
+        );
     }
 
     #[test]
@@ -13590,6 +13599,17 @@ model = "gpt-5"
             written.contains("hook --event session-start --agent codex"),
             "{written}"
         );
+        // An interrupted turn runs Interrupt instead of Stop, through the
+        // same stop command.
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let command = |event: &str| {
+            parsed
+                .pointer(&format!("/hooks/{event}/0/hooks/0/command"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        assert!(command("Interrupt").is_some(), "{written}");
+        assert_eq!(command("Interrupt"), command("Stop"), "{written}");
     }
 
     /// #552, the regression guard: `--apply` must persist the bearer under the
@@ -18475,6 +18495,18 @@ process.exit(0);
                 entries[i].1
             );
         }
+        // StopFailure and Interrupt fire in place of Stop and run exactly its
+        // command, whatever the platform renders it as.
+        let command_of = |name: &str| {
+            entries
+                .iter()
+                .find(|(event, _)| event.as_str() == name)
+                .map(|(_, command)| command.clone())
+                .unwrap_or_else(|| panic!("{name} is wired"))
+        };
+        for abnormal in ["StopFailure", "Interrupt"] {
+            assert_eq!(command_of(abnormal), command_of("Stop"), "{abnormal}");
+        }
         // Only the allowed keys are written — Kimi Code rejects unknown
         // fields by failing the whole config load.
         let doc: toml_edit::DocumentMut =
@@ -18772,6 +18804,18 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
             Some(failure),
             parsed
                 .pointer("/hooks/PostToolUse/0/hooks/0/command")
+                .and_then(serde_json::Value::as_str)
+        );
+        // A turn an API error ends runs StopFailure instead of Stop, through
+        // the same stop handler.
+        let stop_failure = parsed
+            .pointer("/hooks/StopFailure/0/hooks/0/command")
+            .and_then(serde_json::Value::as_str)
+            .expect("StopFailure command should be present");
+        assert_eq!(
+            Some(stop_failure),
+            parsed
+                .pointer("/hooks/Stop/0/hooks/0/command")
                 .and_then(serde_json::Value::as_str)
         );
     }

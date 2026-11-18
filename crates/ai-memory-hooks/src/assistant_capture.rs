@@ -13,10 +13,13 @@
 //! opt-in path that re-introduces a sanitized, capped excerpt: the client-side
 //! [`transform_for_client`] and the server-side [`apply_assistant_backstop`].
 
-use ai_memory_core::{AgentKind, OBSERVATION_BODY_MAX_BYTES, Sanitizer, truncate_utf8_bytes};
+use ai_memory_core::{
+    AgentKind, OBSERVATION_BODY_MAX_BYTES, Sanitizer, truncate_utf8_bytes,
+    truncate_utf8_bytes_head_tail,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::payload::{HookEnvelope, HookEvent};
+use crate::payload::{HookEnvelope, HookEvent, abnormal_turn_end};
 
 /// Synthetic body key carrying the opt-in, sanitized assistant excerpt from the
 /// client to the server. Distinct from the raw `last_assistant_message` field,
@@ -119,8 +122,8 @@ pub struct ClientAssistantTransform {
 ///
 /// Reads the candidate assistant message for `(agent, event)`, unconditionally
 /// strips the raw field, and — when the value is a non-empty, in-bounds string —
-/// sanitizes it with the built-in `Sanitizer`, truncates it to
-/// [`OBSERVATION_BODY_MAX_BYTES`] on a UTF-8 boundary, and splices the versioned
+/// sanitizes it with the built-in `Sanitizer`, retains its beginning and ending
+/// within [`OBSERVATION_BODY_MAX_BYTES`] on UTF-8 boundaries, and splices the versioned
 /// [`AssistantCaptureProtocol`] into the body under [`ASSISTANT_MARKER_KEY`].
 ///
 /// The client cuts at the largest cap the server can be configured with, not
@@ -136,8 +139,13 @@ pub fn transform_for_client(
     agent: AgentKind,
     event: HookEvent,
 ) -> ClientAssistantTransform {
-    // Read the eligible value BEFORE stripping removes the field.
-    let candidate = assistant_message_field(agent, event).and_then(|field| {
+    // Read the eligible value BEFORE stripping removes the field. A failed
+    // turn's `last_assistant_message` is the harness's rendered error text,
+    // not a reply (Claude Code and Qwen Code `StopFailure`), and an
+    // interrupted turn has no reply, so neither is a candidate.
+    let reply_field =
+        assistant_message_field(agent, event).filter(|_| abnormal_turn_end(raw).is_none());
+    let candidate = reply_field.and_then(|field| {
         raw.as_object()
             .and_then(|object| object.get(field))
             .and_then(serde_json::Value::as_str)
@@ -154,7 +162,7 @@ pub fn transform_for_client(
         };
     };
     let scrubbed = Sanitizer::builtin().scrub(&value);
-    let excerpt = truncate_utf8_bytes(&scrubbed, OBSERVATION_BODY_MAX_BYTES);
+    let excerpt = truncate_utf8_bytes_head_tail(&scrubbed, OBSERVATION_BODY_MAX_BYTES);
     if excerpt.is_empty() {
         return ClientAssistantTransform {
             changed,
@@ -200,7 +208,8 @@ pub fn apply_assistant_backstop(env: &mut HookEnvelope, server_enabled: bool, ma
 
     let eligible = server_enabled
         && env.capture_assistant_requested
-        && assistant_message_field(env.agent, env.event).is_some();
+        && assistant_message_field(env.agent, env.event).is_some()
+        && abnormal_turn_end(&env.raw).is_none();
     if !eligible {
         return;
     }
@@ -212,10 +221,14 @@ pub fn apply_assistant_backstop(env: &mut HookEnvelope, server_enabled: bool, ma
         // the client's length. Symmetric to the server re-scrub in `process()`:
         // a forged or buggy client that satisfies the gates cannot inject an
         // oversized Stop body (the request body limit alone is 10 MiB). The
-        // client sends up to the 16 KiB ceiling, so this is where the
-        // configured cap (#2118) is applied.
-        let excerpt =
-            truncate_utf8_bytes(&protocol.excerpt, max_bytes.min(OBSERVATION_BODY_MAX_BYTES));
+        // client sends up to the 16 KiB ceiling, so this is the authoritative
+        // cut where the configured cap (#2118) is applied. Head-and-tail, so the
+        // stored excerpt keeps the reply's beginning and its final result rather
+        // than only the tail.
+        let excerpt = truncate_utf8_bytes_head_tail(
+            &protocol.excerpt,
+            max_bytes.min(OBSERVATION_BODY_MAX_BYTES),
+        );
         if !excerpt.is_empty() {
             env.body_excerpt = Some(excerpt);
         }
@@ -396,6 +409,58 @@ mod tests {
     }
 
     #[test]
+    fn client_selection_preserves_both_ends_and_omits_middle() {
+        let beginning = "INITIAL_DECISION: inspect the parser.\n";
+        let ending = "\nFINAL_RESULT: fixed the parser. PRIVATE_PROSE_LIMITATION";
+        // Each filler run is ~9 KB, so the message clears the 16 KiB client
+        // ceiling and the head-and-tail cut actually fires.
+        let message = format!(
+            "{beginning}{}OMITTED_MIDDLE_DECISION{}{ending}",
+            "é🧪".repeat(1500),
+            "é🧪".repeat(1500),
+        );
+        for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode] {
+            let mut raw = serde_json::json!({
+                "session_id": "same-session",
+                "last_assistant_message": message,
+            });
+            assert!(transform_for_client(&mut raw, agent, HookEvent::Stop).captured);
+            let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
+            assert!(excerpt.starts_with(beginning), "{agent:?}");
+            assert!(excerpt.ends_with(ending), "{agent:?}: final result lost");
+            assert!(excerpt.contains("...[truncated "));
+            assert!(!excerpt.contains("OMITTED_MIDDLE_DECISION"));
+            assert!(excerpt.len() <= OBSERVATION_BODY_MAX_BYTES);
+            assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
+            assert!(raw.get("last_assistant_message").is_none());
+            assert_eq!(raw["session_id"], "same-session");
+        }
+    }
+
+    #[test]
+    fn client_selection_scrubs_secrets_across_both_cuts() {
+        let secret = format!("AKIA{}", "Z".repeat(16));
+        // The client cuts head-and-tail at the 16 KiB ceiling (the helper
+        // reserves 48 bytes, leaving ~8168 at each end). A secret straddling
+        // either cut must be gone, because scrubbing runs on the whole reply
+        // before truncation; slicing first would leak a fragment.
+        let total = 20_000;
+        let half = (OBSERVATION_BODY_MAX_BYTES - 48) / 2;
+        for start in [half - 10, total - half - 10] {
+            let mut message = "x".repeat(total);
+            message.replace_range(start - 1..start, " ");
+            message.replace_range(start..start + secret.len(), &secret);
+            message.replace_range(start + secret.len()..start + secret.len() + 1, " ");
+            let mut raw = serde_json::json!({"last_assistant_message": message});
+            assert!(transform_for_client(&mut raw, AgentKind::Codex, HookEvent::Stop).captured);
+            let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
+            assert!(!excerpt.contains("AKIA"), "secret prefix at {start}");
+            assert!(!excerpt.contains('Z'), "secret suffix at {start}");
+            assert!(excerpt.len() <= OBSERVATION_BODY_MAX_BYTES);
+        }
+    }
+
+    #[test]
     fn client_transform_truncates_multibyte_within_cap() {
         let big = "é".repeat(OBSERVATION_BODY_MAX_BYTES); // 2 bytes each → 2x the cap
         let mut raw = serde_json::json!({ "last_assistant_message": big });
@@ -403,7 +468,11 @@ mod tests {
         assert!(out.captured);
         let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
         assert!(excerpt.len() <= OBSERVATION_BODY_MAX_BYTES, "over cap");
-        assert!(excerpt.ends_with('…'), "truncation marker missing");
+        assert!(
+            excerpt.contains("...[truncated "),
+            "truncation marker missing"
+        );
+        assert!(excerpt.starts_with('é') && excerpt.ends_with('é'));
         // Valid UTF-8 (no split codepoint): re-parsing as str succeeds by construction.
         assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
     }
@@ -464,6 +533,58 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Completed work")
+        );
+    }
+
+    /// Claude Code and Qwen Code put the rendered API error in
+    /// `last_assistant_message` on `StopFailure`, which parses as a Stop. The
+    /// client never takes it as the reply, and still strips it; an interrupted
+    /// turn is no candidate either. A normal Stop still captures (control).
+    #[test]
+    fn client_transform_never_captures_a_failed_or_interrupted_turn() {
+        for (agent, hook_event_name) in [
+            (AgentKind::ClaudeCode, "StopFailure"),
+            (AgentKind::Codex, "Interrupt"),
+        ] {
+            let mut raw = serde_json::json!({
+                "hook_event_name": hook_event_name,
+                "error": "rate_limit",
+                "last_assistant_message": "API Error: Rate limit reached",
+            });
+            let out = transform_for_client(&mut raw, agent, HookEvent::Stop);
+            assert!(!out.captured, "{hook_event_name}");
+            assert!(raw.get("last_assistant_message").is_none(), "{raw}");
+            assert!(raw.get(ASSISTANT_MARKER_KEY).is_none(), "{raw}");
+        }
+        let mut raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "last_assistant_message": "fixed the bug",
+        });
+        assert!(transform_for_client(&mut raw, AgentKind::ClaudeCode, HookEvent::Stop).captured);
+    }
+
+    /// A forged or stale marker on a `StopFailure` (a client that predates the
+    /// check above) is consumed and refused: the failure body stays, and the
+    /// error text is never stored as the reply.
+    #[test]
+    fn backstop_refuses_a_failed_turns_marker() {
+        let protocol = serde_json::json!({
+            "version": ASSISTANT_PROTOCOL_VERSION,
+            "excerpt": "API Error: Rate limit reached",
+        });
+        let mut env = stop_env(
+            serde_json::json!({
+                "hook_event_name": "StopFailure",
+                "error": "rate_limit",
+                ASSISTANT_MARKER_KEY: protocol,
+            }),
+            true,
+        );
+        apply_assistant_backstop(&mut env, true, ASSISTANT_EXCERPT_MAX_BYTES);
+        assert_eq!(env.body_excerpt.as_deref(), Some("error: rate_limit"));
+        assert!(
+            env.raw.get(ASSISTANT_MARKER_KEY).is_none(),
+            "marker persisted"
         );
     }
 

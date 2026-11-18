@@ -3,10 +3,32 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 
 use crate::html_auth::HtmlAuthRedirectConfig;
 use crate::state::WebState;
+
+/// The `Cache-Control` every `/web` page carries.
+///
+/// A page is rendered per request: the session cookie, the viewer's grants,
+/// the project's access mode and the memory itself decide what it shows. A
+/// shared browser profile must not be able to replay one from cache or
+/// bfcache, the way `/api/v1` already refuses to (`routes/api.rs`). Static
+/// assets are the deliberate exception: they carry no identity, so
+/// `routes/statics.rs` keeps its long-lived caching.
+pub(crate) const PRIVATE_NO_STORE: &str = "private, no-store";
+
+/// Wrap a rendered page with [`PRIVATE_NO_STORE`]. Every page-rendering
+/// handler goes through this so the header cannot drift off one of them
+/// again.
+pub(crate) fn private_page(body: String) -> Response {
+    (
+        [(axum::http::header::CACHE_CONTROL, PRIVATE_NO_STORE)],
+        Html(body),
+    )
+        .into_response()
+}
 
 mod agents;
 mod api;
@@ -87,7 +109,7 @@ pub(crate) async fn require_admin(
     level: Option<axum::Extension<ai_memory_core::AuthLevel>>,
 ) -> Result<(), axum::response::Response> {
     use axum::http::StatusCode;
-    use axum::response::{Html, IntoResponse};
+    use axum::response::IntoResponse;
     let level = level.map_or(
         ai_memory_core::AuthLevel::Anonymous,
         |axum::Extension(level)| level,
@@ -106,7 +128,11 @@ pub(crate) async fn require_admin(
             // of sending the user to the change-password form.
             Err(
                 match (crate::templates::AdminRequiredView { i18n: i18n.clone() }).render() {
-                    Ok(body) => (StatusCode::FORBIDDEN, Html(body)).into_response(),
+                    Ok(body) => {
+                        let mut response = private_page(body);
+                        *response.status_mut() = StatusCode::FORBIDDEN;
+                        response
+                    }
                     Err(_) => StatusCode::FORBIDDEN.into_response(),
                 },
             )

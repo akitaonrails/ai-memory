@@ -999,6 +999,71 @@ mod tests {
         assert_eq!(root_names(&roots), ["/repo/.claude/skills"]);
     }
 
+    /// Install and uninstall keep parallel skill-root lists; Hermes once
+    /// installed into a root uninstall never swept (#2285). Every agent, in
+    /// every scope and platform, with and without relocated homes, must
+    /// install only into roots `uninstall` sweeps. No agent is exempt.
+    #[test]
+    fn every_install_skill_root_is_swept_by_uninstall() {
+        use clap::ValueEnum;
+
+        let cwd = Path::new("/repo");
+        let home = Path::new("/home/alice");
+        let appdata = Path::new("/appdata");
+        for relocated in [false, true] {
+            let grok_home = relocated.then_some(Path::new("/custom/grok"));
+            let copilot_home = relocated.then_some(Path::new("/custom/copilot"));
+            let hermes_home = relocated.then_some(Path::new("/custom/hermes"));
+            let claude_config_dir = relocated.then_some(Path::new("/custom/claude"));
+            let swept = crate::commands::uninstall::skill_roots(
+                cwd,
+                Some(home),
+                Some(appdata),
+                grok_home,
+                copilot_home,
+                claude_config_dir,
+                hermes_home,
+            );
+            for &agent in InstallSkillsAgent::value_variants() {
+                // Exhaustive on purpose: a new agent must say which relocated
+                // home (if any) its global install reads.
+                let agent_home = match agent {
+                    InstallSkillsAgent::Grok => grok_home,
+                    InstallSkillsAgent::CopilotCli => copilot_home,
+                    InstallSkillsAgent::Hermes => hermes_home,
+                    InstallSkillsAgent::ClaudeCode
+                    | InstallSkillsAgent::Agents
+                    | InstallSkillsAgent::Devin
+                    | InstallSkillsAgent::Antigravity
+                    | InstallSkillsAgent::Both => None,
+                };
+                for &scope in InstallSkillsScope::value_variants() {
+                    for platform in [SkillHostPlatform::Other, SkillHostPlatform::Windows] {
+                        let roots = resolve_target_roots_for_platform(
+                            &args(scope, agent),
+                            cwd,
+                            Some(home),
+                            Some(appdata),
+                            agent_home,
+                            claude_config_dir,
+                            platform,
+                        )
+                        .unwrap();
+                        assert!(!roots.is_empty(), "{agent:?} {scope:?} {platform:?}");
+                        for root in roots {
+                            assert!(
+                                swept.contains(&root.path),
+                                "{agent:?} {scope:?} {platform:?} relocated={relocated}: \
+                                 install root {} is not swept by uninstall {swept:?}",
+                                root.path.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn explicit_target_dir_overrides_scope_and_agent_roots() {
         let cwd = Path::new("/repo");

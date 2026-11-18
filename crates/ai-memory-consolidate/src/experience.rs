@@ -23,9 +23,9 @@ use ai_memory_store::{ReaderPool, StoredPageBody};
 
 use crate::auto_improve::{
     AutoImproveError, AutoImproveLlmResponse, AutoImproveReport, AutoImproveResult,
-    AutoImproveReviewConfig, ExistingPageIndex, apply_eval_gate, estimate_tokens,
-    load_global_pages, load_patchable_pages, load_rejection_context, render_global_section,
-    render_patchable_pages, render_recent_pages, render_rejection_context,
+    AutoImproveReviewConfig, ExistingPageIndex, apply_eval_gate, load_global_pages,
+    load_patchable_pages, load_rejection_context, render_global_section, render_patchable_pages,
+    render_recent_pages, render_rejection_context, truncate_to_budget,
 };
 
 /// Settings for the cross-session pass.
@@ -64,6 +64,8 @@ impl Default for ExperienceConfig {
 }
 
 const REVIEW_MAX_TOKENS: u32 = 16_000;
+const PROMPT_RESERVE_TOKENS: usize = 1_000;
+const CHARS_PER_TOKEN: usize = 4;
 
 /// Run one cross-session review for a scope. Returns the same report
 /// shape as the per-session reviewer so callers stage proposals through
@@ -178,43 +180,119 @@ pub async fn run_experience_review(
             "entropy filter skipped {entropy_skipped} low-information session page(s) from consolidation"
         ));
     }
-    let mut prompt = String::new();
-    prompt.push_str(
-        "You are reviewing MULTIPLE session summaries of one project side \
+    const PREFIX: &str = "You are reviewing MULTIPLE session summaries of one project side \
          by side. Propose only knowledge that is visible ACROSS sessions.\n\n\
-         ## Recent wiki pages (existing knowledge)\n\n",
-    );
-    prompt.push_str(&render_recent_pages(&briefing.recent_pages));
-    if !global_pages.is_empty() {
-        prompt.push_str("\n## Standing _global pages (read-only, never restate)\n\n");
-        prompt.push_str(&render_global_section(&global_pages));
+         ## Recent wiki pages (existing knowledge)\n\n";
+    const PATCHABLE_HEADING: &str = "\n## Patchable pages (may be edited in place)\n\n";
+    const REJECTION_HEADING: &str = "\n## Previously rejected proposals (do not repeat)\n\n";
+    const SESSION_HEADING: &str = "\n## Session summaries, newest first\n\n";
+    let session_headers: Vec<_> = session_pages
+        .iter()
+        .map(|(started_at, path, _)| format!("### Session started {started_at} — {path}\n\n"))
+        .collect();
+    // Keep the same estimate headroom as bootstrap, and reserve prompt space
+    // before optional context. The final check includes the actual system
+    // prompt, section headers and truncation markers rather than trusting the
+    // reserve to cover every configuration.
+    let input_tokens = crate::bootstrap::with_estimate_margin(cfg.max_input_tokens);
+    let max_request_bytes = input_tokens.saturating_mul(CHARS_PER_TOKEN);
+    let schema_bytes = serde_json::to_string(&schemars::schema_for!(AutoImproveLlmResponse))
+        .map_err(ai_memory_llm::LlmError::from)?
+        .len();
+    let request_overhead = EXPERIENCE_SYSTEM_PROMPT.len()
+        + schema_bytes
+        + crate::consolidator::PROMPT_ENVELOPE_RESERVE_CHARS;
+    let scaffold_bytes = request_overhead
+        + PREFIX.len()
+        + PATCHABLE_HEADING.len()
+        + REJECTION_HEADING.len()
+        + SESSION_HEADING.len()
+        + session_headers.iter().map(String::len).sum::<usize>()
+        + session_pages.len() * 2;
+    if scaffold_bytes > max_request_bytes {
+        return Ok(input_budget_skip(
+            &cfg,
+            label,
+            session_pages.len(),
+            scaffold_bytes.div_ceil(CHARS_PER_TOKEN),
+            warnings,
+        ));
     }
+    let content_bytes = input_tokens
+        .saturating_sub(PROMPT_RESERVE_TOKENS)
+        .saturating_mul(CHARS_PER_TOKEN)
+        .min(max_request_bytes.saturating_sub(scaffold_bytes));
+    let recent_pages = render_recent_pages(&briefing.recent_pages);
+    let recent = truncate_to_budget(
+        &recent_pages,
+        content_bytes / 8,
+        " [recent context truncated by input budget]",
+    );
+    if recent.len() < recent_pages.len() {
+        warnings.push("recent page context truncated by input budget".into());
+    }
+    // Standing `_global` page titles (#2248), read-only context the reviewer may
+    // not restate. Titles only, so the section stays bounded; it is still
+    // charged against the input budget below.
+    let global_section = if global_pages.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Standing _global pages (read-only, never restate)\n\n{}",
+            render_global_section(&global_pages)
+        )
+    };
     let rendered_patchable = render_patchable_pages(
         &patchable_pages,
         cfg.max_patchable_body_chars,
-        cfg.max_patchable_body_chars * cfg.max_patchable_pages,
+        content_bytes / 4,
         &mut warnings,
     );
-    prompt.push_str("\n## Patchable pages (may be edited in place)\n\n");
-    prompt.push_str(&rendered_patchable.text);
-    prompt.push_str("\n## Previously rejected proposals (do not repeat)\n\n");
-    prompt.push_str(&render_rejection_context(
+    let rejection = render_rejection_context(
         &rejection_context,
-        crate::auto_improve::MAX_REJECTION_CONTEXT_CHARS,
-    ));
-    prompt.push_str("\n## Session summaries, newest first\n\n");
-    for (started_at, path, page) in &session_pages {
-        let mut body = page.body.clone();
-        if body.len() > experience.max_session_page_chars {
-            let mut end = experience.max_session_page_chars;
-            while !body.is_char_boundary(end) {
-                end -= 1;
-            }
-            body.truncate(end);
-            body.push_str("\n[truncated]");
+        (content_bytes / 8).min(crate::auto_improve::MAX_REJECTION_CONTEXT_CHARS),
+    );
+    let mut remaining = content_bytes
+        .saturating_sub(recent.len())
+        .saturating_sub(global_section.len())
+        .saturating_sub(rendered_patchable.text.len())
+        .saturating_sub(rejection.len());
+    let mut prompt = format!(
+        "{PREFIX}{recent}{global_section}{PATCHABLE_HEADING}{}{REJECTION_HEADING}{rejection}{SESSION_HEADING}",
+        rendered_patchable.text,
+    );
+    for (index, ((_, _, page), header)) in session_pages.iter().zip(&session_headers).enumerate() {
+        let cap = experience
+            .max_session_page_chars
+            .min(remaining / (session_pages.len() - index));
+        // A marker alone is not evidence from a session. Do not turn a full
+        // cross-session review into a successful empty review when the budget
+        // cannot carry the configured session population.
+        let Some(body) = bounded_session_body(&page.body, cap) else {
+            return Ok(input_budget_skip(
+                &cfg,
+                label,
+                session_pages.len(),
+                scaffold_bytes.div_ceil(CHARS_PER_TOKEN),
+                warnings,
+            ));
+        };
+        if body.len() < page.body.len() {
+            warnings.push("session summary truncated by input budget".into());
         }
-        prompt.push_str(&format!(
-            "### Session started {started_at} — {path}\n\n{body}\n\n"
+        remaining = remaining.saturating_sub(body.len());
+        prompt.push_str(header);
+        prompt.push_str(&body);
+        prompt.push_str("\n\n");
+    }
+    let estimated_input_tokens = (request_overhead + prompt.len()).div_ceil(CHARS_PER_TOKEN);
+    if estimated_input_tokens > input_tokens {
+        return Ok(input_budget_skip(
+            &cfg,
+            label,
+            session_pages.len(),
+            estimated_input_tokens,
+            warnings,
         ));
     }
 
@@ -225,7 +303,6 @@ pub async fn run_experience_review(
         .collect();
     let existing_index = ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable)
         .with_global_pages(&global_pages);
-    let estimated_input_tokens = estimate_tokens(&prompt);
     let request = ChatRequest {
         system: Some(crate::with_output_language(
             EXPERIENCE_SYSTEM_PROMPT,
@@ -285,6 +362,42 @@ pub async fn run_experience_review(
     })
 }
 
+fn bounded_session_body(body: &str, max_bytes: usize) -> Option<String> {
+    let marker = "\n[truncated]";
+    if body.len() > max_bytes
+        && max_bytes < marker.len() + body.chars().next().map_or(0, char::len_utf8)
+    {
+        return None;
+    }
+    Some(truncate_to_budget(body, max_bytes, marker))
+}
+
+fn input_budget_skip(
+    cfg: &AutoImproveReviewConfig,
+    session_id: String,
+    observations_considered: usize,
+    estimated_input_tokens: usize,
+    mut warnings: Vec<String>,
+) -> AutoImproveReport {
+    warnings.push("experience pass skipped: input budget cannot fit the session context".into());
+    AutoImproveReport {
+        session_id,
+        observations_considered,
+        session_duration_secs: 0,
+        estimated_input_tokens,
+        provider: "none".into(),
+        model: "none".into(),
+        min_confidence: cfg.min_confidence,
+        proposal_actor: cfg.proposal_actor.clone(),
+        pending_path: cfg.pending_path.clone(),
+        summary: "experience pass skipped: input budget is too small".into(),
+        proposals: Vec::new(),
+        rejected_candidates: Vec::new(),
+        warnings,
+        eval_results: Vec::new(),
+    }
+}
+
 /// System prompt for the cross-session pass. Same trust boundary and
 /// output contract as the per-session reviewer; the task differs.
 pub const EXPERIENCE_SYSTEM_PROMPT: &str = r#"You are ai-memory's cross-session experience reviewer.
@@ -309,6 +422,21 @@ Write page titles, markdown prose, patch content, and rationale in the dominant 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_truncated_summary_must_include_source_text_before_its_marker() {
+        for (body, rejected, accepted, prefix) in [
+            ("é".repeat(20), 13, 14, "é"),
+            ("🦀".repeat(20), 15, 16, "🦀"),
+        ] {
+            assert!(bounded_session_body(&body, rejected).is_none());
+            let rendered = bounded_session_body(&body, accepted).unwrap();
+            assert_eq!(rendered, format!("{prefix}\n[truncated]"));
+            assert_eq!(rendered.len(), accepted);
+        }
+        assert_eq!(bounded_session_body("", 0).as_deref(), Some(""));
+        assert!(bounded_session_body("not empty", 0).is_none());
+    }
 
     #[test]
     fn experience_prompt_keeps_the_trust_boundary_and_the_cross_session_bar() {

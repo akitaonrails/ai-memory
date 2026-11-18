@@ -47,6 +47,13 @@ CREATE INDEX idx_sessions_scope_ended
 CREATE INDEX idx_sessions_open_owner
     ON sessions(workspace_id, project_id, agent_kind, actor_user)
     WHERE ended_at IS NULL;
+-- Recreate the open-sessions-by-start index V102 (perf_read_io_indexes) adds on
+-- the main patch line. This table rebuild drops every index on `sessions`, and
+-- V102 sorts before it, so without this the index would vanish on a fresh
+-- install and on the 3.4.x -> 3.5 upgrade alike.
+CREATE INDEX idx_sessions_open_started
+    ON sessions(workspace_id, project_id, started_at DESC)
+    WHERE ended_at IS NULL;
 
 CREATE TRIGGER sessions_clear_display_name_on_scope_change
 AFTER UPDATE OF workspace_id, project_id ON sessions

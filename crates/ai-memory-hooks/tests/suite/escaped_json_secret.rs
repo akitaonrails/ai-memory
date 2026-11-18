@@ -154,3 +154,134 @@ async fn an_object_shaped_tool_result_without_a_secret_is_stored_whole() {
         "harmless result must be stored whole: {body:?}"
     );
 }
+
+async fn stored_selected_lifecycle_body(
+    state: &HookState,
+    agent: ai_memory_core::AgentKind,
+    event: crate::payload::HookEvent,
+    message: &str,
+    requested: bool,
+) -> (String, String) {
+    let sid = SessionId::new();
+    let mut body = serde_json::json!({"session_id": sid.to_string(), "cwd": "/repo"});
+    let (event_name, kind, selected) = if event == crate::payload::HookEvent::Stop {
+        body["last_assistant_message"] = message.into();
+        assert!(crate::assistant_capture::transform_for_client(&mut body, agent, event).captured);
+        let selected = body[crate::assistant_capture::ASSISTANT_MARKER_KEY]["excerpt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        ("stop", ObservationKind::Stop, selected)
+    } else {
+        let field = if agent == ai_memory_core::AgentKind::QwenCode {
+            "submitted_prompt"
+        } else {
+            "prompt"
+        };
+        body[field] = message.into();
+        assert!(crate::payload::cap_lifecycle_body_for_client(
+            &mut body, event
+        ));
+        (
+            "user-prompt",
+            ObservationKind::UserPrompt,
+            body[field].as_str().unwrap().to_owned(),
+        )
+    };
+    let query_flag = if requested {
+        "&capture_assistant=1"
+    } else {
+        ""
+    };
+    let agent_name = agent.as_str();
+    let req = Request::builder().method("POST")
+        .uri(format!("/hook?event={event_name}&agent={agent_name}&cwd=/repo&workspace=default&project=scratch{query_flag}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap();
+    let response = hook_router(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let stored = wait_for_kinds(state, &sid.to_string(), &[kind])
+        .await
+        .into_iter()
+        .find(|o| o.kind == kind)
+        .expect("selected lifecycle observation stored")
+        .body;
+    (selected, stored)
+}
+
+#[tokio::test]
+async fn selected_lifecycle_ends_survive_the_unchanged_router_and_store() {
+    use crate::payload::HookEvent;
+    use ai_memory_core::{AgentKind, SanitizeConfig, Sanitizer};
+
+    let tmp = TempDir::new().unwrap();
+    let mut state = make_state(&tmp).await;
+    assert!(state.consolidator.is_none());
+    state.capture_assistant_enabled = true;
+    state.sanitizer = Sanitizer::new(&SanitizeConfig {
+        extra_patterns: vec!["SERVER_ONLY_PRIVATE".into()],
+        allowlist: Vec::new(),
+    })
+    .unwrap();
+    for agent in [
+        AgentKind::ClaudeCode,
+        AgentKind::Codex,
+        AgentKind::OpenCode,
+        AgentKind::QwenCode,
+        AgentKind::KimiCode,
+    ] {
+        for (event, cap) in [(HookEvent::Stop, 2_000), (HookEvent::UserPrompt, 16_384)] {
+            if event == HookEvent::Stop
+                && !matches!(
+                    agent,
+                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode
+                )
+            {
+                continue;
+            }
+            let message = format!(
+                "INITIAL_DECISION\n{}\nSERVER_ONLY_PRIVATE FINAL_CORRECTION",
+                "é🧪".repeat(cap / 3)
+            );
+            let (selected, stored) =
+                stored_selected_lifecycle_body(&state, agent, event, &message, true).await;
+            assert!(selected.contains("SERVER_ONLY_PRIVATE"));
+            assert!(
+                !stored.contains("SERVER_ONLY_PRIVATE"),
+                "server sanitizer bypassed"
+            );
+            assert!(stored.contains("[REDACTED:"));
+            assert!(
+                stored.starts_with("INITIAL_DECISION"),
+                "{agent:?}/{event:?}"
+            );
+            assert!(stored.ends_with("FINAL_CORRECTION"), "{agent:?}/{event:?}");
+            assert!(stored.contains("...[truncated "));
+            assert!(selected.len() <= cap && stored.len() <= cap);
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_stop_still_requires_both_server_and_client_opt_ins() {
+    for (server, requested) in [(false, false), (false, true), (true, false), (true, true)] {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.capture_assistant_enabled = server;
+        let message = format!("INITIAL_DECISION\n{}\nFINAL_RESULT", "x".repeat(4_000));
+        let (selected, stored) = stored_selected_lifecycle_body(
+            &state,
+            ai_memory_core::AgentKind::Codex,
+            crate::payload::HookEvent::Stop,
+            &message,
+            requested,
+        )
+        .await;
+        if server && requested {
+            assert_eq!(stored, selected);
+            assert!(stored.starts_with("INITIAL_DECISION") && stored.ends_with("FINAL_RESULT"));
+        } else {
+            assert!(stored.is_empty(), "server={server} requested={requested}");
+        }
+    }
+}

@@ -1,7 +1,7 @@
 # Design: source provenance and trust class against memory poisoning
 
 Status: design, partially staged. Tracks #2164. Step 1 (the `page_sources`
-table, migration V108) is implemented; "Step 1 as built" below records what
+table, migration V112) is implemented; "Step 1 as built" below records what
 steps 2 to 5 can rely on. The rest of this note covers those steps.
 
 ## Problem
@@ -71,7 +71,7 @@ session citation a write already carries (`PageEvidence::observations`).
 - **Not covered:** the zero-LLM rule-based `sessions/<id>.md` page the hook
   router writes at SessionEnd and at compaction checkpoints. It is built from
   the session's observations and cites no session today, so it records no
-  sources. Pages compiled before V108 have none either; nothing is backfilled,
+  sources. Pages compiled before V112 have none either; nothing is backfilled,
   because the observations an old prompt selected were not kept.
 
 Read path: `ReaderPool::page_compiled_sources`, by `(workspace_id, project_id,

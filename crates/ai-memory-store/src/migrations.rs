@@ -2082,12 +2082,12 @@ mod tests {
         }
     }
 
-    /// V103 expands the persisted session kind again, for WorkBuddy, without
+    /// V107 expands the persisted session kind again, for WorkBuddy, without
     /// losing the session graph or the rows that reference it.
     #[test]
-    fn v102_to_v103_preserves_sessions_and_accepts_workbuddy() {
+    fn v106_to_v107_preserves_sessions_and_accepts_workbuddy() {
         let mut conn = Connection::open_in_memory().unwrap();
-        run_to(&mut conn, 102).unwrap();
+        run_to(&mut conn, 106).unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
         let project_id =
@@ -2105,7 +2105,7 @@ mod tests {
             ],
         )
         .unwrap();
-        // V102 cannot store a WorkBuddy session yet.
+        // V106 cannot store a WorkBuddy session yet.
         assert!(
             conn.execute(
                 "INSERT INTO sessions \
@@ -2118,7 +2118,7 @@ mod tests {
                 ],
             )
             .is_err(),
-            "the V102 CHECK must reject workbuddy"
+            "the V106 CHECK must reject workbuddy"
         );
         conn.execute(
             "INSERT INTO ingest_keys (project_id, key, seen_at, session_id, agent_kind) \
@@ -2997,19 +2997,19 @@ mod tests {
         assert!(plan.contains("idx_observations_file_path"), "{plan}");
     }
 
-    /// V108 adds `page_sources` to a store whose pages were compiled by an
+    /// V112 adds `page_sources` to a store whose pages were compiled by an
     /// older build: nothing is backfilled (the session citation in
     /// `page_evidence` cannot say which observations the prompt carried), the
     /// existing page and its evidence are untouched, and the next compile of
     /// that page records its sources.
     #[test]
-    fn v108_adds_page_sources_without_backfilling_compiled_pages() {
+    fn v112_adds_page_sources_without_backfilling_compiled_pages() {
         use ai_memory_core::{
             NewPage, PageEvidence, PageEvidenceKind, PagePath, SourceObservations, Tier,
         };
 
         let mut conn = Connection::open_in_memory().unwrap();
-        run_to(&mut conn, 107).unwrap();
+        run_to(&mut conn, 111).unwrap();
         let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
         let project_id =
             crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
@@ -3039,7 +3039,7 @@ mod tests {
                 extension: None,
                 source_event: None,
                 title: "tool".into(),
-                body: "before V108".into(),
+                body: "before V112".into(),
                 importance: 5,
                 file_path: None,
             },

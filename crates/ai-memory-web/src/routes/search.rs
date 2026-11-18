@@ -25,7 +25,7 @@ use ai_memory_store::{PAGE_KINDS, PageFilter, SearchExplain, StreamTimings};
 use askama::Template;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::markdown;
@@ -388,7 +388,7 @@ pub(crate) async fn handler(
         max_results: limit_used,
     };
     match view.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => super::private_page(html),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

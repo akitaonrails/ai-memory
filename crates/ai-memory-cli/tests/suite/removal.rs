@@ -2643,6 +2643,103 @@ fn uninstall_keeps_the_hook_bearer_unless_hooks_are_removed() {
     }
 }
 
+fn assert_uninstall_preserves_configured_root_token(
+    only: Option<&str>,
+    root_name: &str,
+    absolute: bool,
+) {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let data = home.path().join(".ai-memory-data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data = data.canonicalize().unwrap();
+    let relative = Path::new("auth-tokens").join(root_name);
+    let root = data.join(&relative);
+    let setting = if absolute { root.clone() } else { relative };
+    let config = format!(
+        "[auth]\nbearer_token_file = {}\n",
+        serde_json::to_string(&setting.to_string_lossy()).unwrap()
+    );
+    write_file(&data.join("config.toml"), &config);
+    write_file(&root, "persistent-root-token\n");
+    let installed = command_with_home(home.path())
+        .args(["install-hooks", "--agent", "claude-code", "--apply"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let profile = data.join("auth-tokens/remote");
+    write_file(&profile, "profile-token\n");
+    write_file(&data.join("auth-token"), "stored-hook-token\n");
+    write_file(
+        &data.join("auth-header"),
+        "Authorization: Bearer stored-hook-token\n",
+    );
+    let mut command = command_with_home(home.path());
+    command
+        .env("AI_MEMORY_AUTH_TOKEN", "temporary-uninstall-token")
+        .args(["uninstall", "--apply", "--yes"])
+        .current_dir(project.path());
+    if let Some(only) = only {
+        command.args(["--only", only]);
+    }
+    let removed = command.output().unwrap();
+    assert!(
+        removed.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&root).ok().as_deref(),
+        Some("persistent-root-token\n"),
+        "an environment override must not delete the server's configured token"
+    );
+    assert_eq!(
+        std::fs::read_to_string(data.join("config.toml")).unwrap(),
+        config
+    );
+    assert!(
+        !profile.exists(),
+        "a profile credential must still be removed"
+    );
+    for file in ["auth-token", "auth-header"] {
+        assert!(
+            !data.join(file).exists(),
+            "the hooks' {file} must be removed"
+        );
+    }
+}
+
+#[test]
+fn full_uninstall_keeps_relative_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(None, "default", false);
+}
+
+#[test]
+fn hooks_uninstall_keeps_relative_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(Some("hooks"), "default", false);
+}
+
+#[test]
+fn uninstall_keeps_custom_relative_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(None, "custom-root", false);
+}
+
+#[test]
+fn full_uninstall_keeps_absolute_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(None, "custom-root", true);
+}
+
+#[test]
+fn hooks_uninstall_keeps_absolute_root_token_with_environment_override() {
+    assert_uninstall_preserves_configured_root_token(Some("hooks"), "custom-root", true);
+}
+
 /// `install-mcp --apply --auth-token` for Claude Code stores the key where the
 /// hooks keep theirs and writes the bridge entry without it, so the stored
 /// key is the bridge's too: `--only hooks` keeps it while that entry remains,

@@ -13,7 +13,7 @@ loopback port, so no request leaves the machine. Steps:
 1. publish `plugins/codex` and the Codex catalog into a throwaway git repo
    (the committed catalog pins a release tag that may not exist yet), then
    `codex plugin marketplace add` it and `codex plugin add ai-memory@ai-memory`;
-2. `codex app-server` reports the plugin's seven hooks, its skills and its
+2. `codex app-server` reports the plugin's eight hooks, its skills and its
    MCP server, and every hook starts untrusted;
 3. after trusting the hooks, a thread and a turn fire the plugin's
    SessionStart and UserPromptSubmit hooks through the launcher into the real
@@ -253,7 +253,7 @@ def main() -> int:
         box.run("codex", "plugin", "add", "ai-memory@ai-memory")
 
         hooks = box.hooks()
-        check(len(hooks) == 7, f"expected 7 plugin hooks, saw {len(hooks)}")
+        check(len(hooks) == 8, f"expected 8 plugin hooks, saw {len(hooks)}")
         check(all(hook["trustStatus"] == "untrusted" for hook in hooks), "a plugin hook started trusted")
         replies = box.app_server(
             [
@@ -270,7 +270,7 @@ def main() -> int:
         plugin = replies[2]["result"]["plugin"]
         check(len(plugin["skills"]) == 7, f"skills: {len(plugin['skills'])}")
         check(plugin["mcpServers"] == ["ai-memory"], f"mcp: {plugin['mcpServers']}")
-        print("ok: the Codex plugin installs with 7 untrusted hooks, 7 skills and the ai-memory MCP server")
+        print("ok: the Codex plugin installs with 8 untrusted hooks, 7 skills and the ai-memory MCP server")
 
         trust = "".join(
             f'\n[hooks.state."{hook["key"]}"]\ntrusted_hash = "{hook["currentHash"]}"\n' for hook in hooks

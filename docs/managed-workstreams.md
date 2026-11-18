@@ -743,6 +743,14 @@ its events and cursor from one SQLite snapshot, so a concurrent native write
 remains available to the next import. Baseline cursor timestamps and revision
 fingerprints also share one snapshot.
 
+OpenCode V1 and OpenCode 2 cursors fingerprint the same way, over the newest
+`time_updated` millisecond bucket. Both native stores stamp `time_updated` with
+`Date.now()` rather than a unique revision number, so an in-place update keeps
+the same `(time_updated, id)` pair; the boundary fingerprints let the next
+export re-emit a same-millisecond revision or lower-id insert without replaying
+unchanged records. A pair-only cursor persisted before these fingerprints still
+deserializes and keeps its original strict id-ordering scan.
+
 Search and tail also return optional `source_record_id` and `metadata` fields.
 The text CLI prints the source record and correlation metadata as escaped JSON;
 `--json` preserves these fields for consumers. Older server responses without

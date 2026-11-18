@@ -338,3 +338,139 @@ async fn output_language_override_reaches_experience_system_prompt() {
         "default keeps the input-language rule: {without}"
     );
 }
+
+#[tokio::test]
+async fn experience_request_respects_the_configured_estimated_input_budget() {
+    let h = harness_with_two_sessions().await;
+    let wiki = Wiki::new(h._tmp.path(), h.store.writer.clone())
+        .unwrap()
+        .with_store_reader(h.store.reader.clone());
+    let sessions = h
+        .store
+        .reader
+        .sessions_for_scope(h.ws, h.proj, ai_memory_core::OwnerFilter::Any, false, 20, 0)
+        .await
+        .unwrap();
+    for (index, session) in sessions.iter().enumerate() {
+        wiki.write_page(WritePageRequest {
+            workspace_id: h.ws,
+            project_id: h.proj,
+            path: ai_memory_core::PagePath::new(format!("sessions/{}.md", session.session_id))
+                .unwrap(),
+            frontmatter: serde_json::json!({"title": format!("summary {index}")}),
+            body: format!(
+                "# Useful session {index}\n{}",
+                "A decisão mantém a transação atômica; execute cargo test antes do merge.\n"
+                    .repeat(120)
+            ),
+            tier: ai_memory_core::Tier::Episodic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+    for index in 0..8 {
+        wiki.write_page(WritePageRequest {
+            workspace_id: h.ws,
+            project_id: h.proj,
+            path: ai_memory_core::PagePath::new(format!("_rules/budget-{index}.md")).unwrap(),
+            frontmatter: serde_json::json!({"title": format!("Rule {index}")}),
+            body: format!(
+                "# Rule {index}\n{}",
+                "Preserve bounded request handling and atomic wiki writes.\n".repeat(160)
+            ),
+            tier: ai_memory_core::Tier::Procedural,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+    let cfg = AutoImproveReviewConfig {
+        max_input_tokens: 5_000,
+        ..AutoImproveReviewConfig::default()
+    };
+    let report = run_experience_review(
+        &h.store.reader,
+        h.llm.as_ref(),
+        h.ws,
+        h.proj,
+        cfg,
+        &experience_cfg(false),
+    )
+    .await
+    .unwrap();
+    let prompts = h.prompts.lock().unwrap();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "bounded summaries should still be reviewed"
+    );
+    let request_bytes = prompts[0].len()
+        + ai_memory_consolidate::EXPERIENCE_SYSTEM_PROMPT.len()
+        + serde_json::to_string(&schemars::schema_for!(
+            ai_memory_consolidate::AutoImproveLlmResponse
+        ))
+        .unwrap()
+        .len()
+        + 1_024;
+    assert!(
+        request_bytes.div_ceil(4) <= 4_000,
+        "system + user + schema request exceeded the 80% estimated input budget: {} tokens",
+        request_bytes.div_ceil(4)
+    );
+    for index in 0..2 {
+        assert!(
+            prompts[0].contains(&format!("Useful session {index}")),
+            "session {index} disappeared"
+        );
+    }
+    assert_eq!(report.observations_considered, 2);
+    assert_eq!(report.estimated_input_tokens, request_bytes.div_ceil(4));
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("budget"))
+    );
+}
+
+#[tokio::test]
+async fn experience_tiny_input_budget_skips_without_calling_the_provider() {
+    let h = harness_with_two_sessions().await;
+    let cfg = AutoImproveReviewConfig {
+        max_input_tokens: 128,
+        ..AutoImproveReviewConfig::default()
+    };
+    let report = run_experience_review(
+        &h.store.reader,
+        h.llm.as_ref(),
+        h.ws,
+        h.proj,
+        cfg,
+        &experience_cfg(false),
+    )
+    .await
+    .unwrap();
+    assert!(
+        h.prompts.lock().unwrap().is_empty(),
+        "even the system prompt exceeds this budget"
+    );
+    assert_eq!(report.provider, "none");
+    assert!(report.proposals.is_empty());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("budget"))
+    );
+}

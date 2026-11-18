@@ -1729,6 +1729,53 @@ pub(crate) fn backfill_cjk_indexes(conn: &mut Connection) -> StoreResult<CjkBack
 /// the whole indexed prefix, so the pass slowed down as it went: quadratic in
 /// the row count, hours of startup on a store with 1.6 million observations
 /// (#1652).
+fn has_backfill_watermarks_table(conn: &Connection) -> StoreResult<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backfill_watermarks')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+fn load_backfill_watermark(conn: &Connection, name: &str) -> StoreResult<Option<i64>> {
+    if !has_backfill_watermarks_table(conn)? {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT max_rowid FROM backfill_watermarks WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+fn save_backfill_watermark_if_advanced(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    prev: Option<i64>,
+) -> StoreResult<()> {
+    if !has_backfill_watermarks_table(conn)? {
+        return Ok(());
+    }
+    let max_rowid: Option<i64> =
+        conn.query_row(&format!("SELECT MAX(rowid) FROM {table}"), [], |row| {
+            row.get(0)
+        })?;
+    if let Some(max_r) = max_rowid
+        && prev.is_none_or(|p| max_r > p)
+    {
+        conn.execute(
+            "INSERT INTO backfill_watermarks (name, max_rowid) VALUES (?1, ?2) \
+             ON CONFLICT (name) DO UPDATE SET max_rowid = excluded.max_rowid",
+            params![name, max_r],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn backfill_cjk_indexes_in_batches(
     conn: &mut Connection,
     batch: i64,
@@ -1738,8 +1785,14 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
     let batch = batch.max(1);
     let mut summary = CjkBackfillSummary::default();
 
-    let mut from = i64::MIN;
-    loop {
+    let pages_watermark = load_backfill_watermark(conn, "cjk_pages")?;
+    let mut from = match pages_watermark {
+        Some(w) if w == i64::MAX => i64::MAX,
+        Some(w) => w + 1,
+        None => i64::MIN,
+    };
+    let mut pages_done = pages_watermark == Some(i64::MAX);
+    while !pages_done {
         let tx = conn.transaction()?;
         let rows: Vec<PageRow> = {
             let mut stmt = tx.prepare(
@@ -1755,19 +1808,31 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
         };
         if rows.is_empty() {
             tx.commit()?;
-            break;
+            pages_done = true;
+            continue;
         }
         for (rowid, title, body, path_search) in &rows {
             index_page_cjk(&tx, *rowid, title, body, path_search)?;
-            from = rowid.saturating_add(1);
+            if *rowid == i64::MAX {
+                pages_done = true;
+            } else {
+                from = rowid + 1;
+            }
         }
         summary.pages += rows.len() as u64;
         tx.commit()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
     }
+    save_backfill_watermark_if_advanced(conn, "pages", "cjk_pages", pages_watermark)?;
 
-    from = i64::MIN;
-    loop {
+    let obs_watermark = load_backfill_watermark(conn, "cjk_observations")?;
+    from = match obs_watermark {
+        Some(w) if w == i64::MAX => i64::MAX,
+        Some(w) => w + 1,
+        None => i64::MIN,
+    };
+    let mut obs_done = obs_watermark == Some(i64::MAX);
+    while !obs_done {
         let tx = conn.transaction()?;
         let rows: Vec<ObservationRow> = {
             let mut stmt = tx.prepare(
@@ -1783,16 +1848,22 @@ pub(crate) fn backfill_cjk_indexes_in_batches(
         };
         if rows.is_empty() {
             tx.commit()?;
-            break;
+            obs_done = true;
+            continue;
         }
         for (rowid, title, body) in &rows {
             index_observation_cjk(&tx, *rowid, title, body)?;
-            from = rowid.saturating_add(1);
+            if *rowid == i64::MAX {
+                obs_done = true;
+            } else {
+                from = rowid + 1;
+            }
         }
         summary.observations += rows.len() as u64;
         tx.commit()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
     }
+    save_backfill_watermark_if_advanced(conn, "observations", "cjk_observations", obs_watermark)?;
     Ok(summary)
 }
 
@@ -1881,6 +1952,12 @@ pub struct EntityBackfillSummary {
 /// `ON CONFLICT DO NOTHING`). Superseded versions are left untouched.
 pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfillSummary> {
     type CandidateRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, i64);
+    let watermark = load_backfill_watermark(conn, "entity_pages")?;
+    let from = match watermark {
+        Some(w) if w == i64::MAX => return Ok(EntityBackfillSummary::default()),
+        Some(w) => w + 1,
+        None => i64::MIN,
+    };
     let tx = conn.transaction()?;
     let mut summary = EntityBackfillSummary::default();
     {
@@ -1888,12 +1965,13 @@ pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfil
             let mut stmt = tx.prepare(
                 "SELECT p.id, p.workspace_id, p.project_id, p.frontmatter_json, p.created_at \
                  FROM pages p \
-                 WHERE p.is_latest = 1 \
+                 WHERE p.rowid >= ?1 \
+                   AND p.is_latest = 1 \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM entity_page_links l WHERE l.page_id = p.id \
                    )",
             )?;
-            stmt.query_map([], |row| {
+            stmt.query_map(params![from], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -1937,6 +2015,7 @@ pub fn backfill_entity_index(conn: &mut Connection) -> StoreResult<EntityBackfil
         }
     }
     tx.commit()?;
+    save_backfill_watermark_if_advanced(conn, "pages", "entity_pages", watermark)?;
     Ok(summary)
 }
 
@@ -1990,14 +2069,22 @@ pub fn backfill_page_windows_in_batches(
     let batch = batch.max(1);
     let mut summary = PageWindowBackfillSummary::default();
 
+    let watermark = load_backfill_watermark(conn, "page_windows")?;
+    let from = match watermark {
+        Some(w) if w == i64::MAX => return Ok(summary),
+        Some(w) => w + 1,
+        None => i64::MIN,
+    };
+
     // Cheap up-front cursor size. On an already-migrated store this is 0 and
     // the loop below exits on its first empty batch without any write.
     let remaining: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pages WHERE valid_from IS NULL",
-        [],
+        "SELECT COUNT(*) FROM pages WHERE rowid >= ?1 AND valid_from IS NULL",
+        params![from],
         |row| row.get(0),
     )?;
     if remaining == 0 {
+        save_backfill_watermark_if_advanced(conn, "pages", "page_windows", watermark)?;
         return Ok(summary);
     }
     tracing::info!(
@@ -2472,7 +2559,7 @@ fn insert_evidence_in_tx(
 }
 
 /// Record which observations a session citation says the page was compiled
-/// from (`page_sources`, V108, #2164), in the page-upsert transaction.
+/// from (`page_sources`, V112, #2164), in the page-upsert transaction.
 ///
 /// The rows take the page's own coordinate, and an observation is recorded
 /// only when it belongs to the cited session inside that same workspace and
@@ -8855,7 +8942,7 @@ pub fn move_project_workspace(
         "UPDATE pages SET workspace_id = ?1 WHERE project_id = ?2",
         params![&to[..], &pid[..]],
     )? as u64;
-    // `page_sources` repeats its page's coordinate (V108), so it follows the
+    // `page_sources` repeats its page's coordinate (V112), so it follows the
     // page; left behind, the old workspace's deletion would cascade it away.
     tx.execute(
         "UPDATE page_sources SET workspace_id = ?1 WHERE project_id = ?2",
@@ -9790,7 +9877,7 @@ pub fn move_session(
                     return Err(StoreError::PagePathTaken { path: page_path });
                 }
                 // The moved versions' `page_sources` rows repeat the page
-                // coordinate (V108); re-stamp them first, while the pages
+                // coordinate (V112); re-stamp them first, while the pages
                 // can still be found under the scope they are leaving.
                 tx.execute(
                     &format!(
@@ -13962,6 +14049,52 @@ pub(crate) mod tests {
             large < small * 3,
             "doubling the rows must not triple the work: {small} steps for 100, {large} for 200"
         );
+    }
+
+    #[test]
+    fn cjk_and_entity_backfill_watermarks_skip_already_scanned_rows() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut conn = unindexed_cjk_fixture(200);
+        conn.execute_batch(
+            "CREATE TABLE backfill_watermarks (
+                name TEXT PRIMARY KEY,
+                max_rowid INTEGER NOT NULL
+            ) WITHOUT ROWID;",
+        )
+        .unwrap();
+
+        let first = backfill_cjk_indexes_in_batches(&mut conn, 50).unwrap();
+        assert_eq!((first.pages, first.observations), (200, 200));
+
+        let visits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&visits);
+        conn.progress_handler(
+            1,
+            Some(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                false
+            }),
+        )
+        .unwrap();
+
+        let second = backfill_cjk_indexes_in_batches(&mut conn, 50).unwrap();
+        assert_eq!(second, CjkBackfillSummary::default());
+        let idle_steps = visits.load(Ordering::Relaxed);
+        assert!(
+            idle_steps < 1000,
+            "second CJK backfill with watermark must be O(1), took {idle_steps} VM steps"
+        );
+
+        // Inserting a new row above the watermark must still be indexed.
+        conn.progress_handler(1, None::<fn() -> bool>).unwrap();
+        conn.execute(
+            "INSERT INTO observations (rowid, title, body) VALUES (201, 'new', '支付新词')",
+            [],
+        )
+        .unwrap();
+        let third = backfill_cjk_indexes_in_batches(&mut conn, 50).unwrap();
+        assert_eq!((third.pages, third.observations), (0, 1));
     }
 
     /// A checkpoint a reader holds back must not fail the operation it follows:

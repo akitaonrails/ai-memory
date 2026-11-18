@@ -1,4 +1,4 @@
-//! `page_sources` (V108, #2164): which observations a page version was
+//! `page_sources` (V112, #2164): which observations a page version was
 //! compiled from.
 //!
 //! Invariants under test:

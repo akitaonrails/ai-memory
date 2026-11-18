@@ -17,6 +17,7 @@ use std::io;
 use anyhow::Result;
 use serde::Deserialize;
 
+use super::render_shared::native_shell_quote;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, ServerResponseError};
 
@@ -69,10 +70,10 @@ impl ProjectSplit {
     fn command(&self, day: &str) -> String {
         format!(
             "  ai-memory repair-split --workspace {} --project-id {} --from-project-id {} --archive-name {}",
-            self.run_workspace,
+            native_shell_quote(&self.run_workspace),
             self.session_project_id,
             self.run_project_id,
-            self.archive_name(day)
+            native_shell_quote(&self.archive_name(day))
         )
     }
 
@@ -82,7 +83,9 @@ impl ProjectSplit {
     fn merge_command(&self) -> String {
         format!(
             "  ai-memory merge-project --workspace {} --from-project-id {} --into-project-id {}",
-            self.run_workspace, self.run_project_id, self.session_project_id
+            native_shell_quote(&self.run_workspace),
+            self.run_project_id,
+            self.session_project_id
         )
     }
 }
@@ -312,6 +315,32 @@ mod tests {
              --project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96 \
              --from-project-id 01a19da2-094f-7830-9807-1d32f2fdb464 \
              --archive-name acme-api-split-20261105"
+        );
+    }
+
+    /// Workspace names only refuse empty and `/`, and a folder-name project
+    /// can hold a space, so each free-form value must reach the pasted
+    /// command as one argument.
+    #[test]
+    fn the_printed_commands_quote_free_form_names() {
+        let spaced = ProjectSplit {
+            workspace: "team space".into(),
+            run_workspace: "team space".into(),
+            run_project: "acme api".into(),
+            ..split()
+        };
+        assert_eq!(
+            spaced.command("20261105"),
+            "  ai-memory repair-split --workspace 'team space' \
+             --project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96 \
+             --from-project-id 01a19da2-094f-7830-9807-1d32f2fdb464 \
+             --archive-name 'acme api-split-20261105'"
+        );
+        assert_eq!(
+            spaced.merge_command(),
+            "  ai-memory merge-project --workspace 'team space' \
+             --from-project-id 01a19da2-094f-7830-9807-1d32f2fdb464 \
+             --into-project-id 01a19c51-63d5-7dc2-8dc1-90201095ba96"
         );
     }
 

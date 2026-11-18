@@ -1082,6 +1082,123 @@ async fn checkpoints_list_and_restore_page_round_trip() {
     );
 }
 
+async fn check_restore_source_is_pinned_before_the_backup(source: &str) {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let path = PagePath::new("notes/recover.md").unwrap();
+    let mut first_oid = None;
+    for (index, body) in [
+        "first checkpoint",
+        "second checkpoint",
+        "uncommitted content",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state
+            .wiki
+            .write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: path.clone(),
+                frontmatter: json!({"title": "Recover", "tier": "semantic"}),
+                body: body.into(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Recover".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        if index < 2 {
+            let oid = state.wiki.commit_all(body).unwrap().unwrap();
+            if index == 0 {
+                first_oid = Some(oid.to_string());
+            }
+        }
+    }
+    let rev = if source == "oid" {
+        first_oid.as_deref().unwrap()
+    } else {
+        source
+    };
+    let expected = if source == "HEAD" {
+        "second checkpoint"
+    } else {
+        "first checkpoint"
+    };
+    let response = post(
+        state.clone(),
+        "/admin/restore-page",
+        json!({
+            "workspace": "default", "project": "scratch", "path": path.as_str(), "rev": rev,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body_json(response).await;
+    assert_eq!(response["restored_from"], rev);
+    assert_eq!(
+        state.wiki.read_page(ws, proj, &path).unwrap().body,
+        expected,
+        "the pre-restore checkpoint must not change what {rev} restores"
+    );
+    assert_eq!(
+        store
+            .reader
+            .page_body_by_ids(ws, proj, path.as_str())
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        expected
+    );
+    let backup = response["pre_checkpoint"]
+        .as_str()
+        .expect("dirty tree is backed up");
+    assert_eq!(
+        state
+            .wiki
+            .page_at_checkpoint(ws, proj, &path, backup)
+            .await
+            .unwrap()
+            .body,
+        "uncommitted content"
+    );
+    assert!(
+        response["checkpoint"].as_str().is_some(),
+        "restored content is checkpointed"
+    );
+}
+
+#[tokio::test]
+async fn restore_page_pins_head_before_the_pre_restore_checkpoint() {
+    check_restore_source_is_pinned_before_the_backup("HEAD").await;
+}
+
+#[tokio::test]
+async fn restore_page_pins_relative_rev_before_the_pre_restore_checkpoint() {
+    check_restore_source_is_pinned_before_the_backup("HEAD~1").await;
+}
+
+#[tokio::test]
+async fn restore_page_full_oid_keeps_the_requested_checkpoint() {
+    check_restore_source_is_pinned_before_the_backup("oid").await;
+}
+
 #[tokio::test]
 async fn restore_page_from_an_unknown_rev_is_404_and_writes_no_checkpoint() {
     let tmp = TempDir::new().unwrap();
@@ -1126,6 +1243,11 @@ async fn restore_page_from_an_unknown_rev_is_404_and_writes_no_checkpoint() {
     for (path, rev) in [
         ("notes/recover.md", "0000000".to_owned()),
         ("notes/missing.md", old_oid.to_string()),
+        ("notes/recover.md", "HEAD^{tree}".to_owned()),
+        (
+            "notes/recover.md",
+            format!("HEAD:{ws}/{proj}/notes/recover.md"),
+        ),
     ] {
         let resp = post(
             state.clone(),

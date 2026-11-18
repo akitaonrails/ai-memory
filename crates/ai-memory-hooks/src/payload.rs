@@ -3,6 +3,7 @@
 use ai_memory_core::{
     AgentKind, FilePathOutcome, OBSERVATION_BODY_MAX_BYTES, ObservationKind, Sanitizer,
     TOOL_BODY_SEPARATOR, TOOL_OUTCOME_LINE_PREFIX, truncate_utf8_bytes,
+    truncate_utf8_bytes_head_tail,
 };
 use serde::{Deserialize, Serialize};
 
@@ -337,6 +338,52 @@ pub(crate) fn body_is_subagent(agent: AgentKind, raw: &serde_json::Value) -> boo
     SUBAGENT_MARKER_KEYS.iter().copied().any(marked)
 }
 
+/// How a turn ended when it did not end normally, for a payload that parsed as
+/// [`HookEvent::Stop`]. The harness's own `hook_event_name` tells it apart:
+///
+/// - `StopFailure` runs instead of `Stop` when an API error ends the turn.
+///   Claude Code sends `error` (`rate_limit`, `billing_error`, ...), an
+///   optional `error_details`, and the rendered error text as
+///   `last_assistant_message` (<https://code.claude.com/docs/en/hooks>,
+///   StopFailure, v2.1.78); Qwen Code sends the same fields
+///   (<https://github.com/QwenLM/qwen-code/blob/f35dde84157f992bc324c0a3f59b1119344a683d/docs/users/features/hooks.md#L1020-L1034>);
+///   Kimi Code sends `error_type` and `error_message`
+///   (<https://github.com/MoonshotAI/kimi-code/blob/6a8493df3e1d796a63f7c7ca0de76c1e690cd943/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts#L424-L435>,
+///   delivered in snake case).
+/// - `Interrupt` runs instead of `Stop` when the user cuts the turn short. Kimi
+///   Code adds a `reason`
+///   (<https://github.com/MoonshotAI/kimi-code/blob/6a8493df3e1d796a63f7c7ca0de76c1e690cd943/packages/agent-core-v2/src/features/externalHooks/agent/agentExternalHooksService.ts#L419-L421>);
+///   Codex sends only the common fields
+///   (<https://github.com/openai/codex/blob/d32063f96c2dff1dc96af839b3952abb6acfeda4/codex-rs/hooks/src/schema.rs#L628-L639>).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AbnormalTurnEnd {
+    /// An API error ended the turn: its type and details, when sent.
+    Failed {
+        error: Option<String>,
+        details: Option<String>,
+    },
+    /// The user interrupted the turn, with the harness's reason when sent.
+    Interrupted { reason: Option<String> },
+}
+
+/// The abnormal end a `Stop`-shaped payload reports, `None` for a normal turn
+/// end. See [`AbnormalTurnEnd`].
+pub(crate) fn abnormal_turn_end(raw: &serde_json::Value) -> Option<AbnormalTurnEnd> {
+    match raw
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("StopFailure") => Some(AbnormalTurnEnd::Failed {
+            error: extract_string(raw, &["error", "error_type"]).and_then(first_line),
+            details: extract_string(raw, &["error_details", "error_message"]).and_then(first_line),
+        }),
+        Some("Interrupt") => Some(AbnormalTurnEnd::Interrupted {
+            reason: extract_string(raw, &["reason"]).and_then(first_line),
+        }),
+        _ => None,
+    }
+}
+
 /// Truthy interpretation of a query-string flag (`1`/`true`/`yes`/`on`,
 /// case-insensitive). Used for the per-project `drop_subagent` opt-in the
 /// host-side hook forwards from a project's `.ai-memory.toml`.
@@ -522,7 +569,11 @@ impl HookEvent {
             }
             "post-compaction" | "post_compaction" | "PostCompaction" => Self::PostCompaction,
             "notification" | "Notification" => Self::Notification,
-            "stop" | "Stop" | "AfterAgent" => Self::Stop,
+            // `StopFailure` (an API error ended the turn) and `Interrupt` (the
+            // user cut it short) fire instead of `Stop`, and end the turn all
+            // the same; the payload's `hook_event_name` says which it was.
+            "stop" | "Stop" | "AfterAgent" | "stop-failure" | "stop_failure" | "StopFailure"
+            | "Interrupt" | "interrupt" => Self::Stop,
             "session-end" | "session_end" | "SessionEnd" | "sessionEnd" => Self::SessionEnd,
             "subagent-start" | "subagent_start" | "SubagentStart" | "subagentStart" => {
                 Self::SubagentStart
@@ -1401,6 +1452,13 @@ fn best_title_hint(event: HookEvent, agent: AgentKind, raw: &serde_json::Value) 
         }
         HookEvent::Notification => extract_string(raw, &["message", "text"]).and_then(first_line),
         HookEvent::PostCompaction => extract_string(raw, &["summary"]).and_then(first_line),
+        HookEvent::Stop => abnormal_turn_end(raw).map(|end| match end {
+            AbnormalTurnEnd::Failed {
+                error: Some(error), ..
+            } => format!("stop failure: {error}"),
+            AbnormalTurnEnd::Failed { error: None, .. } => "stop failure".to_owned(),
+            AbnormalTurnEnd::Interrupted { .. } => "interrupt".to_owned(),
+        }),
         _ => None,
     }
 }
@@ -1509,6 +1567,25 @@ fn best_body_excerpt(
         HookEvent::SessionEnd => extract_string(raw, &["reason"])
             .and_then(first_line)
             .map(|reason| format!("reason: {reason}")),
+        // A turn an API error ended, or the user interrupted, says so in a few
+        // first-line fields. The harness's rendered error text in
+        // `last_assistant_message` is not used: it stays stripped like any
+        // assistant message.
+        HookEvent::Stop => abnormal_turn_end(raw).and_then(|end| match end {
+            AbnormalTurnEnd::Failed { error, details } => {
+                let lines: Vec<String> = [
+                    error.map(|error| format!("error: {error}")),
+                    details.map(|details| format!("details: {details}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                (!lines.is_empty()).then(|| lines.join("\n"))
+            }
+            AbnormalTurnEnd::Interrupted { reason } => {
+                reason.map(|reason| format!("reason: {reason}"))
+            }
+        }),
         _ => None,
     }
 }
@@ -1543,10 +1620,17 @@ pub fn cap_lifecycle_body_for_client(raw: &mut serde_json::Value, event: HookEve
     let Some((keys, max_bytes)) = core_body_cap(event) else {
         return false;
     };
-    let mut changed = cap_candidate_group(raw, keys, max_bytes);
+    // A trailing user correction must survive the first durable write. Other
+    // lifecycle fields keep their existing prefix-only selection.
+    let truncate: fn(&str, usize) -> String = if event == HookEvent::UserPrompt {
+        truncate_utf8_bytes_head_tail
+    } else {
+        truncate_utf8_bytes
+    };
+    let mut changed = cap_candidate_group(raw, keys, max_bytes, truncate);
     for container in ["payload", "event"] {
         if let Some(nested) = raw.get_mut(container) {
-            changed |= cap_candidate_group(nested, keys, max_bytes);
+            changed |= cap_candidate_group(nested, keys, max_bytes, truncate);
         }
     }
     changed
@@ -1570,23 +1654,33 @@ fn core_body_cap(event: HookEvent) -> Option<(&'static [&'static str], usize)> {
     }
 }
 
-fn cap_candidate_group(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
-    let mut changed = cap_object_fields(value, keys, max_bytes);
+fn cap_candidate_group(
+    value: &mut serde_json::Value,
+    keys: &[&str],
+    max_bytes: usize,
+    truncate: fn(&str, usize) -> String,
+) -> bool {
+    let mut changed = cap_object_fields(value, keys, max_bytes, truncate);
     if let Some(properties) = value.get_mut("properties") {
-        changed |= cap_object_fields(properties, keys, max_bytes);
+        changed |= cap_object_fields(properties, keys, max_bytes, truncate);
         if let Some(info) = properties.get_mut("info") {
-            changed |= cap_object_fields(info, keys, max_bytes);
+            changed |= cap_object_fields(info, keys, max_bytes, truncate);
         }
     }
     for container in ["info", "path"] {
         if let Some(nested) = value.get_mut(container) {
-            changed |= cap_object_fields(nested, keys, max_bytes);
+            changed |= cap_object_fields(nested, keys, max_bytes, truncate);
         }
     }
     changed
 }
 
-fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: usize) -> bool {
+fn cap_object_fields(
+    value: &mut serde_json::Value,
+    keys: &[&str],
+    max_bytes: usize,
+    truncate: fn(&str, usize) -> String,
+) -> bool {
     let Some(object) = value.as_object_mut() else {
         return false;
     };
@@ -1607,7 +1701,7 @@ fn cap_object_fields(value: &mut serde_json::Value, keys: &[&str], max_bytes: us
             // unmatchable prefix (#1114), the class #980 / #1109 fixed.
             // Same order as `assistant_capture::transform_for_client`.
             let scrubbed = Sanitizer::builtin().scrub(&text);
-            *field = serde_json::Value::String(truncate_utf8_bytes(&scrubbed, max_bytes));
+            *field = serde_json::Value::String(truncate(&scrubbed, max_bytes));
             changed = true;
         }
     }
@@ -2027,6 +2121,114 @@ mod tests {
             ("PreCompress", HookEvent::PreCompact),
         ] {
             assert_eq!(HookEvent::parse(name), event, "{name}");
+        }
+    }
+
+    /// `StopFailure` (Claude Code 2.1.78, Qwen Code, Kimi Code) and
+    /// `Interrupt` (Kimi Code, Codex) fire instead of `Stop`, so they end the
+    /// turn like it.
+    #[test]
+    fn parses_abnormal_turn_ends_as_stop() {
+        for name in [
+            "StopFailure",
+            "stop-failure",
+            "stop_failure",
+            "Interrupt",
+            "interrupt",
+        ] {
+            assert_eq!(HookEvent::parse(name), HookEvent::Stop, "{name}");
+        }
+    }
+
+    /// Each harness's own shape for a failed or interrupted turn, as its docs
+    /// and source give it, turns into a titled stop row; the rendered error
+    /// text in `last_assistant_message` never reaches the body. A normal `Stop`
+    /// is unchanged (control).
+    #[test]
+    fn abnormal_turn_ends_are_titled_and_described() {
+        let stop = |agent: &str, body: serde_json::Value| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "stop".into(),
+                    agent: Some(agent.into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+        let cases = [
+            (
+                "claude-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error": "rate_limit",
+                    "error_details": "429 Too Many Requests",
+                    "last_assistant_message": "API Error: Rate limit reached",
+                }),
+                Some("stop failure: rate_limit"),
+                Some("error: rate_limit\ndetails: 429 Too Many Requests"),
+            ),
+            (
+                "qwen-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error": "loop_detected",
+                    "error_details": "tool_call_loop",
+                }),
+                Some("stop failure: loop_detected"),
+                Some("error: loop_detected\ndetails: tool_call_loop"),
+            ),
+            (
+                "kimi-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "StopFailure",
+                    "error_type": "ChatProviderError",
+                    "error_message": "rate limited",
+                }),
+                Some("stop failure: ChatProviderError"),
+                Some("error: ChatProviderError\ndetails: rate limited"),
+            ),
+            (
+                "kimi-code",
+                serde_json::json!({
+                    "session_id": "s",
+                    "hook_event_name": "Interrupt",
+                    "turn_id": "t1",
+                    "reason": "cancelled",
+                }),
+                Some("interrupt"),
+                Some("reason: cancelled"),
+            ),
+            (
+                "codex",
+                serde_json::json!({
+                    "session_id": "s",
+                    "turn_id": "t1",
+                    "hook_event_name": "Interrupt",
+                    "model": "gpt-5",
+                }),
+                Some("interrupt"),
+                None,
+            ),
+            (
+                "claude-code",
+                serde_json::json!({ "session_id": "s", "hook_event_name": "Stop" }),
+                None,
+                None,
+            ),
+        ];
+        for (agent, body, title, excerpt) in cases {
+            let env = stop(agent, body.clone());
+            assert_eq!(env.event, HookEvent::Stop, "{agent}: {body}");
+            assert_eq!(env.title_hint.as_deref(), title, "{agent}: {body}");
+            assert_eq!(env.body_excerpt.as_deref(), excerpt, "{agent}: {body}");
+            assert!(
+                !env.body_excerpt.unwrap_or_default().contains("API Error"),
+                "{agent}: the rendered error text stays out of the body"
+            );
         }
     }
 
@@ -3703,7 +3905,7 @@ mod tests {
         ] {
             let text = value.as_str().expect("oversized value flattened to text");
             assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
-            assert!(text.ends_with('…'));
+            assert!(text.contains("...[truncated "));
         }
         assert!(!cap_lifecycle_body_for_client(
             &mut raw,
@@ -3713,6 +3915,81 @@ mod tests {
             &mut raw,
             HookEvent::SessionStart
         ));
+    }
+
+    #[test]
+    fn client_prompt_selection_preserves_corrections_in_every_candidate_shape() {
+        let beginning = "INITIAL_REQUEST: inspect the parser.\n";
+        let ending = "\nFINAL_CORRECTION: inspect the lexer. PRIVATE_PROSE_LIMITATION";
+        let prompt = format!(
+            "{beginning}{}OMITTED_MIDDLE_CORRECTION{}{ending}",
+            "é🧪".repeat(2_000),
+            "é🧪".repeat(2_000),
+        );
+        for key in ["prompt", "message", "text", "submitted_prompt"] {
+            for pointer in [
+                "",
+                "/properties",
+                "/properties/info",
+                "/info",
+                "/path",
+                "/payload",
+                "/payload/properties",
+                "/payload/properties/info",
+                "/payload/info",
+                "/payload/path",
+                "/event",
+                "/event/properties",
+                "/event/properties/info",
+                "/event/info",
+                "/event/path",
+            ] {
+                let mut container = serde_json::json!({(key): [{"type": "text", "text": prompt}]});
+                for part in pointer.split('/').filter(|part| !part.is_empty()).rev() {
+                    container = serde_json::json!({(part): container});
+                }
+                assert!(cap_lifecycle_body_for_client(
+                    &mut container,
+                    HookEvent::UserPrompt
+                ));
+                let text = container
+                    .pointer(&format!("{pointer}/{key}"))
+                    .unwrap()
+                    .as_str()
+                    .unwrap();
+                assert!(text.starts_with(beginning), "{pointer}/{key}");
+                assert!(text.ends_with(ending), "{pointer}/{key}: correction lost");
+                assert!(text.contains("...[truncated "));
+                assert!(!text.contains("OMITTED_MIDDLE_CORRECTION"));
+                assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+                assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+                assert!(!cap_lifecycle_body_for_client(
+                    &mut container,
+                    HookEvent::UserPrompt
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn client_prompt_selection_scrubs_secrets_across_both_cuts() {
+        let secret = format!("AKIA{}", "Z".repeat(16));
+        let half = (USER_PROMPT_EXCERPT_MAX_BYTES - 48) / 2;
+        for start in [half - 10, 24_000 - half - 10] {
+            let mut prompt = "x".repeat(24_000);
+            prompt.replace_range(start - 1..start, " ");
+            prompt.replace_range(start..start + secret.len(), &secret);
+            prompt.replace_range(start + secret.len()..start + secret.len() + 1, " ");
+            let mut raw = serde_json::json!({"prompt": prompt});
+            assert!(cap_lifecycle_body_for_client(
+                &mut raw,
+                HookEvent::UserPrompt
+            ));
+            let text = raw["prompt"].as_str().unwrap();
+            assert!(!text.contains("AKIA"), "secret prefix at {start}");
+            assert!(!text.contains('Z'), "secret suffix at {start}");
+            assert!(text.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
+        }
     }
 
     /// Regression for #1114 (client side): an oversized lifecycle body is
@@ -3771,7 +4048,10 @@ mod tests {
             "submitted_prompt exceeds the per-event cap: {} bytes",
             capped.len()
         );
-        assert!(capped.ends_with('…'), "submitted_prompt not truncated");
+        assert!(
+            capped.contains("...[truncated "),
+            "submitted_prompt not truncated"
+        );
         assert!(
             !capped.contains("AKIA"),
             "unredacted secret fragment survived the cap: {capped:?}"
@@ -3811,7 +4091,7 @@ mod tests {
         ));
         let capped = raw["prompt"].as_str().expect("oversized prompt capped");
         assert!(capped.len() <= USER_PROMPT_EXCERPT_MAX_BYTES);
-        assert!(capped.ends_with('…'));
+        assert!(capped.contains("...[truncated "));
 
         let mut notification = serde_json::json!({
             "message": "y".repeat(NOTIFICATION_EXCERPT_MAX_BYTES + 1),

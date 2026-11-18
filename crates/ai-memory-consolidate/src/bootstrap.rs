@@ -65,7 +65,7 @@ const CHARS_PER_TOKEN: usize = 4;
 const ESTIMATE_BUDGET_PERCENT: usize = 80;
 
 /// `budget` shrunk by [`ESTIMATE_BUDGET_PERCENT`].
-const fn with_estimate_margin(budget: usize) -> usize {
+pub(crate) const fn with_estimate_margin(budget: usize) -> usize {
     budget.saturating_mul(ESTIMATE_BUDGET_PERCENT) / 100
 }
 

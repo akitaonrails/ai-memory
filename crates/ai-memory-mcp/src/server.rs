@@ -7561,15 +7561,25 @@ impl AiMemoryServer {
                 None => ai_memory_core::OwnerFilter::Unattributed,
             }
         };
-        // Blank means omitted, as for `handoff_id`: an empty path has no
-        // directory inside it, so it would hide every automatic handoff.
+        // A blank cwd means omitted: an empty path has no directory inside
+        // it, so it would hide every automatic handoff.
         let receiving_cwd = args.cwd.filter(|cwd| !cwd.trim().is_empty());
+        // A supplied id must name a handoff. Reading a blank one as omitted
+        // would claim the latest eligible baton instead, possibly the one a
+        // parallel harness is about to accept, and a claim cannot be undone.
+        // Message ids follow the same rule (#2244).
         let requested_id = args
             .handoff_id
             .as_deref()
             .map(str::trim)
-            .filter(|id| !id.is_empty())
             .map(|id| {
+                if id.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "invalid handoff_id: it is blank; omit it to claim the latest \
+                         eligible handoff",
+                        None,
+                    ));
+                }
                 HandoffId::from_str(id)
                     .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))
             })
@@ -9549,7 +9559,18 @@ fn page_precondition(
     expected_page_id: Option<&str>,
     create_only: bool,
 ) -> Result<Option<ai_memory_store::PagePrecondition>, McpError> {
-    let expected = expected_page_id.map(str::trim).filter(|id| !id.is_empty());
+    let expected = expected_page_id.map(str::trim);
+    // A supplied precondition must name a version. Reading a blank one as
+    // omitted would quietly turn a conditional write or delete into an
+    // unconditional one, the lost update the precondition exists to stop.
+    // Message and handoff ids follow the same rule (#2244).
+    if expected == Some("") {
+        return Err(McpError::invalid_params(
+            "expected_page_id is blank; pass the page_id you read, or omit it to change the \
+             page unconditionally",
+            None,
+        ));
+    }
     match (expected, create_only) {
         (Some(_), true) => Err(McpError::invalid_params(
             "expected_page_id and create_only cannot be combined",
@@ -21189,6 +21210,44 @@ mod tests {
         assert!(duplicate.message.contains("duplicate batch path"));
     }
 
+    /// A batch entry whose `expected_page_id` is blank is refused for that
+    /// reason, the way a single write is, and nothing is written.
+    #[tokio::test]
+    async fn memory_write_pages_batch_refuses_a_blank_expected_page_id() {
+        let (tmp, store, server, ws, project) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let refused = server
+            .memory_write_pages_batch(
+                Parameters(BatchWritePagesArgs {
+                    workspace: "default".into(),
+                    project: None,
+                    project_id: Some(project.to_string()),
+                    pages: vec![batch_entry("imported/a.md", "# A", false, Some(" "))],
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "{refused:?}"
+        );
+        assert!(
+            refused.message.contains("expected_page_id is blank"),
+            "{refused:?}"
+        );
+        assert!(
+            store
+                .reader
+                .existing_latest_paths(ws, project, vec!["imported/a.md".into()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused batch writes no page"
+        );
+    }
+
     #[tokio::test]
     async fn memory_write_page_metadata_roundtrip() {
         let tmp = TempDir::new().unwrap();
@@ -22222,6 +22281,168 @@ mod tests {
             .read_page(ws, proj, &PagePath::new("notes/status.md").unwrap())
             .unwrap();
         assert!(!stored.body.contains("lost"));
+    }
+
+    #[tokio::test]
+    async fn memory_patch_page_keeps_unterminated_heading() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let write = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "notes/unterminated.md".into(),
+                    body: "# Status\n## Log".into(),
+                    title: None,
+                    tier: None,
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    project_id: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let page_id = call_tool_json(write)["page_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let read = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    path: Some("notes/unterminated.md".into()),
+                    query: None,
+                    project: None,
+                    project_id: None,
+                    workspace: None,
+                    scope: None,
+                    include_related: false,
+                    related_depth: None,
+                    max_chars: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let read = call_tool_json(read);
+        let section_sha256 = read["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|section| section["anchor"] == "Log")
+            .unwrap()["sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        server
+            .memory_patch_page(
+                Parameters(PatchPageArgs {
+                    path: "notes/unterminated.md".into(),
+                    expected_page_id: page_id,
+                    edits: vec![crate::page_patch::PagePatchEdit::ReplaceSection {
+                        anchor: "Log".into(),
+                        section_sha256,
+                        content: "new".into(),
+                    }],
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let stored = server
+            .wiki
+            .as_ref()
+            .unwrap()
+            .read_page(ws, proj, &PagePath::new("notes/unterminated.md").unwrap())
+            .unwrap();
+        assert_eq!(stored.body, "# Status\n## Log\nnew\n");
+
+        let nested_body = "# Status\n## Parent\ntext\n### Log";
+        let nested_write = server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "notes/nested-unterminated.md".into(),
+                    body: nested_body.into(),
+                    title: None,
+                    tier: None,
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    project_id: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let nested_id = call_tool_json(nested_write)["page_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let hash = crate::page_patch::section_hashes(nested_body)
+            .0
+            .into_iter()
+            .find(|section| section.anchor == "Log")
+            .unwrap()
+            .sha256;
+        let error = server
+            .memory_patch_page(
+                Parameters(PatchPageArgs {
+                    path: "notes/nested-unterminated.md".into(),
+                    expected_page_id: nested_id.clone(),
+                    edits: vec![
+                        crate::page_patch::PagePatchEdit::ReplaceSection {
+                            anchor: "Log".into(),
+                            section_sha256: hash,
+                            content: "new".into(),
+                        },
+                        crate::page_patch::PagePatchEdit::Append {
+                            target: crate::page_patch::AppendTarget::Section,
+                            anchor: Some("Parent".into()),
+                            content: "parent".into(),
+                        },
+                    ],
+                    project: None,
+                    workspace: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.data.unwrap()["reason"], "overlapping_edits");
+        let stored = server
+            .wiki
+            .as_ref()
+            .unwrap()
+            .read_page(
+                ws,
+                proj,
+                &PagePath::new("notes/nested-unterminated.md").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(stored.body, nested_body);
+        let current_id = server
+            .reader
+            .latest_page_id_by_ids(ws, proj, "notes/nested-unterminated.md".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_id.to_string(), nested_id);
     }
 
     /// Replacing a section while appending to its last nested section used to
@@ -29312,6 +29533,36 @@ mod tests {
             }
         }
 
+        /// A blank `expected_page_id` is refused, never read as omitted: the
+        /// write it guarded would land on whatever version is latest. The newer
+        /// version stays, and omitting the field still writes unconditionally.
+        #[tokio::test]
+        async fn a_blank_expected_page_id_never_overwrites_the_newer_version() {
+            let (_tmp, server) = server(true).await;
+            let first = put(&server, write("notes/a.md", "# A\n\none", "scratch"))
+                .await
+                .unwrap();
+            let mut next = write("notes/a.md", "# A\n\ntwo", "scratch");
+            next.expected_page_id = Some(first);
+            let second = put(&server, next).await.unwrap();
+
+            for blank in ["", " \t\n "] {
+                let mut stale = write("notes/a.md", "# A\n\nblank", "scratch");
+                stale.expected_page_id = Some(blank.into());
+                let err = put(&server, stale).await.unwrap_err();
+                assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+                assert!(err.message.contains("expected_page_id is blank"), "{err:?}");
+                let page = read(&server, "notes/a.md").await;
+                assert_eq!(page["page_id"], second.as_str(), "blank {blank:?}");
+                assert!(page["body"].as_str().unwrap().contains("two"), "{page}");
+            }
+
+            let third = put(&server, write("notes/a.md", "# A\n\nthree", "scratch"))
+                .await
+                .unwrap();
+            assert_eq!(read(&server, "notes/a.md").await["page_id"], third.as_str());
+        }
+
         /// A version id from another project never matches: the precondition
         /// is checked against the resolved scope's own latest row.
         #[tokio::test]
@@ -29374,6 +29625,41 @@ mod tests {
                     .unwrap_err();
                 assert_precondition_failed(&err, None);
             }
+        }
+
+        /// A blank `expected_page_id` on a delete is refused and the page
+        /// stays; omitting the field still deletes unconditionally.
+        #[tokio::test]
+        async fn a_blank_expected_page_id_never_deletes_the_page() {
+            let (_tmp, server) = server(true).await;
+            let id = put(&server, write("notes/a.md", "# A", "scratch"))
+                .await
+                .unwrap();
+            for blank in ["", "  "] {
+                let err = server
+                    .memory_delete_page(
+                        Parameters(delete("notes/a.md", Some(blank))),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+                assert!(err.message.contains("expected_page_id is blank"), "{err:?}");
+                assert_eq!(
+                    read(&server, "notes/a.md").await["page_id"],
+                    id.as_str(),
+                    "blank {blank:?}"
+                );
+            }
+
+            let deleted = server
+                .memory_delete_page(
+                    Parameters(delete("notes/a.md", None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(json(&deleted)["deleted"], true);
         }
     }
 }

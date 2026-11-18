@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use ai_memory_core::{
-    AgentKind, AgentMessage, ApiCredentialId, HandoffAcceptance, HandoffId, IdentityKey,
+    AgentKind, AgentMessage, ApiCredentialId, Handoff, HandoffAcceptance, HandoffId, IdentityKey,
     ManagedRunId, MessageClaim, MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage,
     NewSession, NewSessionUsage, NewUser, ObservationId, OwnerFilter, PageId, PagePath, ProjectId,
     Sanitized, SessionDisplayName, SessionId, UserId, UserRole, WorkspaceId,
@@ -43,10 +43,12 @@ use crate::workstream::{
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct StartupContextAcceptance {
     /// The requested single-use handoff changed from open to accepted.
     pub handoff_accepted: bool,
+    /// The handoff as claimed, captured before the claim transaction commits.
+    pub handoff: Option<Handoff>,
     /// The requested managed synchronization packet changed to delivered.
     pub managed_context_accepted: bool,
 }
@@ -585,6 +587,11 @@ pub(crate) enum WriteCmd {
     /// the actor. See [`WriterHandle::checkpoint_and_close`].
     Close {
         reply: oneshot::Sender<()>,
+    },
+    /// Atomically replace the persisted wiki file fingerprints table.
+    ReplaceWikiFileFingerprints {
+        rows: Vec<crate::WikiFileFingerprintRow>,
+        reply: oneshot::Sender<StoreResult<()>>,
     },
     /// Test seam: read `PRAGMA journal_size_limit` off the writer's own
     /// connection, the only place the pragma is set.
@@ -2835,6 +2842,17 @@ impl WriterHandle {
         }
     }
 
+    /// Atomically replace all persisted wiki file fingerprints.
+    pub async fn replace_wiki_file_fingerprints(
+        &self,
+        rows: Vec<crate::WikiFileFingerprintRow>,
+    ) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ReplaceWikiFileFingerprints { rows, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// `PRAGMA journal_size_limit` as the writer's connection reports it.
     #[cfg(test)]
     pub(crate) async fn journal_size_limit(&self) -> StoreResult<i64> {
@@ -3987,11 +4005,12 @@ impl WriterHandle {
     /// SessionStart response.
     ///
     /// When a managed run was requested but is no longer claimable, the
-    /// handoff remains open and both result fields are false. `busy_since` is
+    /// handoff remains open and neither context is returned. `busy_since` is
     /// the same cutoff the selection used
     /// ([`crate::ReaderPool::startup_handoff`]), re-applied in the claim's
     /// transaction: a baton whose open source captured anything after it stays
-    /// open.
+    /// open. A successful handoff claim returns its snapshot from that same
+    /// transaction, so a checkpoint refreshed after selection is not lost.
     pub async fn accept_startup_context(
         &self,
         handoff: Option<HandoffAcceptance>,
@@ -5043,6 +5062,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 while rx.blocking_recv().is_some() {}
                 break;
             }
+            WriteCmd::ReplaceWikiFileFingerprints { rows, reply } => {
+                let result = replace_wiki_file_fingerprints_tx(&mut conn, &rows);
+                send_or_warn(reply, result, "replace_wiki_file_fingerprints");
+            }
             #[cfg(test)]
             WriteCmd::JournalSizeLimit { reply } => {
                 let result = conn
@@ -5610,17 +5633,36 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     if managed_run_id.is_some() && !managed_context_accepted {
                         return Ok(StartupContextAcceptance::default());
                     }
-                    let handoff_accepted = match handoff {
-                        Some(acceptance) => ops::accept_handoff_in_transaction(
-                            &tx,
-                            &acceptance,
-                            Some(busy_since.as_microsecond()),
-                        )?,
-                        None => false,
+                    let handoff = match handoff {
+                        Some(acceptance)
+                            if ops::accept_handoff_in_transaction(
+                                &tx,
+                                &acceptance,
+                                Some(busy_since.as_microsecond()),
+                            )? =>
+                        {
+                            // Checkpoints refresh an open row in place. Capture
+                            // what the claim consumed, not the earlier selection.
+                            Some(tx.query_row(
+                                "SELECT id, workspace_id, project_id, from_session_id, from_agent, \
+                                        to_agent, cwd, summary, open_questions, next_steps, \
+                                        files_touched, state, created_at, accepted_by, accepted_at, \
+                                        accepted_by_session, owner_user, accepted_by_user, manual \
+                                 FROM handoffs WHERE id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+                                rusqlite::params![
+                                    acceptance.handoff_id.as_bytes(),
+                                    acceptance.workspace_id.as_bytes(),
+                                    acceptance.project_id.as_bytes(),
+                                ],
+                                crate::reader::row_to_handoff,
+                            )??)
+                        }
+                        _ => None,
                     };
                     tx.commit()?;
                     Ok(StartupContextAcceptance {
-                        handoff_accepted,
+                        handoff_accepted: handoff.is_some(),
+                        handoff,
                         managed_context_accepted,
                     })
                 })();
@@ -5646,6 +5688,36 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
         }
     }
     tracing::debug!("writer thread exiting cleanly");
+}
+
+fn replace_wiki_file_fingerprints_tx(
+    conn: &mut Connection,
+    rows: &[crate::WikiFileFingerprintRow],
+) -> StoreResult<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM wiki_file_fingerprints", [])?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO wiki_file_fingerprints \
+             (workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for row in rows {
+            stmt.execute(rusqlite::params![
+                row.workspace_id.as_bytes(),
+                row.project_id.as_bytes(),
+                row.path.as_str(),
+                i64::try_from(row.file_len).unwrap_or(i64::MAX),
+                row.mtime_secs,
+                i64::from(row.mtime_nanos),
+                i64::try_from(row.inode).unwrap_or(i64::MAX),
+                row.ctime_secs,
+                row.ctime_nanos,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
