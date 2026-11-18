@@ -479,8 +479,13 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
                 )));
             }
             let extra_headers = with_default_openrouter_headers(&base, extra_headers);
+            let mut provider =
+                OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?;
+            if let Some(path) = config.auth.api_key_file() {
+                provider = provider.with_api_key_file(path);
+            }
             Ok(Arc::new(
-                OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
+                provider
                     .with_strict(config.compat_strict)
                     .with_disable_thinking(config.compat_disable_thinking)
                     .with_stream(config.compat_stream)?

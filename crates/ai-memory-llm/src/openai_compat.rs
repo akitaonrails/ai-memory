@@ -208,6 +208,14 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Read the API key from `path` (`llm_api_key_file`) instead of the key
+    /// given to [`Self::new`].
+    #[must_use]
+    pub(crate) fn with_api_key_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.inner = self.inner.with_api_key_file(path);
+        self
+    }
+
     /// Forward operator-configured headers to the inner client. Aggregators
     /// and gateways behind an OpenAI-compatible endpoint are the common case
     /// for caller-identifying headers.

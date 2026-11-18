@@ -343,6 +343,24 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > only when every `openai-compat` endpoint you configure may see your
 > workspace, project and user names.
 
+### Gateways whose token rotates
+
+`LLM_API_KEY` is read once at startup, so a gateway whose bearer token is
+rewritten in a file (by a login CLI or a secrets agent) needs a restart after
+every rotation. Point `llm_api_key_file` (`AI_MEMORY_LLM_API_KEY_FILE`) at the
+file instead:
+
+```toml
+llm_provider = "openai-compat"
+llm_base_url = "https://gateway.example.com/v1"
+llm_model = "your-model"
+llm_api_key_file = "/path/to/api-key"
+```
+
+The key is cached after the first read. On a `401` the file is read again, and
+the request is retried once only if the key changed; a file still holding the
+rejected key returns the `401` without a second request.
+
 ### Falling back when credit or quota runs out
 
 An ordered `[[llm_fallbacks]]` chain moves to the next provider on a transient

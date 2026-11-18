@@ -11,6 +11,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Added
+
+- `llm_api_key_file` (`AI_MEMORY_LLM_API_KEY_FILE`) reads the `openai-compat`
+  API key from a file instead of `LLM_API_KEY`, for gateways whose bearer token
+  rotates while the server runs. The key is read on first use and cached; after
+  a `401` the file is read once more, and the request is retried once only when
+  the file now holds a different key, so a stale token never loops. ai-memory
+  never writes the file. `[llm.<task>]` profiles that inherit the global key
+  inherit the file too, and an ambient `LLM_API_KEY` is ignored by the chat
+  provider when the file is set. (#ISSUE)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added

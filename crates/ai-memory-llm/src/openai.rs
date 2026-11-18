@@ -1,6 +1,7 @@
 //! OpenAI Chat Completions client (with `response_format` JSON schema for
 //! structured output).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,6 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+use crate::api_key_file::ApiKeyFile;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error, response_json_limited};
@@ -117,6 +119,9 @@ pub enum RequestDialect {
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: SecretString,
+    /// When set, the key comes from this file instead of `api_key`: read on
+    /// first use, re-read once after a `401` (see [`Self::post`]).
+    api_key_file: Option<ApiKeyFile>,
     base_url: String,
     model: String,
     dialect: RequestDialect,
@@ -166,6 +171,7 @@ impl OpenAiProvider {
         Ok(Self {
             client,
             api_key,
+            api_key_file: None,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             dialect: RequestDialect::Official,
@@ -185,6 +191,14 @@ impl OpenAiProvider {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Read the API key from `path` instead of the key given to
+    /// [`Self::new`], so a key rotated in the file reaches a running server.
+    #[must_use]
+    pub(crate) fn with_api_key_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.api_key_file = Some(ApiKeyFile::new(path));
         self
     }
 
@@ -629,13 +643,49 @@ impl OpenAiProvider {
         body: &B,
         operation_id: LlmOperationId,
     ) -> LlmResult<OpenAiResponse> {
+        let resp = match &self.api_key_file {
+            None => self.send(body, &operation_id, &self.api_key).await?,
+            Some(file) => {
+                let key = file.current().await?;
+                let resp = self.send(body, &operation_id, &key).await?;
+                // One retry, and only when the file now holds a different
+                // key: a file still holding the rejected key returns the
+                // 401 as is, so a stale token never loops.
+                if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+                    resp
+                } else {
+                    match file.rotated(&key).await {
+                        Ok(Some(rotated)) => self.send(body, &operation_id, &rotated).await?,
+                        Ok(None) => resp,
+                        // The 401 is the failure to report; an unreadable
+                        // file mid-rewrite is only why it was not retried.
+                        Err(error) => {
+                            tracing::warn!(%error, "API key file not re-read after a 401");
+                            resp
+                        }
+                    }
+                }
+            }
+        };
+        if !resp.status().is_success() {
+            return Err(provider_error(resp).await);
+        }
+        response_json_limited::<OpenAiResponse>(resp).await
+    }
+
+    async fn send<B: Serialize>(
+        &self,
+        body: &B,
+        operation_id: &LlmOperationId,
+        api_key: &SecretString,
+    ) -> LlmResult<reqwest::Response> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai");
         let builder = self
             .client
             .post(&url)
             .timeout(self.timeout)
-            .bearer_auth(self.api_key.expose_secret())
+            .bearer_auth(api_key.expose_secret())
             .header("content-type", "application/json");
         // Both header layers go on in one `apply`, which replaces per name.
         // Adding them separately with `RequestBuilder::header` would *append*
@@ -658,7 +708,7 @@ impl OpenAiProvider {
                     }
                 }
                 if self.request_metadata_headers {
-                    insert_request_metadata(&mut headers, &operation_id);
+                    insert_request_metadata(&mut headers, operation_id);
                 }
                 headers.apply(builder)
             }
@@ -680,11 +730,7 @@ impl OpenAiProvider {
                 headers.apply(builder)
             }
         };
-        let resp = request.json(body).send().await?;
-        if !resp.status().is_success() {
-            return Err(provider_error(resp).await);
-        }
-        response_json_limited::<OpenAiResponse>(resp).await
+        Ok(request.json(body).send().await?)
     }
 }
 

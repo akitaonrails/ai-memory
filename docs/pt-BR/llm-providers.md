@@ -312,6 +312,24 @@ não redireciona os embeddings; defina `AI_MEMORY_EMBEDDING_BASE_URL` também.
 > apenas quando todo endpoint `openai-compat` que você configurar puder ver os nomes do seu
 > espaço de trabalho, projeto e usuário.
 
+### Gateways com token rotativo
+
+O `LLM_API_KEY` é lido uma única vez na inicialização, então um gateway cujo
+bearer token é reescrito num arquivo (por uma CLI de login ou um agente de
+segredos) exige reiniciar o servidor a cada rotação. Aponte `llm_api_key_file`
+(`AI_MEMORY_LLM_API_KEY_FILE`) para o arquivo:
+
+```toml
+llm_provider = "openai-compat"
+llm_base_url = "https://gateway.example.com/v1"
+llm_model = "your-model"
+llm_api_key_file = "/path/to/api-key"
+```
+
+A chave fica em cache após a primeira leitura. Num `401` o arquivo é lido de
+novo, e a requisição é repetida uma vez só se a chave mudou; um arquivo que
+ainda tem a chave recusada devolve o `401` sem segunda requisição.
+
 ### Contingência quando o crédito ou a cota se esgota
 
 Uma cadeia `[[llm_fallbacks]]` ordenada passa para o próximo provedor diante de

@@ -1631,6 +1631,9 @@ AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth |
                            cursor | gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
+AI_MEMORY_LLM_API_KEY_FILE openai-compat only: read the key from this file instead of
+                           LLM_API_KEY (`llm_api_key_file`); re-read once after a 401,
+                           so a rotated token reaches a running server
 AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
                            opencode (defaults to the Go endpoint, set
                            https://opencode.ai/zen/v1 for Zen's catalogue).

@@ -449,6 +449,14 @@ pub struct Config {
     /// `reasoning`, xAI Grok `reasoning_effort`, Anthropic
     /// `output_config.effort`, Codex `reasoning.effort`).
     pub llm_reasoning_effort: Option<ReasoningEffort>,
+    /// OpenAI-compat only: read the API key from this file instead of
+    /// `LLM_API_KEY`, for gateways whose bearer token rotates under a running
+    /// server (a login CLI or secrets agent rewriting the file). The file is
+    /// read on first use and re-read once after the endpoint answers `401`;
+    /// ai-memory never writes it. A relative path resolves against the data
+    /// dir. Wins over an ambient `LLM_API_KEY`, which is then ignored. Set
+    /// with `AI_MEMORY_LLM_API_KEY_FILE`.
+    pub llm_api_key_file: Option<PathBuf>,
     /// Extra HTTP headers attached to every LLM chat request, as
     /// `Name: Value` (or `Name=Value`) entries. Empty by default.
     ///
@@ -1594,6 +1602,7 @@ impl Default for Config {
             llm_request_metadata_headers: false,
             bootstrap_max_concurrent: 1,
             llm_reasoning_effort: None,
+            llm_api_key_file: None,
             llm_headers: Vec::new(),
             llm_fallbacks: Vec::new(),
             llm: BTreeMap::new(),
@@ -2745,6 +2754,11 @@ impl Config {
         derive_server_url_from_bind(&mut config, explicit_server_url);
         // After the data dir is final, as for the bearer token file below.
         resolve_admission_header_files(&mut config.admission_webhooks, &config.data_dir);
+        config.llm_api_key_file = config
+            .llm_api_key_file
+            .take()
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| config.data_dir.join(path));
         apply_bearer_token_file(
             &mut config.auth,
             &TokenFileContext {
@@ -3084,9 +3098,19 @@ impl Config {
             } else {
                 config.provider_api_key(provider)
             };
-            let auth = config
-                .profile_provider_auth(provider, explicit_key, key, task.base_url.as_deref())
-                .with_context(|| format!("validating LLM task profile {path}"))?;
+            // A task without `api_key_env` inherits the global key, so it
+            // inherits the key file the same way.
+            let inherited = if explicit_key {
+                None
+            } else {
+                config.llm_api_key_file_auth(provider)
+            };
+            let auth = match inherited {
+                Some(auth) => auth,
+                None => config
+                    .profile_provider_auth(provider, explicit_key, key, task.base_url.as_deref())
+                    .with_context(|| format!("validating LLM task profile {path}"))?,
+            };
             let primary = config
                 .make_provider_config(
                     provider,
@@ -3742,10 +3766,15 @@ impl Config {
                 ProviderAuth::required_api_key_from_env(env_var, self.provider_api_key(provider))
                     .with_cli_api_key_override(api_key_override)
             }
-            AuthRequirement::OptionalApiKey { env_var } => {
-                ProviderAuth::optional_api_key_from_env(env_var, self.provider_api_key(provider))
-                    .with_cli_api_key_override(api_key_override)
-            }
+            AuthRequirement::OptionalApiKey { env_var } => self
+                .llm_api_key_file_auth(provider)
+                .unwrap_or_else(|| {
+                    ProviderAuth::optional_api_key_from_env(
+                        env_var,
+                        self.provider_api_key(provider),
+                    )
+                })
+                .with_cli_api_key_override(api_key_override),
             AuthRequirement::OpenAiOAuthToken => {
                 ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
             }
@@ -3771,6 +3800,20 @@ impl Config {
             AuthRequirement::CursorCli => ProviderAuth::cursor(self.cursor_auth()),
             AuthRequirement::GoogleAdc => self.vertex_auth(),
         }
+    }
+
+    /// `llm_api_key_file` as the credential of the provider that would
+    /// otherwise read `LLM_API_KEY`. The explicit setting wins over the
+    /// ambient variable, as `llm_base_url` wins over `LLM_BASE_URL` (#691).
+    fn llm_api_key_file_auth(&self, provider: ProviderChoice) -> Option<ProviderAuth> {
+        if provider != ProviderChoice::OpenAiCompat {
+            return None;
+        }
+        let path = self.llm_api_key_file.as_ref()?;
+        Some(ProviderAuth::optional_api_key_file(
+            "LLM_API_KEY",
+            path.clone(),
+        ))
     }
 
     /// Base URL for `provider`, from the two sources that can supply one.
@@ -8153,6 +8196,110 @@ headers = [{ name = "Authorization", value_file = "secrets/wake" }]
             "custom-key"
         );
         assert!(!serde_json::to_string(&cfg).unwrap().contains("custom-key"));
+    }
+
+    const KEY_FILE_GLOBAL: &str = "llm_provider = 'openai-compat'\nllm_model = 'm'\n\
+         llm_base_url = 'http://127.0.0.1:9/v1'\nllm_api_key_file = 'keys/llm'\n";
+
+    fn load_with_env(tmp: &TempDir, toml: &str, env: RuntimeEnv) -> Config {
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        Config::load_with_runtime_env(Some(&path), Some(tmp.path().to_path_buf()), env).unwrap()
+    }
+
+    #[test]
+    fn llm_api_key_file_is_the_openai_compat_credential_relative_to_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = load_with_env(&tmp, KEY_FILE_GLOBAL, RuntimeEnv::default());
+
+        let auth = cfg.llm_provider_config().unwrap().unwrap().auth;
+        assert_eq!(
+            auth.api_key_file(),
+            Some(cfg.data_dir.join("keys/llm").as_path())
+        );
+        assert_eq!(auth.source(), ai_memory_llm::CredentialSource::ApiKeyFile);
+        assert!(auth.optional_api_key().is_none());
+    }
+
+    /// `LLM_API_KEY` is a cross-tool convention an operator may export for
+    /// something else; the ai-memory setting names this server's key on
+    /// purpose, as `llm_base_url` wins over `LLM_BASE_URL` (#691).
+    #[test]
+    fn llm_api_key_file_wins_over_an_ambient_llm_api_key() {
+        let tmp = TempDir::new().unwrap();
+        let env = RuntimeEnv {
+            llm_api_key: Some(SecretString::from("ambient-key")),
+            ..RuntimeEnv::default()
+        };
+        let cfg = load_with_env(&tmp, KEY_FILE_GLOBAL, env);
+
+        let auth = cfg.llm_provider_config().unwrap().unwrap().auth;
+        assert!(auth.api_key_file().is_some());
+        assert!(auth.optional_api_key().is_none());
+    }
+
+    /// The file stands in for `LLM_API_KEY` only: a provider with a key of its
+    /// own never picks it up, neither as the global provider nor in a task
+    /// that inherits its native key.
+    #[test]
+    fn llm_api_key_file_reaches_only_the_provider_that_reads_llm_api_key() {
+        let tmp = TempDir::new().unwrap();
+        let toml = format!(
+            "{KEY_FILE_GLOBAL}\
+             [llm.lint]\nprovider = 'openai'\n\
+             [llm.dream]\nprovider = 'opencode'\n"
+        );
+        let env = RuntimeEnv {
+            openai_api_key: Some(SecretString::from("openai-key")),
+            opencode_api_key: Some(SecretString::from("opencode-key")),
+            ..RuntimeEnv::default()
+        };
+        let cfg = load_with_env(&tmp, &toml, env);
+
+        let global_openai = cfg.provider_auth(ProviderChoice::OpenAi, None);
+        assert!(global_openai.api_key_file().is_none());
+        for (task, key) in [("lint", "openai-key"), ("dream", "opencode-key")] {
+            let auth = &cfg.llm_task_configs[task].primary.auth;
+            assert!(auth.api_key_file().is_none(), "{task}");
+            assert_eq!(auth.require_api_key().unwrap().expose_secret(), key);
+        }
+    }
+
+    /// A task without `api_key_env` inherits the global key, so it inherits
+    /// the file; one naming its own key keeps it, and a fallback, which never
+    /// inherits the global key, never inherits the file either.
+    #[test]
+    fn the_key_file_is_inherited_exactly_where_llm_api_key_is() {
+        let tmp = TempDir::new().unwrap();
+        let toml = format!(
+            "{KEY_FILE_GLOBAL}\
+             [llm.lint]\nprovider = 'openai-compat'\nmodel = 'm'\n\
+             base_url = 'http://127.0.0.1:9/v1'\n\
+             [llm.profile]\nprovider = 'openai-compat'\nmodel = 'm'\n\
+             base_url = 'http://127.0.0.1:9/v1'\napi_key_env = 'TASK_KEY'\n\
+             [[llm_fallbacks]]\nprovider = 'openai-compat'\nmodel = 'm'\n\
+             base_url = 'http://127.0.0.1:10/v1'\n"
+        );
+        let env = RuntimeEnv {
+            process_env: CapturedProcessEnv(vec![("TASK_KEY".into(), "task-key".into())]),
+            ..RuntimeEnv::default()
+        };
+        let cfg = load_with_env(&tmp, &toml, env);
+        let key_file = cfg.data_dir.join("keys/llm");
+
+        let lint = &cfg.llm_task_configs["lint"].primary.auth;
+        assert_eq!(lint.api_key_file(), Some(key_file.as_path()));
+
+        let profile = &cfg.llm_task_configs["profile"].primary.auth;
+        assert!(profile.api_key_file().is_none());
+        assert_eq!(
+            profile.optional_api_key().unwrap().expose_secret(),
+            "task-key"
+        );
+
+        let fallback = &cfg.llm_fallback_configs[0].auth;
+        assert!(fallback.api_key_file().is_none());
+        assert!(fallback.optional_api_key().is_none());
     }
 
     #[test]
