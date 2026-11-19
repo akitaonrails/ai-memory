@@ -634,6 +634,7 @@ pub(crate) fn user_written(body: &str) -> Option<String> {
         || looks_like_codex_assessor_transcript_line(body)
         || looks_like_claude_plugin_prompt(body)
         || looks_like_desktop_side_session_brief(body)
+        || looks_like_app_generated_request(body)
     {
         return None;
     }
@@ -643,11 +644,49 @@ pub(crate) fn user_written(body: &str) -> Option<String> {
         ai_memory_core::routing_snippet::MARKER_START,
         ai_memory_core::routing_snippet::MARKER_END,
     );
-    Some(without_fenced(
+    let text = without_fenced(
         &text,
         ai_memory_core::profile::UNTRUSTED_HISTORY_START,
         ai_memory_core::profile::UNTRUSTED_HISTORY_END,
-    ))
+    );
+    Some(without_attached_files(&text))
+}
+
+/// Codex's app asks the model for a next-message suggestion through the
+/// prompt channel. The request opens by naming itself and saying the user did
+/// not write it, so none of its instructions ("Choose the action ... rather
+/// than a generally useful follow-up") is a habit. Both halves of the opening
+/// must be present, at the start, so a prompt that talks about such a request
+/// is kept.
+fn looks_like_app_generated_request(body: &str) -> bool {
+    body.trim_start()
+        .strip_prefix("This is an app-generated request")
+        .and_then(|rest| rest.lines().next())
+        .is_some_and(|opening| opening.contains("The user did not write this message."))
+}
+
+/// `text` without the files a harness attached to the prompt. The Claude
+/// desktop app delivers an `@file` mention as the file's content in a
+/// `<context ref="...">` block after the user's words. Those sentences are
+/// the file's, read out of their context, never something the user said to
+/// the agent. Only a block opening at the start of a line counts, so the tag
+/// quoted inside a sentence keeps the sentence; an unclosed block drops the
+/// rest, as the prompt cap can cut one before its end.
+fn without_attached_files(text: &str) -> String {
+    const OPEN: &str = "<context ref=\"";
+    const CLOSE: &str = "</context>";
+
+    let mut out = String::new();
+    let mut inside = false;
+    for segment in text.split_inclusive('\n') {
+        let line = segment.trim();
+        if inside || line.starts_with(OPEN) {
+            inside = !line.ends_with(CLOSE);
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
 }
 
 /// One row from an approval-review transcript imported by an older version.
@@ -702,10 +741,12 @@ fn looks_like_claude_plugin_prompt(body: &str) -> bool {
 /// agent's words plus that footer, never the user's, so none of it is a habit
 /// — and the footer carries a local filesystem path that must not reach
 /// evidence quotes (#2041). Both halves of the fixed footer must be present so
-/// an ordinary prompt that merely mentions a notes folder is kept.
+/// an ordinary prompt that merely mentions a notes folder is kept. The folder
+/// is matched with either separator: on Windows the footer's path is written
+/// with backslashes.
 fn looks_like_desktop_side_session_brief(body: &str) -> bool {
     body.contains("Shared notes folder for this group of sessions")
-        && body.contains("side-session-notes/")
+        && (body.contains("side-session-notes/") || body.contains("side-session-notes\\"))
 }
 
 /// Remove Claude Code's leading side-agent note while retaining the user's
@@ -925,6 +966,112 @@ pub fn generality_of(text: &str) -> ProfileGenerality {
     } else {
         ProfileGenerality::Project
     }
+}
+
+/// Directories whose pages are rules by where their author filed them.
+/// A page under `decisions/` or `gotchas/` can be a session log, an approval
+/// or a fact about one system, so there the sentence itself has to say it is
+/// a rule ([`is_rule_shaped`]).
+const RULE_PAGE_PREFIXES: &[&str] = &["_rules/", "procedures/"];
+
+/// Whether the statement of the curated page at `path` is a candidate.
+///
+/// Agents open session and decision notes with the same line in every
+/// project ("Plano aprovado pelo usuário."), which met `min_projects` and put
+/// an approval into every session start as a "usual choice". A page outside
+/// the rule directories therefore contributes only a statement with the shape
+/// a prompt sentence needs, and no page contributes a record or a pointer.
+fn page_states_a_rule(path: &str, statement: &str) -> bool {
+    !is_record_statement(statement)
+        && (RULE_PAGE_PREFIXES
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+            || is_rule_shaped(statement))
+}
+
+/// The shape test of [`classify_sentence`], on a page statement: a preference
+/// marker, and an action or a self-contained comparison. Pages are often
+/// agent-written and may run to more than one sentence, so the question,
+/// length and agent-output checks of a prompt sentence do not apply.
+fn is_rule_shaped(statement: &str) -> bool {
+    let padded = padded_lower(statement);
+    PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m))
+        && (SELF_CONTAINED_MARKERS
+            .iter()
+            .any(|m| has_phrase(&padded, m))
+            || ACTION_WORDS.iter().any(|w| has_phrase(&padded, w)))
+}
+
+/// Whether a curated page's statement records an event or only points at
+/// another note, instead of stating a rule:
+///
+/// - it opens with a pointer, a first sentence that is a wikilink and at most
+///   two other words ("Continua [[decisions/...]].", "Ver [[outra-pagina]]");
+/// - it carries a full calendar date outside parentheses and no preference
+///   marker ("Plano aprovado pelo usuário em 2026-11-13.", "Visto em
+///   15/10/2026 ...").
+///
+/// A rule that cites a date in a parenthetical ("... (decisão do time,
+/// 22/10/2026)"), names when it starts ("A partir de 22/10/2026, sempre
+/// ..."), or ends on a link ("... Ver [[outra-pagina]]") is still a rule. A
+/// month/year stamp ("11/2026") or a version ("24.22.3") is not a date.
+fn is_record_statement(statement: &str) -> bool {
+    if opens_with_a_pointer(statement) {
+        return true;
+    }
+    let padded = padded_lower(statement);
+    has_bare_date(statement) && !PREFERENCE_MARKERS.iter().any(|m| has_phrase(&padded, m))
+}
+
+fn opens_with_a_pointer(statement: &str) -> bool {
+    let Some(first) = sentences(statement).into_iter().next() else {
+        return false;
+    };
+    let mut rest = first.as_str();
+    let mut own_words = String::new();
+    let mut linked = false;
+    while let Some((before, after)) = rest.split_once("[[") {
+        let Some((_, tail)) = after.split_once("]]") else {
+            break;
+        };
+        own_words.push_str(before);
+        own_words.push(' ');
+        rest = tail;
+        linked = true;
+    }
+    own_words.push_str(rest);
+    linked && padded_lower(&own_words).split_whitespace().count() <= 2
+}
+
+/// Whether `statement` carries a full calendar date outside parentheses.
+fn has_bare_date(statement: &str) -> bool {
+    let mut depth = 0usize;
+    let outside: String = statement
+        .chars()
+        .filter(|c| {
+            match *c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => return depth == 0,
+            }
+            false
+        })
+        .collect();
+    outside
+        .split(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '/')))
+        .any(|token| is_calendar_date(token.trim_matches(['-', '/'])))
+}
+
+/// `2026-11-13`, `13/11/2026` and the same shapes with the other separator.
+fn is_calendar_date(token: &str) -> bool {
+    let parts: Vec<&str> = token.split(['-', '/']).collect();
+    let [a, b, c] = parts.as_slice() else {
+        return false;
+    };
+    let short = |part: &str| (1..=2).contains(&part.len());
+    parts.iter().all(|part| !part.is_empty())
+        && short(b)
+        && ((a.len() == 4 && short(c)) || (short(a) && c.len() == 4))
 }
 
 /// The topic tokens of a statement: lowercase words with stop words, markers
@@ -1481,10 +1628,18 @@ pub fn converge(
             .copied()
             // A page's metadata field (`**Status:** Accepted`) describes the
             // page, not a habit. Statements no longer start on one, but
-            // candidates harvested before that still sit in the store.
+            // candidates harvested before that still sit in the store. The
+            // same holds for a page line that does not state a rule.
             .filter(|row| {
                 row.candidate.source != ProfileCandidateSource::Page
-                    || !is_metadata_field(&row.candidate.statement)
+                    || (!is_metadata_field(&row.candidate.statement)
+                        && page_states_a_rule(
+                            row.candidate
+                                .source_ref
+                                .strip_prefix("page:")
+                                .unwrap_or_default(),
+                            &row.candidate.statement,
+                        ))
             })
             .partition(|row| row.candidate.source == ProfileCandidateSource::Stack);
 
@@ -1614,8 +1769,23 @@ pub fn converge(
             continue;
         }
         // An entry the user removed stays removed until they say it again.
+        // "Again" is the evidence that admits the group: when only a general
+        // statement does, that statement must be newer than the removal. A
+        // candidate recorded as general by an older, looser rule would
+        // otherwise bring a removed entry back the next time its one project
+        // repeats the sentence.
+        let said_again_at = if independent >= min_projects {
+            newest.row.candidate.observed_at
+        } else {
+            group
+                .iter()
+                .filter(|m| m.row.candidate.generality == ProfileGenerality::General)
+                .map(|m| m.row.candidate.observed_at)
+                .max()
+                .unwrap_or(newest.row.candidate.observed_at)
+        };
         if let Some((entry, _)) = removed.iter().find(|(entry, tokens)| {
-            newest.row.candidate.observed_at <= entry.written_at
+            said_again_at <= entry.written_at
                 && group
                     .iter()
                     .any(|m| topic_similarity(&m.tokens, tokens) >= TOPIC_OVERLAP_THRESHOLD)
@@ -1716,20 +1886,32 @@ const FAN_OUT_WINDOW_US: i64 = 60 * 60 * 1_000_000;
 
 /// How many projects carry independent evidence for a group. The same quote
 /// seen in several projects within [`FAN_OUT_WINDOW_US`] of an occurrence
-/// already counted is one message fanned out, so it counts once.
+/// already counted is one message fanned out, so it counts once. So does the
+/// same quote from the same page path in several projects, whenever each was
+/// recorded: that is one page that reached another project (written in the
+/// wrong scope and moved, or copied), not a rule each project keeps.
 fn independent_projects(group: &[Member<'_>]) -> usize {
-    let mut occurrences: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+    // When, in which project, and from which page (a prompt has none).
+    type Occurrence<'a> = (i64, String, Option<&'a str>);
+    let mut occurrences: BTreeMap<String, Vec<Occurrence<'_>>> = BTreeMap::new();
     for member in group {
+        let candidate = &member.row.candidate;
+        let page = (candidate.source == ProfileCandidateSource::Page)
+            .then_some(candidate.source_ref.as_str());
         occurrences
-            .entry(normalized_quote(&member.row.candidate.quote))
+            .entry(normalized_quote(&candidate.quote))
             .or_default()
-            .push((member.row.candidate.observed_at, project_label(member.row)));
+            .push((candidate.observed_at, project_label(member.row), page));
     }
     let mut projects = BTreeSet::new();
     for mut seen in occurrences.into_values() {
         seen.sort();
         let mut last_counted: Option<i64> = None;
-        for (at, project) in seen {
+        let mut pages_counted = BTreeSet::new();
+        for (at, project, page) in seen {
+            if page.is_some_and(|page| !pages_counted.insert(page)) {
+                continue;
+            }
             if last_counted.is_some_and(|last| at - last < FAN_OUT_WINDOW_US) {
                 continue;
             }
@@ -2385,7 +2567,7 @@ async fn harvest_project(
             applies_to: None,
             confidence: None,
         };
-        if found.statement.is_empty() {
+        if found.statement.is_empty() || !page_states_a_rule(&page.path, &found.statement) {
             continue;
         }
         candidates.push(candidate_from(
@@ -3052,6 +3234,357 @@ mod tests {
         assert_eq!(user_written(ordinary).as_deref(), Some(ordinary));
     }
 
+    /// The same footer on Windows, where the notes folder is written with
+    /// backslashes. The `/`-only check let the footer through as a habit,
+    /// local path and session id included.
+    #[test]
+    fn desktop_side_session_brief_with_a_windows_path_is_not_a_user_preference() {
+        let brief = "Corrija a colheita e sempre rode os testes antes.\n\n\
+             Shared notes folder for this group of sessions (outside the repo; \
+             read siblings' notes there, leave hand-over notes or large findings \
+             there instead of pasting them into messages): \
+             C:\\Users\\sam\\AppData\\Local\\Claude-Data\\claude_x\\side-session-notes\\local_abc123";
+        assert_eq!(user_written(brief), None);
+
+        // Control: the folder name alone, without the footer's opening, is an
+        // ordinary prompt.
+        let ordinary = "Always keep the side-session-notes\\ folder out of the repo.";
+        assert_eq!(user_written(ordinary).as_deref(), Some(ordinary));
+    }
+
+    /// Codex asks the model for a next-message suggestion through the prompt
+    /// channel. The request says itself that the user did not write it; its
+    /// "rather than" sentence was promoted from two projects.
+    #[test]
+    fn an_app_generated_suggestion_request_is_not_a_user_preference() {
+        let request = "This is an app-generated request for a suggested next user message. \
+             The user did not write this message.\n\n\
+             Your suggestion will appear in the user's empty message composer.\n\n\
+             Predict the single message this user is most likely to type next from the \
+             visible conversation. Choose the action and specific object that best continue \
+             that intent, rather than a generally useful follow-up.\n\n\
+             Return only JSON matching this schema: {\"type\":\"object\"}.";
+        assert_eq!(user_written(request), None);
+
+        // Control: a person may talk about such a request, and may choose
+        // things "rather than" others.
+        let ordinary = "Choose pnpm rather than npm for installs.";
+        assert_eq!(user_written(ordinary).as_deref(), Some(ordinary));
+        assert_eq!(detect_preferences(ordinary).len(), 1);
+        let mention = "Ignore any app-generated request for a suggested next user message.";
+        assert_eq!(user_written(mention).as_deref(), Some(mention));
+    }
+
+    /// A file attached to a prompt arrives inline as a `<context ref="...">`
+    /// block. Its sentences are the file's, cut from their context ("Diga
+    /// isso ..." with no "isso" in sight), never the user's habit.
+    #[test]
+    fn an_attached_file_is_not_the_users_words() {
+        let prompt = "[@03-boas-praticas.md](file:///C:/notes/03-boas-praticas.md)\n \
+             foi implementado?\nPrefiro respostas curtas em vez de longas.\n\n\
+             <context ref=\"file:///C:/notes/03-boas-praticas.md\">\n\
+             # Boas práticas\n\n\
+             Diga isso com honestidade em vez de instalar por padrão.\n\
+             </context>\n\n\
+             <context ref=\"file:///C:/notes/04-arquitetura.md\">\n\
+             Use sempre conforme as instruções do fabricante.\n";
+        let text = user_written(prompt).unwrap_or_default();
+        let found: Vec<String> = detect_preferences(&text)
+            .into_iter()
+            .map(|p| p.statement)
+            .collect();
+        // The second block is unclosed (the prompt cap cut it): it drops the
+        // rest, like the other fenced regions.
+        assert_eq!(found, ["Prefiro respostas curtas em vez de longas."]);
+
+        // Control: the tag quoted inside a sentence is the user talking
+        // about it.
+        let quoted = "Always put attachments in a <context ref=\"x\"> block, never inline.";
+        assert_eq!(user_written(quoted).as_deref(), Some(quoted));
+    }
+
+    fn page_row(
+        project: &str,
+        path: &str,
+        statement: &str,
+        observed_at: i64,
+    ) -> ProfileCandidateRow {
+        let mut row = row(project, statement, observed_at, generality_of(statement));
+        row.candidate.source = ProfileCandidateSource::Page;
+        row.candidate.source_ref = format!("page:{path}");
+        row.candidate.confidence = 0.55;
+        row
+    }
+
+    /// A decision log's opening line records an event ("approved on
+    /// <date>") or points at another note ("Continua [[...]]"). Agents write
+    /// the same boilerplate in every project, which met `min_projects` and
+    /// turned a dated approval into a standing "usual choice".
+    #[test]
+    fn a_dated_record_or_a_pointer_is_not_a_page_statement() {
+        let approved_a = page_row(
+            "proj-g",
+            "decisions/node-24.md",
+            "Plano aprovado pelo usuário em 2026-11-13.",
+            day(2),
+        );
+        let approved_b = page_row(
+            "proj-b",
+            "decisions/node-22.md",
+            "Plano aprovado pelo usuário em 2026-11-12.",
+            day(1),
+        );
+        let seen = "Visto no app em 15/10/2026 (interface nova do painel da loja, 2026). \
+             Vale para qualquer app.";
+        let seen_a = page_row("proj-a", "gotchas/capturas.md", seen, day(1));
+        let seen_b = page_row("proj-c", "gotchas/capturas-ios.md", seen, day(9));
+        let pointer = "Continua [[decisions/sessao-ficha-app-store]]. Armadilhas das lojas em \
+             [[gotchas/app-store]].";
+        let pointer_a = page_row("proj-a", "decisions/sessao-release.md", pointer, day(1));
+        let pointer_b = page_row("proj-c", "decisions/sessao-play.md", pointer, day(9));
+        let plan = converge(
+            &[
+                &approved_a,
+                &approved_b,
+                &seen_a,
+                &seen_b,
+                &pointer_a,
+                &pointer_b,
+            ],
+            &[],
+            &[],
+            2,
+            1,
+        );
+        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+        assert!(plan.waiting.is_empty(), "{:?}", plan.waiting);
+
+        // Control: a rule two projects keep on their own pages is still
+        // admitted, and a month/year stamp ("11/2026") is not a date record.
+        let rule_a = page_row(
+            "proj-f",
+            "_rules/veredito-na-fonte.md",
+            "> Ler o veredito na fonte, nunca no exit code de um pipe (mente sempre)",
+            day(1),
+        );
+        let rule_b = page_row(
+            "proj-d",
+            "_rules/ci-veredito.md",
+            "Ler o veredito do teste na fonte, nunca no exit code de um pipe.",
+            day(5),
+        );
+        let stamped_a = page_row(
+            "proj-f",
+            "_rules/idioma.md",
+            "App Expo da casa declara o idioma no app.json; sem isso a App Store lista o app \
+             como Inglês (11/2026).",
+            day(1),
+        );
+        let stamped_b = page_row(
+            "proj-d",
+            "_rules/idioma-ios.md",
+            "App Expo declara o idioma no app.json; sem isso a App Store lista o app como \
+             Inglês (11/2026).",
+            day(5),
+        );
+        let plan = converge(&[&rule_a, &rule_b, &stamped_a, &stamped_b], &[], &[], 2, 1);
+        assert_eq!(plan.writes.len(), 2, "{:?}", plan.waiting);
+    }
+
+    /// One page that reached a second project (written in the wrong scope and
+    /// moved, or copied) is one piece of evidence. Its candidates sit days
+    /// apart, outside the fan-out window, so each copy counted as a project
+    /// and a single project's gotcha became a global default.
+    #[test]
+    fn a_page_copied_to_another_project_counts_once() {
+        let gotcha = "No site, `.rodape a { color: #fff }` vence regras de classe única. \
+             Usar seletor de duas classes.";
+        // Filed under `_rules/`, so the statement needs no rule shape and only
+        // the copy check stands between it and the profile.
+        let origin = page_row("proj-a", "_rules/site-rodape.md", gotcha, day(1));
+        let copy = page_row("proj-c", "_rules/site-rodape.md", gotcha, day(9));
+        let plan = converge(&[&origin, &copy], &[], &[], 2, 1);
+        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+        assert_eq!(plan.waiting.len(), 1);
+        assert_eq!(plan.waiting[0].needs, 1);
+
+        // Control: the same rule on each project's own page is two projects.
+        let own = page_row("proj-c", "_rules/rodape-links.md", gotcha, day(9));
+        let plan = converge(&[&origin, &own], &[], &[], 2, 1);
+        assert_eq!(plan.writes.len(), 1);
+    }
+
+    /// The same opening line with no date in it ("Plano aprovado pelo
+    /// usuário.") on two projects' decision pages is boilerplate too. Outside
+    /// the rule directories a page statement needs the shape of a rule.
+    #[test]
+    fn boilerplate_on_decision_pages_is_not_a_candidate_without_rule_shape() {
+        let approved_a = page_row(
+            "proj-g",
+            "decisions/node-24.md",
+            "Plano aprovado pelo usuário.",
+            day(1),
+        );
+        let approved_b = page_row(
+            "proj-b",
+            "decisions/node-22.md",
+            "Plano aprovado pelo usuário, sem ressalvas.",
+            day(5),
+        );
+        let fact_a = page_row(
+            "proj-a",
+            "gotchas/site-rodape.md",
+            "No site, links de fundo claro no rodapé ficam invisíveis.",
+            day(1),
+        );
+        let fact_b = page_row(
+            "proj-c",
+            "gotchas/rodape-links.md",
+            "No site, links de fundo claro no rodapé ficam invisíveis!",
+            day(5),
+        );
+        let plan = converge(
+            &[&approved_a, &approved_b, &fact_a, &fact_b],
+            &[],
+            &[],
+            2,
+            1,
+        );
+        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+        assert!(plan.waiting.is_empty(), "{:?}", plan.waiting);
+
+        // Controls: a rule two projects keep under `_rules/` is admitted
+        // whatever its wording, and a decision that states a rule still is.
+        let rule_a = page_row(
+            "proj-f",
+            "_rules/veredito-na-fonte.md",
+            "Ler o veredito na fonte, nunca no exit code de um pipe.",
+            day(1),
+        );
+        let rule_b = page_row(
+            "proj-d",
+            "_rules/ci-veredito.md",
+            "Ler o veredito do teste na fonte, nunca no exit code de um pipe.",
+            day(5),
+        );
+        let plain_a = page_row(
+            "proj-f",
+            "_rules/idioma.md",
+            "App Expo da casa declara o idioma no app.json.",
+            day(1),
+        );
+        let plain_b = page_row(
+            "proj-d",
+            "_rules/idioma-ios.md",
+            "App Expo declara o idioma no app.json.",
+            day(5),
+        );
+        let decided_a = page_row(
+            "proj-f",
+            "decisions/gerenciador.md",
+            "Sempre use pnpm em vez de npm.",
+            day(1),
+        );
+        let decided_b = page_row(
+            "proj-d",
+            "decisions/pacotes.md",
+            "Sempre use pnpm em vez de npm nos apps.",
+            day(5),
+        );
+        let plan = converge(
+            &[&rule_a, &rule_b, &plain_a, &plain_b, &decided_a, &decided_b],
+            &[],
+            &[],
+            2,
+            1,
+        );
+        assert_eq!(plan.writes.len(), 3, "{:?}", plan.waiting);
+    }
+
+    /// A rule may cite when it was decided or end on a link. Only a line
+    /// that is the record of an event, or that just points at another note,
+    /// is dropped.
+    #[test]
+    fn a_rule_that_cites_a_date_or_a_link_is_still_a_rule() {
+        for (kept, statement) in [
+            (
+                true,
+                "Gravar nota de retomada ao concluir a tarefa (decisão do time, 22/10/2026).",
+            ),
+            (
+                true,
+                "A partir de 22/10/2026, sempre gravar nota de retomada.",
+            ),
+            (
+                true,
+                "Rodar o validador antes do push. Ver [[fluxo-de-mudanca]].",
+            ),
+            (true, "Usar [[procedures/deploy]] antes de publicar o web."),
+            (false, "Regras revisadas em 2026-11-13."),
+            (false, "Ver [[outra-pagina]]."),
+            (
+                false,
+                "Continua [[decisions/sessao-ficha]]. Armadilhas das lojas em [[gotchas/app-store]].",
+            ),
+        ] {
+            assert_eq!(!is_record_statement(statement), kept, "{statement}");
+            // Through convergence: the same line on two projects' own rule
+            // pages, days apart.
+            let a = page_row("alpha", "_rules/a.md", statement, day(1));
+            let b = page_row("beta", "_rules/b.md", statement, day(5));
+            let plan = converge(&[&a, &b], &[], &[], 2, 1);
+            assert_eq!(plan.writes.len(), usize::from(kept), "{statement}");
+        }
+    }
+
+    /// Candidates stored by a version that read a bare "sempre"/"always" as
+    /// cross-project scope still say `general`. After the user removes the
+    /// entry one of them admitted (an app's end-user copy, a project rule),
+    /// the same project repeating the sentence must not bring it back: the
+    /// stale candidate is what admits the group, and it is older than the
+    /// removal.
+    #[test]
+    fn a_removed_entry_does_not_return_through_a_stale_general_candidate() {
+        let copy = "Use sempre conforme as instruções do fabricante.";
+        let stale = row("proj-f", copy, day(1), ProfileGenerality::General);
+        let path = converge(&[&stale], &[], &[], 2, 1).writes[0].path.clone();
+        let ledger = [ProfileLedgerEntry {
+            path: path.clone(),
+            topic_key: stale.candidate.topic_key.clone(),
+            written_at: day(3),
+        }];
+        let pasted_again = row("proj-f", copy, day(9), ProfileGenerality::Project);
+        let plan = converge(&[&stale, &pasted_again], &[], &ledger, 2, 1);
+        assert!(plan.writes.is_empty(), "{:?}", plan.writes);
+        assert_eq!(plan.forgotten, std::slice::from_ref(&path));
+
+        // Controls: stated as general again after the removal, or repeated
+        // in a second project, it comes back.
+        let restated = row("proj-f", copy, day(9), ProfileGenerality::General);
+        let plan = converge(&[&stale, &restated], &[], &ledger, 2, 1);
+        assert_eq!(plan.writes.len(), 1);
+        let elsewhere = row("proj-d", copy, day(9), ProfileGenerality::Project);
+        let plan = converge(&[&stale, &elsewhere], &[], &ledger, 2, 1);
+        assert_eq!(plan.writes.len(), 1);
+    }
+
+    /// The entries that were right to keep (2026-11) are still harvested
+    /// from their sources.
+    #[test]
+    fn legitimate_preferences_are_still_harvested() {
+        let api = "Se for necessário mudar contrato de API, faça de maneira retrocompatível \
+             sempre que possível.";
+        let found = detect_preferences(&user_written(api).unwrap_or_default());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].statement, api);
+
+        let worktrees = "Criar worktrees Git sob D:\\src\\worktrees\\<projeto>\\<worktree>, \
+             agrupadas pelo nome do projeto, em todos os projetos.";
+        assert_eq!(generality_of(worktrees), ProfileGenerality::General);
+        let general = row("proj-e", worktrees, day(1), generality_of(worktrees));
+        assert_eq!(converge(&[&general], &[], &[], 2, 1).writes.len(), 1);
+    }
+
     #[test]
     fn codex_generated_user_turns_are_not_user_preferences() {
         for generated in [
@@ -3124,7 +3657,7 @@ mod tests {
         let page = |project: &str, statement: &str| {
             let mut r = row(project, statement, day(1), ProfileGenerality::Project);
             r.candidate.source = ProfileCandidateSource::Page;
-            r.candidate.source_ref = format!("page:decisions/{project}.md");
+            r.candidate.source_ref = format!("page:_rules/{project}.md");
             r
         };
         let status = page("alpha", "Status:** Accepted");
