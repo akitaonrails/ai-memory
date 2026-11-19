@@ -589,11 +589,26 @@ when a slow provider or a fallback chain needs longer to answer. `global=true` a
 hits keep their existing non-RRF ranking. Concurrent provider calls are capped
 at four; saturated queries keep their local ranking without waiting.
 
+`reranker = "decisions-choice"` (or `AI_MEMORY_RERANKER=decisions-choice`) sends one typed `POST /v1/decisions` request to OpenAI for each eligible query.
+It requires `OPENAI_API_KEY` through the existing configuration auth resolver and an explicit `llm_model`; it needs no generative provider.
+The request contains one Choice question over the candidate IDs, with the same query/title/snippet budgets and 30-candidate cap.
+The request body is capped at 64 KiB and the response at 1 MiB.
+Timeouts, refusals, HTTP errors and malformed probabilities keep the local order, without retries or redirects.
+The key goes only to `https://api.openai.com:443`; `llm_base_url` may select an HTTP loopback IP origin for tests, which receives no Authorization header.
+The client ignores inherited proxy settings so loopback traffic stays local.
+
+Choice probabilities express relative competition within the candidate pool, not calibrated relevance.
+Leave `min_relevance` unset globally, in project markers and on individual calls with this backend.
+The existing filter behavior is unchanged; a fixed floor can remove different hits as the pool size changes.
+For an external judge endpoint instead, see the [Jev adapter](jev-reranker-adapter.md).
+
 ## Workload telemetry
 
 `ai-memory status --json` (the root-protected `GET /admin/status` response)
-includes `providers.llm_workloads` whenever an LLM provider is configured. Its
-closed labels are `unspecified`, `consolidation`, `rerank`, `auto-improve`,
+includes `providers.llm_workloads` whenever a generative provider is configured or after a direct Decisions Choice call.
+Choice records its calls in the existing `rerank` row even without a generative provider.
+Validated reported usage remains counted when the answer is refused or invalid; an invalid model or usage envelope supplies no trusted token count.
+The closed labels are `unspecified`, `consolidation`, `rerank`, `auto-improve`,
 `bootstrap`, `query-answer`, `lint`, `profile`, `dream`, and `experience`.
 Each row reports process-lifetime calls, successes and errors, total/max
 latency, fixed-bucket p50/p95 upper bounds, last outcome, and token counts. The

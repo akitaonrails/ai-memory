@@ -17,8 +17,8 @@ use ai_memory_hooks::{
     WorkstreamState, hook_router, workstream_router,
 };
 use ai_memory_llm::{
-    Embedder, EmbeddingCapacity, LlmProvider, LlmProviders, LlmWorkload, ProviderHealth,
-    build_embedder, local_capacity,
+    Embedder, EmbeddingCapacity, LlmProvider, LlmProviders, LlmWorkload, ProviderAuth,
+    ProviderChoice, ProviderHealth, build_embedder, local_capacity,
 };
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
@@ -51,7 +51,9 @@ use tracing::info;
 
 use super::eval_embedding_cache::{EvalEmbeddingCache, eval_embedding_cache_dir};
 use crate::cli::{ServeArgs, TransportKind};
-use crate::config::{AuthSettings, AutoImproveSettings, Config, MaintenanceSettings};
+use crate::config::{
+    AuthSettings, AutoImproveSettings, Config, MaintenanceSettings, RerankerBackend,
+};
 use ai_memory_mcp::auth::{AuthState, require_bearer};
 
 /// 10 MB cap on inbound HTTP bodies. The /hook ingress accepts the
@@ -3303,7 +3305,7 @@ fn configure_consolidator(
     project_id: ProjectId,
     provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
-    let want_reranker = config.reranker_choice()?;
+    let reranker_backend = config.reranker_choice()?;
     let providers = config
         .llm_providers()
         .context("building LLM provider chains from config")?;
@@ -3345,19 +3347,51 @@ fn configure_consolidator(
     if let Some(consolidator) = &consolidator {
         server = server.with_consolidator(wiki.clone(), consolidator.clone());
     }
-    if want_reranker {
-        let llm = providers.get(LlmWorkload::Rerank).context(
-            "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider",
-        )?;
+    if let Some(backend) = reranker_backend {
+        let reranker: Arc<dyn ai_memory_llm::Reranker> = match backend {
+            RerankerBackend::Llm => {
+                let llm = providers.get(LlmWorkload::Rerank).context(
+                    "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider",
+                )?;
+                Arc::new(ai_memory_llm::LlmReranker::new(llm.clone()))
+            }
+            RerankerBackend::DecisionsChoice => {
+                let key = config
+                    .provider_api_key(ProviderChoice::OpenAi)
+                    .filter(|key| !key.expose_secret().trim().is_empty());
+                let model = config
+                    .llm_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let (Some(key), Some(model)) = (key, model) else {
+                    anyhow::bail!(
+                        "AI_MEMORY_RERANKER=decisions-choice requires OPENAI_API_KEY and llm_model"
+                    );
+                };
+                let auth = ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", Some(key));
+                let mut adapter = ai_memory_llm::DecisionsReranker::new(auth, model)?
+                    .with_timeout_secs(config.rerank_timeout_secs)
+                    .with_health(provider_health.clone());
+                if let Some(base_url) = config
+                    .llm_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    adapter = adapter.with_base_url(base_url);
+                }
+                Arc::new(adapter)
+            }
+        };
         info!(
-            provider = llm.name(),
-            model = llm.model(),
+            provider = reranker.name(),
+            model = reranker.model(),
             timeout_secs = config.rerank_timeout_secs,
-            "project/scopes memory_query reranking enabled (adds LLM latency)",
+            "project/scopes memory_query reranking enabled",
         );
-        let stage =
-            ai_memory_llm::RerankStage::new(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())))
-                .with_timeout(std::time::Duration::from_secs(config.rerank_timeout_secs));
+        let stage = ai_memory_llm::RerankStage::new(reranker)
+            .with_timeout(std::time::Duration::from_secs(config.rerank_timeout_secs));
         server = server.with_rerank_stage(stage);
     }
     Ok(ConsolidatorSetup {
@@ -3812,6 +3846,9 @@ fn host_without_port(host: &str) -> &str {
         _ => host,
     }
 }
+
+#[cfg(test)]
+mod decisions_choice_tests;
 
 #[cfg(test)]
 mod tests {
