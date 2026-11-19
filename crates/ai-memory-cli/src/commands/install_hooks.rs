@@ -175,7 +175,7 @@ pub(crate) fn baked_generated_server_url(content: &str) -> Option<String> {
     let literal = content
         .lines()
         .find_map(|line| line.trim_start().strip_prefix("const SERVER = "))?
-        .split_once(".replace(")?
+        .rsplit_once(".replace(")?
         .0;
     serde_json::from_str::<String>(literal)
         .ok()
@@ -840,12 +840,13 @@ pub(crate) fn run_with_opencode_dialect_and_mcp_path(
     run_with_hook_connection(config, args, dialect, mcp_config_path, None)
 }
 
-pub(crate) fn run_with_preserved_claude_hook_url(
+pub(crate) fn run_with_preserved_hook_url(
     config: &Config,
     args: InstallHooksArgs,
+    dialect: Option<ai_memory_workstream::OpenCodeDialect>,
     url: &str,
 ) -> Result<()> {
-    run_with_hook_connection(config, args, None, None, Some(url))
+    run_with_hook_connection(config, args, dialect, None, Some(url))
 }
 
 fn run_with_hook_connection(
@@ -853,7 +854,7 @@ fn run_with_hook_connection(
     mut args: InstallHooksArgs,
     dialect: Option<ai_memory_workstream::OpenCodeDialect>,
     mcp_config_path: Option<&Path>,
-    preserved_claude_url: Option<&str>,
+    preserved_hook_url: Option<&str>,
 ) -> Result<()> {
     let i18n = &config.i18n;
     let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
@@ -869,13 +870,12 @@ fn run_with_hook_connection(
     };
     let needs_inferred_url = args.server_url.is_none() && !config.server_url_configured();
     let needs_inferred_token = args.auth_token.is_none() && config.auth.bearer_token.is_none();
-    let inferred = if preserved_claude_url.is_none() && (needs_inferred_url || needs_inferred_token)
-    {
+    let inferred = if preserved_hook_url.is_none() && (needs_inferred_url || needs_inferred_token) {
         infer_installed_mcp_config(i18n, args.agent, mcp_config_path)?
     } else {
         None
     };
-    let server_url = preserved_claude_url.map_or_else(
+    let server_url = preserved_hook_url.map_or_else(
         || effective_hook_server_url(config, &args, inferred.as_ref()),
         str::to_owned,
     );
@@ -887,7 +887,7 @@ fn run_with_hook_connection(
     // The installed URL has no matching authority in the current config.
     // Retain its on-disk hook credentials and OIDC wiring without importing
     // another server's bearer from configuration or an MCP entry.
-    let (token_file, renderable_token) = if preserved_claude_url.is_some() {
+    let (token_file, renderable_token) = if preserved_hook_url.is_some() {
         (None, None)
     } else {
         let token_file = config.auth.token_file_path();
