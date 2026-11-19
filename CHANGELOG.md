@@ -11,6 +11,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept canonical project names ambiguous when a legacy twin holds sent or
+  received messages, including retained history. Name-based mailbox access and
+  writes no longer skip that project as empty, and startup no longer reports
+  it as an empty twin. (#2348, follow-up to #2018.)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
