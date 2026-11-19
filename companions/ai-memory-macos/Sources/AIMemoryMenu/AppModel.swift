@@ -338,7 +338,9 @@ final class AppModel {
         }
     }
 
-    private static func describe(_ error: HealthError) -> String {
+    // Pure formatting; nonisolated so the `.map(Self.describe)` in the start
+    // path type-checks under Swift 6.0 (Xcode 16.2), not only newer compilers.
+    private nonisolated static func describe(_ error: HealthError) -> String {
         switch error {
         case .badURL:
             "Invalid server URL"
