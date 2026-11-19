@@ -72,7 +72,9 @@ async fn reindex_rebuild_does_not_mark_rebuilt_pages_operator_authored() {
         .get_or_create_project(ws, "trust", None)
         .await
         .unwrap();
-    let wiki = Wiki::new(src.path(), source.writer.clone()).unwrap();
+    let wiki = Wiki::new(src.path(), source.writer.clone())
+        .unwrap()
+        .with_store_reader(source.reader.clone());
     for (path, class) in [
         ("notes/fetched.md", TrustClass::ToolResult),
         ("notes/typed.md", TrustClass::OperatorAuthored),
@@ -122,5 +124,61 @@ async fn reindex_rebuild_does_not_mark_rebuilt_pages_operator_authored() {
     assert_eq!(
         class_of(&rebuilt, ws, proj, "notes/fetched.md").await,
         TrustClass::OperatorAuthored
+    );
+}
+
+#[tokio::test]
+async fn decay_tombstone_resurrection_preserves_tool_result_trust_class() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "trust", None)
+        .await
+        .unwrap();
+    let wiki = Wiki::new(tmp.path(), store.writer.clone())
+        .unwrap()
+        .with_store_reader(store.reader.clone());
+
+    let path = PagePath::new("notes/fetched.md").unwrap();
+    let page_id = wiki
+        .write_page(write_request(
+            ws,
+            proj,
+            path.as_str(),
+            TrustClass::ToolResult,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        class_of(&store, ws, proj, path.as_str()).await,
+        TrustClass::ToolResult
+    );
+
+    let abs = wiki.abs_path(ws, proj, &path);
+    let on_disk = std::fs::read(&abs).unwrap();
+    assert!(
+        wiki.evict_page_if_latest(ws, proj, &path, page_id, None)
+            .await
+            .unwrap()
+    );
+    // Simulate the markdown file still being present on disk when decay
+    // cleanup runs, triggering resurrection via `reindex_page_locked`.
+    std::fs::write(&abs, &on_disk).unwrap();
+
+    wiki.hard_delete_decay_tombstone(ws, proj, &path, page_id, i64::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        class_of(&store, ws, proj, path.as_str()).await,
+        TrustClass::ToolResult,
+        "automated decay-tombstone resurrection must preserve tombstone_trust \
+         instead of laundering a tool_result page into operator_authored"
     );
 }

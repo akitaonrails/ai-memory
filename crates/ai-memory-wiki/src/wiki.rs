@@ -2164,8 +2164,13 @@ impl Wiki {
             // about this tombstone's chain. Skipping the reindex leaves
             // `current_latest` at `None` — the state an absent file also
             // gives — and the chain below is still deleted.
+            // Pass `None` rather than `HAND_EDIT`: automated decay-tombstone
+            // resurrection must inherit `tombstone_trust` (preserving
+            // `tool_result` / `model_generated` / `operator_authored`) instead
+            // of laundering a resurrected `tool_result` page into
+            // `operator_authored`.
             match self
-                .reindex_page_locked(workspace_id, project_id, path.clone(), HAND_EDIT)
+                .reindex_page_locked(workspace_id, project_id, path.clone(), None)
                 .await
             {
                 Ok((id, _pending_embed)) => current_latest = Some(id),
@@ -3073,9 +3078,9 @@ impl Wiki {
                 entities: meta.entities,
                 evidence: Vec::new(),
                 // `HAND_EDIT` for a file changed outside ai-memory, `None`
-                // from a rebuild. An unchanged file hits the short-circuit in
-                // `upsert_page_in_tx` and keeps the existing version's
-                // `trust_class` either way (#2164).
+                // from a rebuild or decay-tombstone resurrection. An unchanged
+                // file hits the short-circuit in `upsert_page_in_tx` and keeps
+                // the existing version's `trust_class` either way (#2164).
                 trust_class,
             })
             .await?;
