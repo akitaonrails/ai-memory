@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-cli"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-consolidate"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-core"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "fluent-bundle",
  "fluent-syntax",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-eval"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-hooks"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-llm"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-mcp"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-consolidate",
  "ai-memory-core",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-store"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -295,14 +295,14 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-test-support"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "socket2",
 ]
 
 [[package]]
 name = "ai-memory-web"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-wiki"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-core",
  "ai-memory-llm",
@@ -344,7 +344,6 @@ dependencies = [
  "git2",
  "jiff",
  "notify",
- "notify-debouncer-full",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -362,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "ai-memory-workstream"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "ai-memory-core",
  "anyhow",
@@ -1430,15 +1429,6 @@ dependencies = [
  "toml 0.8.23",
  "uncased",
  "version_check",
-]
-
-[[package]]
-name = "file-id"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1fc6a637b6dc58414714eddd9170ff187ecb0933d4c7024d1abbd23a3cc26e9"
-dependencies = [
- "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2697,19 +2687,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "notify-debouncer-full"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "375bd3a138be7bfeff3480e4a623df4cbfb55b79df617c055cd810ba466fa078"
-dependencies = [
- "file-id",
- "log",
- "notify",
- "notify-types",
- "walkdir",
-]
-
-[[package]]
 name = "notify-types"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3552,9 +3529,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",

@@ -851,9 +851,36 @@ async fn run_persisted_maintenance_job<F, Fut, R, RFut, N>(
     }
 }
 
-fn session_consolidation_retry_delay(attempt: u32) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(4);
-    Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
+/// Maximum number of transport-failed (or slow-outage-backed-off) session
+/// consolidation jobs passively requeued when a real LLM consolidation
+/// succeeds.
+const TRANSPORT_RECOVERY_REQUEUE_LIMIT: usize = 10;
+
+fn session_consolidation_retry_delay(attempt: u32, transport_unreachable: bool) -> Duration {
+    if transport_unreachable && attempt >= ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+        let slow_exponent = attempt
+            .saturating_sub(ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS)
+            .min(3);
+        // Slow outage schedule past the fast attempts:
+        // 30m -> 1h -> 2h -> 4h (capped at 4h through attempt 11).
+        Duration::from_secs(1_800_u64.saturating_mul(1_u64 << slow_exponent))
+    } else {
+        let exponent = attempt.saturating_sub(1).min(4);
+        Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
+    }
+}
+
+/// Whether `error` is a transient transport-unreachable HTTP failure
+/// (`LlmError::Http` with no HTTP status, persisted as
+/// `consolidation failed: class=http status=none`).
+fn is_transport_unreachable_session_consolidation_error(
+    error: &ai_memory_consolidate::ConsolidatorError,
+) -> bool {
+    matches!(
+        error,
+        ai_memory_consolidate::ConsolidatorError::Llm(llm @ ai_memory_llm::LlmError::Http(http))
+            if llm.is_transient() && http.status().is_none()
+    )
 }
 
 /// Failures that must terminate a SessionEnd queue job: re-sending the same
@@ -1073,13 +1100,36 @@ async fn run_session_consolidation_worker(
             Ok(consolidated) => match writer.complete_session_consolidation(job).await {
                 Ok(()) => {
                     match consolidated {
-                        SessionPageConsolidation::Consolidated(outcome) => info!(
-                            session = %session_id,
-                            generation,
-                            attempts,
-                            path = %outcome.path,
-                            "queued LLM consolidation written",
-                        ),
+                        SessionPageConsolidation::Consolidated(outcome) => {
+                            info!(
+                                session = %session_id,
+                                generation,
+                                attempts,
+                                path = %outcome.path,
+                                "queued LLM consolidation written",
+                            );
+                            // A real provider call just succeeded: passively
+                            // requeue a bounded batch of transport-failed or
+                            // outage-backed-off jobs with zero active probing.
+                            let requeue_now = jiff::Timestamp::now().as_microsecond();
+                            match writer
+                                .requeue_transport_failed_session_consolidations(
+                                    requeue_now,
+                                    TRANSPORT_RECOVERY_REQUEUE_LIMIT,
+                                )
+                                .await
+                            {
+                                Ok(requeued) if requeued > 0 => info!(
+                                    requeued,
+                                    "requeued transport-failed session consolidation jobs after provider recovery",
+                                ),
+                                Ok(_) => {}
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "failed to requeue transport-failed session consolidation jobs",
+                                ),
+                            }
+                        }
                         SessionPageConsolidation::AgentPageKept => info!(
                             session = %session_id,
                             generation,
@@ -1097,12 +1147,19 @@ async fn run_session_consolidation_worker(
                 ),
             },
             Err(error) => {
+                let transport_unreachable =
+                    is_transport_unreachable_session_consolidation_error(&error);
+                let max_attempts = if transport_unreachable {
+                    ai_memory_store::TRANSPORT_RECOVERY_MAX_ATTEMPTS
+                } else {
+                    ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS
+                };
                 let retry_at = if is_terminal_session_consolidation_error(&error)
-                    || attempts >= ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS
+                    || attempts >= max_attempts
                 {
                     None
                 } else {
-                    let delay = session_consolidation_retry_delay(attempts);
+                    let delay = session_consolidation_retry_delay(attempts, transport_unreachable);
                     let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
                     Some(
                         jiff::Timestamp::now()
@@ -5794,6 +5851,208 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "completed work must not be claimed again"
+        );
+    }
+
+    #[test]
+    fn session_consolidation_retry_delay_uses_slow_outage_schedule_past_fast_attempts() {
+        // Fast exponential schedule for standard transient errors.
+        assert_eq!(
+            session_consolidation_retry_delay(1, false),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(2, false),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(3, false),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(4, false),
+            Duration::from_secs(240)
+        );
+
+        // Transport-unreachable errors share the fast schedule for attempts 1..4,
+        // then switch to slow outage backoff: 30m -> 1h -> 2h -> 4h (capped).
+        assert_eq!(
+            session_consolidation_retry_delay(1, true),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(4, true),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(5, true),
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(6, true),
+            Duration::from_secs(60 * 60)
+        );
+        assert_eq!(
+            session_consolidation_retry_delay(7, true),
+            Duration::from_secs(2 * 60 * 60)
+        );
+        for attempt in 8..=11 {
+            assert_eq!(
+                session_consolidation_retry_delay(attempt, true),
+                Duration::from_secs(4 * 60 * 60)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_consolidation_worker_passively_requeues_transport_failed_job_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+
+        let create_ended_session = |sid: SessionId| {
+            let writer = store.writer.clone();
+            async move {
+                writer
+                    .begin_session(NewSession {
+                        occurred_at: None,
+                        id: sid,
+                        workspace_id,
+                        project_id,
+                        agent_kind: AgentKind::Codex,
+                        cwd: None,
+                        actor_user: None,
+                        origin: None,
+                    })
+                    .await
+                    .unwrap();
+                writer
+                    .insert_observation(Sanitized::new(
+                        NewObservation {
+                            occurred_at: None,
+                            session_id: sid,
+                            workspace_id,
+                            project_id,
+                            kind: ObservationKind::UserPrompt,
+                            extension: None,
+                            source_event: None,
+                            title: "finish".into(),
+                            body: "complete the durable job".into(),
+                            importance: 8,
+                            file_path: None,
+                        },
+                        &Sanitizer::default(),
+                    ))
+                    .await
+                    .unwrap();
+                writer.end_session(sid, None).await.unwrap();
+                writer
+                    .enqueue_session_consolidation(workspace_id, project_id, sid)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        let failed_transport_session = SessionId::new();
+        let failed_terminal_session = SessionId::new();
+        let healthy_session = SessionId::new();
+        create_ended_session(failed_transport_session).await;
+        create_ended_session(failed_terminal_session).await;
+        create_ended_session(healthy_session).await;
+
+        let now = jiff::Timestamp::now().as_microsecond();
+        {
+            let db = rusqlite::Connection::open(store.db_path()).unwrap();
+            db.execute(
+                "UPDATE session_consolidation_jobs \
+                 SET state = 'failed', attempts = ?1, completed_at = ?2, \
+                     last_error = ?3 \
+                 WHERE session_id = ?4",
+                rusqlite::params![
+                    i64::from(ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS),
+                    now - 10_000,
+                    ai_memory_store::TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                    failed_transport_session.as_bytes(),
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE session_consolidation_jobs \
+                 SET state = 'failed', attempts = 1, completed_at = ?1, \
+                     last_error = 'consolidation failed: class=provider status=400' \
+                 WHERE session_id = ?2",
+                rusqlite::params![now - 10_000, failed_terminal_session.as_bytes()],
+            )
+            .unwrap();
+        }
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            store.reader.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        // Expect two completions: first `healthy_session`, which passively
+        // requeues `failed_transport_session`, then `failed_transport_session`.
+        wait_for_worker_settled(&completed, "worker should complete healthy session").await;
+        wait_for_worker_settled(
+            &completed,
+            "worker should passively recover and complete transport-failed session",
+        )
+        .await;
+
+        cancel.cancel();
+        task.await.unwrap();
+
+        for sid in [healthy_session, failed_transport_session] {
+            let path = format!("sessions/{sid}.md");
+            assert!(
+                store
+                    .reader
+                    .page_body_by_ids(workspace_id, project_id, &path)
+                    .await
+                    .unwrap()
+                    .is_some_and(|page| page.body.contains("Durable worker completed")),
+                "session {sid} must be consolidated after provider recovery"
+            );
+        }
+
+        let db = rusqlite::Connection::open(store.db_path()).unwrap();
+        let terminal_state: String = db
+            .query_row(
+                "SELECT state FROM session_consolidation_jobs WHERE session_id = ?1",
+                rusqlite::params![failed_terminal_session.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            terminal_state, "failed",
+            "non-transport terminal failed jobs must remain untouched on recovery"
         );
     }
 

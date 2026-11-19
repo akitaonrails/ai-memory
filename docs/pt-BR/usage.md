@@ -558,7 +558,10 @@ anexação em `end_of_page` a segue e novas seções vêm por último. Assim,
 lote adicione; o texto que deve vir depois de um novo título vai no `content` desse
 `add_section`. Um novo título recebe uma linha em branco antes e depois. Substituir uma
 seção também substitui as seções aninhadas nela, portanto, outra edição em uma
-delas é um destino sobreposto. Títulos duplicados, tokens de página ou seção
+delas é um destino sobreposto. `replace_section` recusa o título de nível 1
+com `title_section`, porque a seção do título é a página inteira; use
+`memory_write_page` para alterar o texto sob o título. Títulos duplicados,
+tokens de página ou seção
 desatualizados, destinos sobrepostos, falha na admissão ou um gravador simultâneo rejeitam
 o lote inteiro. O frontmatter existente é preservado; o corpo final ainda passa
 pelo sanitizador normal, admissão, atribuição, versionamento, índice e
@@ -660,7 +663,7 @@ ai-memory install-skills --target-dir .custom/skills --force
 ```
 
 Para o Devin, habilidades locais do projeto são instaladas em `.devin/skills`. Instalações
-globais do Devin usam `%APPDATA%\devin\skills` no Windows e `~/.devin/skills`
+globais do Devin usam `%APPDATA%\devin\skills` no Windows e `~/.config/devin/skills`
 em sistemas não Windows. Para a Grok Build CLI, habilidades locais do projeto ficam sob
 `.grok/skills` e globais sob `$GROK_HOME/skills` (padrão
 `~/.grok/skills`). Uma instalação global de habilidades do Grok também grava a regra de handoff do

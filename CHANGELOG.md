@@ -62,6 +62,120 @@ version in [`docs/changelog/`](docs/changelog/):
   It sends one bounded Choice request per eligible query, retains local order on failure, and records validated usage even when an answer is refused.
   Choice probabilities are relative to the candidate pool; leave `min_relevance` unset with this backend. (#2296)
 
+## [3.5.1] - 2026-11-19
+
+### Fixed
+
+- Staged online backups under the wiki mutation and git locks so concurrent
+  page writes, deletions and checkpoints cannot mix SQLite and wiki states.
+  Released those locks before compressing the private staged archive. (#2361)
+
+- Devin CLI user-level installs now write to Devin's documented global config
+  directory (`~/.config/devin/` on Linux/macOS/WSL, `%APPDATA%\devin\` on
+  Windows) instead of `~/.devin/`: `install-hooks --agent devin` merges hooks
+  under the `"hooks"` key of `config.json` (while `--config-file .devin/hooks.v1.json`
+  continues to write the flat project-level event map), `install-mcp --client devin`
+  writes `mcp_config.json`, `install-skills --scope global --agent devin`
+  writes `skills/`, and `backup-agents` captures the new layout, and `restore-agents` /
+  `uninstall` handle both the new layout and legacy `~/.devin/` paths. (#2379)
+
+- Kept canonical project names ambiguous when a legacy twin holds sent or
+  received messages, including retained history. Name-based mailbox access and
+  writes no longer skip that project as empty, and startup no longer reports
+  it as an empty twin. (#2348, follow-up to #2018.)
+
+- Claude Code's Code Mode results are no longer stored as user prompts. When
+  code can run in the background, as in auto mode, Claude Code hands each
+  result of its `REPL` tool back as a `UserPromptSubmit` with
+  `source: "poll_event"`, and every one was captured as something the user
+  typed: the handoff told the next session to continue from a code result, and
+  the session's prompt list, post-compaction anchor and profile harvest read
+  code output as the user's words. The server now accepts these events (202)
+  and stores nothing, before they spend any ingest capacity; the calls the
+  code made are still captured as their own tool events. (#2366)
+
+- The TypeScript SDK waits for the active MCP handshake when a capability
+  refresh supersedes an in-flight handshake. This prevents requests without a
+  session ID on stateful servers when the older response arrives first. (#2047)
+
+- Updated `rustix` to `1.1.6` in the workspace and companion lockfiles that
+  use it, addressing RUSTSEC-2026-0486. (#2371)
+
+- Profile harvest no longer promotes five kinds of text that are not a habit
+  to "your usual choices". Three arrived as prompts: Codex's app-generated
+  request for a suggested next message, a Claude desktop sub-session brief
+  whose shared-notes footer ends in a Windows path (the #2041 check matched
+  `side-session-notes/` only, so the footer, its local path and a session id
+  became an entry), and the content of a file attached to a prompt in a
+  `<context ref="…">` block. Two came from curated pages: the opening line
+  agents repeat on every project's decision or session note ("Plan approved
+  by the user.", "Continues [[decisions/…]]."), and one page that reached a
+  second project, which counted as two projects once its copies were read
+  more than an hour apart. A page under `decisions/` or `gotchas/` now
+  contributes its statement only when it has the shape of a rule (a marker
+  such as *always* or *instead of*, plus an action or a comparison); pages
+  under `_rules/` and `procedures/` contribute as before. In any directory a
+  statement that opens with a pointer to another note, or that carries a full
+  date outside parentheses and no marker, is a record and is skipped; a rule
+  that cites a date in parentheses or ends on a link is kept. An entry you removed also no
+  longer returns when the only thing admitting it is a `general` candidate
+  older than the removal. Entries an earlier version already wrote stay:
+  list them with `ai-memory profile review` and remove the ones you do not
+  want with `ai-memory profile forget <path>`. (#2372)
+
+- Kept recorded retrievals and their hits consistent when the dashboard opens
+  while history retention removes older entries. (#2377)
+
+- `memory_patch_page` refuses a `replace_section` aimed at the page's level 1
+  title with `title_section`. The title's section runs to the end of the page,
+  so the edit replaced the whole body and deleted every section below it. The
+  tool description and the durable-pages Skill now say that `content` is the
+  section body without its heading. (#2378)
+
+- `companions/ai-memory-macos/build.sh` now checks the Rust compiler against
+  `rust-toolchain.toml` before building and says that the pin needs rustup,
+  instead of failing with cargo's "requires rustc" errors under a Homebrew
+  `rust`. The menu bar app also compiles again under Swift 6.0 (Xcode 16.2,
+  the last Xcode for macOS 14) (#2380).
+
+- Antigravity hooks on Windows work again when the user profile path has a
+  space. The caret escape from #1767 let `cmd` find `ai-memory.exe`, but `cmd`
+  drops the carets and passes the command line unquoted, so the program saw
+  `C:\Users\First` and `Last\…\ai-memory.exe` as two arguments and every hook
+  failed with "unrecognized subcommand". The executable and `--data-dir` are
+  now written by their 8.3 short names, which have no space; on a volume with
+  8.3 names off, the caret form is kept. Run `ai-memory setup` again to
+  rewrite `~/.gemini/config/hooks.json`. (#2353)
+
+- A native upgrade no longer points generated integrations (OpenCode,
+  OpenCode 2, Omp, Pi, OpenClaw) at the local server. Installed with an
+  explicit remote `--server-url` and refreshed with no `server_url`
+  configured, they were re-rendered with `http://127.0.0.1:49374`; the refresh
+  now keeps the endpoint the file already names, as it already did for Claude
+  Code's hooks. A configured `server_url` or `AI_MEMORY_SERVER_URL` still
+  wins. (#2374)
+
+- The wiki watcher's reconcile pass no longer rewrites the whole persisted
+  fingerprint table when one file changed. Every pass that reindexed a page
+  deleted all rows and inserted them again on the single writer, thousands of
+  writes on a large wiki; it now deletes only the files that are gone and
+  writes only the fingerprints that changed or are new, in the same
+  transaction, and a pass with nothing changed writes nothing. (#2375)
+
+- Queued session-consolidation jobs that hit a transport-unreachable provider
+  failure (`class=http status=none`) during a network outage or laptop sleep now
+  continue on a slower outage backoff (30m -> 1h -> 2h -> 4h up to 12 total
+  attempts) instead of becoming permanently `failed` after 5 fast attempts, and
+  the worker passively requeues a bounded batch of transport-failed or
+  outage-backed-off jobs whenever a subsequent consolidation succeeds. Terminal
+  and non-transport failures keep the existing 5-attempt cap. (#2360)
+
+- Replaced the `notify-debouncer-full` polling thread in the wiki filesystem
+  watcher with an event-driven debouncer built directly on `notify` and
+  `tokio::time`. Idle servers no longer wake a background thread every 75ms,
+  and `EventKind::Access(_)` and `.git/`-only events are dropped at the raw
+  watcher callback before entering the async channel. (#2354)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
@@ -5975,7 +6089,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.5.0...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.5.1...HEAD
+[3.5.1]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.1
 [3.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.0
 [3.4.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.7
 [3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6

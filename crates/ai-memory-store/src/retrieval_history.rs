@@ -215,7 +215,7 @@ pub(crate) fn record_retrieval_history(
 /// never read another scope's rows through a guessed session id. The owner
 /// filter is enforced upstream by the session-visibility gate the dashboard
 /// shares with the session timeline, exactly as the observations reader relies
-/// on it.
+/// on it. Count, records and hits share one snapshot.
 pub(crate) fn retrieval_history_page(
     conn: &Connection,
     workspace_id: WorkspaceId,
@@ -224,16 +224,18 @@ pub(crate) fn retrieval_history_page(
     offset: i64,
     limit: i64,
 ) -> StoreResult<RetrievalHistoryPage> {
+    // Retention can delete a record and cascade to its hits between reads.
+    let snapshot = conn.unchecked_transaction()?;
     let ws = workspace_id.as_bytes();
     let proj = project_id.as_bytes();
     let sid = session_id.as_bytes();
-    let total: i64 = conn.query_row(
+    let total: i64 = snapshot.query_row(
         "SELECT COUNT(*) FROM retrieval_history \
           WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
         params![ws, proj, sid],
         |row| row.get(0),
     )?;
-    let mut stmt = conn.prepare(
+    let mut stmt = snapshot.prepare(
         "SELECT id, created_at, query, scope_kind, source, result_limit, min_relevance, \
                 filters, duration_us, result_count, notice \
            FROM retrieval_history \
@@ -265,7 +267,7 @@ pub(crate) fn retrieval_history_page(
 
     // Attach each record's hits. The page size is bounded, so a cached
     // per-record query stays cheap and avoids a large `IN (...)` of blob ids.
-    let mut hits_stmt = conn.prepare(
+    let mut hits_stmt = snapshot.prepare(
         "SELECT position, page_path, page_version, relevance, explanation \
            FROM retrieval_history_hits \
           WHERE history_id = ?1 \
@@ -302,4 +304,114 @@ fn uuid_string(bytes: &[u8]) -> String {
 /// Microseconds since the epoch to a timestamp, clamped on an out-of-range row.
 fn micros_to_ts(us: i64) -> Timestamp {
     Timestamp::from_microsecond(us).unwrap_or(Timestamp::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::OpenFlags;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    use super::*;
+    use crate::Store;
+
+    #[tokio::test]
+    async fn history_page_keeps_hits_pruned_during_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let workspace = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project = store
+            .writer
+            .get_or_create_project(workspace, "scratch", None)
+            .await
+            .unwrap();
+        let session = SessionId::new();
+        let first = NewRetrievalHistory {
+            workspace_id: workspace,
+            project_id: project,
+            session_id: session,
+            query: "old query".into(),
+            scope_kind: "project".into(),
+            source: "fts".into(),
+            result_limit: Some(1),
+            min_relevance: None,
+            filters: None,
+            duration_us: 1,
+            result_count: 1,
+            notice: None,
+            hits: vec![NewRetrievalHistoryHit {
+                page_path: "notes/old.md".into(),
+                page_version: None,
+                relevance: None,
+                explanation: None,
+            }],
+        };
+        store
+            .writer
+            .record_retrieval_history(first.clone(), 1)
+            .await
+            .unwrap();
+        let replacement = NewRetrievalHistory {
+            query: "new query".into(),
+            hits: vec![NewRetrievalHistoryHit {
+                page_path: "notes/new.md".into(),
+                ..first.hits[0].clone()
+            }],
+            ..first
+        };
+
+        let path = store.db_path().to_path_buf();
+        let writer = store.writer.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let page = tokio::task::spawn_blocking(move || {
+            let mut reader =
+                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            let mut replacement = Some(replacement);
+            // Commit a normal retention prune after the record query but
+            // before SQLite starts reading its hit rows.
+            reader
+                .authorizer(Some(move |context: AuthContext<'_>| {
+                    if matches!(
+                        context.action,
+                        AuthAction::Read {
+                            table_name: "retrieval_history_hits",
+                            ..
+                        }
+                    ) && let Some(record) = replacement.take()
+                    {
+                        let _ =
+                            send.send(runtime.block_on(writer.record_retrieval_history(record, 1)));
+                    }
+                    Authorization::Allow
+                }))
+                .unwrap();
+            let page = retrieval_history_page(&reader, workspace, project, session, 0, 10).unwrap();
+            receive.try_recv().unwrap().unwrap();
+            page
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.records[0].query, "old query");
+        assert_eq!(
+            page.records[0].hits.len(),
+            1,
+            "the retrieved record lost its hit"
+        );
+        assert_eq!(page.records[0].hits[0].page_path, "notes/old.md");
+
+        let current = store
+            .reader
+            .retrieval_history_page(workspace, project, session, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(current.total, 1);
+        assert_eq!(current.records[0].query, "new query");
+        assert_eq!(current.records[0].hits[0].page_path, "notes/new.md");
+    }
 }

@@ -428,13 +428,14 @@ fn agent_root(
     claude_config_dir: Option<&Path>,
     platform: SkillHostPlatform,
 ) -> Result<PathBuf> {
-    if scope == InstallSkillsScope::Global
-        && kind == SkillRootKind::Devin
-        && platform == SkillHostPlatform::Windows
-    {
-        let appdata = appdata
-            .context("could not locate %APPDATA% for global Devin skill install on Windows")?;
-        return Ok(appdata.join("devin").join(SKILLS_DIR));
+    if scope == InstallSkillsScope::Global && kind == SkillRootKind::Devin {
+        if platform == SkillHostPlatform::Windows {
+            let appdata = appdata
+                .context("could not locate %APPDATA% for global Devin skill install on Windows")?;
+            return Ok(appdata.join("devin").join(SKILLS_DIR));
+        }
+        let home = home.context("could not locate $HOME for global skill install")?;
+        return Ok(home.join(".config").join("devin").join(SKILLS_DIR));
     }
 
     if scope == InstallSkillsScope::Global
@@ -735,7 +736,10 @@ mod tests {
             Some(home),
         )
         .unwrap();
-        assert_eq!(root_names(&global_devin), ["/home/alice/.devin/skills"]);
+        assert_eq!(
+            root_names(&global_devin),
+            ["/home/alice/.config/devin/skills"]
+        );
 
         let global_grok = resolve_target_roots(
             &args(InstallSkillsScope::Global, InstallSkillsAgent::Grok),

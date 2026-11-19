@@ -18,7 +18,9 @@ The app does not replace `ai-memory status`, `/web`, or hand-editing `config.tom
 
 ## Build
 
-From the repository root (needs a Rust toolchain and Xcode / Swift 6):
+From the repository root. Needs rustup (it applies the Rust version pinned in
+`rust-toolchain.toml`; a Homebrew or distro `rust` does not) and Xcode 16.2 or
+later (Swift 6; the Command Line Tools alone lack SwiftUI's macros):
 
 ```bash
 chmod +x companions/ai-memory-macos/build.sh

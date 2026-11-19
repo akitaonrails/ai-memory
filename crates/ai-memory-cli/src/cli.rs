@@ -1951,7 +1951,8 @@ pub enum InstallSkillsAgent {
     ClaudeCode,
     /// Cross-agent `.agents/skills` directory.
     Agents,
-    /// Devin's `.devin/skills` directory.
+    /// Devin's `.devin/skills` (project) or `~/.config/devin/skills` /
+    /// `%APPDATA%\devin\skills` (global) directory.
     Devin,
     /// Grok Build CLI's `.grok/skills` directory.
     Grok,
@@ -2632,7 +2633,8 @@ pub enum AgentChoice {
     /// via the MCP `memory_handoff_accept` tool.
     Zero,
     /// Devin CLI — JSON-config hooks in
-    /// `~/.devin/hooks.v1.json` or `~/.devin/config.json` hooks key.
+    /// `~/.config/devin/config.json` (`%APPDATA%\devin\config.json` on Windows)
+    /// under the `"hooks"` key, or project-level `.devin/hooks.v1.json`.
     /// Native `ai-memory hook --event` integration using Devin-specific
     /// hook scripts. Devin consumes the handoff via
     /// `hookSpecificOutput.additionalContext` on `SessionStart`.
@@ -3012,7 +3014,7 @@ pub enum McpClient {
     /// entry schema is strict: unknown keys make it drop the server
     /// silently, so the generated entry carries nothing else.
     Zcode,
-    /// Devin CLI — `~/.devin/config.json`.
+    /// Devin CLI — `~/.config/devin/mcp_config.json` (`%APPDATA%\devin\mcp_config.json` on Windows).
     Devin,
     /// xAI Grok Build CLI — `~/.grok/config.toml` under
     /// `[mcp_servers.<name>]` with native HTTP `url` + `headers`.

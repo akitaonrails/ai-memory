@@ -7,6 +7,30 @@ ROOT="$(cd "$COMPANION/../.." && pwd)"
 DIST="${1:-$COMPANION/dist/AI Memory.app}"
 CONFIG="${CONFIGURATION:-release}"
 
+# rust-toolchain.toml is honoured only by rustup; a Homebrew or distro cargo
+# ignores it and fails later with a wall of "requires rustc" errors.
+REQUIRED_RUST="$(sed -n 's/^channel *= *"\([0-9.]*\)".*/\1/p' "$ROOT/rust-toolchain.toml")"
+if ! FOUND_RUST="$(cd "$ROOT" && rustc --version 2>/dev/null)"; then
+  echo "error: rustc not found; install rustup from https://rustup.rs (the repo pins Rust $REQUIRED_RUST)" >&2
+  exit 1
+fi
+FOUND_VERSION="$(awk '{print $2}' <<<"$FOUND_RUST")"
+if [[ -n "$REQUIRED_RUST" && "$FOUND_VERSION" =~ ^[0-9]+\.[0-9]+ ]]; then
+  IFS=. read -r req_major req_minor _ <<<"$REQUIRED_RUST"
+  IFS=. read -r got_major got_minor _ <<<"$FOUND_VERSION"
+  if (( 10#$got_major < 10#$req_major || (10#$got_major == 10#$req_major && 10#$got_minor < 10#${req_minor:-0}) )); then
+  echo "error: this repo needs Rust $REQUIRED_RUST, but $(command -v rustc) is $FOUND_RUST" >&2
+  if ! command -v rustup >/dev/null 2>&1; then
+    echo "  rust-toolchain.toml is applied only by rustup, which is not installed." >&2
+    echo "  Install it from https://rustup.rs (on Homebrew, 'brew uninstall rust' first)," >&2
+    echo "  then re-run this script; rustup downloads $REQUIRED_RUST automatically." >&2
+  else
+    echo "  rustup is installed but another rustc comes first on PATH; put ~/.cargo/bin first." >&2
+  fi
+  exit 1
+  fi
+fi
+
 echo "building ai-memory ($CONFIG) from $ROOT"
 if [[ "$CONFIG" == "release" ]]; then
   cargo build --release --bin ai-memory --manifest-path "$ROOT/Cargo.toml"

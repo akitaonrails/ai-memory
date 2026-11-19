@@ -137,7 +137,8 @@ pub use scope::{
     lookup_project_id_guarded, resolve_many_existing_scopes, resolve_many_existing_scopes_guarded,
 };
 pub use session_consolidation::{
-    SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, enqueue_in_tx,
+    SESSION_CONSOLIDATION_MAX_ATTEMPTS, SessionConsolidationJob, TRANSPORT_RECOVERY_MAX_ATTEMPTS,
+    TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR, enqueue_in_tx,
 };
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};

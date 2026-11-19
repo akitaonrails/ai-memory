@@ -1466,7 +1466,8 @@ the supported path for uninstall isolation and hooks URL inference.
 
 ## Devin CLI
 
-Devin manages MCP servers in `~/.devin/config.json` under `mcpServers`:
+Devin manages user-level MCP servers in `~/.config/devin/mcp_config.json`
+(`%APPDATA%\devin\mcp_config.json` on Windows) under `mcpServers`:
 
 ```bash
 ai-memory install-mcp --client devin --apply \
@@ -1494,10 +1495,10 @@ ai-memory install-hooks --agent devin --apply \
     --server-url "http://homelab:49374" --auth-token "$TOKEN"
 ```
 
-By default this writes `~/.devin/hooks.v1.json`, whose root object is the
-event map. If you want the hook entries inside `~/.devin/config.json` instead,
-pass that path with `--config-file`; ai-memory then merges them under the
-`hooks` key.
+By default this merges the hook entries under the `hooks` key of
+`~/.config/devin/config.json` (`%APPDATA%\devin\config.json` on Windows). For
+project-level hooks in `.devin/hooks.v1.json` (whose root object is the flat
+event map), pass `--config-file .devin/hooks.v1.json`.
 
 Devin's supported lifecycle events are `SessionStart`, `UserPromptSubmit`,
 `PreToolUse`, `PostToolUse`, `PostCompaction`, `Stop`, and `SessionEnd`.

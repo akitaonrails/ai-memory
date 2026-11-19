@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Waited for the active MCP handshake during a capability refresh so a
+  superseded response cannot send a call without a stateful session ID. (#2047)
+
 - `pages.update` preserves profile stack filters and enforcement metadata on
   a body edit. `pages.write` and `pages.update` accept `appliesTo` and
   `enforcedBy` for profile entries. (#2207)

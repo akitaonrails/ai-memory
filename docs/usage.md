@@ -580,7 +580,10 @@ a patch inserts follows the page's dominant line ending: on a CRLF page the
 appends, the new section and its blank lines use CRLF, and replacing a nonempty
 section body preserves the blank-line padding around it for both LF and CRLF
 pages. The replacement also removes sections nested in it, so another
-edit to one of those is an overlapping target. Duplicate headings, stale page
+edit to one of those is an overlapping target. `replace_section` refuses the
+level 1 title with `title_section`, because the title's section is the whole
+page; use `memory_write_page` to change text under the title. Duplicate
+headings, stale page
 or section tokens, overlapping targets, failed admission, or a concurrent
 writer reject the whole batch. Existing frontmatter is preserved; the final
 body still passes through the normal sanitizer, admission, attribution,
@@ -683,7 +686,7 @@ ai-memory install-skills --target-dir .custom/skills --force
 ```
 
 For Devin, project-local skills are installed under `.devin/skills`. Global
-Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.devin/skills`
+Devin installs use `%APPDATA%\devin\skills` on Windows and `~/.config/devin/skills`
 on non-Windows systems. For Grok Build CLI, project-local skills go under
 `.grok/skills` and global under `$GROK_HOME/skills` (default
 `~/.grok/skills`). A global Grok skill install also writes the first-turn

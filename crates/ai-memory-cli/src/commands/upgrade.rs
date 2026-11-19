@@ -1032,23 +1032,56 @@ fn refresh_generated_integrations(config: &Config) {
 /// before rather than guessed into another dialect.
 fn refresh_generated_integration(config: &Config, agent: AgentChoice, path: &Path) -> Result<()> {
     let mut args = apply_hooks_args(agent);
-    if agent == AgentChoice::Openclaw {
+    // With no configured `server_url`, keep the endpoint the file already
+    // names, as Claude Code's hooks do, rather than the loopback default (#2374).
+    // If the file cannot be read or its baked SERVER URL cannot be recovered,
+    // fail without overwriting so the caller retains the existing file and
+    // prints the reapply hint.
+    let preserved_url = if !config.server_url_configured() {
+        let content = fs::read_to_string(path).with_context(|| {
+            format!(
+                "could not read {} to preserve its configured server URL",
+                path.display()
+            )
+        })?;
+        let Some(url) = install_hooks::baked_generated_server_url(&content) else {
+            bail!(
+                "could not recover the server URL from {}; keeping the existing integration",
+                path.display()
+            );
+        };
+        Some(url)
+    } else {
+        None
+    };
+
+    let dialect = if agent == AgentChoice::Openclaw {
         args.config_file = path.parent().map(Path::to_path_buf);
-        return install_hooks::run(config, args);
+        None
+    } else {
+        args.config_file = Some(path.to_path_buf());
+        if agent == AgentChoice::OpenCode {
+            let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
+            let dialect = super::opencode_dialect::resolve_generic(None, &child_env)
+                .map_or(ai_memory_workstream::OpenCodeDialect::V1, |resolved| {
+                    resolved.dialect
+                });
+            if dialect == ai_memory_workstream::OpenCodeDialect::V2 {
+                args.config_file = Some(path.with_file_name("ai-memory-opencode2.ts"));
+            }
+            Some(dialect)
+        } else {
+            None
+        }
+    };
+
+    match preserved_url {
+        Some(url) => install_hooks::run_with_preserved_hook_url(config, args, dialect, &url),
+        None => match dialect {
+            Some(dialect) => install_hooks::run_with_opencode_dialect(config, args, Some(dialect)),
+            None => install_hooks::run(config, args),
+        },
     }
-    args.config_file = Some(path.to_path_buf());
-    if agent != AgentChoice::OpenCode {
-        return install_hooks::run(config, args);
-    }
-    let child_env = super::run::EffectiveChildEnv::from_runtime(&config.runtime_env);
-    let dialect = super::opencode_dialect::resolve_generic(None, &child_env)
-        .map_or(ai_memory_workstream::OpenCodeDialect::V1, |resolved| {
-            resolved.dialect
-        });
-    if dialect == ai_memory_workstream::OpenCodeDialect::V2 {
-        args.config_file = Some(path.with_file_name("ai-memory-opencode2.ts"));
-    }
-    install_hooks::run_with_opencode_dialect(config, args, Some(dialect))
 }
 
 fn default_generated_integration_path(agent: AgentChoice) -> Result<PathBuf> {
@@ -1161,7 +1194,7 @@ fn apply_staged_agent_hooks(config: &Config, name: &str, agent: AgentChoice) {
     let args = apply_hooks_args(agent);
     let result = if agent == AgentChoice::ClaudeCode && !config.server_url_configured() {
         if let Some(url) = install_hooks::installed_claude_hook_url(&args, &config.data_dir) {
-            install_hooks::run_with_preserved_claude_hook_url(config, args, &url)
+            install_hooks::run_with_preserved_hook_url(config, args, None, &url)
         } else {
             println!(
                 "{}",
@@ -1446,6 +1479,297 @@ mod tests {
                 assert!(plugin.contains("export default AiMemoryHooks;"));
             }
         }
+    }
+
+    /// #2374: a generated integration installed with an explicit remote
+    /// `--server-url` kept it until an upgrade refreshed it with no
+    /// `server_url` configured, which baked the loopback default instead.
+    /// The endpoint already in the file is kept, as Claude Code's hooks are.
+    #[test]
+    fn a_generated_integration_refresh_keeps_its_baked_remote_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension = temp.path().join("pi").join("ai-memory-pi.ts");
+        let install = Config {
+            data_dir: temp.path().join("data"),
+            server_url: "https://memory.example.invalid/team".into(),
+            server_url_explicit: true,
+            ..Config::default()
+        };
+        let mut args = apply_hooks_args(AgentChoice::Pi);
+        args.config_file = Some(extension.clone());
+        install_hooks::run(&install, args).unwrap();
+        let installed = fs::read_to_string(&extension).unwrap();
+        assert!(
+            installed.contains("https://memory.example.invalid/team"),
+            "{installed}"
+        );
+
+        let upgrade = Config {
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        assert!(!upgrade.server_url_configured());
+        refresh_generated_integration(&upgrade, AgentChoice::Pi, &extension).unwrap();
+
+        let refreshed = fs::read_to_string(&extension).unwrap();
+        assert!(
+            refreshed.contains("https://memory.example.invalid/team"),
+            "{refreshed}"
+        );
+        assert!(!refreshed.contains("127.0.0.1:49374"), "{refreshed}");
+
+        // The reader undoes exactly the escaping the renderers apply, including
+        // URLs that contain `.replace(`.
+        for url in [
+            r#"https://h.invalid/a"b\c"#,
+            "https://h.invalid/path.replace(x)/team",
+        ] {
+            let line = format!(
+                "  const SERVER = {}.replace(/\\/+$/, \"\");",
+                crate::commands::render_shared::ts_string_literal(url)
+            );
+            assert_eq!(
+                install_hooks::baked_generated_server_url(&line).as_deref(),
+                Some(url)
+            );
+        }
+        assert_eq!(
+            install_hooks::baked_generated_server_url("const OTHER = 1;"),
+            None
+        );
+    }
+
+    #[test]
+    fn all_five_generated_integrations_preserve_their_baked_remote_server_on_refresh() {
+        let remote = "https://memory.example.invalid/team";
+        for agent in [
+            AgentChoice::OpenCode,
+            AgentChoice::OpenCode2,
+            AgentChoice::Omp,
+            AgentChoice::Pi,
+            AgentChoice::Openclaw,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let install = Config {
+                data_dir: temp.path().join("data"),
+                server_url: remote.into(),
+                server_url_explicit: true,
+                ..Config::default()
+            };
+            let mut args = apply_hooks_args(agent);
+            let target_file = match agent {
+                AgentChoice::OpenCode => temp.path().join("opencode").join("ai-memory.ts"),
+                AgentChoice::OpenCode2 => {
+                    temp.path().join("opencode2").join("ai-memory-opencode2.ts")
+                }
+                AgentChoice::Omp => temp.path().join("omp").join("ai-memory-omp.ts"),
+                AgentChoice::Pi => temp.path().join("pi").join("ai-memory-pi.ts"),
+                AgentChoice::Openclaw => {
+                    let dir = temp.path().join("openclaw");
+                    args.config_file = Some(dir.clone());
+                    dir.join(crate::commands::openclaw_plugin::ENTRYPOINT_TS)
+                }
+                _ => unreachable!(),
+            };
+            if agent != AgentChoice::Openclaw {
+                args.config_file = Some(target_file.clone());
+            }
+            if agent == AgentChoice::OpenCode {
+                install_hooks::run_with_opencode_dialect(
+                    &install,
+                    args,
+                    Some(ai_memory_workstream::OpenCodeDialect::V1),
+                )
+                .unwrap();
+            } else {
+                install_hooks::run(&install, args).unwrap();
+            }
+            let installed = fs::read_to_string(&target_file).unwrap();
+            assert!(
+                installed.contains(remote),
+                "{agent:?} did not bake {remote}: {installed}"
+            );
+
+            // Empty PATH keeps OpenCode on its V1 dialect without probing host binaries.
+            let upgrade = Config {
+                data_dir: temp.path().join("data"),
+                runtime_env: crate::config::RuntimeEnv::with_process_env_for_tests(&[("PATH", "")]),
+                ..Config::default()
+            };
+            assert!(!upgrade.server_url_configured());
+            refresh_generated_integration(&upgrade, agent, &target_file).unwrap();
+
+            let refreshed = fs::read_to_string(&target_file).unwrap();
+            assert!(
+                refreshed.contains(remote),
+                "{agent:?} lost {remote} on refresh: {refreshed}"
+            );
+            assert!(
+                !refreshed.contains("127.0.0.1:49374"),
+                "{agent:?} fell back to loopback on refresh: {refreshed}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_dialect_switch_carries_the_baked_remote_server_url() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        let plugins = temp.path().join("plugins");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&plugins).unwrap();
+        let opencode = bin.join("opencode");
+        fs::write(&opencode, "#!/bin/sh\nprintf 'opencode v2.0.23\\n'\n").unwrap();
+        fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let remote = "https://memory.example.invalid/opencode";
+        let install = Config {
+            data_dir: temp.path().join("data"),
+            server_url: remote.into(),
+            server_url_explicit: true,
+            ..Config::default()
+        };
+        let v1 = plugins.join("ai-memory.ts");
+        let mut args = apply_hooks_args(AgentChoice::OpenCode);
+        args.config_file = Some(v1.clone());
+        install_hooks::run_with_opencode_dialect(
+            &install,
+            args,
+            Some(ai_memory_workstream::OpenCodeDialect::V1),
+        )
+        .unwrap();
+        assert!(v1.is_file());
+
+        let upgrade = Config {
+            data_dir: temp.path().join("data"),
+            runtime_env: crate::config::RuntimeEnv::with_process_env_for_tests(&[(
+                "PATH",
+                bin.to_str().unwrap(),
+            )]),
+            ..Config::default()
+        };
+        assert!(!upgrade.server_url_configured());
+        refresh_generated_integration(&upgrade, AgentChoice::OpenCode, &v1).unwrap();
+
+        let v2_path = plugins.join("ai-memory-opencode2.ts");
+        assert!(!v1.exists(), "v1 plugin should be replaced by v2");
+        let plugin = fs::read_to_string(&v2_path).unwrap();
+        assert!(plugin.contains("id: \"ai-memory-opencode2\""), "{plugin}");
+        assert!(plugin.contains(remote), "{plugin}");
+        assert!(!plugin.contains("127.0.0.1:49374"), "{plugin}");
+    }
+
+    #[test]
+    fn explicit_configured_server_url_overrides_baked_generated_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension = temp.path().join("pi").join("ai-memory-pi.ts");
+        let install = Config {
+            data_dir: temp.path().join("data"),
+            server_url: "https://old.example.invalid/team".into(),
+            server_url_explicit: true,
+            ..Config::default()
+        };
+        let mut args = apply_hooks_args(AgentChoice::Pi);
+        args.config_file = Some(extension.clone());
+        install_hooks::run(&install, args).unwrap();
+
+        let upgrade = Config {
+            data_dir: temp.path().join("data"),
+            server_url: "https://new.example.invalid/team".into(),
+            server_url_explicit: true,
+            ..Config::default()
+        };
+        assert!(upgrade.server_url_configured());
+        refresh_generated_integration(&upgrade, AgentChoice::Pi, &extension).unwrap();
+
+        let refreshed = fs::read_to_string(&extension).unwrap();
+        assert!(
+            refreshed.contains("https://new.example.invalid/team"),
+            "{refreshed}"
+        );
+        assert!(
+            !refreshed.contains("https://old.example.invalid/team"),
+            "{refreshed}"
+        );
+    }
+
+    #[test]
+    fn unrecoverable_baked_server_url_retains_existing_generated_integration() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension = temp.path().join("pi").join("ai-memory-pi.ts");
+        fs::create_dir_all(extension.parent().unwrap()).unwrap();
+        let original = "// hand-edited generated integration without a recoverable SERVER line\nconst SERVER = process.env.AI_MEMORY_URL ?? 'https://custom.invalid';\n";
+        fs::write(&extension, original).unwrap();
+
+        let upgrade = Config {
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        assert!(!upgrade.server_url_configured());
+        let err = refresh_generated_integration(&upgrade, AgentChoice::Pi, &extension).unwrap_err();
+        assert!(
+            err.to_string().contains("could not recover the server URL"),
+            "{err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&extension).unwrap(),
+            original,
+            "existing file must stay untouched instead of being overwritten with loopback"
+        );
+    }
+
+    #[test]
+    fn preserved_generated_url_does_not_import_local_bearer_token_or_base_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let extension = temp.path().join("pi").join("ai-memory-pi.ts");
+        let remote = "https://memory.example.invalid/team";
+
+        let install = Config {
+            data_dir: data_dir.clone(),
+            server_url: remote.into(),
+            server_url_explicit: true,
+            ..Config::default()
+        };
+        let mut args = apply_hooks_args(AgentChoice::Pi);
+        args.config_file = Some(extension.clone());
+        install_hooks::run(&install, args).unwrap();
+        crate::config::store_hook_auth_token(&data_dir, "remote-existing-token").unwrap();
+
+        let mut upgrade = Config {
+            data_dir: data_dir.clone(),
+            base_path: "/local-prefix".into(),
+            ..Config::default()
+        };
+        upgrade.auth.bearer_token = Some("unrelated-local-server-token".into());
+        assert!(!upgrade.server_url_configured());
+
+        refresh_generated_integration(&upgrade, AgentChoice::Pi, &extension).unwrap();
+
+        let refreshed = fs::read_to_string(&extension).unwrap();
+        assert!(
+            refreshed.contains(&format!(
+                "const SERVER = {}.replace(",
+                crate::commands::render_shared::ts_string_literal(remote)
+            )),
+            "baked URL must not be mutated with local base_path: {refreshed}"
+        );
+        assert!(
+            !refreshed.contains("/local-prefix"),
+            "local base_path leaked into preserved URL: {refreshed}"
+        );
+        assert!(
+            !refreshed.contains("unrelated-local-server-token"),
+            "local bearer token leaked into generated file: {refreshed}"
+        );
+        assert_eq!(
+            fs::read_to_string(crate::config::hook_auth_token_path_in(&data_dir)).unwrap(),
+            "remote-existing-token",
+            "local bearer token must not overwrite existing hook credentials"
+        );
     }
 
     #[test]

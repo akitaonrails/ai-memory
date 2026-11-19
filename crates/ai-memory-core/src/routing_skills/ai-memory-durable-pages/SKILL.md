@@ -57,7 +57,9 @@ required `page_id` as `expected_page_id`, and submit one bounded batch.
 response, and with `target: "end_of_page"` takes none; `add_section` takes a
 new level 2-6 heading such as `## Decisions`; `replace_section` takes an
 `anchor` and must also carry that section's returned `sha256` as
-`section_sha256`.
+`section_sha256`. Its `content` is the section body without the heading line.
+It refuses the `#` title, whose section is the whole page; use
+`memory_write_page` to change text under the title.
 All edits resolve against the same captured body and either commit together or
 write nothing. Missing, duplicate, stale, or conflicting anchors fail closed.
 A page read with `scope: "global"` is patched with `scope: "global"` too,

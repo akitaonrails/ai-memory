@@ -6210,7 +6210,7 @@ impl AiMemoryServer {
             idempotent_hint = false,
             open_world_hint = false
         ),
-        description = "Patch an existing Markdown page without re-emitting its full body or metadata. Requires `expected_page_id` from `memory_read_page`; every edit is materialized against that one base version and the whole batch either commits through the normal write path or writes nothing. `append` requires `target: section` plus an unambiguous heading anchor, or `target: end_of_page` with no anchor. `add_section` requires a unique ATX level 2-6 heading as its anchor. `replace_section` requires both an unambiguous heading anchor and the exact `section_sha256` returned by `memory_read_page`. Headings inside fenced code are ignored. All existing frontmatter is preserved. Static clients pass `workspace` and `project` together. Pass `scope: \"global\"` (and no `workspace`/`project`) to patch a page read with `scope: \"global\"`."
+        description = "Patch an existing Markdown page without re-emitting its full body or metadata. Requires `expected_page_id` from `memory_read_page`; every edit is materialized against that one base version and the whole batch either commits through the normal write path or writes nothing. `append` requires `target: section` plus an unambiguous heading anchor, or `target: end_of_page` with no anchor. `add_section` requires a unique ATX level 2-6 heading as its anchor. `replace_section` requires both an unambiguous level 2-6 heading anchor and the exact `section_sha256` returned by `memory_read_page`; its `content` is the section body without the heading line. Headings inside fenced code are ignored. All existing frontmatter is preserved. Static clients pass `workspace` and `project` together. Pass `scope: \"global\"` (and no `workspace`/`project`) to patch a page read with `scope: \"global\"`."
     )]
     async fn memory_patch_page(
         &self,
@@ -8697,7 +8697,7 @@ impl AiMemoryServer {
                     "agents": "~/.agents/skills",
                     "devin": {
                         "windows": "%APPDATA%\\devin\\skills",
-                        "non_windows": "~/.devin/skills"
+                        "non_windows": "~/.config/devin/skills"
                     },
                     "grok": "$GROK_HOME/skills (default: ~/.grok/skills)",
                     "copilot_cli": "$COPILOT_HOME/skills (default: ~/.copilot/skills)",
@@ -9683,6 +9683,7 @@ fn page_patch_error(path: &PagePath, error: crate::page_patch::PatchError) -> Mc
         PatchError::AnchorNotFound(anchor) => ("anchor_not_found", Some(anchor.as_str())),
         PatchError::AmbiguousAnchor(anchor) => ("ambiguous_anchor", Some(anchor.as_str())),
         PatchError::HeadingExists(anchor) => ("heading_exists", Some(anchor.as_str())),
+        PatchError::TitleSection(anchor) => ("title_section", Some(anchor.as_str())),
         PatchError::SectionContentRepeatsHeading(anchor) => {
             ("section_content_repeats_heading", Some(anchor.as_str()))
         }
@@ -14017,7 +14018,7 @@ mod tests {
             response["target_hints"]["global"]["devin"]["non_windows"]
                 .as_str()
                 .unwrap(),
-            "~/.devin/skills"
+            "~/.config/devin/skills"
         );
         assert_eq!(
             response["target_hints"]["global"]["grok"].as_str().unwrap(),

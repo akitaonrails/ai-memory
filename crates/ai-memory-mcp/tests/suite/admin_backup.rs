@@ -347,3 +347,96 @@ async fn backup_refuses_linked_wiki_directories_before_returning_an_archive() {
         "outside directory canary"
     );
 }
+
+#[tokio::test]
+async fn backup_restores_matching_files_and_rows_while_pages_change() {
+    let tmp = TempDir::new().unwrap();
+    let (state, store) = make_state(&tmp).await;
+    seed_page(&state, &store, "changing.md", "generation 0").await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let live_wiki = state.wiki.clone();
+    let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let changes = tokio::spawn(async move {
+        let mut started = Some(started);
+        for generation in 1.. {
+            if stopped.try_recv() != Err(tokio::sync::oneshot::error::TryRecvError::Empty) {
+                break;
+            }
+            live_wiki
+                .write_page(WritePageRequest {
+                    workspace_id: ws,
+                    project_id: proj,
+                    path: PagePath::new("changing.md").unwrap(),
+                    frontmatter: serde_json::json!({"title":"Changing"}),
+                    body: format!("generation {generation}"),
+                    tier: Tier::Semantic,
+                    pinned: false,
+                    title: Some("Changing".into()),
+                    admission_ctx: None,
+                    author_id: None,
+                    actor: ai_memory_core::ActorContext::anonymous(),
+                    evidence: Vec::new(),
+                })
+                .await
+                .unwrap();
+            if let Some(started) = started.take() {
+                let _ = started.send(());
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    ready.await.unwrap();
+    let router = admin_router(state);
+    for _ in 0..3 {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/backup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let restored = TempDir::new().unwrap();
+        Archive::new(GzDecoder::new(bytes.as_ref()))
+            .unpack(restored.path())
+            .unwrap();
+        let restored_store = Store::open(restored.path()).unwrap();
+        let row = restored_store
+            .reader
+            .page_body_by_ids(ws, proj, "changing.md")
+            .await
+            .unwrap()
+            .unwrap();
+        let raw = std::fs::read_to_string(
+            restored
+                .path()
+                .join("wiki")
+                .join(ws.to_string())
+                .join(proj.to_string())
+                .join("changing.md"),
+        )
+        .unwrap();
+        let markdown = ai_memory_wiki::parse(&raw).unwrap();
+        assert_eq!(markdown.body.trim(), row.body.trim());
+        restored_store.close().await;
+    }
+    drop(stop);
+    changes.await.unwrap();
+}
