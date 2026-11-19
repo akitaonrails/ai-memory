@@ -386,6 +386,7 @@ async fn backup_restores_matching_files_and_rows_while_pages_change() {
                     author_id: None,
                     actor: ai_memory_core::ActorContext::anonymous(),
                     evidence: Vec::new(),
+                    trust_class: None,
                 })
                 .await
                 .unwrap();
