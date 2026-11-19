@@ -5949,6 +5949,7 @@ mod tests {
                             body: "complete the durable job".into(),
                             importance: 8,
                             file_path: None,
+                            trust_class: None,
                         },
                         &Sanitizer::default(),
                     ))
