@@ -1497,6 +1497,9 @@ What is not rebuilt:
 
 - Sessions, observations, handoffs, users/tokens, audit rows, access counters,
   and embeddings. Those are DB-only state; keep a backup if you need them.
+- Page trust classes (`trust_class`, #2164). The markdown does not carry them,
+  so every rebuilt page is `model_generated`, the class of a row whose origin
+  was never recorded, rather than `operator_authored`.
 
 Every scope directory carries the `_meta.md` manifest `reindex` reads its
 workspace/project name from. Identity-backed project manifests also carry

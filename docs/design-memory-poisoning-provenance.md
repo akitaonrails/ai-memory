@@ -178,7 +178,9 @@ level, per the security-boundary test rule.
   `trust_class` via `pages.supersedes` so a patch cannot launder a `tool_result`
   page into `operator_authored`. Only an explicit operator-authored
   `memory_write_page` without `session_id` or a disk hand-edit sets
-  `operator_authored`.
+  `operator_authored`. A rebuild from the markdown (`ai-memory reindex`) is not
+  a hand edit: the files carry no class, so a rebuilt page is `model_generated`,
+  like a row older than V113 (#2392).
 - Settled by step 2 (V113): zero-LLM rule-based `sessions/<id>.md` pages
   (SessionEnd, compaction checkpoint, `idle_end`) derive `pages.trust_class`
   from the session's least-trusted observation via `SessionDigest` without
