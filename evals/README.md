@@ -578,9 +578,11 @@ Baseline knobs: `--embeddings none|local` (also = vectors off/on),
 knobs like `pin_first` / `include_superseded` can be A/B'd;
 `query`/`workspace`/`project`/`limit` are reserved). Each has a
 `--candidate-*` twin (`--candidate-embeddings`, `--candidate-reranker`,
-`--candidate-server-env`, `--candidate-query-arg`); a candidate knob left
-unset mirrors the baseline. The report's config line names every
-`--server-env` variable, but prints `<redacted>` for the value of any name
+`--candidate-server-env`, `--candidate-query-arg`). Without
+`--candidate-embeddings`, the candidate inherits the baseline embedding mode.
+Set the reranker, server environment, and query arguments independently for
+each side. The report's config line names every `--server-env` variable and
+prints `<redacted>` for the value of any variable
 with a `KEY`, `APIKEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
 `CREDENTIALS` or `HEADERS` word
 (`OPENAI_API_KEY`, `AI_MEMORY_LLM_HEADERS`), so a provider key passed for
@@ -593,6 +595,16 @@ The spawned servers do not inherit `AI_MEMORY_*` settings from the evaluator's
 environment. Pass intended server settings through `--server-env` or
 `--candidate-server-env` so the report records them. System settings such as
 `PATH`, home directories and certificate configuration remain inherited.
+
+To investigate local-embedding run variance, pass `--query-arg explain=true`
+for the baseline and `--candidate-query-arg explain=true` for the candidate
+in an A/B run. When the server returns `streams_active`, each question's JSON
+record contains `vector_stream_active` and the Markdown report counts active,
+inactive, and unreported queries. The vector stream can be active with zero
+hits. Capacity limits, provider errors, and FTS-only query modes can all leave
+it inactive. Missing diagnostics from an older server are unreported. Keep the
+explain setting the same when comparing latency because the explanation adds
+work to the query.
 
 ```bash
 # Determinism check — baseline == candidate ⇒ accuracy/context delta = 0:

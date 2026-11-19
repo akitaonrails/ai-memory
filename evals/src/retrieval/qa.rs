@@ -706,6 +706,7 @@ mod tests {
             latency: std::time::Duration::ZERO,
             context_tokens: 0,
             raw_hits: 0,
+            vector_stream_active: None,
         };
         let qa = engine
             .evaluate("What is the user's dog's name?", "Rex", &outcome)
