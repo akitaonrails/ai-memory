@@ -17,6 +17,11 @@ version in [`docs/changelog/`](docs/changelog/):
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
 
+### Fixed
+
+- Avoided scanning every pending wiki path for the next debounce deadline on
+  each filesystem notification, reducing watcher work during bulk edits. (#2354)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed
