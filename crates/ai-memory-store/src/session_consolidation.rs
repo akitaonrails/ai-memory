@@ -20,6 +20,9 @@ pub const TRANSPORT_RECOVERY_MAX_ATTEMPTS: u32 = 12;
 pub const TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR: &str =
     "consolidation failed: class=http status=none";
 
+const FALLBACK_TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR: &str =
+    "consolidation failed: class=fallback-transport-unreachable status=none";
+
 /// One atomically claimed session-consolidation job.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionConsolidationJob {
@@ -324,7 +327,11 @@ pub fn fail(
 ) -> StoreResult<()> {
     let now = Timestamp::now().as_microsecond();
     let error = truncate_error(error);
-    let max_attempts = if error == TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR {
+    let max_attempts = if matches!(
+        error.as_str(),
+        TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR
+            | FALLBACK_TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR
+    ) {
         TRANSPORT_RECOVERY_MAX_ATTEMPTS
     } else {
         SESSION_CONSOLIDATION_MAX_ATTEMPTS
@@ -422,7 +429,8 @@ pub fn reconcile_session_consolidation_completed(
 /// jobs once a real provider call succeeds.
 ///
 /// Resets `state = 'pending'` and `next_attempt_at = now` for up to `limit`
-/// jobs whose `last_error` is [`TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR`],
+/// jobs whose `last_error` records a direct provider or fallback chain
+/// transport outage,
 /// whose `attempts < TRANSPORT_RECOVERY_MAX_ATTEMPTS`, and that are either
 /// `failed` (e.g. from an earlier attempt cap) or `pending` in slow outage
 /// backoff (`next_attempt_at > now`). Jobs superseded by a newer generation,
@@ -441,20 +449,21 @@ pub fn requeue_transport_failed(
         let mut stmt = tx.prepare(
             "SELECT job.session_id, job.generation \
              FROM session_consolidation_jobs job \
-             WHERE job.last_error = ?1 \
-               AND job.attempts < ?2 \
-               AND (job.state = 'failed' OR (job.state = 'pending' AND job.next_attempt_at > ?3)) \
+             WHERE job.last_error IN (?1, ?2) \
+               AND job.attempts < ?3 \
+               AND (job.state = 'failed' OR (job.state = 'pending' AND job.next_attempt_at > ?4)) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM session_consolidation_jobs newer \
                    WHERE newer.session_id = job.session_id \
                      AND newer.generation > job.generation \
                ) \
              ORDER BY job.requested_at ASC, job.generation ASC \
-             LIMIT ?4",
+             LIMIT ?5",
         )?;
         stmt.query_map(
             params![
                 TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                FALLBACK_TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
                 i64::from(TRANSPORT_RECOVERY_MAX_ATTEMPTS),
                 now,
                 i64::try_from(limit).unwrap_or(i64::MAX),
@@ -474,14 +483,15 @@ pub fn requeue_transport_failed(
                  completed_at = NULL, \
                  claim_id = NULL \
              WHERE session_id = ?2 AND generation = ?3 \
-               AND last_error = ?4 \
-               AND attempts < ?5 \
+               AND last_error IN (?4, ?5) \
+               AND attempts < ?6 \
                AND (state = 'failed' OR (state = 'pending' AND next_attempt_at > ?1))",
             params![
                 now,
                 session_id,
                 generation,
                 TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                FALLBACK_TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
                 i64::from(TRANSPORT_RECOVERY_MAX_ATTEMPTS),
             ],
         )?;
@@ -1142,6 +1152,15 @@ mod tests {
 
     #[tokio::test]
     async fn transport_unreachable_failure_retries_past_standard_cap_up_to_recovery_cap() {
+        check_transport_retry_budget(TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR).await;
+    }
+
+    #[tokio::test]
+    async fn fallback_transport_unreachable_failure_uses_the_same_retry_budget() {
+        check_transport_retry_budget(FALLBACK_TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR).await;
+    }
+
+    async fn check_transport_retry_budget(error: &str) {
         let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
         store
             .writer
@@ -1160,11 +1179,7 @@ mod tests {
             assert_eq!(job.attempts(), expected_attempt);
             store
                 .writer
-                .fail_session_consolidation(
-                    job,
-                    TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR.into(),
-                    Some(now),
-                )
+                .fail_session_consolidation(job, error.into(), Some(now))
                 .await
                 .unwrap();
             let (state, attempts, _) = job_state_and_attempts(&store, session_id);
@@ -1181,11 +1196,7 @@ mod tests {
         assert_eq!(final_claim.attempts(), TRANSPORT_RECOVERY_MAX_ATTEMPTS);
         store
             .writer
-            .fail_session_consolidation(
-                final_claim,
-                TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR.into(),
-                Some(now),
-            )
+            .fail_session_consolidation(final_claim, error.into(), Some(now))
             .await
             .unwrap();
 
@@ -1336,7 +1347,7 @@ mod tests {
                  WHERE session_id = ?3",
                 params![
                     future,
-                    TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                    FALLBACK_TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
                     slow_pending.as_bytes(),
                 ],
             )
