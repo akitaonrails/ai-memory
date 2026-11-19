@@ -2919,7 +2919,7 @@ fn windows_native_hook_command_with_exe(
     let mut cmd = format!(
         "{}{}{} hook --event {event} --agent {agent} --server-url {}",
         powershell_call_operator(context.agent),
-        quote_field(&exe),
+        quote.path(&exe),
         native_data_dir_arg(context.data_dir, quote),
         quote_field(server_url),
         agent = context.agent,
@@ -3022,6 +3022,53 @@ impl NativeQuote {
             Self::PowerShell => powershell_quote(s),
         }
     }
+
+    /// [`Self::field`] for a filesystem path. The bare form cannot keep a
+    /// spaced path in one argv entry (#2353), so an existing one is written
+    /// by its 8.3 short name; without one it falls back to the caret escape.
+    fn path(self, s: &str) -> String {
+        match self {
+            Self::WindowsBare => {
+                self.field(&windows_short_path(s).unwrap_or_else(|| s.to_string()))
+            }
+            _ => self.field(s),
+        }
+    }
+}
+
+/// The 8.3 short form of an existing Windows `path` that contains a space,
+/// asked of `cmd` (`%~sI`) since the workspace forbids the `unsafe` a direct
+/// `GetShortPathNameW` call needs. `None` when there is no space, the path
+/// does not exist, 8.3 names are off on its volume, or the answer does not
+/// name the same file.
+#[cfg(windows)]
+fn windows_short_path(path: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // Reject cmd metacharacters/wildcards/newlines and skip spawning cmd.exe for missing paths.
+    if !path.contains(' ')
+        || path.contains(['%', '"', '\r', '\n', '\0', '*', '?'])
+        || !std::path::Path::new(path).exists()
+    {
+        return None;
+    }
+    let output = std::process::Command::new("cmd.exe")
+        .raw_arg(format!(r#"/d /s /c "for %I in ("{path}") do @echo %~sI""#))
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    // Non-ASCII output would arrive in the console code page; leave it alone.
+    let short = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if !output.status.success() || !short.is_ascii() || short.contains(' ') {
+        return None;
+    }
+    let same = std::fs::canonicalize(&short).ok()? == std::fs::canonicalize(path).ok()?;
+    same.then_some(short)
+}
+
+#[cfg(not(windows))]
+fn windows_short_path(_path: &str) -> Option<String> {
+    None
 }
 
 /// Whether an agent's Windows hook executor needs the command rendered
@@ -3040,7 +3087,7 @@ fn native_data_dir_arg(data_dir: Option<&Path>, quote: NativeQuote) -> String {
     // Render safe verbatim Windows data-dir forms as plain paths (#116).
     let lossy = data_dir.to_string_lossy();
     let path = strip_windows_verbatim_prefix(&lossy);
-    format!(" --data-dir {}", quote.field(&path))
+    format!(" --data-dir {}", quote.path(&path))
 }
 
 /// Append ` --project-strategy <value>` to a native hook command when an
@@ -5644,6 +5691,46 @@ if (inheritOnly) {
             !quoted_field.contains('"'),
             "a quote in a field must not be written back: {quoted_field}"
         );
+    }
+
+    /// #2353: cmd drops the carets and hands the child an unquoted command
+    /// line, so `First^ Last\…\ai-memory.exe` reaches it as two argv entries
+    /// and clap reads the second as a subcommand. An existing path is
+    /// rendered by its 8.3 short name instead, which has no space to split.
+    #[cfg(windows)]
+    #[test]
+    fn antigravity_renders_existing_spaced_paths_by_their_short_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let spaced = temp.path().join("First Last");
+        let data_dir = spaced.join("AppData Local");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let exe = spaced.join("ai-memory.exe");
+        std::fs::write(&exe, b"").unwrap();
+
+        let cmd = windows_native_hook_command_with_exe(
+            &exe,
+            Path::new("pre-tool-use.sh"),
+            "http://127.0.0.1:49374",
+            None,
+            HookCommandContext::new(
+                HookCommandPlatform::WindowsNative,
+                "antigravity-cli",
+                Some(&data_dir),
+                None,
+            ),
+        );
+        assert!(!cmd.contains('"'), "must not reopen #611: {cmd}");
+        assert!(!cmd.contains('^'), "no caret left to drop: {cmd}");
+        // Split the way the child's argv parser will, with nothing quoted.
+        let argv: Vec<&str> = cmd.split(' ').collect();
+        let same = |a: &str, b: &Path| {
+            std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
+                && std::fs::canonicalize(b).is_ok()
+        };
+        assert!(same(argv[0], &exe), "argv[0] must be the exe: {cmd}");
+        assert_eq!(argv[1], "--data-dir", "{cmd}");
+        assert!(same(argv[2], &data_dir), "--data-dir value: {cmd}");
+        assert_eq!(argv[3], "hook", "{cmd}");
     }
 
     #[test]
