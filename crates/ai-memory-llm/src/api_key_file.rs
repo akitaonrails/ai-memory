@@ -53,14 +53,32 @@ impl ApiKeyFile {
     }
 }
 
+/// Upper bound on an API key file so a misconfigured path cannot allocate unbounded memory.
+const MAX_KEY_FILE_BYTES: u64 = 16 * 1024;
+
 /// Read and trim the key. Errors name the file, never its contents.
 fn read_key(path: &Path) -> LlmResult<SecretString> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| LlmError::Auth(format!("read API key file {}: {e}", path.display())))?;
+    if meta.len() > MAX_KEY_FILE_BYTES {
+        return Err(LlmError::Auth(format!(
+            "API key file {} exceeds {} bytes",
+            path.display(),
+            MAX_KEY_FILE_BYTES
+        )));
+    }
     let raw = std::fs::read_to_string(path)
         .map_err(|e| LlmError::Auth(format!("read API key file {}: {e}", path.display())))?;
     let key = raw.trim();
     if key.is_empty() {
         return Err(LlmError::Auth(format!(
             "API key file {} is empty",
+            path.display()
+        )));
+    }
+    if key.contains(['\r', '\n']) {
+        return Err(LlmError::Auth(format!(
+            "API key file {} must contain a single-line key",
             path.display()
         )));
     }
