@@ -117,6 +117,14 @@ version in [`docs/changelog/`](docs/changelog/):
   writes only the fingerprints that changed or are new, in the same
   transaction, and a pass with nothing changed writes nothing. (#2375)
 
+- Queued session-consolidation jobs that hit a transport-unreachable provider
+  failure (`class=http status=none`) during a network outage or laptop sleep now
+  continue on a slower outage backoff (30m -> 1h -> 2h -> 4h up to 12 total
+  attempts) instead of becoming permanently `failed` after 5 fast attempts, and
+  the worker passively requeues a bounded batch of transport-failed or
+  outage-backed-off jobs whenever a subsequent consolidation succeeds. Terminal
+  and non-transport failures keep the existing 5-attempt cap. (#2360)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
