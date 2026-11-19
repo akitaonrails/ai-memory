@@ -1093,6 +1093,58 @@ fn antigravity_prompt_ingest_key(
     format!("agy_{}", &digest[..60])
 }
 
+/// Stable identity for a native tool callback, before capture policy can
+/// replace its envelope. The receiver scopes the key by project and checks
+/// the canonical session's owner and agent before applying deduplication.
+fn native_tool_ingest_key(
+    agent: AgentKind,
+    event: HookEvent,
+    raw: &serde_json::Value,
+) -> Option<String> {
+    let source_event = raw.get("hook_event_name")?.as_str()?;
+    match (agent, event, source_event) {
+        (AgentKind::Codex | AgentKind::ClaudeCode, HookEvent::PreToolUse, "PreToolUse")
+        | (AgentKind::Codex | AgentKind::ClaudeCode, HookEvent::PostToolUse, "PostToolUse")
+        | (AgentKind::ClaudeCode, HookEvent::PostToolUse, "PostToolUseFailure") => {}
+        _ => return None,
+    }
+    let identity = |key| {
+        raw.get(key)?
+            .as_str()
+            .filter(|id| ai_memory_hooks::capture_policy::valid_call_id(id))
+    };
+    let call_id = identity("tool_use_id")?;
+    let session = raw.get("session_id")?.as_str()?;
+    if session.trim().is_empty() {
+        return None;
+    }
+    let session = SessionId::from_native(session);
+    let turn_id = if agent == AgentKind::Codex {
+        identity("turn_id")?
+    } else {
+        ""
+    };
+    let agent_id = match raw.get("agent_id") {
+        None | Some(serde_json::Value::Null) => "",
+        Some(_) => identity("agent_id")?,
+    };
+
+    let mut hasher = Sha256::new();
+    for part in [
+        b"native-tool-callback-v1".as_slice(),
+        agent.as_str().as_bytes(),
+        session.as_bytes(),
+        source_event.as_bytes(),
+        turn_id.as_bytes(),
+        agent_id.as_bytes(),
+        call_id.as_bytes(),
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Recovered Antigravity prompts ready to spool, and the cursor to store
 /// once they are.
 struct AntigravityPromptEvents {
@@ -2031,6 +2083,7 @@ where
     }
     // Read before a metadata-only rewrite drops the payload's own fields.
     let subagent_payload = payload_is_subagent(&json);
+    let native_tool_key = native_tool_ingest_key(agent_kind, hook_event, &json);
     if let Some(decision) = decision {
         match decision.protocol().disposition() {
             CaptureDisposition::Drop => {
@@ -2262,7 +2315,8 @@ where
             spool_prompts(prompts);
         }
         if !antigravity_turn_only {
-            let ingest_key = uuid::Uuid::new_v4().simple().to_string();
+            let ingest_key =
+                native_tool_key.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
             let event_url = format!(
                 "{base}/hook?event={}&agent={}{}{}&ingest_key={ingest_key}",
                 args.event, args.agent, hook_qs, capture_qs
@@ -7057,6 +7111,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_native_tool_callbacks_spool_the_same_ingest_key() {
+        for agent in ["codex", "claude-code"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            let raw = serde_json::json!({
+                "session_id": "a56fec84-ca7c-40c3-9295-100f919fea15",
+                "cwd": tmp.path(),
+                "turn_id": "turn-1",
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "pwd"},
+                "tool_use_id": "call-1",
+            });
+            for _ in 0..2 {
+                let mut args = devin_hook_args("post-tool-use");
+                args.agent = agent.into();
+                run_with_payload(
+                    Some(data_dir.clone()),
+                    args,
+                    raw.to_string(),
+                    &mut Vec::new(),
+                    |_, _| panic!("tool callbacks below the threshold must only spool"),
+                )
+                .await
+                .unwrap();
+            }
+            let entries = read_spooled_entries(&hook_spool::spool_dir(&data_dir));
+            assert_eq!(entries.len(), 2);
+            let key = |index: usize| query_param(&entries[index].url, "ingest_key").unwrap();
+            assert_eq!(key(0), key(1), "replayed {agent} callback");
+        }
+    }
+
+    #[test]
+    fn native_tool_ingest_keys_keep_distinct_callback_coordinates() {
+        let callback = serde_json::json!({
+            "session_id": "a56fec84-ca7c-40c3-9295-100f919fea15",
+            "hook_event_name": "PostToolUse",
+            "turn_id": "turn-1",
+            "tool_use_id": "call-1",
+        });
+        let codex_post =
+            native_tool_ingest_key(AgentKind::Codex, HookEvent::PostToolUse, &callback).unwrap();
+        assert_eq!(codex_post.len(), 64);
+        assert!(codex_post.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        for (field, value) in [
+            ("tool_use_id", "call-2"),
+            ("turn_id", "turn-2"),
+            ("session_id", "131e9784-ea4d-4217-becb-677742eefc75"),
+            ("agent_id", "agent-1"),
+        ] {
+            let mut other = callback.clone();
+            other[field] = serde_json::json!(value);
+            assert_ne!(
+                native_tool_ingest_key(AgentKind::Codex, HookEvent::PostToolUse, &other).unwrap(),
+                codex_post,
+                "changed {field}",
+            );
+        }
+        let claude_post =
+            native_tool_ingest_key(AgentKind::ClaudeCode, HookEvent::PostToolUse, &callback)
+                .unwrap();
+        assert_ne!(claude_post, codex_post);
+        let mut failure = callback.clone();
+        failure["hook_event_name"] = serde_json::json!("PostToolUseFailure");
+        let claude_failure =
+            native_tool_ingest_key(AgentKind::ClaudeCode, HookEvent::PostToolUse, &failure)
+                .unwrap();
+        assert_ne!(claude_failure, claude_post);
+
+        let mut pre = callback;
+        pre["hook_event_name"] = serde_json::json!("PreToolUse");
+        let codex_pre =
+            native_tool_ingest_key(AgentKind::Codex, HookEvent::PreToolUse, &pre).unwrap();
+        assert_ne!(codex_pre, codex_post);
+    }
+
+    #[test]
+    fn native_tool_ingest_key_requires_the_native_callback_identity() {
+        let complete = serde_json::json!({
+            "session_id": "a56fec84-ca7c-40c3-9295-100f919fea15",
+            "hook_event_name": "PostToolUse",
+            "turn_id": "turn-1",
+            "tool_use_id": "call-1",
+        });
+        for name in ["session_id", "hook_event_name", "turn_id", "tool_use_id"] {
+            let mut partial = complete.clone();
+            partial.as_object_mut().unwrap().remove(name);
+            assert!(
+                native_tool_ingest_key(AgentKind::Codex, HookEvent::PostToolUse, &partial)
+                    .is_none(),
+                "absent {name}",
+            );
+        }
+        assert!(
+            native_tool_ingest_key(AgentKind::ClaudeDesktop, HookEvent::PostToolUse, &complete)
+                .is_none()
+        );
+        assert!(native_tool_ingest_key(AgentKind::Codex, HookEvent::Stop, &complete).is_none());
     }
 
     #[tokio::test]

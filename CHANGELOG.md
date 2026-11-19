@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Deduplicated repeated native Codex and Claude Code tool callbacks with a
+  stable call identity while preserving separate calls and callback phases.
+  Callbacks without sufficient identity retain at-least-once delivery.
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed
