@@ -3045,8 +3045,11 @@ impl NativeQuote {
 fn windows_short_path(path: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // `%` would be expanded by cmd and `"` would end the quoted operand.
-    if !path.contains(' ') || path.contains(['%', '"']) {
+    // Reject cmd metacharacters/wildcards/newlines and skip spawning cmd.exe for missing paths.
+    if !path.contains(' ')
+        || path.contains(['%', '"', '\r', '\n', '\0', '*', '?'])
+        || !std::path::Path::new(path).exists()
+    {
         return None;
     }
     let output = std::process::Command::new("cmd.exe")
