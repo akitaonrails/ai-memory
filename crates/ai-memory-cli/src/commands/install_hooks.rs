@@ -167,6 +167,21 @@ pub(crate) fn document_carries_ai_memory_hooks(document: &serde_json::Value) -> 
     ai_memory_claude_hooks(document).is_some()
 }
 
+/// The endpoint a generated integration (OpenCode, OpenCode 2, Omp, Pi,
+/// OpenClaw) baked as `const SERVER = "<url>".replace(...)`, so a refresh with
+/// no configured `server_url` keeps it instead of falling back to the loopback
+/// default (#2374). `None` when the file has no such line.
+pub(crate) fn baked_generated_server_url(content: &str) -> Option<String> {
+    let literal = content
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("const SERVER = "))?
+        .split_once(".replace(")?
+        .0;
+    serde_json::from_str::<String>(literal)
+        .ok()
+        .filter(|url| !url.is_empty())
+}
+
 /// Only a single endpoint shared by every owned native handler can be
 /// re-rendered without changing where a hook sends observations.
 pub(crate) fn installed_claude_hook_url(

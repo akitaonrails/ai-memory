@@ -1032,6 +1032,13 @@ fn refresh_generated_integrations(config: &Config) {
 /// before rather than guessed into another dialect.
 fn refresh_generated_integration(config: &Config, agent: AgentChoice, path: &Path) -> Result<()> {
     let mut args = apply_hooks_args(agent);
+    // With no configured `server_url`, keep the endpoint the file already
+    // names, as Claude Code's hooks do, rather than the loopback default (#2374).
+    if !config.server_url_configured() {
+        args.server_url = fs::read_to_string(path)
+            .ok()
+            .and_then(|content| install_hooks::baked_generated_server_url(&content));
+    }
     if agent == AgentChoice::Openclaw {
         args.config_file = path.parent().map(Path::to_path_buf);
         return install_hooks::run(config, args);
@@ -1446,6 +1453,59 @@ mod tests {
                 assert!(plugin.contains("export default AiMemoryHooks;"));
             }
         }
+    }
+
+    /// #2374: a generated integration installed with an explicit remote
+    /// `--server-url` kept it until an upgrade refreshed it with no
+    /// `server_url` configured, which baked the loopback default instead.
+    /// The endpoint already in the file is kept, as Claude Code's hooks are.
+    #[test]
+    fn a_generated_integration_refresh_keeps_its_baked_remote_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension = temp.path().join("pi").join("ai-memory-pi.ts");
+        let install = Config {
+            data_dir: temp.path().join("data"),
+            server_url: "https://memory.example.invalid/team".into(),
+            server_url_explicit: true,
+            ..Config::default()
+        };
+        let mut args = apply_hooks_args(AgentChoice::Pi);
+        args.config_file = Some(extension.clone());
+        install_hooks::run(&install, args).unwrap();
+        let installed = fs::read_to_string(&extension).unwrap();
+        assert!(
+            installed.contains("https://memory.example.invalid/team"),
+            "{installed}"
+        );
+
+        let upgrade = Config {
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        };
+        assert!(!upgrade.server_url_configured());
+        refresh_generated_integration(&upgrade, AgentChoice::Pi, &extension).unwrap();
+
+        let refreshed = fs::read_to_string(&extension).unwrap();
+        assert!(
+            refreshed.contains("https://memory.example.invalid/team"),
+            "{refreshed}"
+        );
+        assert!(!refreshed.contains("127.0.0.1:49374"), "{refreshed}");
+
+        // The reader undoes exactly the escaping the renderers apply.
+        let url = r#"https://h.invalid/a"b\c"#;
+        let line = format!(
+            "  const SERVER = {}.replace(/\\/+$/, \"\");",
+            crate::commands::render_shared::ts_string_literal(url)
+        );
+        assert_eq!(
+            install_hooks::baked_generated_server_url(&line).as_deref(),
+            Some(url)
+        );
+        assert_eq!(
+            install_hooks::baked_generated_server_url("const OTHER = 1;"),
+            None
+        );
     }
 
     #[test]
