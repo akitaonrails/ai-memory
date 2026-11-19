@@ -212,11 +212,14 @@ pub fn claim_next(
     stale_before: i64,
 ) -> StoreResult<Option<SessionConsolidationJob>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Failure at the cap is terminal and records an error. A pending job at
+    // the cap without an error is a released final attempt and can resume.
     let row = tx
         .query_row(
             "SELECT session_id, workspace_id, project_id, generation, attempts, state \
              FROM session_consolidation_jobs \
-             WHERE (state = 'pending' AND attempts < ?1 AND next_attempt_at <= ?2) \
+             WHERE (state = 'pending' AND next_attempt_at <= ?2 \
+                    AND (attempts < ?1 OR (attempts = ?1 AND last_error IS NULL))) \
                 OR (state = 'running' AND attempts <= ?1 AND started_at <= ?3) \
              ORDER BY requested_at ASC, generation ASC \
              LIMIT 1",
@@ -251,21 +254,21 @@ pub fn claim_next(
     let attempts = u32::try_from(attempts).map_err(|_| {
         StoreError::MalformedRecord("invalid session consolidation attempt count".into())
     })?;
-    let claimed_attempts = match state.as_str() {
-        "pending" => attempts.saturating_add(1),
-        "running" => attempts,
+    let attempt_spent = match state.as_str() {
+        "pending" => attempts < TRANSPORT_RECOVERY_MAX_ATTEMPTS,
+        "running" => false,
         other => {
             return Err(StoreError::MalformedRecord(format!(
                 "invalid claimable session consolidation state: {other}"
             )));
         }
     };
-    let attempt_spent = state == "pending";
+    let claimed_attempts = attempts.saturating_add(u32::from(attempt_spent));
     let claim_id = Uuid::new_v4();
     let changed = tx.execute(
         "UPDATE session_consolidation_jobs \
          SET state = 'running', started_at = ?1, completed_at = NULL, \
-             attempts = CASE WHEN state = 'pending' THEN attempts + 1 ELSE attempts END, \
+             attempts = ?7, \
              claim_id = ?2, last_error = NULL \
          WHERE session_id = ?3 AND generation = ?4 \
            AND attempts = ?5 \
@@ -278,6 +281,7 @@ pub fn claim_next(
             i64::try_from(generation).unwrap_or(i64::MAX),
             i64::from(attempts),
             stale_before,
+            i64::from(claimed_attempts),
         ],
     )?;
     if changed != 1 {
@@ -1200,6 +1204,109 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a transport-failed job at the hard cap must not be re-claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaimed_final_attempt_can_resume_after_graceful_release() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+        let cap = TRANSPORT_RECOVERY_MAX_ATTEMPTS;
+        for expected_attempt in 1..cap {
+            let job = store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.attempts(), expected_attempt);
+            store
+                .writer
+                .fail_session_consolidation(
+                    job,
+                    TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR.into(),
+                    Some(now),
+                )
+                .await
+                .unwrap();
+        }
+
+        let final_claim = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_claim.attempts(), cap);
+        let recovered = store
+            .writer
+            .claim_session_consolidation(now + 1, now)
+            .await
+            .unwrap()
+            .expect("an expired final lease can be recovered");
+        assert_eq!(recovered.attempts(), cap);
+        store
+            .writer
+            .release_session_consolidation(recovered)
+            .await
+            .unwrap();
+
+        let (state, attempts, due) = job_state_and_attempts(&store, session_id);
+        assert_eq!((state.as_str(), attempts), ("pending", cap));
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(due - 1, due - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a released continuation still respects its due time"
+        );
+        let continuation = store
+            .writer
+            .claim_session_consolidation(due, due - 1)
+            .await
+            .unwrap()
+            .expect("graceful release must leave the interrupted final attempt claimable");
+        assert_eq!(continuation.attempts(), cap);
+
+        store
+            .writer
+            .release_session_consolidation(continuation)
+            .await
+            .unwrap();
+        let (state, attempts, due) = job_state_and_attempts(&store, session_id);
+        assert_eq!((state.as_str(), attempts), ("pending", cap));
+        let resumed = store
+            .writer
+            .claim_session_consolidation(due, due - 1)
+            .await
+            .unwrap()
+            .expect("another shutdown must leave the same attempt claimable");
+        assert_eq!(resumed.attempts(), cap);
+        store
+            .writer
+            .fail_session_consolidation(
+                resumed,
+                TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR.into(),
+                Some(due),
+            )
+            .await
+            .unwrap();
+        let (state, attempts, _) = job_state_and_attempts(&store, session_id);
+        assert_eq!((state.as_str(), attempts), ("failed", cap));
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(due + 1, due)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
