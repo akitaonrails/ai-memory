@@ -18,6 +18,10 @@ version in [`docs/changelog/`](docs/changelog/):
   It sends one bounded Choice request per eligible query, retains local order on failure, and records validated usage even when an answer is refused.
   Choice probabilities are relative to the candidate pool; leave `min_relevance` unset with this backend. (#2296)
 
+## [3.5.0] - 2026-11-18
+
+### Added
+
 - `memory_message_list` accepts an optional `after_id` cursor and pages the
   pending queue by `(created_at, id)`. An inbox can hold 256 pending messages
   while one list call returns at most 200, so the tail could not be seen without
@@ -5927,7 +5931,8 @@ version in [`docs/changelog/`](docs/changelog/):
   session-timeline owner rule. Another operator's observations still rank
   shared session pages.
 
-[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.4.7...HEAD
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v3.5.0...HEAD
+[3.5.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.5.0
 [3.4.7]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.7
 [3.4.6]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.6
 [3.4.5]: https://github.com/akitaonrails/ai-memory/releases/tag/v3.4.5
