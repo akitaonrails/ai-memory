@@ -564,7 +564,9 @@ the source has an open session or an unexpired active managed-run lease. A
 same-path collision produces a new version whose body is the target body, a
 `<!-- ai-memory:merged-from workspace/source -->` marker, and the source body.
 The target frontmatter wins; `expires_at`/`stale_after` survive only when both
-sides were expiring. The new page keeps the earlier creation time and receives
+sides were expiring. Its trust class (#2164) is the less trusted of the two
+sides', so text compiled from a tool result keeps that class in the combined
+page. The new page keeps the earlier creation time and receives
 `stale` feedback naming the source, so `memory_lint` continues to report it
 until a person or agent reconciles the combined prose. Every prior target and
 source version remains under the target path and is available to history and

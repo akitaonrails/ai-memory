@@ -539,7 +539,9 @@ a origem tiver uma sessão aberta ou um lease de execução gerenciada ativa nã
 colisão de mesmo caminho produz uma nova versão cujo corpo é o corpo de destino, um
 marcador `<!-- ai-memory:merged-from workspace/source -->` e o corpo de origem.
 O frontmatter de destino prevalece; `expires_at`/`stale_after` sobrevivem apenas quando ambos
-os lados estavam expirando. A nova página mantém o horário de criação anterior e recebe
+os lados estavam expirando. Sua classe de confiança (#2164) é a menos confiável dos dois lados,
+então um texto compilado de um resultado de ferramenta mantém essa classe na página combinada.
+A nova página mantém o horário de criação anterior e recebe
 feedback `stale` nomeando a origem, de modo que `memory_lint` continua relatando-a
 até que uma pessoa ou agente reconcilie a prosa combinada. Cada versão anterior de destino e
 origem permanece sob o caminho de destino e fica disponível para histórico e
