@@ -558,7 +558,10 @@ anexação em `end_of_page` a segue e novas seções vêm por último. Assim,
 lote adicione; o texto que deve vir depois de um novo título vai no `content` desse
 `add_section`. Um novo título recebe uma linha em branco antes e depois. Substituir uma
 seção também substitui as seções aninhadas nela, portanto, outra edição em uma
-delas é um destino sobreposto. Títulos duplicados, tokens de página ou seção
+delas é um destino sobreposto. `replace_section` recusa o título de nível 1
+com `title_section`, porque a seção do título é a página inteira; use
+`memory_write_page` para alterar o texto sob o título. Títulos duplicados,
+tokens de página ou seção
 desatualizados, destinos sobrepostos, falha na admissão ou um gravador simultâneo rejeitam
 o lote inteiro. O frontmatter existente é preservado; o corpo final ainda passa
 pelo sanitizador normal, admissão, atribuição, versionamento, índice e
