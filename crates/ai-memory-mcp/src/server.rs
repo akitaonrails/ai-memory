@@ -5907,6 +5907,12 @@ impl AiMemoryServer {
                 })
                 .into_iter()
                 .collect(),
+            // Operator-authored writes without a `session_id` set
+            // `operator_authored`; writes tied to a session derive their class
+            // from the session's observations recorded in `page_sources` (#2164).
+            trust_class: session_id
+                .is_none()
+                .then_some(ai_memory_core::TrustClass::OperatorAuthored),
         };
         let written = match precondition {
             None => wiki
@@ -6149,6 +6155,7 @@ impl AiMemoryServer {
                     author_id,
                     actor: actor.clone(),
                     evidence: Vec::new(),
+                    trust_class: Some(ai_memory_core::TrustClass::OperatorAuthored),
                 },
                 precondition,
             ));
@@ -6351,6 +6358,10 @@ impl AiMemoryServer {
                     author_id,
                     actor,
                     evidence: Vec::new(),
+                    // Citationless patch inherits the superseded version's
+                    // `trust_class` so a patch cannot launder `tool_result`
+                    // into `operator_authored` (#2164).
+                    trust_class: None,
                 },
                 ai_memory_store::PagePrecondition::Latest(expected),
             )
@@ -10473,6 +10484,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -10676,6 +10688,7 @@ mod tests {
                         rank: idx as f64,
                         superseded: false,
                         pinned: false,
+                        trust_class: ai_memory_core::TrustClass::ModelGenerated,
                     },
                     Some(ai_memory_store::SearchExplain::default()),
                 )
@@ -11836,6 +11849,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -11962,6 +11976,7 @@ mod tests {
                     body: body.into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -14171,6 +14186,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         };
         let target_id = store
             .writer
@@ -14974,6 +14990,7 @@ mod tests {
             expires_at: None,
             entities: vec!["postgres".into()],
             evidence: Vec::new(),
+            trust_class: None,
         };
         store.writer.upsert_page(v1.clone()).await.unwrap();
         let between = jiff::Timestamp::now().to_string();
@@ -15400,6 +15417,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -15484,6 +15502,7 @@ mod tests {
             expires_at: None,
             entities: vec!["nats jetstream".into()],
             evidence: Vec::new(),
+            trust_class: None,
         };
         store.writer.upsert_page(entity_only.clone()).await.unwrap();
         entity_only.path = PagePath::new("concepts/linked.md").unwrap();
@@ -15507,6 +15526,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -15606,6 +15626,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -15742,6 +15763,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -15769,6 +15791,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -15958,6 +15981,7 @@ mod tests {
                     body: "raw fallback contains quokka only detail".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -16049,6 +16073,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -16094,6 +16119,7 @@ mod tests {
                     body: "the api listens on quokka port 8088".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -16205,6 +16231,7 @@ mod tests {
                     expires_at: None,
                     entities: vec!["filterneedle".into()],
                     evidence: Vec::new(),
+                    trust_class: None,
                 })
                 .await
                 .unwrap();
@@ -16311,6 +16338,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -16378,6 +16406,7 @@ mod tests {
             expires_at: None,
             entities: vec!["filterhistory".into()],
             evidence: Vec::new(),
+            trust_class: None,
         };
         store
             .writer
@@ -16420,6 +16449,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -16535,6 +16565,7 @@ mod tests {
                             body: body.into(),
                             importance: 5,
                             file_path: None,
+                            trust_class: None,
                         },
                         &Sanitizer::builtin(),
                     ))
@@ -16558,6 +16589,7 @@ mod tests {
                         expires_at: None,
                         entities: Vec::new(),
                         evidence: Vec::new(),
+                        trust_class: None,
                     })
                     .await
                     .unwrap();
@@ -16686,6 +16718,7 @@ mod tests {
                     body: "raw fallback contains quokka only detail".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -16987,6 +17020,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -17080,6 +17114,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -17933,6 +17968,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -18050,6 +18086,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -18108,6 +18145,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -18166,6 +18204,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -18217,6 +18256,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -18275,6 +18315,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -18298,6 +18339,7 @@ mod tests {
                 expires_at: Some(jiff::Timestamp::from_second(a_minute_ago).unwrap()),
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -18537,6 +18579,7 @@ mod tests {
                         body: (*body).into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -18600,6 +18643,7 @@ mod tests {
                     body: "other scope".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -18802,6 +18846,7 @@ mod tests {
                         body: "router ipv6".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -19209,6 +19254,7 @@ mod tests {
                     body: "work".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -19630,6 +19676,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -19649,6 +19696,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -19668,6 +19716,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -19775,6 +19824,7 @@ mod tests {
                     expires_at: None,
                     entities: Vec::new(),
                     evidence: Vec::new(),
+                    trust_class: None,
                 })
                 .await
                 .unwrap();
@@ -19795,6 +19845,7 @@ mod tests {
                 expires_at: Some("2020-01-01T23:59:59Z".parse().unwrap()),
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -19932,6 +19983,7 @@ mod tests {
                     expires_at: None,
                     entities: Vec::new(),
                     evidence: Vec::new(),
+                    trust_class: None,
                 })
                 .await
                 .unwrap();
@@ -20335,6 +20387,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -20391,6 +20444,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -20650,6 +20704,7 @@ mod tests {
                     body: "end the session".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -20870,6 +20925,7 @@ mod tests {
                     expires_at: None,
                     entities: Vec::new(),
                     evidence: Vec::new(),
+                    trust_class: None,
                 })
                 .await
                 .unwrap();
@@ -24813,6 +24869,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         };
         let link_to_secret = ai_memory_core::LinkTarget {
             workspace: None,
@@ -24966,6 +25023,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -25185,6 +25243,7 @@ mod tests {
                     body: "the zircon day rate for this client is confidential".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -25207,6 +25266,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -26023,6 +26083,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -26131,6 +26192,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         };
         if !matches!(
             case,
@@ -27408,6 +27470,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -28291,6 +28354,7 @@ mod tests {
                     body: String::new(),
                     importance: 1,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -28709,6 +28773,7 @@ mod tests {
                     body: "durable lesson worth capturing".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -28898,6 +28963,7 @@ mod tests {
                     body: "durable lesson worth capturing".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))

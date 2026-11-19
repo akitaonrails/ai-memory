@@ -91,6 +91,20 @@ pub struct NewPage {
     /// or [`crate::PageAuthority`].
     #[serde(default)]
     pub evidence: Vec<PageEvidence>,
+    /// Explicit trust class for this write when known up front (#2164).
+    ///
+    /// When `page_sources` rows are recorded in the same upsert transaction,
+    /// the store derives `pages.trust_class` from the least-trusted source
+    /// observation. When no `page_sources` rows are recorded:
+    /// - `Some(class)` sets `pages.trust_class` directly (operator-authored
+    ///   `memory_write_page` without `session_id`, disk hand-edits, or
+    ///   zero-LLM rule-based `sessions/<id>.md` pages).
+    /// - `None` inherits the superseded version's `trust_class` (so
+    ///   `memory_patch_page` and automated rewrites cannot launder a
+    ///   `tool_result` page into `operator_authored`), falling back to
+    ///   [`crate::TrustClass::ModelGenerated`] on a brand-new page.
+    #[serde(default)]
+    pub trust_class: Option<crate::TrustClass>,
 }
 
 /// One piece of evidence supporting a page write (P2,
@@ -683,6 +697,8 @@ pub struct Page {
     pub updated_at: Timestamp,
     /// TTL instant, if the page carries a frontmatter `expires_at:`.
     pub expires_at: Option<Timestamp>,
+    /// Derived or assigned origin trust class (V113, #2164).
+    pub trust_class: crate::TrustClass,
 }
 
 impl Tier {

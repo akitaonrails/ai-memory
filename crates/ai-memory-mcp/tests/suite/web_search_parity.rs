@@ -112,6 +112,7 @@ fn write_req(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> WriteP
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 

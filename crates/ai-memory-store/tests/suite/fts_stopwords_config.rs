@@ -59,6 +59,7 @@ fn page(
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -304,6 +305,7 @@ async fn configured_stopword_list_removes_noise_from_observation_search() {
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &sanitizer,
         ))
@@ -325,6 +327,7 @@ async fn configured_stopword_list_removes_noise_from_observation_search() {
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &sanitizer,
         ))

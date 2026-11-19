@@ -85,6 +85,7 @@ pub(crate) async fn observe(
                 body: body.into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -107,6 +108,7 @@ pub(crate) fn page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> 
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 

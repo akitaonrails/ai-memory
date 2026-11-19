@@ -39,6 +39,7 @@ fn page(
         expires_at: None,
         entities: Vec::new(),
         evidence,
+        trust_class: None,
     }
 }
 

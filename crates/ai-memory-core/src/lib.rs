@@ -37,6 +37,7 @@ pub use scaffolding::{
 pub mod routing_snippet;
 pub mod sanitize;
 pub mod slots;
+pub mod trust;
 pub mod user;
 mod workstream;
 
@@ -107,6 +108,7 @@ pub use slots::{
     SLOT_PREFIX, SlotPlacement, SlotVisibility, is_slot_named, is_slot_path, slot_owner,
     slot_placement,
 };
+pub use trust::TrustClass;
 pub use user::{
     ApiCredential, EXTERNAL_API_KEY_PREFIX, MAX_EMAIL_LEN, MAX_HUMAN_PASSWORD_BYTES,
     MAX_USERNAME_LEN, MIN_HUMAN_PASSWORD_BYTES, NATIVE_API_KEY_PREFIX, NewUser,

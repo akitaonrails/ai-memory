@@ -13,6 +13,21 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Memory-poisoning origin trust class (`trust_class`, migration V113) and
+  `_rules/` emission gating: observations receive an immutable trust class at
+  hook ingress (`user-prompt` -> `operator_authored`, `post-tool-use` ->
+  `tool_result`, assistant/lifecycle -> `model_generated`), compiled pages
+  derive their least-trusted class from `page_sources` (and fold on
+  byte-identical accumulation), citationless rewrites such as
+  `memory_patch_page` inherit the superseded version's `trust_class` so a patch
+  cannot launder `tool_result` into `operator_authored`, zero-LLM rule-based
+  `sessions/<id>.md` pages derive their class from the session's observations
+  without synthetic `page_evidence` rows, consolidation and auto-improve refuse
+  `_rules/` emission when all supporting sources are `tool_result` (downgrading
+  consolidation output to `gotchas/` and rejecting auto-improve rule proposals;
+  operator corroboration in a `user-prompt` lifts the gate), and `memory_query`
+  surfaces `trust_class` on hits without changing RRF ranking. (#2164)
+
 - `memory_patch_page` accepts `scope: "global"`, like `memory_read_page` and
   `memory_write_page`, so a page read from the global scope can be patched with
   the `page_id` that read returned. Before, the patch looked in the current

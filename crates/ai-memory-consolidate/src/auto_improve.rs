@@ -706,10 +706,16 @@ pub async fn run_auto_improve_review(
                     .map(|(projected, _stats)| projected)
                     .ok_or(StoreError::SessionCollision)?
             };
+            let tool_result_only = if totals.total == 0 {
+                false
+            } else {
+                snap.sources_are_tool_result_only(&projected.source_ids)?
+            };
             Ok(ReviewOutcome::Reviewed {
                 total: totals.total,
                 duration,
                 projected,
+                tool_result_only,
             })
         })
         .await?;
@@ -740,6 +746,7 @@ pub async fn run_auto_improve_review(
             total,
             duration,
             projected,
+            tool_result_only,
         } => {
             let mut prompt_input = build_prompt_input(
                 session_id,
@@ -816,6 +823,35 @@ pub async fn run_auto_improve_review(
                 complete_structured_with_operation_id(llm, request, operation_id).await?;
             let (mut proposals, mut rejected_candidates, mut warnings) =
                 validate_response(raw, &cfg, &existing_index);
+            // Step 3 (#2164): refuse `_rules/` proposals backed solely by
+            // `tool_result` observations (no `user-prompt` or `stop` backing).
+            if tool_result_only {
+                let mut kept = Vec::with_capacity(proposals.len());
+                for proposal in proposals {
+                    if proposal.kind == "rule" || proposal.path.starts_with("_rules/") {
+                        tracing::warn!(
+                            session = %session_id,
+                            target_path = %proposal.path,
+                            kind = %proposal.kind,
+                            "auto-improve: refused _rules/ proposal backed only by tool_result observations",
+                        );
+                        rejected_candidates.push(AutoImproveRejectedCandidate {
+                            reason: "tool_result_only_rule_refused".into(),
+                            evidence: format!(
+                                "refused _rules/ proposal for {} because all supporting session observations are tool_result",
+                                proposal.path
+                            ),
+                            target_path: Some(proposal.path),
+                            kind: Some(proposal.kind),
+                            operation: Some(proposal.operation.as_str().to_owned()),
+                            edit_mode: Some(proposal.edit_mode.as_str().to_owned()),
+                        });
+                    } else {
+                        kept.push(proposal);
+                    }
+                }
+                proposals = kept;
+            }
             rejected_candidates.extend(prompt_input.rejected_candidates);
             warnings.extend(prompt_input.warnings);
             let eval_results = apply_eval_gate(
@@ -869,6 +905,7 @@ enum ReviewOutcome {
         total: usize,
         duration: u64,
         projected: ProjectedObservations,
+        tool_result_only: bool,
     },
 }
 
@@ -3599,6 +3636,7 @@ mod tests {
             importance,
             created_at: Timestamp::from_microsecond(idx as i64 * 1_000_000)
                 .expect("test timestamp is valid"),
+            trust_class: ai_memory_core::TrustClass::from_observation_kind(kind),
         }
     }
 
@@ -3651,6 +3689,7 @@ mod tests {
                         body: "run the full gate before release".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -3732,6 +3771,7 @@ mod tests {
                         body: "run the full gate before release".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -3815,6 +3855,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         };
         store
             .writer
@@ -3862,6 +3903,7 @@ mod tests {
                         body: "run the full gate before release".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))

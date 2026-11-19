@@ -697,6 +697,7 @@ fn preserved_page(ws: WorkspaceId, project: ProjectId) -> NewPage {
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 

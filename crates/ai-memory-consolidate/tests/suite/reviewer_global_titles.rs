@@ -107,6 +107,7 @@ async fn write(fx: &Fixture, project: ProjectId, path: &str, title: &str) {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -143,6 +144,7 @@ async fn session(fx: &Fixture, project: ProjectId) -> SessionId {
                 body: "keep agent footers out of pull requests".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -317,6 +319,7 @@ async fn the_experience_pass_follows_the_same_option() {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

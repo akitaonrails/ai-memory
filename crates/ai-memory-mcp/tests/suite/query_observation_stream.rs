@@ -111,6 +111,7 @@ async fn seed_session(
                     .into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -137,6 +138,7 @@ async fn seed_session(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("session page");
@@ -158,6 +160,7 @@ async fn seed_session(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("distractor");

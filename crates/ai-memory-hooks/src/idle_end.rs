@@ -373,6 +373,7 @@ async fn summary_page_decision(
                 author_id: None,
                 actor,
                 evidence: Vec::new(),
+                trust_class: page.trust_class,
             },
             precondition,
         )

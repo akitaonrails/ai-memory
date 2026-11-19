@@ -322,6 +322,7 @@ mod tests {
             body: body.into(),
             importance: 5,
             created_at: Timestamp::now(),
+            trust_class: ai_memory_core::TrustClass::OperatorAuthored,
         }
     }
 

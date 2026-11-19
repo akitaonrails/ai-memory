@@ -97,6 +97,7 @@ fn observation(
         importance: 5,
         occurred_at: Some(at_us),
         file_path: None,
+        trust_class: None,
     }
 }
 
@@ -172,6 +173,7 @@ async fn session_page(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()
@@ -203,6 +205,7 @@ async fn session_page_body(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()

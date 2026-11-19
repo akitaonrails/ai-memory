@@ -107,6 +107,7 @@ async fn observe(
                 body: format!("body at {at}"),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -135,6 +136,7 @@ fn page(
         expires_at: None,
         entities: Vec::new(),
         evidence,
+        trust_class: None,
     }
 }
 

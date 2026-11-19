@@ -61,6 +61,7 @@ async fn quoted_phrases_keep_adjacency_in_pages_and_observations() {
                     expires_at: None,
                     entities: Vec::new(),
                     evidence: Vec::new(),
+                    trust_class: None,
                 })
                 .await
                 .unwrap();

@@ -59,6 +59,7 @@ async fn page(store: &Store, ws: WorkspaceId, project: ProjectId, body: &str) {
             expires_at: None,
             entities: vec![],
             evidence: vec![],
+            trust_class: None,
         })
         .await
         .unwrap();

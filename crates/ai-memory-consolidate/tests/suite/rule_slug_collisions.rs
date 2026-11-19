@@ -79,6 +79,7 @@ async fn fixture(tmp: &std::path::Path) -> (Store, Wiki, SessionId) {
                 body: "set the deploy convention".to_string(),
                 importance: 3,
                 file_path: None,
+                trust_class: None,
             },
             &sanitizer,
         ))
@@ -143,6 +144,7 @@ async fn colliding_rule_batch_keeps_both_pages() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -566,6 +568,7 @@ async fn restating_a_pre_digest_rule_keeps_its_legacy_path() {
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
