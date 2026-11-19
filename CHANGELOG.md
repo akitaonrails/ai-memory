@@ -22,8 +22,6 @@ version in [`docs/changelog/`](docs/changelog/):
   a global page. The TypeScript SDK exposes it as
   `pages.patch({ global: true })`. (#2362, #2363)
 
-### Added
-
 - `llm_api_key_file` (`AI_MEMORY_LLM_API_KEY_FILE`) reads the `openai-compat`
   API key from a file instead of `LLM_API_KEY`, for gateways whose bearer token
   rotates while the server runs. The key is read on first use and cached; after
@@ -32,8 +30,6 @@ version in [`docs/changelog/`](docs/changelog/):
   never writes the file. `[llm.<task>]` profiles that inherit the global key
   inherit the file too, and an ambient `LLM_API_KEY` is ignored by the chat
   provider when the file is set. (#2365)
-
-### Added
 
 - Added the native OpenAI Decisions Choice reranker, selected with `reranker = "decisions-choice"` or `AI_MEMORY_RERANKER=decisions-choice`.
   It requires `OPENAI_API_KEY` and an explicit `llm_model`, without a generative provider.
