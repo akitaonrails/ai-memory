@@ -28,6 +28,15 @@ version in [`docs/changelog/`](docs/changelog/):
   shutdown. The pending job stays claimable at the same attempt count after
   restart, and a provider failure on that attempt still ends it. (#2360)
 
+### Fixed
+
+- `docs/jev-reranker-adapter.md` no longer says the server never thresholds
+  reranker relevance. Since 3.5.0 a `min_relevance` floor and retrieval
+  history read the absolute value, and the choice adapter's relevance is a
+  choice probability, so a floor of 0.2 keeps only the winning hit. The guide
+  and the adapter's docstring now say to leave `min_relevance` unset with a
+  choice adapter. (#2388)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed
