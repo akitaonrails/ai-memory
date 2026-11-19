@@ -11,6 +11,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Antigravity hooks on Windows work again when the user profile path has a
+  space. The caret escape from #1767 let `cmd` find `ai-memory.exe`, but `cmd`
+  drops the carets and passes the command line unquoted, so the program saw
+  `C:\Users\First` and `Last\…\ai-memory.exe` as two arguments and every hook
+  failed with "unrecognized subcommand". The executable and `--data-dir` are
+  now written by their 8.3 short names, which have no space; on a volume with
+  8.3 names off, the caret form is kept. Run `ai-memory setup` again to
+  rewrite `~/.gemini/config/hooks.json`. (#2353)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
