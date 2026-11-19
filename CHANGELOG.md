@@ -37,6 +37,11 @@ version in [`docs/changelog/`](docs/changelog/):
   and the adapter's docstring now say to leave `min_relevance` unset with a
   choice adapter. (#2388)
 
+### Fixed
+
+- Kept queued session consolidation eligible for outage recovery when every
+  fallback candidate is unreachable at the HTTP transport layer. (#2384)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

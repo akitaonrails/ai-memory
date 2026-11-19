@@ -81,6 +81,7 @@ struct CandidateState {
     circuit_open_until: Option<Instant>,
     /// Why the circuit was last opened, for health reporting.
     circuit_reason: Option<FailoverClass>,
+    circuit_transport_unreachable: bool,
 }
 
 struct CandidateEntry {
@@ -155,14 +156,6 @@ impl FallbackLlmProvider {
         }
     }
 
-    fn circuit_open(&self, index: usize) -> bool {
-        let state = self.entries[index]
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        matches!(state.circuit_open_until, Some(until) if Instant::now() < until)
-    }
-
     fn record_success(&self, index: usize) {
         {
             let mut state = self.entries[index]
@@ -172,6 +165,7 @@ impl FallbackLlmProvider {
             state.last_success_at = Some(Timestamp::now());
             state.circuit_open_until = None;
             state.circuit_reason = None;
+            state.circuit_transport_unreachable = false;
         }
         let previous = self
             .last_selected
@@ -219,6 +213,7 @@ impl FallbackLlmProvider {
                 {
                     state.circuit_open_until = Some(deadline);
                     state.circuit_reason = Some(class);
+                    state.circuit_transport_unreachable = err.is_transport_unreachable();
                 }
             }
             cooldown.is_some() && !circuit_was_open
@@ -280,24 +275,35 @@ impl FallbackLlmProvider {
 
     /// Summary entry for a candidate skipped because its circuit is open, so
     /// an aggregate error with every circuit open still names the reason.
-    fn describe_skipped(&self, index: usize) -> String {
-        let candidate = &self.entries[index].candidate;
-        let reason = self.entries[index]
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    fn skipped_candidate(&self, index: usize) -> Option<(String, bool)> {
+        let entry = &self.entries[index];
+        let state = entry.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .circuit_open_until
+            .is_none_or(|until| Instant::now() >= until)
+        {
+            return None;
+        }
+
+        let candidate = &entry.candidate;
+        let reason = state
             .circuit_reason
             .map_or("transient", FailoverClass::as_str);
-        format!(
-            "{}/{}: skipped (circuit open: {reason})",
-            candidate.provider, candidate.model
-        )
+        Some((
+            format!(
+                "{}/{}: skipped (circuit open: {reason})",
+                candidate.provider, candidate.model
+            ),
+            state.circuit_transport_unreachable,
+        ))
     }
 
-    fn exhausted(&self, attempted: usize, summary: Vec<String>) -> LlmError {
-        LlmError::AllCandidatesFailed {
-            attempted,
-            summary: summary.join("; "),
+    fn exhausted(attempted: usize, summary: Vec<String>, transport_unreachable: bool) -> LlmError {
+        let summary = summary.join("; ");
+        if transport_unreachable {
+            LlmError::FallbackTransportUnreachable { attempted, summary }
+        } else {
+            LlmError::AllCandidatesFailed { attempted, summary }
         }
     }
 }
@@ -319,9 +325,11 @@ impl LlmProvider for FallbackLlmProvider {
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
         let mut attempted = 0usize;
         let mut summary = Vec::new();
+        let mut transport_unreachable = !self.entries.is_empty();
         for (i, entry) in self.entries.iter().enumerate() {
-            if self.circuit_open(i) {
-                summary.push(self.describe_skipped(i));
+            if let Some((description, skipped_for_transport)) = self.skipped_candidate(i) {
+                summary.push(description);
+                transport_unreachable &= skipped_for_transport;
                 continue;
             }
             attempted += 1;
@@ -332,6 +340,7 @@ impl LlmProvider for FallbackLlmProvider {
                 }
                 Err(err) => {
                     let fail_over = err.should_fail_over();
+                    transport_unreachable &= err.is_transport_unreachable();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
                     if !fail_over {
@@ -340,7 +349,7 @@ impl LlmProvider for FallbackLlmProvider {
                 }
             }
         }
-        Err(self.exhausted(attempted, summary))
+        Err(Self::exhausted(attempted, summary, transport_unreachable))
     }
 
     async fn complete_with_operation_id(
@@ -350,9 +359,11 @@ impl LlmProvider for FallbackLlmProvider {
     ) -> LlmResult<ChatResponse> {
         let mut attempted = 0usize;
         let mut summary = Vec::new();
+        let mut transport_unreachable = !self.entries.is_empty();
         for (i, entry) in self.entries.iter().enumerate() {
-            if self.circuit_open(i) {
-                summary.push(self.describe_skipped(i));
+            if let Some((description, skipped_for_transport)) = self.skipped_candidate(i) {
+                summary.push(description);
+                transport_unreachable &= skipped_for_transport;
                 continue;
             }
             attempted += 1;
@@ -368,6 +379,7 @@ impl LlmProvider for FallbackLlmProvider {
                 }
                 Err(err) => {
                     let fail_over = err.should_fail_over();
+                    transport_unreachable &= err.is_transport_unreachable();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
                     if !fail_over {
@@ -376,7 +388,7 @@ impl LlmProvider for FallbackLlmProvider {
                 }
             }
         }
-        Err(self.exhausted(attempted, summary))
+        Err(Self::exhausted(attempted, summary, transport_unreachable))
     }
 
     async fn complete_structured_raw(
@@ -386,9 +398,11 @@ impl LlmProvider for FallbackLlmProvider {
     ) -> LlmResult<serde_json::Value> {
         let mut attempted = 0usize;
         let mut summary = Vec::new();
+        let mut transport_unreachable = !self.entries.is_empty();
         for (i, entry) in self.entries.iter().enumerate() {
-            if self.circuit_open(i) {
-                summary.push(self.describe_skipped(i));
+            if let Some((description, skipped_for_transport)) = self.skipped_candidate(i) {
+                summary.push(description);
+                transport_unreachable &= skipped_for_transport;
                 continue;
             }
             attempted += 1;
@@ -404,6 +418,7 @@ impl LlmProvider for FallbackLlmProvider {
                 }
                 Err(err) => {
                     let fail_over = err.should_fail_over();
+                    transport_unreachable &= err.is_transport_unreachable();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
                     if !fail_over {
@@ -412,7 +427,7 @@ impl LlmProvider for FallbackLlmProvider {
                 }
             }
         }
-        Err(self.exhausted(attempted, summary))
+        Err(Self::exhausted(attempted, summary, transport_unreachable))
     }
 
     async fn complete_structured_raw_with_operation_id(
@@ -423,9 +438,11 @@ impl LlmProvider for FallbackLlmProvider {
     ) -> LlmResult<serde_json::Value> {
         let mut attempted = 0usize;
         let mut summary = Vec::new();
+        let mut transport_unreachable = !self.entries.is_empty();
         for (i, entry) in self.entries.iter().enumerate() {
-            if self.circuit_open(i) {
-                summary.push(self.describe_skipped(i));
+            if let Some((description, skipped_for_transport)) = self.skipped_candidate(i) {
+                summary.push(description);
+                transport_unreachable &= skipped_for_transport;
                 continue;
             }
             attempted += 1;
@@ -445,6 +462,7 @@ impl LlmProvider for FallbackLlmProvider {
                 }
                 Err(err) => {
                     let fail_over = err.should_fail_over();
+                    transport_unreachable &= err.is_transport_unreachable();
                     summary.push(self.describe_failure(i, &err));
                     self.record_error(i, &err);
                     if !fail_over {
@@ -453,7 +471,7 @@ impl LlmProvider for FallbackLlmProvider {
                 }
             }
         }
-        Err(self.exhausted(attempted, summary))
+        Err(Self::exhausted(attempted, summary, transport_unreachable))
     }
 
     fn candidate_health(&self) -> Vec<CandidateHealth> {
@@ -946,12 +964,12 @@ mod tests {
             let mut state = chain.entries[0].state.lock().unwrap();
             state.circuit_open_until = Some(Instant::now() + Duration::from_secs(600));
         }
-        assert!(chain.circuit_open(0));
+        assert!(chain.skipped_candidate(0).is_some());
 
         chain.record_success(0);
 
         assert!(
-            !chain.circuit_open(0),
+            chain.skipped_candidate(0).is_none(),
             "a success must close the circuit immediately, not wait out the cooldown"
         );
     }
@@ -967,7 +985,7 @@ mod tests {
             let mut state = chain.entries[0].state.lock().unwrap();
             state.circuit_open_until = Some(Instant::now() - Duration::from_secs(1));
         }
-        assert!(!chain.circuit_open(0));
+        assert!(chain.skipped_candidate(0).is_none());
     }
 
     #[tokio::test]

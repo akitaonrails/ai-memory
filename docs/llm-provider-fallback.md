@@ -174,6 +174,11 @@ or secrets. A candidate skipped because its circuit is open appears as
 `provider/model: skipped (circuit open: quota-exhausted)` (or `transient`), so
 the error says why a candidate was not attempted.
 
+When every candidate fails at the HTTP transport layer or remains in a circuit
+opened by that failure, the durable SessionEnd queue uses the same bounded
+outage backoff and passive recovery as for an unreachable direct provider.
+The chain still returns immediately to callers that do not use the durable queue.
+
 ## Credit and quota exhaustion
 
 When an account runs out of credit, the HTTP status alone looks like a
