@@ -214,7 +214,7 @@ or prompt routing for learning review.
 - **Store:** `rusqlite` (bundled SQLite, backup API), `refinery`
   migrations, FTS5, `parking_lot`.
 - **Wiki:** atomic markdown writes (tmp + rename + fsync),
-  `notify-debouncer-full` watcher, `git2` with vendored libgit2
+  event-driven `notify` watcher, `git2` with vendored libgit2
   checkpoints.
 - **LLM:** typed providers in `ai-memory-llm` behind `LlmProvider` /
   `Embedder` traits; `reqwest` (rustls) for provider HTTP.

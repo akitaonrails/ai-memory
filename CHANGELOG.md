@@ -66,6 +66,12 @@ version in [`docs/changelog/`](docs/changelog/):
   tool description and the durable-pages Skill now say that `content` is the
   section body without its heading. (#2378)
 
+- Replaced the `notify-debouncer-full` polling thread in the wiki filesystem
+  watcher with an event-driven debouncer built directly on `notify` and
+  `tokio::time`. Idle servers no longer wake a background thread every 75ms,
+  and `EventKind::Access(_)` and `.git/`-only events are dropped at the raw
+  watcher callback before entering the async channel. (#2354)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added

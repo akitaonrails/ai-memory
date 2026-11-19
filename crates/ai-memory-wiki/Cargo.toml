@@ -28,7 +28,6 @@ fs2.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 notify.workspace = true
-notify-debouncer-full.workspace = true
 git2.workspace = true
 async-trait.workspace = true
 # Admission webhook chain (sync HTTP calls before page persistence).
