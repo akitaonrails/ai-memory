@@ -99,6 +99,15 @@ version in [`docs/changelog/`](docs/changelog/):
   Code's hooks. A configured `server_url` or `AI_MEMORY_SERVER_URL` still
   wins. (#2374)
 
+### Fixed
+
+- The wiki watcher's reconcile pass no longer rewrites the whole persisted
+  fingerprint table when one file changed. Every pass that reindexed a page
+  deleted all rows and inserted them again on the single writer, thousands of
+  writes on a large wiki; it now deletes only the files that are gone and
+  writes only the fingerprints that changed or are new, in the same
+  transaction, and a pass with nothing changed writes nothing. (#2375)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added

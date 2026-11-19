@@ -1307,12 +1307,26 @@ impl Wiki {
         Ok(reader.load_wiki_file_fingerprints().await?)
     }
 
-    /// Persist the current watcher file fingerprints to the store.
+    /// Persist the current watcher file fingerprints to the store via full
+    /// replacement (used as recovery fallback when startup seeding fails).
     pub(crate) async fn replace_file_fingerprints(
         &self,
         rows: Vec<ai_memory_store::WikiFileFingerprintRow>,
     ) -> WikiResult<()> {
         self.writer.replace_wiki_file_fingerprints(rows).await?;
+        Ok(())
+    }
+
+    /// Apply incremental upserts and deletes to persisted watcher file
+    /// fingerprints in the store.
+    pub(crate) async fn apply_file_fingerprint_delta(
+        &self,
+        upserts: Vec<ai_memory_store::WikiFileFingerprintRow>,
+        deletes: Vec<(WorkspaceId, ProjectId, PagePath)>,
+    ) -> WikiResult<()> {
+        self.writer
+            .apply_wiki_file_fingerprint_delta(upserts, deletes)
+            .await?;
         Ok(())
     }
 

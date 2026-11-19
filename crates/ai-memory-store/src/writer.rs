@@ -593,6 +593,13 @@ pub(crate) enum WriteCmd {
         rows: Vec<crate::WikiFileFingerprintRow>,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    /// Atomically apply incremental upserts and deletes to the persisted wiki
+    /// file fingerprints table.
+    ApplyWikiFileFingerprintDelta {
+        upserts: Vec<crate::WikiFileFingerprintRow>,
+        deletes: Vec<(WorkspaceId, ProjectId, PagePath)>,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     /// Test seam: read `PRAGMA journal_size_limit` off the writer's own
     /// connection, the only place the pragma is set.
     #[cfg(test)]
@@ -2853,6 +2860,26 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Atomically apply incremental upserts and deletes to persisted wiki file
+    /// fingerprints without scanning or probing unchanged rows.
+    pub async fn apply_wiki_file_fingerprint_delta(
+        &self,
+        upserts: Vec<crate::WikiFileFingerprintRow>,
+        deletes: Vec<(WorkspaceId, ProjectId, PagePath)>,
+    ) -> StoreResult<()> {
+        if upserts.is_empty() && deletes.is_empty() {
+            return Ok(());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ApplyWikiFileFingerprintDelta {
+            upserts,
+            deletes,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// `PRAGMA journal_size_limit` as the writer's connection reports it.
     #[cfg(test)]
     pub(crate) async fn journal_size_limit(&self) -> StoreResult<i64> {
@@ -5066,6 +5093,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 let result = replace_wiki_file_fingerprints_tx(&mut conn, &rows);
                 send_or_warn(reply, result, "replace_wiki_file_fingerprints");
             }
+            WriteCmd::ApplyWikiFileFingerprintDelta {
+                upserts,
+                deletes,
+                reply,
+            } => {
+                let result = apply_wiki_file_fingerprint_delta_tx(&mut conn, &upserts, &deletes);
+                send_or_warn(reply, result, "apply_wiki_file_fingerprint_delta");
+            }
             #[cfg(test)]
             WriteCmd::JournalSizeLimit { reply } => {
                 let result = conn
@@ -5690,22 +5725,108 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
     tracing::debug!("writer thread exiting cleanly");
 }
 
+const DELETE_WIKI_FILE_FINGERPRINT_SQL: &str = "\
+    DELETE FROM wiki_file_fingerprints \
+     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3";
+
+const UPSERT_WIKI_FILE_FINGERPRINT_SQL: &str = "\
+    INSERT INTO wiki_file_fingerprints \
+     (workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+     ON CONFLICT (workspace_id, project_id, path) DO UPDATE SET \
+       file_len = excluded.file_len, mtime_secs = excluded.mtime_secs, \
+       mtime_nanos = excluded.mtime_nanos, inode = excluded.inode, \
+       ctime_secs = excluded.ctime_secs, ctime_nanos = excluded.ctime_nanos \
+     WHERE (file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
+       IS NOT (excluded.file_len, excluded.mtime_secs, excluded.mtime_nanos, \
+               excluded.inode, excluded.ctime_secs, excluded.ctime_nanos)";
+
 fn replace_wiki_file_fingerprints_tx(
     conn: &mut Connection,
     rows: &[crate::WikiFileFingerprintRow],
 ) -> StoreResult<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute("DELETE FROM wiki_file_fingerprints", [])?;
+    // Write only what changed (#2375): one edited file used to delete and
+    // re-insert the whole table on the single writer.
     {
-        let mut stmt = tx.prepare(
-            "INSERT INTO wiki_file_fingerprints \
-             (workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
+        let keep: std::collections::HashSet<([u8; 16], [u8; 16], &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    *row.workspace_id.as_bytes(),
+                    *row.project_id.as_bytes(),
+                    row.path.as_str(),
+                )
+            })
+            .collect();
+        let gone: Vec<([u8; 16], [u8; 16], String)> = {
+            let mut select =
+                tx.prepare("SELECT workspace_id, project_id, path FROM wiki_file_fingerprints")?;
+            let mut existing = select.query([])?;
+            let mut gone = Vec::new();
+            while let Some(r) = existing.next()? {
+                let ws: [u8; 16] = r.get(0)?;
+                let proj: [u8; 16] = r.get(1)?;
+                let path = r.get_ref(2)?.as_str().map_err(rusqlite::Error::from)?;
+                if !keep.contains(&(ws, proj, path)) {
+                    gone.push((ws, proj, path.to_owned()));
+                }
+            }
+            gone
+        };
+        if !gone.is_empty() {
+            let mut delete = tx.prepare(DELETE_WIKI_FILE_FINGERPRINT_SQL)?;
+            for (ws, proj, path) in &gone {
+                delete.execute(rusqlite::params![ws.as_slice(), proj.as_slice(), path])?;
+            }
+        }
+    }
+    if !rows.is_empty() {
+        // An unchanged row matches the WHERE of DO UPDATE as false: no write.
+        let mut stmt = tx.prepare(UPSERT_WIKI_FILE_FINGERPRINT_SQL)?;
         for row in rows {
             stmt.execute(rusqlite::params![
-                row.workspace_id.as_bytes(),
-                row.project_id.as_bytes(),
+                row.workspace_id.as_bytes().as_slice(),
+                row.project_id.as_bytes().as_slice(),
+                row.path.as_str(),
+                i64::try_from(row.file_len).unwrap_or(i64::MAX),
+                row.mtime_secs,
+                i64::from(row.mtime_nanos),
+                i64::try_from(row.inode).unwrap_or(i64::MAX),
+                row.ctime_secs,
+                row.ctime_nanos,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn apply_wiki_file_fingerprint_delta_tx(
+    conn: &mut Connection,
+    upserts: &[crate::WikiFileFingerprintRow],
+    deletes: &[(WorkspaceId, ProjectId, PagePath)],
+) -> StoreResult<()> {
+    if upserts.is_empty() && deletes.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if !deletes.is_empty() {
+        let mut delete = tx.prepare(DELETE_WIKI_FILE_FINGERPRINT_SQL)?;
+        for (ws, proj, path) in deletes {
+            delete.execute(rusqlite::params![
+                ws.as_bytes().as_slice(),
+                proj.as_bytes().as_slice(),
+                path.as_str(),
+            ])?;
+        }
+    }
+    if !upserts.is_empty() {
+        let mut upsert = tx.prepare(UPSERT_WIKI_FILE_FINGERPRINT_SQL)?;
+        for row in upserts {
+            upsert.execute(rusqlite::params![
+                row.workspace_id.as_bytes().as_slice(),
+                row.project_id.as_bytes().as_slice(),
                 row.path.as_str(),
                 i64::try_from(row.file_len).unwrap_or(i64::MAX),
                 row.mtime_secs,
@@ -5725,6 +5846,184 @@ mod tests {
     use super::*;
     use crate::Store;
     use ai_memory_core::{NewPage, PagePath, Tier};
+
+    /// #2375: one changed wiki file made the reconcile pass delete every
+    /// persisted fingerprint and insert them all again on the single writer.
+    /// Only the rows that changed, appeared or disappeared may be written.
+    #[test]
+    fn replacing_wiki_fingerprints_writes_only_the_rows_that_changed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/V103__wiki_file_fingerprints.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE probe (deleted INTEGER, inserted INTEGER, updated INTEGER);
+             INSERT INTO probe VALUES (0, 0, 0);
+             CREATE TRIGGER probe_d AFTER DELETE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET deleted = deleted + 1; END;
+             CREATE TRIGGER probe_i AFTER INSERT ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET inserted = inserted + 1; END;
+             CREATE TRIGGER probe_u AFTER UPDATE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET updated = updated + 1; END;",
+        )
+        .unwrap();
+        let (ws, proj) = (WorkspaceId::new(), ProjectId::new());
+        let row = |path: &str, file_len: u64| crate::WikiFileFingerprintRow {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            file_len,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            inode: 0,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+        };
+        let first: Vec<_> = (0..100).map(|i| row(&format!("notes/{i}.md"), 1)).collect();
+        replace_wiki_file_fingerprints_tx(&mut conn, &first).unwrap();
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+
+        let mut next = first.clone();
+        next[0].file_len = 2; // changed
+        next.remove(1); // gone
+        next.push(row("notes/new.md", 1)); // new
+        replace_wiki_file_fingerprints_tx(&mut conn, &next).unwrap();
+
+        let counts: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1), "(deleted, inserted, updated)");
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wiki_file_fingerprints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 100);
+        let changed: i64 = conn
+            .query_row(
+                "SELECT file_len FROM wiki_file_fingerprints WHERE path = 'notes/0.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(changed, 2);
+
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+        replace_wiki_file_fingerprints_tx(&mut conn, &next).unwrap();
+        let unchanged: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            unchanged,
+            (0, 0, 0),
+            "a pass with nothing changed writes nothing"
+        );
+    }
+
+    #[test]
+    fn applying_wiki_fingerprint_delta_writes_only_changed_and_deleted_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/V103__wiki_file_fingerprints.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE probe (deleted INTEGER, inserted INTEGER, updated INTEGER);
+             INSERT INTO probe VALUES (0, 0, 0);
+             CREATE TRIGGER probe_d AFTER DELETE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET deleted = deleted + 1; END;
+             CREATE TRIGGER probe_i AFTER INSERT ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET inserted = inserted + 1; END;
+             CREATE TRIGGER probe_u AFTER UPDATE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET updated = updated + 1; END;",
+        )
+        .unwrap();
+        let (ws, proj) = (WorkspaceId::new(), ProjectId::new());
+        let row = |path: &str, file_len: u64| crate::WikiFileFingerprintRow {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            file_len,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            inode: 0,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+        };
+        let initial: Vec<_> = (0..100).map(|i| row(&format!("notes/{i}.md"), 1)).collect();
+        apply_wiki_file_fingerprint_delta_tx(&mut conn, &initial, &[]).unwrap();
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+
+        // Update 1 row, insert 1 new row, delete 1 row; 98 rows are untouched.
+        let upserts = vec![row("notes/0.md", 2), row("notes/new.md", 1)];
+        let deletes = vec![(ws, proj, PagePath::new("notes/1.md").unwrap())];
+        apply_wiki_file_fingerprint_delta_tx(&mut conn, &upserts, &deletes).unwrap();
+
+        let counts: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1), "(deleted, inserted, updated)");
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wiki_file_fingerprints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 100);
+        let changed: i64 = conn
+            .query_row(
+                "SELECT file_len FROM wiki_file_fingerprints WHERE path = 'notes/0.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(changed, 2);
+
+        // Empty delta writes nothing.
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+        apply_wiki_file_fingerprint_delta_tx(&mut conn, &[], &[]).unwrap();
+        let empty: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(empty, (0, 0, 0), "empty delta writes nothing");
+
+        // Re-upserting an identical row writes nothing.
+        apply_wiki_file_fingerprint_delta_tx(&mut conn, &[row("notes/0.md", 2)], &[]).unwrap();
+        let noop_upsert: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            noop_upsert,
+            (0, 0, 0),
+            "identical upsert must not trigger an update"
+        );
+    }
     use std::time::Duration;
     use tempfile::TempDir;
 
