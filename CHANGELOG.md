@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept scheduled mirror and online backups running when a native install
+  stores its configuration in the data directory and has no default
+  external configuration directory. (#2385)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

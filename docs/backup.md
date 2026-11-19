@@ -180,7 +180,10 @@ cadence):
    listed in `SECRET_EXCLUDES` (`*.env`, `auth.json`, `.secrets`, `*.pem`, `*.key`, `*.crt` by default).
 2. `rsync -a --delete` the config dir under the same exclude rules so
    `config.toml` is captured but env files, OAuth tokens, and private CA
-   bundles are not.
+   bundles are not. A native install may keep its config under `DATA_SRC`.
+   If the default `~/.config/ai-memory/` is absent, skip the separate copy
+   and retain any previously mirrored `config/` files. A directory named
+   explicitly by `CFG_SRC` must exist.
 3. `git add -A && git commit -m "auto: snapshot $(date +%F)"` if anything
    changed; skip if there is no delta.
 4. `git push origin main` with a timeout. Each run attempts the push so a
@@ -204,9 +207,8 @@ Task Scheduler via WSL, Docker sidecar).
 The mirror repository is a copy of the data dir minus derived state.
 Recovering the full ai-memory install from it is two steps:
 
-1. Clone the mirror onto the target host, then rsync the `data/` and
-   `config/` subtrees into place under the ai-memory data dir and config dir
-   respectively.
+1. Clone the mirror onto the target host. Rsync `data/` to the ai-memory data
+   dir, and copy `config/` to the config dir if the mirror has that subtree.
 2. Rebuild the SQLite index from the recovered markdown:
    [`lifecycle-ops.md#reindex`](lifecycle-ops.md#reindex) walks through this.
    Sessions, observations, handoffs, users/tokens, audit rows, and

@@ -53,3 +53,35 @@ test "$first_backups" -eq 1
 test "$remote_head" = "$local_head"
 test "$(git -C "$REPO_DIR" rev-parse HEAD)" = "$local_head"
 test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 2
+
+# A native install can keep its configuration entirely in DATA_SRC. A missing
+# default external directory should leave the previous external mirror alone.
+default_config_home="$fixture/default-home"
+mkdir -p "$default_config_home" "$REPO_DIR/config"
+printf '# Configuration stored with the data directory\n' > "$DATA_SRC/config.toml"
+printf '# Previously mirrored external configuration\n' > "$REPO_DIR/config/previous.toml"
+git -C "$REPO_DIR" add config/previous.toml
+git -C "$REPO_DIR" commit -qm 'Mirror separate configuration'
+git -C "$REPO_DIR" push -q origin main
+if ! env -u CFG_SRC HOME="$default_config_home" bash "$root/docs/examples/backup/ai-memory-snapshot.sh"; then
+    echo 'Snapshot failed without a default external configuration directory' >&2
+    exit 1
+fi
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 3
+test -f "$REPO_DIR/config/previous.toml"
+cmp "$DATA_SRC/config.toml" "$REPO_DIR/data/config.toml"
+
+# Once the default directory exists, it is still mirrored with --delete.
+mkdir -p "$default_config_home/.config/ai-memory"
+printf '# Current external configuration\n' > "$default_config_home/.config/ai-memory/current.toml"
+env -u CFG_SRC HOME="$default_config_home" bash "$root/docs/examples/backup/ai-memory-snapshot.sh"
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 4
+test ! -e "$REPO_DIR/config/previous.toml"
+cmp "$default_config_home/.config/ai-memory/current.toml" "$REPO_DIR/config/current.toml"
+
+# A typo in an explicit override should still cause the scheduled job to fail.
+override_status=0
+CFG_SRC="$fixture/absent-override" bash "$root/docs/examples/backup/ai-memory-snapshot.sh" || override_status=$?
+test "$override_status" -ne 0
+test "$(wc -l < "$SNAPSHOT_CALLS")" -eq 4
+test -f "$REPO_DIR/config/current.toml"
