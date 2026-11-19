@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Recorded query vector-stream activity in retrieval eval reports when
+  `explain=true` was requested, exposing queries that ran without the vector
+  stream during local-embedding evaluations. (#1854)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

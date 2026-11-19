@@ -376,6 +376,7 @@ async fn retrieve(
             latency: started.elapsed(),
             context_tokens: chars.div_ceil(4),
             raw_hits: 0,
+            vector_stream_active: None,
         },
         QuestionMetadata {
             question_id: question.question_id.clone(),

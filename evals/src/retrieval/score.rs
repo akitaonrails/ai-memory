@@ -44,6 +44,10 @@ pub struct QuestionScore {
     /// when page search finds nothing).
     #[serde(default)]
     pub raw_hits: usize,
+    /// Whether the server reported an active vector stream. Unreported on
+    /// queries without server stream diagnostics and on standalone engines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_stream_active: Option<bool>,
     /// End-to-end QA outcome (R2b, opt-in): a candidate answer graded
     /// against the gold answer. `None` on the default zero-LLM path and for
     /// any question whose QA step failed (logged, left ungraded).
@@ -110,6 +114,7 @@ pub fn score_question(
         context_tokens,
         ingest_ms: 0,
         raw_hits: 0,
+        vector_stream_active: None,
         // R2a scoring is answer-agnostic; the QA path attaches its outcome
         // afterward, keeping this function pure and deterministic.
         qa: None,

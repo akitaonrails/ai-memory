@@ -62,6 +62,9 @@ pub struct QueryOutcome {
     /// them when page search returns nothing, so a non-zero count marks a
     /// question answered from observations.
     pub raw_hits: usize,
+    /// Whether the server reported the vector stream as active for this
+    /// query. Missing when the response does not include an explanation.
+    pub vector_stream_active: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +78,16 @@ struct QueryResponse {
     /// today's server simply never sets it.
     #[serde(default)]
     answer: Option<ServerAnswer>,
+    #[serde(default)]
+    streams_active: Option<Vec<String>>,
+}
+
+impl QueryResponse {
+    fn vector_stream_active(&self) -> Option<bool> {
+        self.streams_active
+            .as_ref()
+            .map(|streams| streams.iter().any(|stream| stream == "vector"))
+    }
 }
 
 /// Production `memory_query(answer=true)` response shape.
@@ -146,6 +159,7 @@ pub async fn memory_query(
     let mut parsed: QueryResponse = serde_json::from_str(&text)
         .with_context(|| format!("parsing memory_query JSON: {text}"))?;
     let raw_hits = parsed.raw_hits.len();
+    let vector_stream_active = parsed.vector_stream_active();
     // A blank/whitespace `answer` is treated as absent so the QA path falls
     // back to harness synthesis rather than grading an empty string.
     let answer = parsed
@@ -160,6 +174,7 @@ pub async fn memory_query(
         latency,
         context_tokens,
         raw_hits,
+        vector_stream_active,
     })
 }
 
@@ -307,6 +322,7 @@ mod tests {
                 snippet: String::new(),
             }],
             answer: None,
+            streams_active: None,
         };
         let (flat, contexts, _) = flatten(resp);
         assert_eq!(flat.len(), 2);
@@ -334,6 +350,7 @@ mod tests {
                 snippet: "mnop".into(),
             }],
             answer: None,
+            streams_active: None,
         };
         let (_, contexts, tokens) = flatten(resp);
         assert_eq!(tokens, 4);
@@ -361,5 +378,23 @@ mod tests {
         let answer = parsed.answer.unwrap();
         assert_eq!(answer.text, "Use port 49374.");
         assert_eq!(answer.citations, ["rules/server.md"]);
+    }
+
+    #[test]
+    fn vector_activity_comes_from_the_stream_list_even_without_hits() {
+        for (response, expected) in [
+            (
+                r#"{"hits":[],"streams_active":["fts","entity","vector"]}"#,
+                Some(true),
+            ),
+            (
+                r#"{"hits":[],"streams_active":["fts","entity"]}"#,
+                Some(false),
+            ),
+            (r#"{"hits":[]}"#, None),
+        ] {
+            let response: QueryResponse = serde_json::from_str(response).unwrap();
+            assert_eq!(response.vector_stream_active(), expected);
+        }
     }
 }
