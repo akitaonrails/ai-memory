@@ -15,9 +15,10 @@ if ! FOUND_RUST="$(cd "$ROOT" && rustc --version 2>/dev/null)"; then
   exit 1
 fi
 FOUND_VERSION="$(awk '{print $2}' <<<"$FOUND_RUST")"
-IFS=. read -r req_major req_minor _ <<<"$REQUIRED_RUST"
-IFS=. read -r got_major got_minor _ <<<"$FOUND_VERSION"
-if (( got_major < req_major || (got_major == req_major && got_minor < ${req_minor:-0}) )); then
+if [[ -n "$REQUIRED_RUST" && "$FOUND_VERSION" =~ ^[0-9]+\.[0-9]+ ]]; then
+  IFS=. read -r req_major req_minor _ <<<"$REQUIRED_RUST"
+  IFS=. read -r got_major got_minor _ <<<"$FOUND_VERSION"
+  if (( 10#$got_major < 10#$req_major || (10#$got_major == 10#$req_major && 10#$got_minor < 10#${req_minor:-0}) )); then
   echo "error: this repo needs Rust $REQUIRED_RUST, but $(command -v rustc) is $FOUND_RUST" >&2
   if ! command -v rustup >/dev/null 2>&1; then
     echo "  rust-toolchain.toml is applied only by rustup, which is not installed." >&2
@@ -27,6 +28,7 @@ if (( got_major < req_major || (got_major == req_major && got_minor < ${req_mino
     echo "  rustup is installed but another rustc comes first on PATH; put ~/.cargo/bin first." >&2
   fi
   exit 1
+  fi
 fi
 
 echo "building ai-memory ($CONFIG) from $ROOT"
