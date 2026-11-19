@@ -17,18 +17,12 @@ version in [`docs/changelog/`](docs/changelog/):
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
 
-### Fixed
-
 - Avoided scanning every pending wiki path for the next debounce deadline on
   each filesystem notification, reducing watcher work during bulk edits. (#2354)
-
-### Fixed
 
 - Resumed a reclaimed final session consolidation attempt after graceful
   shutdown. The pending job stays claimable at the same attempt count after
   restart, and a provider failure on that attempt still ends it. (#2360)
-
-### Fixed
 
 - `docs/jev-reranker-adapter.md` no longer says the server never thresholds
   reranker relevance. Since 3.5.0 a `min_relevance` floor and retrieval
@@ -37,12 +31,8 @@ version in [`docs/changelog/`](docs/changelog/):
   and the adapter's docstring now say to leave `min_relevance` unset with a
   choice adapter. (#2388)
 
-### Fixed
-
 - Kept queued session consolidation eligible for outage recovery when every
   fallback candidate is unreachable at the HTTP transport layer. (#2384)
-
-### Fixed
 
 - Recorded query vector-stream activity in retrieval eval reports when
   `explain=true` was requested, exposing queries that ran without the vector
