@@ -20,7 +20,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AIMemoryMenuTests",
-            dependencies: ["AIMemoryMenuCore"],
+            dependencies: ["AIMemoryMenuCore", "AIMemoryMenu"],
             path: "Tests/AIMemoryMenuTests",
             resources: [.copy("fixtures")]
         ),

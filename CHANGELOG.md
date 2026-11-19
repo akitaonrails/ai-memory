@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept the macOS menu bar status on the latest poll when an earlier response
+  arrived after a settings or lifecycle refresh. (#2383)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed
