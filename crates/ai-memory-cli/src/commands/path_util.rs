@@ -248,9 +248,16 @@ pub(crate) mod acl_probe {
             .collect()
     }
 
-    /// The current account's SID.
+    /// The current account's trustee string as `icacls /save` SDDL renders it.
+    /// Windows abbreviates the built-in local Administrator (`S-1-5-21-...-500`,
+    /// which GitHub Actions Windows runners use) as `LA`.
     pub(crate) fn current_sid() -> String {
-        super::current_account_sid().unwrap()
+        let sid = super::current_account_sid().unwrap();
+        if sid.starts_with("S-1-5-21-") && sid.ends_with("-500") {
+            "LA".to_owned()
+        } else {
+            sid
+        }
     }
 
     /// Give the built-in Users group read access to `dir` and everything
