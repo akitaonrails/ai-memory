@@ -150,6 +150,31 @@ pub(crate) fn hermes_home_in(
     home.map(|home| home.join(format!(".hermes{suffix}")))
 }
 
+/// Devin CLI's user-level config root: `%APPDATA%\devin` on Windows (falling
+/// back to `<home>/.config/devin` when `APPDATA` is unset or empty), and
+/// `<home>/.config/devin` on Linux/macOS/WSL.
+pub(crate) fn devin_user_config_dir() -> Option<PathBuf> {
+    let home = home_dir();
+    devin_user_config_dir_in(std::env::var_os("APPDATA"), home.as_deref(), cfg!(windows))
+}
+
+/// [`devin_user_config_dir`] with the environment passed in, so tests can
+/// exercise both Windows and POSIX defaults on either host.
+pub(crate) fn devin_user_config_dir_in(
+    appdata: Option<std::ffi::OsString>,
+    home: Option<&Path>,
+    windows: bool,
+) -> Option<PathBuf> {
+    if windows
+        && let Some(base) = appdata
+            .filter(|value| value.to_str().is_none_or(|text| !text.trim().is_empty()))
+            .map(PathBuf::from)
+    {
+        return Some(base.join("devin"));
+    }
+    home.map(|home| home.join(".config").join("devin"))
+}
+
 /// Hermes profile ids follow `^[a-z0-9][a-z0-9_-]{0,63}$`.
 pub(crate) fn is_hermes_profile_id(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -439,5 +464,42 @@ mod tests {
             &*strip_windows_verbatim_prefix(r"\\?\C:relative\m"),
             r"\\?\C:relative\m"
         );
+    }
+
+    #[test]
+    fn devin_user_config_dir_in_resolves_posix_and_windows_defaults() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            devin_user_config_dir_in(None, Some(home), false),
+            Some(PathBuf::from("/home/alice/.config/devin"))
+        );
+        // POSIX ignores APPDATA even if set.
+        assert_eq!(
+            devin_user_config_dir_in(
+                Some("C:\\Users\\Alice\\AppData\\Roaming".into()),
+                Some(home),
+                false
+            ),
+            Some(PathBuf::from("/home/alice/.config/devin"))
+        );
+        // Windows uses %APPDATA%\devin when set and non-empty.
+        assert_eq!(
+            devin_user_config_dir_in(
+                Some("C:\\Users\\Alice\\AppData\\Roaming".into()),
+                Some(home),
+                true
+            ),
+            Some(PathBuf::from("C:\\Users\\Alice\\AppData\\Roaming").join("devin"))
+        );
+        // Windows falls back to <home>/.config/devin when APPDATA is unset or blank.
+        assert_eq!(
+            devin_user_config_dir_in(None, Some(home), true),
+            Some(PathBuf::from("/home/alice/.config/devin"))
+        );
+        assert_eq!(
+            devin_user_config_dir_in(Some("   ".into()), Some(home), true),
+            Some(PathBuf::from("/home/alice/.config/devin"))
+        );
+        assert_eq!(devin_user_config_dir_in(None, None, false), None);
     }
 }

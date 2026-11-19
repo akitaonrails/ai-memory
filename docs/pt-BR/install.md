@@ -1523,10 +1523,11 @@ que a reinstalação adicione `SessionStart`.
 
 ### Devin CLI
 
-Devin usa `~/.devin/config.json` para servidores MCP e `~/.devin/hooks.v1.json`
-para hooks de ciclo de vida por padrão. Se você preferir um único arquivo combinado de configuração do Devin,
-passe `--config-file ~/.devin/config.json` para `install-hooks`; ai-memory então
-mescla as entradas de hook sob a chave `hooks` daquele arquivo.
+O Devin mantém a configuração em nível de usuário em `~/.config/devin/` no
+Linux/macOS/WSL (`%APPDATA%\devin\` no Windows): `mcp_config.json` para
+servidores MCP e a chave `hooks` em `config.json` para hooks de ciclo de vida.
+Para hooks em nível de projeto, passe `--config-file .devin/hooks.v1.json` para
+`install-hooks`; o ai-memory então grava o mapa plano de eventos do projeto.
 
 ```bash
 ai-memory install-mcp --client devin --apply \
@@ -3648,7 +3649,7 @@ Raízes de destino de skills padrão:
 | Scope | `--agent claude-code` | `--agent agents` | `--agent devin` | `--agent grok` | `--agent copilot-cli` | `--agent hermes` | `--agent antigravity` |
 |---|---|---|---|---|---|---|---|
 | `project` | `.claude/skills` | `.agents/skills` | `.devin/skills` | `.grok/skills` | `.github/skills` | `.hermes/skills` | `.agents/skills` |
-| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; não-Windows: `~/.devin/skills` | `$GROK_HOME/skills` (padrão `~/.grok/skills`), mais a regra de primeiro turno `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (padrão `~/.copilot/skills`) | `~/.hermes/skills` | ambos `~/.gemini/config/skills` (Antigravity App e IDE) e `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
+| `global` | `~/.claude/skills` | `~/.agents/skills` | Windows: `%APPDATA%\devin\skills`; não-Windows: `~/.config/devin/skills` | `$GROK_HOME/skills` (padrão `~/.grok/skills`), mais a regra de primeiro turno `$GROK_HOME/rules/ai-memory-handoff.md` | `$COPILOT_HOME/skills` (padrão `~/.copilot/skills`) | `~/.hermes/skills` | ambos `~/.gemini/config/skills` (Antigravity App e IDE) e `~/.gemini/antigravity-cli/skills` (Antigravity CLI) |
 
 Cada skill gerenciada é gravada como `<root>/<skill-name>/SKILL.md`.
 

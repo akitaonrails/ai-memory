@@ -271,16 +271,17 @@ fn build_plan(
                 install_hooks::grok_hooks_path()?,
                 HookConfigShape::NestedHooksKey,
             ),
-            // Devin's default hooks.v1.json is flat: the file itself is the
-            // event map. Its config.json alternative stores the same entries
-            // under the usual hooks key.
-            (
-                install_hooks::devin_hooks_path()?,
-                HookConfigShape::FlatHookFile,
-            ),
+            // Devin's user-level hooks live in `<devin_user_config_dir>/config.json`
+            // under the `"hooks"` key; a standalone `hooks.v1.json` is flat (the
+            // file itself is the event map). Legacy `~/.devin/{hooks.v1.json,config.json}`
+            // are swept below so pre-#2379 installs are removed too.
             (
                 install_hooks::devin_config_path()?,
                 HookConfigShape::NestedHooksKey,
+            ),
+            (
+                install_hooks::devin_hooks_path()?,
+                HookConfigShape::FlatHookFile,
             ),
             // Droid's hooks.json is the event map itself, like Devin's
             // hooks.v1.json.
@@ -315,6 +316,28 @@ fn build_plan(
                 HookConfigShape::NestedHooksKey,
             ),
         ]);
+        if let Some(home) = home.as_deref() {
+            // Sweep legacy `~/.devin/{hooks.v1.json,config.json}` written by
+            // versions before #2379 moved user-level Devin config to
+            // `~/.config/devin/` (`%APPDATA%\devin\` on Windows).
+            for (legacy_path, shape) in [
+                (
+                    home.join(".devin").join("hooks.v1.json"),
+                    HookConfigShape::FlatHookFile,
+                ),
+                (
+                    home.join(".devin").join("config.json"),
+                    HookConfigShape::NestedHooksKey,
+                ),
+            ] {
+                if !hook_files
+                    .iter()
+                    .any(|(existing, _)| existing == &legacy_path)
+                {
+                    hook_files.push((legacy_path, shape));
+                }
+            }
+        }
         for (path, shape) in hook_files {
             if !path.exists() {
                 continue;
@@ -542,6 +565,21 @@ fn build_plan(
                 omp_dirs.iter().map(|dir| dir.join("mcp.json")).collect()
             } else if matches!(client, Muse) {
                 vec![install_hooks::muse_settings_path(env)?]
+            } else if matches!(client, Devin) {
+                // Sweep `<devin_user_config_dir>/mcp_config.json` plus legacy
+                // `~/.devin/config.json` from pre-#2379 installs.
+                let mut paths = Vec::with_capacity(2);
+                if let Ok(path) = install_mcp::mcp_config_path_with(Devin, &|name| env.var_os(name))
+                {
+                    paths.push(path);
+                }
+                if let Some(home) = home.as_deref() {
+                    let legacy = home.join(".devin").join("config.json");
+                    if !paths.contains(&legacy) {
+                        paths.push(legacy);
+                    }
+                }
+                paths
             } else {
                 let Ok(path) = install_mcp::mcp_config_path_with(client, &|name| env.var_os(name))
                 else {
@@ -676,6 +714,11 @@ pub(super) fn skill_roots(
     if let Some(home) = home {
         push_unique_skill_root(&mut roots, home.join(CLAUDE_SKILL_DIR).join(SKILLS_DIR));
         push_unique_skill_root(&mut roots, home.join(AGENTS_SKILL_DIR).join(SKILLS_DIR));
+        push_unique_skill_root(
+            &mut roots,
+            home.join(".config").join("devin").join(SKILLS_DIR),
+        );
+        // Also sweep legacy `~/.devin/skills` from pre-#2379 installs.
         push_unique_skill_root(&mut roots, home.join(DEVIN_SKILL_DIR).join(SKILLS_DIR));
         let grok_root = grok_home
             .map(Path::to_path_buf)
@@ -2516,12 +2559,16 @@ mod tests {
         );
 
         let without = skill_roots(cwd, Some(home), None, None, None, None, None);
+        assert!(
+            without.contains(&home.join(".config").join("devin").join(SKILLS_DIR)),
+            "{without:?}"
+        );
         assert_eq!(
             without.len(),
-            16,
+            17,
             "no phantom root when APPDATA is unset \
              (claude/agents/devin/grok/copilot/hermes/workbuddy × \
-             project+global, plus Antigravity's two global roots)"
+             project+global, legacy ~/.devin/skills, plus Antigravity's two global roots)"
         );
         assert!(
             without.contains(&cwd.join(GROK_SKILL_DIR).join(SKILLS_DIR)),

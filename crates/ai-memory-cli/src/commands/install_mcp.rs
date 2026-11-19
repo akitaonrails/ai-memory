@@ -25,7 +25,9 @@ use serde_json::json;
 
 use crate::cli::{InstallMcpArgs, McpClient, SchemaFlavor};
 use crate::commands::apply_shared::{ApplyOutcome, apply_atomic, mutate_json, mutate_toml};
-use crate::commands::path_util::{claude_config_dir, home_dir, strip_windows_verbatim_prefix};
+use crate::commands::path_util::{
+    claude_config_dir, devin_user_config_dir_in, home_dir, strip_windows_verbatim_prefix,
+};
 use crate::commands::render_shared::{
     bearer_header_value, hook_embedded_exe_path, mask_secret, shell_quote, yaml_single_quote,
 };
@@ -835,7 +837,11 @@ pub(crate) fn mcp_config_path_with(
         // (workspace scopes like .zcode/config.json exist, but user scope
         // is the install default for every other client too).
         McpClient::Zcode => home()?.join(".zcode").join("cli").join("config.json"),
-        McpClient::Devin => home()?.join(".devin").join("config.json"),
+        McpClient::Devin => {
+            devin_user_config_dir_in(env("APPDATA"), home().ok().as_deref(), cfg!(windows))
+                .context("could not locate $HOME for ~/.config/devin/mcp_config.json")?
+                .join("mcp_config.json")
+        }
         // Kimi Code keeps its data dir at $KIMI_CODE_HOME when set,
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
         // that root.
@@ -2889,7 +2895,7 @@ fn render_antigravity_cli(args: &InstallMcpArgs) -> Result<String> {
 
 fn render_devin(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
-        "# Devin CLI — merge into ~/.devin/config.json:\n\
+        "# Devin CLI — merge into ~/.config/devin/mcp_config.json:\n\
          #\n\
          # Devin uses `mcpServers` with HTTP transport and optional Bearer auth.\n\
          {snippet}\n",
@@ -6430,6 +6436,32 @@ mod tests {
             panic!("expected install-mcp command for devin");
         };
         assert!(matches!(mcp_args.client, crate::cli::McpClient::Devin));
+    }
+
+    #[test]
+    fn devin_default_mcp_config_path_and_render_use_config_dir() {
+        let path = mcp_config_path_with(McpClient::Devin, &|_| None).unwrap();
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("mcp_config.json")
+        );
+        #[cfg(not(windows))]
+        {
+            let parent = path.parent().unwrap();
+            assert_eq!(parent.file_name().and_then(|s| s.to_str()), Some("devin"));
+            assert_eq!(
+                parent
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .and_then(|s| s.to_str()),
+                Some(".config")
+            );
+        }
+
+        let rendered = render_devin(&args_with_token(McpClient::Devin)).unwrap();
+        assert!(rendered.contains("~/.config/devin/mcp_config.json"));
+        assert!(!rendered.contains("~/.devin/config.json"));
     }
 
     #[test]
