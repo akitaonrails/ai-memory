@@ -3373,7 +3373,12 @@ fn configure_consolidator(
                 let mut adapter = ai_memory_llm::DecisionsReranker::new(auth, model)?
                     .with_timeout_secs(config.rerank_timeout_secs)
                     .with_health(provider_health.clone());
-                if let Some(base_url) = config.llm_base_url.as_deref() {
+                if let Some(base_url) = config
+                    .llm_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
                     adapter = adapter.with_base_url(base_url);
                 }
                 Arc::new(adapter)

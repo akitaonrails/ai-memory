@@ -599,7 +599,12 @@ async fn loopback_bypasses_inherited_http_proxy() {
                 "--test-threads=1",
             ])
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .envs(
+                ["SYSTEMROOT", "WINDIR"]
+                    .into_iter()
+                    .filter_map(|k| std::env::var_os(k).map(|v| (k, v))),
+            )
             .env("HOME", home.path())
             .env("TMPDIR", home.path())
             .env("AI_MEMORY_HOME", home.path().join("memory"))
