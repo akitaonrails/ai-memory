@@ -22,7 +22,7 @@ version in [`docs/changelog/`](docs/changelog/):
   writes it, the Windows counterpart of the `0600`/`0700` modes used on Unix.
   The credential files are narrowed again the next time `install-hooks` or
   `setup` writes them; an existing spool or token directory keeps its access
-  list (see `docs/security-boundaries.md` row 10m). (#PR)
+  list (see `docs/security-boundaries.md` row 10m). (#2396)
 
 ## [3.5.1] - 2026-11-19
 
