@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Resumed a reclaimed final session consolidation attempt after graceful
+  shutdown. The pending job stays claimable at the same attempt count after
+  restart, and a provider failure on that attempt still ends it. (#2360)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed
