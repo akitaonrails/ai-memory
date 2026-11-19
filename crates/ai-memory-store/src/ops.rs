@@ -9687,7 +9687,29 @@ pub fn merge_project(
                 params![dst, page.path.as_str()],
                 |row| row.get(0),
             )?;
-            let merged_id = upsert_page_in_tx(&tx, merged, now)?;
+            // The merged body carries the source head's text after the
+            // target's, so it must not inherit the target head's trust class
+            // alone: it takes the less trusted of the two heads (#2164).
+            let mut merged = merged.clone();
+            if has_trust_class_column(&tx, "pages") {
+                let rank: Option<i64> = tx.query_row(
+                    "SELECT MIN(CASE trust_class \
+                         WHEN 'tool_result' THEN 0 \
+                         WHEN 'model_generated' THEN 1 \
+                         ELSE 2 \
+                     END) \
+                     FROM pages WHERE id IN (?1, ?2)",
+                    params![
+                        page.source_page_id.as_bytes(),
+                        page.target_page_id.as_ref().map(PageId::as_bytes),
+                    ],
+                    |row| row.get(0),
+                )?;
+                let heads = rank.map(trust_class_from_rank);
+                merged.trust_class =
+                    TrustClass::least_trusted_of(heads.into_iter().chain(merged.trust_class));
+            }
+            let merged_id = upsert_page_in_tx(&tx, &merged, now)?;
             tx.execute(
                 "UPDATE pages SET created_at = ?2 WHERE id = ?1",
                 params![merged_id.as_bytes(), created_at],
