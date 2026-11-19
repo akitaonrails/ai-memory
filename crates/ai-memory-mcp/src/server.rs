@@ -1972,6 +1972,11 @@ struct PatchPageArgs {
     /// clients must pass both.
     #[serde(default)]
     workspace: Option<String>,
+    /// Set to `"global"` to patch a page in the reserved cross-project global
+    /// scope, as `memory_read_page` and `memory_write_page` do. Cannot be
+    /// combined with `workspace` or `project`.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// Bounds for `memory_read_page`'s `max_chars`. The default keeps a typical
@@ -6198,7 +6203,7 @@ impl AiMemoryServer {
             idempotent_hint = false,
             open_world_hint = false
         ),
-        description = "Patch an existing Markdown page without re-emitting its full body or metadata. Requires `expected_page_id` from `memory_read_page`; every edit is materialized against that one base version and the whole batch either commits through the normal write path or writes nothing. `append` requires `target: section` plus an unambiguous heading anchor, or `target: end_of_page` with no anchor. `add_section` requires a unique ATX level 2-6 heading as its anchor. `replace_section` requires both an unambiguous heading anchor and the exact `section_sha256` returned by `memory_read_page`. Headings inside fenced code are ignored. All existing frontmatter is preserved. Static clients pass `workspace` and `project` together."
+        description = "Patch an existing Markdown page without re-emitting its full body or metadata. Requires `expected_page_id` from `memory_read_page`; every edit is materialized against that one base version and the whole batch either commits through the normal write path or writes nothing. `append` requires `target: section` plus an unambiguous heading anchor, or `target: end_of_page` with no anchor. `add_section` requires a unique ATX level 2-6 heading as its anchor. `replace_section` requires both an unambiguous heading anchor and the exact `section_sha256` returned by `memory_read_page`. Headings inside fenced code are ignored. All existing frontmatter is preserved. Static clients pass `workspace` and `project` together. Pass `scope: \"global\"` (and no `workspace`/`project`) to patch a page read with `scope: \"global\"`."
     )]
     async fn memory_patch_page(
         &self,
@@ -6219,25 +6224,72 @@ impl AiMemoryServer {
             .map_err(|error| McpError::invalid_params(format!("invalid path: {error}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let (workspace_id, project_id) = self
-            .effective_ids_for_mutation_args_with_actor(
+        let viewer = Self::viewer_from_parts(Some(&parts));
+        let global = match args.scope.as_deref().map(str::trim) {
+            None | Some("") => false,
+            Some("global") => true,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("unknown scope '{other}': the only supported value is \"global\""),
+                    None,
+                ));
+            }
+        };
+        let (workspace_id, project_id) = if global {
+            if [&args.workspace, &args.project]
+                .into_iter()
+                .any(|s| s.as_deref().is_some_and(|s| !s.trim().is_empty()))
+            {
+                return Err(McpError::invalid_params(
+                    "scope: \"global\" cannot be combined with workspace/project",
+                    None,
+                ));
+            }
+            // Same no-create, write-gated resolver as an explicit
+            // `default/_global` patch.
+            self.effective_ids_for_mutation_args_with_actor(
+                Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
+                Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
+                &aps_actor,
+                viewer,
+            )
+            .await
+            .map_err(|error| McpError {
+                message: format!("scope \"global\" could not be resolved: {}", error.message)
+                    .into(),
+                ..error
+            })?
+        } else {
+            self.effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
                 args.project.as_deref(),
                 &aps_actor,
-                Self::viewer_from_parts(Some(&parts)),
+                viewer,
             )
-            .await?;
+            .await?
+        };
         let current = self
             .reader
             .latest_page_id_by_ids(workspace_id, project_id, path.to_string())
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         if current != Some(expected) {
-            return Err(precondition_failed(
+            let mut error = precondition_failed(
                 &path,
                 Some(ai_memory_store::PagePrecondition::Latest(expected)),
                 current,
-            ));
+            );
+            if current.is_none() && !global {
+                // A page_id read from the global scope lands here; point at
+                // the missing scope instead of a phantom concurrent delete.
+                error.message = format!(
+                    "{}. {path} has no page in the resolved project; if you read it with \
+                     scope: \"global\", pass scope: \"global\" here too",
+                    error.message
+                )
+                .into();
+            }
+            return Err(error);
         }
         let page = wiki
             .read_page(workspace_id, project_id, &path)
@@ -22143,6 +22195,7 @@ mod tests {
                     }],
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -22231,6 +22284,7 @@ mod tests {
             }],
             project: None,
             workspace: None,
+            scope: None,
         };
         let patched = server
             .memory_patch_page(
@@ -22353,6 +22407,7 @@ mod tests {
                     }],
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -22419,6 +22474,7 @@ mod tests {
                     ],
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -22526,6 +22582,7 @@ mod tests {
                     ],
                     project: None,
                     workspace: None,
+                    scope: None,
                 }),
                 OptionalParts(test_parts_default()),
             )
@@ -22603,6 +22660,7 @@ mod tests {
             }],
             project: Some("scratch".into()),
             workspace: Some("default".into()),
+            scope: None,
         };
         let mut user_parts = test_parts_default();
         user_parts.extensions.insert(AuthLevel::User);
@@ -22657,6 +22715,142 @@ mod tests {
             right.is_ok(),
             "exactly one CAS writer must win"
         );
+    }
+
+    /// Issue #2362: a page read with `scope: "global"` can be patched with
+    /// the same scope, and patching it without the scope says where it
+    /// looked instead of "latest is no page".
+    #[tokio::test]
+    async fn memory_patch_page_patches_a_global_page_by_scope() {
+        let (tmp, store, server, _ws, _proj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        // Built from wire JSON, the way a client sends it.
+        let patch = |page_id: &str, scope: Option<&str>, project: Option<&str>| {
+            serde_json::from_value::<PatchPageArgs>(serde_json::json!({
+                "path": "_rules/global.md",
+                "expected_page_id": page_id,
+                "edits": [{ "op": "append", "target": "end_of_page", "content": "appended" }],
+                "project": project,
+                "workspace": project.map(|_| "default"),
+                "scope": scope,
+            }))
+            .unwrap()
+        };
+
+        let missing = server
+            .memory_patch_page(
+                Parameters(patch(&PageId::new().to_string(), Some("global"), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("a missing global scope must fail");
+        assert!(
+            missing
+                .message
+                .contains("scope \"global\" could not be resolved"),
+            "{missing}"
+        );
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "_rules/global.md".into(),
+                    body: "# Rule\n".into(),
+                    title: None,
+                    tier: None,
+                    tags: vec![],
+                    pinned: false,
+                    project: None,
+                    project_id: None,
+                    workspace: None,
+                    scope: Some("global".into()),
+                    expires_at: None,
+                    session_id: None,
+                    create_only: false,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let read = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    path: Some("_rules/global.md".into()),
+                    query: None,
+                    project: None,
+                    project_id: None,
+                    workspace: None,
+                    scope: Some("global".into()),
+                    include_related: false,
+                    related_depth: None,
+                    max_chars: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let page_id = call_tool_json(read)["page_id"].as_str().unwrap().to_owned();
+
+        let unscoped = server
+            .memory_patch_page(
+                Parameters(patch(&page_id, None, None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("the page is not in the current project");
+        assert_eq!(unscoped.code, rmcp::model::ErrorCode::INVALID_REQUEST);
+        let data = unscoped.data.as_ref().unwrap();
+        assert_eq!(data["reason"], "precondition_failed", "{data}");
+        assert!(data["current_page_id"].is_null(), "{data}");
+        assert!(
+            unscoped.message.contains("pass scope: \"global\""),
+            "{unscoped}"
+        );
+        let combined = server
+            .memory_patch_page(
+                Parameters(patch(&page_id, Some("global"), Some("_global"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("scope + project must fail closed");
+        assert!(
+            combined.message.contains("cannot be combined"),
+            "{combined}"
+        );
+        let unknown = server
+            .memory_patch_page(
+                Parameters(patch(&page_id, Some("universe"), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect_err("unknown scope values must fail closed");
+        assert!(unknown.message.contains("unknown scope"), "{unknown}");
+
+        let patched = server
+            .memory_patch_page(
+                Parameters(patch(&page_id, Some("global"), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(call_tool_json(patched)["page_id"], page_id.as_str());
+        let global = ai_memory_store::lookup_global_scope(&store.reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = server
+            .wiki
+            .as_ref()
+            .unwrap()
+            .read_page(
+                global.workspace_id,
+                global.project_id,
+                &PagePath::new("_rules/global.md").unwrap(),
+            )
+            .unwrap();
+        assert!(stored.body.ends_with("appended\n"), "{:?}", stored.body);
     }
 
     /// A malformed path, tier or scope is the caller's mistake, so the page
@@ -23753,6 +23947,86 @@ mod tests {
             .filter_map(|hit| hit["path"].as_str())
             .collect();
         assert!(paths.contains(&"preferences.md"), "{value}");
+    }
+
+    /// #2362: `memory_patch_page` with `scope: "global"` is another way into
+    /// the reserved global scope, so it passes the same write gate as
+    /// `memory_write_page`. A user without a write grant on `_global` is
+    /// refused with the page left alone; the same patch from a granted user
+    /// lands.
+    #[tokio::test]
+    async fn patching_the_global_scope_needs_a_global_write_grant() {
+        let tmp = TempDir::new().unwrap();
+        let (store, server, _joao, maria) = global_gate_fixture(&tmp).await;
+        server
+            .memory_write_page(
+                Parameters(global_page("preferences.md", Some("global"), None, None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("root writes the global scope");
+        let read = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    max_chars: None,
+                    include_related: false,
+                    related_depth: None,
+                    path: Some("preferences.md".into()),
+                    query: None,
+                    project: None,
+                    project_id: None,
+                    workspace: None,
+                    scope: Some("global".into()),
+                }),
+                OptionalParts(parts_as_user(maria)),
+            )
+            .await
+            .expect("reads of the global scope stay open");
+        let page_id = tool_json(&read)["page_id"].as_str().unwrap().to_owned();
+        let patch = || {
+            serde_json::from_value::<PatchPageArgs>(serde_json::json!({
+                "path": "preferences.md",
+                "expected_page_id": page_id,
+                "edits": [{ "op": "append", "target": "end_of_page", "content": "patchgate" }],
+                "scope": "global",
+            }))
+            .unwrap()
+        };
+        let global = ai_memory_store::lookup_global_scope(&store.reader)
+            .await
+            .unwrap()
+            .unwrap();
+        let body = || {
+            server
+                .wiki
+                .as_ref()
+                .unwrap()
+                .read_page(
+                    global.workspace_id,
+                    global.project_id,
+                    &PagePath::new("preferences.md").unwrap(),
+                )
+                .unwrap()
+                .body
+        };
+
+        let err = server
+            .memory_patch_page(Parameters(patch()), OptionalParts(parts_as_user(maria)))
+            .await
+            .expect_err("maria holds no write grant on _global");
+        assert!(
+            err.message.contains("not authorized for _global"),
+            "{}",
+            err.message
+        );
+        assert!(!body().contains("patchgate"), "the refused patch landed");
+
+        grant_writer(store.db_path(), maria, global.project_id);
+        server
+            .memory_patch_page(Parameters(patch()), OptionalParts(parts_as_user(maria)))
+            .await
+            .expect("a write grant on _global admits the patch");
+        assert!(body().contains("patchgate"));
     }
 
     // ---- cross-project profile (docs/design-cross-project-profile.md) ----

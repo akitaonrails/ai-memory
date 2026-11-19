@@ -60,6 +60,8 @@ new level 2-6 heading such as `## Decisions`; `replace_section` takes an
 `section_sha256`.
 All edits resolve against the same captured body and either commit together or
 write nothing. Missing, duplicate, stale, or conflicting anchors fail closed.
+A page read with `scope: "global"` is patched with `scope: "global"` too,
+without `workspace` or `project`.
 Use `memory_write_page` when replacing the whole document.
 
 When the user explicitly wants a note to be temporary, pass `expires_at` as an

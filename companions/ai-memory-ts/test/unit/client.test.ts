@@ -197,6 +197,19 @@ describe("pages", () => {
       ],
     });
     assert.equal(result.pageId, payloads.NEXT_PAGE_ID);
+    const edits = [{ op: "append", target: "end_of_page", content: "x" }] as const;
+    const globalPatch = { path: "_rules/a.md", expectedPageId: payloads.PAGE_ID, edits };
+    await memory.pages.patch({ ...globalPatch, global: true });
+    assert.deepEqual(server.lastArgs(), {
+      scope: "global",
+      path: "_rules/a.md",
+      expected_page_id: payloads.PAGE_ID,
+      edits: [{ op: "append", target: "end_of_page", content: "x" }],
+    });
+    await assert.rejects(
+      memory.pages.patch({ ...globalPatch, global: true, scope: OTHER }),
+      ArgumentError,
+    );
   });
 
   it("read by path or query, never both, and decodes the page", async () => {
@@ -923,6 +936,12 @@ describe("wire names", () => {
           { op: "add_section", anchor: "## B", content: "c" },
           { op: "replace_section", anchor: "C", sectionSha256: "h", content: "d" },
         ],
+      }),
+      memory.pages.patch({
+        path: "global",
+        expectedPageId: "v",
+        edits: [{ op: "append", target: "end_of_page", content: "b" }],
+        global: true,
       }),
       memory.pages.read({ path: "p", includeRelated: true, relatedDepth: 2, maxChars: 500 }),
       memory.pages.read({ path: "global", global: true }),
