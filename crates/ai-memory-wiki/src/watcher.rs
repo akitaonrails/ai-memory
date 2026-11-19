@@ -184,6 +184,7 @@ async fn run_loop(
     // pass-to-pass memory, not shared server state.
     let mut missing_streaks: MissingStreaks = HashMap::new();
     let mut indexed_fingerprints: IndexedFingerprints = HashMap::new();
+    let mut persisted_fingerprints: Option<IndexedFingerprints> = None;
     let mut fingerprints_seeded = false;
 
     loop {
@@ -198,10 +199,18 @@ async fn run_loop(
             }
             _ = tick.tick() => {
                 if !fingerprints_seeded {
-                    seed_fingerprints_from_store(&wiki, &mut indexed_fingerprints).await;
+                    persisted_fingerprints =
+                        seed_fingerprints_from_store(&wiki, &mut indexed_fingerprints).await;
                     fingerprints_seeded = true;
                 }
-                match reconcile_and_persist(&wiki, &mut missing_streaks, &mut indexed_fingerprints).await {
+                match reconcile_and_persist(
+                    &wiki,
+                    &mut missing_streaks,
+                    &mut indexed_fingerprints,
+                    &mut persisted_fingerprints,
+                )
+                .await
+                {
                     Ok(_) => {
                         if consecutive_failures > 0 {
                             tracing::info!(
@@ -775,17 +784,87 @@ async fn reconcile_missing_pages(
     }
 }
 
-async fn seed_fingerprints_from_store(wiki: &Wiki, indexed_fingerprints: &mut IndexedFingerprints) {
+/// Load persisted fingerprints from the store into `indexed_fingerprints`.
+///
+/// Returns `Some(baseline)` when the load succeeds so subsequent ticks can
+/// persist O(changed) deltas against that known store state, or `None` when
+/// loading fails (or encounters a row that cannot be decoded) so the next
+/// successful reconcile falls back to a full replacement.
+async fn seed_fingerprints_from_store(
+    wiki: &Wiki,
+    indexed_fingerprints: &mut IndexedFingerprints,
+) -> Option<IndexedFingerprints> {
     match wiki.load_file_fingerprints().await {
         Ok(rows) => {
+            let mut all_valid = true;
             for row in rows {
                 if let Some(fp) = FileFingerprint::from_row(&row) {
                     indexed_fingerprints.insert((row.workspace_id, row.project_id, row.path), fp);
+                } else {
+                    all_valid = false;
                 }
             }
+            all_valid.then(|| indexed_fingerprints.clone())
         }
         Err(error) => {
             warn!(%error, "failed to load persisted wiki file fingerprints; starting cold");
+            None
+        }
+    }
+}
+
+/// Compute the `(upserts, deletes)` delta needed to bring `baseline` up to
+/// `current`. Runs outside the store writer lock so the single writer only
+/// touches rows that actually changed.
+fn diff_fingerprints(
+    baseline: &IndexedFingerprints,
+    current: &IndexedFingerprints,
+) -> (
+    Vec<ai_memory_store::WikiFileFingerprintRow>,
+    Vec<(WorkspaceId, ProjectId, PagePath)>,
+) {
+    let mut upserts = Vec::new();
+    for (key, fp) in current {
+        if baseline.get(key) != Some(fp) {
+            upserts.push(fp.to_row(key.0, key.1, key.2.clone()));
+        }
+    }
+    let mut deletes = Vec::new();
+    for key in baseline.keys() {
+        if !current.contains_key(key) {
+            deletes.push(key.clone());
+        }
+    }
+    (upserts, deletes)
+}
+
+async fn persist_fingerprint_changes(
+    wiki: &Wiki,
+    indexed_fingerprints: &IndexedFingerprints,
+    persisted_fingerprints: &mut Option<IndexedFingerprints>,
+) {
+    let result = match persisted_fingerprints.as_ref() {
+        Some(baseline) => {
+            let (upserts, deletes) = diff_fingerprints(baseline, indexed_fingerprints);
+            if upserts.is_empty() && deletes.is_empty() {
+                return;
+            }
+            wiki.apply_file_fingerprint_delta(upserts, deletes).await
+        }
+        None => {
+            let rows: Vec<_> = indexed_fingerprints
+                .iter()
+                .map(|((ws, proj, path), fp)| fp.to_row(*ws, *proj, path.clone()))
+                .collect();
+            wiki.replace_file_fingerprints(rows).await
+        }
+    };
+    match result {
+        Ok(()) => {
+            *persisted_fingerprints = Some(indexed_fingerprints.clone());
+        }
+        Err(error) => {
+            warn!(%error, "failed to persist wiki file fingerprints");
         }
     }
 }
@@ -794,11 +873,13 @@ async fn reconcile_and_persist(
     wiki: &Wiki,
     missing_streaks: &mut MissingStreaks,
     indexed_fingerprints: &mut IndexedFingerprints,
+    persisted_fingerprints: &mut Option<IndexedFingerprints>,
 ) -> WikiResult<ReconcileStats> {
     reconcile_and_persist_at(
         wiki,
         missing_streaks,
         indexed_fingerprints,
+        persisted_fingerprints,
         std::time::SystemTime::now(),
     )
     .await
@@ -808,19 +889,11 @@ async fn reconcile_and_persist_at(
     wiki: &Wiki,
     missing_streaks: &mut MissingStreaks,
     indexed_fingerprints: &mut IndexedFingerprints,
+    persisted_fingerprints: &mut Option<IndexedFingerprints>,
     pass_started: std::time::SystemTime,
 ) -> WikiResult<ReconcileStats> {
-    let prev_len = indexed_fingerprints.len();
     let stats = reconcile_at(wiki, missing_streaks, indexed_fingerprints, pass_started).await?;
-    if stats.indexed > 0 || indexed_fingerprints.len() != prev_len {
-        let rows: Vec<_> = indexed_fingerprints
-            .iter()
-            .map(|((ws, proj, path), fp)| fp.to_row(*ws, *proj, path.clone()))
-            .collect();
-        if let Err(error) = wiki.replace_file_fingerprints(rows).await {
-            warn!(%error, "failed to persist wiki file fingerprints");
-        }
-    }
+    persist_fingerprint_changes(wiki, indexed_fingerprints, persisted_fingerprints).await;
     Ok(stats)
 }
 
@@ -3255,6 +3328,39 @@ mod tests {
         );
     }
 
+    fn install_fingerprint_probe(db_path: &std::path::Path) -> rusqlite::Connection {
+        let db = rusqlite::Connection::open(db_path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE fingerprint_probe (deleted INTEGER, inserted INTEGER, updated INTEGER);
+             INSERT INTO fingerprint_probe VALUES (0, 0, 0);
+             CREATE TRIGGER fp_probe_d AFTER DELETE ON wiki_file_fingerprints
+                 BEGIN UPDATE fingerprint_probe SET deleted = deleted + 1; END;
+             CREATE TRIGGER fp_probe_i AFTER INSERT ON wiki_file_fingerprints
+                 BEGIN UPDATE fingerprint_probe SET inserted = inserted + 1; END;
+             CREATE TRIGGER fp_probe_u AFTER UPDATE ON wiki_file_fingerprints
+                 BEGIN UPDATE fingerprint_probe SET updated = updated + 1; END;",
+        )
+        .unwrap();
+        db
+    }
+
+    fn reset_fingerprint_probe(db: &rusqlite::Connection) {
+        db.execute(
+            "UPDATE fingerprint_probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn read_fingerprint_probe(db: &rusqlite::Connection) -> (i64, i64, i64) {
+        db.query_row(
+            "SELECT deleted, inserted, updated FROM fingerprint_probe",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn reconcile_persists_fingerprints_across_restart_and_skips_unchanged_files() {
         let (tmp, _store, wiki, ws, proj) = setup().await;
@@ -3263,36 +3369,331 @@ mod tests {
         std::fs::write(dir.join("a.md"), "alpha page content\n").unwrap();
         std::fs::write(dir.join("b.md"), "beta page content\n").unwrap();
 
+        let db = install_fingerprint_probe(&tmp.path().join("db").join("memory.sqlite"));
+
         let later = std::time::SystemTime::now() + Duration::from_secs(60);
         let mut streaks = MissingStreaks::new();
         let mut fingerprints = IndexedFingerprints::new();
-        let first = reconcile_and_persist_at(&wiki, &mut streaks, &mut fingerprints, later)
-            .await
-            .unwrap();
+        let mut persisted = seed_fingerprints_from_store(&wiki, &mut fingerprints).await;
+        assert!(persisted.is_some());
+
+        let first = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later,
+        )
+        .await
+        .unwrap();
         assert_eq!((first.indexed, first.skipped_unchanged), (2, 0));
+        assert_eq!(read_fingerprint_probe(&db), (0, 2, 0));
 
         // Simulate server restart: fresh in-memory map seeded from SQLite.
+        reset_fingerprint_probe(&db);
         let mut restarted_fingerprints = IndexedFingerprints::new();
-        seed_fingerprints_from_store(&wiki, &mut restarted_fingerprints).await;
-        let second =
-            reconcile_and_persist_at(&wiki, &mut streaks, &mut restarted_fingerprints, later)
-                .await
-                .unwrap();
+        let mut restarted_persisted =
+            seed_fingerprints_from_store(&wiki, &mut restarted_fingerprints).await;
+        assert!(restarted_persisted.is_some());
+        let second = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut restarted_fingerprints,
+            &mut restarted_persisted,
+            later,
+        )
+        .await
+        .unwrap();
         assert_eq!((second.indexed, second.skipped_unchanged), (0, 2));
+        assert_eq!(
+            read_fingerprint_probe(&db),
+            (0, 0, 0),
+            "idle restart tick must write nothing"
+        );
 
-        // Simulate offline edit while server was stopped: must still be detected!
+        // Simulate offline edit while server was stopped: must still be detected
+        // and update only the single edited row.
         std::fs::write(dir.join("a.md"), "alpha page content updated offline\n").unwrap();
         let mut after_edit_fingerprints = IndexedFingerprints::new();
-        seed_fingerprints_from_store(&wiki, &mut after_edit_fingerprints).await;
+        let mut after_edit_persisted =
+            seed_fingerprints_from_store(&wiki, &mut after_edit_fingerprints).await;
+        assert!(after_edit_persisted.is_some());
         let even_later = later + Duration::from_secs(60);
         let third = reconcile_and_persist_at(
             &wiki,
             &mut streaks,
             &mut after_edit_fingerprints,
+            &mut after_edit_persisted,
             even_later,
         )
         .await
         .unwrap();
         assert_eq!((third.indexed, third.skipped_unchanged), (1, 1));
+        assert_eq!(
+            read_fingerprint_probe(&db),
+            (0, 0, 1),
+            "offline edit must update only the changed row"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_delta_updates_only_edited_and_deletes_only_removed_row() {
+        let (tmp, _store, wiki, ws, proj) = setup().await;
+        let dir = proj_dir(&tmp, ws, proj);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "alpha v1\n").unwrap();
+        std::fs::write(dir.join("b.md"), "beta v1\n").unwrap();
+        std::fs::write(dir.join("c.md"), "gamma v1\n").unwrap();
+
+        let db = install_fingerprint_probe(&tmp.path().join("db").join("memory.sqlite"));
+
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        let mut persisted = seed_fingerprints_from_store(&wiki, &mut fingerprints).await;
+
+        let initial = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later,
+        )
+        .await
+        .unwrap();
+        assert_eq!((initial.indexed, initial.skipped_unchanged), (3, 0));
+        assert_eq!(read_fingerprint_probe(&db), (0, 3, 0));
+
+        // Edit a single file: only that row is updated.
+        reset_fingerprint_probe(&db);
+        std::fs::write(dir.join("a.md"), "alpha v2 longer content\n").unwrap();
+        let edited = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!((edited.indexed, edited.skipped_unchanged), (1, 2));
+        assert_eq!(
+            read_fingerprint_probe(&db),
+            (0, 0, 1),
+            "single-file edit must update only that row"
+        );
+
+        // Remove a single file: only that row is deleted.
+        reset_fingerprint_probe(&db);
+        std::fs::remove_file(dir.join("b.md")).unwrap();
+        let removed = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later + Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+        assert_eq!((removed.indexed, removed.skipped_unchanged), (0, 2));
+        assert_eq!(
+            read_fingerprint_probe(&db),
+            (1, 0, 0),
+            "removed file must delete only that row"
+        );
+        let remaining: i64 = db
+            .query_row("SELECT COUNT(*) FROM wiki_file_fingerprints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 2);
+    }
+
+    #[tokio::test]
+    async fn reconcile_retries_failed_fingerprint_save_on_next_tick_without_new_edits() {
+        let (tmp, _store, wiki, ws, proj) = setup().await;
+        let dir = proj_dir(&tmp, ws, proj);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "alpha v1\n").unwrap();
+        std::fs::write(dir.join("b.md"), "beta v1\n").unwrap();
+
+        let db = install_fingerprint_probe(&tmp.path().join("db").join("memory.sqlite"));
+
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        let mut persisted = seed_fingerprints_from_store(&wiki, &mut fingerprints).await;
+
+        reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later,
+        )
+        .await
+        .unwrap();
+        let old_len: i64 = db
+            .query_row(
+                "SELECT file_len FROM wiki_file_fingerprints WHERE path = 'a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_len, "alpha v1\n".len() as i64);
+
+        // Inject a failure on fingerprint persistence and edit `a.md`.
+        reset_fingerprint_probe(&db);
+        db.execute_batch(
+            "CREATE TRIGGER fail_fp_update BEFORE UPDATE ON wiki_file_fingerprints
+             BEGIN SELECT RAISE(ABORT, 'injected persistence failure'); END;",
+        )
+        .unwrap();
+        let new_content = "alpha v2 with updated content\n";
+        std::fs::write(dir.join("a.md"), new_content).unwrap();
+
+        let failed_tick = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!((failed_tick.indexed, failed_tick.skipped_unchanged), (1, 1));
+        assert_eq!(read_fingerprint_probe(&db), (0, 0, 0));
+        let still_old_len: i64 = db
+            .query_row(
+                "SELECT file_len FROM wiki_file_fingerprints WHERE path = 'a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_old_len, old_len,
+            "failed persistence must leave the store untouched"
+        );
+        // Baseline must NOT have advanced past the failed save.
+        assert_ne!(persisted.as_ref(), Some(&fingerprints));
+
+        // Clear the injected failure and run another tick with NO new file edits.
+        db.execute_batch("DROP TRIGGER fail_fp_update;").unwrap();
+        let retry_tick = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later + Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (retry_tick.indexed, retry_tick.skipped_unchanged),
+            (0, 2),
+            "in-memory fingerprints still skip reindexing unchanged files"
+        );
+        assert_eq!(
+            read_fingerprint_probe(&db),
+            (0, 0, 1),
+            "pending fingerprint update must be retried on the next tick without new edits"
+        );
+        let updated_len: i64 = db
+            .query_row(
+                "SELECT file_len FROM wiki_file_fingerprints WHERE path = 'a.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_len, new_content.len() as i64);
+        assert_eq!(persisted.as_ref(), Some(&fingerprints));
+
+        // Subsequent idle tick writes nothing now that baseline caught up.
+        reset_fingerprint_probe(&db);
+        reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later + Duration::from_secs(180),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_fingerprint_probe(&db), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn reconcile_falls_back_to_full_replace_when_startup_seed_failed() {
+        let (tmp, store, wiki, ws, proj) = setup().await;
+        let dir = proj_dir(&tmp, ws, proj);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "alpha v1\n").unwrap();
+        std::fs::write(dir.join("b.md"), "beta v1\n").unwrap();
+
+        // Seed the DB with a stale row that does not exist on disk.
+        store
+            .writer
+            .replace_wiki_file_fingerprints(vec![ai_memory_store::WikiFileFingerprintRow {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("stale.md").unwrap(),
+                file_len: 10,
+                mtime_secs: 1,
+                mtime_nanos: 0,
+                inode: 0,
+                ctime_secs: 0,
+                ctime_nanos: 0,
+            }])
+            .await
+            .unwrap();
+
+        let db = install_fingerprint_probe(&tmp.path().join("db").join("memory.sqlite"));
+
+        // Simulate startup-seed failure: empty in-memory map and `persisted = None`.
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        let mut streaks = MissingStreaks::new();
+        let mut fingerprints = IndexedFingerprints::new();
+        let mut persisted: Option<IndexedFingerprints> = None;
+
+        let recovery = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later,
+        )
+        .await
+        .unwrap();
+        assert_eq!((recovery.indexed, recovery.skipped_unchanged), (2, 0));
+        // Full replacement deleted the stale row and inserted both live rows.
+        assert_eq!(read_fingerprint_probe(&db), (1, 2, 0));
+        assert_eq!(
+            persisted.as_ref(),
+            Some(&fingerprints),
+            "successful fallback replacement must establish the delta baseline"
+        );
+        let stale_exists: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM wiki_file_fingerprints WHERE path = 'stale.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_exists, 0);
+
+        // Subsequent tick uses the O(changed) delta path against the new baseline.
+        reset_fingerprint_probe(&db);
+        std::fs::write(dir.join("a.md"), "alpha v2 after recovery\n").unwrap();
+        let next = reconcile_and_persist_at(
+            &wiki,
+            &mut streaks,
+            &mut fingerprints,
+            &mut persisted,
+            later + Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!((next.indexed, next.skipped_unchanged), (1, 1));
+        assert_eq!(read_fingerprint_probe(&db), (0, 0, 1));
     }
 }
