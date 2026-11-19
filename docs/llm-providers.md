@@ -715,9 +715,11 @@ test against Copilot here; treat it as needing a real-Copilot smoke test
 before relying on it in production.
 
 `AI_MEMORY_EMBEDDING_PROVIDER=local` needs no key and no server at all:
-sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
-384-dim), with the model fetched once into `<data_dir>/models/` under
-pinned checksums; see [`docs/local-embeddings.md`](local-embeddings.md).
+sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2` by
+default, or `intfloat/multilingual-e5-small` / `multilingual-e5-small` for
+non-English wikis; both 384-dim), with the model fetched once into
+`<data_dir>/models/` under pinned checksums; see
+[`docs/local-embeddings.md`](local-embeddings.md).
 
 See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra/Standard Compute

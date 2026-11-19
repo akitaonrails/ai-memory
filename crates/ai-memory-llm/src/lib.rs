@@ -146,7 +146,11 @@ pub use health::{
     error_status_and_message,
 };
 #[cfg(feature = "local-embeddings")]
-pub use local::{LOCAL_DIM, LOCAL_MODEL, LocalEmbedder, fetch_model, model_present};
+pub use local::{
+    DEFAULT_LOCAL_MODEL, LOCAL_DIM, LOCAL_MODEL, LOCAL_MODELS, LocalEmbedder, LocalModelSpec,
+    MULTILINGUAL_E5_SMALL_MODEL, fetch_model, fetch_model_for, model_dir, model_dir_for,
+    model_present, model_present_for, resolve_local_model,
+};
 pub use oidc::{
     DeviceAuthorizationResponse, OIDC_DEFAULT_SCOPE, OidcDiscovery, OidcExtras, OidcToken,
     OidcTokenResponse, PollOutcome, discover, poll_token_once, refresh_access_token,

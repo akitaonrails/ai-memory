@@ -3566,6 +3566,11 @@ impl Config {
                 EmbedderChoice::Copilot => ai_memory_llm::COPILOT_DEFAULT_EMBED_MODEL.to_string(),
             },
         };
+        let model = if provider == EmbedderChoice::Local {
+            ai_memory_llm::resolve_local_model(&model)?.id.to_string()
+        } else {
+            model
+        };
         let dim = match self.embedding_dim {
             Some(0) => {
                 return Err(LlmError::NotConfigured(
@@ -6977,6 +6982,41 @@ input_token_safety_margin = {margin}
             cfg.embedder_config().unwrap().unwrap().provider,
             EmbedderChoice::Google
         );
+    }
+
+    #[test]
+    fn local_embedder_config_accepts_multilingual_canonical_and_alias_and_rejects_unknown() {
+        let default_cfg = Config {
+            embedding_provider: Some("local".into()),
+            ..Config::default()
+        };
+        let default_embedder = default_cfg.embedder_config().unwrap().unwrap();
+        assert_eq!(default_embedder.provider, EmbedderChoice::Local);
+        assert_eq!(default_embedder.model, "all-MiniLM-L6-v2");
+        assert_eq!(default_embedder.dim, 384);
+
+        for configured in ["intfloat/multilingual-e5-small", "multilingual-e5-small"] {
+            let cfg = Config {
+                embedding_provider: Some("local".into()),
+                embedding_model: Some(configured.into()),
+                ..Config::default()
+            };
+            let embedder = cfg.embedder_config().unwrap().unwrap();
+            assert_eq!(embedder.provider, EmbedderChoice::Local);
+            assert_eq!(embedder.model, "intfloat/multilingual-e5-small");
+            assert_eq!(embedder.dim, 384);
+        }
+
+        let bad_cfg = Config {
+            embedding_provider: Some("local".into()),
+            embedding_model: Some("nonexistent-local-model".into()),
+            ..Config::default()
+        };
+        let err = bad_cfg.embedder_config().unwrap_err();
+        assert!(matches!(err, LlmError::NotConfigured(_)), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("nonexistent-local-model"), "{msg}");
+        assert!(msg.contains("intfloat/multilingual-e5-small"), "{msg}");
     }
 
     #[test]

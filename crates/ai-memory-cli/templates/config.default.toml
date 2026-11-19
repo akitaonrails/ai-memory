@@ -321,7 +321,9 @@ log_level = "info"
 # 384-dim), no API key, no data egress. The ~87 MB model is fetched once
 # into <data_dir>/models/ in the background (checksum-pinned; hybrid search
 # enables on the next start), and existing pages are backfilled
-# automatically at startup. See docs/local-embeddings.md.
+# automatically at startup. For non-English wikis, set embedding_model to
+# "intfloat/multilingual-e5-small" (or alias "multilingual-e5-small", ~470 MB,
+# 384-dim, automatic "query: " / "passage: " prefixes). See docs/local-embeddings.md.
 #   embedding_provider = "none"           # opt out (FTS + entity + graph only)
 #   embedding_provider = "openai"         # or voyage | google | gemini |
 #                                         # openai-compat | local | copilot | none
