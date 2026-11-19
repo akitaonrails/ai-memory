@@ -71,6 +71,14 @@ version in [`docs/changelog/`](docs/changelog/):
 - Kept recorded retrievals and their hits consistent when the dashboard opens
   while history retention removes older entries. (#2377)
 
+### Fixed
+
+- `memory_patch_page` refuses a `replace_section` aimed at the page's level 1
+  title with `title_section`. The title's section runs to the end of the page,
+  so the edit replaced the whole body and deleted every section below it. The
+  tool description and the durable-pages Skill now say that `content` is the
+  section body without its heading.
+
 ## [3.5.0] - 2026-11-18
 
 ### Added

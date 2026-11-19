@@ -68,6 +68,10 @@ pub(crate) enum PatchError {
     InvalidNewHeading,
     #[error("heading already exists: {0}")]
     HeadingExists(String),
+    #[error(
+        "replace_section cannot target the level 1 title, whose section is the whole page: {0}"
+    )]
+    TitleSection(String),
     #[error("replace_section content must not repeat the section heading: {0}")]
     SectionContentRepeatsHeading(String),
     #[error("section precondition failed: {0}")]
@@ -207,6 +211,11 @@ pub(crate) fn apply(body: &str, edits: &[PagePatchEdit]) -> Result<String, Patch
                 content,
             } => {
                 let section = find_section(&by_anchor, anchor)?;
+                // The title's section runs to the end of the page, so
+                // replacing it would delete every section below it.
+                if section.level == 1 {
+                    return Err(PatchError::TitleSection(section.anchor.clone()));
+                }
                 if !targets.insert(section.normalized.clone()) {
                     return Err(PatchError::DuplicateTarget(section.anchor.clone()));
                 }
@@ -769,6 +778,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(patched, "# T\n\n## One\n\nnew\n");
+    }
+
+    #[test]
+    fn replace_section_refuses_the_title_heading() {
+        let body = "# T\n\nintro\n\n## One\n\nold\n";
+        let title = section_hashes(body)
+            .0
+            .into_iter()
+            .find(|section| section.anchor == "T")
+            .unwrap();
+        assert_eq!(
+            apply(
+                body,
+                &[PagePatchEdit::ReplaceSection {
+                    anchor: "T".into(),
+                    section_sha256: title.sha256,
+                    content: "new intro".into(),
+                }]
+            ),
+            Err(PatchError::TitleSection("T".into()))
+        );
     }
 
     #[test]
