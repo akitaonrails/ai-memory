@@ -6,4 +6,5 @@ mod admission;
 mod admission_bot_wake;
 mod auto_improve_admission;
 mod ledger_files;
+mod trust_class;
 mod wiki_git_ledgers;
