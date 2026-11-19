@@ -5695,12 +5695,47 @@ fn replace_wiki_file_fingerprints_tx(
     rows: &[crate::WikiFileFingerprintRow],
 ) -> StoreResult<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute("DELETE FROM wiki_file_fingerprints", [])?;
+    // Write only what changed (#2375): one edited file used to delete and
+    // re-insert the whole table on the single writer.
     {
+        let keep: std::collections::HashSet<(Vec<u8>, Vec<u8>, &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.workspace_id.as_bytes().to_vec(),
+                    row.project_id.as_bytes().to_vec(),
+                    row.path.as_str(),
+                )
+            })
+            .collect();
+        let gone: Vec<(Vec<u8>, Vec<u8>, String)> = tx
+            .prepare("SELECT workspace_id, project_id, path FROM wiki_file_fingerprints")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<(Vec<u8>, Vec<u8>, String)>>>()?
+            .into_iter()
+            .filter(|(ws, proj, path)| !keep.contains(&(ws.clone(), proj.clone(), path.as_str())))
+            .collect();
+        let mut delete = tx.prepare(
+            "DELETE FROM wiki_file_fingerprints \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3",
+        )?;
+        for (ws, proj, path) in &gone {
+            delete.execute(rusqlite::params![ws, proj, path])?;
+        }
+    }
+    {
+        // An unchanged row matches the WHERE of DO UPDATE as false: no write.
         let mut stmt = tx.prepare(
             "INSERT INTO wiki_file_fingerprints \
              (workspace_id, project_id, path, file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT (workspace_id, project_id, path) DO UPDATE SET \
+               file_len = excluded.file_len, mtime_secs = excluded.mtime_secs, \
+               mtime_nanos = excluded.mtime_nanos, inode = excluded.inode, \
+               ctime_secs = excluded.ctime_secs, ctime_nanos = excluded.ctime_nanos \
+             WHERE (file_len, mtime_secs, mtime_nanos, inode, ctime_secs, ctime_nanos) \
+               IS NOT (excluded.file_len, excluded.mtime_secs, excluded.mtime_nanos, \
+                       excluded.inode, excluded.ctime_secs, excluded.ctime_nanos)",
         )?;
         for row in rows {
             stmt.execute(rusqlite::params![
@@ -5725,6 +5760,92 @@ mod tests {
     use super::*;
     use crate::Store;
     use ai_memory_core::{NewPage, PagePath, Tier};
+
+    /// #2375: one changed wiki file made the reconcile pass delete every
+    /// persisted fingerprint and insert them all again on the single writer.
+    /// Only the rows that changed, appeared or disappeared may be written.
+    #[test]
+    fn replacing_wiki_fingerprints_writes_only_the_rows_that_changed() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/V103__wiki_file_fingerprints.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE probe (deleted INTEGER, inserted INTEGER, updated INTEGER);
+             INSERT INTO probe VALUES (0, 0, 0);
+             CREATE TRIGGER probe_d AFTER DELETE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET deleted = deleted + 1; END;
+             CREATE TRIGGER probe_i AFTER INSERT ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET inserted = inserted + 1; END;
+             CREATE TRIGGER probe_u AFTER UPDATE ON wiki_file_fingerprints
+                 BEGIN UPDATE probe SET updated = updated + 1; END;",
+        )
+        .unwrap();
+        let (ws, proj) = (WorkspaceId::new(), ProjectId::new());
+        let row = |path: &str, file_len: u64| crate::WikiFileFingerprintRow {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            file_len,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            inode: 0,
+            ctime_secs: 0,
+            ctime_nanos: 0,
+        };
+        let first: Vec<_> = (0..100).map(|i| row(&format!("notes/{i}.md"), 1)).collect();
+        replace_wiki_file_fingerprints_tx(&mut conn, &first).unwrap();
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+
+        let mut next = first.clone();
+        next[0].file_len = 2; // changed
+        next.remove(1); // gone
+        next.push(row("notes/new.md", 1)); // new
+        replace_wiki_file_fingerprints_tx(&mut conn, &next).unwrap();
+
+        let counts: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1), "(deleted, inserted, updated)");
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM wiki_file_fingerprints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 100);
+        let changed: i64 = conn
+            .query_row(
+                "SELECT file_len FROM wiki_file_fingerprints WHERE path = 'notes/0.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(changed, 2);
+
+        conn.execute(
+            "UPDATE probe SET deleted = 0, inserted = 0, updated = 0",
+            [],
+        )
+        .unwrap();
+        replace_wiki_file_fingerprints_tx(&mut conn, &next).unwrap();
+        let unchanged: (i64, i64, i64) = conn
+            .query_row("SELECT deleted, inserted, updated FROM probe", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            unchanged,
+            (0, 0, 0),
+            "a pass with nothing changed writes nothing"
+        );
+    }
     use std::time::Duration;
     use tempfile::TempDir;
 
