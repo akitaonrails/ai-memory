@@ -1412,7 +1412,8 @@ native `ai-memory` binary and `hooks/` tree, governs the existing LaunchAgent
 `config.toml`, the data directory, and logs. It does not replace those tools
 with a second dashboard.
 
-Needs a Rust toolchain and Xcode / Swift 6 (the same as a source build):
+Needs rustup, which applies the Rust version pinned in `rust-toolchain.toml`
+(a Homebrew or distro `rust` does not), and Xcode 16.2 or later (Swift 6):
 
 ```bash
 git clone https://github.com/akitaonrails/ai-memory
