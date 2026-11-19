@@ -663,7 +663,7 @@ ai-memory install-skills --target-dir .custom/skills --force
 ```
 
 Para o Devin, habilidades locais do projeto são instaladas em `.devin/skills`. Instalações
-globais do Devin usam `%APPDATA%\devin\skills` no Windows e `~/.devin/skills`
+globais do Devin usam `%APPDATA%\devin\skills` no Windows e `~/.config/devin/skills`
 em sistemas não Windows. Para a Grok Build CLI, habilidades locais do projeto ficam sob
 `.grok/skills` e globais sob `$GROK_HOME/skills` (padrão
 `~/.grok/skills`). Uma instalação global de habilidades do Grok também grava a regra de handoff do

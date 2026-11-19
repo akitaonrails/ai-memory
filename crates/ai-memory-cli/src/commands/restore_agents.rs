@@ -736,6 +736,7 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".gemini/",
                 ".cursor/",
                 ".config/opencode/",
+                ".config/devin/",
                 ".devin/",
                 ".grok/",
                 ".kiro/",

@@ -8634,7 +8634,7 @@ impl AiMemoryServer {
                     "agents": "~/.agents/skills",
                     "devin": {
                         "windows": "%APPDATA%\\devin\\skills",
-                        "non_windows": "~/.devin/skills"
+                        "non_windows": "~/.config/devin/skills"
                     },
                     "grok": "$GROK_HOME/skills (default: ~/.grok/skills)",
                     "copilot_cli": "$COPILOT_HOME/skills (default: ~/.copilot/skills)",
@@ -13951,7 +13951,7 @@ mod tests {
             response["target_hints"]["global"]["devin"]["non_windows"]
                 .as_str()
                 .unwrap(),
-            "~/.devin/skills"
+            "~/.config/devin/skills"
         );
         assert_eq!(
             response["target_hints"]["global"]["grok"].as_str().unwrap(),

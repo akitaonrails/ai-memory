@@ -838,7 +838,7 @@ fn render_devin_setup_output(emit_root: &Path, args: &SetupAgentArgs) -> Result<
         serde_json::to_string_pretty(&payload).context("serializing Devin hook config")?;
     let mut out = String::new();
     out.push_str(
-        "# Devin CLI — write to ~/.devin/hooks.v1.json or ~/.devin/config.json hooks key\n",
+        "# Devin CLI — merge into ~/.config/devin/config.json (or project .devin/hooks.v1.json)\n",
     );
     out.push_str("# Hook scripts (must be reachable from the host that runs Devin):\n");
     out.push_str(&format!("#   {}\n", emit_root.display()));
@@ -846,7 +846,7 @@ fn render_devin_setup_output(emit_root: &Path, args: &SetupAgentArgs) -> Result<
     if args.auth_token.is_some() {
         out.push_str("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.\n");
         out.push_str(
-            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600).\n",
+            "#       Treat ~/.config/devin/config.json (or .devin/hooks.v1.json) as sensitive (chmod 600).\n",
         );
     }
     out.push_str(
@@ -1225,7 +1225,7 @@ mod tests {
         let rendered = render_devin_setup_output(emit_root, &args).unwrap();
 
         assert!(rendered.contains("# Devin CLI"));
-        assert!(rendered.contains("~/.devin/hooks.v1.json"));
+        assert!(rendered.contains("~/.config/devin/config.json"));
         assert!(rendered.contains("hookSpecificOutput.additionalContext"));
         assert!(rendered.contains("AI_MEMORY_AUTH_TOKEN"));
 

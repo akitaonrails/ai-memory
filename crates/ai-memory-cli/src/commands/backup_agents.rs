@@ -662,15 +662,24 @@ pub fn discover_assets(
     // 6. Devin
     if filter_agent(AgentKind::Devin) {
         if want_global {
-            let devin_dir = home.join(".devin");
+            let devin_dir = home.join(".config").join("devin");
             push_if_file(
                 &mut assets,
                 AgentKind::Devin,
                 AgentAssetKind::McpConfig,
                 AgentAssetScope::Global,
                 devin_dir.join("config.json"),
-                ".devin/config.json",
+                ".config/devin/config.json",
                 "devin/config.json",
+            );
+            push_if_file(
+                &mut assets,
+                AgentKind::Devin,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                devin_dir.join("mcp_config.json"),
+                ".config/devin/mcp_config.json",
+                "devin/mcp_config.json",
             );
             collect_dir_assets(
                 &mut assets,
@@ -678,7 +687,7 @@ pub fn discover_assets(
                 AgentAssetKind::Skill,
                 AgentAssetScope::Global,
                 &devin_dir.join("skills"),
-                ".devin/skills",
+                ".config/devin/skills",
                 "devin/skills",
             )?;
         }

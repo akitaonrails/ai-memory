@@ -28,7 +28,7 @@ use crate::commands::apply_shared::{
 };
 use crate::commands::install_mcp;
 use crate::commands::openclaw_plugin;
-use crate::commands::path_util::{home_dir, strip_windows_verbatim_prefix};
+use crate::commands::path_util::{devin_user_config_dir, home_dir, strip_windows_verbatim_prefix};
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, COMMAND_CODE_PROFILE,
     COPILOT_CLI_PROFILE, CURSOR_PROFILE, DSH_EVENTS, GEMINI_PROFILE, HermesHookSet,
@@ -669,19 +669,20 @@ pub(crate) fn zcode_config_path() -> anyhow::Result<std::path::PathBuf> {
         .join("config.json"))
 }
 
-/// `~/.devin/hooks.v1.json` — Devin CLI lifecycle hooks (default target).
+/// `<devin_user_config_dir>/hooks.v1.json` — Devin CLI flat hooks file (standalone
+/// `hooks.v1.json` is normally project-level `.devin/hooks.v1.json`).
 pub(crate) fn devin_hooks_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.devin/hooks.v1.json")?
-        .join(".devin")
+    Ok(devin_user_config_dir()
+        .context("could not locate $HOME for ~/.config/devin/hooks.v1.json")?
         .join("hooks.v1.json"))
 }
 
-/// `~/.devin/config.json` — Devin CLI lifecycle hooks (alternative target under `hooks` key).
+/// `<devin_user_config_dir>/config.json` — Devin CLI user-level lifecycle hooks
+/// (default target, merged under the `"hooks"` key; `~/.config/devin/config.json`
+/// on Linux/macOS/WSL and `%APPDATA%\devin\config.json` on Windows).
 pub(crate) fn devin_config_path() -> anyhow::Result<std::path::PathBuf> {
-    Ok(home_dir()
-        .context("could not locate $HOME for ~/.devin/config.json")?
-        .join(".devin")
+    Ok(devin_user_config_dir()
+        .context("could not locate $HOME for ~/.config/devin/config.json")?
         .join("config.json"))
 }
 
@@ -1802,7 +1803,7 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             // never writes, so there is no install-owned file to recover a
             // baked project strategy from.
             AgentChoice::Hermes => return None,
-            AgentChoice::Devin => devin_hooks_path().ok()?,
+            AgentChoice::Devin => devin_config_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
             AgentChoice::KiroCli => return None,
             // Pool's hook config is per-repo (`.poolside/settings.yaml`), not a
@@ -2910,7 +2911,9 @@ fn apply_to_grok_settings(
     Ok(())
 }
 
-/// Mutate Devin's hook config (either `~/.devin/hooks.v1.json` or `~/.devin/config.json` hooks key).
+/// Mutate Devin's hook config (defaults to `<devin_user_config_dir>/config.json`
+/// under the `"hooks"` key; `--config-file .../.devin/hooks.v1.json` writes the
+/// flat project-level event map).
 /// Devin uses the same nested hook JSON shape as Claude Code/Grok, but with DEVIN_EVENTS
 /// (PostCompaction instead of PreCompact, no subagent events). SessionStart injects
 /// the handoff via hookSpecificOutput.additionalContext.
@@ -2949,7 +2952,7 @@ fn apply_to_devin_settings_with_staged(
 ) -> Result<()> {
     let path = match &args.config_file {
         Some(p) => p.clone(),
-        None => devin_hooks_path()?,
+        None => devin_config_path()?,
     };
     let command_dir = staged_command_dir(staged, "devin");
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -9043,14 +9046,14 @@ fn render_devin(
     let serialized =
         serde_json::to_string_pretty(&payload).context("serializing devin hook config")?;
     println!(
-        "# Devin CLI hook config — write to ~/.devin/hooks.v1.json or ~/.devin/config.json hooks key"
+        "# Devin CLI hook config — merge into ~/.config/devin/config.json (or project .devin/hooks.v1.json)"
     );
     println!("# Hook scripts: {}", hooks_dir.display());
     println!("# AI-memory server URL: {server_url}");
     if auth_token.is_some() {
         println!("# Auth: AI_MEMORY_AUTH_TOKEN embedded in each hook command below.");
         println!(
-            "#       Treat ~/.devin/hooks.v1.json or ~/.devin/config.json as sensitive (chmod 600)."
+            "#       Treat ~/.config/devin/config.json (or .devin/hooks.v1.json) as sensitive (chmod 600)."
         );
     }
     println!(
@@ -19367,7 +19370,29 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
     // ----------------------------------------------------------------
 
     #[test]
-    fn devin_apply_writes_hooks_v1_json_by_default() {
+    fn devin_default_config_path_uses_user_config_dir() {
+        let path = devin_config_path().unwrap();
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("config.json")
+        );
+        #[cfg(not(windows))]
+        {
+            let parent = path.parent().unwrap();
+            assert_eq!(parent.file_name().and_then(|s| s.to_str()), Some("devin"));
+            assert_eq!(
+                parent
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .and_then(|s| s.to_str()),
+                Some(".config")
+            );
+        }
+    }
+
+    #[test]
+    fn devin_apply_project_hooks_v1_json_writes_flat_event_map() {
         let hooks_tmp = TempDir::new().unwrap();
         stub_scripts(
             hooks_tmp.path(),

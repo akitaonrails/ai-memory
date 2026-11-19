@@ -28,7 +28,7 @@ Before these commands were added:
 | **Qoder** | `~/.qoder/settings.json` | `~/.agents/skills/` | — | `AGENTS.md` |
 | **Cursor IDE** | `~/.cursor/mcp.json`<br>`.cursor/mcp.json` | — | VS Code / Cursor extensions | `.cursorrules`<br>`.cursor/rules/` |
 | **OpenCode (v1 / v2)** | `opencode.json`<br>`opencode.jsonc`<br>`~/.config/opencode/opencode.json` | `~/.config/opencode/skills/` | `~/.config/opencode/plugins/` | `AGENTS.md` |
-| **Devin CLI** | `~/.devin/config.json` | `~/.devin/skills/` | — | Devin instructions |
+| **Devin CLI** | `~/.config/devin/config.json`<br>`~/.config/devin/mcp_config.json` | `~/.config/devin/skills/`<br>`.devin/skills/` | — | Devin instructions |
 | **Grok Build CLI** | `~/.grok/config.toml` | `~/.grok/skills/` | — | Grok instructions |
 | **Kiro CLI (AWS)** | `~/.kiro/settings/mcp.json` | `~/.kiro/agents/*.json` | — | — |
 | **OpenClaw** | `~/.openclaw/config.json` | — | `~/.openclaw/extensions/` | — |

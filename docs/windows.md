@@ -212,10 +212,10 @@ Use the matching `--client` / `--agent` values for other clients, for
 example `codex`, `command-code`, `devin`, `kimi-code`, `kiro-cli`, `cursor`, or `gemini-cli`.
 
 For Devin, `install-mcp --client devin --apply` writes MCP config to
-`%USERPROFILE%\.devin\config.json`. `install-hooks --agent devin --apply`
-writes lifecycle hooks to `%USERPROFILE%\.devin\hooks.v1.json` by default;
-pass `--config-file "%USERPROFILE%\.devin\config.json"` if you want hooks under
-the `hooks` key in Devin's main config file.
+`%APPDATA%\devin\mcp_config.json`. `install-hooks --agent devin --apply`
+writes lifecycle hooks under the `hooks` key of `%APPDATA%\devin\config.json`
+by default; pass `--config-file ".devin\hooks.v1.json"` for project-level
+flat hooks.
 
 For Kiro CLI, `install-mcp --client kiro-cli --apply` writes
 `%USERPROFILE%\.kiro\settings\mcp.json` unless `$env:KIRO_HOME` overrides the

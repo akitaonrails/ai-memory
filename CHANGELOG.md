@@ -17,6 +17,15 @@ version in [`docs/changelog/`](docs/changelog/):
   page writes, deletions and checkpoints cannot mix SQLite and wiki states.
   Released those locks before compressing the private staged archive. (#2361)
 
+- Devin CLI user-level installs now write to Devin's documented global config
+  directory (`~/.config/devin/` on Linux/macOS/WSL, `%APPDATA%\devin\` on
+  Windows) instead of `~/.devin/`: `install-hooks --agent devin` merges hooks
+  under the `"hooks"` key of `config.json` (while `--config-file .devin/hooks.v1.json`
+  continues to write the flat project-level event map), `install-mcp --client devin`
+  writes `mcp_config.json`, `install-skills --scope global --agent devin`
+  writes `skills/`, and `backup-agents` / `restore-agents` / `uninstall` handle
+  both the new layout and legacy `~/.devin/` paths. (#2379)
+
 - Kept canonical project names ambiguous when a legacy twin holds sent or
   received messages, including retained history. Name-based mailbox access and
   writes no longer skip that project as empty, and startup no longer reports
