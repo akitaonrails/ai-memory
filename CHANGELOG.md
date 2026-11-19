@@ -37,7 +37,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `_rules/` emission when all supporting sources are `tool_result` (downgrading
   consolidation output to `gotchas/` and rejecting auto-improve rule proposals;
   operator corroboration in a `user-prompt` lifts the gate), and `memory_query`
-  surfaces `trust_class` on hits without changing RRF ranking. (#2164)
+  surfaces `trust_class` on hits without changing RRF ranking. A rebuild with
+  `ai-memory reindex` cannot recover a class from the markdown, so it stores
+  each rebuilt page as `model_generated` rather than `operator_authored`.
+  (#2164, #2392)
 
 - `memory_patch_page` accepts `scope: "global"`, like `memory_read_page` and
   `memory_write_page`, so a page read from the global scope can be patched with
