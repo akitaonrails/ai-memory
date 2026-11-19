@@ -121,10 +121,7 @@ export class Core {
   }
 
   /** The handshake is needed even by calls that skip schema checks. */
-  #initialize(options?: CallOptions): Promise<SessionInfo> {
-    if (options?.signal?.aborted === true) {
-      return Promise.reject(new AbortError("aborted by the caller before initialization", false));
-    }
+  #initialize(): Promise<SessionInfo> {
     if (this.#session === undefined) {
       const session = initialize(this.transport);
       this.#session = session;
@@ -132,7 +129,27 @@ export class Core {
         if (this.#session === session) this.#session = undefined;
       });
     }
-    return waitForShared(this.#session, options);
+    return this.#session;
+  }
+
+  /** A refresh can replace the handshake while a request is waiting for it. */
+  async #withSession<T>(send: (info: SessionInfo) => Promise<T>, options?: CallOptions): Promise<T> {
+    if (options?.signal?.aborted === true) {
+      throw new AbortError("aborted by the caller before initialization", false);
+    }
+    const deadline = options?.timeoutMs === undefined ? undefined : performance.now() + options.timeoutMs;
+    for (;;) {
+      const session = this.#initialize();
+      const info = await waitForShared(session, options);
+      // Invoke send in the same turn as the identity check, before another
+      // refresh can clear the transport's session id.
+      if (this.#session === session) return send(info);
+      if (deadline !== undefined) {
+        const remaining = Math.ceil(deadline - performance.now());
+        if (remaining <= 0) throw new TimeoutError("timed out waiting for initialization", false);
+        options = { ...options, timeoutMs: remaining };
+      }
+    }
   }
 
   /** `initialize` + `tools/list`, probed once per client and cached. */
@@ -141,8 +158,8 @@ export class Core {
       return Promise.reject(new AbortError("aborted by the caller before initialization", false));
     }
     if (this.#index === undefined) {
-      const session = this.#initialize();
-      const probe = session.then((info) => probeTools(this.transport, info));
+      const probe = this.#withSession((info) => probeTools(this.transport, info));
+      const session = this.#session;
       this.#index = probe;
       // A failed probe is not cached: the next call probes again.
       probe.catch(() => {
@@ -185,11 +202,8 @@ export class Core {
     mutating: boolean,
     options?: CallOptions,
   ): Promise<unknown> {
-    await this.#initialize(options);
-    const result = await this.transport.rpc(
-      "tools/call",
-      { name: tool, arguments: args },
-      mutating,
+    const result = await this.#withSession(
+      () => this.transport.rpc("tools/call", { name: tool, arguments: args }, mutating, options),
       options,
     );
     const text = firstText(result["content"]);

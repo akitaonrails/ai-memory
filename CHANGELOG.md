@@ -11,6 +11,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- The TypeScript SDK waits for the active MCP handshake when a capability
+  refresh supersedes an in-flight handshake. This prevents requests without a
+  session ID on stateful servers when the older response arrives first. (#2047)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
