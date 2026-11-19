@@ -132,7 +132,9 @@ def jev_rerank(payload):
     both backends measured (see the comparison table in the docs), and it
     is the only shape in which replay-trained small models hold their
     quality. Relevance is the raw choice probability: monotonic in the
-    probability order, which is all the reranker sorts on.
+    probability order, which is all the reranker sorts on. It is not a
+    grade, so a `min_relevance` floor filters it as if it were one; leave
+    the floor unset with this adapter (docs/jev-reranker-adapter.md).
     """
     user = next((m.get("content", "") for m in payload.get("messages", [])
                  if m.get("role") == "user"), "")

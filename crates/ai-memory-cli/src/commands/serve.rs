@@ -870,16 +870,14 @@ fn session_consolidation_retry_delay(attempt: u32, transport_unreachable: bool) 
     }
 }
 
-/// Whether `error` is a transient transport-unreachable HTTP failure
-/// (`LlmError::Http` with no HTTP status, persisted as
-/// `consolidation failed: class=http status=none`).
+/// Whether a direct provider or the entire fallback chain is unreachable
+/// at the HTTP transport layer.
 fn is_transport_unreachable_session_consolidation_error(
     error: &ai_memory_consolidate::ConsolidatorError,
 ) -> bool {
     matches!(
         error,
-        ai_memory_consolidate::ConsolidatorError::Llm(llm @ ai_memory_llm::LlmError::Http(http))
-            if llm.is_transient() && http.status().is_none()
+        ai_memory_consolidate::ConsolidatorError::Llm(llm) if llm.is_transport_unreachable()
     )
 }
 
@@ -901,7 +899,8 @@ fn is_transport_unreachable_session_consolidation_error(
 /// malformed-request `4xx` — reproduces on identical inputs, so the job goes
 /// terminal and the heuristic page the SessionEnd hook already wrote remains.
 /// Exhausted credit or quota (`LlmError::is_quota_exhausted`) is the one
-/// exception: not transient, but kept on the queue's backoff.
+/// exception for a direct provider. A fallback chain exhausted solely by
+/// transport failures also stays on the durable queue's backoff.
 ///
 /// A `ConsolidatorError::Serde` is not an `LlmError`: it is this crate's own
 /// JSON failure on an unchanged input and stays terminal on its own.
@@ -913,7 +912,7 @@ fn is_terminal_session_consolidation_error(
         // later, but a top-up or quota reset can clear it within the queue's
         // backoff window, so it keeps the job queued like a 429 always did.
         ai_memory_consolidate::ConsolidatorError::Llm(llm) => {
-            !llm.is_transient() && !llm.is_quota_exhausted()
+            !llm.is_transient() && !llm.is_quota_exhausted() && !llm.is_transport_unreachable()
         }
         ai_memory_consolidate::ConsolidatorError::Serde(_) => true,
         _ => false,
@@ -5464,6 +5463,10 @@ mod tests {
 
         let terminal = [
             ConsolidatorError::Serde("truncated json".into()),
+            ConsolidatorError::Llm(LlmError::AllCandidatesFailed {
+                attempted: 1,
+                summary: "mixed provider failure".into(),
+            }),
             ConsolidatorError::Llm(LlmError::Serde("missing field `title`".into())),
             ConsolidatorError::Llm(LlmError::UnexpectedShape("no tool block".into())),
             ConsolidatorError::Llm(LlmError::TruncatedResponse {
@@ -5546,6 +5549,21 @@ mod tests {
                 "a failure a later attempt may clear must keep the queue retrying: {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn fallback_transport_failure_is_retryable_and_redacted_for_outage_recovery() {
+        let error =
+            ai_memory_consolidate::ConsolidatorError::Llm(LlmError::FallbackTransportUnreachable {
+                attempted: 2,
+                summary: "first/model: http; second/model: http".into(),
+            });
+        assert!(is_transport_unreachable_session_consolidation_error(&error));
+        assert!(!is_terminal_session_consolidation_error(&error));
+        assert_eq!(
+            ai_memory_consolidate::redacted_error_summary(&error),
+            "consolidation failed: class=fallback-transport-unreachable status=none"
+        );
     }
 
     /// #678: the pointer is process memory, so `systemctl restart` mid-session

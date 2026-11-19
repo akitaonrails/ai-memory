@@ -92,6 +92,16 @@ pub enum LlmError {
         /// attempt, joined with `"; "`.
         summary: String,
     },
+
+    /// The chain was exhausted solely by transient HTTP transport errors
+    /// and circuits still open after such errors.
+    #[error("llm fallback chain exhausted after {attempted} candidate(s): {summary}")]
+    FallbackTransportUnreachable {
+        /// Number of candidates actually attempted.
+        attempted: usize,
+        /// Redacted candidate labels and error categories.
+        summary: String,
+    },
 }
 
 /// What a failed call means for retries and for an ordered fallback chain.
@@ -174,6 +184,16 @@ impl LlmError {
         self.failover_class() == FailoverClass::Transient
     }
 
+    /// Whether the durable queue can use transport outage recovery.
+    ///
+    /// The durable queue can recover a chain exhausted solely by transport
+    /// errors. Immediate retry loops still use [`Self::is_transient`].
+    #[must_use]
+    pub fn is_transport_unreachable(&self) -> bool {
+        matches!(self, Self::FallbackTransportUnreachable { .. })
+            || matches!(self, Self::Http(error) if self.is_transient() && error.status().is_none())
+    }
+
     /// Whether the provider reported exhausted credit, quota or billing, or
     /// a disabled account. See [`FailoverClass::QuotaExhausted`].
     #[must_use]
@@ -238,6 +258,7 @@ impl LlmError {
             Self::CapacityBusy(_) => "capacity-busy",
             Self::Schema(_) => "schema",
             Self::AllCandidatesFailed { .. } => "all-candidates-failed",
+            Self::FallbackTransportUnreachable { .. } => "fallback-transport-unreachable",
         }
     }
 }

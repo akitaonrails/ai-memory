@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use ai_memory_llm::types::ChatRequest;
+use ai_memory_llm::types::{ChatRequest, LlmOperationId};
 use ai_memory_llm::{Candidate, FallbackLlmProvider, LlmProvider, OpenAiCompatProvider};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -70,6 +70,61 @@ async fn a_real_connection_error_advances_to_the_next_candidate() {
         .await
         .expect("a real connection error must advance to the next candidate");
     assert_eq!(response.text, "second answer");
+}
+
+#[rstest::rstest]
+#[case::all_unreachable(false, "fallback-transport-unreachable")]
+#[case::mixed_with_http_503(true, "all-candidates-failed")]
+#[tokio::test]
+async fn aggregate_retains_transport_outage_through_open_circuits(
+    #[case] respond_with_503: bool,
+    #[case] expected_class: &str,
+) {
+    let unreachable = closed_port_url().await;
+    let other = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&other)
+        .await;
+    let other_url = if respond_with_503 {
+        format!("{}/v1", other.uri())
+    } else {
+        unreachable.clone()
+    };
+    let chain = FallbackLlmProvider::new(vec![
+        Candidate::new(
+            "openai-compat",
+            "first-model",
+            std::sync::Arc::new(compat_provider(unreachable, "first-model", 5)),
+        ),
+        Candidate::new(
+            "openai-compat",
+            "second-model",
+            std::sync::Arc::new(compat_provider(other_url, "second-model", 5)),
+        ),
+    ]);
+
+    for attempted in [2, 0] {
+        let error = chain
+            .complete_structured_raw_with_operation_id(
+                ChatRequest::user_prompt("hi"),
+                serde_json::json!({"type": "object", "properties": {}}),
+                LlmOperationId::new(),
+            )
+            .await
+            .expect_err("the chain cannot answer");
+        assert_eq!(error.class(), expected_class);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("after {attempted} candidate(s)"))
+        );
+        assert!(
+            !error.is_transient(),
+            "immediate retries must stay disabled"
+        );
+    }
 }
 
 #[tokio::test]

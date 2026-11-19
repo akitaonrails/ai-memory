@@ -3335,6 +3335,40 @@ mod tests {
         assert_eq!(mode, 0o700, "spool dir must be owner-only");
     }
 
+    /// A spool entry carries a static bearer inline. On Windows a new spool
+    /// dir used to inherit the data dir's access list, so a read grant above
+    /// it (a sandbox group on `%LOCALAPPDATA%`) could read every queued
+    /// token. The control file beside the spool proves the grant is there.
+    #[cfg(windows)]
+    #[test]
+    fn enqueue_keeps_a_spooled_bearer_from_a_grant_inherited_from_above() {
+        use super::super::path_util::acl_probe;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        acl_probe::grant_users_read(&data);
+        let control = data.join("control.txt");
+        std::fs::write(&control, "not a secret").unwrap();
+        assert!(acl_probe::names_users(&acl_probe::allowed_sids(&control)));
+
+        let spool = data.join("hook-spool");
+        let entry = entry_for("https://x/hook".into(), "{}".into(), Some("tok"), false);
+        enqueue(&spool, &entry).unwrap();
+
+        let owner = acl_probe::current_sid();
+        let (files, _) = list_entries(&spool).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(std::fs::read_to_string(&files[0]).unwrap().contains("tok"));
+        for path in [spool.clone(), files[0].clone()] {
+            let sids = acl_probe::allowed_sids(&path);
+            assert!(
+                !sids.is_empty() && sids.iter().all(|sid| *sid == owner),
+                "{} must be reachable by the owner alone, got {sids:?}",
+                path.display()
+            );
+        }
+    }
+
     #[test]
     fn enqueue_names_are_unique_in_tight_loop() {
         let tmp = tempfile::tempdir().unwrap();

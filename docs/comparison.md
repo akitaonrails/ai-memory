@@ -302,7 +302,8 @@ ships something ai-memory does not, it is named.
   subagents and an agent that edits its own memory.
 - **From Claude Code's built-in memory:** the same "remember my project"
   convenience, but synced across machines and agents, searchable, usable by a
-  team, and capturing tool lifecycle, where the built-in memory is a per-laptop `MEMORY.md`.
+  team, and capturing tool lifecycle, where the built-in memory is a machine-local
+  `MEMORY.md` index plus topic files for each repository.
 - **From mcp-memory-service:** the switch is fact-rows →
   wiki pages (human-editable markdown truth) and cross-agent handoffs as a
   first-class protocol. Cross-project [agent messaging](agent-messaging.md) is

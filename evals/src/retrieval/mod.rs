@@ -761,6 +761,7 @@ async fn run_config(run: &RunContext<'_>, knobs: &Knobs) -> Result<report::Repor
             );
             score.ingest_ms = ingest_stats.elapsed.as_millis();
             score.raw_hits = outcome.raw_hits;
+            score.vector_stream_active = outcome.vector_stream_active;
             // Read back only after the query, so the measurement never
             // changes what the query saw.
             let reach = if reach_on {

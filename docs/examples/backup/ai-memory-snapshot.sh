@@ -21,7 +21,11 @@
 # systemd unit's Environment= lines. Sample values are commented out.
 : "${REPO_DIR:=$HOME/ai-memory-backup}"           # local mirror checkout, `git init`'d and pointed at a remote
 : "${DATA_SRC:=$HOME/.local/share/ai-memory}"     # ai-memory data dir
-: "${CFG_SRC:=$HOME/.config/ai-memory}"           # ai-memory config dir (may hold provider env files)
+cfg_src_is_default=false
+if [[ -z "${CFG_SRC:-}" ]]; then
+    CFG_SRC="$HOME/.config/ai-memory"              # may hold provider env files
+    cfg_src_is_default=true
+fi
 : "${TARBALL_DIR:=$HOME/backups/ai-memory}"       # second-location tarball drop (external disk, network share, ...)
 : "${LOG_DIR:=$HOME/logs/ai-memory-snapshot}"     # rotated per run
 : "${TARBALL_RETENTION_DAYS:=30}"                 # how long to keep tarballs
@@ -71,12 +75,18 @@ done
 echo "--- rsync data ---"
 rsync -a --delete "${rsync_excludes[@]}" "$DATA_SRC/" "$REPO_DIR/data/"
 
-echo "--- rsync config (secrets excluded) ---"
-config_excludes=()
-for glob in $SECRET_EXCLUDES; do
-    config_excludes+=(--exclude="$glob")
-done
-rsync -a --delete "${config_excludes[@]}" "$CFG_SRC/" "$REPO_DIR/config/"
+if [[ "$cfg_src_is_default" == true && ! -e "$CFG_SRC" && ! -L "$CFG_SRC" ]]; then
+    # Native installs can keep all configuration in DATA_SRC. Leave any
+    # previously mirrored external configuration in place.
+    echo "no separate configuration directory at $CFG_SRC; skipping its mirror"
+else
+    echo "--- rsync config (secrets excluded) ---"
+    config_excludes=()
+    for glob in $SECRET_EXCLUDES; do
+        config_excludes+=(--exclude="$glob")
+    done
+    rsync -a --delete "${config_excludes[@]}" "$CFG_SRC/" "$REPO_DIR/config/"
+fi
 
 cd "$REPO_DIR"
 git add -A

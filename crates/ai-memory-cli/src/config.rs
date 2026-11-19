@@ -4105,8 +4105,10 @@ pub fn hook_auth_header_path_in(data_dir: &Path) -> PathBuf {
 
 /// Persist the bearer for hooks to read, replacing any previous pair.
 ///
-/// Both files are written `0600` inside the data dir, which is itself `0700`.
-/// That is strictly less exposure than the status quo, where the token sat in
+/// Both files are written `0600` inside the data dir, which is itself `0700`;
+/// on Windows each file's access list names only the current account, since
+/// the data dir inherits whatever its ancestors grant. That is strictly less
+/// exposure than the status quo, where the token sat in
 /// the agent's own config file *and* on the command line of every hook and
 /// every `curl` — readable through `/proc/<pid>/cmdline` by any local user for
 /// as long as each ran.
@@ -4206,9 +4208,29 @@ fn write_secret_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             .open(path)?;
         file.write_all(contents)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // Windows has no mode bits here; the data dir's own ACL is the boundary.
+        // Windows has no mode bits, and the file would inherit whatever the
+        // data dir's ancestors grant, so it is narrowed to this account
+        // before the secret goes in. Share mode 0 keeps every other opener
+        // out while this handle is held (changing the access list is not a
+        // shared-access request, so `icacls` still gets through), and the old
+        // contents are only truncated once the narrowing succeeded.
+        use std::io::Write as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)?;
+        crate::commands::path_util::restrict_to_owner(path)?;
+        file.set_len(0)?;
+        file.write_all(contents)?;
+        file.sync_all()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         std::fs::write(path, contents)
     }
 }
@@ -4331,6 +4353,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Windows has no `0600`: the hook credential files used to inherit the
+    /// data dir's access list, so a read grant above it (a sandbox group on
+    /// `%LOCALAPPDATA%`) reached the bearer. Both a fresh pair and one that
+    /// replaces files already carrying the inherited grant must end up
+    /// readable by this account alone. The control file next to them proves
+    /// the grant really is inherited there.
+    #[cfg(windows)]
+    #[test]
+    fn a_persisted_hook_token_drops_a_read_grant_inherited_from_above() {
+        use crate::commands::path_util::acl_probe;
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        std::fs::create_dir_all(&dd).unwrap();
+        acl_probe::grant_users_read(&dd);
+        let control = dd.join("control.txt");
+        std::fs::write(&control, "not a secret").unwrap();
+        assert!(
+            acl_probe::names_users(&acl_probe::allowed_sids(&control)),
+            "the test grant must reach a plain file in the data dir"
+        );
+        // A predecessor written before the fix carries the inherited grant.
+        std::fs::write(hook_auth_token_path_in(&dd), "old-bearer\n").unwrap();
+
+        store_hook_auth_token(&dd, "s3cret-bearer").unwrap();
+
+        let owner = acl_probe::current_sid();
+        for path in [hook_auth_token_path_in(&dd), hook_auth_header_path_in(&dd)] {
+            let sids = acl_probe::allowed_sids(&path);
+            assert!(
+                !sids.is_empty() && sids.iter().all(|sid| *sid == owner),
+                "{} must be readable by the owner alone, got {sids:?}",
+                path.display()
+            );
+        }
+        assert_eq!(read_hook_auth_token(&dd).as_deref(), Some("s3cret-bearer"));
+        assert_eq!(
+            std::fs::read_to_string(hook_auth_header_path_in(&dd)).unwrap(),
+            "Authorization: Bearer s3cret-bearer\n"
+        );
     }
 
     /// Re-running `install-hooks --apply` after `api-key rotate` must leave

@@ -65,6 +65,47 @@ version in [`docs/changelog/`](docs/changelog/):
   It sends one bounded Choice request per eligible query, retains local order on failure, and records validated usage even when an answer is refused.
   Choice probabilities are relative to the candidate pool; leave `min_relevance` unset with this backend. (#2296)
 
+### Fixed
+
+- Kept scheduled mirror and online backups running when a native install
+  stores its configuration in the data directory and has no default
+  external configuration directory. (#2385)
+
+- Avoided scanning every pending wiki path for the next debounce deadline on
+  each filesystem notification, reducing watcher work during bulk edits. (#2354)
+
+- Resumed a reclaimed final session consolidation attempt after graceful
+  shutdown. The pending job stays claimable at the same attempt count after
+  restart, and a provider failure on that attempt still ends it. (#2360)
+
+- `docs/jev-reranker-adapter.md` no longer says the server never thresholds
+  reranker relevance. Since 3.5.0 a `min_relevance` floor and retrieval
+  history read the absolute value, and the choice adapter's relevance is a
+  choice probability, so a floor of 0.2 keeps only the winning hit. The guide
+  and the adapter's docstring now say to leave `min_relevance` unset with a
+  choice adapter. (#2388)
+
+- Kept queued session consolidation eligible for outage recovery when every
+  fallback candidate is unreachable at the HTTP transport layer. (#2384)
+
+- Recorded query vector-stream activity in retrieval eval reports when
+  `explain=true` was requested, exposing queries that ran without the vector
+  stream during local-embedding evaluations. (#1854)
+
+- Kept the macOS menu bar status on the latest poll when an earlier response
+  arrived after a settings or lifecycle refresh. (#2383)
+
+- On Windows, the hook credential files (`auth-token`, `auth-header`) and the
+  directories ai-memory creates as private (the hook spool, `auth-tokens/`, the
+  recovery journal's) no longer inherit read access granted above the data
+  dir. They used to take the access list of `%LOCALAPPDATA%`, so an account
+  given read there, such as a sandbox group, could read the root bearer and
+  every token queued in the spool. Each is now restricted to the account that
+  writes it, the Windows counterpart of the `0600`/`0700` modes used on Unix.
+  The credential files are narrowed again the next time `install-hooks` or
+  `setup` writes them; an existing spool or token directory keeps its access
+  list (see `docs/security-boundaries.md` row 10m). (#2396)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

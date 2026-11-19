@@ -162,11 +162,16 @@ posture, not mechanism: theirs runs autonomously; ours preserves the
 zero-LLM default path and evicts nothing on upgrade.
 
 **Platform development: Claude Code native "auto memory"** shipped
-default-on (v2.1.59): the agent keeps its own `MEMORY.md` plus topic
-files per project, loading the first 200 lines each session. Its
-documented limits are our differentiators: machine-local
-with **no sync**, single-agent (nothing carries to Codex/Cursor/others),
-repo-scoped, no search beyond reading files, no capture of tool
+default-on (v2.1.59 per third-party guides; the official docs name no
+version): the agent keeps a `MEMORY.md` index plus one typed topic file per
+memory, per git repository, loading the first 200 lines or 25 KB of the
+index each session and reading topic files on demand (checked against the
+official docs on 2026-11-14, see
+[`research-anthropic-agent-memory.md`](research-anthropic-agent-memory.md)).
+Its documented limits are our differentiators: machine-local
+with **no sync**, single-agent (nothing carries to Codex/Cursor/others,
+and subagents other than forks do not load it), repo-scoped, no search
+beyond reading files, no capture of tool
 lifecycle, no team story. Two readings, both true: the basic solo
 use case ("remember my project between sessions on this laptop") is
 being absorbed by the platforms; and the platforms are training users
@@ -790,10 +795,19 @@ public, open artifact is the MIT npm client `@liquidlm/cli` (stable v0.1.6).
   deliberate LLM-dependent boundary.
 - Also active, lower relevance for us: MIRIX (multi-agent memory
   specialization), MemOS (scheduling memory like an OS),
-  A-TMA (state-aware memory failure taxonomy), sleep-time compute
-  (Letta: consolidate between sessions, not during). We already do the last
-  by shape (session-end consolidation jobs,
-  scheduled maintenance) without the branding.
+  A-TMA (state-aware memory failure taxonomy).
+- **Sleep-time compute / "dreaming"** (Letta and UC Berkeley,
+  arXiv:2504.13171; Anthropic's "The components of agent memory",
+  2026-11-06). Anthropic's article makes offline consolidation the core
+  mechanism over a transcript → notes → wiki → injected-context hierarchy.
+  Session-end consolidation jobs and scheduled maintenance cover only part of
+  it. The article's clearest result corrects a wrong note against the
+  transcript. Our passes correct forward, when a new session's observations
+  contradict a page; none goes back to the observations behind an existing
+  page. The Managed Agents memory stores and dreams it uses serve agents built
+  on that API and do not plug into a coding harness, so they have no camp
+  entry. Analysis and open questions:
+  [`research-anthropic-agent-memory.md`](research-anthropic-agent-memory.md).
 
 ## 5. What this means for ai-memory - analysis and recommendations
 
@@ -1012,9 +1026,14 @@ benchmarks as a ranking; chasing agentmemory's tool-count
 - Zep/Graphiti: arXiv:2501.13956; getzep.com temporal-KG explainer;
   Neo4j "Graphiti: Knowledge graph memory for an agentic world".
 - Letta: "Is a Filesystem All You Need?" (letta.com blog, Aug 2025).
-- Claude Code auto memory: blog.memoryplugin.com/claude-code-memory,
-  thepromptshelf.dev guide (v2.1.59 default-on; ~/.claude/projects/
-  <project>/memory layout).
+- Claude Code auto memory: official docs code.claude.com/docs/en/memory
+  (read 2026-11-14: layout, 200-line / 25 KB index load, machine-local,
+  per-repository keying); blog.memoryplugin.com/claude-code-memory and
+  the thepromptshelf.dev guide (third-party, the only source for the v2.1.59
+  default-on version).
+- Anthropic, "The components of agent memory" (2026-11-06),
+  anthropic.com/research/components-of-agent-memory; analyzed in
+  [`research-anthropic-agent-memory.md`](research-anthropic-agent-memory.md).
 - Papers: arXiv:2605.19952 (TriMem), arXiv:2605.06716 (Storage→
   Experience survey), arXiv:2605.12493 (LongMemEval-V2), MIRIX
   (Semantic Scholar), MemOS listings.

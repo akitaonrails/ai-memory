@@ -32,7 +32,7 @@
 //! External writes drive store updates; internal writes drive disk +
 //! store updates via [`Wiki::write_page`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -214,6 +214,9 @@ struct PendingEntry {
 #[derive(Debug, Default)]
 struct PendingDebounce {
     entries: HashMap<PathBuf, PendingEntry>,
+    // Keep one timer key per path so a large edit batch does not rescan
+    // every pending path after each new notification.
+    deadlines: BTreeSet<(tokio::time::Instant, PathBuf)>,
 }
 
 impl PendingDebounce {
@@ -223,29 +226,32 @@ impl PendingDebounce {
 
     fn record(&mut self, path: PathBuf, kind: EventKind, now: tokio::time::Instant) {
         let deadline = now + DEBOUNCE_WINDOW;
-        self.entries
-            .entry(path)
-            .and_modify(|entry| {
-                entry.kind = merge_event_kind(entry.kind, kind);
-                entry.deadline = deadline;
-            })
-            .or_insert(PendingEntry { kind, deadline });
+        if let Some(entry) = self.entries.get_mut(&path) {
+            let old_key = (entry.deadline, path);
+            self.deadlines.remove(&old_key);
+            entry.kind = merge_event_kind(entry.kind, kind);
+            entry.deadline = deadline;
+            self.deadlines.insert((deadline, old_key.1));
+        } else {
+            self.entries
+                .insert(path.clone(), PendingEntry { kind, deadline });
+            self.deadlines.insert((deadline, path));
+        }
     }
 
     fn next_deadline(&self) -> Option<tokio::time::Instant> {
-        self.entries.values().map(|entry| entry.deadline).min()
+        self.deadlines.first().map(|(deadline, _)| *deadline)
     }
 
     fn drain_ready(&mut self, now: tokio::time::Instant) -> Vec<(PathBuf, EventKind)> {
         let mut ready = Vec::new();
-        self.entries.retain(|path, entry| {
-            if entry.deadline <= now {
-                ready.push((path.clone(), entry.kind));
-                false
-            } else {
-                true
+        while self.next_deadline().is_some_and(|deadline| deadline <= now)
+            && let Some((_, path)) = self.deadlines.pop_first()
+        {
+            if let Some(entry) = self.entries.remove(&path) {
+                ready.push((path, entry.kind));
             }
-        });
+        }
         ready
     }
 }
@@ -3931,6 +3937,56 @@ mod tests {
             second,
             vec![(path_b, EventKind::Create(notify::event::CreateKind::File))]
         );
+    }
+
+    #[test]
+    fn rescheduling_the_earliest_path_leaves_no_stale_deadline() {
+        let mut pending = PendingDebounce::new();
+        let t0 = tokio::time::Instant::now();
+        let t1 = t0 + Duration::from_millis(1);
+        let t2 = t0 + Duration::from_millis(2);
+        let a = PathBuf::from("a.md");
+        let b = PathBuf::from("b.md");
+        let modify = EventKind::Modify(notify::event::ModifyKind::Any);
+        let remove = EventKind::Remove(notify::event::RemoveKind::File);
+
+        pending.record(a.clone(), modify, t0);
+        pending.record(b.clone(), modify, t1);
+        assert_eq!(pending.next_deadline(), Some(t0 + DEBOUNCE_WINDOW));
+        pending.record(a.clone(), remove, t2);
+
+        assert_eq!(pending.next_deadline(), Some(t1 + DEBOUNCE_WINDOW));
+        assert!(pending.drain_ready(t0 + DEBOUNCE_WINDOW).is_empty());
+        assert_eq!(pending.drain_ready(t1 + DEBOUNCE_WINDOW), vec![(b, modify)]);
+        assert_eq!(pending.next_deadline(), Some(t2 + DEBOUNCE_WINDOW));
+        assert_eq!(pending.drain_ready(t2 + DEBOUNCE_WINDOW), vec![(a, remove)]);
+        assert!(pending.drain_ready(t2 + DEBOUNCE_WINDOW).is_empty());
+        assert_eq!(pending.next_deadline(), None);
+    }
+
+    #[test]
+    fn paths_with_equal_deadlines_are_each_drained_once() {
+        let mut pending = PendingDebounce::new();
+        let now = tokio::time::Instant::now();
+        let deadline = now + DEBOUNCE_WINDOW;
+        let path_a = PathBuf::from("a.md");
+        let path_b = PathBuf::from("b.md");
+        let modify = EventKind::Modify(notify::event::ModifyKind::Any);
+        pending.record(path_a.clone(), modify, now);
+        pending.record(path_b.clone(), modify, now);
+        pending.record(path_a.clone(), modify, now);
+
+        assert_eq!(pending.next_deadline(), Some(deadline));
+        assert!(
+            pending
+                .drain_ready(deadline - Duration::from_millis(1))
+                .is_empty()
+        );
+        let mut ready = pending.drain_ready(deadline);
+        ready.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(ready, vec![(path_a, modify), (path_b, modify)]);
+        assert!(pending.drain_ready(deadline).is_empty());
+        assert_eq!(pending.next_deadline(), None);
     }
 
     #[test]

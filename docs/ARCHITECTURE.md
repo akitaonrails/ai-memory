@@ -1965,6 +1965,9 @@ the server URL is loopback and no `default` server profile is registered.
   [`research-ecc.md`](research-ecc.md),
   [`research-codebase-memory-mcp.md`](research-codebase-memory-mcp.md):
   prior art studied.
+* [`docs/research-anthropic-agent-memory.md`](research-anthropic-agent-memory.md):
+  Anthropic's memory-hierarchy and dreaming findings, Claude Code's native
+  memory, and how ai-memory maps onto both.
 * [`docs/auto-improvement-loop.md`](auto-improvement-loop.md):
   Hermes Agent-inspired learning-loop research and safety boundaries.
 * [`docs/issues-*.md`](.): concrete failure modes we've designed to
