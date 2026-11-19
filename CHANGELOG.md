@@ -23,8 +23,8 @@ version in [`docs/changelog/`](docs/changelog/):
   under the `"hooks"` key of `config.json` (while `--config-file .devin/hooks.v1.json`
   continues to write the flat project-level event map), `install-mcp --client devin`
   writes `mcp_config.json`, `install-skills --scope global --agent devin`
-  writes `skills/`, and `backup-agents` / `restore-agents` / `uninstall` handle
-  both the new layout and legacy `~/.devin/` paths. (#2379)
+  writes `skills/`, and `backup-agents` captures the new layout, and `restore-agents` /
+  `uninstall` handle both the new layout and legacy `~/.devin/` paths. (#2379)
 
 - Kept canonical project names ambiguous when a legacy twin holds sent or
   received messages, including retained history. Name-based mailbox access and
