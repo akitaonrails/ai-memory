@@ -13,6 +13,17 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Local in-process embeddings (`embedding_provider = "local"`) now offer a
+  checksum-pinned multilingual model for non-English wikis:
+  `intfloat/multilingual-e5-small` (also accepted via the shorthand alias
+  `multilingual-e5-small`, 384-dim, ~470 MB, stored under
+  `<data_dir>/models/multilingual-e5-small/`). `all-MiniLM-L6-v2` remains the
+  default. `LocalEmbedder` automatically prepends E5's asymmetric `"query: "`
+  and `"passage: "` prefixes ahead of truncation, reports the canonical model
+  id so switching local models triggers the existing mismatch guard
+  (`ai-memory embed --force`), and rejects unknown local model names loudly at
+  config load. (#2369)
+
 - `memory_patch_page` accepts `scope: "global"`, like `memory_read_page` and
   `memory_write_page`, so a page read from the global scope can be patched with
   the `page_id` that read returned. Before, the patch looked in the current

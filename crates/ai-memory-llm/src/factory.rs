@@ -182,10 +182,10 @@ pub enum EmbedderChoice {
     /// OpenAI-compatible embeddings endpoint (Ollama / LM Studio /
     /// vLLM). Keyless-capable; base URL, model, and dim are required.
     OpenAiCompat,
-    /// In-process pure-Rust embeddings (all-MiniLM-L6-v2, 384-dim) —
-    /// no API key, no server. Requires the model files under
-    /// `<data_dir>/models/` (fetched at serve startup or dropped in
-    /// manually; docs/local-embeddings.md).
+    /// In-process pure-Rust embeddings (`all-MiniLM-L6-v2` by default, or
+    /// `intfloat/multilingual-e5-small`; both 384-dim) — no API key, no
+    /// server. Requires the model files under `<data_dir>/models/` (fetched
+    /// at serve startup or dropped in manually; docs/local-embeddings.md).
     #[cfg(feature = "local-embeddings")]
     Local,
     /// GitHub Copilot's OpenAI-compatible `/embeddings` endpoint. Reuses the
@@ -304,7 +304,8 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             let models_dir = config.models_dir.ok_or_else(|| {
                 LlmError::NotConfigured("local embeddings need the data dir's models/ root".into())
             })?;
-            Arc::new(crate::local::LocalEmbedder::load(&models_dir)?)
+            let spec = crate::local::resolve_local_model(&config.model)?;
+            Arc::new(crate::local::LocalEmbedder::load_model(&models_dir, spec)?)
         }
         EmbedderChoice::Copilot => {
             let auth = config.copilot_auth.ok_or_else(|| {
@@ -336,7 +337,9 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
         (EmbedderChoice::Voyage, "voyage-3-large") => Some(1024),
         (EmbedderChoice::Voyage, _) => Some(1024),
         #[cfg(feature = "local-embeddings")]
-        (EmbedderChoice::Local, _) => Some(crate::local::LOCAL_DIM),
+        (EmbedderChoice::Local, model) => {
+            crate::local::resolve_local_model(model).ok().map(|s| s.dim)
+        }
         (EmbedderChoice::Google, "gemini-embedding-2") => Some(768),
         (EmbedderChoice::Google, "gemini-embedding-001") => Some(768),
         (EmbedderChoice::Google, _) => Some(768),
@@ -953,5 +956,50 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(crate::DEFAULT_USER_AGENT),
         );
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn try_default_embedding_dim_resolves_local_models_and_rejects_unknown() {
+        assert_eq!(
+            try_default_embedding_dim(EmbedderChoice::Local, "all-MiniLM-L6-v2"),
+            Some(384)
+        );
+        assert_eq!(
+            try_default_embedding_dim(EmbedderChoice::Local, "intfloat/multilingual-e5-small"),
+            Some(384)
+        );
+        assert_eq!(
+            try_default_embedding_dim(EmbedderChoice::Local, "multilingual-e5-small"),
+            Some(384)
+        );
+        assert_eq!(
+            try_default_embedding_dim(EmbedderChoice::Local, "unknown-local-model"),
+            None
+        );
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn build_embedder_rejects_unknown_local_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = EmbedderConfig {
+            provider: EmbedderChoice::Local,
+            model: "unknown-local-model".into(),
+            dim: 384,
+            api_key: SecretString::from(String::new()),
+            base_url: None,
+            models_dir: Some(tmp.path().to_path_buf()),
+            copilot_auth: None,
+            defaulted: false,
+            query_prefix: String::new(),
+            document_prefix: String::new(),
+        };
+        let err = match build_embedder(cfg) {
+            Ok(_) => panic!("unknown local model must be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, LlmError::NotConfigured(_)), "{err}");
+        assert!(err.to_string().contains("unknown-local-model"), "{err}");
     }
 }

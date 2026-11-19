@@ -3172,42 +3172,53 @@ async fn configure_embedder(
     // the files into models/ by hand and never hit the network.
     if cfg.provider == ai_memory_llm::EmbedderChoice::Local
         && let Some(models_dir) = cfg.models_dir.as_deref()
-        && !ai_memory_llm::model_present(models_dir)
     {
-        if defaulted {
-            // Best-effort default (docs/local-embeddings.md): never
-            // block startup on an ~87 MB download. Fetch in the
-            // background; THIS boot runs without an embedder (the
-            // pre-2.0 behaviour), the next start finds the files and
-            // enables hybrid search. Offline hosts just log the warn.
-            let models_dir = models_dir.to_path_buf();
-            tokio::spawn(async move {
-                tracing::info!(
-                    dir = %models_dir.display(),
-                    "fetching the default local embedding model in the \
-                     background (~87 MB, one time); hybrid search enables \
-                     on the next start"
-                );
-                if let Err(e) = ai_memory_llm::fetch_model(&models_dir).await {
-                    tracing::warn!(
-                        error = %e,
-                        "default local embedding model fetch failed; running \
-                         without an embedder. Set embedding_provider = \"none\" \
-                         to opt out, or install offline per \
-                         docs/local-embeddings.md"
+        let spec = ai_memory_llm::resolve_local_model(&cfg.model)?;
+        if !ai_memory_llm::model_present_for(models_dir, spec) {
+            if defaulted {
+                // Best-effort default (docs/local-embeddings.md): never
+                // block startup on a model download. Fetch in the
+                // background; THIS boot runs without an embedder (the
+                // pre-2.0 behaviour), the next start finds the files and
+                // enables hybrid search. Offline hosts just log the warn.
+                let models_dir = models_dir.to_path_buf();
+                tokio::spawn(async move {
+                    tracing::info!(
+                        dir = %models_dir.display(),
+                        model = spec.id,
+                        approx_mb = spec.approx_download_mb,
+                        "fetching the default local embedding model in the \
+                         background (~{} MB, one time); hybrid search enables \
+                         on the next start",
+                        spec.approx_download_mb
                     );
-                }
-            });
-            return Ok((wiki, None));
+                    if let Err(e) = ai_memory_llm::fetch_model_for(&models_dir, spec).await {
+                        tracing::warn!(
+                            model = spec.id,
+                            error = %e,
+                            "default local embedding model fetch failed; running \
+                             without an embedder. Set embedding_provider = \"none\" \
+                             to opt out, or install offline per \
+                             docs/local-embeddings.md"
+                        );
+                    }
+                });
+                return Ok((wiki, None));
+            }
+            tracing::info!(
+                dir = %models_dir.display(),
+                model = spec.id,
+                approx_mb = spec.approx_download_mb,
+                "local embedding model not present; fetching (~{} MB, one time)",
+                spec.approx_download_mb
+            );
+            ai_memory_llm::fetch_model_for(models_dir, spec)
+                .await
+                .context(
+                    "fetching the local embedding model (set up offline per \
+                     docs/local-embeddings.md if this host has no network)",
+                )?;
         }
-        tracing::info!(
-            dir = %models_dir.display(),
-            "local embedding model not present; fetching (~87 MB, one time)"
-        );
-        ai_memory_llm::fetch_model(models_dir).await.context(
-            "fetching the local embedding model (set up offline per \
-             docs/local-embeddings.md if this host has no network)",
-        )?;
     }
     let embedder = match build_embedder(cfg) {
         Ok(e) => e,

@@ -2,23 +2,32 @@
 
 *2.0 item 5.* `AI_MEMORY_EMBEDDING_PROVIDER=local` runs sentence
 embeddings in-process, with no API key, external server, or GPU
-required. It uses pure-Rust BERT inference (candle) with
-`all-MiniLM-L6-v2` (384-dim), the sentence-transformers model the
-comparable memory servers ship by default.
+required. It uses pure-Rust BERT inference (candle) and ships two
+checksum-pinned 384-dim models:
+
+- `all-MiniLM-L6-v2` (default, ~87 MB, Apache-2.0) — the English-focused
+  sentence-transformers workhorse the comparable memory servers ship by
+  default.
+- `intfloat/multilingual-e5-small` (alias `multilingual-e5-small`, ~470 MB,
+  MIT) — covers ~100 languages for non-English or mixed-language wikis.
+  The loader applies E5's asymmetric `"query: "` and `"passage: "`
+  prefixes automatically (no `embedding_query_prefix` /
+  `embedding_document_prefix` setting needed).
 
 **As of 2.0 this is the default**: an install with no
-`embedding_provider` configured gets local embeddings automatically, on a
-best-effort basis. The model downloads in the background on the first start
-(hybrid search enables on the next restart) and existing pages are
-backfilled automatically. A host that cannot fetch the model (or a
-slim build without the feature) keeps the FTS-only behaviour
-with a warning. Opt out with `embedding_provider = "none"`; an
+`embedding_provider` configured gets local embeddings (`all-MiniLM-L6-v2`)
+automatically, on a best-effort basis. The model downloads in the
+background on the first start (hybrid search enables on the next restart)
+and existing pages are backfilled automatically. A host that cannot fetch
+the model (or a slim build without the feature) keeps the FTS-only
+behaviour with a warning. Opt out with `embedding_provider = "none"`; an
 explicitly configured provider is never overridden.
 
 ```toml
 # config.toml — all optional as of 2.0
-embedding_provider = "local"     # explicit: hard-fails if unavailable
-# embedding_provider = "none"    # opt out of vectors entirely
+embedding_provider = "local"                           # explicit: hard-fails if unavailable
+# embedding_model  = "intfloat/multilingual-e5-small"  # or alias "multilingual-e5-small"
+# embedding_provider = "none"                          # opt out of vectors entirely
 ```
 
 ## Why: semantic recall without data egress
@@ -64,11 +73,15 @@ sandboxed nix build). If a future model requires an ONNX-only runtime, the
 
 ## The model files
 
-The binary does not bundle the model (~87 MB). On the first start with
-`local` configured, the server fetches three files into
-`<data_dir>/models/all-MiniLM-L6-v2/`. Each is verified against a sha256
-pinned in the source, so a drifted or tampered upstream file fails
-loudly instead of silently changing every vector:
+The binary does not bundle the model weights. On the first start with
+`local` configured, the server fetches three files for the selected model
+into `<data_dir>/models/<dir>/`. Each is verified against a sha256 pinned
+in the source, so a drifted or tampered upstream file fails loudly instead
+of silently changing every vector.
+
+### `all-MiniLM-L6-v2` (default, ~87 MB, Apache-2.0)
+
+Directory: `<data_dir>/models/all-MiniLM-L6-v2/`
 
 | file | sha256 (pinned 2026-09-01) |
 |---|---|
@@ -76,20 +89,37 @@ loudly instead of silently changing every vector:
 | `tokenizer.json` | `be50c362…` |
 | `config.json` | `953f9c0d…` |
 
-**Offline installs**: download the three files from
+Offline base URL:
 `https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/`
-on any machine and drop them into the directory above; the loader
-verifies the same checksums and never touches the network. The model
-is Apache-2.0.
+
+### `intfloat/multilingual-e5-small` (~470 MB, MIT)
+
+Directory: `<data_dir>/models/multilingual-e5-small/`
+
+| file | sha256 (pinned revision `614241f6`) |
+|---|---|
+| `model.safetensors` | `1a55775f…` |
+| `tokenizer.json` | `0b44a9d7…` |
+| `config.json` | `69137736…` |
+
+Offline base URL:
+`https://huggingface.co/intfloat/multilingual-e5-small/resolve/614241f622f53c4eeff9890bdc4f31cfecc418b3/`
+
+**Offline installs**: download the three files for your chosen model from
+its base URL above on any network-connected machine and drop them into its
+directory under `<data_dir>/models/`; the loader verifies the same
+checksums and never touches the network.
 
 ## Coexistence and migration
 
 Nothing is forced. `(provider, model, dim)` is stored on every
 embedding row, and hybrid search ignores vectors whose triple does not
 match the configured embedder. Local vectors therefore sit beside any
-provider vectors you already have, and switching back is a config
-change. `ai-memory embed --force` re-embeds a project under the
-current provider when you want one consistent set.
+provider vectors you already have — and switching between
+`all-MiniLM-L6-v2` and `intfloat/multilingual-e5-small` triggers the same
+mismatch guard, because the stored `model` identity differs. Run
+`ai-memory embed --force` to re-embed a project immediately under the new
+model (or wait for scheduled backfill).
 
 Existing installs keep their configured provider; `local` is opt-in.
 Fresh-install defaults are decided by benchmark numbers.
