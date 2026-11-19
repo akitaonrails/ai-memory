@@ -162,12 +162,17 @@ On a 30-candidate pool that wording moved the 35B from 0.828 to 0.879 hit@1
 below is the earlier choice-versus-rubric comparison, not that wording test.
 
 That is deliberately the substitution the caveat below used to warn about.
-It is sound here because the reranker's consumer is sort-only: the
-server reorders candidates by `relevance` and never thresholds or sums its
-absolute value, and a per-question monotonic map preserves order exactly.
-The old warning applies to consumers that *read* absolute relevance
-grades; the reranker leg does not, and the caveat below is now scoped to
-that case.
+It is sound for ordering: the server reorders candidates by `relevance`,
+and a per-question monotonic map preserves order exactly. It is not sound
+for the two places that read the absolute value since ai-memory 3.5.0. A
+`min_relevance` floor (per call, a project's `[retrieval] min_relevance`,
+or the global one) drops every hit scoring below it, and with a choice
+adapter only the winner scores high, so a floor of 0.2 keeps one hit or
+none. Retrieval history (`[retrieval] record_history`) stores each hit's
+`relevance` as its calibrated score; with this adapter that value is a
+choice probability. Leave `min_relevance` unset when the reranker
+runs through a choice adapter, and read recorded relevance as ordering
+only.
 
 Measured on one production deployment (same 102-query golden set, same
 live server and backend, end-to-end through the adapter):
@@ -188,11 +193,12 @@ models collapse (0.596 on 4B vs 0.636 on 35B); in the choice shape the
 same 4B overtakes the 35B. If your backend is a small replay-trained
 judge, the choice adapter is the difference between usable and not.
 
-Prefer the choice adapter when the reranker leg is the only consumer.
-Keep the rubric adapter if anything downstream reads absolute relevance
-grades (thresholding, logging heuristics, score fusion), because choice
-probabilities carry no absolute meaning and their scale shifts with
-candidate count.
+Prefer the choice adapter when nothing reads the absolute relevance: no
+`min_relevance` floor is set and recorded relevance is not compared across
+queries. Use the rubric adapter (recoverable as shown at the top of this
+page) or the built-in chat reranker if anything does (a `min_relevance`
+floor, logging heuristics, score fusion), because choice probabilities
+carry no absolute meaning and their scale shifts with candidate count.
 
 ## Caveats
 
@@ -201,12 +207,14 @@ candidate count.
   scoring) breaks first: reranker requests would be proxied to the hosted
   model, which is the pre-adapter behavior, not an outage.
 - Rubric scoring produces absolute relevance grades. If anything
-  downstream of `relevance` reads absolute values (thresholding, fusion,
-  logged heuristics), keep the rubric adapter: per-candidate choice
-  probabilities from the choice adapter are normalized across the whole
-  candidate list (winner ≈ 0.99, rest ≈ 0.001, scale shifts with
-  candidate count) and carry ordering information only. The sort-only
-  reranker leg itself reads no absolute values, which is why the choice
-  variant is safe to substitute for it.
+  downstream of `relevance` reads absolute values (a `min_relevance`
+  floor, fusion, logged heuristics), keep the rubric adapter: per-candidate
+  choice probabilities from the choice adapter are normalized across the
+  whole candidate list (winner ≈ 0.99, rest ≈ 0.001, scale shifts with
+  candidate count) and carry ordering information only. The server cannot
+  tell the two apart, so a floor set with a choice adapter in place filters
+  on probabilities without any warning. The reordering itself reads no
+  absolute values, which is why the choice variant is safe to substitute
+  when no floor is set.
 - Run the adapter on loopback or a trusted private network. It forwards
   `Authorization` headers verbatim and adds no authentication of its own.
