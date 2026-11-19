@@ -34,7 +34,7 @@ version in [`docs/changelog/`](docs/changelog/):
   longer returns when the only thing admitting it is a `general` candidate
   older than the removal. Entries an earlier version already wrote stay:
   list them with `ai-memory profile review` and remove the ones you do not
-  want with `ai-memory profile forget <path>`.
+  want with `ai-memory profile forget <path>`. (#2372)
 
 ## [3.5.0] - 2026-11-18
 
