@@ -11,7 +11,7 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
 - `memory_patch_page` accepts `scope: "global"`, like `memory_read_page` and
   `memory_write_page`, so a page read from the global scope can be patched with
@@ -19,8 +19,8 @@ version in [`docs/changelog/`](docs/changelog/):
   project and failed with `latest is no page`, which read as a concurrent
   delete. A patch whose path has no page in the resolved project still fails as
   `precondition_failed`, and its message now says to pass `scope: "global"` for
-  a global page. The
-  TypeScript SDK exposes it as `pages.patch({ global: true })`. (#2362)
+  a global page. The TypeScript SDK exposes it as
+  `pages.patch({ global: true })`. (#2362, #2363)
 
 ## [3.5.0] - 2026-11-18
 
