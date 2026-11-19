@@ -61,6 +61,22 @@ always names the reserved `_global` project in the default workspace. Sibling
 projects use `[[project:path]]`; another workspace uses
 `[[workspace/project:path]]`. Bare `[[name]]` stays inside the current project.
 
+## Recipe: stop the agent repeating something you rejected
+
+> "No, don't mock the database in this integration test. Last month a mock hid
+> a broken migration; use the shared test Postgres."
+
+With an LLM provider configured you don't have to ask for this to be
+remembered. After the session completes, the auto-improvement reviewer picks
+up a correction that comes with a reason, whatever language you wrote it in.
+It proposes a `_rules/` page, or a patch to the one already on that topic,
+saying what to avoid, why, and what to do instead, and it quotes your words as
+evidence. The proposal goes through your `[auto_improve]` approval policy. A
+plain "no" or a one-off rename does not become a rule. Details and limits are
+in [`auto-improvement-loop.md`](auto-improvement-loop.md#user-corrections).
+If the agent still repeats the mistake with the rule in place, turn the rule
+into a hook or a test.
+
 ## Recipe: notice when a page's code has changed
 
 > "Remember this deploy gotcha; it is about `bin/deploy.sh`."
@@ -330,6 +346,12 @@ compacted or merged stays in git and the supersession chain, recoverable with
 - **Keep used memory longer:** nothing to configure. A page you open, search,
   or reach through a related-pages walk is reinforced automatically and resists
   decay.
+- **Check for contradictions on a schedule:** set `[maintenance]
+  lint_llm_interval_secs = 604800` to run the LLM contradiction pass weekly
+  across every project, with the `lint` provider (`[llm.lint]` or the default
+  one). `memory_briefing` then reports the warning count of each project's
+  `_lint/report.md`, and a session start in a project with warnings gets one
+  line pointing at the report.
 - **Review similar knowledge:** run `memory_lint` (through your agent or the
   CLI); with embeddings configured it emits `similarity_candidate` findings
   for same-topic page pairs, advisory only. Similarity reads shared vocabulary

@@ -123,6 +123,7 @@ async fn seed_ended_session_summary(
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -223,6 +224,7 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -398,6 +400,8 @@ async fn purge_session_reports_file_cleanup_failure_after_db_commit() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeSession],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -547,6 +551,8 @@ async fn purge_session_dry_run_does_not_dispatch_admission_webhook() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeSession],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -595,6 +601,8 @@ async fn purge_session_unknown_session_is_404_before_admission_and_checkpoint() 
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeSession],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -920,6 +928,7 @@ async fn purge_session_dry_run_and_confirmed_purge_both_report_collateral_damage
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1321,6 +1330,8 @@ async fn purge_project_rejecting_admission_leaves_source_intact() {
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::PurgeProject],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let wiki = Wiki::new(tmp.path(), store.writer.clone())
@@ -1594,6 +1605,8 @@ async fn purge_project_dry_run_does_not_dispatch_admission_webhook() {
         failure_policy: FailurePolicy::Ignore,
         events: vec![AdmissionOp::PurgeProject],
         blocking: false,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let (state, store) = make_state_with_chain(&tmp, Some(chain)).await;
@@ -1701,6 +1714,7 @@ async fn purge_project_dry_run_counts_observations_stamped_from_another_projects
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -1844,6 +1858,7 @@ async fn purge_project_dry_run_and_confirmed_purge_both_report_collateral_damage
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();

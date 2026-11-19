@@ -9,6 +9,7 @@ mod history_replay;
 mod operations;
 mod pending;
 mod recall_trace;
+mod retrievals;
 mod routes;
 mod workstreams;
 
@@ -16,6 +17,8 @@ mod workstreams;
 mod management;
 
 mod contextual;
+
+mod design_tokens;
 
 mod localization;
 

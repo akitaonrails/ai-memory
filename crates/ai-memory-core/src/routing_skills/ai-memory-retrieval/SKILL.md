@@ -6,7 +6,7 @@ description: "Use this skill for any request whose goal is read-only retrieval f
 
 # ai-memory retrieval
 
-Use this skill for read-only ai-memory lookups, catch-up, and evaluating remembered project knowledge before you design, debug, or edit.
+Use this skill for read-only ai-memory lookups, catch-up, and evaluating remembered project knowledge before you design, debug, or edit. When the harness has no ai-memory MCP tools, every tool these skills name can be called as `ai-memory call <tool> '<json>'`.
 
 ## Tools in this cluster
 

@@ -10,13 +10,13 @@
 <section class="surface installation-status" aria-label="{{ i18n.text("web-effective-installation-state") }}">
 <details {% if doc.id == "features" %}open{% endif %}><summary>{{ i18n.text("web-effective-installation-state-and-next-steps") }}</summary>
 <p class="section-note">{{ i18n.text("web-these-facts-describe-this-server-and-your-current-access-provider-health-browser-pref") }} <a href="../api/v1/docs/features/status">{{ i18n.text("web-read-status-json") }}</a></p>
-<div class="feature-status-grid">{% for feature in features %}<section class="feature-status" data-feature="{{ feature.id }}"><h2>{{ i18n.label(feature.title) }}</h2><p><strong>{{ i18n.label(feature.state) }}</strong></p><p>{{ i18n.label(feature.detail) }}</p><p class="section-note">{{ i18n.text("web-next-step") }} {{ i18n.label(feature.next_step) }}</p><a href="docs/{{ feature.guide }}">{{ i18n.text("web-setup-guide") }}</a></section>{% endfor %}</div>
+<div class="feature-status-grid">{% for (feature, guide) in features %}<section class="feature-status" data-feature="{{ feature.id }}"><h2>{{ i18n.label(feature.title) }}</h2><p><strong>{{ i18n.label(feature.state) }}</strong></p><p>{{ i18n.label(feature.detail) }}</p><p class="section-note">{{ i18n.text("web-next-step") }} {{ i18n.label(feature.next_step) }}</p><a href="docs/{{ guide }}">{{ i18n.text("web-setup-guide") }}</a></section>{% endfor %}</div>
 </details></section>
 {% endif %}
 <div class="docs-layout">
-<aside class="surface docs-sidebar" aria-label="{{ i18n.text("web-documentation-guides") }}"><details open><summary>{{ i18n.text("web-browse-guides") }}</summary><nav>{% for item in sidebar %}<a href="docs/{{ item.id }}" {% if item.id == doc.id %}aria-current="page"{% endif %}>{{ item.title }}</a>{% endfor %}</nav></details></aside>
+<aside class="surface docs-sidebar" aria-label="{{ i18n.text("web-documentation-guides") }}"><details open><summary>{{ i18n.text("web-browse-guides") }}</summary><nav>{% for item in sidebar %}<a href="docs/{{ item.id }}" {% if item.id == doc.id %}aria-current="page"{% endif %}>{{ i18n.label(item.title) }}</a>{% endfor %}</nav></details></aside>
 {% if !outline.is_empty() %}<aside class="docs-outline" aria-label="{{ i18n.text("web-on-this-page") }}"><details open><summary>{{ i18n.text("web-on-this-page") }}</summary><nav>{% for entry in outline %}{% if entry.level <= 3 %}<a href="{{ current_href }}#{{ entry.id }}" class="toc-level-{{ entry.level }}">{{ entry.text }}</a>{% endif %}{% endfor %}</nav></details></aside>{% endif %}
-<article class="surface docs-article"><p class="docs-source">{{ i18n.text("web-source") }} <code>{{ doc.source }}</code> {{ i18n.text("web-included-in-this-server-build") }}</p><div class="markdown-body">{{ html|safe }}</div><a class="secondary-button" href="docs">{{ i18n.text("web-all-documentation") }}</a></article>
+<article class="surface docs-article"><p class="docs-source">{{ i18n.text("web-source") }} <code>{{ source }}</code> {{ i18n.text("web-included-in-this-server-build") }}</p><div class="markdown-body">{{ html|safe }}</div><a class="secondary-button" href="docs">{{ i18n.text("web-all-documentation") }}</a></article>
 </div>
 <script>
 const releaseSelect=document.getElementById("release-version");

@@ -282,6 +282,7 @@ async fn configured_stopword_list_removes_noise_from_observation_search() {
             actor_user: None,
 
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();

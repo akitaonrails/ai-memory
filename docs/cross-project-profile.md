@@ -197,10 +197,12 @@ is new since the last one.
   task brief or a pasted review, not you. Text you did not write is skipped
   as well: a harness turn stored as a prompt (Claude Code's
   `<task-notification>` blocks), Claude Code cross-session/plugin turns and
-  side-agent quote blocks, the instruction files Codex injects as a user
-  message, and ai-memory's own routing snippet or recalled-history digest
-  pasted into a prompt (only that block; your sentences around it still
-  count). A prompt written by a program driving the agent through its SDK is
+  side-agent quote blocks, a Claude desktop sub-session's agent-written brief
+  with its shared-notes footer, Codex's app-generated request for a suggested
+  next message, the instruction files Codex injects as a user message, a file
+  attached to the prompt (a `<context ref="…">` block), and ai-memory's own
+  routing snippet or recalled-history digest pasted into a prompt (only that
+  block; your sentences around it still count). A prompt written by a program driving the agent through its SDK is
   skipped whole: one that wraps a transcript ("Here is a conversation between
   a user and a coding agent…") or asks for a verbatim reply ("Reply with
   exactly…") is a summarizer or a demo, and its instructions are the program's,
@@ -213,7 +215,23 @@ is new since the last one.
 - **Curated pages** of the project: `_rules/`, `decisions/`, `gotchas/` and
   `procedures/`. A page contributes its `summary`, or else its first line of
   prose; metadata fields such as `**Status:** Accepted` or `**Date:**` at the
-  top of an ADR are skipped. A page the auto-improve scheduler auto-approved
+  top of an ADR are skipped. Where the page is filed decides what its
+  statement needs. A page under `_rules/` or `procedures/` is a rule by where
+  you put it, whatever its wording. A page under `decisions/` or `gotchas/`
+  can be a session log, an approval or a fact about one system, so its
+  statement counts only when it has the shape a prompt sentence needs (a
+  marker such as *always*, *never*, *prefer*, *instead of*, plus an action or
+  a comparison): "Always use pnpm instead of npm." counts, "Plan approved by
+  the user." does not, however many projects repeat it. In any directory a
+  statement that is a record or a pointer is skipped: one that opens with a
+  wikilink and at most two other words ("Continues [[decisions/…]].",
+  "See [[other-page]]"), or one with a full date outside parentheses and no
+  marker ("Rules reviewed on 2026-11-13."). A rule that cites a date in
+  parentheses ("… (decided 2026-10-22)"), says when it starts ("From
+  2026-10-22, always …") or ends on a link is still a rule, and a month/year
+  stamp such as "11/2026" is not a date. A rule page whose first line is only
+  a dated note is therefore dropped: put the rule first, or give the page a
+  `summary`. A page the auto-improve scheduler auto-approved
   is skipped too: model output nobody reviewed is not curated, but a page a
   human approved still counts.
 - **Stack signals**: the languages the project's activity shows (from file
@@ -233,7 +251,10 @@ becomes an entry when:
 - the same choice shows up in at least `min_projects` projects (default 2).
   The same sentence arriving in several projects within an hour counts as one
   project: that is one message fanned out to several checkouts (a lead agent
-  briefing its workers), not a habit. And one sentence backs at most one
+  briefing its workers), not a habit. The same statement from the same page
+  path in several projects also counts as one project, whenever each was
+  read: that is one page that reached another project, not a rule each
+  project keeps. And one sentence backs at most one
   entry, so a statement the classifier splits into two topics does not
   produce duplicate pages.
 
@@ -436,6 +457,39 @@ A marker that sets only `[profile]` keys is a settings boundary, like one
 that sets `[briefing]` keys: an outer marker's `workspace`/`project` do not
 apply through it. `ai-memory profile status` lists the projects that opted out
 of contributing.
+
+## Keeping orchestrator briefs out of the profile
+
+An orchestrator that launches agents non-interactively (a nightly batch, or a
+pane manager that opens each session with a generated brief) is a different
+case from a project you want to exclude. The work those sessions do is worth
+capturing, but their opening brief is not something you said, and a rule-shaped
+sentence in it ("never push", "this run is read-only") can otherwise be
+harvested as your own preference and delivered to every project.
+
+Mark those sessions at launch instead of taking a whole project out. Set
+
+```sh
+AI_MEMORY_SESSION_ORIGIN=automation
+```
+
+in the harness environment the orchestrator starts each agent with. The hook
+clients forward it, and the server records it on the session. Then set the
+server to skip automation sessions when it harvests:
+
+```toml
+[profile]
+harvest_prompts = "interactive"   # default "all"
+```
+
+With both in place, the harvester reads no `user-prompt` from a session marked
+automation, while everything else about those sessions is unchanged: capture,
+handoff, recall, and the projects' curated pages and stack signals still feed
+the profile. `all` (the default) harvests every session's prompts as before, so
+an install that sets neither sees no change. The signal is per session, so an
+interactive session you start by hand in the same project still contributes.
+That is unlike `contribute = false`, which takes the whole project out for
+everyone.
 
 ## Privacy and isolation
 

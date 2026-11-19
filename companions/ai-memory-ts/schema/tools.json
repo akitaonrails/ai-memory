@@ -468,6 +468,12 @@
   },
   "memory_message_list": {
     "properties": {
+      "after_id": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "box": {
         "type": [
           "null",
@@ -668,6 +674,12 @@
         "type": [
           "integer",
           "null"
+        ]
+      },
+      "min_relevance": {
+        "type": [
+          "null",
+          "number"
         ]
       },
       "path_prefix": {

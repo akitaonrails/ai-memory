@@ -100,7 +100,7 @@ struct SessionAwareBridge {
 
 /// The launch directory's project and the tools it is filled into (#1979).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LaunchScope {
+pub(crate) struct LaunchScope {
     workspace: String,
     project: String,
     /// Upstream tools whose input schema takes both `workspace` and
@@ -111,7 +111,7 @@ struct LaunchScope {
 impl LaunchScope {
     /// `request` with this scope filled in, when it calls a project-scoped
     /// tool and names no scope of its own; otherwise unchanged.
-    fn apply(&self, mut request: CallToolRequestParams) -> CallToolRequestParams {
+    pub(crate) fn apply(&self, mut request: CallToolRequestParams) -> CallToolRequestParams {
         if !self.tools.contains(request.name.as_ref()) {
             return request;
         }
@@ -137,7 +137,7 @@ fn project_scoped_tools(tools: &[Tool]) -> HashSet<String> {
 /// `(workspace, project)` with the upstream tools it applies to. Without the
 /// schemas the bridge cannot tell a project-scoped tool from another, so a
 /// failed listing leaves every call unchanged.
-async fn launch_scope(
+pub(crate) async fn launch_scope(
     upstream: &Peer<RoleClient>,
     (workspace, project): (String, String),
 ) -> Option<Arc<LaunchScope>> {
@@ -156,7 +156,7 @@ async fn launch_scope(
 
 /// The directory the bridge was launched from: the host cwd the Docker
 /// wrapper passes, else the process cwd.
-fn launch_dir(config: &Config) -> Option<PathBuf> {
+pub(crate) fn launch_dir(config: &Config) -> Option<PathBuf> {
     config
         .runtime_env
         .host_cwd()
@@ -168,7 +168,7 @@ fn launch_dir(config: &Config) -> Option<PathBuf> {
 /// ([`super::resolve_scope_for_path`]), or `None` when `dir` is neither
 /// covered by a scope marker nor inside a checkout, when a marker routes it
 /// to a `server` profile, or when the marker cannot be read.
-fn launch_project(config: &Config, dir: &Path) -> Option<(String, String)> {
+pub(crate) fn launch_project(config: &Config, dir: &Path) -> Option<(String, String)> {
     let dir = crate::marker::absolute_normalized(dir);
     let lookup = dir.to_string_lossy();
     let home = config.runtime_env.home_dir().map(Path::new);
@@ -649,9 +649,9 @@ fn bridge_bearer(config: &Config, server_url: &str) -> Result<Option<String>> {
 /// The bound stays well under the five seconds a client such as OpenCode
 /// allows a local MCP server to answer, so a server that never comes up still
 /// fails inside the client's own window (#1947).
-const SERVER_WAIT: Duration = Duration::from_secs(3);
+pub(crate) const SERVER_WAIT: Duration = Duration::from_secs(3);
 /// The pause between connection attempts while waiting.
-const SERVER_WAIT_POLL: Duration = Duration::from_millis(200);
+pub(crate) const SERVER_WAIT_POLL: Duration = Duration::from_millis(200);
 
 /// Wait, at most `budget`, until something accepts TCP connections at
 /// `server_url`'s host and port, retrying only while the port refuses
@@ -661,7 +661,11 @@ const SERVER_WAIT_POLL: Duration = Duration::from_millis(200);
 /// `error sending request ... when send initialize request` under a bearer
 /// hint that has nothing to do with it. A URL with no host is left to the
 /// transport to reject.
-async fn wait_for_server(server_url: &str, budget: Duration, poll: Duration) -> Result<()> {
+pub(crate) async fn wait_for_server(
+    server_url: &str,
+    budget: Duration,
+    poll: Duration,
+) -> Result<()> {
     let Ok(url) = reqwest_mcp::Url::parse(server_url) else {
         return Ok(());
     };

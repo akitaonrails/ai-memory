@@ -69,6 +69,18 @@ pub(crate) const SCANNED_HARNESSES: &[ManagedHarness] = &[
 /// cap does not change any verdict.
 const SCAN_LIMIT: usize = 1_000;
 
+/// A data directory, or its parent, that grants write access to another local
+/// account. Capture state lives under the data dir and the hook spool holds the
+/// bearer its entries carry, so an account that can write the directory can
+/// replace the spool and read it out; one that can write the parent can rename
+/// the directory away and put its own in place.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SharedDataDir {
+    path: String,
+    /// The octal mode the platform reported, e.g. `0777`.
+    mode: String,
+}
+
 /// One agent kind's local (on-disk) session tally for the current project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalScan {
@@ -189,6 +201,12 @@ struct DoctorReport {
     /// The local hook spool: events waiting for the server, and whether it is
     /// full and dropping newly captured events.
     spool: super::hook_spool::SpoolHealth,
+    /// Set when the data dir, or its parent, grants write access to another
+    /// local account: the hook spool lives there and its entries carry the
+    /// bearer. Absent when the posture is owner-only, and on Windows, whose
+    /// access control lists the mode bits do not describe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_dir_shared: Option<SharedDataDir>,
     /// Nothing answered at the server URL; capture counts are unavailable and
     /// hook events are being spooled.
     server_unreachable: bool,
@@ -628,6 +646,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         .await,
     );
     let spool = super::hook_spool::spool_health(&super::hook_spool::spool_dir(&config.data_dir));
+    let data_dir_shared = shared_data_dir(&config.data_dir);
     let mut server_unreachable = false;
     let mut capture_coverage_problem = None;
     let captured = match get_json::<ByAgentResponse>(
@@ -742,6 +761,7 @@ pub async fn run(config: &Config, args: crate::cli::DoctorArgs) -> Result<()> {
         project_coordinate,
         native_memory,
         spool,
+        data_dir_shared,
         server_unreachable,
         codex_hooks,
         agentmemory_residue,
@@ -1081,6 +1101,65 @@ fn spool_age(age_ms: Option<u64>) -> String {
     }
 }
 
+/// Whether a directory's mode lets an account that does not own it write
+/// there. `sticky_clears` is set for the parent directory, where the sticky
+/// bit is the protection: it stops another account renaming an entry it does
+/// not own, which is the parent's risk. Inside the data dir itself the bit
+/// protects nothing, since the entries another account may write are ours.
+fn directory_is_shared(mode: u32, sticky_clears: bool) -> bool {
+    mode & 0o022 != 0 && !(sticky_clears && mode & 0o1000 != 0)
+}
+
+/// The data dir's own mode, or its parent's, when either lets another local
+/// account write there; the data dir itself comes first, since it is the one
+/// that exposes the spool directly. Windows reports no mode here: its access
+/// control lists are not what these bits describe.
+#[must_use]
+fn shared_data_dir(data_dir: &Path) -> Option<SharedDataDir> {
+    for (mode, path, sticky_clears) in data_dir_modes(data_dir) {
+        if directory_is_shared(mode, sticky_clears) {
+            return Some(SharedDataDir {
+                path: path.display().to_string(),
+                mode: format!("{mode:04o}"),
+            });
+        }
+    }
+    None
+}
+
+/// The data dir and its parent as `(mode, path, sticky_clears)`.
+fn data_dir_modes(data_dir: &Path) -> Vec<(u32, PathBuf, bool)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let own = std::fs::metadata(data_dir).ok().map(|metadata| {
+            (
+                metadata.permissions().mode() & 0o7777,
+                data_dir.to_path_buf(),
+                false,
+            )
+        });
+        let parent = data_dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .and_then(|parent| {
+                std::fs::metadata(parent).ok().map(|metadata| {
+                    (
+                        metadata.permissions().mode() & 0o7777,
+                        parent.to_path_buf(),
+                        true,
+                    )
+                })
+            });
+        own.into_iter().chain(parent).collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        Vec::new()
+    }
+}
+
 fn render_project_coordinate(
     i18n: &ai_memory_core::i18n::Localizer,
     coordinate: &ProjectCoordinateReport,
@@ -1231,6 +1310,7 @@ mod tests {
             project_coordinate: None,
             native_memory: Vec::new(),
             spool,
+            data_dir_shared: None,
             server_unreachable,
             codex_hooks,
             agentmemory_residue: Vec::new(),
@@ -1418,6 +1498,85 @@ mod tests {
             &health_report(SpoolHealth::default(), false, Some(trusted)),
         );
         assert_eq!(quiet, "");
+    }
+
+    /// Sticky only helps the parent, where it stops another account renaming
+    /// an entry it does not own. A writable data dir is reported either way,
+    /// because the entries another account may write there are ours.
+    #[test]
+    fn sticky_only_clears_a_shared_parent_not_the_data_dir() {
+        for (mode, sticky_clears, shared) in [
+            (0o700, false, false),
+            (0o750, false, false),
+            (0o755, false, false),
+            (0o770, false, true),
+            (0o707, false, true),
+            (0o777, false, true),
+            (0o1700, true, false),
+            (0o1770, true, false),
+            (0o1777, true, false),
+            (0o1777, false, true),
+            (0o1002, false, true),
+        ] {
+            assert_eq!(
+                directory_is_shared(mode, sticky_clears),
+                shared,
+                "{mode:04o} sticky_clears={sticky_clears}"
+            );
+        }
+    }
+
+    /// A data dir an operator only has to chmod is reported; the owner-only
+    /// default every install creates is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_data_dir_is_reported_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let parent = tempfile::tempdir().unwrap();
+        let data = parent.path().join("ai-memory");
+        std::fs::create_dir(&data).unwrap();
+        assert_eq!(shared_data_dir(&data), None, "the install default");
+
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let shared = shared_data_dir(&data).expect("a world-writable data dir is reported");
+        assert_eq!(shared.mode, "0777");
+        assert!(shared.path.ends_with("ai-memory"), "{}", shared.path);
+
+        // Owner-only again, but the parent now lets another account replace it.
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        let shared = shared_data_dir(&data).expect("a group-writable parent is reported");
+        assert_eq!(shared.mode, "0770");
+        assert_eq!(shared.path, parent.path().display().to_string());
+
+        // A sticky parent stops the rename that the parent's mode would allow.
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert_eq!(shared_data_dir(&data), None);
+    }
+
+    /// Nothing to report stays out of the JSON, like the logon warning.
+    #[test]
+    fn doctor_json_carries_a_shared_data_dir_only_when_there_is_one() {
+        let quiet = health_report(
+            super::super::hook_spool::SpoolHealth::default(),
+            false,
+            None,
+        );
+        let json = serde_json::to_value(&quiet).unwrap();
+        assert!(json.get("data_dir_shared").is_none(), "{json}");
+
+        let mut loud = health_report(
+            super::super::hook_spool::SpoolHealth::default(),
+            false,
+            None,
+        );
+        loud.data_dir_shared = Some(SharedDataDir {
+            path: "/tmp/ai-memory".into(),
+            mode: "1777".into(),
+        });
+        let json = serde_json::to_value(&loud).unwrap();
+        assert_eq!(json["data_dir_shared"]["mode"], "1777");
+        assert_eq!(json["data_dir_shared"]["path"], "/tmp/ai-memory");
     }
 
     fn server_coordinate(

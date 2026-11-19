@@ -186,6 +186,8 @@ async fn an_admission_webhook_cannot_swap_a_ledger_for_an_ordinary_page_before_d
         failure_policy: FailurePolicy::Reject,
         events: vec![AdmissionOp::DeleteEventLedger],
         blocking: true,
+        projects: Vec::new(),
+        headers: Vec::new(),
     }])
     .unwrap();
     let fx = fixture_with_admission(Some(chain)).await;

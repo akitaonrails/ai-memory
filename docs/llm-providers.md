@@ -57,6 +57,7 @@ Recommended defaults:
 | `cursor` | `cursor-grok-4.6-high` | Cursor subscription via the logged-in `agent` CLI. Runs `agent --print --mode ask` (read-only). Does not pass `--yolo`. The default id is the one `agent --list-models` labels "Grok 4.6". |
 | `copilot` | `gpt-5.5` | GitHub Copilot Chat backend via `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN`; requires a Copilot subscription. |
 | `gemini` | `gemini-3.5-flash` | Google-hosted option with a generous free tier. |
+| `vertex` | `gemini-3.5-flash` | The same Gemini models through Vertex AI, billed to a Google Cloud project (Cloud credits apply). Uses `gcloud` Application Default Credentials; no API key. |
 | `opencode` | `mimo-v2.6-flash` | OpenCode Go or Zen via `OPENCODE_API_KEY`. Go is the default endpoint; `AI_MEMORY_LLM_BASE_URL` selects Zen. Set `AI_MEMORY_LLM_MODEL` to an id the chosen endpoint serves. |
 | `openai-compat` | no default | OpenRouter, Atlas Cloud, OrcaRouter, Cheaper Inference, API Route, FutureInfra, Standard Compute, Ollama, vLLM, LM Studio, and other compatible endpoints. |
 | `openai-compat` + `AI_MEMORY_LLM_BASE_URL=https://openrouter.ai/api/v1` | no default (recommended: `anthropic/claude-haiku-4.5`) | Hosted access to a large model catalogue through one key. See [OpenRouter](#openrouter) below and the empirical comparison in [`llm-provider-comparison.md`](llm-provider-comparison.md). |
@@ -105,6 +106,36 @@ workspace is created under the system temp directory captured at startup.
 export AI_MEMORY_LLM_PROVIDER=cursor
 export AI_MEMORY_LLM_MODEL=cursor-grok-4.6-high
 ai-memory llm-test --provider cursor --model cursor-grok-4.6-high --prompt "Reply with OK"
+```
+
+`vertex` calls the same Gemini models as `gemini`, through Vertex AI instead of
+AI Studio. Usage is billed to a Google Cloud project, so Google Cloud credits
+(free trial, startup and promotional credits) pay for it; they do not pay for
+AI Studio. There is no API key. The provider uses Google Application Default
+Credentials, read from the same places Google's SDKs read them:
+
+- `GOOGLE_APPLICATION_CREDENTIALS`, the path to a service-account key file;
+- otherwise the file `gcloud auth application-default login` writes:
+  `$CLOUDSDK_CONFIG/application_default_credentials.json`, else
+  `~/.config/gcloud/` (`%APPDATA%\gcloud\` on Windows).
+
+`GOOGLE_CLOUD_PROJECT` names the project to bill. Without it, ai-memory uses
+the project the credentials file names (`project_id` in a service-account key,
+`quota_project_id` in a `gcloud` login). `GOOGLE_CLOUD_LOCATION` picks the
+region and defaults to `global`, which serves the newest Gemini models. The
+access token is refreshed before it expires and re-read after a `401`, so a new
+`gcloud` login is picked up without a restart. Workload identity federation,
+service-account impersonation and the GCE metadata server are not supported.
+The project needs the Vertex AI API enabled
+(`gcloud services enable aiplatform.googleapis.com`), and the account needs the
+`roles/aiplatform.user` role. Embeddings are unchanged: `vertex` covers the
+chat provider only.
+
+```bash
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT=my-project
+export AI_MEMORY_LLM_PROVIDER=vertex
+ai-memory llm-test --provider vertex --model gemini-3.5-flash --prompt "Reply with OK"
 ```
 
 Codex credential storage mode `file` is supported. `auto` works only when its
@@ -283,6 +314,60 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > static `x-request-id` entry in `AI_MEMORY_LLM_HEADERS` is refused at
 > startup for that provider; the dynamic value must not be shadowed or
 > duplicated.
+
+> [!TIP]
+> **`openai-compat` can also say what each operation is.** With
+> `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS=true` (`llm_request_metadata_headers
+> = true`), every chat attempt carries, next to `X-Request-Id`:
+>
+> | Header | Value | Sent when |
+> | --- | --- | --- |
+> | `x-ai-memory-workload` | `consolidation`, `profile`, `dream`, `lint`, `auto-improve`, `experience`, `bootstrap`, `query-answer`, `rerank` or `unspecified` | always |
+> | `x-ai-memory-workspace` | workspace name | the operation reads one workspace |
+> | `x-ai-memory-project` | project name | the operation reads one project |
+> | `x-ai-memory-user` | username | the operation acts for one user |
+>
+> A gateway can use them to attribute cost or apply a limit per workload,
+> project or user. A header the operation cannot name with one value is left
+> out, never guessed: a profile classification batch mixing several
+> operators' sentences sends no user, a `memory_query` answer (whose
+> evidence spans projects) sends no scope, and the rerank call sends only the
+> workload. A value that is not a valid HTTP header value (a non-ASCII
+> project name, for example) is also left out. The values are identifiers,
+> never page content. The setting is off by default, only `openai-compat`
+> sends these headers (the official providers, `opencode`, and a fallback to
+> another provider never do), and the four names are refused in
+> `AI_MEMORY_LLM_HEADERS` for `openai-compat` whether or not the setting is
+> on. The setting is server-wide: an `openai-compat` entry in
+> `llm_fallbacks` sends the headers to its own endpoint too, so turn it on
+> only when every `openai-compat` endpoint you configure may see your
+> workspace, project and user names.
+
+### Falling back when credit or quota runs out
+
+An ordered `[[llm_fallbacks]]` chain moves to the next provider on a transient
+failure and also when a provider says the account is out of credit, quota or
+billing: Anthropic's `400` "credit balance is too low", OpenAI's
+`429 insufficient_quota`, an OpenRouter `402`, a Gemini daily
+`RESOURCE_EXHAUSTED`, a Codex `usage_limit_reached` or a Copilot
+`quota_exceeded`. A plain invalid-key `401` does not fall back. The exhausted
+provider is skipped for `llm_quota_cooldown_secs` (default 900). The next
+call after that tries it again, so it takes over again once topped up.
+
+```toml
+llm_provider = "anthropic"
+llm_model = "claude-sonnet-4-6"
+
+[[llm_fallbacks]]
+provider = "openai"
+model = "gpt-5.4-mini"
+api_key_env = "OPENAI_API_KEY"
+```
+
+`ai-memory status` then shows `primary anthropic/claude-sonnet-4-6 exhausted
+(credit/quota); using fallback openai/gpt-5.4-mini`. The full rule, with the
+per-provider signals, is in
+[`llm-provider-fallback.md`](llm-provider-fallback.md#credit-and-quota-exhaustion).
 
 ### Probing the server's own provider
 

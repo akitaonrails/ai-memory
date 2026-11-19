@@ -35,6 +35,8 @@ pub const GITHUB_SKILL_DIR: &str = ".github";
 pub const COPILOT_SKILL_DIR: &str = ".copilot";
 /// Hermes Agent Skill directory below a project or home root.
 pub const HERMES_SKILL_DIR: &str = ".hermes";
+/// Tencent WorkBuddy Agent Skill directory below a project or home root.
+pub const WORKBUDDY_SKILL_DIR: &str = ".workbuddy";
 /// Google Antigravity's directory below the home root. Its global skills live
 /// in two directories under it, one per product; workspace skills use
 /// [`AGENTS_SKILL_DIR`] (<https://antigravity.google/docs/skills/>).

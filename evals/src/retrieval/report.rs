@@ -45,6 +45,10 @@ pub struct Report {
     /// Evidence reachability (`--reachability` only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reachability: Option<ReachabilityReport>,
+    /// Protocol, pinned models, stage timings and source-window provenance
+    /// for the opt-in Raw-RAG engine. Absent on existing server/grep reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_rag: Option<super::raw_rag::Metadata>,
     pub slices: BTreeMap<String, SliceMetrics>,
     pub per_question: Vec<QuestionScore>,
 }
@@ -118,6 +122,9 @@ impl IngestSummary {
 /// Ingest and reachability sections for one config, empty when absent.
 fn extras_md(r: &Report) -> String {
     let mut md = String::new();
+    if let Some(metadata) = &r.raw_rag {
+        md.push_str(&super::raw_rag::markdown(metadata));
+    }
     if let Some(i) = &r.ingest {
         md.push_str(&format!(
             "\n### Ingest\n\n- mode: {} (date prefix: {}), concurrency {}\n\
@@ -303,7 +310,9 @@ pub fn to_markdown(r: &Report) -> String {
     md.push_str(&slices_table_md(r));
     md.push_str(&qa_table_md(r));
     md.push_str(&extras_md(r));
-    md.push_str(METRIC_NOTES);
+    if r.raw_rag.is_none() {
+        md.push_str(METRIC_NOTES);
+    }
     md
 }
 
@@ -513,6 +522,7 @@ mod tests {
             qa: None,
             ingest: None,
             reachability: None,
+            raw_rag: None,
             slices,
             per_question: vec![],
         }

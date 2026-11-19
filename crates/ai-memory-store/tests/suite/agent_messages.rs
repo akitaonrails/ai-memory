@@ -904,3 +904,166 @@ async fn message_evidence_within_character_budget_is_not_truncated() {
         Some(four_byte_capped.as_str())
     );
 }
+
+#[tokio::test]
+async fn list_messages_after_pages_without_gaps_or_overlap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    for i in 0..5 {
+        store
+            .writer
+            .insert_message(message(a, b, &format!("message {i}")))
+            .await
+            .unwrap();
+    }
+    let all = store
+        .reader
+        .list_messages(b.0, b.1, MessageBox::Inbox, 50)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 5);
+
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .reader
+            .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, after)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "the page ignored its limit");
+        after = page.last().map(|m| m.id);
+        paged.extend(page.into_iter().map(|m| m.id));
+    }
+    assert_eq!(
+        paged,
+        all.iter().map(|m| m.id).collect::<Vec<_>>(),
+        "paging must cover the queue once, in order"
+    );
+
+    let unknown = ai_memory_core::MessageId::new();
+    let empty = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, Some(unknown))
+        .await
+        .unwrap();
+    assert!(
+        empty.is_empty(),
+        "an unknown cursor must not page another mailbox"
+    );
+}
+
+/// The list hands out the ids `pop` and `cancel` consume, so the message a
+/// cursor names can leave the queue before the next page. Its place in its own
+/// mailbox still holds, while a cursor from another mailbox stays an empty page
+/// whether that message is pending or consumed (#2356).
+#[tokio::test]
+async fn list_messages_after_keeps_its_place_once_the_cursor_is_consumed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let a = project(&store, "default", "project-a").await;
+    let b = project(&store, "default", "project-b").await;
+    let c = project(&store, "default", "project-c").await;
+    // Sent first, so a cursor resolved outside B's mailbox would page all of it.
+    let foreign = store
+        .writer
+        .insert_message(message(a, c, "for project c"))
+        .await
+        .unwrap();
+    for i in 0..5 {
+        store
+            .writer
+            .insert_message(message(a, b, &format!("message {i}")))
+            .await
+            .unwrap();
+    }
+    let all: Vec<_> = store
+        .reader
+        .list_messages(b.0, b.1, MessageBox::Inbox, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(all.len(), 5);
+
+    // Inbox: the recipient pops the last message of the first page by id.
+    let first = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, None)
+        .await
+        .unwrap();
+    let cursor = first.last().map(|m| m.id).unwrap();
+    assert_eq!(cursor, all[1]);
+    store
+        .writer
+        .pop_message(claim(b), Some(cursor))
+        .await
+        .unwrap()
+        .expect("the cursor's message is popped");
+    let next: Vec<_> = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 2, Some(cursor))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        next,
+        all[2..4].to_vec(),
+        "a popped cursor must not end the paging"
+    );
+
+    // Outbox: the sender cancels the message its cursor names.
+    let cancelled = store
+        .writer
+        .cancel_messages(a.0, a.1, Some(all[3]))
+        .await
+        .unwrap();
+    assert_eq!(cancelled, 1);
+    let rest: Vec<_> = store
+        .reader
+        .list_messages_after(a.0, a.1, MessageBox::Outbox, 2, Some(all[3]))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        rest,
+        vec![all[4]],
+        "a cancelled cursor must not end the paging"
+    );
+
+    // A cursor from C's inbox never pages B's, pending or consumed.
+    let page = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 50, Some(foreign))
+        .await
+        .unwrap();
+    assert!(
+        page.is_empty(),
+        "a pending foreign cursor must not page B's inbox"
+    );
+    store
+        .writer
+        .pop_message(claim(c), Some(foreign))
+        .await
+        .unwrap()
+        .expect("project c pops its own message");
+    let page = store
+        .reader
+        .list_messages_after(b.0, b.1, MessageBox::Inbox, 50, Some(foreign))
+        .await
+        .unwrap();
+    assert!(
+        page.is_empty(),
+        "a consumed foreign cursor must not page B's inbox"
+    );
+}

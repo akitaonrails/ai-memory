@@ -13,6 +13,7 @@
 use std::io::Read;
 
 use anyhow::Result;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{
@@ -20,7 +21,7 @@ use crate::cli::{
     MessageSendArgs,
 };
 use crate::config::Config;
-use crate::http_client::{ServerEndpoint, get_json, post_json};
+use crate::http_client::{ServerEndpoint, get_json, is_missing_route, post_json};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct AgentMessage {
@@ -130,9 +131,9 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
     };
 
     let endpoint = ServerEndpoint::for_checkout(config).await?;
-    let resp: SendMessageResponse = post_json(
+    let resp: SendMessageResponse = post_message_route(
         &endpoint,
-        "/admin/messages/send",
+        "/send",
         &SendRequest {
             from_workspace: &from_workspace,
             from_project: &from_project,
@@ -168,6 +169,35 @@ async fn send(config: &Config, args: MessageSendArgs) -> Result<()> {
     Ok(())
 }
 
+/// POST to a `/messages` route, or its root-only `/admin` twin on a server too
+/// old to have it. A missing route did nothing, so retrying a pop cannot claim
+/// a second message.
+async fn post_message_route<B: Serialize, T: DeserializeOwned>(
+    endpoint: &ServerEndpoint,
+    route: &str,
+    body: &B,
+) -> Result<T> {
+    match post_json(endpoint, &format!("/messages{route}"), body).await {
+        Err(error) if is_missing_route(&error) => {
+            post_json(endpoint, &format!("/admin/messages{route}"), body).await
+        }
+        result => result,
+    }
+}
+
+/// `GET /messages`, with the same fallback as [`post_message_route`].
+async fn get_message_list<T: DeserializeOwned>(
+    endpoint: &ServerEndpoint,
+    query: &[(&str, &str)],
+) -> Result<T> {
+    match get_json(endpoint, "/messages", query).await {
+        Err(error) if is_missing_route(&error) => {
+            get_json(endpoint, "/admin/messages", query).await
+        }
+        result => result,
+    }
+}
+
 async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
     let i18n = &config.i18n;
     let (workspace, project) =
@@ -175,9 +205,8 @@ async fn list(config: &Config, args: MessageListArgs) -> Result<()> {
     let endpoint = ServerEndpoint::for_checkout(config).await?;
     let mailbox = if args.outbox { "outbox" } else { "inbox" };
 
-    let response: ListMessagesResponse = get_json(
+    let response: ListMessagesResponse = get_message_list(
         &endpoint,
-        "/admin/messages",
         &[
             ("workspace", workspace.as_str()),
             ("project", project.as_str()),
@@ -273,9 +302,9 @@ async fn pop(config: &Config, args: MessagePopArgs) -> Result<()> {
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::for_checkout(config).await?;
 
-    let resp: PopMessageResponse = post_json(
+    let resp: PopMessageResponse = post_message_route(
         &endpoint,
-        "/admin/messages/pop",
+        "/pop",
         &PopRequest {
             agent: args.agent.as_deref(),
             workspace: &workspace,
@@ -471,9 +500,9 @@ async fn cancel(config: &Config, args: MessageCancelArgs) -> Result<()> {
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::for_checkout(config).await?;
 
-    let resp: CancelMessagesResponse = post_json(
+    let resp: CancelMessagesResponse = post_message_route(
         &endpoint,
-        "/admin/messages/cancel",
+        "/cancel",
         &CancelRequest {
             workspace: &workspace,
             project: &project,
@@ -513,6 +542,68 @@ struct CancelRequest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, http::StatusCode, routing::post};
+    use serde_json::{Value, json};
+
+    /// A server with `app`, addressed the way the CLI addresses one.
+    async fn serve(app: Router) -> ServerEndpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        ServerEndpoint::from_pair(Some(url), None)
+    }
+
+    #[tokio::test]
+    async fn a_server_without_the_route_is_reached_through_admin() {
+        let endpoint = serve(Router::new().route(
+            "/admin/messages/pop",
+            post(|| async { Json(json!({ "via": "admin" })) }),
+        ))
+        .await;
+        let reply: Value = post_message_route(&endpoint, "/pop", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(reply["via"], "admin");
+    }
+
+    #[tokio::test]
+    async fn a_missing_project_does_not_retry_through_admin() {
+        let endpoint = serve(
+            Router::new()
+                .route(
+                    "/messages/pop",
+                    post(|| async {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({ "error": "project not found" })),
+                        )
+                    }),
+                )
+                .route(
+                    "/admin/messages/pop",
+                    post(|| async { panic!("a JSON 404 must not fall back") as StatusCode }),
+                ),
+        )
+        .await;
+        let error = post_message_route::<_, Value>(&endpoint, "/pop", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("project not found"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_on_the_new_route_is_not_retried() {
+        let endpoint =
+            serve(Router::new().route("/messages/pop", post(|| async { StatusCode::FORBIDDEN })))
+                .await;
+        let error = post_message_route::<_, Value>(&endpoint, "/pop", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(!is_missing_route(&error), "{error:#}");
+    }
 
     fn message(subject: Option<&str>, body: &str) -> AgentMessage {
         AgentMessage {

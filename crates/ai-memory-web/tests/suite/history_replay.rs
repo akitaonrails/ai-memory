@@ -127,6 +127,7 @@ impl Fixture {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: owner.map(|name| IdentityKey::User(name.into()).storage_key()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -323,7 +324,7 @@ async fn history_lists_k_plus_one_versions_newest_first_and_diffs_the_latest() {
     assert_eq!(status, StatusCode::OK, "{page}");
     assert!(
         page.contains(
-            "href=\"w/default/app/h/notes/on-disk.md\" class=\"text-blue-600 dark:text-blue-400 underline\">History</a>"
+            "href=\"w/default/app/h/notes/on-disk.md\" class=\"text-green underline\">History</a>"
         ),
         "{page}"
     );

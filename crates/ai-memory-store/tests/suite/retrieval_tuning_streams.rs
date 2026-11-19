@@ -634,6 +634,7 @@ async fn purging_a_session_deletes_the_query_signals_it_wrote_last() {
             agent_kind: AgentKind::ClaudeCode,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -716,6 +717,7 @@ async fn purges_delete_query_signals_a_session_left_in_another_project() {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();

@@ -520,6 +520,12 @@ fn resolve_provider(side: &str, args: &AbArgs) -> Result<ResolvedConfig> {
             std::env::temp_dir(),
             &std::env::vars_os().collect::<Vec<_>>(),
         )),
+        AuthRequirement::GoogleAdc => ProviderAuth::vertex(
+            token_file,
+            None,
+            "global".into(),
+            ai_memory_llm::CredentialSource::TokenFile,
+        ),
     };
 
     Ok(ResolvedConfig {
@@ -569,6 +575,7 @@ impl From<ResolvedConfig> for ProviderConfig {
             // the default user agent, which is what a gateway needs to
             // attribute harness traffic.
             extra_headers: ai_memory_llm::ExtraHeaders::default(),
+            request_metadata_headers: false,
         }
     }
 }

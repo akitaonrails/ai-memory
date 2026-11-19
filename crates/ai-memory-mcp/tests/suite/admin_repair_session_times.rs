@@ -83,6 +83,7 @@ async fn seed_session(store: &Store, workspace: &str, project: &str, ended: bool
             cwd: None,
             actor_user: None,
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();

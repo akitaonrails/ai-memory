@@ -207,6 +207,15 @@ which can drain previously captured events. Choose the capture owner before
 the execution's first event; switching midway cannot deduplicate events already
 produced by independent paths.
 
+Native assistant capture (`--capture-assistant`) spawns a separate
+`ai-memory hook` for the turn's Stop. The generated Pi and OpenCode 2 extensions
+drain their direct-hook queue before that spawn, so the Stop follows the turn's
+already-enqueued prompt and tool events on the online path. This ordering is
+best-effort and online only: a queued event that fails is spooled and recovered
+on a separate drain, so its order across an offline backlog, or across a process
+restart, is not guaranteed. The `agent_end` (OpenCode 2: execution) handler
+calls the funnel fire-and-forget, so the drain never blocks the turn.
+
 Manual backfill, the importer, `finalize-session` and managed transcript import
 through `ai-memory run` retain their existing behavior. Do not combine them as
 independent lifecycle producers for the same execution. External capture does

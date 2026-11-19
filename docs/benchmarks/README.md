@@ -13,6 +13,8 @@ cargo run --release -p ai-memory-eval -- retrieval --fetch
 
 | date | dataset | mode | overall hit@5 | file |
 |---|---|---|---|---|
+| **2026-11-18** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.5.0 release)** | **0.953** | [longmemeval-s-3.5.0-release.md](longmemeval-s-3.5.0-release.md) |
+| **2026-11-18** | LongMemEval-S (v1) | **local embeddings + observation stream (3.5.0 release)** | **0.940** | [longmemeval-s-3.5.0-release.md](longmemeval-s-3.5.0-release.md) |
 | **2026-11-06** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.4.3 release)** | **0.951** | [longmemeval-s-3.4.3-release.md](longmemeval-s-3.4.3-release.md) |
 | **2026-11-06** | LongMemEval-S (v1) | **local embeddings + observation stream (3.4.3 release)** | **0.943** | [longmemeval-s-3.4.3-release.md](longmemeval-s-3.4.3-release.md) |
 | **2026-11-04** | LongMemEval-S (v1) | **zero-llm FTS + observation stream (3.4.0 release)** | **0.951** | [longmemeval-s-3.4.0-release.md](longmemeval-s-3.4.0-release.md) |
@@ -367,3 +369,9 @@ work on it; accuracy noise is the ±0.005 band above, not wall clock.
 [Draft query-answer context admission](query-answer-context-draft.md) records
 synthetic prompt sizes and local debug timings for #1684. It does not measure
 retrieval quality, answer accuracy or provider token usage.
+
+[Raw-RAG local-model smoke comparison](raw-rag-local-2026-11-05.md) runs the
+opt-in `--engine raw-rag` evaluator baseline (#2017) against the existing
+ingest modes on the four coding-v1 questions and a six-question LongMemEval-S
+sample, with a [per-question CSV](raw-rag-local-2026-11-05.csv). It is a
+diagnostic, not a release benchmark or a reproduction of the paper's scores.

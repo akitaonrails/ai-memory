@@ -342,6 +342,8 @@ async fn concurrent_member_write_skips_dedup_batch(edit_survivor: bool) {
             failure_policy: FailurePolicy::Reject,
             events: vec![AdmissionOp::WritePage],
             blocking: true,
+            projects: Vec::new(),
+            headers: Vec::new(),
         }])
         .unwrap(),
     );

@@ -41,6 +41,15 @@ Known fixed authentication errors are localized at the display boundary; their
 wire representation stays unchanged. Unknown diagnostic text is preserved.
 Bundled product guides and release notes keep their source language.
 
+### Generated memory language
+
+The language of generated memory prose is separate from the interface
+language. By default, consolidation, dream merges, bootstrap, and
+auto-improvement write prose in the dominant language of their input. Set
+`[consolidation] output_language` (for example `"English"`) to force one
+language for all of them. Evidence quotes, code, identifiers, paths and raw
+session history always stay verbatim.
+
 ### Known gaps
 
 These strings still appear in English under `pt-BR`:

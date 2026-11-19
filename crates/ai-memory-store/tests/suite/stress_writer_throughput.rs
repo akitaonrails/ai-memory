@@ -44,6 +44,7 @@ async fn scope(store: &Store) -> (WorkspaceId, ProjectId, SessionId) {
             agent_kind: AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .unwrap();

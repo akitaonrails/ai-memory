@@ -415,6 +415,62 @@ describe("stateful sessions", () => {
     assert.ok(log.every((e) => !e.endsWith(":retired")), log.join(", "));
   });
 
+  it("waits for a concurrent refresh when the superseded handshake replies first", async () => {
+    const server = new FakeServer();
+    const methods: { method: string; session?: string }[] = [];
+    let releaseOld!: () => void;
+    let releaseRefresh!: () => void;
+    let markRefreshStarted!: () => void;
+    const oldReply = new Promise<void>((resolve) => { releaseOld = resolve; });
+    const refreshedReply = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    const refreshStarted = new Promise<void>((resolve) => { markRefreshStarted = resolve; });
+    let handshakes = 0;
+    server.mcp = async (request) => {
+      const { method, id } = request.body as { method: string; id?: number };
+      const session = request.headers["mcp-session-id"];
+      const reply = (result: unknown, headers = {}) => json({ jsonrpc: "2.0", id, result }, 200, headers);
+      if (method === "initialize") {
+        const n = ++handshakes;
+        if (n === 2) markRefreshStarted();
+        await (n === 1 ? oldReply : refreshedReply);
+        return reply({ protocolVersion: "2025-03-26" }, { "Mcp-Session-Id": n === 1 ? "old" : "live" });
+      }
+      methods.push({ method, ...(session === undefined ? {} : { session }) });
+      if (session !== "live") return json({ error: "session missing" }, 404);
+      if (method === "notifications/initialized") return json({}, 202);
+      if (method === "tools/list") return reply({ tools: [] });
+      if (method === "tools/call") return reply({ content: [{ type: "text", text: '{"ok":true}' }] });
+      throw new Error(`unexpected ${method}`);
+    };
+    const memory = client(server);
+
+    const first = memory.callTool("probe", {}).catch((error: unknown) => error);
+    const originalProbe = memory.capabilities();
+    void originalProbe.catch(() => undefined);
+    const controller = new AbortController();
+    const cancelled = memory.callTool("probe", {}, { signal: controller.signal })
+      .catch((error: unknown) => error);
+    const refresh = memory.capabilities({ refresh: true });
+    await refreshStarted;
+    releaseOld();
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual([...methods], [], "no MCP request may run while the current handshake is pending");
+      controller.abort();
+      const cancellation = await cancelled;
+      assert.ok(cancellation instanceof AbortError);
+      assert.equal(cancellation.uncertain, false);
+    } finally {
+      releaseRefresh();
+      await refresh;
+    }
+    assert.deepEqual(await first, { ok: true });
+    assert.equal((await originalProbe).statefulSession, true);
+    assert.equal(handshakes, 2);
+    assert.equal(methods.filter(({ method }) => method === "tools/call").length, 1);
+    assert.ok(methods.every(({ session }) => session === "live"));
+  });
+
   it("raw and wrapped calls share one handshake and refresh opens a new session", async () => {
     const server = new FakeServer();
     server.sessionId = "session-raw";

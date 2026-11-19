@@ -100,14 +100,16 @@ impl ProjectCoordinateMatch {
 }
 
 /// Whether the project holds nothing a caller could mean by naming it: no
-/// sessions, observations, pages, handoffs or workstreams.
+/// sessions, observations, pages, handoffs, workstreams or sent/received messages.
 fn project_is_empty(conn: &Connection, id: ProjectId) -> StoreResult<bool> {
     Ok(conn.query_row(
         "SELECT NOT (EXISTS(SELECT 1 FROM sessions WHERE project_id = ?1) \
            OR EXISTS(SELECT 1 FROM observations WHERE project_id = ?1) \
            OR EXISTS(SELECT 1 FROM pages WHERE project_id = ?1) \
            OR EXISTS(SELECT 1 FROM handoffs WHERE project_id = ?1) \
-           OR EXISTS(SELECT 1 FROM workstreams WHERE project_id = ?1))",
+           OR EXISTS(SELECT 1 FROM workstreams WHERE project_id = ?1) \
+           OR EXISTS(SELECT 1 FROM agent_messages \
+                     WHERE from_project_id = ?1 OR to_project_id = ?1))",
         [id.as_bytes()],
         |row| row.get(0),
     )?)
@@ -398,8 +400,11 @@ pub(crate) fn shadowing_empty_twins(
     limit: usize,
 ) -> StoreResult<Vec<ShadowingTwin>> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    // The sender index is pending-only. Materialize eligible empty twins first
+    // so retained history is scanned only if one still needs a message check.
     let mut statement = conn.prepare(
-        "SELECT w.name, t.id, t.name, o.name FROM projects t \
+        "WITH twins(workspace, id, name, owner) AS MATERIALIZED ( \
+         SELECT w.name, t.id, t.name, o.name FROM projects t \
          JOIN projects o ON o.workspace_id = t.workspace_id AND o.id <> t.id \
            AND o.canonical_name = t.name AND o.identity <> '' \
          JOIN workspaces w ON w.id = t.workspace_id \
@@ -408,8 +413,11 @@ pub(crate) fn shadowing_empty_twins(
            AND NOT EXISTS(SELECT 1 FROM observations WHERE project_id = t.id) \
            AND NOT EXISTS(SELECT 1 FROM pages WHERE project_id = t.id) \
            AND NOT EXISTS(SELECT 1 FROM handoffs WHERE project_id = t.id) \
-           AND NOT EXISTS(SELECT 1 FROM workstreams WHERE project_id = t.id) \
-         ORDER BY w.name, t.name LIMIT ?1",
+           AND NOT EXISTS(SELECT 1 FROM workstreams WHERE project_id = t.id)) \
+         SELECT workspace, id, name, owner FROM twins \
+         WHERE id NOT IN (SELECT from_project_id FROM agent_messages \
+                          UNION SELECT to_project_id FROM agent_messages) \
+         ORDER BY workspace, name LIMIT ?1",
     )?;
     let rows = statement
         .query_map([limit], |row| {
@@ -529,10 +537,161 @@ mod tests {
                 agent_kind: ai_memory_core::AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             },
         )
         .unwrap();
         assert!(shadowing_empty_twins(&conn, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shadowing_empty_twins_omits_message_senders_recipients_and_history() {
+        for state in ["pending", "editing", "claimed", "cancelled"] {
+            for sender_is_twin in [false, true] {
+                let mut conn = Connection::open_in_memory().unwrap();
+                crate::migrations::run(&mut conn).unwrap();
+                let ws = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+                let owner = crate::ops::get_or_create_project(&mut conn, &ws, "api", None).unwrap();
+                let peer = crate::ops::get_or_create_project(&mut conn, &ws, "peer", None).unwrap();
+                conn.execute(
+                    "UPDATE projects SET identity = 'github.com/acme/api', identity_source = 'git_remote', \
+                     canonical_name = 'acme-api', legacy_name = 'api' WHERE id = ?1",
+                    [owner.as_bytes()],
+                ).unwrap();
+                let twin = ProjectId::new();
+                conn.execute("INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, 'acme-api', 0)",
+                    params![twin.as_bytes(), ws.as_bytes()]).unwrap();
+                let message = |from, to| ai_memory_core::NewAgentMessage {
+                    from_workspace_id: ws,
+                    from_project_id: from,
+                    from_agent: ai_memory_core::AgentKind::Codex,
+                    from_session_id: None,
+                    from_owner_user: None,
+                    to_workspace_id: ws,
+                    to_project_id: to,
+                    to_agent: None,
+                    subject: None,
+                    body: "Keep this message and its provenance".into(),
+                    nature: ai_memory_core::MessageNature::Unknown,
+                    evidence: None,
+                };
+                let unrelated =
+                    crate::ops::insert_message(&mut conn, &message(owner, peer)).unwrap();
+                assert!(project_is_empty(&conn, twin).unwrap());
+                assert_eq!(
+                    shadowing_empty_twins(&conn, 10).unwrap().len(),
+                    1,
+                    "a genuinely empty legacy twin remains visible"
+                );
+                let (from, to) = if sender_is_twin {
+                    (twin, peer)
+                } else {
+                    (peer, twin)
+                };
+                let id = crate::ops::insert_message(&mut conn, &message(from, to)).unwrap();
+                conn.execute(
+                    "UPDATE agent_messages SET state = ?1 WHERE id = ?2",
+                    params![state, id.as_bytes()],
+                )
+                .unwrap();
+                assert!(
+                    !project_is_empty(&conn, twin).unwrap(),
+                    "the {state} message's endpoint is not empty (sender={sender_is_twin})"
+                );
+                assert!(
+                    shadowing_empty_twins(&conn, 10).unwrap().is_empty(),
+                    "startup must not describe a {state} message endpoint as empty (sender={sender_is_twin})"
+                );
+                conn.execute("DELETE FROM agent_messages WHERE id = ?1", [id.as_bytes()])
+                    .unwrap();
+                let retained: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM agent_messages WHERE id = ?1",
+                        [unrelated.as_bytes()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retained, 1, "the unrelated message survives the control");
+                assert!(project_is_empty(&conn, twin).unwrap());
+                assert_eq!(
+                    shadowing_empty_twins(&conn, 10).unwrap().len(),
+                    1,
+                    "removing the only message restores the empty-twin control"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_empty_twin_report_does_not_scan_mail_when_twins_hold_data() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrations::run(&mut conn).unwrap();
+        let ws = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let owner = crate::ops::get_or_create_project(&mut conn, &ws, "api", None).unwrap();
+        let peer = crate::ops::get_or_create_project(&mut conn, &ws, "peer", None).unwrap();
+        conn.execute(
+            "UPDATE projects SET identity = 'github.com/acme/api', identity_source = 'git_remote', \
+             canonical_name = 'acme-api', legacy_name = 'api' WHERE id = ?1",
+            [owner.as_bytes()],
+        )
+        .unwrap();
+        let twin = ProjectId::new();
+        conn.execute("INSERT INTO projects (id, workspace_id, name, created_at) VALUES (?1, ?2, 'acme-api', 0)",
+            params![twin.as_bytes(), ws.as_bytes()]).unwrap();
+        crate::ops::begin_session(
+            &mut conn,
+            &ai_memory_core::NewSession {
+                occurred_at: None,
+                id: ai_memory_core::SessionId::new(),
+                workspace_id: ws,
+                project_id: twin,
+                agent_kind: ai_memory_core::AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        let measure = |conn: &mut Connection| {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+            let twins = shadowing_empty_twins(conn, 10).unwrap();
+            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+            assert!(twins.is_empty());
+            steps.load(Ordering::Relaxed)
+        };
+        let without_messages = measure(&mut conn);
+        conn.execute(
+            "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 1000) \
+             INSERT INTO agent_messages \
+               (id, from_workspace_id, from_project_id, from_agent, to_workspace_id, \
+                to_project_id, body, state, created_at) \
+             SELECT randomblob(16), ?1, ?2, 'codex', ?1, ?3, 'retained history', 'claimed', n FROM seq",
+            params![ws.as_bytes(), owner.as_bytes(), peer.as_bytes()],
+        ).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1000);
+        let with_messages = measure(&mut conn);
+        println!(
+            "occupied-twin report VM steps: without messages={without_messages}, with 1000 messages={with_messages}"
+        );
+        assert!(
+            with_messages <= without_messages + 2000,
+            "unrelated messages must not add a mailbox scan: {without_messages} -> {with_messages} VM steps"
+        );
     }
 
     #[test]

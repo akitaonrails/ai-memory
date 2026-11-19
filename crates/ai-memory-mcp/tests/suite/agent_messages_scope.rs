@@ -381,6 +381,7 @@ async fn a_sender_named_by_its_remote_reaches_the_repository_owner_past_an_empty
             agent_kind: ai_memory_core::AgentKind::Codex,
             cwd: None,
             actor_user: None,
+            origin: None,
         })
         .await
         .expect("twin session");
@@ -408,7 +409,7 @@ async fn a_sender_named_by_its_remote_reaches_the_repository_owner_past_an_empty
 }
 
 /// Both recipient fields are required (#2082, `docs/security-boundaries.md`
-/// row 8f). A blank one used to fall through to the caller's inferred current
+/// row 8i). A blank one used to fall through to the caller's inferred current
 /// project, delivering the message into the sender's own inbox instead of
 /// refusing it. The sender here is explicit, so only the required-recipient
 /// guard is under test.

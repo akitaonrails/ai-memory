@@ -48,6 +48,7 @@ fn sessions(n: usize) -> Vec<PageEvidence> {
         .map(|i| PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: format!("session-{i}"),
+            observations: Default::default(),
         })
         .collect()
 }

@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai_memory_llm::{
-    AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, CursorAuth, EmbedderChoice, EmbedderConfig,
-    ExtraHeaders, FallbackLlmProvider, LlmError, LlmProvider, LlmProviders, LlmResult, LlmWorkload,
-    OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice, ProviderConfig, ReasoningEffort,
-    build_provider, cursor_executable,
+    AuthRequirement, CURSOR_DEFAULT_MODEL, Candidate, CredentialSource, CursorAuth, EmbedderChoice,
+    EmbedderConfig, ExtraHeaders, FallbackLlmProvider, LlmError, LlmProvider, LlmProviders,
+    LlmResult, LlmWorkload, OPENCODE_DEFAULT_MODEL, ProviderAuth, ProviderChoice, ProviderConfig,
+    ReasoningEffort, build_provider, cursor_executable,
 };
 use anyhow::{Context, Result};
 use figment::{
@@ -239,7 +239,8 @@ impl DecaySettings {
 
 /// One `[[llm_fallbacks]]` entry: an ordered LLM provider tried only after
 /// the primary (`llm_provider`) fails a transient call
-/// (`LlmError::is_transient()`). See `docs/llm-provider-fallback.md`.
+/// (`LlmError::is_transient()`) or reports exhausted credit/quota
+/// (`LlmError::is_quota_exhausted()`). See `docs/llm-provider-fallback.md`.
 ///
 /// `Config::load` validates every profile and resolves its credential once,
 /// at startup — a missing/empty provider or model, an unknown provider, or
@@ -278,6 +279,25 @@ pub struct TaskLlmSettings {
 pub struct ResolvedTaskLlm {
     pub primary: ProviderConfig,
     pub fallbacks: Vec<ProviderConfig>,
+}
+
+/// The `exposure` the generated Pi extension gives each bridged MCP tool.
+///
+/// Pi documents five values; only the two that keep every tool reachable by
+/// the model are offered. `model-only` would stop codemode scripts calling the
+/// tools, `deferred` hides them from codemode's own listing, and `hidden`
+/// withdraws them. See
+/// <https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#tool-exposure>.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PiToolExposure {
+    /// Pi's default: declared to the model while active. The generated file
+    /// omits the property, so it stays byte-identical to earlier releases.
+    #[default]
+    Direct,
+    /// Callable whenever registered and listed by Pi's `codemode` tool, but
+    /// not declared to the model unless activated explicitly.
+    Codemode,
 }
 
 /// Top-level runtime configuration.
@@ -407,6 +427,13 @@ pub struct Config {
     /// ceiling (observed with free aggregator tiers). Set with
     /// `AI_MEMORY_LLM_TIMEOUT_SECS`.
     pub llm_timeout_secs: u64,
+    /// OpenAI-compat only: add the `x-ai-memory-*` request metadata headers
+    /// (the operation's workload, and the workspace, project and username it
+    /// names when it has exactly one) to every chat attempt, so a gateway
+    /// can attribute and limit traffic. Values are identifiers, never page
+    /// content. Ignored by every other provider; off by default. Set with
+    /// `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS`.
+    pub llm_request_metadata_headers: bool,
     /// How many live `bootstrap` runs may call the LLM at once, across
     /// projects. A second run for the same project always waits for the
     /// first. Defaults to 1 (strictly one at a time); raise it when the
@@ -440,7 +467,8 @@ pub struct Config {
     /// overriding it. Values are never logged.
     pub llm_headers: Vec<String>,
     /// Ordered LLM fallback chain, tried after the primary provider only on
-    /// a transient failure (`LlmError::is_transient()`); empty by default
+    /// a transient failure (`LlmError::is_transient()`) or exhausted
+    /// credit/quota (`LlmError::is_quota_exhausted()`); empty by default
     /// (no behavior change). See [`FallbackProfile`] and
     /// `docs/llm-provider-fallback.md`. Configure via TOML:
     /// ```toml
@@ -477,6 +505,12 @@ pub struct Config {
     /// server's credentials (#762). Same `pub` rationale as above.
     #[serde(skip)]
     pub llm_fallback_unresolved: Vec<String>,
+    /// Seconds a fallback-chain candidate that reported exhausted credit,
+    /// quota or billing is skipped before the next call probes it again.
+    /// Only used when `llm_fallbacks` is non-empty. Defaults to 900
+    /// (`ai_memory_llm::DEFAULT_QUOTA_COOLDOWN`); accepted range 30–86400.
+    /// Set with `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS`.
+    pub llm_quota_cooldown_secs: u64,
     /// Opt-in: run LLM consolidation on SessionEnd (in addition to the
     /// always-written heuristic session page), when an LLM provider is
     /// configured. Off by default. Provider work is durably queued after the
@@ -493,6 +527,10 @@ pub struct Config {
     /// `install-hooks --capture-assistant`. Set with
     /// `AI_MEMORY_CAPTURE_ASSISTANT=true`.
     pub capture_assistant: bool,
+    /// Byte cap on the assistant excerpt stored when `capture_assistant` is on
+    /// (#2118). Defaults to 2,000; clamped to 16 KiB where it is applied. Set
+    /// with `AI_MEMORY_ASSISTANT_EXCERPT_MAX_BYTES`.
+    pub assistant_excerpt_max_bytes: usize,
     /// On by default. When the project's ai-memory store is brand new (empty),
     /// the SessionStart hook triggers a one-time, bounded import of this
     /// project's existing local harness session history so installing hooks
@@ -522,6 +560,14 @@ pub struct Config {
     /// `AI_MEMORY_CLAUDE_TRUE_YOLO` from an older release keeps loading; when
     /// true, `ai-memory run` prints a terminal note asking to remove it.
     pub claude_true_yolo: bool,
+    /// How the generated Pi extension exposes ai-memory's MCP tools to the
+    /// model (#1988). `direct` (the default) declares every tool, as before;
+    /// `codemode` registers them with Pi's `exposure: "codemode"`, so Pi's
+    /// codemode tool lists and calls them without their schemas being sent on
+    /// every request. Read by `install-hooks --agent pi`, preview and
+    /// `--apply` alike, so regenerating the extension keeps the choice. Set
+    /// with `AI_MEMORY_PI_TOOL_EXPOSURE` or `pi_tool_exposure` in config.toml.
+    pub pi_tool_exposure: PiToolExposure,
     /// Strip root-level `anyOf`/`oneOf`/`allOf` from MCP tool input
     /// schemas (e.g. `memory_read_page`'s "exactly one of path/query"
     /// contract) on every `tools/list`, regardless of client or `?flavor=`
@@ -805,6 +851,11 @@ pub struct RuntimeEnv {
     copilot_client_id: Option<String>,
     voyage_api_key: Option<SecretString>,
     opencode_api_key: Option<SecretString>,
+    google_application_credentials: Option<PathBuf>,
+    cloudsdk_config: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    google_cloud_project: Option<String>,
+    google_cloud_location: Option<String>,
     hook_spool_max_attempts: Option<String>,
     run_require_server: Option<String>,
 }
@@ -867,6 +918,13 @@ impl RuntimeEnv {
             copilot_client_id: env_string("AI_MEMORY_COPILOT_CLIENT_ID"),
             voyage_api_key: env_secret("VOYAGE_API_KEY"),
             opencode_api_key: env_secret("OPENCODE_API_KEY"),
+            // The names Google's own SDKs and `gcloud` read, so a machine already
+            // set up for Vertex AI needs nothing ai-memory-specific.
+            google_application_credentials: env_path("GOOGLE_APPLICATION_CREDENTIALS"),
+            cloudsdk_config: env_path("CLOUDSDK_CONFIG"),
+            appdata: env_path("APPDATA"),
+            google_cloud_project: env_string("GOOGLE_CLOUD_PROJECT"),
+            google_cloud_location: env_string("GOOGLE_CLOUD_LOCATION"),
             hook_spool_max_attempts: std::env::var("AI_MEMORY_HOOK_SPOOL_MAX_ATTEMPTS").ok(),
             // A flat env var (not `AI_MEMORY_RUN__REQUIRE_SERVER`, which
             // figment's `__` split would map onto `run.require_server`) so it
@@ -1266,6 +1324,29 @@ impl AuthSettings {
     }
 }
 
+/// Parse `AI_MEMORY_ADMISSION_WEBHOOKS_JSON`: the same webhook list a
+/// `[[admission_webhooks]]` table holds, as one JSON array.
+fn parse_admission_webhooks_json(raw: &str) -> Result<Vec<ai_memory_wiki::WebhookConfig>> {
+    serde_json::from_str(raw).with_context(|| {
+        "parsing AI_MEMORY_ADMISSION_WEBHOOKS_JSON (must be a JSON array of \
+         {name,url,timeout_ms?,failure_policy?,events,blocking?,projects?,headers?})"
+    })
+}
+
+/// Resolve each webhook header's relative `value_file` against the data dir.
+///
+/// Only the path is resolved here. The file holds a secret only the server
+/// sends, and every hook and thin client loads this same config, so it is
+/// read once by `AdmissionChain::new` when `serve` builds the chain; a missing
+/// file then stops the server, not the hooks.
+fn resolve_admission_header_files(webhooks: &mut [ai_memory_wiki::WebhookConfig], data_dir: &Path) {
+    for header in webhooks.iter_mut().flat_map(|hook| hook.headers.iter_mut()) {
+        if header.value_file.is_relative() {
+            header.value_file = data_dir.join(&header.value_file);
+        }
+    }
+}
+
 /// What [`apply_bearer_token_file`] needs to know about the load.
 struct TokenFileContext<'a> {
     data_dir: &'a Path,
@@ -1400,6 +1481,11 @@ pub struct RoutingSettings {
     /// `follow-cwd` (default) or `sticky`. See
     /// [`ai_memory_core::MidSessionRouting`] for full semantics.
     pub mid_session: ai_memory_core::MidSessionRouting,
+    /// Opt-in (default `false`): a mid-session event that resolves through a
+    /// `.ai-memory.toml` marker to a project other than the session's own gets
+    /// that project's core brief (pinned, `_rules/`, `_slots/`) once per
+    /// project per session (#2103).
+    pub brief_on_project_change: bool,
 }
 
 /// `[ingest]`: tool events the server drops whatever the client sends
@@ -1477,6 +1563,11 @@ where
         .unwrap_or(DEFAULT_HOOK_SPOOL_MAX_ATTEMPTS))
 }
 
+/// Lower bound for `llm_quota_cooldown_secs`: the transient circuit floor.
+const MIN_LLM_QUOTA_COOLDOWN_SECS: u64 = ai_memory_llm::CIRCUIT_COOLDOWN.as_secs();
+/// Upper bound for `llm_quota_cooldown_secs`: one day.
+const MAX_LLM_QUOTA_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1500,6 +1591,7 @@ impl Default for Config {
             llm_compat_disable_thinking: false,
             llm_compat_stream: None,
             llm_timeout_secs: ai_memory_llm::DEFAULT_REQUEST_TIMEOUT_SECS,
+            llm_request_metadata_headers: false,
             bootstrap_max_concurrent: 1,
             llm_reasoning_effort: None,
             llm_headers: Vec::new(),
@@ -1508,12 +1600,15 @@ impl Default for Config {
             llm_task_configs: BTreeMap::new(),
             llm_fallback_configs: Vec::new(),
             llm_fallback_unresolved: Vec::new(),
+            llm_quota_cooldown_secs: ai_memory_llm::DEFAULT_QUOTA_COOLDOWN.as_secs(),
             consolidate_on_session_end: false,
             capture_assistant: false,
+            assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
             backfill_on_start: true,
             run_autowire: true,
             run: RunSettings::default(),
             claude_true_yolo: false,
+            pi_tool_exposure: PiToolExposure::default(),
             strip_root_combinators: false,
             gemini_safe_schemas: false,
             reranker: None,
@@ -1689,6 +1784,16 @@ pub struct ConsolidationSettings {
     /// the effective char budget (default 0.8); lower it further for a corpus
     /// that is mostly non-English or code. (#884)
     pub input_token_safety_margin: f64,
+    /// Natural language for generated memory PROSE — session summaries,
+    /// cross-session lessons, dream merges, and auto-improvement proposals.
+    ///
+    /// `None` (default) keeps the existing behavior: generated prose follows
+    /// the dominant natural language of the input. Set to a language name such
+    /// as `"English"` to force every generation pass to write prose in that
+    /// language regardless of the input language. Evidence quotes, code,
+    /// identifiers, file paths, and raw session history always stay verbatim in
+    /// their original language. (#2185)
+    pub output_language: Option<String>,
 }
 
 impl Default for ConsolidationSettings {
@@ -1699,6 +1804,7 @@ impl Default for ConsolidationSettings {
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
                 ai_memory_consolidate::DEFAULT_CONSOLIDATION_INPUT_TOKEN_SAFETY_MARGIN,
+            output_language: None,
         }
     }
 }
@@ -1804,6 +1910,10 @@ pub struct AutoImproveSettings {
     pub max_procedure_page_tokens: usize,
     /// Whether future reviewers may include raw observation fallback details.
     pub include_raw_fallback: bool,
+    /// List the reserved `_global` scope's page titles to the reviewer,
+    /// read-only, and refuse a full-page proposal that reuses one of their
+    /// paths or titles. Off by default (#1212).
+    pub include_global_titles: bool,
     /// Synthetic actor used for autonomous proposal provenance.
     pub proposal_actor: String,
     /// Wiki-relative folder for non-indexed pending proposal sidecars.
@@ -1915,6 +2025,7 @@ impl Default for AutoImproveSettings {
             max_procedure_page_tokens:
                 ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS,
             include_raw_fallback: false,
+            include_global_titles: false,
             proposal_actor: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into(),
             pending_path: ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into(),
         }
@@ -1973,6 +2084,13 @@ pub struct MaintenanceSettings {
     /// persist cadence across restarts; overdue work starts after a bounded
     /// startup delay.
     pub lint_interval_secs: u64,
+    /// Interval for lint with the LLM contradiction pass (#2021). `0` (the
+    /// default) disables this job, because each run makes one `[llm.lint]`
+    /// provider call per project with enough semantic pages. Without a lint
+    /// provider the job is skipped with one startup warning. Cadence persists
+    /// like `lint_interval_secs`, and while it is on the rule-based run keeps
+    /// the last LLM findings in `_lint/report.md`.
+    pub lint_llm_interval_secs: u64,
     /// Interval for embedding backfill. `0` disables this job.
     /// Defaults to off because it may call a paid provider.
     pub embedding_backfill_interval_secs: u64,
@@ -2010,6 +2128,7 @@ impl Default for MaintenanceSettings {
             enabled: true,
             forget_sweep_interval_secs: 86_400,
             lint_interval_secs: 86_400,
+            lint_llm_interval_secs: 0,
             embedding_backfill_interval_secs: 0,
             reconcile_tombstones_deleted_pages: false,
         }
@@ -2102,6 +2221,7 @@ impl DreamSettings {
     pub fn dream_config(
         self,
         embedding: Option<ai_memory_consolidate::EmbeddingCoord>,
+        output_language: Option<String>,
     ) -> ai_memory_consolidate::DreamConfig {
         ai_memory_consolidate::DreamConfig {
             enabled: self.enabled,
@@ -2111,6 +2231,7 @@ impl DreamSettings {
             max_clusters_per_run: self.max_clusters_per_run,
             min_cold_pages: self.min_cold_pages,
             idle_window_secs: self.idle_window_secs,
+            output_language,
         }
     }
 }
@@ -2159,6 +2280,29 @@ pub struct RetrievalSettings {
     /// to `weight * similarity` in authority. `0.0` (the default) is inert —
     /// nothing is captured and nothing is boosted.
     pub query_signal_weight: f64,
+    /// Default number of hits `memory_query` returns when a call gives no
+    /// explicit `limit` and the queried project carries no stored
+    /// `default_result_limit` of its own (#2038). `None` (the default) keeps
+    /// the built-in default of 10. A per-project marker value and an explicit
+    /// per-call `limit` both override this; all three are clamped to `1..=100`.
+    pub default_result_limit: Option<usize>,
+    /// Lowest calibrated reranker relevance a `memory_query` hit may have when
+    /// a call gives no explicit `min_relevance` and the queried project carries
+    /// no stored `min_relevance` of its own (#2038). `None` (the default)
+    /// applies no floor. A per-project marker value and an explicit per-call
+    /// `min_relevance` both override this; all three are bounded to `0.0..=1.0`.
+    /// The threshold needs a configured reranker — a query that sets it with
+    /// none available is rejected, never silently applied to the RRF rank.
+    pub min_relevance: Option<f32>,
+    /// Record each single-project `memory_query` call to a per-session
+    /// retrieval history a read-only `/web` dashboard renders, so retrieval
+    /// accuracy can be inspected and noisy results debugged (#2038). `false`
+    /// (the default) records nothing; turning it off never disables retrieval.
+    pub record_history: bool,
+    /// Newest-N retrieval records kept per `(workspace, project, session)` when
+    /// `record_history` is on (#2038). `None` (the default) keeps the built-in
+    /// cap; a value is floored to 1 so recording is never silently inert.
+    pub history_retention_per_session: Option<usize>,
 }
 
 impl Default for RetrievalSettings {
@@ -2172,6 +2316,10 @@ impl Default for RetrievalSettings {
             observation_stream: base.observation_stream,
             feedback_demotion: base.feedback_demotion,
             query_signal_weight: base.query_signal_weight,
+            default_result_limit: None,
+            min_relevance: None,
+            record_history: false,
+            history_retention_per_session: None,
         }
     }
 }
@@ -2541,12 +2689,7 @@ impl Config {
         if let Ok(raw) = std::env::var("AI_MEMORY_ADMISSION_WEBHOOKS_JSON")
             && !raw.trim().is_empty()
         {
-            let parsed: Vec<ai_memory_wiki::WebhookConfig> = serde_json::from_str(&raw)
-                .with_context(|| {
-                    "parsing AI_MEMORY_ADMISSION_WEBHOOKS_JSON (must be a JSON array of \
-                     {name,url,timeout_ms?,failure_policy?,events})"
-                })?;
-            config.admission_webhooks = parsed;
+            config.admission_webhooks = parse_admission_webhooks_json(&raw)?;
         }
         // FTS stopword list (issue #953): CSV env override, applied as data
         // (see `apply_fts_stopwords_env`'s doc comment for why this can't go
@@ -2600,6 +2743,8 @@ impl Config {
         // server WAS on the default port -- which is how the reporter wrote
         // test pages into their real store.
         derive_server_url_from_bind(&mut config, explicit_server_url);
+        // After the data dir is final, as for the bearer token file below.
+        resolve_admission_header_files(&mut config.admission_webhooks, &config.data_dir);
         apply_bearer_token_file(
             &mut config.auth,
             &TokenFileContext {
@@ -2706,6 +2851,40 @@ impl Config {
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
         }
+        // The default result count is the same `1..=100` window `memory_query`
+        // clamps a per-call `limit` to (#2038). Reject an out-of-range global
+        // default at startup rather than silently clamping a `0` to `1` or a
+        // `500` to `100` and running queries no one asked for.
+        if let Some(limit) = config.retrieval.default_result_limit
+            && !(1..=100).contains(&limit)
+        {
+            anyhow::bail!(
+                "retrieval.default_result_limit must be between 1 and 100 (got {limit}); it sets \
+                 how many hits memory_query returns when a call gives no explicit limit"
+            );
+        }
+        // The relevance floor is a calibrated `0.0..=1.0` reranker score (#2038).
+        // Reject an out-of-range global default at startup (NaN included, since
+        // it fails the range check) rather than silently ignoring a value the
+        // operator clearly meant.
+        if let Some(min_relevance) = config.retrieval.min_relevance
+            && !(0.0..=1.0).contains(&min_relevance)
+        {
+            anyhow::bail!(
+                "retrieval.min_relevance must be between 0 and 1 (got {min_relevance}); it sets the \
+                 lowest calibrated reranker relevance a memory_query hit may have when a call gives \
+                 no explicit min_relevance"
+            );
+        }
+        // A zero retention cap would delete every record the moment it was
+        // written, making an opted-in dashboard silently empty. Reject it loudly
+        // rather than ship a feature that looks on but keeps nothing (#2038).
+        if let Some(0) = config.retrieval.history_retention_per_session {
+            anyhow::bail!(
+                "retrieval.history_retention_per_session must be at least 1 (got 0); it caps how \
+                 many retrieval records are kept per session when retrieval.record_history is on"
+            );
+        }
         config.ingest.drop_list = Box::new(
             ai_memory_hooks::IngestDropList::new(
                 config.ingest.drop_tool_use_id_prefixes.clone(),
@@ -2741,6 +2920,25 @@ impl Config {
             .validate()
         {
             anyhow::bail!("auto_improve.scheduler.experience_{message}");
+        }
+
+        // The language name is interpolated into an LLM system prompt, so keep
+        // it to a short single-line name (#2185).
+        const MAX_OUTPUT_LANGUAGE_CHARS: usize = 40; // keep in sync with the message below
+        config.consolidation.output_language = config
+            .consolidation
+            .output_language
+            .take()
+            .map(|lang| lang.trim().to_owned())
+            .filter(|lang| !lang.is_empty());
+        if let Some(lang) = &config.consolidation.output_language
+            && (lang.chars().count() > MAX_OUTPUT_LANGUAGE_CHARS
+                || lang.chars().any(char::is_control))
+        {
+            anyhow::bail!(
+                "consolidation.output_language must be a single-line language name of at most \
+                 40 characters with no control characters"
+            );
         }
 
         // The safety margin scales the input budget, so a non-positive value
@@ -2821,6 +3019,19 @@ impl Config {
             anyhow::bail!(
                 "bootstrap_max_concurrent must be at least 1 (got 0); \
                  AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT counts concurrent runs"
+            );
+        }
+        // Below the transient circuit floor a quota-exhausted primary would be
+        // re-probed more often than a merely rate-limited one; above a day it
+        // would outlive any provider's quota window.
+        if !(MIN_LLM_QUOTA_COOLDOWN_SECS..=MAX_LLM_QUOTA_COOLDOWN_SECS)
+            .contains(&config.llm_quota_cooldown_secs)
+        {
+            anyhow::bail!(
+                "llm_quota_cooldown_secs must be between {MIN_LLM_QUOTA_COOLDOWN_SECS} and \
+                 {MAX_LLM_QUOTA_COOLDOWN_SECS} seconds (got {}); \
+                 AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS is read in seconds",
+                config.llm_quota_cooldown_secs
             );
         }
         // Zero would time out every rerank before the provider is called,
@@ -2935,7 +3146,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "AI_MEMORY_LLM_PROVIDER={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
+                 anthropic|openai|gemini|vertex|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         self.make_provider_config(
@@ -2961,6 +3172,7 @@ impl Config {
                 ProviderChoice::AnthropicOAuth => "claude-sonnet-4-6".to_string(),
                 ProviderChoice::OpenAi => "gpt-5.4-mini".to_string(),
                 ProviderChoice::Gemini => "gemini-3.5-flash".to_string(),
+                ProviderChoice::Vertex => "gemini-3.5-flash".to_string(),
                 ProviderChoice::OpenAiOAuth => "gpt-5.5".to_string(),
                 ProviderChoice::Codex => "gpt-5.6-luna".to_string(),
                 ProviderChoice::Copilot => "gpt-5.5".to_string(),
@@ -2986,6 +3198,7 @@ impl Config {
             request_timeout_secs: self.llm_timeout_secs,
             reasoning_effort: self.llm_reasoning_effort,
             extra_headers: self.llm_extra_headers()?,
+            request_metadata_headers: self.llm_request_metadata_headers,
         })
     }
 
@@ -3070,7 +3283,7 @@ impl Config {
         let provider = provider_choice_from_str(provider_raw).ok_or_else(|| {
             LlmError::NotConfigured(format!(
                 "{path}.provider={provider_raw} is not one of \
-                 anthropic|openai|gemini|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
+                 anthropic|openai|gemini|vertex|openai-compat|openai-oauth|codex|copilot|anthropic-oauth|opencode|cursor"
             ))
         })?;
         let model = non_empty(Some(profile.model.as_str()))
@@ -3141,6 +3354,7 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken
             | AuthRequirement::CodexAuthFile
             | AuthRequirement::CursorCli
+            | AuthRequirement::GoogleAdc
                 if explicit_key =>
             {
                 return Err(LlmError::NotConfigured(format!(
@@ -3190,7 +3404,18 @@ impl Config {
         let Some(primary_cfg) = self.llm_provider_config()? else {
             return Ok(None);
         };
-        build_llm_chain(primary_cfg, &self.llm_fallback_configs).map(Some)
+        build_llm_chain(
+            primary_cfg,
+            &self.llm_fallback_configs,
+            self.llm_quota_cooldown(),
+        )
+        .map(Some)
+    }
+
+    /// How long any chain, the default or a workload's, skips a candidate
+    /// that reported exhausted credit or quota.
+    fn llm_quota_cooldown(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.llm_quota_cooldown_secs)
     }
 
     /// Construct the default chain and each independently configured workload chain.
@@ -3205,7 +3430,11 @@ impl Config {
                 .ok_or_else(|| LlmError::NotConfigured(format!("unknown LLM task llm.{name}")))?;
             overrides.insert(
                 workload,
-                build_llm_chain(task.primary.clone(), &task.fallbacks)?,
+                build_llm_chain(
+                    task.primary.clone(),
+                    &task.fallbacks,
+                    self.llm_quota_cooldown(),
+                )?,
             );
         }
         Ok(LlmProviders { default, overrides })
@@ -3399,6 +3628,7 @@ impl Config {
             ProviderChoice::AnthropicOAuth => None,
             ProviderChoice::OpenCode => self.runtime_env.opencode_api_key.clone(),
             ProviderChoice::Cursor => None,
+            ProviderChoice::Vertex => None,
         }
     }
 
@@ -3436,6 +3666,40 @@ impl Config {
             cursor_executable(self.runtime_env.cursor_executable.as_deref()),
             self.runtime_env.temp_dir.clone().unwrap_or_default(),
             self.runtime_env.process_env(),
+        )
+    }
+
+    /// Vertex AI inputs, from values captured once by [`Config::load`]: an
+    /// explicit `GOOGLE_APPLICATION_CREDENTIALS`, else the file
+    /// `gcloud auth application-default login` writes.
+    fn vertex_auth(&self) -> ProviderAuth {
+        let env = &self.runtime_env;
+        let (credentials_file, source) = match &env.google_application_credentials {
+            Some(path) => (
+                Some(path.clone()),
+                CredentialSource::Environment {
+                    name: "GOOGLE_APPLICATION_CREDENTIALS",
+                },
+            ),
+            None => (
+                gcloud_adc_file(
+                    env.cloudsdk_config.as_deref(),
+                    env.appdata.as_deref(),
+                    env.platform_home
+                        .as_deref()
+                        .or_else(|| env.home_dir.as_deref().map(Path::new)),
+                    cfg!(windows),
+                ),
+                CredentialSource::TokenFile,
+            ),
+        };
+        ProviderAuth::vertex(
+            credentials_file,
+            env.google_cloud_project.clone(),
+            env.google_cloud_location
+                .clone()
+                .unwrap_or_else(|| "global".to_string()),
+            source,
         )
     }
 
@@ -3505,6 +3769,7 @@ impl Config {
                 ProviderAuth::anthropic_oauth_token(self.runtime_env.anthropic_oauth_token.clone())
             }
             AuthRequirement::CursorCli => ProviderAuth::cursor(self.cursor_auth()),
+            AuthRequirement::GoogleAdc => self.vertex_auth(),
         }
     }
 
@@ -3553,6 +3818,7 @@ impl Config {
 fn build_llm_chain(
     primary: ProviderConfig,
     fallbacks: &[ProviderConfig],
+    quota_cooldown: std::time::Duration,
 ) -> LlmResult<Arc<dyn LlmProvider>> {
     if fallbacks.is_empty() {
         return build_provider(primary);
@@ -3570,7 +3836,27 @@ fn build_llm_chain(
             build_provider(cfg.clone())?,
         ));
     }
-    Ok(Arc::new(FallbackLlmProvider::new(candidates)))
+    Ok(Arc::new(
+        FallbackLlmProvider::new(candidates).with_quota_cooldown(quota_cooldown),
+    ))
+}
+
+/// Where `gcloud auth application-default login` writes its credentials:
+/// `$CLOUDSDK_CONFIG`, else `%APPDATA%\gcloud` on Windows and
+/// `~/.config/gcloud` elsewhere.
+/// <https://cloud.google.com/docs/authentication/application-default-credentials#personal>
+fn gcloud_adc_file(
+    cloudsdk_config: Option<&Path>,
+    appdata: Option<&Path>,
+    home: Option<&Path>,
+    windows: bool,
+) -> Option<PathBuf> {
+    let config_dir = match cloudsdk_config {
+        Some(dir) => dir.to_path_buf(),
+        None if windows => appdata?.join("gcloud"),
+        None => home?.join(".config").join("gcloud"),
+    };
+    Some(config_dir.join("application_default_credentials.json"))
 }
 
 /// Wire-name parsing shared by `llm_provider` and `llm_fallbacks[].provider`.
@@ -3586,6 +3872,7 @@ fn provider_choice_from_str(raw: &str) -> Option<ProviderChoice> {
         "anthropic-oauth" | "anthropic_oauth" => ProviderChoice::AnthropicOAuth,
         "opencode" | "opencode-zen" | "opencode_zen" => ProviderChoice::OpenCode,
         "cursor" => ProviderChoice::Cursor,
+        "vertex" | "vertex-ai" | "vertex_ai" => ProviderChoice::Vertex,
         _ => return None,
     })
 }
@@ -4532,6 +4819,7 @@ mod tests {
         assert!(cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
         assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
+        assert_eq!(cfg.maintenance.lint_llm_interval_secs, 0);
         assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
         assert_eq!(cfg.decay.breadth_weight, 0.0);
         // Observation pruning must stay OFF by default: an install that never
@@ -4574,6 +4862,7 @@ mod tests {
         assert_eq!(cfg.auto_improve.eval.targets, vec!["_rules", "procedures"]);
         assert_eq!(cfg.auto_improve.eval.min_delta, 0.0);
         assert!(!cfg.auto_improve.include_raw_fallback);
+        assert!(!cfg.auto_improve.include_global_titles);
         assert_eq!(cfg.auto_improve.proposal_actor, "auto_improve");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/auto-improve");
     }
@@ -4654,6 +4943,127 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_default_result_limit_defaults_unset_and_loads_from_toml() {
+        // Unset by default, so the server keeps its built-in 10.
+        assert_eq!(Config::default().retrieval.default_result_limit, None);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[retrieval]\ndefault_result_limit = 25\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.retrieval.default_result_limit, Some(25));
+    }
+
+    #[test]
+    fn load_rejects_out_of_range_default_result_limit() {
+        for value in ["0", "101", "1000"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[retrieval]\ndefault_result_limit = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err(&format!("default_result_limit = {value} must fail closed"));
+            assert!(
+                error.to_string().contains("default_result_limit"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+        // The `1..=100` edges load.
+        for value in ["1", "100"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[retrieval]\ndefault_result_limit = {value}\n"),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .unwrap_or_else(|e| panic!("default_result_limit = {value} must load: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn retrieval_min_relevance_defaults_unset_and_loads_from_toml() {
+        // Unset by default, so no relevance floor is applied.
+        assert_eq!(Config::default().retrieval.min_relevance, None);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[retrieval]\nmin_relevance = 0.35\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.retrieval.min_relevance, Some(0.35));
+    }
+
+    #[test]
+    fn load_rejects_out_of_range_min_relevance() {
+        for value in ["-0.1", "1.1", "2.0"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[retrieval]\nmin_relevance = {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .expect_err(&format!("min_relevance = {value} must fail closed"));
+            assert!(
+                error.to_string().contains("min_relevance"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+        // The `0.0..=1.0` edges load.
+        for value in ["0.0", "1.0"] {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[retrieval]\nmin_relevance = {value}\n"),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+                .unwrap_or_else(|e| panic!("min_relevance = {value} must load: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn retrieval_record_history_defaults_off_and_loads_from_toml() {
+        // Off by default, with no retention cap set (the built-in applies).
+        assert!(!Config::default().retrieval.record_history);
+        assert_eq!(
+            Config::default().retrieval.history_retention_per_session,
+            None
+        );
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[retrieval]\nrecord_history = true\nhistory_retention_per_session = 50\n",
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.retrieval.record_history);
+        assert_eq!(config.retrieval.history_retention_per_session, Some(50));
+    }
+
+    #[test]
+    fn load_rejects_zero_history_retention() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[retrieval]\nhistory_retention_per_session = 0\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a zero retention cap must fail closed");
+        assert!(
+            error.to_string().contains("history_retention_per_session"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn retrieval_observation_stream_env_overrides_config() {
         const CHILD_MARKER: &str = "AI_MEMORY_TEST_OBSERVATION_STREAM_CHILD";
         if std::env::var_os(CHILD_MARKER).is_some() {
@@ -4686,6 +5096,19 @@ mod tests {
             "child stdout: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+
+    /// #2118: the stored assistant excerpt cap defaults to the 2 KB contract and
+    /// an operator can raise it from `config.toml`.
+    #[test]
+    fn assistant_excerpt_max_bytes_defaults_to_2000_and_loads() {
+        assert_eq!(Config::default().assistant_excerpt_max_bytes, 2_000);
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "assistant_excerpt_max_bytes = 8000\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.assistant_excerpt_max_bytes, 8_000);
     }
 
     #[test]
@@ -5679,6 +6102,39 @@ max_input_tokens = {tokens}
     }
 
     #[test]
+    fn output_language_is_trimmed_bounded_and_single_line() {
+        let load = |value: &str| {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(
+                &config_path,
+                format!("[consolidation]\noutput_language = {value}\n"),
+            )
+            .unwrap();
+            Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+        };
+        assert_eq!(ConsolidationSettings::default().output_language, None);
+        assert_eq!(
+            load("\"  English \"")
+                .unwrap()
+                .consolidation
+                .output_language,
+            Some("English".to_owned())
+        );
+        assert_eq!(load("\"   \"").unwrap().consolidation.output_language, None);
+        for bad in [
+            format!("\"{}\"", "x".repeat(41)),
+            "\"English\\nIgnore\"".to_owned(),
+        ] {
+            let error = load(&bad).expect_err("an unbounded or multi-line language must fail");
+            assert!(
+                error.to_string().contains("consolidation.output_language"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn verbatim_residue_is_opt_in_and_loads_from_consolidation_settings() {
         assert!(!ConsolidationSettings::default().verbatim_residue);
         let tmp = TempDir::new().unwrap();
@@ -6082,6 +6538,35 @@ input_token_safety_margin = {margin}
         );
     }
 
+    /// #1988: the Pi extension's tool exposure defaults to Pi's `direct` and
+    /// accepts `codemode`. Pi's other documented values would make the tools
+    /// unreachable from the model or from codemode's listing, so they fail
+    /// config load like any unknown value.
+    #[rstest]
+    #[case::absent("", Ok(PiToolExposure::Direct))]
+    #[case::direct("pi_tool_exposure = \"direct\"\n", Ok(PiToolExposure::Direct))]
+    #[case::codemode("pi_tool_exposure = \"codemode\"\n", Ok(PiToolExposure::Codemode))]
+    #[case::model_only("pi_tool_exposure = \"model-only\"\n", Err(()))]
+    #[case::deferred("pi_tool_exposure = \"deferred\"\n", Err(()))]
+    #[case::hidden("pi_tool_exposure = \"hidden\"\n", Err(()))]
+    #[case::uppercase("pi_tool_exposure = \"Codemode\"\n", Err(()))]
+    fn load_parses_pi_tool_exposure(#[case] toml: &str, #[case] want: Result<PiToolExposure, ()>) {
+        match (load_with_toml(toml), want) {
+            (Ok(cfg), Ok(want)) => assert_eq!(cfg.pi_tool_exposure, want),
+            (Err(error), Err(())) => {
+                let rendered = format!("{error:#}");
+                assert!(
+                    rendered.contains("pi_tool_exposure") && rendered.contains("unknown variant"),
+                    "unexpected error: {rendered}"
+                );
+            }
+            (got, want) => panic!(
+                "{toml:?}: got {:?}, want {want:?}",
+                got.map(|c| c.pi_tool_exposure)
+            ),
+        }
+    }
+
     #[test]
     fn defaults_bound_consolidation_prompts_for_a_large_context_provider() {
         let tmp = TempDir::new().unwrap();
@@ -6221,6 +6706,7 @@ input_token_safety_margin = {margin}
             [maintenance]
             enabled = false
             lint_interval_secs = 3600
+            lint_llm_interval_secs = 604800
 
             [auto_improve]
             mode = "dry_run"
@@ -6243,6 +6729,7 @@ input_token_safety_margin = {margin}
             max_rule_page_tokens = 1000
             max_procedure_page_tokens = 1500
             include_raw_fallback = true
+            include_global_titles = true
             proposal_actor = "review_bot"
             pending_path = "_pending/review-bot"
 
@@ -6276,6 +6763,7 @@ input_token_safety_margin = {margin}
         assert!(!cfg.handoff.create_on_session_end);
         assert!(!cfg.maintenance.enabled);
         assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
+        assert_eq!(cfg.maintenance.lint_llm_interval_secs, 604_800);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 1_800);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 4);
@@ -6307,6 +6795,7 @@ input_token_safety_margin = {margin}
         assert_eq!(cfg.auto_improve.eval.targets, vec!["_rules"]);
         assert_eq!(cfg.auto_improve.eval.min_delta, 0.05);
         assert!(cfg.auto_improve.include_raw_fallback);
+        assert!(cfg.auto_improve.include_global_titles);
         assert_eq!(cfg.auto_improve.proposal_actor, "review_bot");
         assert_eq!(cfg.auto_improve.pending_path, "_pending/review-bot");
     }
@@ -6365,11 +6854,18 @@ input_token_safety_margin = {margin}
 
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
+        // Defaults keep the historical harvest behaviour (#2180).
+        assert_eq!(
+            defaults.harvest_prompts,
+            ai_memory_core::profile::HarvestPrompts::All
+        );
+
         std::fs::write(
             &cfg_path,
             "[profile]\nenabled = true\nshare = \"workspace\"\nmin_projects = 3\n\
              inject_on_session_start = false\ndigest_max_bytes = 4000\n\
-             baseline_max_bytes = 8000\napply_max_lines = 20\nllm = false\n",
+             baseline_max_bytes = 8000\napply_max_lines = 20\nllm = false\n\
+             harvest_prompts = \"interactive\"\n",
         )
         .unwrap();
         let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
@@ -6381,6 +6877,10 @@ input_token_safety_margin = {margin}
         assert_eq!(cfg.profile.baseline_max_bytes, 8_000);
         assert_eq!(cfg.profile.apply_max_lines, 20);
         assert!(!cfg.profile.llm);
+        assert_eq!(
+            cfg.profile.harvest_prompts,
+            ai_memory_core::profile::HarvestPrompts::Interactive
+        );
         assert_eq!(
             cfg.profile.effective_share(true),
             Some(EffectiveProfileShare::Workspace)
@@ -7008,6 +7508,73 @@ input_token_safety_margin = {margin}
         assert!(!cfg.llm_compat_disable_thinking);
     }
 
+    /// Request metadata is opt-in: off by default, so an existing gateway
+    /// sees no new headers, and forwarded verbatim once turned on.
+    #[test]
+    fn llm_request_metadata_headers_defaults_off_and_is_forwarded() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+        assert!(!cfg.llm_request_metadata_headers);
+        cfg.llm_provider = Some("openai-compat".into());
+        cfg.llm_model = Some("qwen3:32b".into());
+        cfg.llm_base_url = Some("http://localhost:11434/v1".into());
+        assert!(
+            !cfg.llm_provider_config()
+                .unwrap()
+                .unwrap()
+                .request_metadata_headers
+        );
+
+        cfg.llm_request_metadata_headers = true;
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        assert!(provider.request_metadata_headers);
+    }
+
+    #[test]
+    fn load_accepts_llm_request_metadata_headers_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "llm_request_metadata_headers = true\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(cfg.llm_request_metadata_headers);
+    }
+
+    /// `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` turns it on through the env.
+    /// Child-process marker pattern: `std::env::set_var` is unsafe and
+    /// forbidden in this crate's multi-threaded test binary.
+    #[test]
+    fn llm_request_metadata_headers_env_turns_it_on() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_REQUEST_METADATA_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config = Config::load(None, Some(tmp.path().to_path_buf())).unwrap();
+            assert!(config.llm_request_metadata_headers);
+            println!("request-metadata-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::llm_request_metadata_headers_env_turns_it_on")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_LLM_REQUEST_METADATA_HEADERS", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("request-metadata-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
     #[test]
     fn load_accepts_llm_compat_stream_from_toml() {
         let tmp = TempDir::new().unwrap();
@@ -7251,6 +7818,105 @@ input_token_safety_margin = {margin}
         assert_eq!(provider.auth.requirement(), AuthRequirement::CursorCli);
     }
 
+    #[test]
+    fn vertex_provider_reads_google_cloud_env_and_defaults_to_global() {
+        let cfg = Config {
+            llm_provider: Some("vertex".into()),
+            runtime_env: RuntimeEnv {
+                google_application_credentials: Some(PathBuf::from("/secrets/sa.json")),
+                google_cloud_project: Some("billing-project".into()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_vertex_auth().unwrap();
+
+        assert_eq!(provider.provider, ProviderChoice::Vertex);
+        assert_eq!(provider.model, "gemini-3.5-flash");
+        assert_eq!(auth.credentials_file, PathBuf::from("/secrets/sa.json"));
+        assert_eq!(auth.project.as_deref(), Some("billing-project"));
+        assert_eq!(auth.location, "global");
+        assert_eq!(
+            provider.auth.source(),
+            CredentialSource::Environment {
+                name: "GOOGLE_APPLICATION_CREDENTIALS"
+            }
+        );
+    }
+
+    /// Without `GOOGLE_APPLICATION_CREDENTIALS` the provider uses the file a
+    /// `gcloud auth application-default login` left in the operator's home.
+    #[test]
+    fn vertex_provider_falls_back_to_the_gcloud_login_file() {
+        let cfg = Config {
+            llm_provider: Some("vertex-ai".into()),
+            runtime_env: RuntimeEnv {
+                platform_home: Some(PathBuf::from("/home/op")),
+                // Windows resolves the gcloud login file under %APPDATA%, not the
+                // POSIX `~/.config` path, so the fallback needs an appdata root to
+                // resolve on that platform too.
+                appdata: Some(PathBuf::from("C:/Users/op/AppData/Roaming")),
+                google_cloud_location: Some("us-central1".into()),
+                ..RuntimeEnv::default()
+            },
+            ..Config::default()
+        };
+
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        let auth = provider.auth.require_vertex_auth().unwrap();
+
+        if cfg!(windows) {
+            assert_eq!(
+                auth.credentials_file,
+                Path::new(
+                    "C:/Users/op/AppData/Roaming/gcloud/application_default_credentials.json"
+                )
+            );
+        } else {
+            assert_eq!(
+                auth.credentials_file,
+                Path::new("/home/op/.config/gcloud/application_default_credentials.json")
+            );
+        }
+        assert_eq!(auth.project, None);
+        assert_eq!(auth.location, "us-central1");
+        assert_eq!(provider.auth.source(), CredentialSource::TokenFile);
+    }
+
+    #[test]
+    fn gcloud_adc_file_follows_cloudsdk_config_then_the_platform_default() {
+        let file = "application_default_credentials.json";
+        assert_eq!(
+            gcloud_adc_file(
+                Some(Path::new("/custom/gcloud")),
+                Some(Path::new("C:/Users/op/AppData/Roaming")),
+                Some(Path::new("/home/op")),
+                true,
+            ),
+            Some(Path::new("/custom/gcloud").join(file))
+        );
+        assert_eq!(
+            gcloud_adc_file(
+                None,
+                Some(Path::new("C:/Users/op/AppData/Roaming")),
+                None,
+                true
+            ),
+            Some(Path::new("C:/Users/op/AppData/Roaming/gcloud").join(file))
+        );
+        assert_eq!(
+            gcloud_adc_file(None, None, Some(Path::new("/home/op")), false),
+            Some(Path::new("/home/op/.config/gcloud").join(file))
+        );
+        assert_eq!(gcloud_adc_file(None, None, None, false), None);
+        assert_eq!(
+            gcloud_adc_file(None, None, Some(Path::new("/home/op")), true),
+            None
+        );
+    }
+
     /// The Cursor child reads untrusted session text: the provider config
     /// hands it the captured environment's allowlisted part only, so the
     /// server's own bearer and other providers' keys never reach it.
@@ -7298,6 +7964,43 @@ input_token_safety_margin = {margin}
         let config_path = tmp.path().join("config.toml");
         std::fs::write(&config_path, toml).unwrap();
         Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+    }
+
+    #[test]
+    fn admission_webhook_bot_wake_config_is_the_same_from_toml_and_json() {
+        let toml = r#"
+[[admission_webhooks]]
+name = "grok-bot-wake"
+url = "https://example.test/hook"
+events = ["message_send"]
+blocking = false
+projects = ["fuad/grok-bot"]
+headers = [{ name = "Authorization", value_file = "secrets/wake" }]
+"#;
+        // The secret file does not exist: loading the config must not open it,
+        // or every hook and thin client would fail on a server-only secret.
+        let config = load_with_toml(toml).unwrap();
+        let mut from_json = parse_admission_webhooks_json(
+            r#"[{"name":"grok-bot-wake","url":"https://example.test/hook",
+                "events":["message_send"],"blocking":false,
+                "projects":["fuad/grok-bot"],
+                "headers":[{"name":"Authorization","value_file":"secrets/wake"}]}]"#,
+        )
+        .unwrap();
+        resolve_admission_header_files(&mut from_json, &config.data_dir);
+
+        assert_eq!(
+            serde_json::to_value(&config.admission_webhooks).unwrap(),
+            serde_json::to_value(&from_json).unwrap(),
+            "TOML and the JSON env override describe the same webhook"
+        );
+        let hook = &config.admission_webhooks[0];
+        assert_eq!(hook.projects, ["fuad/grok-bot"]);
+        assert_eq!(
+            hook.headers[0].value_file,
+            config.data_dir.join("secrets/wake"),
+            "a relative value_file resolves against the data dir"
+        );
     }
 
     fn load_with_oauth_fixture(tmp: &TempDir, toml: &str) -> Config {
@@ -7675,6 +8378,28 @@ input_token_safety_margin = {margin}
         );
     }
 
+    /// `llm_request_metadata_headers` is server-wide, as `docs/llm-providers.md`
+    /// warns: an `openai-compat` fallback sends the metadata to its own
+    /// endpoint too.
+    #[test]
+    fn an_openai_compat_fallback_inherits_request_metadata_headers() {
+        let cfg = Config {
+            llm_request_metadata_headers: true,
+            ..Config::default()
+        };
+        let profile = FallbackProfile {
+            provider: "openai-compat".into(),
+            model: "qwen3:32b".into(),
+            base_url: Some("http://gateway.internal/v1".into()),
+            api_key_env: Some("COMPAT_FALLBACK_KEY".into()),
+        };
+        let provider_cfg = cfg
+            .fallback_provider_config(0, &profile, Some(SecretString::from("sk-fallback-test")))
+            .unwrap();
+        assert_eq!(provider_cfg.provider, ProviderChoice::OpenAiCompat);
+        assert!(provider_cfg.request_metadata_headers);
+    }
+
     #[test]
     fn native_profile_overrides_use_named_credentials_and_profile_endpoints() {
         let tmp = TempDir::new().unwrap();
@@ -7743,7 +8468,7 @@ input_token_safety_margin = {margin}
 
     #[test]
     fn native_profiles_reject_unsupported_named_credentials() {
-        for provider in ["openai-oauth", "codex", "cursor"] {
+        for provider in ["openai-oauth", "codex", "cursor", "vertex"] {
             for profile in [
                 format!("[llm.lint]\nprovider = '{provider}'\napi_key_env = 'KEY'\n"),
                 format!(
@@ -7888,6 +8613,100 @@ input_token_safety_margin = {margin}
         assert_eq!(candidates[0].model, "primary-model");
         assert_eq!(candidates[1].provider, "openai-compat");
         assert_eq!(candidates[1].model, "fallback-model");
+    }
+
+    #[test]
+    fn llm_quota_cooldown_defaults_round_trips_and_is_range_checked() {
+        let cfg = load_with_toml("").unwrap();
+        assert_eq!(cfg.llm_quota_cooldown_secs, 900);
+        assert_eq!(
+            cfg.llm_quota_cooldown_secs,
+            ai_memory_llm::DEFAULT_QUOTA_COOLDOWN.as_secs()
+        );
+        let cfg = load_with_toml("llm_quota_cooldown_secs = 3600\n").unwrap();
+        assert_eq!(cfg.llm_quota_cooldown_secs, 3600);
+        for bad in [0, 29, 86_401] {
+            let error = load_with_toml(&format!("llm_quota_cooldown_secs = {bad}\n"))
+                .expect_err("an out-of-range quota cooldown must fail closed");
+            assert!(
+                error.to_string().contains("llm_quota_cooldown_secs"),
+                "{bad}: unexpected error: {error:#}"
+            );
+        }
+    }
+
+    /// The documented "Anthropic primary, OpenAI on credit exhaustion" shape
+    /// loads, and the fallback credential is still resolved from the named
+    /// variable (an unset name here, so it is deferred to `serve`).
+    #[test]
+    fn the_documented_anthropic_primary_openai_fallback_example_loads() {
+        let cfg = load_with_toml(
+            "llm_provider = \"anthropic\"\n\
+             llm_quota_cooldown_secs = 900\n\
+             [[llm_fallbacks]]\n\
+             provider = \"openai\"\n\
+             model = \"gpt-5.4-mini\"\n\
+             api_key_env = \"AI_MEMORY_TEST_QUOTA_FALLBACK_UNSET_KEY\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.llm_fallbacks.len(), 1);
+        assert_eq!(cfg.llm_fallbacks[0].provider, "openai");
+        assert_eq!(cfg.llm_fallback_unresolved.len(), 1);
+    }
+
+    /// The configured quota cooldown reaches the chain: a candidate that
+    /// reports exhausted credit stays skipped (its circuit reason reads
+    /// `quota-exhausted`) for the configured window, not the 30s transient one.
+    #[tokio::test]
+    async fn llm_provider_chain_applies_the_configured_quota_cooldown() {
+        // A loopback endpoint that answers every request with OpenRouter's
+        // documented out-of-credit 402, without a mock-server dependency.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let body = r#"{"error":{"message":"Insufficient credits","code":402}}"#;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 64 * 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 402 Payment Required\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let cfg = load_with_toml(&format!(
+            "llm_provider = \"openai-compat\"\n\
+             llm_model = \"primary-model\"\n\
+             llm_base_url = \"{uri}/v1\"\n\
+             llm_quota_cooldown_secs = 7200\n\
+             [[llm_fallbacks]]\n\
+             provider = \"openai-compat\"\n\
+             model = \"fallback-model\"\n\
+             base_url = \"{uri}/v1\"\n",
+        ))
+        .unwrap();
+        let chain = cfg.llm_provider_chain().unwrap().unwrap();
+        let err = chain
+            .complete(ai_memory_llm::ChatRequest::user_prompt("hi"))
+            .await
+            .expect_err("both candidates are out of credit");
+        assert!(err.to_string().contains("quota-exhausted 402"), "{err}");
+        let health = chain.candidate_health();
+        let until = health[0].circuit_open_until.expect("circuit open");
+        let remaining = until.duration_since(jiff::Timestamp::now()).as_secs_f64();
+        assert!(
+            remaining > 7_000.0,
+            "cooldown {remaining}s is not the configured 7200s"
+        );
+        assert_eq!(health[0].circuit_reason.as_deref(), Some("quota-exhausted"));
+        server.abort();
     }
 
     #[test]

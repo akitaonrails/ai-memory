@@ -7,9 +7,9 @@
 //!   [`fidelity`] and `evals/README.md`).
 //! - `projection` — the zero-LLM half of that scoring: which fixture facts
 //!   and literal tokens the observation projection lets into the prompt.
-//! - `retrieval` — pinned retrieval benchmarks driven end-to-end
-//!   through a real `ai-memory serve` subprocess: hook-shaped ingestion,
-//!   real search stack, R@k / hit@k per question category (see
+//! - `retrieval` — pinned retrieval benchmarks through a real
+//!   `ai-memory serve` subprocess or independent grep/Raw-RAG baselines:
+//!   R@k / hit@k per question category (see
 //!   [`retrieval`] and `docs/benchmarks/`).
 //! - `retrieval-compare` — pairs two saved `retrieval` reports by question
 //!   and lists the questions whose first hit moved.
@@ -44,7 +44,7 @@ enum Command {
     /// Zero-LLM: which facts the consolidation prompt's observation
     /// projection keeps, per fixture.
     Projection(projection::ProjectionArgs),
-    /// Pinned retrieval benchmarks through the real server stack.
+    /// Pinned retrieval benchmarks through the server or source-history baselines.
     Retrieval(Box<retrieval::RetrievalArgs>),
     /// Pair two saved retrieval reports by question: which questions' first
     /// hit moved, by how many cutoffs, and in which question types.

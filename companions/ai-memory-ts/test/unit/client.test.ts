@@ -631,6 +631,20 @@ describe("messages", () => {
     assert.equal(listed.messages[0]?.nature, "reported");
     assert.equal(listed.messages[0]?.evidence, "source message 42");
     assert.equal(listed.messages[0]?.toAgent, null);
+    const paged = await memory.messages.list({
+      box: "outbox",
+      limit: 3,
+      afterId: payloads.MESSAGE_ID,
+    });
+    assert.deepEqual(server.lastArgs(), {
+      workspace: "demo",
+      project: "app",
+      box: "outbox",
+      limit: 3,
+      after_id: payloads.MESSAGE_ID,
+    });
+    assert.equal(paged.messages[0]?.body, "please do X");
+    await assert.rejects(memory.messages.list({ afterId: "" }), ArgumentError);
     const popped = await memory.messages.pop({ messageId: payloads.MESSAGE_ID, agent: "codex" });
     assert.deepEqual(server.lastArgs(), {
       workspace: "demo",
@@ -965,7 +979,7 @@ describe("wire names", () => {
         nature: "measured",
         evidence: "test:1",
       }),
-      memory.messages.list({ box: "inbox", limit: 1 }),
+      memory.messages.list({ box: "inbox", limit: 1, afterId: "m" }),
       memory.messages.pop({ messageId: "m", agent: "codex" }),
       memory.messages.cancel({ messageId: "m" }),
     ];

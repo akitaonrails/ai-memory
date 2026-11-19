@@ -28,7 +28,12 @@ mod ops;
 pub mod password;
 mod profile;
 mod provenance;
-pub use provenance::{PageDisagreement, PageProvenance, PageSource};
+mod retrieval_criteria;
+mod retrieval_history;
+pub use provenance::{
+    CompiledSource, CompiledSourceObservation, MAX_COMPILED_SOURCES_PAGE, PageCompiledSources,
+    PageDisagreement, PageProvenance, PageSource,
+};
 mod project_authz;
 mod project_coordinates;
 pub mod query_signals;
@@ -100,21 +105,27 @@ pub use reader::{
     DerivedIndexStatus, EmbeddingTripleCount, FTS_HIGHLIGHT_END, FTS_HIGHLIGHT_START,
     FeedbackFinding, FileSessionRef, GraphVia, HealthDetail, HealthPage, HybridSearch,
     HybridSearchOutcome, IdleOpenSession, InboxCount, InboxEntry, InterruptedSessionCandidate,
-    LinkGraph, LinkGraphEdge, LinkGraphNode, ObservationHit, ObservationOrder, ObservationPage,
-    ObservationPageResult, ObservationProjectionTotals, ObservationRecord, OpenSession, PAGE_KINDS,
-    PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor, PageFilter, PageHit,
-    PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary, PageVersion,
-    PageVersionBody, PageVersions, ProjectCoordinateCollisionReason, ProjectCoordinateDiagnostic,
-    ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES,
-    ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage, RrfContributions,
-    SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow, SearchExplain,
-    SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary, SessionDependentRows,
-    SessionEndDisposition, SessionKindSummary, SessionLine, SessionObservationSnapshot,
-    SessionPromptTitles, SessionSummary, SessionToolTitles, SessionUsageView, SettledPage,
-    StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody, StreamTimings, TokenCallOrder,
-    TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery, WikiFileFingerprintRow,
-    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes, highlighted_snippet_html, plain_snippet,
-    project_name_fold_key,
+    LinkGraph, LinkGraphEdge, LinkGraphNode, LintSummary, ObservationHit, ObservationOrder,
+    ObservationPage, ObservationPageResult, ObservationProjectionTotals, ObservationRecord,
+    OpenSession, PAGE_KINDS, PAGE_VERSIONS_MAX_LIMIT, PROJECT_LINK_GRAPH_MAX_NODES, PageAuthor,
+    PageFilter, PageHit, PageHitWithMeta, PageLinks, PageLinksPreview, PageMeta, PageSummary,
+    PageVersion, PageVersionBody, PageVersions, ProjectCoordinateCollisionReason,
+    ProjectCoordinateDiagnostic, ProjectCoordinateStatus, ProjectSummary, RELATED_WALK_MAX_DEPTH,
+    RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
+    RrfContributions, SESSION_LINE_TITLE_CHARS, SUBSTANTIVE_OBSERVATION_KIND_SQL, ScopeRow,
+    SearchExplain, SessionActivity, SessionConsolidationQueue, SessionConsolidationSummary,
+    SessionDependentRows, SessionEndDisposition, SessionKindSummary, SessionLine,
+    SessionObservationSnapshot, SessionPromptTitles, SessionSummary, SessionToolTitles,
+    SessionUsageView, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
+    StreamTimings, TokenCallOrder, TokenCallQuery, TokenCallView, TokenUsageReport, VectorQuery,
+    WikiFileFingerprintRow, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    highlighted_snippet_html, plain_snippet, project_name_fold_key,
+};
+pub use retrieval_criteria::{MAX_RESULT_LIMIT, RetrievalCriteria};
+pub use retrieval_history::{
+    DEFAULT_RETRIEVAL_HISTORY_RETENTION, NewRetrievalHistory, NewRetrievalHistoryHit,
+    RETRIEVAL_HISTORY_QUERY_MAX_CHARS, RetrievalHistoryHitRow, RetrievalHistoryPage,
+    RetrievalHistoryRow,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -1026,6 +1037,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -1999,6 +2011,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -2396,6 +2409,7 @@ mod tests {
                 agent_kind: AgentKind::AntigravityCli,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -3037,6 +3051,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -3793,6 +3808,7 @@ mod tests {
         with_evidence.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-1".into(),
+            observations: Default::default(),
         }];
         store
             .writer
@@ -3802,6 +3818,7 @@ mod tests {
         with_evidence.evidence = vec![PageEvidence {
             kind: PageEvidenceKind::Session,
             source_id: "session-2".into(),
+            observations: Default::default(),
         }];
         store.writer.upsert_page(with_evidence).await.unwrap();
 
@@ -3900,6 +3917,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -3963,6 +3981,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4034,6 +4053,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4131,6 +4151,7 @@ mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4316,6 +4337,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4362,6 +4384,7 @@ mod tests {
                 agent_kind: AgentKind::Codex,
                 cwd: None,
                 actor_user: Some("user:alice".into()),
+                origin: None,
             })
             .await
             .unwrap();
@@ -4473,6 +4496,7 @@ mod tests {
                 agent_kind: AgentKind::ClaudeCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4616,6 +4640,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4648,6 +4673,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4724,6 +4750,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4800,6 +4827,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4828,6 +4856,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4872,6 +4901,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -4920,6 +4950,7 @@ mod tests {
                     agent_kind: AgentKind::OpenCode,
                     cwd: None,
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -4985,6 +5016,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5076,6 +5108,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5281,6 +5314,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5388,6 +5422,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5491,6 +5526,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5552,6 +5588,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -5691,6 +5728,7 @@ mod tests {
                 agent_kind: AgentKind::OpenCode,
                 cwd: None,
                 actor_user: None,
+                origin: None,
             })
             .await
             .unwrap();
@@ -6419,10 +6457,12 @@ mod tests {
             PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: "session-1".into(),
+                observations: Default::default(),
             },
             PageEvidence {
                 kind: PageEvidenceKind::Session,
                 source_id: "session-2".into(),
+                observations: Default::default(),
             },
         ];
         store.writer.upsert_page(decision_a).await.unwrap();
@@ -8265,6 +8305,7 @@ mod tests {
                     agent_kind: AgentKind::ClaudeCode,
                     cwd: Some(cwd.into()),
                     actor_user: None,
+                    origin: None,
                 })
                 .await
                 .unwrap();

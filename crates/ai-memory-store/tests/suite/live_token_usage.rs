@@ -22,6 +22,7 @@ async fn session(
             cwd: None,
             actor_user: None,
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();
@@ -308,6 +309,7 @@ async fn token_call_queries_search_and_order_before_pagination_with_scope_and_ow
             cwd: None,
             actor_user: Some(ai_memory_core::IdentityKey::User("bob".into()).storage_key()),
             occurred_at: None,
+            origin: None,
         })
         .await
         .unwrap();

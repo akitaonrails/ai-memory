@@ -42,6 +42,7 @@ pub async fn run(config: &Config, args: LlmTestArgs) -> Result<()> {
         extra_headers: config
             .llm_extra_headers()
             .context(i18n.text("cli-llm-test-parsing-ai-memory-llm-headers-llm-headers"))?,
+        request_metadata_headers: config.llm_request_metadata_headers,
     };
     let client =
         build_provider(provider_config).context(i18n.text("cli-llm-test-building-llm-provider"))?;
@@ -142,6 +143,7 @@ impl From<LlmProviderChoice> for ProviderChoice {
             LlmProviderChoice::AnthropicOauth => Self::AnthropicOAuth,
             LlmProviderChoice::Openai => Self::OpenAi,
             LlmProviderChoice::Gemini => Self::Gemini,
+            LlmProviderChoice::Vertex => Self::Vertex,
             LlmProviderChoice::OpenaiCompat => Self::OpenAiCompat,
             LlmProviderChoice::OpenaiOauth => Self::OpenAiOAuth,
             LlmProviderChoice::Codex => Self::Codex,
@@ -188,6 +190,14 @@ mod tests {
         assert_eq!(
             ProviderChoice::from(LlmProviderChoice::AnthropicOauth),
             ProviderChoice::AnthropicOAuth
+        );
+    }
+
+    #[test]
+    fn vertex_choice_maps_to_runtime_provider() {
+        assert_eq!(
+            ProviderChoice::from(LlmProviderChoice::Vertex),
+            ProviderChoice::Vertex
         );
     }
 

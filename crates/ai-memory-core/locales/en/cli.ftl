@@ -356,6 +356,7 @@ cli-doctor-codex-skips-of-the-plugin-s-hooks-untrusted-or-modified-open-codex-ru
 cli-doctor-the-server-at-did-not-answer-hook-events-are-being-spooled-locally = ⚠ The server at { $value0 } did not answer. Hook events are being spooled locally.{ "\u000A" }
 cli-doctor-the-hook-spool-is-full-events-oldest-newly-captured-events-are-dropped-until = ⚠ The hook spool is full ({ $value0 } events, oldest { $value1 }): newly captured events are dropped until space is available.{ "\u000A" }
 cli-doctor-hook-spool-event-s-waiting-for-the-server-oldest = { "  " }hook spool: { $value0 } event(s) waiting for the server (oldest { $value1 }).{ "\u000A" }
+cli-doctor-shared-data-dir = ⚠ { $path } is writable by other accounts (mode { $mode }): another local account can replace the hook spool under it and read the bearer its entries carry.{ "\u000A" }
 cli-doctor-codex-skips-ai-memory-hook-s-codex-runs-a-hook-only-after-you-trust-it-and-a = ⚠ Codex skips { $value0 } ai-memory hook(s): { $value1 }. Codex runs a hook only after you trust it, and again after its command changes. Open Codex, run /hooks, and trust them; until then Codex sessions are not captured.{ "\u000A" }
 cli-doctor-project-coordinate-requested-current = { "  " }project coordinate: { $value0 } (requested { $value1 }, current { $value2 })
 cli-doctor-collision-reason = { "    " }collision: { $value0 }

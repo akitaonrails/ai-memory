@@ -10,10 +10,11 @@
 
 use ai_memory_llm::types::ChatRequest;
 use ai_memory_llm::{
-    Embedder, ExtraHeaders, GoogleEmbedder, ProviderAuth, ProviderChoice, ProviderConfig,
-    build_provider,
+    Embedder, ExtraHeaders, GeminiProvider, GoogleEmbedder, LlmProvider, ProviderAuth,
+    ProviderChoice, ProviderConfig, VertexAuth, build_provider,
 };
 use secrecy::SecretString;
+use serde_json::json;
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -59,6 +60,7 @@ fn config(provider: ProviderChoice, auth: ProviderAuth, base_url: String) -> Pro
         request_timeout_secs: 5,
         reasoning_effort: None,
         extra_headers: ExtraHeaders::parse(["x-gateway-key: gateway-secret"]).expect("valid"),
+        request_metadata_headers: false,
     }
 }
 
@@ -258,5 +260,105 @@ async fn a_refused_redirect_says_where_it_pointed() {
     assert!(
         message.contains("another origin") && message.contains(&second.uri()),
         "the error explains the refusal: {message}"
+    );
+}
+
+/// Writes an Application Default Credentials file whose token endpoint is
+/// `token_uri`, so a Vertex provider built from it fetches its bearer there.
+fn adc_credentials(dir: &std::path::Path, token_uri: &str) -> std::path::PathBuf {
+    let file = dir.join("adc.json");
+    std::fs::write(
+        &file,
+        json!({
+            "type": "authorized_user",
+            "client_id": "test-client.apps.googleusercontent.com",
+            "client_secret": "test-client-secret",
+            "refresh_token": "test-refresh-token",
+            "token_uri": token_uri,
+        })
+        .to_string(),
+    )
+    .expect("write adc");
+    file
+}
+
+fn vertex_provider(
+    credentials_file: std::path::PathBuf,
+    content_base_url: String,
+) -> GeminiProvider {
+    GeminiProvider::new_vertex(
+        VertexAuth {
+            credentials_file,
+            project: Some("quota-project".into()),
+            location: "global".into(),
+        },
+        "gemini-3.5-flash",
+    )
+    .expect("vertex provider builds")
+    .with_base_url(content_base_url)
+}
+
+/// Vertex AI exchanges Application Default Credentials for a bearer by POSTing
+/// the refresh secret (or a signed assertion) to the credentials' `token_uri`.
+/// reqwest replays a POST body across a 307, so an attacker who could answer
+/// the token endpoint with a cross-origin redirect would otherwise receive the
+/// secret. The token client refuses the redirect, so it never leaves the origin.
+#[tokio::test]
+async fn vertex_token_exchange_does_not_follow_a_cross_origin_redirect() {
+    let second = recording().await;
+    let first = redirecting_to(&second.uri(), 307).await;
+    // Never reached: the token exchange is refused before any content call.
+    let content = recording().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = adc_credentials(dir.path(), &format!("{}/token", first.uri()));
+    let provider = vertex_provider(file, content.uri());
+
+    provider
+        .complete(ChatRequest::user_prompt("hi"))
+        .await
+        .expect_err("a cross-origin redirect off the token endpoint fails the request");
+
+    let leaked = received(&second).await;
+    assert!(
+        leaked.is_empty(),
+        "the refresh secret must not follow a cross-origin redirect off the Vertex token endpoint"
+    );
+}
+
+/// The Vertex content call carries the bearer as `Authorization`. reqwest
+/// strips `Authorization` across hosts on its own (the control), but the
+/// content client additionally refuses the cross-origin redirect, so nothing —
+/// bearer or otherwise — reaches the host the redirect names.
+#[tokio::test]
+async fn vertex_bearer_does_not_follow_a_cross_origin_redirect() {
+    let second = recording().await;
+    let first = redirecting_to(&second.uri(), 307).await;
+
+    // A same-origin token endpoint so the provider actually obtains a bearer
+    // before it makes the content call that gets redirected.
+    let tokens = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "vertex-access-1",
+            "expires_in": 3599,
+            "token_type": "Bearer",
+        })))
+        .mount(&tokens)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = adc_credentials(dir.path(), &format!("{}/token", tokens.uri()));
+    let provider = vertex_provider(file, first.uri());
+
+    provider
+        .complete(ChatRequest::user_prompt("hi"))
+        .await
+        .expect_err("a cross-origin redirect off the content endpoint fails the request");
+
+    let leaked = received(&second).await;
+    assert!(
+        leaked.is_empty(),
+        "the Vertex bearer must not follow a cross-origin redirect off the content endpoint"
     );
 }

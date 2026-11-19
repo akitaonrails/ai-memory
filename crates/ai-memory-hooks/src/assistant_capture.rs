@@ -13,7 +13,9 @@
 //! opt-in path that re-introduces a sanitized, capped excerpt: the client-side
 //! [`transform_for_client`] and the server-side [`apply_assistant_backstop`].
 
-use ai_memory_core::{AgentKind, Sanitizer, truncate_utf8_bytes, truncate_utf8_bytes_head_tail};
+use ai_memory_core::{
+    AgentKind, OBSERVATION_BODY_MAX_BYTES, Sanitizer, truncate_utf8_bytes_head_tail,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::payload::{HookEnvelope, HookEvent, abnormal_turn_end};
@@ -32,9 +34,12 @@ pub const ASSISTANT_PROTOCOL_VERSION: u8 = 1;
 /// sanitizing/truncating. Oversized input is treated as absent.
 pub const ASSISTANT_MESSAGE_MAX_INPUT_BYTES: usize = 64 * 1024;
 
-/// Byte cap on the sanitized excerpt the opt-in path persists. Kept equal to
-/// `truncate_excerpt`'s existing 2 KB excerpt contract so Stop bodies do not
-/// become a second, larger excerpt norm.
+/// Default byte cap on the sanitized excerpt the opt-in path persists. Kept
+/// equal to `truncate_excerpt`'s existing 2 KB excerpt contract so Stop bodies
+/// do not become a second, larger excerpt norm unless the operator raises
+/// `assistant_excerpt_max_bytes` (#2118). The server enforces the configured
+/// value, clamped to [`OBSERVATION_BODY_MAX_BYTES`], in
+/// [`apply_assistant_backstop`].
 pub const ASSISTANT_EXCERPT_MAX_BYTES: usize = 2_000;
 
 /// Every raw top-level field name known to carry an assistant message across
@@ -50,7 +55,7 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message", "prompt_re
 /// The raw field that carries the assistant's final message for `(agent, event)`,
 /// or `None` when the pair has no verified assistant-message field.
 ///
-/// Closed table: Claude Code, Codex, and OpenCode support `Stop` capture.
+/// Closed table: Claude Code, Codex, OpenCode, and Pi support `Stop` capture.
 /// Extend deliberately — a new entry opts an agent/event into capture and MUST
 /// have its field name present in [`ASSISTANT_MESSAGE_FIELDS`] so the strip
 /// covers it (enforced by `closed_table_fields_are_all_stripped`).
@@ -59,12 +64,20 @@ const ASSISTANT_MESSAGE_FIELDS: &[&str] = &["last_assistant_message", "prompt_re
 /// codex-cli 0.154.0, #743) — the same spelling Claude Code uses, so no new
 /// entry in [`ASSISTANT_MESSAGE_FIELDS`] is needed. Codex has no `SubagentStop`
 /// in its supported event vocabulary, so only `(Codex, Stop)` is added.
+///
+/// Pi has no raw assistant field on its `agent_end` (→ `Stop`) payload; its
+/// extension reads the final `role: "assistant"` message from the session
+/// (`ctx.sessionManager.getEntries()`, Pi's `session-format.md`) and funnels it
+/// through the native `ai-memory hook --agent pi --capture-assistant` under the
+/// same `last_assistant_message` spelling, so the Rust sanitizer boundary runs
+/// before the text reaches the wire (#2240). No new strip field is needed.
 #[must_use]
 pub fn assistant_message_field(agent: AgentKind, event: HookEvent) -> Option<&'static str> {
     match (agent, event) {
-        (AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode, HookEvent::Stop) => {
-            Some("last_assistant_message")
-        }
+        (
+            AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode | AgentKind::Pi,
+            HookEvent::Stop,
+        ) => Some("last_assistant_message"),
         _ => None,
     }
 }
@@ -109,8 +122,12 @@ pub struct ClientAssistantTransform {
 /// Reads the candidate assistant message for `(agent, event)`, unconditionally
 /// strips the raw field, and — when the value is a non-empty, in-bounds string —
 /// sanitizes it with the built-in `Sanitizer`, retains its beginning and ending
-/// within [`ASSISTANT_EXCERPT_MAX_BYTES`] on UTF-8 boundaries, and splices the versioned
+/// within [`OBSERVATION_BODY_MAX_BYTES`] on UTF-8 boundaries, and splices the versioned
 /// [`AssistantCaptureProtocol`] into the body under [`ASSISTANT_MARKER_KEY`].
+///
+/// The client cuts at the largest cap the server can be configured with, not
+/// at the 2 KB default, because it cannot know the server's setting; the
+/// server's [`apply_assistant_backstop`] decides what is stored (#2118).
 ///
 /// Scrub happens BEFORE truncation (a secret straddling the cap must be redacted
 /// before it can be cut). Non-string, empty, or oversized values yield no
@@ -144,7 +161,7 @@ pub fn transform_for_client(
         };
     };
     let scrubbed = Sanitizer::builtin().scrub(&value);
-    let excerpt = truncate_utf8_bytes_head_tail(&scrubbed, ASSISTANT_EXCERPT_MAX_BYTES);
+    let excerpt = truncate_utf8_bytes_head_tail(&scrubbed, OBSERVATION_BODY_MAX_BYTES);
     if excerpt.is_empty() {
         return ClientAssistantTransform {
             changed,
@@ -176,7 +193,11 @@ pub fn transform_for_client(
 /// `body_excerpt` as `None` — an empty Stop — so a forged or stale marker cannot
 /// inject content. Infallible: never returns an error, so a capture decision can
 /// never turn into a batch fail-fast.
-pub fn apply_assistant_backstop(env: &mut HookEnvelope, server_enabled: bool) {
+///
+/// `max_bytes` is the server's `assistant_excerpt_max_bytes` (#2118), clamped
+/// here to [`OBSERVATION_BODY_MAX_BYTES`]. A cap too small to keep any text
+/// leaves the Stop empty.
+pub fn apply_assistant_backstop(env: &mut HookEnvelope, server_enabled: bool, max_bytes: usize) {
     // Consume the marker unconditionally: it must never survive into the stored
     // raw, whether or not the gates below accept it.
     let marker = env
@@ -198,12 +219,18 @@ pub fn apply_assistant_backstop(env: &mut HookEnvelope, server_enabled: bool) {
         // Re-enforce the excerpt cap at the persistence boundary — never trust
         // the client's length. Symmetric to the server re-scrub in `process()`:
         // a forged or buggy client that satisfies the gates cannot inject an
-        // oversized Stop body (the request body limit alone is 10 MiB). Almost
-        // always a no-op, since a well-behaved client already truncated.
-        env.body_excerpt = Some(truncate_utf8_bytes(
+        // oversized Stop body (the request body limit alone is 10 MiB). The
+        // client sends up to the 16 KiB ceiling, so this is the authoritative
+        // cut where the configured cap (#2118) is applied. Head-and-tail, so the
+        // stored excerpt keeps the reply's beginning and its final result rather
+        // than only the tail.
+        let excerpt = truncate_utf8_bytes_head_tail(
             &protocol.excerpt,
-            ASSISTANT_EXCERPT_MAX_BYTES,
-        ));
+            max_bytes.min(OBSERVATION_BODY_MAX_BYTES),
+        );
+        if !excerpt.is_empty() {
+            env.body_excerpt = Some(excerpt);
+        }
     }
 }
 
@@ -233,8 +260,9 @@ pub fn strip_assistant_message_raw(raw: &mut serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
-    /// Only Claude Code, Codex, and OpenCode Stop are capture candidates; every
-    /// other agent/event pair across the full agent surface must return `None`.
+    /// Only Claude Code, Codex, OpenCode, and Pi Stop are capture candidates;
+    /// every other agent/event pair across the full agent surface must return
+    /// `None`.
     #[test]
     fn only_supported_stop_events_are_capture_candidates() {
         let events = [
@@ -255,7 +283,7 @@ mod tests {
             for event in events {
                 let expected = matches!(
                     agent,
-                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode
+                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode | AgentKind::Pi
                 ) && event == HookEvent::Stop;
                 assert_eq!(
                     assistant_message_field(agent, event).is_some(),
@@ -383,10 +411,12 @@ mod tests {
     fn client_selection_preserves_both_ends_and_omits_middle() {
         let beginning = "INITIAL_DECISION: inspect the parser.\n";
         let ending = "\nFINAL_RESULT: fixed the parser. PRIVATE_PROSE_LIMITATION";
+        // Each filler run is ~9 KB, so the message clears the 16 KiB client
+        // ceiling and the head-and-tail cut actually fires.
         let message = format!(
             "{beginning}{}OMITTED_MIDDLE_DECISION{}{ending}",
-            "é🧪".repeat(400),
-            "é🧪".repeat(400),
+            "é🧪".repeat(1500),
+            "é🧪".repeat(1500),
         );
         for agent in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode] {
             let mut raw = serde_json::json!({
@@ -399,7 +429,7 @@ mod tests {
             assert!(excerpt.ends_with(ending), "{agent:?}: final result lost");
             assert!(excerpt.contains("...[truncated "));
             assert!(!excerpt.contains("OMITTED_MIDDLE_DECISION"));
-            assert!(excerpt.len() <= ASSISTANT_EXCERPT_MAX_BYTES);
+            assert!(excerpt.len() <= OBSERVATION_BODY_MAX_BYTES);
             assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
             assert!(raw.get("last_assistant_message").is_none());
             assert_eq!(raw["session_id"], "same-session");
@@ -409,11 +439,14 @@ mod tests {
     #[test]
     fn client_selection_scrubs_secrets_across_both_cuts() {
         let secret = format!("AKIA{}", "Z".repeat(16));
-        // The existing helper reserves 48 bytes, leaving 976 bytes at each end.
-        // Each raw cut crosses a fake key; slicing first would leak a fragment.
-        let half = (ASSISTANT_EXCERPT_MAX_BYTES - 48) / 2;
-        for start in [half - 10, 6_000 - half - 10] {
-            let mut message = "x".repeat(6_000);
+        // The client cuts head-and-tail at the 16 KiB ceiling (the helper
+        // reserves 48 bytes, leaving ~8168 at each end). A secret straddling
+        // either cut must be gone, because scrubbing runs on the whole reply
+        // before truncation; slicing first would leak a fragment.
+        let total = 20_000;
+        let half = (OBSERVATION_BODY_MAX_BYTES - 48) / 2;
+        for start in [half - 10, total - half - 10] {
+            let mut message = "x".repeat(total);
             message.replace_range(start - 1..start, " ");
             message.replace_range(start..start + secret.len(), &secret);
             message.replace_range(start + secret.len()..start + secret.len() + 1, " ");
@@ -422,18 +455,18 @@ mod tests {
             let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
             assert!(!excerpt.contains("AKIA"), "secret prefix at {start}");
             assert!(!excerpt.contains('Z'), "secret suffix at {start}");
-            assert!(excerpt.len() <= ASSISTANT_EXCERPT_MAX_BYTES);
+            assert!(excerpt.len() <= OBSERVATION_BODY_MAX_BYTES);
         }
     }
 
     #[test]
     fn client_transform_truncates_multibyte_within_cap() {
-        let big = "é".repeat(ASSISTANT_EXCERPT_MAX_BYTES); // 2 bytes each → 2x the cap
+        let big = "é".repeat(OBSERVATION_BODY_MAX_BYTES); // 2 bytes each → 2x the cap
         let mut raw = serde_json::json!({ "last_assistant_message": big });
         let out = transform_for_client(&mut raw, AgentKind::ClaudeCode, HookEvent::Stop);
         assert!(out.captured);
         let excerpt = raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str().unwrap();
-        assert!(excerpt.len() <= ASSISTANT_EXCERPT_MAX_BYTES, "over cap");
+        assert!(excerpt.len() <= OBSERVATION_BODY_MAX_BYTES, "over cap");
         assert!(
             excerpt.contains("...[truncated "),
             "truncation marker missing"
@@ -546,7 +579,7 @@ mod tests {
             }),
             true,
         );
-        apply_assistant_backstop(&mut env, true);
+        apply_assistant_backstop(&mut env, true, ASSISTANT_EXCERPT_MAX_BYTES);
         assert_eq!(env.body_excerpt.as_deref(), Some("error: rate_limit"));
         assert!(
             env.raw.get(ASSISTANT_MARKER_KEY).is_none(),
@@ -559,7 +592,7 @@ mod tests {
         let mut raw = serde_json::json!({ "last_assistant_message": "done" });
         transform_for_client(&mut raw, AgentKind::ClaudeCode, HookEvent::Stop);
         let mut env = stop_env(raw, true);
-        apply_assistant_backstop(&mut env, true);
+        apply_assistant_backstop(&mut env, true, ASSISTANT_EXCERPT_MAX_BYTES);
         assert_eq!(env.body_excerpt.as_deref(), Some("done"));
         assert!(
             env.raw.get(ASSISTANT_MARKER_KEY).is_none(),
@@ -576,7 +609,7 @@ mod tests {
         };
         // Server disabled.
         let mut env = stop_env(make(), true);
-        apply_assistant_backstop(&mut env, false);
+        apply_assistant_backstop(&mut env, false, ASSISTANT_EXCERPT_MAX_BYTES);
         assert!(env.body_excerpt.is_none());
         assert!(
             env.raw.get(ASSISTANT_MARKER_KEY).is_none(),
@@ -584,7 +617,7 @@ mod tests {
         );
         // Query flag absent (client did not request).
         let mut env = stop_env(make(), false);
-        apply_assistant_backstop(&mut env, true);
+        apply_assistant_backstop(&mut env, true, ASSISTANT_EXCERPT_MAX_BYTES);
         assert!(env.body_excerpt.is_none());
     }
 
@@ -598,12 +631,68 @@ mod tests {
             ASSISTANT_MARKER_KEY: { "version": 1, "excerpt": huge }
         });
         let mut env = stop_env(raw, true);
-        apply_assistant_backstop(&mut env, true);
+        apply_assistant_backstop(&mut env, true, ASSISTANT_EXCERPT_MAX_BYTES);
         let body = env.body_excerpt.expect("gates pass, body set");
         assert!(
             body.len() <= ASSISTANT_EXCERPT_MAX_BYTES,
             "server did not cap oversized excerpt: {} bytes",
             body.len()
+        );
+    }
+
+    /// #2118: an operator who raised `assistant_excerpt_max_bytes` gets the
+    /// longer excerpt stored instead of the 2 KB default.
+    #[test]
+    fn backstop_honors_configured_cap_above_default() {
+        let long = "a".repeat(ASSISTANT_EXCERPT_MAX_BYTES * 3);
+        let raw = serde_json::json!({
+            ASSISTANT_MARKER_KEY: { "version": 1, "excerpt": long }
+        });
+        let mut env = stop_env(raw, true);
+        apply_assistant_backstop(&mut env, true, 8_000);
+        assert_eq!(env.body_excerpt.as_deref(), Some(long.as_str()));
+    }
+
+    /// #2118: the configured cap can never exceed the observation body limit.
+    #[test]
+    fn backstop_clamps_configured_cap_to_observation_body_max() {
+        let huge = "a".repeat(OBSERVATION_BODY_MAX_BYTES * 2);
+        let raw = serde_json::json!({
+            ASSISTANT_MARKER_KEY: { "version": 1, "excerpt": huge }
+        });
+        let mut env = stop_env(raw, true);
+        apply_assistant_backstop(&mut env, true, usize::MAX);
+        let body = env.body_excerpt.expect("gates pass, body set");
+        assert!(
+            body.len() <= OBSERVATION_BODY_MAX_BYTES,
+            "cap not clamped: {} bytes",
+            body.len()
+        );
+    }
+
+    /// #2118: a cap too small to hold any text leaves an empty Stop, never an
+    /// empty-string body.
+    #[test]
+    fn backstop_with_zero_cap_stores_nothing() {
+        let raw = serde_json::json!({
+            ASSISTANT_MARKER_KEY: { "version": 1, "excerpt": "done" }
+        });
+        let mut env = stop_env(raw, true);
+        apply_assistant_backstop(&mut env, true, 0);
+        assert!(env.body_excerpt.is_none(), "{:?}", env.body_excerpt);
+    }
+
+    /// #2118: the client no longer cuts at the 2 KB default, so a larger server
+    /// cap has text to keep. The server stays the authority on what is stored.
+    #[test]
+    fn client_transform_sends_up_to_observation_body_max() {
+        let long = "a".repeat(ASSISTANT_EXCERPT_MAX_BYTES * 3);
+        let mut raw = serde_json::json!({ "last_assistant_message": long });
+        let out = transform_for_client(&mut raw, AgentKind::ClaudeCode, HookEvent::Stop);
+        assert!(out.captured);
+        assert_eq!(
+            raw[ASSISTANT_MARKER_KEY]["excerpt"].as_str(),
+            Some(long.as_str())
         );
     }
 
@@ -617,7 +706,7 @@ mod tests {
         ] {
             let raw = serde_json::json!({ ASSISTANT_MARKER_KEY: marker });
             let mut env = stop_env(raw, true);
-            apply_assistant_backstop(&mut env, true);
+            apply_assistant_backstop(&mut env, true, ASSISTANT_EXCERPT_MAX_BYTES);
             assert!(
                 env.body_excerpt.is_none(),
                 "forged marker accepted: {:?}",
@@ -640,7 +729,7 @@ mod tests {
             },
             raw,
         );
-        apply_assistant_backstop(&mut env, true);
+        apply_assistant_backstop(&mut env, true, ASSISTANT_EXCERPT_MAX_BYTES);
         assert!(env.body_excerpt.is_none());
     }
 }
