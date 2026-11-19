@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- `companions/ai-memory-macos/build.sh` now checks the Rust compiler against
+  `rust-toolchain.toml` before building and says that the pin needs rustup,
+  instead of failing with cargo's "requires rustc" errors under a Homebrew
+  `rust`. The menu bar app also compiles again under Swift 6.0 (Xcode 16.2,
+  the last Xcode for macOS 14) (#2380).
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
