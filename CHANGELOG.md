@@ -125,6 +125,12 @@ version in [`docs/changelog/`](docs/changelog/):
   outage-backed-off jobs whenever a subsequent consolidation succeeds. Terminal
   and non-transport failures keep the existing 5-attempt cap. (#2360)
 
+- Replaced the `notify-debouncer-full` polling thread in the wiki filesystem
+  watcher with an event-driven debouncer built directly on `notify` and
+  `tokio::time`. Idle servers no longer wake a background thread every 75ms,
+  and `EventKind::Access(_)` and `.git/`-only events are dropped at the raw
+  watcher callback before entering the async channel. (#2354)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added

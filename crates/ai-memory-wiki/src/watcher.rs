@@ -2,11 +2,12 @@
 //!
 //! Two parts work together:
 //!
-//! 1. **Debounced events** via [`notify_debouncer_full`]. When a markdown
-//!    file under the wiki root is created or modified, we read it from
-//!    disk, parse the frontmatter, and `reindex_page` against the store.
-//!    Own-writes are absorbed by the store's sha256 short-circuit, so
-//!    the loop terminates after one no-op reindex.
+//! 1. **Debounced events** via [`notify`] and an event-driven `tokio::time`
+//!    debouncer. When a markdown file under the wiki root is created or
+//!    modified, we read it from disk, parse the frontmatter, and
+//!    `reindex_page` against the store. Own-writes are absorbed by the
+//!    store's sha256 short-circuit, so the loop terminates after one no-op
+//!    reindex.
 //! 2. **Reconciliation tick** every 300s walks the entire wiki tree and
 //!    reindexes page markdown files (excluding `_meta.md`, bootstrap files,
 //!    raw event ledgers, and symlinks). Catches any events the OS dropped
@@ -32,13 +33,12 @@
 //! store updates via [`Wiki::write_page`].
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
 use ai_memory_core::{PageId, PagePath, ProjectId, WorkspaceId};
-use notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer_opt};
+use notify::{EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -65,6 +65,12 @@ const RACY_FINGERPRINT_WINDOW: Duration = Duration::from_secs(5);
 /// Debounce window for filesystem events.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(300);
 
+/// Capacity of the bounded channel from the OS watcher callback to `run_loop`.
+///
+/// If a burst ever saturates this buffer, excess events are dropped with a
+/// debug log and the periodic 300s reconciliation pass catches up.
+const EVENT_CHANNEL_CAPACITY: usize = 4096;
+
 #[cfg(all(test, target_os = "macos"))]
 type PlatformWatcher = notify::PollWatcher;
 #[cfg(not(all(test, target_os = "macos")))]
@@ -72,14 +78,15 @@ type PlatformWatcher = notify::RecommendedWatcher;
 
 /// Handle representing an active watcher; drop to stop.
 pub struct WatcherHandle {
-    _debouncer: Debouncer<PlatformWatcher, RecommendedCache>,
+    _watcher: PlatformWatcher,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl WatcherHandle {
     /// Start watching `wiki.root()` recursively. Spawns one tokio task
-    /// that consumes debounced events and runs the reconciliation timer.
+    /// that debounces filesystem events on demand and runs the reconciliation
+    /// timer.
     ///
     /// Events are attributed to their `(workspace_id, project_id)` by
     /// parsing the first two path segments as UUIDs. Events outside the
@@ -89,29 +96,29 @@ impl WatcherHandle {
     /// Propagates any notify error encountered when installing the OS
     /// watcher.
     pub fn start(wiki: Wiki) -> WikiResult<Self> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let wiki_root = wiki.root().to_path_buf();
 
-        let mut debouncer = new_debouncer_opt::<_, PlatformWatcher, RecommendedCache>(
-            DEBOUNCE_WINDOW,
-            None,
-            move |result: DebounceEventResult| match result {
-                Ok(events) => {
-                    for event in events {
-                        let _ = event_tx.send(event);
+        let mut watcher = PlatformWatcher::new(
+            move |result: notify::Result<notify::Event>| match result {
+                Ok(event) => {
+                    if let Some(filtered) = filter_raw_event(&wiki_root, event)
+                        && let Err(mpsc::error::TrySendError::Full(_)) = event_tx.try_send(filtered)
+                    {
+                        debug!(
+                            "watcher event channel full; dropping event (reconcile will catch up)"
+                        );
                     }
                 }
-                Err(errors) => {
-                    for e in errors {
-                        warn!(error = %e, "notify error");
-                    }
+                Err(e) => {
+                    warn!(error = %e, "notify error");
                 }
             },
-            RecommendedCache::new(),
             watcher_config(),
         )
         .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
 
-        debouncer
+        watcher
             .watch(wiki.root(), RecursiveMode::Recursive)
             .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -119,7 +126,7 @@ impl WatcherHandle {
         let task = tokio::spawn(run_loop(wiki, event_rx, shutdown_rx));
 
         Ok(Self {
-            _debouncer: debouncer,
+            _watcher: watcher,
             shutdown: Some(shutdown_tx),
             task: Some(task),
         })
@@ -159,9 +166,93 @@ fn watcher_config() -> notify::Config {
     }
 }
 
+/// Drop non-actionable raw `notify` events at the OS callback boundary before
+/// they cross into the async channel.
+///
+/// `notify`'s Linux inotify backend registers `WatchMask::OPEN` recursively on
+/// the wiki root (including `.git/`), so every file read from reconciliation,
+/// `read_page`, or git commits produces `EventKind::Access(_)`. Dropping those
+/// and `.git/`-only paths here avoids waking the tokio task or arming a
+/// debounce timer when nothing indexable changed.
+fn filter_raw_event(wiki_root: &Path, event: notify::Event) -> Option<(EventKind, Vec<PathBuf>)> {
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Other
+    ) {
+        return None;
+    }
+    let paths: Vec<PathBuf> = event
+        .paths
+        .into_iter()
+        .filter(|path| !is_git_internal(wiki_root, path))
+        .collect();
+    if paths.is_empty() {
+        return None;
+    }
+    Some((event.kind, paths))
+}
+
+fn merge_event_kind(existing: EventKind, incoming: EventKind) -> EventKind {
+    match incoming {
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Other => {
+            incoming
+        }
+        _ => existing,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingEntry {
+    kind: EventKind,
+    deadline: tokio::time::Instant,
+}
+
+/// Event-driven per-path debouncer owned by [`run_loop`].
+///
+/// No background polling thread runs: callers only arm a single
+/// `tokio::time::Sleep` when [`Self::next_deadline`] returns `Some`.
+#[derive(Debug, Default)]
+struct PendingDebounce {
+    entries: HashMap<PathBuf, PendingEntry>,
+}
+
+impl PendingDebounce {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&mut self, path: PathBuf, kind: EventKind, now: tokio::time::Instant) {
+        let deadline = now + DEBOUNCE_WINDOW;
+        self.entries
+            .entry(path)
+            .and_modify(|entry| {
+                entry.kind = merge_event_kind(entry.kind, kind);
+                entry.deadline = deadline;
+            })
+            .or_insert(PendingEntry { kind, deadline });
+    }
+
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.entries.values().map(|entry| entry.deadline).min()
+    }
+
+    fn drain_ready(&mut self, now: tokio::time::Instant) -> Vec<(PathBuf, EventKind)> {
+        let mut ready = Vec::new();
+        self.entries.retain(|path, entry| {
+            if entry.deadline <= now {
+                ready.push((path.clone(), entry.kind));
+                false
+            } else {
+                true
+            }
+        });
+        ready
+    }
+}
+
 async fn run_loop(
     wiki: Wiki,
-    mut rx: mpsc::UnboundedReceiver<notify_debouncer_full::DebouncedEvent>,
+    mut rx: mpsc::Receiver<(EventKind, Vec<PathBuf>)>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
@@ -186,16 +277,36 @@ async fn run_loop(
     let mut indexed_fingerprints: IndexedFingerprints = HashMap::new();
     let mut persisted_fingerprints: Option<IndexedFingerprints> = None;
     let mut fingerprints_seeded = false;
+    let mut pending = PendingDebounce::new();
 
     loop {
+        let next_flush = pending.next_deadline();
         tokio::select! {
             biased;
             _ = &mut shutdown => {
                 debug!("watcher shutting down");
                 return;
             }
-            Some(event) = rx.recv() => {
-                handle_event(&wiki, event).await;
+            maybe_event = rx.recv() => {
+                match maybe_event {
+                    Some((kind, paths)) => {
+                        let now = tokio::time::Instant::now();
+                        for path in paths {
+                            pending.record(path, kind, now);
+                        }
+                    }
+                    None => return,
+                }
+            }
+            _ = async {
+                if let Some(deadline) = next_flush {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if next_flush.is_some() => {
+                let ready = pending.drain_ready(tokio::time::Instant::now());
+                for (path, kind) in ready {
+                    handle_event(&wiki, kind, &path).await;
+                }
             }
             _ = tick.tick() => {
                 if !fingerprints_seeded {
@@ -241,7 +352,6 @@ async fn run_loop(
                     }
                 }
             }
-            else => return,
         }
     }
 }
@@ -254,86 +364,82 @@ fn is_git_internal(root: &Path, path: &Path) -> bool {
     })
 }
 
-async fn handle_event(wiki: &Wiki, event: notify_debouncer_full::DebouncedEvent) {
+async fn handle_event(wiki: &Wiki, kind: EventKind, raw_path: &Path) {
     // Nothing to index, but the next auto-commit must stage it.
-    if matches!(event.kind, EventKind::Remove(_)) {
-        for raw_path in &event.paths {
-            if !is_tempfile(raw_path) && !is_git_internal(wiki.root(), raw_path) {
-                wiki.git().mark_written(raw_path);
-            }
+    if matches!(kind, EventKind::Remove(_)) {
+        if !is_tempfile(raw_path) && !is_git_internal(wiki.root(), raw_path) {
+            wiki.git().mark_written(raw_path);
         }
         return;
     }
     if !matches!(
-        event.kind,
+        kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Other
     ) {
         return;
     }
-    for raw_path in &event.paths {
-        if is_git_internal(wiki.root(), raw_path) {
-            continue;
-        }
-        let metadata = match std::fs::symlink_metadata(raw_path) {
-            Ok(metadata) => metadata,
-            // A rename away from a watched path arrives as
-            // `Modify(Name(RenameMode::From))`, not as a `Remove`, and its
-            // path is already gone. Unreported, the next path-scoped commit
-            // keeps the old blob in its tree, so a checkpoint taken in that
-            // window records a page that no longer exists. Reporting a path
-            // that was merely mid-rename is harmless: staging re-adds a file
-            // that still exists.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if !is_tempfile(raw_path) {
-                    wiki.git().mark_written(raw_path);
-                }
-                continue;
+    if is_git_internal(wiki.root(), raw_path) {
+        return;
+    }
+    let metadata = match std::fs::symlink_metadata(raw_path) {
+        Ok(metadata) => metadata,
+        // A rename away from a watched path arrives as
+        // `Modify(Name(RenameMode::From))`, not as a `Remove`, and its
+        // path is already gone. Unreported, the next path-scoped commit
+        // keeps the old blob in its tree, so a checkpoint taken in that
+        // window records a page that no longer exists. Reporting a path
+        // that was merely mid-rename is harmless: staging re-adds a file
+        // that still exists.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !is_tempfile(raw_path) {
+                wiki.git().mark_written(raw_path);
             }
-            // Likely a transient state (an atomic rename in flight).
-            Err(_) => continue,
+            return;
+        }
+        // Likely a transient state (an atomic rename in flight).
+        Err(_) => return,
+    };
+    let ft = metadata.file_type();
+    if crate::confinement::is_link_like(&metadata) {
+        return;
+    }
+    if ft.is_dir() {
+        let Some((ws, proj, proj_root)) = extract_project_dir_ids(wiki.root(), raw_path) else {
+            return;
         };
-        let ft = metadata.file_type();
-        if crate::confinement::is_link_like(&metadata) {
-            continue;
+        if wiki.validate_project_root(ws, proj).is_err() {
+            return;
         }
-        if ft.is_dir() {
-            let Some((ws, proj, proj_root)) = extract_project_dir_ids(wiki.root(), raw_path) else {
-                continue;
-            };
-            if wiki.validate_project_root(ws, proj).is_err() {
-                continue;
-            }
-            reindex_project_dir(wiki, ws, proj, proj_root).await;
-            continue;
+        reindex_project_dir(wiki, ws, proj, proj_root).await;
+        return;
+    }
+    if !ft.is_file() || is_tempfile(raw_path) {
+        return;
+    }
+    // Reported before the indexer's filters, which skip ledgers,
+    // pending and non-markdown files.
+    wiki.git().mark_written(raw_path);
+    if !is_markdown(raw_path) {
+        return;
+    }
+    let Some((ws, proj, page_path)) = extract_project_ids(wiki.root(), raw_path) else {
+        return;
+    };
+    if wiki.validate_page_path(ws, proj, &page_path).is_err() {
+        return;
+    }
+    if is_pending_path(&page_path) {
+        return;
+    }
+    if is_reserved_page_file(raw_path, &page_path) {
+        return;
+    }
+    match wiki.reindex_page(ws, proj, page_path.clone()).await {
+        Ok(_) => debug!(path = %page_path, "reindexed via watcher"),
+        Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
+            debug!(path = %page_path, "ignoring event for a purged session page");
         }
-        if !ft.is_file() || is_tempfile(raw_path) {
-            continue;
-        }
-        // Reported before the indexer's filters, which skip ledgers,
-        // pending and non-markdown files.
-        wiki.git().mark_written(raw_path);
-        if !is_markdown(raw_path) {
-            continue;
-        }
-        let Some((ws, proj, page_path)) = extract_project_ids(wiki.root(), raw_path) else {
-            continue;
-        };
-        if wiki.validate_page_path(ws, proj, &page_path).is_err() {
-            continue;
-        }
-        if is_pending_path(&page_path) {
-            continue;
-        }
-        if is_reserved_page_file(raw_path, &page_path) {
-            continue;
-        }
-        match wiki.reindex_page(ws, proj, page_path.clone()).await {
-            Ok(_) => debug!(path = %page_path, "reindexed via watcher"),
-            Err(WikiError::Store(ai_memory_store::StoreError::SessionPurged(_))) => {
-                debug!(path = %page_path, "ignoring event for a purged session page");
-            }
-            Err(e) => warn!(path = %page_path, error = %e, "watcher reindex failed"),
-        }
+        Err(e) => warn!(path = %page_path, error = %e, "watcher reindex failed"),
     }
 }
 
@@ -1423,12 +1529,12 @@ mod tests {
                     assert_eq!(stats.skipped_purged_sessions, 0);
                 }
                 "file event" => {
-                    let event = notify_debouncer_full::DebouncedEvent::new(
-                        notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
-                            .add_path(abs.clone()),
-                        std::time::Instant::now(),
-                    );
-                    handle_event(&wiki, event).await;
+                    handle_event(
+                        &wiki,
+                        EventKind::Modify(notify::event::ModifyKind::Any),
+                        &abs,
+                    )
+                    .await;
                 }
                 "directory event" => {
                     assert!(
@@ -1700,12 +1806,12 @@ mod tests {
         )
         .unwrap();
 
-        let event = notify_debouncer_full::DebouncedEvent::new(
-            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
-                .add_path(proj_dir),
-            std::time::Instant::now(),
-        );
-        handle_event(&wiki, event).await;
+        handle_event(
+            &wiki,
+            EventKind::Modify(notify::event::ModifyKind::Any),
+            &proj_dir,
+        )
+        .await;
 
         let hits = store
             .reader
@@ -1747,11 +1853,7 @@ mod tests {
                 &nested_git,
             ),
         ] {
-            let event = notify_debouncer_full::DebouncedEvent::new(
-                notify::Event::new(kind).add_path(path.clone()),
-                std::time::Instant::now(),
-            );
-            handle_event(&wiki, event).await;
+            handle_event(&wiki, kind, path).await;
         }
 
         let reported = wiki.git().written_paths();
@@ -1788,14 +1890,14 @@ mod tests {
 
         // `mv notes/a.md /tmp/`: the path is gone before the event arrives.
         std::fs::remove_file(&gone).unwrap();
-        let event = notify_debouncer_full::DebouncedEvent::new(
-            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+        handle_event(
+            &wiki,
+            EventKind::Modify(notify::event::ModifyKind::Name(
                 notify::event::RenameMode::From,
-            )))
-            .add_path(gone.clone()),
-            std::time::Instant::now(),
-        );
-        handle_event(&wiki, event).await;
+            )),
+            &gone,
+        )
+        .await;
 
         let reported = wiki.git().written_paths();
         assert!(reported.contains(&rel(&gone)), "{reported:?}");
@@ -2455,12 +2557,12 @@ mod tests {
             return;
         }
 
-        let event = notify_debouncer_full::DebouncedEvent::new(
-            notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
-                .add_path(symlink),
-            std::time::Instant::now(),
-        );
-        handle_event(&wiki, event).await;
+        handle_event(
+            &wiki,
+            EventKind::Create(notify::event::CreateKind::File),
+            &symlink,
+        )
+        .await;
 
         let hits = store
             .reader
@@ -3695,5 +3797,162 @@ mod tests {
         .unwrap();
         assert_eq!((next.indexed, next.skipped_unchanged), (1, 1));
         assert_eq!(read_fingerprint_probe(&db), (0, 0, 1));
+    }
+
+    // --- #2354: event-driven debouncer & callback-boundary filtering ---
+
+    #[test]
+    fn filter_raw_event_drops_access_and_git_internal_events() {
+        let wiki_root = Path::new("/tmp/wiki");
+        let page = wiki_root.join("ws/proj/page.md");
+        let root_git = wiki_root.join(".git/logs/HEAD");
+        let nested_git = wiki_root.join("ws/proj/.git/config");
+
+        // Access events (inotify OPEN / READ) must be dropped before the channel.
+        for kind in [
+            EventKind::Access(notify::event::AccessKind::Open(
+                notify::event::AccessMode::Any,
+            )),
+            EventKind::Access(notify::event::AccessKind::Read),
+            EventKind::Any,
+        ] {
+            let ev = notify::Event::new(kind).add_path(page.clone());
+            assert!(
+                filter_raw_event(wiki_root, ev).is_none(),
+                "non-mutating event {kind:?} must be dropped at callback boundary"
+            );
+        }
+
+        // Events whose paths are all inside `.git/` must be dropped completely.
+        for git_path in [&root_git, &nested_git] {
+            let ev = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(git_path.clone());
+            assert!(
+                filter_raw_event(wiki_root, ev).is_none(),
+                ".git path {} must be dropped at callback boundary",
+                git_path.display()
+            );
+        }
+
+        // Mixed event keeps only non-git paths.
+        let mixed = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(root_git.clone())
+            .add_path(page.clone())
+            .add_path(nested_git);
+        let (kind, paths) = filter_raw_event(wiki_root, mixed).expect("page path must survive");
+        assert_eq!(kind, EventKind::Modify(notify::event::ModifyKind::Any));
+        assert_eq!(paths, vec![page.clone()]);
+
+        // Actionable Remove and Create pass through.
+        let remove = notify::Event::new(EventKind::Remove(notify::event::RemoveKind::File))
+            .add_path(page.clone());
+        let (kind, paths) = filter_raw_event(wiki_root, remove).expect("remove must pass through");
+        assert_eq!(kind, EventKind::Remove(notify::event::RemoveKind::File));
+        assert_eq!(paths, vec![page]);
+    }
+
+    #[test]
+    fn pending_debounce_coalesces_rapid_writes_and_merges_kinds() {
+        let mut pending = PendingDebounce::new();
+        let t0 = tokio::time::Instant::now();
+        let path_a = PathBuf::from("/tmp/wiki/ws/proj/a.md");
+        let path_b = PathBuf::from("/tmp/wiki/ws/proj/b.md");
+
+        // Rapid writes to the same path push its deadline forward and coalesce.
+        pending.record(
+            path_a.clone(),
+            EventKind::Create(notify::event::CreateKind::File),
+            t0,
+        );
+        let t1 = t0 + Duration::from_millis(100);
+        pending.record(
+            path_a.clone(),
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            t1,
+        );
+        let t2 = t0 + Duration::from_millis(200);
+        pending.record(
+            path_a.clone(),
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            t2,
+        );
+
+        // Not ready at original t0 + DEBOUNCE_WINDOW because t2 extended it.
+        assert!(pending.drain_ready(t0 + DEBOUNCE_WINDOW).is_empty());
+        assert_eq!(pending.next_deadline(), Some(t2 + DEBOUNCE_WINDOW));
+
+        // Ready once DEBOUNCE_WINDOW elapses after the last write: exactly one event.
+        let flushed = pending.drain_ready(t2 + DEBOUNCE_WINDOW);
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].0, path_a);
+        assert_eq!(
+            flushed[0].1,
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content
+            ))
+        );
+
+        // Create/Modify followed by Remove preserves Remove; Remove followed by Create preserves Create.
+        pending.record(
+            path_a.clone(),
+            EventKind::Modify(notify::event::ModifyKind::Any),
+            t0,
+        );
+        pending.record(
+            path_a.clone(),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            t1,
+        );
+        pending.record(
+            path_b.clone(),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            t0,
+        );
+        pending.record(
+            path_b.clone(),
+            EventKind::Create(notify::event::CreateKind::File),
+            t2,
+        );
+
+        // path_a flushes at t1 + DEBOUNCE_WINDOW while path_b stays pending until t2 + DEBOUNCE_WINDOW.
+        let first = pending.drain_ready(t1 + DEBOUNCE_WINDOW);
+        assert_eq!(
+            first,
+            vec![(path_a, EventKind::Remove(notify::event::RemoveKind::File))]
+        );
+        assert_eq!(pending.next_deadline(), Some(t2 + DEBOUNCE_WINDOW));
+
+        let second = pending.drain_ready(t2 + DEBOUNCE_WINDOW);
+        assert_eq!(
+            second,
+            vec![(path_b, EventKind::Create(notify::event::CreateKind::File))]
+        );
+    }
+
+    #[test]
+    fn empty_pending_debounce_arms_no_wakeup_timer() {
+        let mut pending = PendingDebounce::new();
+        assert_eq!(
+            pending.next_deadline(),
+            None,
+            "idle debouncer must not arm any wakeup timer"
+        );
+
+        let t0 = tokio::time::Instant::now();
+        let path = PathBuf::from("/tmp/wiki/ws/proj/idle.md");
+        pending.record(path, EventKind::Modify(notify::event::ModifyKind::Any), t0);
+        assert_eq!(pending.next_deadline(), Some(t0 + DEBOUNCE_WINDOW));
+
+        let ready = pending.drain_ready(t0 + DEBOUNCE_WINDOW);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            pending.next_deadline(),
+            None,
+            "after flushing all pending entries, no wakeup timer may remain armed"
+        );
     }
 }
