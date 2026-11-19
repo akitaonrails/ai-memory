@@ -101,6 +101,7 @@ pub mod reranker;
 pub mod routes;
 pub mod types;
 
+mod api_key_file;
 mod auth_file;
 mod codex_responses;
 mod quota;
