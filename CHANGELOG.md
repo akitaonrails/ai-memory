@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Updated `rustix` to `1.1.6` in the workspace and companion lockfiles that
+  use it, addressing [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html).
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
