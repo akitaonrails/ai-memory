@@ -5059,6 +5059,7 @@ mod tests {
                     importance: 5,
                     occurred_at: Some(last_activity),
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5545,6 +5546,7 @@ mod tests {
                     body: "the session that outlived the daemon".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5650,6 +5652,7 @@ mod tests {
                     body: "activity the seed would otherwise reach for".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5732,6 +5735,7 @@ mod tests {
                     body: "complete the durable job".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5839,6 +5843,7 @@ mod tests {
                     body: "open session still running".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5948,6 +5953,7 @@ mod tests {
                     body: "owned session still running".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6048,6 +6054,7 @@ mod tests {
                     body: "end the session".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6190,6 +6197,7 @@ mod tests {
                     body: "complete the durable job".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6215,6 +6223,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -6379,6 +6388,7 @@ mod tests {
                         author_id: None,
                         actor: ai_memory_core::ActorContext::anonymous(),
                         evidence: Vec::new(),
+                        trust_class: None,
                     })
                     .await
                     .unwrap();
@@ -6502,6 +6512,7 @@ mod tests {
                     body: "end the session".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6744,6 +6755,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -8388,6 +8400,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

@@ -230,6 +230,7 @@ async fn contextual_page_sources_preserve_shared_pages_and_refuse_foreign_or_pri
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence,
+        trust_class: None,
     };
     wiki.write_page(request(foreign, "secret.md", "# FOREIGN_SECRET", vec![]))
         .await
@@ -430,6 +431,7 @@ async fn contextual_evidence_paginates_versions_and_hides_expired_disagreements(
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence,
+        trust_class: None,
     };
     let id = wiki
         .write_page(request(

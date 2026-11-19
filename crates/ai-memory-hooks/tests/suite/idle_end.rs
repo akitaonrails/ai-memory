@@ -171,6 +171,7 @@ async fn observe_titled(
                 importance: 5,
                 occurred_at: Some(at),
                 file_path: None,
+                trust_class: None,
             },
             &state.sanitizer,
         ))
@@ -774,6 +775,7 @@ async fn idle_tick_keeps_a_session_page_written_by_the_agent() {
         author_id: None,
         actor: ActorContext::default(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -973,6 +975,7 @@ async fn idle_tick_keeps_the_agents_page_for_a_crossed_session() {
         author_id: None,
         actor: ActorContext::default(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();

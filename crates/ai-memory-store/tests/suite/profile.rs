@@ -56,6 +56,7 @@ fn profile_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> New
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -393,6 +394,7 @@ async fn digest_inputs_read_entries_stack_and_newness() {
                 importance: 5,
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -465,6 +467,7 @@ async fn hook_ingest_stamps_origin_on_create_and_on_an_existing_row() {
                 body: "use pnpm here".to_owned(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -517,6 +520,7 @@ async fn hook_ingest_stamps_origin_on_create_and_on_an_existing_row() {
             body: body.to_owned(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         store
             .writer
@@ -783,6 +787,7 @@ async fn harvest_reads_every_row_of_a_timestamp_group_split_by_the_batch() {
                     importance: 5,
                     occurred_at: Some(2_000_000),
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))

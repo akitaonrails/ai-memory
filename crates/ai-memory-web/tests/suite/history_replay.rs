@@ -88,6 +88,7 @@ impl Fixture {
                 expires_at,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap()
@@ -147,6 +148,7 @@ impl Fixture {
                         body: (*body).to_owned(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -317,6 +319,7 @@ async fn history_lists_k_plus_one_versions_newest_first_and_diffs_the_latest() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

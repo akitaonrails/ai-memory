@@ -45,6 +45,7 @@ async fn embedding_backfill_embeds_frontmatter_abstract() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -91,6 +92,7 @@ async fn embedding_backfill_embeds_frontmatter_abstract() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -145,6 +147,7 @@ async fn dry_run_counts_a_page_needing_only_an_abstract() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();

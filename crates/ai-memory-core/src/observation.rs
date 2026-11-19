@@ -87,6 +87,17 @@ impl ObservationKind {
             Self::Other => "other",
         }
     }
+
+    /// Whether an observation of this kind can corroborate a `_rules/` page
+    /// (#2164, `docs/design-memory-poisoning-provenance.md` Steps 2–3).
+    ///
+    /// Lifecycle and metadata events carry `TrustClass::ModelGenerated` as
+    /// context, never as a rule source; only `user-prompt` (`OperatorAuthored`)
+    /// and `stop` (`ModelGenerated`) can back a `_rules/` emission.
+    #[must_use]
+    pub const fn can_back_rule(self) -> bool {
+        matches!(self, Self::UserPrompt | Self::Stop)
+    }
 }
 
 impl std::str::FromStr for ObservationKind {
@@ -156,6 +167,23 @@ pub struct NewObservation {
     /// clears a value that fails [`crate::Sanitizer::admits_file_path`].
     #[serde(default)]
     pub file_path: Option<String>,
+    /// Trust class assigned once at hook ingress (#2164). `None` falls back to
+    /// [`crate::TrustClass::from_observation_kind`] via
+    /// [`Self::effective_trust_class`].
+    #[serde(default)]
+    pub trust_class: Option<crate::TrustClass>,
+}
+
+impl NewObservation {
+    /// Trust class to persist for this observation: the explicit ingress value
+    /// when set, otherwise derived from [`Self::kind`].
+    #[must_use]
+    pub const fn effective_trust_class(&self) -> crate::TrustClass {
+        match self.trust_class {
+            Some(class) => class,
+            None => crate::TrustClass::from_observation_kind(self.kind),
+        }
+    }
 }
 
 /// Materialised view of an observation row.
@@ -183,6 +211,8 @@ pub struct Observation {
     pub importance: u8,
     /// Wall-clock capture time.
     pub created_at: Timestamp,
+    /// Immutable ingress trust class (V113, #2164).
+    pub trust_class: crate::TrustClass,
 }
 
 /// How a session was launched, when a launcher declares it. Absent (the

@@ -608,21 +608,25 @@ pub(crate) fn synthesise_observations(fx: &Fixture) -> Vec<Observation> {
     let session_id = SessionId::new();
     fx.observations
         .iter()
-        .map(|f| Observation {
-            id: ai_memory_core::ObservationId::new(),
-            session_id,
-            workspace_id,
-            project_id,
-            kind: f
+        .map(|f| {
+            let kind = f
                 .kind
                 .parse::<ObservationKind>()
-                .unwrap_or(ObservationKind::Other),
-            extension: None,
-            source_event: None,
-            title: f.title.clone(),
-            body: f.body.clone(),
-            importance: 5,
-            created_at: Timestamp::now(),
+                .unwrap_or(ObservationKind::Other);
+            Observation {
+                id: ai_memory_core::ObservationId::new(),
+                session_id,
+                workspace_id,
+                project_id,
+                kind,
+                extension: None,
+                source_event: None,
+                title: f.title.clone(),
+                body: f.body.clone(),
+                importance: 5,
+                created_at: Timestamp::now(),
+                trust_class: ai_memory_core::TrustClass::from_observation_kind(kind),
+            }
         })
         .collect()
 }

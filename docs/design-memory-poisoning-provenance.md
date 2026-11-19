@@ -1,8 +1,11 @@
 # Design: source provenance and trust class against memory poisoning
 
-Status: design, partially staged. Tracks #2164. Step 1 (the `page_sources`
-table, migration V112) is implemented; "Step 1 as built" below records what
-steps 2 to 5 can rely on. The rest of this note covers those steps.
+Status: design, staged. Tracks #2164. Step 1 (`page_sources`, migration V112),
+Step 2 (`trust_class` on observations and pages, migration V113, plus additive
+`trust_class` metadata on `memory_query` hits), Step 3 (`_rules/` emission
+gating in consolidation and auto-improve), and their Step 5 adversarial tests
+and `docs/security-boundaries.md` row are implemented. Step 4 (RRF ranking
+demotion) remains gated on the `ai-memory-eval poison` baseline.
 
 ## Problem
 
@@ -170,11 +173,17 @@ level, per the security-boundary test rule.
 
 - Settled by step 1: `page_sources` is re-derived per compiled version, not
   append-only across the supersession chain. See "Step 1 as built".
-- What class a version takes when it was written without a session citation
-  over a version that had tool-result sources (see "Step 1 as built").
-- Whether the rule-based session page should cite its session, which would
-  also add a `page_evidence` row on zero-LLM installs.
-- Whether `model_generated` should also be demoted at retrieval, or only
-  `tool_result`. The paper's vector is the tool result; demoting model-generated
-  text as well is a larger behaviour change, left out of the default until the
-  baseline says it helps.
+- Settled by step 2 (V113): citationless rewrites (`memory_patch_page`, lint,
+  compaction, curator, automated rewrites) inherit the superseded version's
+  `trust_class` via `pages.supersedes` so a patch cannot launder a `tool_result`
+  page into `operator_authored`. Only an explicit operator-authored
+  `memory_write_page` without `session_id` or a disk hand-edit sets
+  `operator_authored`.
+- Settled by step 2 (V113): zero-LLM rule-based `sessions/<id>.md` pages
+  (SessionEnd, compaction checkpoint, `idle_end`) derive `pages.trust_class`
+  from the session's least-trusted observation via `SessionDigest` without
+  creating synthetic `page_evidence` rows.
+- Still open (for step 4): whether `model_generated` should also be demoted at
+  retrieval, or only `tool_result`. The paper's vector is the tool result;
+  demoting model-generated text as well is a larger behaviour change, left out
+  of the default until the `ai-memory-eval poison` baseline says it helps.

@@ -75,6 +75,7 @@ async fn store_with_ledger_residue(
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

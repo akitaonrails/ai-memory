@@ -402,6 +402,7 @@ mod tests {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap()
@@ -568,6 +569,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -861,6 +863,7 @@ mod tests {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

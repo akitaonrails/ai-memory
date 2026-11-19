@@ -1405,6 +1405,7 @@ impl Wiki {
             expires_at: metadata.expires_at,
             entities: metadata.entities,
             evidence: Vec::new(),
+            trust_class: None,
         };
         store.merged_page = Some(merged_page);
         Ok(MergeProjectFile {
@@ -1667,6 +1668,7 @@ impl Wiki {
                     expires_at: meta.expires_at,
                     entities: meta.entities,
                     evidence: Vec::new(),
+                    trust_class: None,
                 })
                 .await
             {
@@ -2787,6 +2789,7 @@ impl Wiki {
             expires_at,
             entities,
             evidence: Vec::new(),
+            trust_class: None,
         };
 
         let result = {
@@ -2977,6 +2980,11 @@ impl Wiki {
                 expires_at: meta.expires_at,
                 entities: meta.entities,
                 evidence: Vec::new(),
+                // A human hand-edit on disk changes the file bytes and lands
+                // as `operator_authored`; an unchanged reindex hits the
+                // byte-identical short-circuit in `upsert_page_in_tx` and
+                // preserves the existing version's `trust_class` (#2164).
+                trust_class: Some(ai_memory_core::TrustClass::OperatorAuthored),
             })
             .await?;
 
@@ -3580,6 +3588,7 @@ impl Wiki {
                         expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
                         entities: parse_entities(&req.path, &req.frontmatter)?,
                         evidence: req.evidence.clone(),
+                        trust_class: req.trust_class,
                     })
                 })
                 .collect::<WikiResult<Vec<_>>>()?;
@@ -3783,6 +3792,7 @@ impl Wiki {
             author_id,
             actor,
             evidence,
+            trust_class,
         } = req;
 
         // Defence-in-depth: scrub the body before we touch disk or the
@@ -3900,6 +3910,7 @@ impl Wiki {
                 expires_at,
                 entities,
                 evidence,
+                trust_class,
             };
             let written = match precondition {
                 None => self
@@ -4163,6 +4174,9 @@ pub struct WritePageRequest {
     /// configured root template, rung 2 supplies the row's
     /// user/name/email. Defaults to anonymous for backward compat.
     pub actor: ai_memory_core::ActorContext,
+    /// Optional explicit trust class forwarded to
+    /// [`ai_memory_core::NewPage::trust_class`] (#2164).
+    pub trust_class: Option<ai_memory_core::TrustClass>,
 }
 
 fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
@@ -5295,6 +5309,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 
@@ -5717,6 +5732,7 @@ mod tests {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
         };
 
@@ -8009,6 +8025,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .collect();
         let ids = wiki.apply_batch(batch).await.unwrap();
@@ -8376,6 +8393,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             }])
             .await
             .unwrap();
@@ -8533,6 +8551,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -8550,6 +8569,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -8676,6 +8696,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -8827,6 +8848,7 @@ mod tests {
                 ..ai_memory_core::ActorContext::default()
             },
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -8886,6 +8908,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -9319,6 +9342,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         };
 
         // Many rounds so any interleave window is likely to be exercised.
@@ -9378,6 +9402,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -10826,6 +10851,7 @@ mod tests {
                 expires_at: None,
                 entities: vec![],
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -10880,6 +10906,7 @@ mod tests {
                 expires_at: None,
                 entities: vec![],
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -10899,6 +10926,7 @@ mod tests {
                 expires_at: None,
                 entities: vec![],
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

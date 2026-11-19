@@ -170,6 +170,7 @@ async fn seed_page_with_metadata(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -849,6 +850,7 @@ async fn move_project_true_move_preserves_sessions_and_observations() {
                 body: "do the thing".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -921,6 +923,7 @@ async fn true_move_stale_source_write_fails_before_creating_file() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap_err();
@@ -2294,6 +2297,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -2330,6 +2334,7 @@ async fn delete_workspace_dry_run_reports_the_same_counts_the_confirmed_delete_w
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2696,6 +2701,7 @@ async fn delete_workspace_dry_run_and_confirmed_delete_both_report_collateral_da
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2825,6 +2831,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2915,6 +2922,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -2956,6 +2964,7 @@ async fn delete_workspace_dry_run_never_counts_a_different_workspaces_rows() {
 
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))

@@ -51,6 +51,7 @@ mod self_service_keys;
 mod session_management;
 mod slot_identity;
 mod stress_autoscope;
+mod trust_class;
 
 #[cfg(feature = "management-ui")]
 mod management;

@@ -135,6 +135,7 @@ async fn harness_with_two_sessions() -> Harness {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -370,6 +371,7 @@ async fn experience_request_respects_the_configured_estimated_input_budget() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -391,6 +393,7 @@ async fn experience_request_respects_the_configured_estimated_input_budget() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

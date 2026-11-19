@@ -94,6 +94,7 @@ async fn write_page(writer: &WriterHandle, ws: WorkspaceId, proj: ProjectId, pat
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("upsert")

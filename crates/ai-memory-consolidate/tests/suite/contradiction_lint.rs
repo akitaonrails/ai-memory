@@ -82,6 +82,7 @@ async fn write_semantic(fx: &Fixture, path: &str, body: &str) -> PageId {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()
@@ -534,6 +535,7 @@ async fn seed_evidence_case(case: &EvidenceCase) -> Fixture {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

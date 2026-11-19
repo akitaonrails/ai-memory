@@ -94,6 +94,7 @@ fn new_page(
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -116,6 +117,7 @@ fn wiki_req(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -1330,6 +1332,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1352,6 +1355,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -2034,6 +2038,7 @@ async fn seed_session(
                     body: (*body).to_owned(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &ai_memory_core::Sanitizer::builtin(),
             ))
@@ -3590,6 +3595,7 @@ async fn viewer_filtered_api_reads_are_never_served_from_cache() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3795,6 +3801,7 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3968,6 +3975,7 @@ async fn api_page_handler_etag_differs_per_page() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -3984,6 +3992,7 @@ async fn api_page_handler_etag_differs_per_page() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();

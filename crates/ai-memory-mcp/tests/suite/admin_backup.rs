@@ -82,6 +82,7 @@ async fn seed_page(state: &AdminState, store: &Store, path: &str, body: &str) {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

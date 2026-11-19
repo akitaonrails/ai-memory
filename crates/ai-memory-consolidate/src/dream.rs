@@ -785,6 +785,7 @@ async fn merge_one_cluster(
         author_id: None,
         actor: actor.clone(),
         evidence,
+        trust_class: None,
     });
 
     // Loser stubs: superseded, pointing at the survivor, marked terminal so the
@@ -826,6 +827,7 @@ async fn merge_one_cluster(
             author_id: None,
             actor: actor.clone(),
             evidence: Vec::new(),
+            trust_class: None,
         });
     }
 

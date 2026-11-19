@@ -112,6 +112,7 @@ async fn session_end_readers_refuse_foreign_session_ids() {
                 body: "foreign scopes must not read this".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -201,6 +202,7 @@ async fn rowid_fetch_refuses_foreign_sessions_with_legitimate_control() {
                         body: format!("{tag} row {i}"),
                         importance: 1,
                         file_path: None,
+                        trust_class: None,
                     },
                     &sanitizer,
                 ))
@@ -313,6 +315,7 @@ async fn a_crossed_repository_session_snapshot_reads_only_its_scope() {
                 body: body.into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &sanitizer,
         );
@@ -488,6 +491,7 @@ async fn a_crossed_session_snapshot_counts_the_whole_session_as_a_number_only() 
                 body: "body".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &sanitizer,
         );
@@ -541,6 +545,7 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -2221,6 +2226,7 @@ async fn startup_claim_rechecks_the_source_and_sweeps_only_quiet_open_batons() {
 
                     occurred_at: None,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5011,6 +5017,7 @@ async fn owned_session_purge_refuses_cross_project_cascades_with_admin_control()
         importance: 5,
         occurred_at: None,
         file_path: None,
+        trust_class: None,
     };
     store
         .writer
@@ -5761,6 +5768,7 @@ async fn interrupted_recovery_refuses_foreign_scope_owner_and_receiver_with_cont
                     body: format!("private evidence {index}"),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5867,6 +5875,7 @@ async fn interrupted_recovery_ignores_foreign_scope_work_and_batons_with_control
                 body: "private evidence".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         )
@@ -5974,6 +5983,7 @@ async fn file_observation(
                 body: "tool_family: file\noutcome: ok".into(),
                 importance: 5,
                 file_path: file_path.map(str::to_owned),
+                trust_class: None,
             },
             &Sanitizer::default(),
         ))
@@ -6279,6 +6289,7 @@ async fn agent_mismatch_names_the_bound_agent_only_to_an_admitted_owner() {
                 body: "body".into(),
                 importance: 3,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         )
@@ -6393,6 +6404,7 @@ async fn an_explicit_handoff_from_a_live_session_is_delivered_and_claimed_once()
                 importance: 5,
                 occurred_at: None,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))

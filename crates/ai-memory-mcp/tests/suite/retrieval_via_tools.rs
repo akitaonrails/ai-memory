@@ -141,6 +141,7 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, title: &str, body: &str) -
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 

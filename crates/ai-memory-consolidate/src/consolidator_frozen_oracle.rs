@@ -854,6 +854,7 @@ mod tests {
             importance,
             extension: None,
             source_event: None,
+            trust_class: ai_memory_core::TrustClass::from_observation_kind(kind),
         }
     }
 

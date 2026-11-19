@@ -144,6 +144,7 @@ async fn portuguese_session_recall_is_opt_in_and_preserves_fact_queries() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("write page");
@@ -257,6 +258,7 @@ async fn recall_at_5_baseline() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("write page");
@@ -317,6 +319,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .expect("write target");
@@ -333,6 +336,7 @@ async fn graph_neighbor_expansion_recovers_linked_page() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .expect("write source");
@@ -410,6 +414,7 @@ async fn entity_stream_recovers_a_probe_fts_and_graph_both_miss() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .expect("write page");
@@ -498,6 +503,7 @@ async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
                 body: "raw fallback detail mentions capybara exactly once".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -587,6 +593,7 @@ async fn profile_recall_across_projects() {
                     body: prompt.into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))

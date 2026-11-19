@@ -1119,6 +1119,7 @@ mod tests {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -1693,6 +1694,7 @@ mod tests {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -1987,6 +1989,7 @@ mod tests {
                         body: "run the full gate before release".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -2038,6 +2041,7 @@ mod tests {
                         body: "run the full gate before release".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))

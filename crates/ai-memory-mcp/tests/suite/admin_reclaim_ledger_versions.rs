@@ -96,6 +96,7 @@ async fn seed_ledger(store: &Store) -> ai_memory_core::ProjectId {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

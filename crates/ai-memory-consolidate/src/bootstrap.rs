@@ -649,6 +649,7 @@ impl Bootstrap {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             });
         }
         // Plus the manifest itself.
@@ -680,6 +681,7 @@ impl Bootstrap {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         });
 
         // #1218: de-link any cross-scope wikilink the model invented before
@@ -3045,6 +3047,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

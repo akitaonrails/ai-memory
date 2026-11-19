@@ -69,6 +69,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("write page");
@@ -194,6 +195,7 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .expect("rewrite page");

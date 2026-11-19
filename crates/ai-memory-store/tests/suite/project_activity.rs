@@ -82,6 +82,7 @@ async fn add_page(
             expires_at: expires_at.map(|at| jiff::Timestamp::from_microsecond(at).unwrap()),
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

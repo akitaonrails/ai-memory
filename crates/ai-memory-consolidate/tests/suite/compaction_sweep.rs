@@ -86,6 +86,7 @@ async fn write(
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap()
@@ -755,6 +756,7 @@ async fn flag_off_keeps_an_already_compacted_residue_terminal() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
