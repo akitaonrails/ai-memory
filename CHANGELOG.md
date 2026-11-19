@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Staged online backups under the wiki mutation and git locks so concurrent
+  page writes, deletions and checkpoints cannot mix SQLite and wiki states.
+  Released those locks before compressing the private staged archive. (#2361)
+
 - Kept canonical project names ambiguous when a legacy twin holds sent or
   received messages, including retained history. Name-based mailbox access and
   writes no longer skip that project as empty, and startup no longer reports

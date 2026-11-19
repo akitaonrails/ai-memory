@@ -961,46 +961,17 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
 }
 
 async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::fs::File> {
-    let wiki_dir = state.data_dir.join("wiki");
-    ai_memory_wiki::validate_wiki_tree(&wiki_dir)
-        .map_err(|error| anyhow::anyhow!("validating wiki tree: {error}"))?;
-    let staging = tempfile::tempdir()?;
-    let snapshot_path = staging.path().join("memory.sqlite");
-    info!(snapshot = %snapshot_path.display(), "snapshotting SQLite for backup");
-    state
-        .reader
-        .snapshot_to(snapshot_path.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("sqlite snapshot: {e}"))?;
-
-    let mut tar_file = tempfile::tempfile()?;
-    {
-        let encoder = GzEncoder::new(&mut tar_file, Compression::default());
-        let mut tar = tar::Builder::new(encoder);
-        tar.mode(tar::HeaderMode::Deterministic);
-        tar.follow_symlinks(false);
-
-        ai_memory_wiki::validate_wiki_tree(&wiki_dir)
-            .map_err(|error| anyhow::anyhow!("validating wiki tree before archive: {error}"))?;
-        if wiki_dir.is_dir() {
-            tar.append_dir_all("wiki", &wiki_dir)
-                .map_err(|e| anyhow::anyhow!("archiving wiki/: {e}"))?;
-        }
-
-        tar.append_path_with_name(&snapshot_path, "db/memory.sqlite")
-            .map_err(|e| anyhow::anyhow!("archiving db snapshot: {e}"))?;
-
-        let cfg = state.data_dir.join("config.toml");
-        if cfg.is_file() {
-            tar.append_path_with_name(&cfg, "config.toml")
-                .map_err(|e| anyhow::anyhow!("archiving config.toml: {e}"))?;
-        }
-
-        let encoder = tar.into_inner()?;
+    let mut snapshot = state.wiki.snapshot_archive(&state.reader).await?;
+    let tar_file = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut file = tempfile::tempfile()?;
+        let mut encoder = GzEncoder::new(&mut file, Compression::default());
+        std::io::copy(&mut snapshot, &mut encoder)?;
         encoder.finish()?;
-    }
-    tar_file.sync_data()?;
-    tar_file.rewind()?;
+        file.sync_data()?;
+        file.rewind()?;
+        Ok(file)
+    })
+    .await??;
     Ok(tokio::fs::File::from_std(tar_file))
 }
 
