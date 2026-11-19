@@ -599,7 +599,10 @@ async fn loopback_bypasses_inherited_http_proxy() {
                 "--test-threads=1",
             ])
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
             .envs(
                 ["SYSTEMROOT", "WINDIR"]
                     .into_iter()
