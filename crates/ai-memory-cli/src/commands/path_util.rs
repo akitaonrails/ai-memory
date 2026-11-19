@@ -3,10 +3,12 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-/// Create `dir` (and its parents) `0700` on Unix. On Windows the new `dir`
-/// itself gets an access list naming only the current account
-/// ([`restrict_to_owner`]), which everything later created inside it
-/// inherits. Idempotent: an existing directory's mode or access list is left
+/// Create `dir` (and its parents) `0700` on Unix. On Windows every newly
+/// created directory component gets an access list naming only the current
+/// account ([`restrict_to_owner`]), which everything later created inside it
+/// inherits; if restricting a newly created directory fails, newly created
+/// directories are removed so a retry never accepts a wide-ACL directory as
+/// private. Idempotent: an existing directory's mode or access list is left
 /// untouched (never widened, never narrowed) to avoid churning a path an
 /// operator may have set deliberately.
 pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -30,15 +32,104 @@ pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        if dir.is_dir() {
-            return Ok(());
-        }
-        std::fs::create_dir_all(dir)?;
-        restrict_to_owner(dir)
+        create_private_dir_with(dir, restrict_to_owner)
     }
     #[cfg(not(any(unix, windows)))]
     {
         std::fs::create_dir_all(dir)
+    }
+}
+
+/// Create every missing component of `dir` in order, calling `restrict` on
+/// each newly created directory. If `create_dir` or `restrict` fails partway
+/// through, best-effort remove the newly created directories in reverse order
+/// so a failed ACL call cannot leave a wide-ACL directory on disk that a retry
+/// would silently accept as private.
+#[cfg(any(windows, test))]
+fn create_private_dir_with(
+    dir: &Path,
+    mut restrict: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    let mut current = Some(dir);
+    while let Some(path) = current {
+        if path.as_os_str().is_empty() || path.exists() {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        current = path.parent();
+    }
+    if missing.is_empty() {
+        // `dir` exists as a non-directory (e.g. a regular file); let
+        // `create_dir` surface the platform error.
+        return std::fs::create_dir(dir);
+    }
+    missing.reverse();
+
+    let mut created = Vec::with_capacity(missing.len());
+    for component in missing {
+        match std::fs::create_dir(&component) {
+            Ok(()) => {
+                created.push(component.clone());
+                if let Err(err) = restrict(&component) {
+                    for dir_to_remove in created.into_iter().rev() {
+                        let _ = std::fs::remove_dir(&dir_to_remove);
+                    }
+                    return Err(err);
+                }
+            }
+            // A concurrent caller may have created this component between the
+            // existence check and `create_dir`; leave its existing ACL alone.
+            Err(_) if component.is_dir() => {}
+            Err(err) => {
+                for dir_to_remove in created.into_iter().rev() {
+                    let _ = std::fs::remove_dir(&dir_to_remove);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a Windows built-in tool (`icacls.exe`, `whoami.exe`) from
+/// `%SystemRoot%\System32` so a Git for Windows / MSYS2 tool earlier on
+/// `PATH` (notably `whoami.exe`) cannot shadow or hijack it. Falls back to
+/// the bare command name only when `SystemRoot` is unset or empty.
+#[cfg(any(windows, test))]
+fn windows_system32_tool_in(system_root: Option<std::ffi::OsString>, exe_name: &str) -> PathBuf {
+    if let Some(root) =
+        system_root.filter(|v| !v.is_empty() && v.to_str().is_none_or(|t| !t.trim().is_empty()))
+    {
+        PathBuf::from(root).join("System32").join(exe_name)
+    } else {
+        PathBuf::from(exe_name.strip_suffix(".exe").unwrap_or(exe_name))
+    }
+}
+
+#[cfg(windows)]
+fn windows_system32_tool(exe_name: &str) -> PathBuf {
+    windows_system32_tool_in(std::env::var_os("SystemRoot"), exe_name)
+}
+
+/// Normalize a path before passing it to `icacls.exe`: `icacls` treats `?` as
+/// a wildcard and can reject `\\?\` verbatim prefixes produced by
+/// `std::fs::canonicalize`. Safe drive and UNC verbatim prefixes are stripped
+/// via [`strip_windows_verbatim_prefix`]; non-UTF-8 or unknown verbatim forms
+/// are passed through unchanged.
+#[cfg(any(windows, test))]
+fn icacls_target_path(path: &Path) -> Cow<'_, Path> {
+    let Some(text) = path.to_str() else {
+        return Cow::Borrowed(path);
+    };
+    match strip_windows_verbatim_prefix(text) {
+        Cow::Borrowed(stripped) if stripped.len() == text.len() => Cow::Borrowed(path),
+        Cow::Borrowed(stripped) => Cow::Borrowed(Path::new(stripped)),
+        Cow::Owned(stripped) => Cow::Owned(PathBuf::from(stripped)),
     }
 }
 
@@ -64,10 +155,11 @@ pub(crate) fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
     } else {
         format!("*{sid}:F")
     };
-    // System32 comes before PATH in Windows' program search, so a Git for
-    // Windows coreutils on PATH cannot stand in for either tool.
-    let output = std::process::Command::new("icacls")
-        .arg(path)
+    let target = icacls_target_path(path);
+    // Resolve `icacls.exe` explicitly under `%SystemRoot%\System32` so a
+    // tool earlier on `PATH` cannot shadow or hijack it.
+    let output = std::process::Command::new(windows_system32_tool("icacls.exe"))
+        .arg(target.as_ref())
         .args(["/inheritance:r", "/grant:r"])
         .arg(grant)
         .arg("/q")
@@ -85,7 +177,9 @@ pub(crate) fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
 /// The SID of the account this process runs as, from `whoami /user`.
 #[cfg(windows)]
 fn current_account_sid() -> std::io::Result<String> {
-    let output = std::process::Command::new("whoami")
+    // Resolve `whoami.exe` explicitly under `%SystemRoot%\System32` so a
+    // Git for Windows / MSYS2 `whoami.exe` earlier on `PATH` cannot shadow it.
+    let output = std::process::Command::new(windows_system32_tool("whoami.exe"))
         .args(["/user", "/fo", "csv", "/nh"])
         .output()?;
     if !output.status.success() {
@@ -126,10 +220,12 @@ pub(crate) mod acl_probe {
     pub(crate) fn allowed_sids(path: &Path) -> Vec<String> {
         let scratch = tempfile::tempdir().unwrap();
         let saved = scratch.path().join("acl.txt");
-        let output = std::process::Command::new("icacls")
-            .arg(path)
+        let target = super::icacls_target_path(path);
+        let saved_target = super::icacls_target_path(&saved);
+        let output = std::process::Command::new(super::windows_system32_tool("icacls.exe"))
+            .arg(target.as_ref())
             .arg("/save")
-            .arg(&saved)
+            .arg(saved_target.as_ref())
             .arg("/q")
             .output()
             .unwrap();
@@ -161,8 +257,9 @@ pub(crate) mod acl_probe {
     /// created inside it, the way a sandbox group's grant on
     /// `%LOCALAPPDATA%` reaches the data dir.
     pub(crate) fn grant_users_read(dir: &Path) {
-        let output = std::process::Command::new("icacls")
-            .arg(dir)
+        let target = super::icacls_target_path(dir);
+        let output = std::process::Command::new(super::windows_system32_tool("icacls.exe"))
+            .arg(target.as_ref())
             .args(["/grant", "*S-1-5-32-545:(OI)(CI)R", "/q"])
             .output()
             .unwrap();
@@ -447,7 +544,11 @@ mod tests {
         std::fs::write(&inside, "s3cret").unwrap();
 
         let owner = acl_probe::current_sid();
-        for path in [&private, &inside] {
+        for path in [
+            private.parent().unwrap(),
+            private.as_path(),
+            inside.as_path(),
+        ] {
             let sids = acl_probe::allowed_sids(path);
             assert!(
                 !sids.is_empty() && sids.iter().all(|sid| *sid == owner),
@@ -461,6 +562,168 @@ mod tests {
             acl_probe::names_users(&acl_probe::allowed_sids(&control)),
             "an existing directory's access list is never narrowed"
         );
+    }
+
+    /// `std::fs::canonicalize` on Windows produces a `\\?\` verbatim path,
+    /// which is how `data_dir` reaches `create_private_dir` and
+    /// `store_hook_auth_token` in real runs. `icacls.exe` must succeed and
+    /// narrow the ACL on those canonicalized paths as well.
+    #[cfg(windows)]
+    #[test]
+    fn canonicalized_verbatim_data_dir_is_restricted_by_icacls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        acl_probe::grant_users_read(&data_dir);
+
+        let canonical_data_dir = std::fs::canonicalize(&data_dir).unwrap();
+        assert!(
+            canonical_data_dir.to_string_lossy().starts_with(r"\\?\"),
+            "expected Windows canonicalize to return a verbatim path, got {}",
+            canonical_data_dir.display()
+        );
+
+        let private_dir = canonical_data_dir.join("private").join("nested");
+        create_private_dir(&private_dir).unwrap();
+        crate::config::store_hook_auth_token(&canonical_data_dir, "verbatim-bearer").unwrap();
+
+        let owner = acl_probe::current_sid();
+        for path in [
+            private_dir.parent().unwrap().to_path_buf(),
+            private_dir,
+            crate::config::hook_auth_token_path_in(&canonical_data_dir),
+            crate::config::hook_auth_header_path_in(&canonical_data_dir),
+        ] {
+            let sids = acl_probe::allowed_sids(&path);
+            assert!(
+                !sids.is_empty() && sids.iter().all(|sid| *sid == owner),
+                "{} must be reachable by the owner alone, got {sids:?}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            crate::config::read_hook_auth_token(&canonical_data_dir).as_deref(),
+            Some("verbatim-bearer")
+        );
+    }
+
+    #[test]
+    fn windows_system32_tool_in_resolves_under_system_root_and_falls_back_when_unset() {
+        assert_eq!(
+            windows_system32_tool_in(Some(OsString::from(r"C:\Windows")), "icacls.exe"),
+            PathBuf::from(r"C:\Windows")
+                .join("System32")
+                .join("icacls.exe")
+        );
+        assert_eq!(
+            windows_system32_tool_in(Some(OsString::from(r"C:\Windows")), "whoami.exe"),
+            PathBuf::from(r"C:\Windows")
+                .join("System32")
+                .join("whoami.exe")
+        );
+        for unset in [None, Some(OsString::new()), Some(OsString::from("   "))] {
+            assert_eq!(
+                windows_system32_tool_in(unset.clone(), "icacls.exe"),
+                PathBuf::from("icacls"),
+                "{unset:?}"
+            );
+            assert_eq!(
+                windows_system32_tool_in(unset.clone(), "whoami.exe"),
+                PathBuf::from("whoami"),
+                "{unset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn icacls_target_path_strips_safe_verbatim_prefixes() {
+        assert_eq!(
+            icacls_target_path(Path::new(r"\\?\C:\Users\me\data\auth-token")).as_ref(),
+            Path::new(r"C:\Users\me\data\auth-token")
+        );
+        assert_eq!(
+            icacls_target_path(Path::new(r"\\?\UNC\server\share\data")).as_ref(),
+            Path::new(r"\\server\share\data")
+        );
+        assert_eq!(
+            icacls_target_path(Path::new(r"C:\Users\me\data")).as_ref(),
+            Path::new(r"C:\Users\me\data")
+        );
+        assert_eq!(
+            icacls_target_path(Path::new(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\m"
+            ))
+            .as_ref(),
+            Path::new(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\m")
+        );
+    }
+
+    #[test]
+    fn create_private_dir_with_restricts_every_new_component_and_rolls_back_on_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+
+        let target = existing.join("a").join("b").join("c");
+        let mut restricted = Vec::new();
+        create_private_dir_with(&target, |p| {
+            restricted.push(p.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            restricted,
+            vec![
+                existing.join("a"),
+                existing.join("a").join("b"),
+                existing.join("a").join("b").join("c"),
+            ]
+        );
+        assert!(target.is_dir());
+
+        // Idempotent: an existing directory is left untouched.
+        let mut called = false;
+        create_private_dir_with(&target, |_| {
+            called = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!called, "existing directory must not be restricted again");
+
+        // Rollback: if restricting a nested new directory fails, every newly
+        // created component is removed so a retry never sees a wide-ACL dir.
+        let failing = existing.join("x").join("y").join("z");
+        let err = create_private_dir_with(&failing, |p| {
+            if p == existing.join("x").join("y") {
+                Err(std::io::Error::other("simulated icacls failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("simulated icacls failure"));
+        assert!(
+            !existing.join("x").exists(),
+            "failed restrict must roll back all newly created components"
+        );
+        assert!(
+            existing.is_dir(),
+            "pre-existing ancestor must not be removed"
+        );
+
+        // Collision with an existing regular file returns an error without
+        // invoking restrict.
+        let file = existing.join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let mut file_restricted = false;
+        assert!(
+            create_private_dir_with(&file, |_| {
+                file_restricted = true;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!file_restricted);
     }
 
     /// #2016: `PWD` names the directory only when it opens the same one as
