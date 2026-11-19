@@ -7,8 +7,18 @@ use uuid::Uuid;
 
 use crate::error::{StoreError, StoreResult};
 
-/// Maximum provider attempts for one immutable observation generation.
+/// Maximum provider attempts for one immutable observation generation under
+/// standard (non-outage) failures.
 pub const SESSION_CONSOLIDATION_MAX_ATTEMPTS: u32 = 5;
+
+/// Hard attempt cap for transport-unreachable consolidation failures (5 fast
+/// attempts plus 7 slow outage retries).
+pub const TRANSPORT_RECOVERY_MAX_ATTEMPTS: u32 = 12;
+
+/// Redacted queue error string recorded when the LLM provider could not be
+/// reached at the HTTP transport layer (`LlmError::Http` with no HTTP status).
+pub const TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR: &str =
+    "consolidation failed: class=http status=none";
 
 /// One atomically claimed session-consolidation job.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,7 +221,7 @@ pub fn claim_next(
              ORDER BY requested_at ASC, generation ASC \
              LIMIT 1",
             params![
-                i64::from(SESSION_CONSOLIDATION_MAX_ATTEMPTS),
+                i64::from(TRANSPORT_RECOVERY_MAX_ATTEMPTS),
                 now,
                 stale_before
             ],
@@ -314,7 +324,12 @@ pub fn fail(
 ) -> StoreResult<()> {
     let now = Timestamp::now().as_microsecond();
     let error = truncate_error(error);
-    if job.attempts >= SESSION_CONSOLIDATION_MAX_ATTEMPTS || retry_at.is_none() {
+    let max_attempts = if error == TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR {
+        TRANSPORT_RECOVERY_MAX_ATTEMPTS
+    } else {
+        SESSION_CONSOLIDATION_MAX_ATTEMPTS
+    };
+    if job.attempts >= max_attempts || retry_at.is_none() {
         let changed = conn.execute(
             "UPDATE session_consolidation_jobs \
              SET state = 'failed', completed_at = ?1, claim_id = NULL, last_error = ?2 \
@@ -401,6 +416,79 @@ pub fn reconcile_session_consolidation_completed(
         params![now, session_id.as_bytes()],
     )?;
     Ok(changed)
+}
+
+/// Passively requeue a bounded batch of transport-unreachable consolidation
+/// jobs once a real provider call succeeds.
+///
+/// Resets `state = 'pending'` and `next_attempt_at = now` for up to `limit`
+/// jobs whose `last_error` is [`TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR`],
+/// whose `attempts < TRANSPORT_RECOVERY_MAX_ATTEMPTS`, and that are either
+/// `failed` (e.g. from an earlier attempt cap) or `pending` in slow outage
+/// backoff (`next_attempt_at > now`). Jobs superseded by a newer generation,
+/// jobs at the hard attempt cap, non-transport failures, and live `running`
+/// leases are never touched.
+pub fn requeue_transport_failed(
+    conn: &mut Connection,
+    now: i64,
+    limit: usize,
+) -> StoreResult<usize> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let candidates: Vec<(Vec<u8>, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT job.session_id, job.generation \
+             FROM session_consolidation_jobs job \
+             WHERE job.last_error = ?1 \
+               AND job.attempts < ?2 \
+               AND (job.state = 'failed' OR (job.state = 'pending' AND job.next_attempt_at > ?3)) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM session_consolidation_jobs newer \
+                   WHERE newer.session_id = job.session_id \
+                     AND newer.generation > job.generation \
+               ) \
+             ORDER BY job.requested_at ASC, job.generation ASC \
+             LIMIT ?4",
+        )?;
+        stmt.query_map(
+            params![
+                TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                i64::from(TRANSPORT_RECOVERY_MAX_ATTEMPTS),
+                now,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut requeued = 0usize;
+    for (session_id, generation) in candidates {
+        let changed = tx.execute(
+            "UPDATE session_consolidation_jobs \
+             SET state = 'pending', \
+                 next_attempt_at = ?1, \
+                 started_at = NULL, \
+                 completed_at = NULL, \
+                 claim_id = NULL \
+             WHERE session_id = ?2 AND generation = ?3 \
+               AND last_error = ?4 \
+               AND attempts < ?5 \
+               AND (state = 'failed' OR (state = 'pending' AND next_attempt_at > ?1))",
+            params![
+                now,
+                session_id,
+                generation,
+                TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                i64::from(TRANSPORT_RECOVERY_MAX_ATTEMPTS),
+            ],
+        )?;
+        requeued = requeued.saturating_add(changed);
+    }
+    tx.commit()?;
+    Ok(requeued)
 }
 
 fn require_claim_update(changed: usize) -> StoreResult<()> {
@@ -1014,5 +1102,282 @@ mod tests {
             .fail_session_consolidation(recovered, "terminal".into(), None)
             .await
             .unwrap();
+    }
+
+    async fn add_ended_session(
+        store: &Store,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            })
+            .await
+            .unwrap();
+        insert_observation(store, workspace_id, project_id, session_id).await;
+        store.writer.end_session(session_id, None).await.unwrap();
+        session_id
+    }
+
+    fn job_state_and_attempts(store: &Store, session_id: SessionId) -> (String, u32, i64) {
+        let db = Connection::open(store.db_path()).unwrap();
+        db.query_row(
+            "SELECT state, attempts, next_attempt_at \
+             FROM session_consolidation_jobs WHERE session_id = ?1",
+            params![session_id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transport_unreachable_failure_retries_past_standard_cap_up_to_recovery_cap() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+
+        for expected_attempt in 1..TRANSPORT_RECOVERY_MAX_ATTEMPTS {
+            let job = store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .expect("transport-unreachable job must stay claimable below recovery cap");
+            assert_eq!(job.attempts(), expected_attempt);
+            store
+                .writer
+                .fail_session_consolidation(
+                    job,
+                    TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR.into(),
+                    Some(now),
+                )
+                .await
+                .unwrap();
+            let (state, attempts, _) = job_state_and_attempts(&store, session_id);
+            assert_eq!(state, "pending");
+            assert_eq!(attempts, expected_attempt);
+        }
+
+        let final_claim = store
+            .writer
+            .claim_session_consolidation(now, now - 1)
+            .await
+            .unwrap()
+            .expect("the final recovery attempt must still be claimable");
+        assert_eq!(final_claim.attempts(), TRANSPORT_RECOVERY_MAX_ATTEMPTS);
+        store
+            .writer
+            .fail_session_consolidation(
+                final_claim,
+                TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR.into(),
+                Some(now),
+            )
+            .await
+            .unwrap();
+
+        let (state, attempts, _) = job_state_and_attempts(&store, session_id);
+        assert_eq!(state, "failed");
+        assert_eq!(attempts, TRANSPORT_RECOVERY_MAX_ATTEMPTS);
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now + 1_000, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a transport-failed job at the hard cap must not be re-claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_transport_failure_still_terminates_at_standard_attempt_cap() {
+        let (_tmp, store, workspace_id, project_id, session_id) = ended_session().await;
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+        let now = Timestamp::now().as_microsecond();
+
+        for expected_attempt in 1..=SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+            let job = store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.attempts(), expected_attempt);
+            store
+                .writer
+                .fail_session_consolidation(
+                    job,
+                    "consolidation failed: class=provider status=503".into(),
+                    Some(now),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (state, attempts, _) = job_state_and_attempts(&store, session_id);
+        assert_eq!(state, "failed");
+        assert_eq!(attempts, SESSION_CONSOLIDATION_MAX_ATTEMPTS);
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now + 1_000, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "non-transport transient failures must still stop at SESSION_CONSOLIDATION_MAX_ATTEMPTS"
+        );
+    }
+
+    #[tokio::test]
+    async fn requeue_transport_failed_respects_limit_error_filter_and_hard_cap() {
+        let (_tmp, store, workspace_id, project_id, failed_a) = ended_session().await;
+        let failed_b = add_ended_session(&store, workspace_id, project_id).await;
+        let failed_c = add_ended_session(&store, workspace_id, project_id).await;
+        let capped = add_ended_session(&store, workspace_id, project_id).await;
+        let terminal_400 = add_ended_session(&store, workspace_id, project_id).await;
+        let failed_503 = add_ended_session(&store, workspace_id, project_id).await;
+        let slow_pending = add_ended_session(&store, workspace_id, project_id).await;
+
+        for sid in [
+            failed_a,
+            failed_b,
+            failed_c,
+            capped,
+            terminal_400,
+            failed_503,
+            slow_pending,
+        ] {
+            store
+                .writer
+                .enqueue_session_consolidation(workspace_id, project_id, sid)
+                .await
+                .unwrap();
+        }
+
+        let now = Timestamp::now().as_microsecond();
+        let future = now + 3_600_000_000;
+        {
+            let db = Connection::open(store.db_path()).unwrap();
+            // Simulate jobs that exhausted the old 5-attempt cap during an outage.
+            for sid in [failed_a, failed_b, failed_c] {
+                db.execute(
+                    "UPDATE session_consolidation_jobs \
+                     SET state = 'failed', attempts = ?1, completed_at = ?2, \
+                         next_attempt_at = ?2, last_error = ?3 \
+                     WHERE session_id = ?4",
+                    params![
+                        i64::from(SESSION_CONSOLIDATION_MAX_ATTEMPTS),
+                        now - 10_000,
+                        TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                        sid.as_bytes(),
+                    ],
+                )
+                .unwrap();
+            }
+            // Transport-failed job already at the hard cap: must never be requeued.
+            db.execute(
+                "UPDATE session_consolidation_jobs \
+                 SET state = 'failed', attempts = ?1, completed_at = ?2, \
+                     next_attempt_at = ?2, last_error = ?3 \
+                 WHERE session_id = ?4",
+                params![
+                    i64::from(TRANSPORT_RECOVERY_MAX_ATTEMPTS),
+                    now - 10_000,
+                    TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                    capped.as_bytes(),
+                ],
+            )
+            .unwrap();
+            // Non-transport terminal 400 failure: must never be requeued.
+            db.execute(
+                "UPDATE session_consolidation_jobs \
+                 SET state = 'failed', attempts = 1, completed_at = ?1, \
+                     next_attempt_at = ?1, last_error = 'consolidation failed: class=provider status=400' \
+                 WHERE session_id = ?2",
+                params![now - 10_000, terminal_400.as_bytes()],
+            )
+            .unwrap();
+            // Non-transport 503 failure past cap: must never be requeued.
+            db.execute(
+                "UPDATE session_consolidation_jobs \
+                 SET state = 'failed', attempts = ?1, completed_at = ?2, \
+                     next_attempt_at = ?2, last_error = 'consolidation failed: class=provider status=503' \
+                 WHERE session_id = ?3",
+                params![
+                    i64::from(SESSION_CONSOLIDATION_MAX_ATTEMPTS),
+                    now - 10_000,
+                    failed_503.as_bytes(),
+                ],
+            )
+            .unwrap();
+            // Slow outage backoff pending job: expedited to `now` on recovery.
+            db.execute(
+                "UPDATE session_consolidation_jobs \
+                 SET state = 'pending', attempts = 6, next_attempt_at = ?1, \
+                     last_error = ?2 \
+                 WHERE session_id = ?3",
+                params![
+                    future,
+                    TRANSPORT_UNREACHABLE_CONSOLIDATION_ERROR,
+                    slow_pending.as_bytes(),
+                ],
+            )
+            .unwrap();
+        }
+
+        // First call is bounded to limit = 2.
+        let first_batch = store
+            .writer
+            .requeue_transport_failed_session_consolidations(now, 2)
+            .await
+            .unwrap();
+        assert_eq!(first_batch, 2, "requeue must respect the per-call limit");
+
+        // Second call picks up the remaining 2 eligible jobs (1 failed + 1 delayed pending).
+        let second_batch = store
+            .writer
+            .requeue_transport_failed_session_consolidations(now, 10)
+            .await
+            .unwrap();
+        assert_eq!(second_batch, 2);
+
+        // Third call is a no-op: all eligible jobs are already pending & due.
+        let third_batch = store
+            .writer
+            .requeue_transport_failed_session_consolidations(now, 10)
+            .await
+            .unwrap();
+        assert_eq!(third_batch, 0);
+
+        for sid in [failed_a, failed_b, failed_c, slow_pending] {
+            let (state, _, next_attempt_at) = job_state_and_attempts(&store, sid);
+            assert_eq!(state, "pending");
+            assert_eq!(next_attempt_at, now);
+        }
+        for sid in [capped, terminal_400, failed_503] {
+            let (state, _, _) = job_state_and_attempts(&store, sid);
+            assert_eq!(
+                state, "failed",
+                "capped and non-transport failed jobs must remain untouched"
+            );
+        }
     }
 }

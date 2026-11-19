@@ -349,6 +349,11 @@ pub(crate) enum WriteCmd {
         session_id: SessionId,
         reply: oneshot::Sender<StoreResult<usize>>,
     },
+    RequeueTransportFailedSessionConsolidations {
+        now: i64,
+        limit: usize,
+        reply: oneshot::Sender<StoreResult<usize>>,
+    },
     InsertHandoff {
         handoff: NewHandoff,
         reply: oneshot::Sender<StoreResult<HandoffId>>,
@@ -2031,6 +2036,25 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ReconcileSessionConsolidationCompleted {
             session_id,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Passively requeue up to `limit` transport-unreachable consolidation jobs
+    /// (`state = 'failed'` or `state = 'pending'` in slow outage backoff) whose
+    /// attempt count is still below [`crate::TRANSPORT_RECOVERY_MAX_ATTEMPTS`].
+    /// Returns the number of rows updated.
+    pub async fn requeue_transport_failed_session_consolidations(
+        &self,
+        now: i64,
+        limit: usize,
+    ) -> StoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::RequeueTransportFailedSessionConsolidations {
+            now,
+            limit,
             reply: tx,
         })
         .await?;
@@ -4679,6 +4703,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                         &mut conn, session_id,
                     );
                 send_or_warn(reply, result, "reconcile_session_consolidation_completed");
+            }
+            WriteCmd::RequeueTransportFailedSessionConsolidations { now, limit, reply } => {
+                let result =
+                    crate::session_consolidation::requeue_transport_failed(&mut conn, now, limit);
+                send_or_warn(
+                    reply,
+                    result,
+                    "requeue_transport_failed_session_consolidations",
+                );
             }
             WriteCmd::InsertHandoff { handoff, reply } => {
                 let result = ops::insert_handoff(&mut conn, &handoff);
