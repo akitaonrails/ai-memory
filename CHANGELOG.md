@@ -18,8 +18,6 @@ version in [`docs/changelog/`](docs/changelog/):
   writes no longer skip that project as empty, and startup no longer reports
   it as an empty twin. (#2348, follow-up to #2018.)
 
-### Fixed
-
 - Claude Code's Code Mode results are no longer stored as user prompts. When
   code can run in the background, as in auto mode, Claude Code hands each
   result of its `REPL` tool back as a `UserPromptSubmit` with
@@ -30,18 +28,12 @@ version in [`docs/changelog/`](docs/changelog/):
   and stores nothing, before they spend any ingest capacity; the calls the
   code made are still captured as their own tool events. (#2366)
 
-### Fixed
-
 - The TypeScript SDK waits for the active MCP handshake when a capability
   refresh supersedes an in-flight handshake. This prevents requests without a
   session ID on stateful servers when the older response arrives first. (#2047)
 
-### Fixed
-
 - Updated `rustix` to `1.1.6` in the workspace and companion lockfiles that
   use it, addressing RUSTSEC-2026-0486. (#2371)
-
-### Fixed
 
 - Profile harvest no longer promotes five kinds of text that are not a habit
   to "your usual choices". Three arrived as prompts: Codex's app-generated
@@ -59,25 +51,20 @@ version in [`docs/changelog/`](docs/changelog/):
   under `_rules/` and `procedures/` contribute as before. In any directory a
   statement that opens with a pointer to another note, or that carries a full
   date outside parentheses and no marker, is a record and is skipped; a rule
-  that cites a date in parentheses or ends on a link is kept. An entry you
-  removed also no
+  that cites a date in parentheses or ends on a link is kept. An entry you removed also no
   longer returns when the only thing admitting it is a `general` candidate
   older than the removal. Entries an earlier version already wrote stay:
   list them with `ai-memory profile review` and remove the ones you do not
   want with `ai-memory profile forget <path>`. (#2372)
 
-### Fixed
-
 - Kept recorded retrievals and their hits consistent when the dashboard opens
   while history retention removes older entries. (#2377)
-
-### Fixed
 
 - `memory_patch_page` refuses a `replace_section` aimed at the page's level 1
   title with `title_section`. The title's section runs to the end of the page,
   so the edit replaced the whole body and deleted every section below it. The
   tool description and the durable-pages Skill now say that `content` is the
-  section body without its heading.
+  section body without its heading. (#2378)
 
 ## [3.5.0] - 2026-11-18
 
