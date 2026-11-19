@@ -366,6 +366,13 @@ undelivered event for a later drain.
 - A memory audit that includes the token cost of the session brief (Letta
   Code's `/doctor`-style check).
 - A generated per-project index page (Letta's `MEMORY.md` index).
+- Re-checking an existing page against the observations it was built from
+  (Anthropic's "dreaming" result, where a note corrected against its
+  transcript changed the outcome). *Verify first*: auto-improve and
+  consolidation correct pages only from a new session's observations, and
+  the dream pass merges cold pages using only those pages. See open
+  questions in
+  [`research-anthropic-agent-memory.md`](research-anthropic-agent-memory.md).
 - A stale-write signal that returns the current version (Supermemory
   memoryrepo); evaluate against invariant #16, where a divergent write
   supersedes and is never rejected silently.
