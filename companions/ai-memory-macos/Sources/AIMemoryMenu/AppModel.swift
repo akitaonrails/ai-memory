@@ -20,9 +20,10 @@ final class AppModel {
     var lastHTTPStatus: Int?
 
     @ObservationIgnored private var tokenStore: any TokenStore
-    @ObservationIgnored private var health = HealthClient()
+    @ObservationIgnored private let fetchHealth: @Sendable (URL, String?) async throws -> StatusReport
     @ObservationIgnored private var runner: any CommandRunning
     @ObservationIgnored private var pollTask: Task<Void, Never>?
+    @ObservationIgnored private var latestPoll: UUID?
     @ObservationIgnored private var fetchFailed = false
     @ObservationIgnored private var startingDeadline: Date?
     @ObservationIgnored private var logFreshSince = Date()
@@ -30,11 +31,14 @@ final class AppModel {
     init(
         settings: AppSettings = .load(),
         tokenStore: any TokenStore = KeychainTokenStore(),
-        runner: any CommandRunning = ProcessRunner()
+        runner: any CommandRunning = ProcessRunner(),
+        fetchHealth: @escaping @Sendable (URL, String?) async throws -> StatusReport = HealthClient().fetch,
+        pollAutomatically: Bool = true
     ) {
         self.settings = settings
         self.tokenStore = tokenStore
         self.runner = runner
+        self.fetchHealth = fetchHealth
         self.tokenConfigured = tokenStore.read()?.isEmpty == false
         self.dataDirTokenPresent = DataDirToken.read(dataDir: settings.resolvedDataDir) != nil
         // A token saved by an earlier version has no recorded origin. Bind it
@@ -50,7 +54,9 @@ final class AppModel {
             self.settings.adoptUnboundToken()
             self.settings.save()
         }
-        startPolling()
+        if pollAutomatically {
+            startPolling()
+        }
     }
 
     var headlineVersion: String {
@@ -135,14 +141,26 @@ final class AppModel {
     }
 
     func poll() async {
-        let controller = launchdController()
-        launchd = controller.state()
-        lastHTTPStatus = nil
+        let pollID = UUID()
+        latestPoll = pollID
+        launchd = launchdController().state()
+        let result: Result<StatusReport, any Error>
         do {
-            report = try await health.fetch(baseURL: settings.serverURL, token: effectiveToken)
+            result = .success(try await fetchHealth(settings.serverURL, effectiveToken))
+        } catch {
+            result = .failure(error)
+        }
+        // A settings or lifecycle action can refresh while the background
+        // poll is suspended. Only the latest request can publish its state.
+        guard latestPoll == pollID, !Task.isCancelled else { return }
+
+        lastHTTPStatus = nil
+        switch result {
+        case .success(let fetched):
+            report = fetched
             fetchFailed = false
             lastError = nil
-        } catch {
+        case .failure(let error):
             report = nil
             fetchFailed = true
             if let health = error as? HealthError, case let .http(code) = health {
@@ -283,6 +301,7 @@ final class AppModel {
         }
         settings.save()
         tokenConfigured = tokenStore.read()?.isEmpty == false
+        latestPoll = nil
         Task { await poll() }
     }
 
@@ -292,6 +311,7 @@ final class AppModel {
         icon = .starting
         report = nil
         lastError = nil
+        latestPoll = nil
         pollTask?.cancel()
         pollTask = nil
         startPolling()
