@@ -89,6 +89,16 @@ version in [`docs/changelog/`](docs/changelog/):
   8.3 names off, the caret form is kept. Run `ai-memory setup` again to
   rewrite `~/.gemini/config/hooks.json`. (#2353)
 
+### Fixed
+
+- A native upgrade no longer points generated integrations (OpenCode,
+  OpenCode 2, Omp, Pi, OpenClaw) at the local server. Installed with an
+  explicit remote `--server-url` and refreshed with no `server_url`
+  configured, they were re-rendered with `http://127.0.0.1:49374`; the refresh
+  now keeps the endpoint the file already names, as it already did for Claude
+  Code's hooks. A configured `server_url` or `AI_MEMORY_SERVER_URL` still
+  wins. (#2374)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
