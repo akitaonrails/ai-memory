@@ -11,6 +11,19 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- On Windows, the hook credential files (`auth-token`, `auth-header`) and the
+  directories ai-memory creates as private (the hook spool, `auth-tokens/`, the
+  recovery journal's) no longer inherit read access granted above the data
+  dir. They used to take the access list of `%LOCALAPPDATA%`, so an account
+  given read there, such as a sandbox group, could read the root bearer and
+  every token queued in the spool. Each is now restricted to the account that
+  writes it, the Windows counterpart of the `0600`/`0700` modes used on Unix.
+  The credential files are narrowed again the next time `install-hooks` or
+  `setup` writes them; an existing spool or token directory keeps its access
+  list (see `docs/security-boundaries.md` row 10m). (#PR)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

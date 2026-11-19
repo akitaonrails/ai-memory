@@ -3,10 +3,12 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-/// Create `dir` (and its parents) `0700` on Unix. On non-Unix the mode is a
-/// no-op (falls back to `create_dir_all`). Idempotent: an existing
-/// directory's mode is left untouched (never widened, never narrowed) to
-/// avoid churning a path an operator may have set deliberately.
+/// Create `dir` (and its parents) `0700` on Unix. On Windows the new `dir`
+/// itself gets an access list naming only the current account
+/// ([`restrict_to_owner`]), which everything later created inside it
+/// inherits. Idempotent: an existing directory's mode or access list is left
+/// untouched (never widened, never narrowed) to avoid churning a path an
+/// operator may have set deliberately.
 pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -26,9 +28,150 @@ pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
             Err(e) => Err(e),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if dir.is_dir() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir)?;
+        restrict_to_owner(dir)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::create_dir_all(dir)
+    }
+}
+
+/// Replace `path`'s inherited access list with one entry: full control for
+/// the account this process runs as. A directory passes that entry on to
+/// everything created inside it.
+///
+/// Windows has no mode bits for `0600`/`0700`. A new file or directory
+/// inherits its parent's list, so a read grant anywhere above the data dir
+/// (a sandbox group on `%LOCALAPPDATA%`, say) would otherwise reach a bearer
+/// written there. Explicit entries an operator added to `path` itself are
+/// kept. The account is named by SID, so the grant does not depend on the
+/// display language or on how the account name resolves.
+///
+/// # Errors
+/// The current account's SID cannot be read, or `icacls` fails; callers
+/// treat that as a failed write rather than leave the secret readable.
+#[cfg(windows)]
+pub(crate) fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    let sid = current_account_sid()?;
+    let grant = if path.is_dir() {
+        format!("*{sid}:(OI)(CI)F")
+    } else {
+        format!("*{sid}:F")
+    };
+    // System32 comes before PATH in Windows' program search, so a Git for
+    // Windows coreutils on PATH cannot stand in for either tool.
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(grant)
+        .arg("/q")
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "icacls could not restrict {} to the current account",
+            path.display()
+        )))
+    }
+}
+
+/// The SID of the account this process runs as, from `whoami /user`.
+#[cfg(windows)]
+fn current_account_sid() -> std::io::Result<String> {
+    let output = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            "whoami could not report the current account",
+        ));
+    }
+    parse_whoami_sid(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| std::io::Error::other("whoami reported no SID for the current account"))
+}
+
+/// The SID column of `whoami /user /fo csv /nh` (`"domain\user","S-1-5-..."`).
+/// Only a well-formed SID comes back, so nothing else reaches `icacls`.
+#[cfg(any(windows, test))]
+fn parse_whoami_sid(csv: &str) -> Option<String> {
+    let sid = csv
+        .lines()
+        .next()?
+        .rsplit(',')
+        .next()?
+        .trim()
+        .trim_matches('"');
+    let valid = sid.starts_with("S-1-")
+        && sid.len() > 4
+        && sid[4..]
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    valid.then(|| sid.to_owned())
+}
+
+/// Read a path's access list in a form tests can check without depending on
+/// the display language: the SDDL `icacls /save` writes.
+#[cfg(all(test, windows))]
+pub(crate) mod acl_probe {
+    use std::path::Path;
+
+    /// The SIDs (or SDDL aliases such as `BU`) of every allow entry on `path`.
+    pub(crate) fn allowed_sids(path: &Path) -> Vec<String> {
+        let scratch = tempfile::tempdir().unwrap();
+        let saved = scratch.path().join("acl.txt");
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .arg("/save")
+            .arg(&saved)
+            .arg("/q")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "icacls /save failed: {output:?}");
+        let raw = std::fs::read(&saved).unwrap();
+        let units: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let text = String::from_utf16_lossy(&units);
+        let sddl = text.lines().nth(1).unwrap_or_default().to_owned();
+        let dacl = sddl.split("D:").nth(1).unwrap_or_default();
+        let dacl = dacl.split("S:").next().unwrap_or_default();
+        dacl.split('(')
+            .skip(1)
+            .filter_map(|ace| {
+                let fields: Vec<&str> = ace.trim_end_matches(')').split(';').collect();
+                (fields.first() == Some(&"A")).then(|| fields.last().unwrap().to_string())
+            })
+            .collect()
+    }
+
+    /// The current account's SID.
+    pub(crate) fn current_sid() -> String {
+        super::current_account_sid().unwrap()
+    }
+
+    /// Give the built-in Users group read access to `dir` and everything
+    /// created inside it, the way a sandbox group's grant on
+    /// `%LOCALAPPDATA%` reaches the data dir.
+    pub(crate) fn grant_users_read(dir: &Path) {
+        let output = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)R", "/q"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    /// Whether an allow entry names the built-in Users group.
+    pub(crate) fn names_users(sids: &[String]) -> bool {
+        sids.iter().any(|sid| sid == "BU" || sid == "S-1-5-32-545")
     }
 }
 
@@ -262,6 +405,63 @@ pub(crate) fn strip_windows_verbatim_prefix(path: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    /// Only a well-formed SID reaches `icacls`; anything else from `whoami`
+    /// is refused rather than passed on as an account to grant.
+    #[test]
+    fn parse_whoami_sid_takes_only_a_well_formed_sid() {
+        assert_eq!(
+            parse_whoami_sid("\"host\\user\",\"S-1-5-21-1-2-3-1001\"\r\n").as_deref(),
+            Some("S-1-5-21-1-2-3-1001")
+        );
+        for bad in [
+            "",
+            "\"host\\user\"",
+            "\"host\\user\",\"S-1-\"",
+            "\"host\\user\",\"S-1-5-x\"",
+            "\"host\\user\",\"Everyone:F\"",
+            "\"host\\user\",\"S-1-5--1\"",
+        ] {
+            assert_eq!(parse_whoami_sid(bad), None, "{bad:?}");
+        }
+    }
+
+    /// A read grant above a new private dir (a sandbox group on
+    /// `%LOCALAPPDATA%`) must not reach the dir or a file later created in
+    /// it; the control dir made the ordinary way shows the grant does reach
+    /// a sibling. An existing dir is left as it was.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_private_dir_drops_a_read_grant_inherited_from_above() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        acl_probe::grant_users_read(&root);
+        let control = root.join("plain");
+        std::fs::create_dir_all(&control).unwrap();
+        assert!(acl_probe::names_users(&acl_probe::allowed_sids(&control)));
+
+        let private = root.join("private").join("nested");
+        create_private_dir(&private).unwrap();
+        let inside = private.join("secret.txt");
+        std::fs::write(&inside, "s3cret").unwrap();
+
+        let owner = acl_probe::current_sid();
+        for path in [&private, &inside] {
+            let sids = acl_probe::allowed_sids(path);
+            assert!(
+                !sids.is_empty() && sids.iter().all(|sid| *sid == owner),
+                "{} must be reachable by the owner alone, got {sids:?}",
+                path.display()
+            );
+        }
+
+        create_private_dir(&control).unwrap();
+        assert!(
+            acl_probe::names_users(&acl_probe::allowed_sids(&control)),
+            "an existing directory's access list is never narrowed"
+        );
+    }
 
     /// #2016: `PWD` names the directory only when it opens the same one as
     /// the physical cwd; anything else keeps the physical path.

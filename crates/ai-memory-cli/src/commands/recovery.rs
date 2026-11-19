@@ -396,25 +396,8 @@ fn make_private(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn make_private(path: &Path) -> Result<()> {
-    let identity = std::process::Command::new("whoami")
-        .output()
-        .context("resolving the Windows recovery-journal owner")?;
-    if !identity.status.success() {
-        bail!("could not resolve the Windows recovery-journal owner");
-    }
-    let owner =
-        String::from_utf8(identity.stdout).context("reading the Windows recovery-journal owner")?;
-    let grant = format!("{}:(F)", owner.trim());
-    let restricted = std::process::Command::new("icacls")
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(grant)
-        .output()
-        .with_context(|| format!("restricting permissions on {}", path.display()))?;
-    if !restricted.status.success() {
-        bail!("could not restrict permissions on {}", path.display());
-    }
-    Ok(())
+    crate::commands::path_util::restrict_to_owner(path)
+        .with_context(|| format!("restricting permissions on {}", path.display()))
 }
 
 #[cfg(not(any(unix, windows)))]
