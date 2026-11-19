@@ -79,15 +79,11 @@ version in [`docs/changelog/`](docs/changelog/):
   tool description and the durable-pages Skill now say that `content` is the
   section body without its heading. (#2378)
 
-### Fixed
-
 - `companions/ai-memory-macos/build.sh` now checks the Rust compiler against
   `rust-toolchain.toml` before building and says that the pin needs rustup,
   instead of failing with cargo's "requires rustc" errors under a Homebrew
   `rust`. The menu bar app also compiles again under Swift 6.0 (Xcode 16.2,
   the last Xcode for macOS 14) (#2380).
-
-### Fixed
 
 - Antigravity hooks on Windows work again when the user profile path has a
   space. The caret escape from #1767 let `cmd` find `ai-memory.exe`, but `cmd`
@@ -98,8 +94,6 @@ version in [`docs/changelog/`](docs/changelog/):
   8.3 names off, the caret form is kept. Run `ai-memory setup` again to
   rewrite `~/.gemini/config/hooks.json`. (#2353)
 
-### Fixed
-
 - A native upgrade no longer points generated integrations (OpenCode,
   OpenCode 2, Omp, Pi, OpenClaw) at the local server. Installed with an
   explicit remote `--server-url` and refreshed with no `server_url`
@@ -107,8 +101,6 @@ version in [`docs/changelog/`](docs/changelog/):
   now keeps the endpoint the file already names, as it already did for Claude
   Code's hooks. A configured `server_url` or `AI_MEMORY_SERVER_URL` still
   wins. (#2374)
-
-### Fixed
 
 - The wiki watcher's reconcile pass no longer rewrites the whole persisted
   fingerprint table when one file changed. Every pass that reindexed a page
