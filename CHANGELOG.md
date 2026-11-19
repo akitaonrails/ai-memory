@@ -30,6 +30,12 @@ version in [`docs/changelog/`](docs/changelog/):
   and stores nothing, before they spend any ingest capacity; the calls the
   code made are still captured as their own tool events. (#2366)
 
+### Fixed
+
+- The TypeScript SDK waits for the active MCP handshake when a capability
+  refresh supersedes an in-flight handshake. This prevents requests without a
+  session ID on stateful servers when the older response arrives first. (#2047)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
