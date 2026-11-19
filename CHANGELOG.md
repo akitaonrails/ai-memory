@@ -66,6 +66,11 @@ version in [`docs/changelog/`](docs/changelog/):
   list them with `ai-memory profile review` and remove the ones you do not
   want with `ai-memory profile forget <path>`. (#2372)
 
+### Fixed
+
+- Kept recorded retrievals and their hits consistent when the dashboard opens
+  while history retention removes older entries. (#2377)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
