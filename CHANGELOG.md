@@ -11,6 +11,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Kept recorded retrievals and their hits consistent when the dashboard opens
+  while history retention removes older entries. (#2377)
+
 ## [3.5.0] - 2026-11-18
 
 ### Added
