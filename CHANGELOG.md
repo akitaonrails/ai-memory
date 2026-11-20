@@ -34,6 +34,9 @@ version in [`docs/changelog/`](docs/changelog/):
 - Kept queued session consolidation eligible for outage recovery when every
   fallback candidate is unreachable at the HTTP transport layer. (#2384)
 
+- Recovered stale retrieval-history bookmarks by opening the last retained
+  page after older records were pruned. (#2038)
+
 - Recorded query vector-stream activity in retrieval eval reports when
   `explain=true` was requested, exposing queries that ran without the vector
   stream during local-embedding evaluations. (#1854)
