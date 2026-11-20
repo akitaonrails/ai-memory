@@ -5617,7 +5617,7 @@ fn add_hook_spooling(source: String) -> Result<String> {
     }
     out = out.replacen(
         import_anchor,
-        "import { closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from \"node:fs\";",
+        "import { closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from \"node:fs\";",
         1,
     );
     Ok(out)
@@ -14880,9 +14880,9 @@ model = "gpt-5"
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        // Three spool-delivery spawns plus the two #2122 server-routed native
-        // spawns (capture and handoff).
-        assert_eq!(plugin.matches("windowsHide: true").count(), 5);
+        // Three spool-delivery spawns, the two #2122 server-routed native
+        // spawns (capture and handoff), and the spool dir's whoami and icacls.
+        assert_eq!(plugin.matches("windowsHide: true").count(), 7);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -15487,7 +15487,7 @@ model = "gpt-5"
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(extension.contains("function repoRootProject"));
         assert!(extension.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(extension.matches("windowsHide: true").count(), 3);
+        assert_eq!(extension.matches("windowsHide: true").count(), 5); // three before, plus the spool dir's whoami and icacls
         assert!(extension.contains("--git-common-dir"));
         assert!(
             extension
@@ -17130,7 +17130,7 @@ process.exit(0);
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(!extension.contains(".omp"));
         assert!(extension.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(extension.matches("windowsHide: true").count(), 3);
+        assert_eq!(extension.matches("windowsHide: true").count(), 5); // three before, plus the spool dir's whoami and icacls
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
         // #676: the pi string-transform (api.on( -> pi.on() must still

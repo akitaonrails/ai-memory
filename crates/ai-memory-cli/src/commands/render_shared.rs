@@ -3614,10 +3614,80 @@ function hookSpoolDir(): string {
 const spoolSeqPrefix = Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, "0");
 let spoolSeq = 0;
 
+// Windows ignores the mode bits, so a directory made with mkdirSync takes the
+// access list of the folder above it. When anything grants read there (a
+// sandbox group with read-and-execute on %LOCALAPPDATA%, say), every account in
+// that grant can read the spool, and a spooled entry carries the bearer. Mirror
+// the native writer (`path_util::create_private_dir`, #2396): every directory
+// this creates gets an owner-only list that its contents inherit, and an
+// existing directory is left as it is. Each one is built under a temporary name
+// and renamed into place only after icacls succeeds, so the final name never
+// exists with the inherited list, even for a moment. Throws when a directory
+// cannot be made private; the caller then does not spool.
+let spoolOwnerSid: string | undefined;
+
+// System32 explicitly, so a Git for Windows or MSYS2 tool earlier on PATH
+// cannot stand in for it (the same lookup the native writer does).
+function windowsSystemTool(name: string): string {
+  const root = process.env.SystemRoot?.trim();
+  return root ? join(root, "System32", name) : name;
+}
+
+// The SID, not the account name: it does not depend on the display language
+// or on how the name resolves.
+function spoolOwner(): string {
+  if (spoolOwnerSid) return spoolOwnerSid;
+  const out = execFileSync(windowsSystemTool("whoami.exe"), ["/user", "/fo", "csv", "/nh"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 5000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  const sid = (out.trim().split(",").pop() ?? "").replace(/"/g, "").trim();
+  if (!/^S-1-\d+(-\d+)+$/.test(sid)) throw new Error("unexpected whoami output");
+  spoolOwnerSid = sid;
+  return sid;
+}
+
+function makePrivateSpoolDir(dir: string): void {
+  if (process.platform !== "win32") {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return;
+  }
+  const missing: string[] = [];
+  for (let p = dir; !existsSync(p); ) {
+    missing.unshift(p);
+    const parent = dirname(p);
+    if (parent === p) break;
+    p = parent;
+  }
+  for (const target of missing) {
+    const staging = `${target}.${spoolSeqPrefix}${Date.now().toString(16)}.tmp`;
+    mkdirSync(staging);
+    try {
+      execFileSync(
+        windowsSystemTool("icacls.exe"),
+        [staging, "/inheritance:r", "/grant:r", `*${spoolOwner()}:(OI)(CI)F`],
+        { windowsHide: true, timeout: 5000, stdio: "ignore" },
+      );
+      try {
+        renameSync(staging, target);
+      } catch (e) {
+        // Another writer created it first; it keeps its own list.
+        if (!existsSync(target)) throw e;
+        rmdirSync(staging);
+      }
+    } catch (e) {
+      try { rmdirSync(staging); } catch (_e) {}
+      throw e;
+    }
+  }
+}
+
 function spoolFailedHook(url: URL | string, payload: Record<string, unknown>): void {
   try {
     const dir = hookSpoolDir();
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    makePrivateSpoolDir(dir);
     const createdMs = Date.now();
     // Idempotency key minted ONCE at spool time and baked into the URL,
     // so this plugin's drain and the CLI's drain can both deliver the
@@ -3941,6 +4011,127 @@ try {
             output.status.success(),
             "spool runtime evidence failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Windows ignores the mode bits the TS spool hands to `mkdirSync`, so a
+    /// spool directory a plugin creates must get an owner-only list of its own
+    /// instead of inheriting a read grant from above the data dir (#2396
+    /// follow-up). The grant is the built-in Users group's, the way a sandbox
+    /// group's read on `%LOCALAPPDATA%` reaches the data dir.
+    #[cfg(windows)]
+    #[test]
+    fn generated_ts_spool_keeps_a_new_spool_dir_from_a_grant_inherited_from_above() {
+        use crate::commands::path_util::acl_probe;
+        let Some(()) = node_strip_types_available() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let granted = temp.path().join("granted");
+        fs::create_dir(&granted).unwrap();
+        acl_probe::grant_users_read(&granted);
+        let control = granted.join("control.txt");
+        fs::write(&control, "x").unwrap();
+        assert!(
+            acl_probe::names_users(&acl_probe::allowed_sids(&control)),
+            "control: the fixture grant reaches an ordinary file"
+        );
+
+        let module = temp.path().join("spool-acl.mts");
+        const HARNESS: &str = r#"
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+const AGENT = "open-code";
+function resolveToken(): string | undefined { return "probe-bearer"; }
+// Node needs a real SystemRoot to start, so the failure case swaps it only
+// once the process is up, for the spool's own tool lookup.
+if (process.env.PROBE_SYSTEMROOT) process.env.SystemRoot = process.env.PROBE_SYSTEMROOT;
+spoolFailedHook("http://127.0.0.1:1/hook?event=stop", { e: "acl" });
+"#;
+        fs::write(
+            &module,
+            format!("{}{}\n{HARNESS}", ts_spool_runtime(), ts_timeout_signal()),
+        )
+        .unwrap();
+        let spool = |data_dir: &Path, system_root: Option<&Path>| {
+            let mut command = Command::new("node");
+            command
+                .arg("--experimental-strip-types")
+                .arg(&module)
+                .env("AI_MEMORY_DATA_DIR", data_dir);
+            if let Some(root) = system_root {
+                command.env("PROBE_SYSTEMROOT", root);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "spool runtime failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let entries = |dir: &Path| -> Vec<PathBuf> {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect()
+        };
+        let leftovers = |dir: &Path| -> Vec<PathBuf> {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "tmp"))
+                .collect()
+        };
+        let me = acl_probe::current_sid();
+
+        // A data dir and spool dir the plugin creates itself.
+        let data = granted.join("data");
+        spool(&data, None);
+        let spool_dir = data.join("hook-spool");
+        let written = entries(&spool_dir);
+        assert_eq!(written.len(), 1, "one entry spooled");
+        assert!(
+            fs::read_to_string(&written[0])
+                .unwrap()
+                .contains("probe-bearer")
+        );
+        for path in [&data, &spool_dir, &written[0]] {
+            let sids = acl_probe::allowed_sids(path);
+            assert!(
+                !acl_probe::names_users(&sids),
+                "{path:?} kept the grant: {sids:?}"
+            );
+            assert!(sids.contains(&me), "{path:?} lost the owner: {sids:?}");
+        }
+        assert!(
+            leftovers(&granted).is_empty(),
+            "staging dir left in the root"
+        );
+        assert!(
+            leftovers(&data).is_empty(),
+            "staging dir left in the data dir"
+        );
+
+        // An existing spool dir keeps its list, like the native writer.
+        let existing = granted.join("existing");
+        fs::create_dir_all(existing.join("hook-spool")).unwrap();
+        spool(&existing, None);
+        assert!(acl_probe::names_users(&acl_probe::allowed_sids(
+            &existing.join("hook-spool")
+        )));
+        assert_eq!(entries(&existing.join("hook-spool")).len(), 1);
+
+        // When the directory cannot be made private, nothing is spooled and no
+        // directory is left behind for a later write to take as private.
+        let refused = granted.join("refused");
+        spool(&refused, Some(&temp.path().join("no-such-windows")));
+        assert!(!refused.exists(), "failed restriction left a data dir");
+        assert!(
+            leftovers(&granted).is_empty(),
+            "failed restriction left a staging dir"
         );
     }
 
