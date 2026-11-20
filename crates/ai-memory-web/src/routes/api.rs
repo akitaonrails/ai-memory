@@ -655,7 +655,9 @@ fn decode_recent_cursor(raw: &str) -> ApiParseResult<RecentCursor> {
     }
     let cursor: RecentCursor = serde_json::from_slice(&bytes)
         .map_err(|_| ApiFailure::bad_request("invalid recent cursor"))?;
-    if cursor.v != 1 || cursor.path.len() > 2048 || PagePath::new(&cursor.path).is_err() {
+    // The decoded payload cap also bounds the path. A stored nested wiki
+    // path can exceed 2,048 bytes and still fit in the continuation cursor.
+    if cursor.v != 1 || PagePath::new(&cursor.path).is_err() {
         return Err(ApiFailure::bad_request("invalid recent cursor"));
     }
     Ok(cursor)
