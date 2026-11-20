@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Renewed an expired Codex token on Windows when Codex is installed through
+  npm. Without `AI_MEMORY_CODEX_EXECUTABLE`, the recovery now resolves `codex`
+  through `PATH` and `PATHEXT` like `ai-memory run` does, so it finds the
+  `codex.cmd` shim (a native `codex.exe` still wins), and a failed start now
+  names the executable and keeps the OS error. (#2404)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
