@@ -52,6 +52,15 @@ version in [`docs/changelog/`](docs/changelog/):
   `setup` writes them; an existing spool or token directory keeps its access
   list (see `docs/security-boundaries.md` row 10m). (#2396)
 
+- On Windows, the PowerShell hook bundle and the generated TypeScript plugins
+  (OpenCode, OMP/Pi, OpenClaw) no longer create the hook spool with the access
+  list of the folder above the data dir. Both write the bearer into every
+  spooled entry, and on a fresh install where one of them spools first, an
+  account given read on `%LOCALAPPDATA%` could read it. A spool directory they
+  create is now restricted to the account that writes it, as the native writer
+  does since #2396; an existing one keeps its access list (see
+  `docs/security-boundaries.md` row 10n). (#NNNN)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

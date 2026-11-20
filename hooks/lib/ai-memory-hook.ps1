@@ -729,12 +729,71 @@ function Get-AiMemorySpoolDir {
 
 # Best-effort chmod for the pwsh-on-Unix case: the shell and native writers
 # keep the spool 0700/0600 (the spool holds private capture until it
-# drains). `chmod` is absent or a no-op on Windows, where the profile-scoped
-# data dir already restricts access.
+# drains). `chmod` is absent or a no-op on Windows; New-AiMemoryPrivateDirectory
+# covers that side.
 function Set-AiMemoryPrivateMode {
     param([string] $Path, [string] $Mode)
     if (Get-Command chmod -ErrorAction SilentlyContinue) {
         & chmod $Mode $Path 2>$null
+    }
+}
+
+function Test-AiMemoryWindows {
+    return ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
+}
+
+# Windows has no mode bits, so a directory created with New-Item takes the
+# access list of the folder above it. When anything grants read there (a
+# sandbox group with read-and-execute on %LOCALAPPDATA%, say), every account
+# in that grant can read the spool, and a spooled entry carries the bearer.
+# Mirror the native writer (`path_util::create_private_dir`, #2396): every
+# directory this call creates gets an owner-only list that its contents
+# inherit, and an existing directory is left as it is. Each one is built
+# under a temporary name and renamed into place only after icacls succeeds,
+# so the final name never exists with the inherited list, even for a moment.
+# Throws when a directory cannot be made private; the caller then does not
+# spool, rather than spool where other accounts can read it.
+function New-AiMemoryPrivateDirectory {
+    param([string] $Path)
+    if (-not (Test-AiMemoryWindows)) {
+        New-Item -ItemType Directory -Force -Path $Path -ErrorAction Stop | Out-Null
+        Set-AiMemoryPrivateMode -Path $Path -Mode "700"
+        return
+    }
+    if (Test-Path -LiteralPath $Path -PathType Container) { return }
+    $missing = New-Object System.Collections.Generic.List[string]
+    $cursor = [IO.Path]::GetFullPath($Path)
+    while ($cursor -and -not (Test-Path -LiteralPath $cursor -PathType Container)) {
+        $missing.Insert(0, $cursor)
+        $parent = [IO.Path]::GetDirectoryName($cursor)
+        if (-not $parent -or $parent -eq $cursor) { break }
+        $cursor = $parent
+    }
+    # The SID, not the account name: it does not depend on the display
+    # language or on how the name resolves.
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($sid -notmatch '^S-1-\d+(-\d+)+$') { throw "unexpected account SID" }
+    # System32 explicitly, so a Git for Windows or MSYS2 tool earlier on PATH
+    # cannot stand in for it (the same lookup the native writer does).
+    $icacls = "icacls.exe"
+    if ($env:SystemRoot) { $icacls = Join-Path (Join-Path $env:SystemRoot "System32") "icacls.exe" }
+    foreach ($target in $missing) {
+        $staging = "$target.$([Guid]::NewGuid().ToString('N')).tmp"
+        [IO.Directory]::CreateDirectory($staging) | Out-Null
+        try {
+            & $icacls $staging /inheritance:r /grant:r "*${sid}:(OI)(CI)F" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls exited $LASTEXITCODE" }
+            try {
+                [IO.Directory]::Move($staging, $target)
+            } catch {
+                # Another writer created it first; it keeps its own list.
+                if (-not (Test-Path -LiteralPath $target -PathType Container)) { throw }
+                [IO.Directory]::Delete($staging)
+            }
+        } catch {
+            if (Test-Path -LiteralPath $staging) { Remove-Item -Force -Recurse -LiteralPath $staging -ErrorAction SilentlyContinue }
+            throw
+        }
     }
 }
 
@@ -745,8 +804,7 @@ function Write-AiMemorySpoolEvent {
     param([string] $Url, [string] $Body)
     try {
         $dir = Get-AiMemorySpoolDir
-        New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
-        Set-AiMemoryPrivateMode -Path $dir -Mode "700"
+        New-AiMemoryPrivateDirectory -Path $dir
         if (-not $script:AiMemorySpoolSeq) { $script:AiMemorySpoolSeq = 0 }
         $script:AiMemorySpoolSeq = $script:AiMemorySpoolSeq + 1
         $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
