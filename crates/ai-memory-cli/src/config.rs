@@ -3655,6 +3655,31 @@ impl Config {
         resolve_codex_auth_file(self.runtime_env.codex_home.as_deref(), platform_home)
     }
 
+    /// Codex CLI used to renew an expired Codex token.
+    ///
+    /// `AI_MEMORY_CODEX_EXECUTABLE` wins. Otherwise, on Windows, `codex` is
+    /// resolved against the captured `PATH` and `PATHEXT` the same way
+    /// `ai-memory run` resolves harnesses: an npm install puts `codex`,
+    /// `codex.cmd` and `codex.ps1` side by side, and spawning the bare name
+    /// only tries `codex.exe`, so recovery failed on every attempt. Elsewhere,
+    /// or when nothing launchable is found, the bare `codex` is kept.
+    fn codex_executable(&self) -> PathBuf {
+        if let Some(executable) = &self.runtime_env.codex_executable {
+            return executable.clone();
+        }
+        let bare = PathBuf::from("codex");
+        if !cfg!(windows) {
+            return bare;
+        }
+        let path = self.runtime_env.var_os("PATH");
+        let extensions = self.runtime_env.var_os("PATHEXT");
+        crate::commands::run::resolve_program(
+            bare.as_os_str(),
+            crate::commands::run::ExecutableSearch::new(path.as_deref(), extensions.as_deref()),
+        )
+        .unwrap_or(bare)
+    }
+
     /// Cursor Agent CLI inputs, from values captured once by [`Config::load`].
     ///
     /// The child gets only the allowlisted part of the captured process
@@ -3749,13 +3774,9 @@ impl Config {
             AuthRequirement::OpenAiOAuthToken => {
                 ProviderAuth::openai_oauth_token_file(self.openai_oauth_token_path())
             }
-            AuthRequirement::CodexAuthFile => ProviderAuth::codex(
-                self.codex_auth_file_path(),
-                self.runtime_env
-                    .codex_executable
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("codex")),
-            ),
+            AuthRequirement::CodexAuthFile => {
+                ProviderAuth::codex(self.codex_auth_file_path(), self.codex_executable())
+            }
             AuthRequirement::CopilotToken => ProviderAuth::copilot(
                 self.copilot_token_path(),
                 self.runtime_env.copilot_github_token.clone(),
@@ -7730,6 +7751,86 @@ input_token_safety_margin = {margin}
 
         assert_eq!(auth.auth_file, tmp.path().join(".codex").join("auth.json"));
         assert_eq!(auth.executable, Path::new("codex"));
+    }
+
+    fn codex_config_with_path(home: &Path, path_dir: &Path) -> Config {
+        let path_dir = path_dir.to_str().unwrap();
+        Config {
+            llm_provider: Some("codex".into()),
+            runtime_env: RuntimeEnv {
+                platform_home: Some(home.to_path_buf()),
+                ..RuntimeEnv::with_process_env_for_tests(&[
+                    ("PATH", path_dir),
+                    ("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+                ])
+            },
+            ..Config::default()
+        }
+    }
+
+    fn codex_executable_of(cfg: &Config) -> PathBuf {
+        let provider = cfg.llm_provider_config().unwrap().unwrap();
+        provider
+            .auth
+            .require_codex_auth()
+            .unwrap()
+            .executable
+            .clone()
+    }
+
+    // An npm install on Windows leaves `codex`, `codex.cmd` and `codex.ps1` on
+    // PATH. Spawning the bare name only tries `codex.exe`, so recovery must
+    // get the launchable `.cmd` shim.
+    #[cfg(windows)]
+    #[test]
+    fn codex_provider_resolves_the_npm_shim_on_windows() {
+        let home = TempDir::new().unwrap();
+        let bin = TempDir::new().unwrap();
+        for name in ["codex", "codex.cmd", "codex.ps1"] {
+            std::fs::write(bin.path().join(name), "").unwrap();
+        }
+
+        let executable = codex_executable_of(&codex_config_with_path(home.path(), bin.path()));
+
+        assert_eq!(executable, bin.path().join("codex.CMD"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_provider_prefers_a_native_exe_over_the_shim_on_windows() {
+        let home = TempDir::new().unwrap();
+        let bin = TempDir::new().unwrap();
+        for name in ["codex.cmd", "codex.exe"] {
+            std::fs::write(bin.path().join(name), "").unwrap();
+        }
+
+        let executable = codex_executable_of(&codex_config_with_path(home.path(), bin.path()));
+
+        assert_eq!(executable, bin.path().join("codex.EXE"));
+    }
+
+    #[test]
+    fn codex_provider_keeps_the_bare_name_when_nothing_launchable_is_on_path() {
+        let home = TempDir::new().unwrap();
+        let bin = TempDir::new().unwrap();
+        // Extension-less script only: not launchable by `CreateProcess`, and
+        // never resolved off Windows either.
+        std::fs::write(bin.path().join("codex"), "").unwrap();
+
+        let executable = codex_executable_of(&codex_config_with_path(home.path(), bin.path()));
+
+        assert_eq!(executable, Path::new("codex"));
+    }
+
+    #[test]
+    fn codex_executable_override_wins_over_path_resolution() {
+        let home = TempDir::new().unwrap();
+        let bin = TempDir::new().unwrap();
+        std::fs::write(bin.path().join("codex.cmd"), "").unwrap();
+        let mut cfg = codex_config_with_path(home.path(), bin.path());
+        cfg.runtime_env.codex_executable = Some(PathBuf::from("codex-custom"));
+
+        assert_eq!(codex_executable_of(&cfg), Path::new("codex-custom"));
     }
 
     #[test]
