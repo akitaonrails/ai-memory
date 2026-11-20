@@ -41,6 +41,9 @@ version in [`docs/changelog/`](docs/changelog/):
 - Kept the macOS menu bar status on the latest poll when an earlier response
   arrived after a settings or lifecycle refresh. (#2383)
 
+- Rewrote wikilinks that explicitly name the exported workspace and project as
+  bundle-relative Markdown links in OKF exports. (#2410)
+
 - On Windows, the hook credential files (`auth-token`, `auth-header`) and the
   directories ai-memory creates as private (the hook spool, `auth-tokens/`, the
   recovery journal's) no longer inherit read access granted above the data
