@@ -463,15 +463,12 @@ fn split_scope(target: &str) -> LinkKey {
     (None, None, target.to_string())
 }
 
-/// Rewrite `body`'s LOCAL wikilinks (`[[target]]`, `[[target|label]]`, no
-/// scope prefix, or an explicit scope prefix naming `own_project`) into
-/// bundle-relative standard Markdown links (`[label](relative/path.md)`),
-/// computed from `page_path`'s own directory depth. A cross-project
-/// (`[[project:path]]`) or cross-workspace (`[[workspace/project:path]]`)
-/// wikilink that does not resolve to `own_project` is left as literal
-/// `[[...]]` text — no bundle-relative equivalent exists across bundle
-/// boundaries. Export-only: this never runs on the write path, so it never
-/// touches an on-disk wiki file.
+/// Rewrite local wikilinks into bundle-relative Markdown links, using the
+/// page's directory depth. `own_scope` is the bundle's (workspace, project).
+/// Unqualified links and links that name the bundle's project or its full
+/// workspace/project scope are local.
+/// Links to a different project or workspace remain literal `[[...]]` text.
+/// This runs only on the exported copy.
 ///
 /// Skips fenced code blocks and inline code spans exactly like
 /// [`extract_links`] does, reusing the same fence/inline-code detection so
@@ -479,7 +476,11 @@ fn split_scope(target: &str) -> LinkKey {
 /// targets are left untouched, mirroring [`extract_links`]'s own leniency;
 /// this never panics on any body content.
 #[must_use]
-pub fn rewrite_local_wikilinks(body: &str, page_path: &PagePath, own_project: &str) -> String {
+pub fn rewrite_local_wikilinks(
+    body: &str,
+    page_path: &PagePath,
+    own_scope: (&str, &str),
+) -> String {
     let mut out = String::with_capacity(body.len() + 64);
     let mut fence: Option<CodeFence> = None;
     for raw_line in body.split_inclusive('\n') {
@@ -491,7 +492,7 @@ pub fn rewrite_local_wikilinks(body: &str, page_path: &PagePath, own_project: &s
             out.push_str(terminator);
             continue;
         }
-        rewrite_wikilinks_in_line(line, page_path, own_project, &mut out);
+        rewrite_wikilinks_in_line(line, page_path, own_scope, &mut out);
         out.push_str(terminator);
     }
     out
@@ -512,23 +513,23 @@ fn split_line_terminator(raw: &str) -> (&str, &str) {
 fn rewrite_wikilinks_in_line(
     line: &str,
     page_path: &PagePath,
-    own_project: &str,
+    own_scope: (&str, &str),
     out: &mut String,
 ) {
     let code_spans = inline_code_spans(line);
     let mut pos = 0;
     for span in &code_spans {
-        rewrite_wikilinks_in_segment(&line[pos..span.start], page_path, own_project, out);
+        rewrite_wikilinks_in_segment(&line[pos..span.start], page_path, own_scope, out);
         out.push_str(&line[span.clone()]);
         pos = span.end;
     }
-    rewrite_wikilinks_in_segment(&line[pos..], page_path, own_project, out);
+    rewrite_wikilinks_in_segment(&line[pos..], page_path, own_scope, out);
 }
 
 fn rewrite_wikilinks_in_segment(
     seg: &str,
     page_path: &PagePath,
-    own_project: &str,
+    own_scope: (&str, &str),
     out: &mut String,
 ) {
     let mut rest = seg;
@@ -544,7 +545,7 @@ fn rewrite_wikilinks_in_segment(
             return;
         };
         let raw = &after_start[..end];
-        let resolved = resolve_local_wikilink(raw, page_path, own_project)
+        let resolved = resolve_local_wikilink(raw, page_path, own_scope)
             .and_then(|(href, label)| Some((markdown_destination(&href)?, label)));
         match resolved {
             Some((destination, label)) => {
@@ -774,21 +775,19 @@ fn rewrite_wikilink_targets_in_segment(
 fn resolve_local_wikilink(
     raw: &str,
     page_path: &PagePath,
-    own_project: &str,
+    own_scope: (&str, &str),
 ) -> Option<(String, String)> {
     let (target_part, label) = raw
         .split_once('|')
         .map_or((raw, None), |(t, l)| (t, Some(l)));
     let target_part = target_part.trim();
     let (workspace, project, path_part) = split_scope(target_part);
-    // `split_scope` pins `[[_global:path]]` to the default workspace. When
-    // we are exporting that same reserved project, the target is still a
-    // local page even though the workspace is now explicit.
-    let exporting_global_home = own_project == GLOBAL_SCOPE_PROJECT
-        && project.as_deref() == Some(GLOBAL_SCOPE_PROJECT)
-        && workspace.as_deref() == Some(DEFAULT_WORKSPACE_NAME);
-    if workspace.is_some() && !exporting_global_home {
-        return None; // no cross-workspace Markdown equivalent
+    let (own_workspace, own_project) = own_scope;
+    if workspace
+        .as_deref()
+        .is_some_and(|name| name != own_workspace)
+    {
+        return None;
     }
     if let Some(project) = &project
         && project != own_project
@@ -2073,27 +2072,27 @@ mod tests {
         // concepts/a.md -> decisions/b.md: up one, then into decisions/.
         let a = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("See [[decisions/b.md]].", &a, "proj"),
+            rewrite_local_wikilinks("See [[decisions/b.md]].", &a, ("default", "proj")),
             "See [decisions/b.md](../decisions/b.md)."
         );
 
         // Bundle root -> a nested page: no "../" needed.
         let root = PagePath::new("a.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("[[concepts/c.md]]", &root, "proj"),
+            rewrite_local_wikilinks("[[concepts/c.md]]", &root, ("default", "proj")),
             "[concepts/c.md](concepts/c.md)"
         );
 
         // Same directory: no "../" and no shared-prefix repetition.
         assert_eq!(
-            rewrite_local_wikilinks("[[concepts/c.md]]", &a, "proj"),
+            rewrite_local_wikilinks("[[concepts/c.md]]", &a, ("default", "proj")),
             "[concepts/c.md](c.md)"
         );
 
         // Two levels deep.
         let nested = PagePath::new("a/b/c.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("[[decisions/d.md]]", &nested, "proj"),
+            rewrite_local_wikilinks("[[decisions/d.md]]", &nested, ("default", "proj")),
             "[decisions/d.md](../../decisions/d.md)"
         );
     }
@@ -2102,7 +2101,11 @@ mod tests {
     fn rewrite_local_wikilinks_preserves_explicit_label() {
         let path = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("[[decisions/b.md|the decision]]", &path, "proj"),
+            rewrite_local_wikilinks(
+                "[[decisions/b.md|the decision]]",
+                &path,
+                ("default", "proj")
+            ),
             "[the decision](../decisions/b.md)"
         );
     }
@@ -2114,11 +2117,11 @@ mod tests {
         // the target in that case.
         let path = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("[[decisions/b.md|]]", &path, "proj"),
+            rewrite_local_wikilinks("[[decisions/b.md|]]", &path, ("default", "proj")),
             "[decisions/b.md](../decisions/b.md)"
         );
         assert_eq!(
-            rewrite_local_wikilinks("[[decisions/b|  ]]", &path, "proj"),
+            rewrite_local_wikilinks("[[decisions/b|  ]]", &path, ("default", "proj")),
             "[decisions/b](../decisions/b.md)"
         );
     }
@@ -2136,7 +2139,7 @@ mod tests {
         ] {
             let before = extract_links(body, &page);
             assert_eq!(before.len(), 1, "{body}");
-            let exported = rewrite_local_wikilinks(body, &page, "proj");
+            let exported = rewrite_local_wikilinks(body, &page, ("default", "proj"));
             assert!(exported.contains(&format!("]({href})")), "{exported}");
             assert_eq!(extract_links(&exported, &page), before, "{exported}");
         }
@@ -2154,7 +2157,7 @@ mod tests {
             let body = format!("See [[notes/{target}]].\n");
             let before = extract_links(&body, &page);
             assert_eq!(before.len(), 1, "{body}");
-            let exported = rewrite_local_wikilinks(&body, &page, "proj");
+            let exported = rewrite_local_wikilinks(&body, &page, ("default", "proj"));
             assert!(exported.contains(&format!("]({href})")), "{exported}");
             assert_eq!(extract_links(&exported, &page), before, "{exported}");
         }
@@ -2164,19 +2167,31 @@ mod tests {
     fn rewrite_local_wikilinks_preserves_anchor_and_query_fragments() {
         let path = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("See [[decisions/b.md#context]].", &path, "proj"),
+            rewrite_local_wikilinks(
+                "See [[decisions/b.md#context]].",
+                &path,
+                ("default", "proj")
+            ),
             "See [decisions/b.md#context](../decisions/b.md#context)."
         );
         assert_eq!(
-            rewrite_local_wikilinks("[[decisions/b#context|the decision]]", &path, "proj"),
+            rewrite_local_wikilinks(
+                "[[decisions/b#context|the decision]]",
+                &path,
+                ("default", "proj")
+            ),
             "[the decision](../decisions/b.md#context)"
         );
         assert_eq!(
-            rewrite_local_wikilinks("[[decisions/b.md?v=1#part-2]]", &path, "proj"),
+            rewrite_local_wikilinks("[[decisions/b.md?v=1#part-2]]", &path, ("default", "proj")),
             "[decisions/b.md?v=1#part-2](../decisions/b.md?v=1#part-2)"
         );
         assert_eq!(
-            rewrite_local_wikilinks("[[decisions/b#my section|My Section]]", &path, "proj"),
+            rewrite_local_wikilinks(
+                "[[decisions/b#my section|My Section]]",
+                &path,
+                ("default", "proj")
+            ),
             "[My Section](<../decisions/b.md#my section>)"
         );
     }
@@ -2185,15 +2200,23 @@ mod tests {
     fn rewrite_local_wikilinks_leaves_cross_project_untouched() {
         let path = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("[[other-project:decisions/b.md]]", &path, "proj"),
+            rewrite_local_wikilinks(
+                "[[other-project:decisions/b.md]]",
+                &path,
+                ("default", "proj")
+            ),
             "[[other-project:decisions/b.md]]"
         );
         assert_eq!(
-            rewrite_local_wikilinks("[[ws/other-project:decisions/b.md]]", &path, "proj"),
+            rewrite_local_wikilinks(
+                "[[ws/other-project:decisions/b.md]]",
+                &path,
+                ("default", "proj")
+            ),
             "[[ws/other-project:decisions/b.md]]"
         );
         assert_eq!(
-            rewrite_local_wikilinks("[[_global:python-env.md]]", &path, "proj"),
+            rewrite_local_wikilinks("[[_global:python-env.md]]", &path, ("default", "proj")),
             "[[_global:python-env.md]]"
         );
     }
@@ -2202,16 +2225,28 @@ mod tests {
     fn rewrite_local_wikilinks_resolves_global_when_exporting_global() {
         let path = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("[[_global:python-env.md]]", &path, GLOBAL_SCOPE_PROJECT),
+            rewrite_local_wikilinks(
+                "[[_global:python-env.md]]",
+                &path,
+                ("default", GLOBAL_SCOPE_PROJECT)
+            ),
             "[_global:python-env.md](../python-env.md)"
         );
         assert_eq!(
             rewrite_local_wikilinks(
                 "[[default/_global:python-env.md]]",
                 &path,
-                GLOBAL_SCOPE_PROJECT,
+                ("default", GLOBAL_SCOPE_PROJECT),
             ),
             "[default/_global:python-env.md](../python-env.md)"
+        );
+        assert_eq!(
+            rewrite_local_wikilinks(
+                "[[_global:python-env.md]]",
+                &path,
+                ("other", GLOBAL_SCOPE_PROJECT),
+            ),
+            "[[_global:python-env.md]]"
         );
     }
 
@@ -2219,7 +2254,7 @@ mod tests {
     fn rewrite_local_wikilinks_resolves_explicit_own_project_scope() {
         let path = PagePath::new("concepts/a.md").unwrap();
         assert_eq!(
-            rewrite_local_wikilinks("[[proj:decisions/b.md]]", &path, "proj"),
+            rewrite_local_wikilinks("[[proj:decisions/b.md]]", &path, ("default", "proj")),
             "[proj:decisions/b.md](../decisions/b.md)"
         );
     }
@@ -2230,7 +2265,7 @@ mod tests {
         let body = "```\n[[decisions/ignored.md]]\n```\n\
                     Use `[[decisions/also-ignored.md]]` inline.\n\
                     [[decisions/kept.md]]\n";
-        let rewritten = rewrite_local_wikilinks(body, &path, "proj");
+        let rewritten = rewrite_local_wikilinks(body, &path, ("default", "proj"));
         assert!(rewritten.contains("[[decisions/ignored.md]]"));
         assert!(rewritten.contains("`[[decisions/also-ignored.md]]`"));
         assert!(rewritten.contains("[decisions/kept.md](../decisions/kept.md)"));
@@ -2240,7 +2275,10 @@ mod tests {
     fn rewrite_local_wikilinks_leaves_malformed_or_empty_targets_untouched() {
         let path = PagePath::new("concepts/a.md").unwrap();
         for body in ["[[]]", "[[   ]]", "[[unterminated", "no links here at all"] {
-            assert_eq!(rewrite_local_wikilinks(body, &path, "proj"), body);
+            assert_eq!(
+                rewrite_local_wikilinks(body, &path, ("default", "proj")),
+                body
+            );
         }
     }
 
@@ -2256,7 +2294,7 @@ mod tests {
             "`[[dangling backtick",
             "[[../../escape.md]]",
         ] {
-            let _ = rewrite_local_wikilinks(body, &path, "proj");
+            let _ = rewrite_local_wikilinks(body, &path, ("default", "proj"));
         }
     }
 
@@ -2268,7 +2306,7 @@ mod tests {
         assert_eq!(links.len(), 1, "only link outside fence extracted");
         assert_eq!(links[0].path.as_str(), "e/f.md");
 
-        let rewritten = rewrite_local_wikilinks(md, &path, "proj");
+        let rewritten = rewrite_local_wikilinks(md, &path, ("default", "proj"));
         assert!(rewritten.contains("[[a/b.md]]"), "a/b remains literal");
         assert!(rewritten.contains("[[c/d.md]]"), "c/d remains literal");
         assert!(
@@ -2313,7 +2351,7 @@ mod tests {
                 "prefix {prefix:?}"
             );
 
-            let rewritten = rewrite_local_wikilinks(&body, &page, "proj");
+            let rewritten = rewrite_local_wikilinks(&body, &page, ("default", "proj"));
             assert!(
                 rewritten.contains("[[decisions/hidden.md]]"),
                 "prefix {prefix:?}: {rewritten}"
@@ -2349,14 +2387,18 @@ mod tests {
     #[test]
     fn rewrite_local_wikilinks_encloses_destinations_with_spaces_in_pointy_brackets() {
         let path = PagePath::new("concepts/a.md").unwrap();
-        let rewritten = rewrite_local_wikilinks("See [[decisions/my decision.md]].", &path, "proj");
+        let rewritten = rewrite_local_wikilinks(
+            "See [[decisions/my decision.md]].",
+            &path,
+            ("default", "proj"),
+        );
         assert_eq!(
             rewritten,
             "See [decisions/my decision.md](<../decisions/my decision.md>)."
         );
 
         // Without spaces, no pointy brackets needed
-        let plain = rewrite_local_wikilinks("See [[decisions/b.md]].", &path, "proj");
+        let plain = rewrite_local_wikilinks("See [[decisions/b.md]].", &path, ("default", "proj"));
         assert_eq!(plain, "See [decisions/b.md](../decisions/b.md).");
     }
 
@@ -2427,7 +2469,7 @@ mod tests {
         let path = PagePath::new("concepts/a.md").unwrap();
         for label in ["array[0] access", r"C:\work\notes", "日本語 [索引]"] {
             let source = format!("[[notes/array.md|{label}]]");
-            let rewritten = rewrite_local_wikilinks(&source, &path, "proj");
+            let rewritten = rewrite_local_wikilinks(&source, &path, ("default", "proj"));
             assert_eq!(
                 extract_links(&rewritten, &path)
                     .iter()
@@ -2499,7 +2541,7 @@ mod tests {
         assert_eq!(linked(md), ["a/b.md", "c/d.md", "g/h.md"]);
 
         let path = PagePath::new("concepts/a.md").unwrap();
-        let rewritten = rewrite_local_wikilinks(md, &path, "proj");
+        let rewritten = rewrite_local_wikilinks(md, &path, ("default", "proj"));
         assert!(rewritten.contains("[a/b.md](../a/b.md)"), "{rewritten}");
         assert!(rewritten.contains("[[e/f.md]]"), "{rewritten}");
 
@@ -2518,7 +2560,8 @@ mod tests {
             "notes/a b).md",
             "notes/(x) y.md",
         ] {
-            let rewritten = rewrite_local_wikilinks(&format!("See [[{target}]]."), &path, "proj");
+            let rewritten =
+                rewrite_local_wikilinks(&format!("See [[{target}]]."), &path, ("default", "proj"));
             assert_eq!(
                 extract_links(&rewritten, &path)
                     .iter()
@@ -2529,9 +2572,9 @@ mod tests {
             );
         }
         // Balanced parentheses need no brackets; unbalanced ones do.
-        let balanced = rewrite_local_wikilinks("[[notes/foo_(1).md]]", &path, "proj");
+        let balanced = rewrite_local_wikilinks("[[notes/foo_(1).md]]", &path, ("default", "proj"));
         assert!(balanced.ends_with("](../notes/foo_(1).md)"), "{balanced}");
-        let unbalanced = rewrite_local_wikilinks("[[notes/a).md]]", &path, "proj");
+        let unbalanced = rewrite_local_wikilinks("[[notes/a).md]]", &path, ("default", "proj"));
         assert!(unbalanced.ends_with("](<../notes/a).md>)"), "{unbalanced}");
     }
 
@@ -2541,9 +2584,12 @@ mod tests {
         // backslash escape the extractor does not read back.
         let path = PagePath::new("concepts/a.md").unwrap();
         let body = "See [[notes/a>b c.md]].";
-        assert_eq!(rewrite_local_wikilinks(body, &path, "proj"), body);
+        assert_eq!(
+            rewrite_local_wikilinks(body, &path, ("default", "proj")),
+            body
+        );
         // Without whitespace or parens a bare destination holds them fine.
-        let bare = rewrite_local_wikilinks("[[notes/a>b.md]]", &path, "proj");
+        let bare = rewrite_local_wikilinks("[[notes/a>b.md]]", &path, ("default", "proj"));
         assert!(bare.ends_with("](../notes/a>b.md)"), "{bare}");
     }
 

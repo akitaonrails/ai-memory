@@ -791,8 +791,11 @@ mod tests {
             "notes/a&b.md",
             "notes/a%26copy;&copy;.md",
         ] {
-            let exported =
-                ai_memory_wiki::rewrite_local_wikilinks(&format!("[[{target}]]"), &page, "proj");
+            let exported = ai_memory_wiki::rewrite_local_wikilinks(
+                &format!("[[{target}]]"),
+                &page,
+                ("default", "proj"),
+            );
             let destination = Parser::new_ext(&exported, options())
                 .find_map(|event| match event {
                     Event::Start(Tag::Link { dest_url, .. }) => Some(dest_url),

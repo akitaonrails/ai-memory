@@ -996,11 +996,13 @@ async fn handle_export_okf(
     State(state): State<Arc<AdminState>>,
     Query(q): Query<ExportOkfQuery>,
 ) -> Response {
-    let ids = match lookup_ws_proj_no_create(&state, q.workspace.trim(), q.project.trim()).await {
+    let workspace = q.workspace.trim();
+    let project = q.project.trim();
+    let ids = match lookup_ws_proj_no_create(&state, workspace, project).await {
         Ok(ids) => ids,
         Err((status, body)) => return (status, body).into_response(),
     };
-    match build_okf_bundle_file(&state, ids.0, ids.1, q.project.trim()).await {
+    match build_okf_bundle_file(&state, ids.0, ids.1, (workspace, project)).await {
         Ok(file) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/gzip")
@@ -1027,7 +1029,7 @@ async fn build_okf_bundle_file(
     state: &AdminState,
     ws: ai_memory_core::WorkspaceId,
     proj: ai_memory_core::ProjectId,
-    project_name: &str,
+    scope: (&str, &str),
 ) -> anyhow::Result<tokio::fs::File> {
     state.wiki.validate_project_tree(ws, proj)?;
     let bundle_dir = state.wiki.project_root(ws, proj);
@@ -1137,7 +1139,7 @@ async fn build_okf_bundle_file(
         for (path, raw) in files {
             let rel = path.strip_prefix(&bundle_dir).unwrap_or(&path);
             let rel_str = rel.to_string_lossy().replace('\\', "/");
-            let bytes = augment_page_for_export(&raw, &rel_str, project_name)?;
+            let bytes = augment_page_for_export(&raw, &rel_str, scope)?;
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
@@ -1160,7 +1162,7 @@ async fn build_okf_bundle_file(
 fn augment_page_for_export(
     raw: &str,
     rel_path: &str,
-    project_name: &str,
+    scope: (&str, &str),
 ) -> anyhow::Result<Vec<u8>> {
     let page_path = ai_memory_core::PagePath::new(rel_path.to_string())?;
     let mut md = ai_memory_wiki::parse(raw)?;
@@ -1208,7 +1210,7 @@ fn augment_page_for_export(
         map.insert("description".into(), serde_json::Value::String(description));
     }
 
-    md.body = ai_memory_wiki::rewrite_local_wikilinks(&md.body, &page_path, project_name);
+    md.body = ai_memory_wiki::rewrite_local_wikilinks(&md.body, &page_path, scope);
 
     Ok(ai_memory_wiki::emit(&md)?.into_bytes())
 }
@@ -11815,7 +11817,7 @@ mod tests {
     #[tokio::test]
     async fn export_okf_rewrites_local_wikilinks_to_relative_markdown_links() {
         let (tmp, router) = read_page_test_router();
-        post_write_page(&router, "default", "scratch", "notes/seed.md", "seed").await;
+        post_write_page(&router, "workshop", "scratch", "notes/seed.md", "seed").await;
         let proj_dir = scratch_project_dir(tmp.path());
         std::fs::create_dir_all(proj_dir.join("concepts")).unwrap();
         std::fs::create_dir_all(proj_dir.join("decisions")).unwrap();
@@ -11826,7 +11828,11 @@ mod tests {
         .unwrap();
         std::fs::write(
             proj_dir.join("concepts/a.md"),
-            "---\ntype: Concept\n---\n\nSee [[decisions/b.md]] and [[other-project:x.md]].\n",
+            concat!(
+                "---\ntype: Concept\n---\n\n",
+                "See [[decisions/b.md]] and [[workshop/scratch:decisions/b#details|details]].\n",
+                "Also [[other-project:x.md]] and [[default/scratch:decisions/b.md]].\n",
+            ),
         )
         .unwrap();
 
@@ -11835,7 +11841,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .uri("/admin/export-okf?workspace=workshop&project=scratch")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -11859,6 +11865,16 @@ mod tests {
         assert!(
             parsed.body.contains("[decisions/b.md](../decisions/b.md)"),
             "{}",
+            parsed.body
+        );
+        assert!(
+            parsed.body.contains("[details](../decisions/b.md#details)"),
+            "same-bundle qualified wikilink must be portable: {}",
+            parsed.body
+        );
+        assert!(
+            parsed.body.contains("[[default/scratch:decisions/b.md]]"),
+            "cross-workspace wikilink must ship untouched: {}",
             parsed.body
         );
         assert!(
