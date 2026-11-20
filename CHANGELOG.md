@@ -13,6 +13,10 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Applied the container wrapper's host-file UID and SELinux handling to
+  `doctor`, so it can read home markers and harness stores instead of
+  reporting an invalid home route map when access is denied. (#2403)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
