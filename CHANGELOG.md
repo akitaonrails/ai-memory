@@ -59,7 +59,7 @@ version in [`docs/changelog/`](docs/changelog/):
   account given read on `%LOCALAPPDATA%` could read it. A spool directory they
   create is now restricted to the account that writes it, as the native writer
   does since #2396; an existing one keeps its access list (see
-  `docs/security-boundaries.md` row 10n). (#NNNN)
+  `docs/security-boundaries.md` row 10n). (#2401)
 
 ## [3.5.1] - 2026-11-19
 
