@@ -20,8 +20,8 @@ use tracing::info;
 
 use crate::cli::{AgentBackupScope, BackupAgentsArgs, McpClient};
 use crate::commands::backup::human_bytes;
-use crate::commands::path_util::{claude_config_dir, home_dir};
-use crate::config::Config;
+use crate::commands::path_util::{agent_config_home, claude_config_dir, home_dir};
+use crate::config::{Config, RuntimeEnv};
 
 const MAX_BACKUP_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -47,13 +47,13 @@ pub struct DiscoveredAsset {
 /// # Errors
 /// Returns an error if directory traversal fails, source files cannot be read,
 /// or writing the output archive fails.
-pub fn run(_config: &Config, args: BackupAgentsArgs) -> Result<()> {
-    let i18n = &_config.i18n;
+pub fn run(config: &Config, args: BackupAgentsArgs) -> Result<()> {
+    let i18n = &config.i18n;
     let home = home_dir().context(i18n.text("cli-backup-agents-locating-user-home-directory"))?;
     let cwd = std::env::current_dir()
         .context(i18n.text("cli-backup-agents-locating-current-working-directory"))?;
 
-    let mut discovered = discover_assets(&home, &cwd, &args)?;
+    let mut discovered = discover_assets(&home, &cwd, &args, &config.runtime_env)?;
 
     // Never consume the archive while replacing it. This matters when an
     // existing destination sits under one of the collected plugin trees.
@@ -174,6 +174,7 @@ pub fn discover_assets(
     home: &Path,
     cwd: &Path,
     args: &BackupAgentsArgs,
+    env: &RuntimeEnv,
 ) -> Result<Vec<DiscoveredAsset>> {
     let mut assets = Vec::new();
     let want_global = matches!(
@@ -283,7 +284,8 @@ pub fn discover_assets(
     // 2. OpenAI Codex CLI
     if filter_agent(AgentKind::Codex) {
         if want_global {
-            let codex_dir = home.join(".codex");
+            let codex_dir =
+                agent_config_home(env.var_os("CODEX_HOME")).unwrap_or_else(|| home.join(".codex"));
             push_if_file(
                 &mut assets,
                 AgentKind::Codex,
@@ -301,6 +303,16 @@ pub fn discover_assets(
                 codex_dir.join("mcp.json"),
                 ".codex/mcp.json",
                 "codex/mcp.json",
+            );
+            // Hook commands can contain tokens, so use config-file redaction.
+            push_if_file(
+                &mut assets,
+                AgentKind::Codex,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                codex_dir.join("hooks.json"),
+                ".codex/hooks.json",
+                "codex/hooks.json",
             );
             collect_dir_assets(
                 &mut assets,
