@@ -35,6 +35,7 @@ fn command_with_env(home: &Path, cwd: &Path) -> Command {
         .env_remove("AI_MEMORY_SERVER_URL")
         .env_remove("AI_MEMORY_AUTH_TOKEN")
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
         .env_remove("COPILOT_HOME")
         .env_remove("KIMI_CODE_HOME")
         .env_remove("KIRO_HOME");
@@ -126,6 +127,11 @@ fn backup_and_restore_agents_round_trip() {
         "[mcp_servers.demo]\nurl = \"http://localhost\"\n",
     )
     .unwrap();
+
+    let codex_hooks = home.path().join(".codex/hooks.json");
+    let hooks =
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo ready"}]}]}}"#;
+    fs::write(codex_hooks, hooks).unwrap();
 
     let agents_md = project.path().join("AGENTS.md");
     fs::write(&agents_md, "# Project Rules\nCodex rules").unwrap();
@@ -236,6 +242,10 @@ fn backup_and_restore_agents_round_trip() {
     assert_eq!(
         restored_codex,
         "[mcp_servers.demo]\nurl = \"http://localhost\"\n"
+    );
+    assert_eq!(
+        fs::read_to_string(restore_home.path().join(".codex/hooks.json")).unwrap(),
+        hooks
     );
 
     let restored_agents_md = fs::read_to_string(restore_project.path().join("AGENTS.md")).unwrap();
@@ -398,6 +408,78 @@ fn assert_success(output: &std::process::Output, what: &str) {
         "{what} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn codex_assets_follow_codex_home_on_backup_and_restore() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let codex_home = home.path().join("active Codex home");
+    let fixtures = [
+        (
+            "config.toml",
+            "[mcp_servers.demo]\nurl = \"http://localhost\"\n",
+        ),
+        ("mcp.json", r#"{"mcpServers":{}}"#),
+        ("skills/personal/SKILL.md", "# Personal Codex skill"),
+        (
+            "plugins/local/.codex-plugin/plugin.json",
+            r#"{"name":"local"}"#,
+        ),
+    ];
+    for (relative, body) in fixtures {
+        let path = codex_home.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    let fake_token = "ghp_FAKE0123456789ABCDEFGHIJKLMNOPQRSTUV";
+    let hooks = serde_json::json!({"hooks":{"SessionStart":[{"hooks":[{
+        "type":"command",
+        "command": format!("echo {fake_token}")
+    }]}]}});
+    fs::write(codex_home.join("hooks.json"), hooks.to_string()).unwrap();
+    let shared_skill = home.path().join(".agents/skills/shared/SKILL.md");
+    fs::create_dir_all(shared_skill.parent().unwrap()).unwrap();
+    fs::write(shared_skill, "# Shared skill").unwrap();
+    let inactive_skill = home.path().join(".codex/skills/stale/SKILL.md");
+    fs::create_dir_all(inactive_skill.parent().unwrap()).unwrap();
+    fs::write(inactive_skill, "# Stale skill").unwrap();
+
+    let archive = project.path().join("codex-home.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .env("CODEX_HOME", &codex_home)
+        .args(backup_agents_args(&archive, "codex"))
+        .output()
+        .unwrap();
+    assert_success(&backup, "backup");
+
+    let restored_home = tempfile::tempdir().unwrap();
+    let destination = restored_home.path().join("destination Codex home");
+    let restore = command_with_env(restored_home.path(), project.path())
+        .env("CODEX_HOME", &destination)
+        .args(restore_agents_args(&archive, "codex"))
+        .output()
+        .unwrap();
+    assert_success(&restore, "restore");
+
+    for (relative, body) in fixtures {
+        assert_eq!(
+            fs::read_to_string(destination.join(relative)).unwrap(),
+            body
+        );
+    }
+    let restored_hooks = fs::read_to_string(destination.join("hooks.json")).unwrap();
+    assert!(!restored_hooks.contains(fake_token));
+    assert!(restored_hooks.contains("[REDACTED:"));
+    assert!(serde_json::from_str::<serde_json::Value>(&restored_hooks).is_ok());
+    assert_eq!(
+        fs::read_to_string(restored_home.path().join(".agents/skills/shared/SKILL.md")).unwrap(),
+        "# Shared skill"
+    );
+    assert!(!restored_home.path().join(".codex").exists());
+    assert!(!destination.join("skills/stale").exists());
 }
 
 /// Copilot CLI reads personal skills from `$COPILOT_HOME/skills` (default

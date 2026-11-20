@@ -19,10 +19,10 @@ Before these commands were added:
 
 ## 2. Target Matrix by Agent Harness
 
-| Harness | MCP Configuration | Skills (Global / Project) | Plugins / Extensions | Instructions / Rules |
+| Harness | Configuration | Skills (Global / Project) | Plugins / Extensions | Instructions / Rules |
 | :--- | :--- | :--- | :--- | :--- |
 | **Claude Code / Desktop** | `~/.claude.json`<br>`~/.claude/settings.json`<br>`claude_desktop_config.json` | `~/.claude/skills/`<br>`.claude/skills/` | `~/.claude/plugins/`<br>`Claude Extensions/` | `CLAUDE.md` |
-| **OpenAI Codex CLI** | `~/.codex/config.toml`<br>`~/.codex/mcp.json` | `~/.agents/skills/`<br>`.agents/skills/`<br>`~/.codex/skills/` | `~/.codex/plugins/` | `AGENTS.md` |
+| **OpenAI Codex CLI** | `~/.codex/config.toml`<br>`~/.codex/mcp.json`<br>`~/.codex/hooks.json` | `~/.agents/skills/`<br>`.agents/skills/`<br>`~/.codex/skills/` | `~/.codex/plugins/` | `AGENTS.md` |
 | **Antigravity CLI (`agy`) / Gemini** | `~/.gemini/settings.json`<br>`~/.gemini/config/mcp_config.json`<br>`antigravity-cli/mcp_config.json` | Antigravity: `~/.gemini/config/skills/`, `~/.gemini/antigravity-cli/skills/`, `.agents/skills/`<br>Gemini: `~/.gemini/skills/`, `.gemini/skills/` | `antigravity-cli/plugins/`<br>`~/.gemini/plugins/` | `GEMINI.md`<br>`AGENTS.md`<br>`rules/` |
 | **Qwen Code** | `~/.qwen/settings.json` | `~/.qwen/skills/`<br>`~/.agents/skills/` | — | `QWEN.md`<br>`AGENTS.md` |
 | **Qoder** | `~/.qoder/settings.json` | `~/.agents/skills/` | — | `AGENTS.md` |
@@ -34,6 +34,11 @@ Before these commands were added:
 | **OpenClaw** | `~/.openclaw/config.json` | — | `~/.openclaw/extensions/` | — |
 | **GitHub Copilot CLI** | — (MCP and hooks are not archived) | `$COPILOT_HOME/skills/` (default `~/.copilot/skills/`)<br>`.github/skills/` | — | — |
 | **VS Code Copilot** | `.vscode/mcp.json` | — | Extensions | Copilot instructions |
+
+Codex files listed under `~/.codex` use `CODEX_HOME` when set. Archives keep
+portable `.codex/` paths so the files restore into the receiving machine's
+Codex home. Shared skills under `~/.agents/skills` stay under the user home.
+`hooks.json` uses the same default redaction as other configuration files.
 
 Copilot CLI also reads `~/.agents/skills`, `.agents/skills` and
 `.claude/skills`; those roots are archived once, under Codex and Claude Code.
