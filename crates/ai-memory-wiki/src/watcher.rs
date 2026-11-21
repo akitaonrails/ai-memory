@@ -286,13 +286,17 @@ async fn run_loop(
     let mut pending = PendingDebounce::new();
 
     loop {
+        // Keep shutdown ahead of work without giving a busy receive queue
+        // priority over the debounce or reconciliation timers.
+        if !matches!(
+            shutdown.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ) {
+            break;
+        }
         let next_flush = pending.next_deadline();
         tokio::select! {
-            biased;
-            _ = &mut shutdown => {
-                debug!("watcher shutting down");
-                return;
-            }
+            _ = &mut shutdown => break,
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some((kind, paths)) => {
@@ -360,6 +364,7 @@ async fn run_loop(
             }
         }
     }
+    debug!("watcher shutting down");
 }
 
 /// Inside the wiki's own git directory or any nested git metadata: neither indexed nor reported.
@@ -4009,6 +4014,47 @@ mod tests {
             pending.next_deadline(),
             None,
             "after flushing all pending entries, no wakeup timer may remain armed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn due_debounce_is_flushed_with_an_event_backlog() {
+        let (_tmp, _store, wiki, ws, proj) = setup().await;
+        let settled = PathBuf::from(ws.to_string())
+            .join(proj.to_string())
+            .join("removed.md");
+        let busy = wiki.root().join(&settled).with_file_name("busy.md");
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let watcher = run_loop(wiki.clone(), event_rx, shutdown_rx);
+        tokio::pin!(watcher);
+
+        event_tx
+            .try_send((
+                EventKind::Remove(notify::event::RemoveKind::File),
+                vec![wiki.root().join(&settled)],
+            ))
+            .unwrap();
+        assert!(futures_util::poll!(watcher.as_mut()).is_pending());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(futures_util::poll!(watcher.as_mut()).is_pending());
+        assert_eq!(event_tx.capacity(), EVENT_CHANNEL_CAPACITY);
+        assert!(!wiki.git().written_paths().contains(&settled));
+
+        tokio::time::sleep(DEBOUNCE_WINDOW).await;
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            event_tx
+                .try_send((
+                    EventKind::Modify(notify::event::ModifyKind::Any),
+                    vec![busy.clone()],
+                ))
+                .unwrap();
+        }
+        assert!(futures_util::poll!(watcher.as_mut()).is_pending());
+        assert!(event_tx.capacity() < EVENT_CHANNEL_CAPACITY);
+        assert!(
+            wiki.git().written_paths().contains(&settled),
+            "the settled removal should reach the checkpoint while other events are queued"
         );
     }
 }
