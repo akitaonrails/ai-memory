@@ -18,8 +18,6 @@ pub struct RuntimeFeatures {
     pub backfill_on_start: bool,
     /// The automatic learning scheduler is effectively enabled.
     pub learning_scheduled: bool,
-    /// Session-end learning is enabled.
-    pub learning_on_session_end: bool,
     /// Proposals wait for manual approval.
     pub review_requires_approval: bool,
     /// Scheduled maintenance is enabled.
@@ -195,13 +193,13 @@ pub(crate) async fn states(
             "Automatic learning",
             if !r.llm_configured {
                 "Unavailable without LLM"
-            } else if r.learning_scheduled || r.learning_on_session_end {
+            } else if r.learning_scheduled {
                 "Scheduled"
             } else {
                 "Manual only"
             },
             "Effective scheduling accounts for the enabled flag, nonzero interval and batch size.",
-            "Configure the LLM and auto_improve scheduler or on_session_end; inspect Learning review.",
+            "Configure the LLM and the auto_improve scheduler; inspect Learning review.",
             "features#learning-and-proposal-review",
             true,
         );

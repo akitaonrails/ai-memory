@@ -239,7 +239,7 @@ The defaults named `DEFAULT_AUTO_IMPROVE_*` are constants in `ai-memory-consolid
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
 | `require_approval` | `false` | `AI_MEMORY_AUTO_IMPROVE__REQUIRE_APPROVAL` | Keep proposals pending until an admin approves them. |
-| `on_session_end` | `false` | `AI_MEMORY_AUTO_IMPROVE__ON_SESSION_END` | Schedule a reviewer run on SessionEnd. |
+| `on_session_end` | `false` | `AI_MEMORY_AUTO_IMPROVE__ON_SESSION_END` | Has no effect; accepted so existing configs keep loading. `[auto_improve.scheduler]` reviews completed sessions. |
 | `min_observations` | `8` (`DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS`) | `AI_MEMORY_AUTO_IMPROVE__MIN_OBSERVATIONS` | Observations a session needs before it is reviewed. |
 | `min_session_duration_secs` | `120` (`DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS`) | `AI_MEMORY_AUTO_IMPROVE__MIN_SESSION_DURATION_SECS` | Minimum span between first and last observation before review. |
 | `min_confidence` | `0.75` (`DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE`) | `AI_MEMORY_AUTO_IMPROVE__MIN_CONFIDENCE` | Lowest model confidence validation accepts. |

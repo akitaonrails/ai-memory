@@ -11,6 +11,14 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ## [Unreleased]
 
+### Fixed
+
+- Stopped the `/web` Features page from reporting automatic learning as
+  "Scheduled" when only `[auto_improve] on_session_end` was set. The key has
+  no effect, since session-end triggering stays off and
+  `[auto_improve.scheduler]` runs reviews; the config template, the key's
+  documentation and the page's next step said otherwise. (#2515)
+
 ## [3.6.2] - 2026-11-25
 
 ### Security
