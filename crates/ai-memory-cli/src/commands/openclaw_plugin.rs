@@ -617,8 +617,9 @@ mod tests {
                 "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", false)"
             )
         );
-        assert!(plugin.contains("url.searchParams.set(\"handoff\", \"0\")"));
-        assert!(plugin.contains("url.searchParams.set(\"recovery\", \"0\")"));
+        assert!(plugin.contains("function deliveryFlag"));
+        assert!(plugin.contains("url.searchParams.set(\"handoff\", handoffValue)"));
+        assert!(plugin.contains("url.searchParams.set(\"recovery\", recoveryValue)"));
         assert!(plugin.contains("url.searchParams.set(\"briefing_budget\", briefingBudget)"));
         // #668: same settings-walk as the shared ts_apply_marker_params
         // (install_hooks.rs) — the two applyMarkerParams copies stay

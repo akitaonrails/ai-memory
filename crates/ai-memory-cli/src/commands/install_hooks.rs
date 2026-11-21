@@ -5100,8 +5100,8 @@ pub(crate) fn ts_apply_marker_params(
   let profileConsume: string | undefined;
   let defaultResultLimit: string | undefined;
   let minRelevance: string | undefined;
-  let handoffOff = false;
-  let recoveryOff = false;
+  let handoffValue: string | undefined;
+  let recoveryValue: string | undefined;
   let explicitIdentity: string | undefined;
   let identityStyle: string | undefined;
   let aliases: string | undefined;
@@ -5121,8 +5121,8 @@ pub(crate) fn ts_apply_marker_params(
         briefingBudget = tomlFlag(body, "max_chars");
         profileContribute = profileFlag(tomlFlag(body, "contribute"));
         profileConsume = profileFlag(tomlFlag(body, "consume"));
-        handoffOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true)) === "0";
-        recoveryOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false)) === "0";
+        handoffValue = deliveryFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true));
+        recoveryValue = deliveryFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false));
         if (route) {
           routed = true;
           workspace = route.workspace;
@@ -5157,8 +5157,8 @@ pub(crate) fn ts_apply_marker_params(
       profileConsume = profileFlag(tomlFlag(body, "consume"));
       defaultResultLimit = tomlFlag(body, "default_result_limit") ?? "";
       minRelevance = tomlFlag(body, "min_relevance") ?? "";
-      handoffOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true)) === "0";
-      recoveryOff = profileFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false)) === "0";
+      handoffValue = deliveryFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", true));
+      recoveryValue = deliveryFlag(tomlScopedFlag(body, "deliver_on_session_start", "recovery", false));
       explicitIdentity = tomlKey(body, "identity");
       identityStyle = tomlKey(body, "identity_style");
       aliases = markerAliases(body);
@@ -5192,8 +5192,8 @@ pub(crate) fn ts_apply_marker_params(
   if (profileConsume) url.searchParams.set("profile_consume", profileConsume);
   if (defaultResultLimit !== undefined) url.searchParams.set("default_result_limit", defaultResultLimit);
   if (minRelevance !== undefined) url.searchParams.set("min_relevance", minRelevance);
-  if (handoffOff) url.searchParams.set("handoff", "0");
-  if (recoveryOff) url.searchParams.set("recovery", "0");
+  if (handoffValue !== undefined) url.searchParams.set("handoff", handoffValue);
+  if (recoveryValue !== undefined) url.searchParams.set("recovery", recoveryValue);
   return true;
 }"#
     .replace("__DEFAULT_LINE__", apply_default)
@@ -5487,6 +5487,9 @@ function tomlScopedFlag(text: string, key: string, section: string, exclude: boo
 // Parity with `profile_flag_value` in hook_capture.rs.
 function profileFlag(value: string | undefined): string {
   return value !== undefined && ["0", "false", "no", "off"].includes(value.trim().toLowerCase()) ? "0" : "1";
+}
+function deliveryFlag(value: string | undefined): string | undefined {
+  return value === undefined || value === "" ? undefined : profileFlag(value);
 }"#;
 
 /// `repoRootProject`, shared by every generated TypeScript integration: the
@@ -14764,10 +14767,12 @@ model = "gpt-5"
         ] {
             for expected in [
                 "function tomlScopedFlag",
+                "function deliveryFlag",
+                "value === undefined || value === \"\" ? undefined",
                 "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)",
                 "tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", false)",
-                "url.searchParams.set(\"handoff\", \"0\")",
-                "url.searchParams.set(\"recovery\", \"0\")",
+                "url.searchParams.set(\"handoff\", handoffValue)",
+                "url.searchParams.set(\"recovery\", recoveryValue)",
             ] {
                 assert!(generated.contains(expected), "missing {expected}");
             }
@@ -14825,7 +14830,7 @@ model = "gpt-5"
             plugin
                 .contains("tomlScopedFlag(body, \"deliver_on_session_start\", \"recovery\", true)")
         );
-        assert!(plugin.contains("url.searchParams.set(\"handoff\", \"0\")"));
+        assert!(plugin.contains("url.searchParams.set(\"handoff\", handoffValue)"));
         // #668: applyMarkerParams resolves scope/settings via the
         // settings-walk, not the nearest-marker findMarker, so a nested
         // capture-only marker does not shadow an outer marker's scope.
@@ -20248,6 +20253,36 @@ mod identity_parity_tests {
                 case["name"]
             );
         }
+    }
+
+    /// The generated TypeScript treats an exact empty delivery value as absent;
+    /// a whitespace-only value still forwards `1`, like native and shell.
+    #[test]
+    fn generated_typescript_treats_an_empty_delivery_value_as_absent() {
+        let Some(()) = crate::commands::render_shared::node_strip_types_available() else {
+            return;
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let module = tmp.path().join("delivery-flag.ts");
+        std::fs::write(
+            &module,
+            format!(
+                "{}\nfor (const value of [\"\", \"  \", \"true\", \"false\"]) process.stdout.write((deliveryFlag(value) ?? \"absent\") + \",\");\n",
+                super::TS_TOML_FLAG
+            ),
+        )
+        .unwrap();
+        let output = Command::new("node")
+            .args(["--experimental-strip-types", "--no-warnings"])
+            .arg(&module)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "absent,1,1,0,");
     }
 
     /// #1951: the generated TypeScript adapters forward

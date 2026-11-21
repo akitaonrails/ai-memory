@@ -607,8 +607,8 @@ function Get-AiMemoryMarkerQuery {
     $identityStyle = $null
     $profileContribute = $null
     $profileConsume = $null
-    $handoffOff = $false
-    $recoveryOff = $false
+    $handoffValue = $null
+    $recoveryValue = $null
     $aliases = $null
     $identityQuery = ""
     $homeRouted = $false
@@ -650,8 +650,10 @@ function Get-AiMemoryMarkerQuery {
         $profileContribute = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "contribute")
         $profileConsume = ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlFlag -File $marker -Key "consume")
         # The delivery key is independent in [handoff] and [recovery].
-        $handoffOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start" -Exclude)) -eq "0"
-        $recoveryOff = (ConvertTo-AiMemoryProfileFlag (Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start")) -eq "0"
+        $handoffRaw = Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start" -Exclude
+        if ($handoffRaw) { $handoffValue = ConvertTo-AiMemoryProfileFlag $handoffRaw }
+        $recoveryRaw = Get-AiMemoryTomlScopedFlag -File $marker -Section "recovery" -Key "deliver_on_session_start"
+        if ($recoveryRaw) { $recoveryValue = ConvertTo-AiMemoryProfileFlag $recoveryRaw }
         if ($proj) { $projSrc = "marker" }
     }
     # Before repo-root can fill $proj: a repo-root name is an inference, while
@@ -685,8 +687,8 @@ function Get-AiMemoryMarkerQuery {
     if ($defaultGlobal) { $qs += "&default_global=$([uri]::EscapeDataString($defaultGlobal))" }
     if ($profileContribute) { $qs += "&profile_contribute=$([uri]::EscapeDataString($profileContribute))" }
     if ($profileConsume) { $qs += "&profile_consume=$([uri]::EscapeDataString($profileConsume))" }
-    if ($handoffOff) { $qs += "&handoff=0" }
-    if ($recoveryOff) { $qs += "&recovery=0" }
+    if ($handoffValue) { $qs += "&handoff=$handoffValue" }
+    if ($recoveryValue) { $qs += "&recovery=$recoveryValue" }
     return $qs
 }
 
