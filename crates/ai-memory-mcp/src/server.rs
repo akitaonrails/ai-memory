@@ -89,26 +89,27 @@ fn default_auto_improve_review_config() -> AutoImproveReviewConfig {
     }
 }
 
-fn cap_handoff_list<I>(
-    items: I,
+/// Caps a handoff list and returns it with how many of `items` it kept (the
+/// rest were dropped for the item-count or total-chars budget).
+fn cap_handoff_list(
+    items: &[String],
     item_max_chars: usize,
     total_max_chars: usize,
     item_label: &str,
     list_label: &str,
-) -> Vec<String>
-where
-    I: IntoIterator<Item = String>,
-{
+) -> (Vec<String>, usize) {
     let capped: Vec<String> = items
-        .into_iter()
-        .map(|item| cap_text_with_marker(&item, item_max_chars, item_label))
+        .iter()
+        .map(|item| cap_text_with_marker(item, item_max_chars, item_label))
         .collect();
     let total_items = capped.len();
+    let mut kept = total_items;
     let mut out = Vec::new();
     let mut used_chars = 0usize;
 
     for (idx, item) in capped.into_iter().enumerate() {
         if out.len() >= HANDOFF_LIST_MAX_ITEMS {
+            kept = idx;
             push_handoff_omission_marker(
                 &mut out,
                 &mut used_chars,
@@ -126,6 +127,7 @@ where
                 .saturating_add(item_len)
                 > total_max_chars
         {
+            kept = idx;
             push_handoff_omission_marker(
                 &mut out,
                 &mut used_chars,
@@ -140,7 +142,54 @@ where
             .saturating_add(item_len);
         out.push(item);
     }
-    out
+    (out, kept)
+}
+
+/// How much of one text field a write-time cap kept, or `None` when it fit.
+/// Counted on the scrubbed text, which is what the cap sees (#2411).
+fn text_truncation(text: &str, max_chars: usize) -> Option<serde_json::Value> {
+    let original_chars = text.chars().count();
+    (original_chars > max_chars)
+        .then(|| serde_json::json!({ "original_chars": original_chars, "stored_chars": max_chars }))
+}
+
+/// [`text_truncation`] for a handoff list: chars are summed over the items'
+/// own text (omission markers excluded), so a sender can tell dropped items
+/// (`stored_items` < `original_items`) from clipped ones.
+fn list_truncation(
+    items: &[String],
+    stored_items: usize,
+    item_max_chars: usize,
+) -> Option<serde_json::Value> {
+    let original_chars: usize = items.iter().map(|item| item.chars().count()).sum();
+    let stored_chars: usize = items[..stored_items]
+        .iter()
+        .map(|item| item.chars().count().min(item_max_chars))
+        .sum();
+    (stored_items < items.len() || stored_chars < original_chars).then(|| {
+        serde_json::json!({
+            "original_items": items.len(),
+            "stored_items": stored_items,
+            "original_chars": original_chars,
+            "stored_chars": stored_chars,
+        })
+    })
+}
+
+/// Adds `truncated: true` and a `truncated_fields` map to a write response
+/// when any field was capped; leaves the response untouched otherwise.
+fn add_truncation_report<'a>(
+    result: &mut serde_json::Value,
+    fields: impl IntoIterator<Item = (&'a str, Option<serde_json::Value>)>,
+) {
+    let fields: serde_json::Map<String, serde_json::Value> = fields
+        .into_iter()
+        .filter_map(|(name, report)| report.map(|report| (name.to_owned(), report)))
+        .collect();
+    if !fields.is_empty() {
+        result["truncated"] = serde_json::Value::Bool(true);
+        result["truncated_fields"] = serde_json::Value::Object(fields);
+    }
 }
 
 fn push_handoff_omission_marker(
@@ -1597,15 +1646,18 @@ struct AutoImproveArgs {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct HandoffBeginArgs {
-    /// Short prose summary of where the session left off.
+    /// Short prose summary of where the session left off. Capped at 3000 chars.
     summary: String,
-    /// Questions the next agent should resolve.
+    /// Questions the next agent should resolve. Each item is capped at
+    /// 1500 chars; the list keeps at most 20 items and 6000 chars.
     #[serde(default)]
     open_questions: Vec<String>,
-    /// Suggested next steps.
+    /// Suggested next steps. Each item is capped at 1500 chars; the list keeps
+    /// at most 20 items and 6000 chars.
     #[serde(default)]
     next_steps: Vec<String>,
-    /// Files touched during the session.
+    /// Files touched during the session. Each entry is capped at 512 chars;
+    /// the list keeps at most 20 entries and 4096 chars.
     #[serde(default)]
     files_touched: Vec<String>,
     /// Working directory at the time of handoff. Recorded on the handoff and
@@ -1742,9 +1794,11 @@ struct MessageSendArgs {
     to_agent: Option<String>,
     /// The message body: the request for the recipient agent. Compose a
     /// self-contained prompt — the recipient works from this alone, without
-    /// your project's context.
+    /// your project's context. Capped at 8000 chars; split longer content
+    /// across several messages.
     body: String,
     /// Optional one-line subject shown in the recipient's inbox listing.
+    /// Capped at 200 chars.
     #[serde(default)]
     subject: Option<String>,
     /// How the sender knows the claim: `unknown` (default), `measured`,
@@ -1753,6 +1807,7 @@ struct MessageSendArgs {
     nature: ai_memory_core::MessageNature,
     /// Supporting evidence such as a query, `file:line`, or source message id.
     /// Required and non-empty when `nature` is `measured`.
+    /// Capped at 1000 chars.
     #[serde(default)]
     evidence: Option<String>,
     /// Sender harness, for static MCP clients whose session the server cannot
@@ -7323,7 +7378,15 @@ impl AiMemoryServer {
         operators, a teammate's session will not consume it. Pass \
         `shared: true` to hand the baton to whoever opens the project next. \
         `cwd` is recorded for reference; it does not restrict who receives a \
-        handoff created here."
+        handoff created here. \
+        \
+        Limits: `summary` 3000 chars; each `open_questions` / `next_steps` \
+        item 1500 chars, at most 20 items and 6000 chars per list; each \
+        `files_touched` entry 512 chars, at most 20 entries and 4096 chars. \
+        Excess is cut. When anything was cut the response adds \
+        `truncated: true` and `truncated_fields`: per text field \
+        `original_chars`/`stored_chars`, per list also \
+        `original_items`/`stored_items`."
     )]
     async fn memory_handoff_begin(
         &self,
@@ -7352,27 +7415,58 @@ impl AiMemoryServer {
             .await?;
         let (ws, proj) = resolved_scope.scope.as_tuple();
         let manifest_warning = self.refresh_promoted_scope(&resolved_scope).await;
-        let open_questions = cap_handoff_list(
-            args.open_questions.iter().map(|q| s.scrub(q)),
+        let scrub_all = |items: &[String]| items.iter().map(|item| s.scrub(item)).collect();
+        let raw_open_questions: Vec<String> = scrub_all(&args.open_questions);
+        let raw_next_steps: Vec<String> = scrub_all(&args.next_steps);
+        let raw_files_touched: Vec<String> = scrub_all(&args.files_touched);
+        let raw_summary = s.scrub(&args.summary);
+        let (open_questions, kept_open_questions) = cap_handoff_list(
+            &raw_open_questions,
             HANDOFF_ITEM_MAX_CHARS,
             HANDOFF_TEXT_LIST_MAX_CHARS,
             "handoff item",
             "handoff open_questions",
         );
-        let next_steps = cap_handoff_list(
-            args.next_steps.iter().map(|n| s.scrub(n)),
+        let (next_steps, kept_next_steps) = cap_handoff_list(
+            &raw_next_steps,
             HANDOFF_ITEM_MAX_CHARS,
             HANDOFF_TEXT_LIST_MAX_CHARS,
             "handoff item",
             "handoff next_steps",
         );
-        let files_touched = cap_handoff_list(
-            args.files_touched.iter().map(|f| s.scrub(f)),
+        let (files_touched, kept_files_touched) = cap_handoff_list(
+            &raw_files_touched,
             HANDOFF_FILE_MAX_CHARS,
             HANDOFF_FILE_LIST_MAX_CHARS,
             "handoff file",
             "handoff files_touched",
         );
+        let truncation = [
+            (
+                "summary",
+                text_truncation(&raw_summary, HANDOFF_SUMMARY_MAX_CHARS),
+            ),
+            (
+                "open_questions",
+                list_truncation(
+                    &raw_open_questions,
+                    kept_open_questions,
+                    HANDOFF_ITEM_MAX_CHARS,
+                ),
+            ),
+            (
+                "next_steps",
+                list_truncation(&raw_next_steps, kept_next_steps, HANDOFF_ITEM_MAX_CHARS),
+            ),
+            (
+                "files_touched",
+                list_truncation(
+                    &raw_files_touched,
+                    kept_files_touched,
+                    HANDOFF_FILE_MAX_CHARS,
+                ),
+            ),
+        ];
         let creator = crate::actor::actor_from_parts(&parts);
         let owner_user = if args.shared.unwrap_or(false) {
             None
@@ -7422,7 +7516,7 @@ impl AiMemoryServer {
             to_agent: None,
             cwd: cwd.map(std::path::PathBuf::from),
             summary: cap_text_with_marker(
-                &s.scrub(&args.summary),
+                &raw_summary,
                 HANDOFF_SUMMARY_MAX_CHARS,
                 "handoff summary",
             ),
@@ -7453,6 +7547,7 @@ impl AiMemoryServer {
             })?;
         self.notify_operation_observers(admission.as_ref());
         let mut result = serde_json::json!({ "handoff_id": id.to_string() });
+        add_truncation_report(&mut result, truncation);
         if let Some(warning) = manifest_warning {
             result["manifest_warning"] = serde_json::Value::String(warning.to_string());
         }
@@ -7909,8 +8004,12 @@ impl AiMemoryServer {
         `evidence`. Sender is the current project only for session-aware clients; static \
         MCP clients MUST set `from_workspace`+`from_project` (a guessed sender \
         is refused). `from_agent` is for static clients whose session does not \
-        record the sender harness. Body is secret-scrubbed and size-capped. \
-        Returns `{ \"message_id\": ... }`."
+        record the sender harness. Text is secret-scrubbed, then capped: \
+        `body` at 8000 chars, `subject` at 200, `evidence` at 1000; split a \
+        longer body across several messages. Returns `{ \"message_id\": ... }`; \
+        when a cap cut anything it also returns `truncated: true` and \
+        `truncated_fields`, e.g. `{ \"body\": { \"original_chars\": 9000, \
+        \"stored_chars\": 8000 } }`, so you can send the rest."
     )]
     async fn memory_message_send(
         &self,
@@ -7991,21 +8090,31 @@ impl AiMemoryServer {
         // here — a body crossing into the recipient agent's live context must not
         // carry secrets.
         let s = &self.sanitizer;
-        let body =
-            cap_text_with_marker(&s.scrub(&args.body), MESSAGE_BODY_MAX_CHARS, "message body");
-        let subject = args.subject.as_deref().map(|raw| {
-            cap_text_with_marker(&s.scrub(raw), MESSAGE_SUBJECT_MAX_CHARS, "message subject")
-        });
-        let evidence = args
-            .evidence
+        let raw_body = s.scrub(&args.body);
+        let raw_subject = args.subject.as_deref().map(|raw| s.scrub(raw));
+        let raw_evidence = args.evidence.as_deref().map(|raw| s.scrub(raw));
+        let truncation = [
+            ("body", text_truncation(&raw_body, MESSAGE_BODY_MAX_CHARS)),
+            (
+                "subject",
+                raw_subject
+                    .as_deref()
+                    .and_then(|raw| text_truncation(raw, MESSAGE_SUBJECT_MAX_CHARS)),
+            ),
+            (
+                "evidence",
+                raw_evidence
+                    .as_deref()
+                    .and_then(|raw| text_truncation(raw, MESSAGE_EVIDENCE_MAX_CHARS)),
+            ),
+        ];
+        let body = cap_text_with_marker(&raw_body, MESSAGE_BODY_MAX_CHARS, "message body");
+        let subject = raw_subject
             .as_deref()
-            .map(|raw| {
-                cap_text_with_marker(
-                    &s.scrub(raw),
-                    MESSAGE_EVIDENCE_MAX_CHARS,
-                    "message evidence",
-                )
-            })
+            .map(|raw| cap_text_with_marker(raw, MESSAGE_SUBJECT_MAX_CHARS, "message subject"));
+        let evidence = raw_evidence
+            .as_deref()
+            .map(|raw| cap_text_with_marker(raw, MESSAGE_EVIDENCE_MAX_CHARS, "message evidence"))
             .filter(|value| !value.trim().is_empty());
         if args.nature == ai_memory_core::MessageNature::Measured && evidence.is_none() {
             return Err(McpError::invalid_params(
@@ -8077,11 +8186,13 @@ impl AiMemoryServer {
                 .await;
         }
         self.notify_operation_observers(admission.as_ref());
-        ok_json(&serde_json::json!({
+        let mut result = serde_json::json!({
             "message_id": id.to_string(),
             "from_agent": effective_from_agent,
             "to_agent": effective_to_agent,
-        }))
+        });
+        add_truncation_report(&mut result, truncation);
+        ok_json(&result)
     }
 
     /// List pending inbox/outbox messages without consuming them.
@@ -27109,8 +27220,10 @@ mod tests {
 
     #[test]
     fn handoff_list_cap_keeps_marker_inside_total_budget() {
-        let items = (0..10).map(|idx| format!("item-{idx}: {}", "x".repeat(80)));
-        let capped = cap_handoff_list(items, 100, 220, "item", "list");
+        let items: Vec<String> = (0..10)
+            .map(|idx| format!("item-{idx}: {}", "x".repeat(80)))
+            .collect();
+        let (capped, _) = cap_handoff_list(&items, 100, 220, "item", "list");
         let rendered_len = capped
             .iter()
             .map(|item| item.chars().count())
@@ -27118,6 +27231,274 @@ mod tests {
             .saturating_add(capped.len().saturating_sub(1));
         assert!(rendered_len <= 220);
         assert!(capped.iter().any(|item| item.contains("list truncated")));
+    }
+
+    fn handoff_args(
+        summary: String,
+        open_questions: Vec<String>,
+        next_steps: Vec<String>,
+    ) -> HandoffBeginArgs {
+        HandoffBeginArgs {
+            summary,
+            open_questions,
+            next_steps,
+            files_touched: vec!["src/lib.rs".into()],
+            cwd: Some("/tmp/aim".into()),
+            project: None,
+            workspace: None,
+            shared: None,
+        }
+    }
+
+    /// #2411: a capped handoff tells the sender what was cut, per field.
+    #[tokio::test]
+    async fn handoff_begin_reports_truncation_to_sender() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let open_questions: Vec<String> = (0..30).map(|idx| format!("q{idx}")).collect();
+        let original_question_chars: usize = open_questions.iter().map(String::len).sum();
+        let stored_question_chars: usize = open_questions[..HANDOFF_LIST_MAX_ITEMS]
+            .iter()
+            .map(String::len)
+            .sum();
+        let result = tool_json(
+            &server
+                .memory_handoff_begin(
+                    Parameters(handoff_args(
+                        "s".repeat(HANDOFF_SUMMARY_MAX_CHARS + 1),
+                        open_questions,
+                        vec!["short".into(), "n".repeat(HANDOFF_ITEM_MAX_CHARS + 1)],
+                    )),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(result["handoff_id"].is_string());
+        assert_eq!(result["truncated"], true);
+        let fields = &result["truncated_fields"];
+        assert_eq!(
+            fields["summary"],
+            serde_json::json!({
+                "original_chars": HANDOFF_SUMMARY_MAX_CHARS + 1,
+                "stored_chars": HANDOFF_SUMMARY_MAX_CHARS,
+            })
+        );
+        assert_eq!(
+            fields["open_questions"],
+            serde_json::json!({
+                "original_items": 30,
+                "stored_items": HANDOFF_LIST_MAX_ITEMS,
+                "original_chars": original_question_chars,
+                "stored_chars": stored_question_chars,
+            })
+        );
+        assert_eq!(
+            fields["next_steps"],
+            serde_json::json!({
+                "original_items": 2,
+                "stored_items": 2,
+                "original_chars": 5 + HANDOFF_ITEM_MAX_CHARS + 1,
+                "stored_chars": 5 + HANDOFF_ITEM_MAX_CHARS,
+            })
+        );
+        assert!(
+            fields.get("files_touched").is_none(),
+            "an uncapped field must not be reported: {result}"
+        );
+    }
+
+    /// A list cut by its total-chars budget reports the dropped items.
+    #[test]
+    fn handoff_list_truncation_reports_items_dropped_by_char_budget() {
+        let items: Vec<String> = (0..10).map(|_| "x".repeat(1_000)).collect();
+        let (_, kept) = cap_handoff_list(
+            &items,
+            HANDOFF_ITEM_MAX_CHARS,
+            HANDOFF_TEXT_LIST_MAX_CHARS,
+            "item",
+            "list",
+        );
+        assert_eq!(kept, 5);
+        assert_eq!(
+            list_truncation(&items, kept, HANDOFF_ITEM_MAX_CHARS),
+            Some(serde_json::json!({
+                "original_items": 10,
+                "stored_items": 5,
+                "original_chars": 10_000,
+                "stored_chars": 5_000,
+            }))
+        );
+        assert_eq!(
+            list_truncation(&items[..5], 5, HANDOFF_ITEM_MAX_CHARS),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn handoff_begin_without_truncation_keeps_response_shape() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let result = tool_json(
+            &server
+                .memory_handoff_begin(
+                    Parameters(handoff_args(
+                        "s".repeat(HANDOFF_SUMMARY_MAX_CHARS),
+                        vec!["q".repeat(HANDOFF_ITEM_MAX_CHARS)],
+                        vec![],
+                    )),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let keys: Vec<&str> = result
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["handoff_id"], "{result}");
+    }
+
+    async fn send_message(
+        server: &AiMemoryServer,
+        body: String,
+        subject: Option<String>,
+    ) -> serde_json::Value {
+        call_tool_json(
+            server
+                .memory_message_send(
+                    Parameters(MessageSendArgs {
+                        to_workspace: "default".into(),
+                        to_project: "project-b".into(),
+                        to_agent: None,
+                        body,
+                        subject,
+                        nature: ai_memory_core::MessageNature::Unknown,
+                        evidence: None,
+                        from_agent: None,
+                        from_project: Some("scratch".into()),
+                        from_workspace: Some("default".into()),
+                    }),
+                    test_optional_parts(),
+                )
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// #2411: the sender learns its body was cut instead of finding out from
+    /// the recipient.
+    #[tokio::test]
+    async fn message_send_reports_truncation_to_sender() {
+        let (_tmp, store, server, ws, _scratch) = setup_server().await;
+        store
+            .writer
+            .get_or_create_project(ws, "project-b", None)
+            .await
+            .unwrap();
+        let result = send_message(
+            &server,
+            "b".repeat(MESSAGE_BODY_MAX_CHARS + 1),
+            Some("fits".into()),
+        )
+        .await;
+        assert!(result["message_id"].is_string());
+        assert_eq!(result["truncated"], true);
+        assert_eq!(
+            result["truncated_fields"],
+            serde_json::json!({
+                "body": {
+                    "original_chars": MESSAGE_BODY_MAX_CHARS + 1,
+                    "stored_chars": MESSAGE_BODY_MAX_CHARS,
+                }
+            })
+        );
+
+        let fits = send_message(&server, "b".repeat(MESSAGE_BODY_MAX_CHARS), None).await;
+        let mut keys: Vec<&str> = fits
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["from_agent", "message_id", "to_agent"], "{fits}");
+    }
+
+    /// The limits in the tool and field descriptions are hand-written, so pin
+    /// them to the constants the caps actually use.
+    #[tokio::test]
+    async fn message_and_handoff_descriptions_state_the_caps() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let tool = |name: &str| {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            (
+                tool.description.as_deref().unwrap().to_owned(),
+                serde_json::Value::Object((*tool.input_schema).clone()),
+            )
+        };
+        let field_doc = |schema: &serde_json::Value, field: &str| {
+            schema["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} must be described"))
+                .to_owned()
+        };
+        let (send, send_schema) = tool("memory_message_send");
+        for (field, cap) in [
+            ("body", MESSAGE_BODY_MAX_CHARS),
+            ("subject", MESSAGE_SUBJECT_MAX_CHARS),
+            ("evidence", MESSAGE_EVIDENCE_MAX_CHARS),
+        ] {
+            let stated = format!("{cap} chars");
+            assert!(send.contains(&format!("`{field}` at {cap}")), "{send}");
+            assert!(field_doc(&send_schema, field).contains(&stated), "{field}");
+        }
+        let (begin, begin_schema) = tool("memory_handoff_begin");
+        for stated in [
+            format!("`summary` {HANDOFF_SUMMARY_MAX_CHARS} chars"),
+            format!("item {HANDOFF_ITEM_MAX_CHARS} chars"),
+            format!(
+                "at most {HANDOFF_LIST_MAX_ITEMS} items and {HANDOFF_TEXT_LIST_MAX_CHARS} chars"
+            ),
+            format!("entry {HANDOFF_FILE_MAX_CHARS} chars"),
+            format!(
+                "at most {HANDOFF_LIST_MAX_ITEMS} entries and {HANDOFF_FILE_LIST_MAX_CHARS} chars"
+            ),
+        ] {
+            assert!(begin.contains(&stated), "missing {stated:?}: {begin}");
+        }
+        assert!(
+            field_doc(&begin_schema, "summary")
+                .contains(&format!("{HANDOFF_SUMMARY_MAX_CHARS} chars"))
+        );
+        for field in ["open_questions", "next_steps"] {
+            let doc = field_doc(&begin_schema, field);
+            assert!(
+                doc.contains(&format!("{HANDOFF_ITEM_MAX_CHARS} chars")),
+                "{doc}"
+            );
+            assert!(
+                doc.contains(&format!(
+                    "{HANDOFF_LIST_MAX_ITEMS} items and {HANDOFF_TEXT_LIST_MAX_CHARS} chars"
+                )),
+                "{doc}"
+            );
+        }
+        let files = field_doc(&begin_schema, "files_touched");
+        assert!(
+            files.contains(&format!("{HANDOFF_FILE_MAX_CHARS} chars")),
+            "{files}"
+        );
+        assert!(
+            files.contains(&format!(
+                "{HANDOFF_LIST_MAX_ITEMS} entries and {HANDOFF_FILE_LIST_MAX_CHARS} chars"
+            )),
+            "{files}"
+        );
     }
 
     #[tokio::test]

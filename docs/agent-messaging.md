@@ -204,7 +204,9 @@ separate operator-mailbox flag.
   share the prefix, so a reply never matches a question filter.
 - `body`: the question, the options, and the project the answer goes back to.
   Compose it as a complete prompt. The recipient has no other context. Keep
-  it within 8,000 characters; a longer body is truncated on send. Secrets are
+  it within 8,000 characters; a longer body is truncated on send, and the
+  response then carries `truncated: true` and
+  `truncated_fields.body.original_chars` / `stored_chars`. Secrets are
   scrubbed on the way in.
 
 The call returns `message_id`. Keep it. The reply names that id.
