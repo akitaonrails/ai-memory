@@ -209,21 +209,22 @@ max_chars = 4000
 # every subagent pays for the brief in tokens, so opt in per repo.
 inject_on_subagent_start = "true"
 
-# Optional. Stop delivering this project's handoff at session start. Only an
-# explicit false / "no" / "off" / "0" turns it off; the default is to deliver.
-# Handoffs are still created when a session ends, and stay open (an agent can
-# still take one with `memory_handoff_accept`), so only the automatic delivery
-# stops. The brief, the profile digest and everything else on start are
-# unchanged.
+# Optional. Override this project's handoff delivery at session start. Only an
+# explicit false / "no" / "off" / "0" turns it off; `true` turns it back on even
+# when the server's `[handoff] deliver_on_session_start` is false. Handoffs are
+# still created when a session ends, and stay open (an agent can still take one
+# with `memory_handoff_accept`), so only the automatic delivery stops. The
+# brief, the profile digest and everything else on start are unchanged.
 [handoff]
 deliver_on_session_start = false
 
-# Optional. Stop delivering the unfinished-session recovery snapshot at
+# Optional. Override delivery of the unfinished-session recovery snapshot at
 # session start. Only an explicit false / "no" / "off" / "0" turns it off;
-# the default is to deliver. This also suppresses the snapshot's backfill
-# marker. The source session remains open and its lifecycle is unchanged.
-# Independent of [handoff]: handoffs, managed context, the brief, the profile
-# digest and the inbox notice are unchanged.
+# `true` turns it back on even when the server's `[recovery]
+# deliver_on_session_start` is false. This also suppresses the snapshot's
+# backfill marker. The source session remains open and its lifecycle is
+# unchanged. Independent of [handoff]: handoffs, managed context, the brief,
+# the profile digest and the inbox notice are unchanged.
 [recovery]
 deliver_on_session_start = false
 
@@ -355,21 +356,32 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
 
-`[handoff] deliver_on_session_start` is on unless the value is explicitly falsy
-(`false` / `0` / `no` / `off`, quoted or bare). Clients send `handoff=0` on the
-session-start fetch only when the marker turns it off, so the server reads
-nothing, claims nothing and adds no handoff or continuity notice for that
-project. A marker that sets only `[handoff]` is a settings boundary, like one
-with `[briefing]` or `[profile]` keys. Use it for projects whose automatic
-handoffs are mostly noise, such as a bot fleet driven by routines and webhooks.
+`[handoff] deliver_on_session_start` overrides the server-wide
+`[handoff] deliver_on_session_start` in either direction and defaults to on
+when neither is set. Clients forward the declared value on the session-start
+fetch (`handoff=0` when falsy, `handoff=1` otherwise, quoted or bare). An
+exact empty quoted value is absent and sends nothing; a whitespace-only value
+counts as declared. `false` makes the server read nothing, claim nothing and
+add no handoff or continuity notice for that project, while `true` restores
+delivery under a server default of `false`. A marker that sets only
+`[handoff]` is a settings boundary, like one with `[briefing]` or `[profile]`
+keys. Use it for projects
+whose automatic handoffs are mostly noise, such as a bot fleet driven by
+routines and webhooks. Old hook files send only `0`, so a project that turns
+delivery back on needs the hook update described in
+[install.md](install.md#hook-files-after-an-update).
 
-`[recovery] deliver_on_session_start` is also on unless explicitly falsy.
-Clients then send `recovery=0`, which suppresses only the unfinished-session
-recovery snapshot and its backfill marker. The source session stays open, and
-handoffs, managed context, the brief, the profile digest and the inbox notice
-are still delivered. A marker that sets only `[recovery]` is a settings
-boundary. Use this in projects with long-lived parallel sessions, where another
-session's recovery snapshot is usually noise for that layout.
+`[recovery] deliver_on_session_start` overrides the server-wide
+`[recovery] deliver_on_session_start` the same way. Clients forward
+`recovery=0` when falsy and `recovery=1` otherwise; the empty-value rule is
+the same. `0` suppresses only the unfinished-session recovery snapshot and its
+backfill marker, and `1` restores it under a server default of `false`. The
+source session stays open, and handoffs, managed context, the brief, the
+profile digest and the inbox notice are still delivered. A marker that sets
+only `[recovery]` is a settings boundary. Use this in projects with long-lived
+parallel sessions, where another
+session's recovery snapshot is usually noise for that layout. The same stale
+hook caveat as `[handoff]` applies when opting back in.
 
 `[recall] default_global` applies to an agent's unscoped `memory_query` and
 `memory_recent` calls. On `memory_query`, an explicit `global: false` keeps

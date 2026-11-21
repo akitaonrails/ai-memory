@@ -4207,6 +4207,34 @@ upgrade refreshes the staged scripts and keeps the existing settings. To
 update those hooks, re-run `ai-memory install-hooks --apply --agent claude-code`
 with the original connection options.
 
+### Hook files after an update
+
+`ai-memory upgrade` rewrites the hook scripts and generated integrations it
+staged when a release changes them; it is the only update path that does. Every
+other way of updating leaves the installed files at their old version:
+
+- package-managed installs (Homebrew, AUR, Scoop, Nix, `/usr`), which `upgrade`
+  refuses and hands to the package manager;
+- a binary copied into place by hand, which never touches the hooks tree;
+- project-scoped hook installs, which live in each checkout instead of the
+  data-dir hooks tree.
+
+After any of those, run the installer for every agent whose hooks you use:
+
+```bash
+ai-memory install-hooks --agent <agent> --apply
+# project-scoped install, in each checkout:
+ai-memory install-hooks --agent <agent> --apply --scope project
+```
+
+This matters when a project's `.ai-memory.toml` sets `[handoff]
+deliver_on_session_start = true` or `[recovery] deliver_on_session_start =
+true` to override a server-wide `false`, as described in
+[marker-file.md](marker-file.md): the current clients forward the declared
+value (`handoff=1` / `recovery=1`), while an old hook file sends only the `0`
+opt-out and the project override has no effect. A marker set to `false` keeps
+working without the refresh, because old files already send `0`.
+
 ### Server container you run yourself, native client on the host
 
 Some installs split the two halves by hand: the server runs in a container you
