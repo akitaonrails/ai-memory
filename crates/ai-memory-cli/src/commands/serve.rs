@@ -1729,6 +1729,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 capture_assistant_enabled: config.capture_assistant,
                 assistant_excerpt_max_bytes: config.assistant_excerpt_max_bytes,
                 claim_handoff_on_session_start: config.handoff.claim_on_session_start,
+                deliver_handoff_on_session_start: config.handoff.deliver_on_session_start,
+                deliver_recovery_on_session_start: config.recovery.deliver_on_session_start,
                 create_handoff_on_session_end: config.handoff.create_on_session_end,
                 per_user_slots: config.slots.per_user,
                 subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(

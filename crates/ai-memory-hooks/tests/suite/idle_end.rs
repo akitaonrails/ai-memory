@@ -72,6 +72,8 @@ async fn harness() -> (TempDir, Store, Wiki, HookState) {
         capture_assistant_enabled: false,
         assistant_excerpt_max_bytes: ai_memory_hooks::ASSISTANT_EXCERPT_MAX_BYTES,
         claim_handoff_on_session_start: true,
+        deliver_handoff_on_session_start: true,
+        deliver_recovery_on_session_start: true,
         create_handoff_on_session_end: true,
         subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
         ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),

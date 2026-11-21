@@ -300,7 +300,14 @@ Defined by `EntropyFilterConfig` in `ai-memory-consolidate`. A skipped page is l
 | Key | Default | Env equivalent | Purpose |
 | --- | --- | --- | --- |
 | `claim_on_session_start` | `true` | `AI_MEMORY_HANDOFF__CLAIM_ON_SESSION_START` | Claim a pending handoff automatically at SessionStart. `false` renders a notice and waits for `memory_handoff_accept`. |
+| `deliver_on_session_start` | `true` | `AI_MEMORY_HANDOFF__DELIVER_ON_SESSION_START` | Deliver a pending handoff at session start (claiming it when `claim_on_session_start` is on). `false` suppresses delivery; the baton stays open for `memory_handoff_accept`. A project marker's `[handoff] deliver_on_session_start` overrides it. |
 | `create_on_session_end` | `true` | `AI_MEMORY_HANDOFF__CREATE_ON_SESSION_END` | Create an automatic open handoff when an unmanaged session ends. A hook client running with `AI_MEMORY_AUTO_HANDOFF=off` skips it for that execution only (see `docs/usage.md`). |
+
+## `[recovery]`
+
+| Key | Default | Env equivalent | Purpose |
+| --- | --- | --- | --- |
+| `deliver_on_session_start` | `true` | `AI_MEMORY_RECOVERY__DELIVER_ON_SESSION_START` | Deliver the unfinished-session recovery snapshot and its backfill marker at session start. `false` skips only that snapshot. A project marker's `[recovery] deliver_on_session_start` overrides it. |
 
 ## `[profile]`
 

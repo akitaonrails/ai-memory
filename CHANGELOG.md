@@ -65,6 +65,17 @@ version in [`docs/changelog/`](docs/changelog/):
   It sends one bounded Choice request per eligible query, retains local order on failure, and records validated usage even when an answer is refused.
   Choice probabilities are relative to the candidate pool; leave `min_relevance` unset with this backend. (#2296)
 
+- Added server-wide `[handoff] deliver_on_session_start` and `[recovery]
+  deliver_on_session_start` settings, which turn off the session-start handoff
+  block and the unfinished-session recovery snapshot for every project from one
+  `config.toml`. A project's `.ai-memory.toml` still overrides the server
+  default in either direction: all four hook clients now forward a declared
+  value (`handoff=1` / `recovery=1` as well as `0`) instead of only the
+  opt-out, and an absent key follows the server default. Existing `0` opt-outs
+  keep working; old hook files need
+  `ai-memory install-hooks --agent <agent> --apply` to send the opt-in (see
+  `docs/install.md#hook-files-after-an-update`). (#1621, #1865)
+
 ### Fixed
 
 - Kept scheduled mirror and online backups running when a native install
