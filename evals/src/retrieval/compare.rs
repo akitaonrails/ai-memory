@@ -8,9 +8,8 @@
 //! the cutoffs it moved between. Moves of one cutoff in both directions,
 //! spread across question types, look like boundary noise; moves that skip
 //! cutoffs, go one way, or cluster in one type point at a ranking change.
-//! With `--fts`, the candidate build's FTS report marks moved questions whose
-//! row equals the FTS row exactly, which is what a query that ran without its
-//! vector looks like.
+//! With `--fts`, moved questions are marked by whether their rows exactly
+//! match the candidate build's FTS report, when it has a corresponding row.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -278,15 +277,14 @@ fn compare(
         } else {
             counts.worsened += 1;
         }
-        let same_as_fts = fts.zip(fts_ids.as_ref()).map(|(fts, ids)| {
-            ids.get(&c.question_id)
-                .map(|&index| &fts.per_question[index])
-                .is_some_and(|f| {
-                    f.hit_at == c.hit_at
-                        && f.recall_at == c.recall_at
-                        && f.retrieved_sessions == c.retrieved_sessions
-                        && f.context_tokens == c.context_tokens
-                })
+        let same_as_fts = fts.zip(fts_ids.as_ref()).and_then(|(fts, ids)| {
+            ids.get(&c.question_id).map(|&index| {
+                let f = &fts.per_question[index];
+                f.hit_at == c.hit_at
+                    && f.recall_at == c.recall_at
+                    && f.retrieved_sessions == c.retrieved_sessions
+                    && f.context_tokens == c.context_tokens
+            })
         });
         moved.push(Moved {
             question_id: c.question_id.clone(),
@@ -396,6 +394,7 @@ fn to_markdown(c: &Comparison) -> String {
             let fts_cell = match m.same_as_fts {
                 Some(true) => " yes |",
                 Some(false) => " no |",
+                None if c.fts_checked => " unavailable |",
                 None => "",
             };
             md.push_str(&format!(
@@ -672,6 +671,7 @@ mod tests {
             vec![
                 question("q1", "user", Some(5)),
                 question("q2", "user", Some(5)),
+                question("q3", "user", Some(5)),
             ],
         );
         let candidate = report(
@@ -679,6 +679,7 @@ mod tests {
             vec![
                 question("q1", "user", Some(10)),
                 question("q2", "user", Some(10)),
+                question("q3", "user", Some(10)),
             ],
         );
         let mut matching = question("q1", "user", Some(10));
@@ -693,10 +694,17 @@ mod tests {
             .iter()
             .map(|m| (m.question_id.as_str(), m.same_as_fts))
             .collect();
-        assert_eq!(marks, vec![("q1", Some(true)), ("q2", Some(false))]);
+        assert_eq!(
+            marks,
+            vec![("q1", Some(true)), ("q2", Some(false)), ("q3", None)]
+        );
         let md = to_markdown(&c);
         assert!(md.contains("candidate row = FTS row |"));
         assert!(md.contains("| q1 | user | @5 → @10 | 1 | 1.00 → 1.00 | 120 → 120 | yes |"));
+        assert!(md.contains("| q2 | user | @5 → @10 | 1 | 1.00 → 1.00 | 120 → 120 | no |"));
+        assert!(
+            md.contains("| q3 | user | @5 → @10 | 1 | 1.00 → 1.00 | 120 → 120 | unavailable |")
+        );
         assert!(
             compare(&baseline, &candidate, None).unwrap().moved[0]
                 .same_as_fts
