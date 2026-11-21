@@ -12,6 +12,7 @@ import type {
   ActivityWindow,
   AnsweredScope,
   ApiHandoff,
+  FieldTruncation,
   ApiPage,
   ApiSearchHit,
   Briefing,
@@ -97,6 +98,36 @@ export function bool(o: Raw, key: string, where: string): boolean {
     throw new ProtocolError(`${where}: field ${key} is missing or not a boolean`);
   }
   return value;
+}
+
+/**
+ * The optional `truncated` / `truncated_fields` report on a write result:
+ * both `undefined` when the server cut nothing. Read leniently, since the
+ * write has already happened: an entry without numeric char counts is
+ * skipped rather than failing the call (the full report stays in `raw`).
+ */
+export function truncation(o: Raw): {
+  truncated: boolean | undefined;
+  truncatedFields: Readonly<Record<string, FieldTruncation>> | undefined;
+} {
+  const truncated = typeof o["truncated"] === "boolean" ? o["truncated"] : undefined;
+  const fields = o["truncated_fields"];
+  if (typeof fields !== "object" || fields === null || Array.isArray(fields)) {
+    return { truncated, truncatedFields: undefined };
+  }
+  const truncatedFields: Record<string, FieldTruncation> = {};
+  for (const [name, value] of Object.entries(fields)) {
+    if (typeof value !== "object" || value === null) continue;
+    const f = value as Raw;
+    if (typeof f["original_chars"] !== "number" || typeof f["stored_chars"] !== "number") continue;
+    truncatedFields[name] = {
+      originalChars: f["original_chars"],
+      storedChars: f["stored_chars"],
+      originalItems: typeof f["original_items"] === "number" ? f["original_items"] : undefined,
+      storedItems: typeof f["stored_items"] === "number" ? f["stored_items"] : undefined,
+    };
+  }
+  return { truncated, truncatedFields };
 }
 
 /** An optional boolean, false when absent. */
