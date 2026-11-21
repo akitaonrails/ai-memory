@@ -399,6 +399,14 @@ fn resolve_target(
             .to_path_buf();
         return Ok((base, target));
     }
+    if entry.agent == AgentKind::KimiCode
+        && let Some(relative) = entry.target_relative.strip_prefix(".kimi-code/")
+        && let Some(custom_dir) = agent_config_home(std::env::var_os("KIMI_CODE_HOME"))
+    {
+        let base = cwd.join(custom_dir);
+        let target = base.join(relative);
+        return Ok((base, target));
+    }
     if entry.agent == AgentKind::OpenCode
         && let Some(relative) = entry.target_relative.strip_prefix(".config/opencode/")
     {
@@ -743,11 +751,12 @@ fn validate_target_relative(scope: AgentAssetScope, rel_path: &str) -> Result<()
                 ".openclaw/",
                 ".commandcode/",
                 ".kimi/",
+                ".kimi-code/skills/",
                 ".qwen/",
                 ".qoder/",
                 ".copilot/skills/",
             ];
-            let allowed = rel_path == ".claude.json"
+            let allowed = matches!(rel_path, ".claude.json" | ".kimi-code/mcp.json")
                 || PREFIXES.iter().any(|prefix| rel_path.starts_with(prefix));
             if !allowed {
                 bail!(

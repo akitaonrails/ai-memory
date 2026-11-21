@@ -614,6 +614,90 @@ fn restore_agents_limits_copilot_destinations_to_skill_roots() {
 }
 
 #[test]
+fn kimi_code_backup_round_trips_mcp_config_and_skills() {
+    let _guard = cli_test_lock();
+    for (source_dir, restore_dir) in [
+        (".kimi-code", ".kimi-code"),
+        ("custom-kimi", "relocated-kimi"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let kimi_home = home.path().join(source_dir);
+        let command = || {
+            let mut command = command_with_env(home.path(), project.path());
+            if source_dir != ".kimi-code" {
+                command.env("KIMI_CODE_HOME", &kimi_home);
+            }
+            command
+        };
+        let token = "FAKEfake0123456789";
+        let mcp = command()
+            .args([
+                "install-mcp",
+                "--client",
+                "kimi-code",
+                "--apply",
+                "--server-url",
+                "http://127.0.0.1:49374/mcp",
+                "--auth-token",
+                token,
+            ])
+            .output()
+            .unwrap();
+        assert_success(&mcp, "install MCP config");
+        assert!(
+            fs::read_to_string(kimi_home.join("mcp.json"))
+                .unwrap()
+                .contains(token)
+        );
+        let skill = kimi_home.join("skills/current/SKILL.md");
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&skill, "# Current Kimi skill").unwrap();
+        let legacy_mcp = ".kimi/mcp.json";
+        fs::create_dir_all(home.path().join(".kimi")).unwrap();
+        fs::write(home.path().join(legacy_mcp), r#"{"mcpServers":{}}"#).unwrap();
+
+        let archive = project.path().join("kimi-code.tar.gz");
+        let backup = command()
+            .args(backup_agents_args(&archive, "kimi-code"))
+            .args(["--scope", "global"])
+            .output()
+            .unwrap();
+        assert_success(&backup, "backup");
+
+        let restored_home = tempfile::tempdir().unwrap();
+        let restored_kimi_home = restored_home.path().join(restore_dir);
+        let mut restore = command_with_env(restored_home.path(), project.path());
+        if restore_dir != ".kimi-code" {
+            restore.env("KIMI_CODE_HOME", &restored_kimi_home);
+        }
+        let restored = restore
+            .args(restore_agents_args(&archive, "kimi-code"))
+            .output()
+            .unwrap();
+        assert_success(&restored, "restore");
+        let restored_mcp = fs::read_to_string(restored_kimi_home.join("mcp.json")).unwrap();
+        assert!(!restored_mcp.contains(token));
+        let mcp: serde_json::Value = serde_json::from_str(&restored_mcp).unwrap();
+        assert_eq!(
+            mcp["mcpServers"]["ai-memory"]["url"],
+            "http://127.0.0.1:49374/mcp?flavor=moonshot"
+        );
+        assert_eq!(
+            fs::read_to_string(restored_kimi_home.join("skills/current/SKILL.md")).unwrap(),
+            "# Current Kimi skill"
+        );
+        assert_eq!(
+            fs::read_to_string(restored_home.path().join(legacy_mcp)).unwrap(),
+            r#"{"mcpServers":{}}"#
+        );
+        if restore_dir != ".kimi-code" {
+            assert!(!restored_home.path().join(".kimi-code").exists());
+        }
+    }
+}
+
+#[test]
 fn qwen_backup_round_trips_every_documented_asset() {
     let _guard = cli_test_lock();
     let home = tempfile::tempdir().unwrap();
@@ -1439,30 +1523,34 @@ fn restore_agents_rejects_a_symlinked_destination_parent() {
     use std::os::unix::fs::symlink;
 
     let _guard = cli_test_lock();
-    let source_home = tempfile::tempdir().unwrap();
-    let source_project = tempfile::tempdir().unwrap();
-    let settings = source_home.path().join(".claude/settings.json");
-    fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    fs::write(&settings, br#"{"mcpServers":{}}"#).unwrap();
-    let archive = source_project.path().join("backup.tar.gz");
-    let backup = command_with_env(source_home.path(), source_project.path())
-        .args(["backup-agents", "-o", archive.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(backup.status.success());
+    for (agent, dir, name) in [
+        ("claude-code", ".claude", "settings.json"),
+        ("kimi-code", ".kimi-code", "mcp.json"),
+    ] {
+        let source_home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let asset_dir = source_home.path().join(dir);
+        fs::create_dir_all(&asset_dir).unwrap();
+        fs::write(asset_dir.join(name), br#"{"mcpServers":{}}"#).unwrap();
+        let archive = project.path().join("backup.tar.gz");
+        let backup = command_with_env(source_home.path(), project.path())
+            .args(backup_agents_args(&archive, agent))
+            .output()
+            .unwrap();
+        assert_success(&backup, "backup");
 
-    let restore_home = tempfile::tempdir().unwrap();
-    let restore_project = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    symlink(outside.path(), restore_home.path().join(".claude")).unwrap();
-    let restore = command_with_env(restore_home.path(), restore_project.path())
-        .args(["restore-agents", "-i", archive.to_str().unwrap(), "--apply"])
-        .output()
-        .unwrap();
+        let restore_home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), restore_home.path().join(dir)).unwrap();
+        let restore = command_with_env(restore_home.path(), project.path())
+            .args(restore_agents_args(&archive, agent))
+            .output()
+            .unwrap();
 
-    assert!(!restore.status.success());
-    assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
-    assert!(!outside.path().join("settings.json").exists());
+        assert!(!restore.status.success());
+        assert!(String::from_utf8_lossy(&restore.stderr).contains("symlinked path"));
+        assert!(!outside.path().join(name).exists());
+    }
 }
 
 #[test]

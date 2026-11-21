@@ -52,6 +52,10 @@ version in [`docs/changelog/`](docs/changelog/):
   `setup` writes them; an existing spool or token directory keeps its access
   list (see `docs/security-boundaries.md` row 10m). (#2396)
 
+- Backed up Kimi Code's MCP settings and skills from its active home.
+  Restores honor `KIMI_CODE_HOME` and keep the recorded destinations for
+  older `.kimi/` archives. (#2418)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

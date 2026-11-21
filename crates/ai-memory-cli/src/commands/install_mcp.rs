@@ -1048,7 +1048,7 @@ fn codex_config_path_in(env_override: Option<std::ffi::OsString>) -> Result<Path
 /// Kimi Code's data dir: `$KIMI_CODE_HOME` when set and not blank, else
 /// `~/.kimi-code`. The env value comes in as a parameter so tests can
 /// exercise both branches without mutating process env.
-fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+pub(crate) fn kimi_code_home(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
     if let Some(dir) = crate::commands::path_util::agent_config_home(env_override) {
         return Ok(dir);
     }
