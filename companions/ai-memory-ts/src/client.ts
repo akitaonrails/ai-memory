@@ -623,7 +623,7 @@ export class HandoffsNamespace {
     const o = record(decoded, "memory_handoff_begin");
     return {
       handoffId: str(o, "handoff_id", "memory_handoff_begin"),
-      ...truncation(o, "memory_handoff_begin"),
+      ...truncation(o),
       raw: o,
     };
   }
@@ -769,7 +769,7 @@ export class MessagesNamespace {
     const o = record(decoded, "memory_message_send");
     return {
       messageId: str(o, "message_id", "memory_message_send"),
-      ...truncation(o, "memory_message_send"),
+      ...truncation(o),
       raw: o,
     };
   }

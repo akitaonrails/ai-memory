@@ -102,25 +102,27 @@ export function bool(o: Raw, key: string, where: string): boolean {
 
 /**
  * The optional `truncated` / `truncated_fields` report on a write result:
- * both `undefined` when the server cut nothing.
+ * both `undefined` when the server cut nothing. Read leniently, since the
+ * write has already happened: an entry without numeric char counts is
+ * skipped rather than failing the call (the full report stays in `raw`).
  */
-export function truncation(
-  o: Raw,
-  where: string,
-): {
+export function truncation(o: Raw): {
   truncated: boolean | undefined;
   truncatedFields: Readonly<Record<string, FieldTruncation>> | undefined;
 } {
   const truncated = typeof o["truncated"] === "boolean" ? o["truncated"] : undefined;
-  if (o["truncated_fields"] === undefined) return { truncated, truncatedFields: undefined };
-  const fields = record(o["truncated_fields"], `${where} truncated_fields`);
+  const fields = o["truncated_fields"];
+  if (typeof fields !== "object" || fields === null || Array.isArray(fields)) {
+    return { truncated, truncatedFields: undefined };
+  }
   const truncatedFields: Record<string, FieldTruncation> = {};
   for (const [name, value] of Object.entries(fields)) {
-    const f = record(value, `${where} truncated_fields.${name}`);
-    const at = `${where} truncated_fields.${name}`;
+    if (typeof value !== "object" || value === null) continue;
+    const f = value as Raw;
+    if (typeof f["original_chars"] !== "number" || typeof f["stored_chars"] !== "number") continue;
     truncatedFields[name] = {
-      originalChars: num(f, "original_chars", at),
-      storedChars: num(f, "stored_chars", at),
+      originalChars: f["original_chars"],
+      storedChars: f["stored_chars"],
       originalItems: typeof f["original_items"] === "number" ? f["original_items"] : undefined,
       storedItems: typeof f["stored_items"] === "number" ? f["stored_items"] : undefined,
     };

@@ -615,14 +615,34 @@ describe("handoffs", () => {
     });
   });
 
-  it("begin rejects a malformed truncation report", async () => {
+  it("begin skips a malformed truncation entry instead of failing the write", async () => {
     const { server, memory } = setup();
     server.tools.set("memory_handoff_begin", () => ({
       handoff_id: payloads.HANDOFF_ID,
       truncated: true,
-      truncated_fields: { summary: { original_chars: "3001" } },
+      truncated_fields: {
+        summary: { original_chars: "3001" },
+        next_steps: { original_chars: 1501, stored_chars: 1500 },
+      },
     }));
-    await assert.rejects(memory.handoffs.begin({ summary: "Left off here" }), ProtocolError);
+    const begun = await memory.handoffs.begin({ summary: "Left off here" });
+    assert.equal(begun.handoffId, payloads.HANDOFF_ID);
+    assert.equal(begun.truncated, true);
+    assert.deepEqual(begun.truncatedFields, {
+      next_steps: { originalChars: 1501, storedChars: 1500, originalItems: undefined, storedItems: undefined },
+    });
+  });
+
+  it("begin ignores a truncated_fields report that is not an object", async () => {
+    const { server, memory } = setup();
+    server.tools.set("memory_handoff_begin", () => ({
+      handoff_id: payloads.HANDOFF_ID,
+      truncated: true,
+      truncated_fields: null,
+    }));
+    const begun = await memory.handoffs.begin({ summary: "Left off here" });
+    assert.equal(begun.handoffId, payloads.HANDOFF_ID);
+    assert.equal(begun.truncatedFields, undefined);
   });
 
   it("accept refuses an unknown status", async () => {
