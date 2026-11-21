@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Fixed installation-guide links whose GitHub fragments contain repeated
+  hyphens so they jump to the matching heading in the bundled web docs. (#2419)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)

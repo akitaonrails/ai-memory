@@ -59,15 +59,47 @@ pub(crate) fn render_reference_document(
     mut rewrite: impl FnMut(&str) -> String,
 ) -> Rendered {
     let mut headings = HeadingIdAssigner::new(Parser::new_ext(body, options()));
-    let events = headings
-        .by_ref()
-        .map(|event| sanitize_event_with_links(event, |url| CowStr::Boxed(rewrite(&url).into())));
+    // A guide's table of contents can link to headings before they are rendered.
+    let events = headings.by_ref().collect::<Vec<_>>();
+    let events = events.into_iter().map(|event| {
+        sanitize_event_with_links(event, |url| {
+            let destination = match reference_heading_id(&url, &headings.outline) {
+                Some(id) => rewrite(&format!("#{id}")),
+                None => rewrite(&url),
+            };
+            CowStr::Boxed(destination.into())
+        })
+    });
     let mut html = String::new();
     html::push_html(&mut html, events);
     Rendered {
         html,
         outline: headings.outline,
     }
+}
+
+/// Match GitHub-style repeated-hyphen fragments in a guide's same-document links.
+/// For example, the two spaces around `/` in "Nix / NixOS" yield `nix--nixos`
+/// on GitHub. The embedded heading keeps its existing `nix-nixos` ID.
+fn reference_heading_id<'a>(url: &str, outline: &'a [OutlineEntry]) -> Option<&'a str> {
+    let fragment = url.strip_prefix('#')?;
+    if !fragment.contains("--") || outline.iter().any(|entry| entry.id == fragment) {
+        return None;
+    }
+    let mut matches = outline.iter().filter(|entry| {
+        entry
+            .text
+            .chars()
+            .filter_map(|ch| match ch {
+                ' ' => Some('-'),
+                '-' | '_' => Some(ch),
+                _ => ch.is_alphanumeric().then_some(ch),
+            })
+            .flat_map(char::to_lowercase)
+            .eq(fragment.chars())
+    });
+    let heading = matches.next()?;
+    matches.next().is_none().then_some(heading.id.as_str())
 }
 
 /// A rendered page body and the headings it contains.
@@ -1610,6 +1642,22 @@ mod tests {
 
 #[cfg(test)]
 mod reference_document_tests {
+    #[test]
+    fn bundled_links_resolve_to_the_matching_heading_id() {
+        let body = "[GitHub](#nix--nixos) [existing](#nix-nixos) [unknown](#nix---nixos) [other](other.md#nix--nixos)\n\n## Nix NixOS\n\n## Nix / NixOS";
+        let docs = super::render_reference_document(body, str::to_owned);
+        assert!(docs.html.contains(r##"href="#nix-nixos-1">GitHub</a>"##));
+        assert!(docs.html.contains(r##"href="#nix-nixos">existing</a>"##));
+        assert!(docs.html.contains(r##"href="#nix---nixos">unknown</a>"##));
+        assert!(
+            docs.html
+                .contains(r#"href="other.md#nix--nixos">other</a>"#)
+        );
+
+        let wiki = super::render_document(body, "default", "scratch");
+        assert!(wiki.html.contains(r##"href="#nix--nixos">GitHub</a>"##));
+    }
+
     #[test]
     fn bundled_guides_keep_unsafe_markup_inert_and_use_document_anchors() {
         let doc = crate::documentation::find("features").unwrap();
