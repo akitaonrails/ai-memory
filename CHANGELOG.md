@@ -13,6 +13,9 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Kept the ETag from the page version written by `ai-memory-wikisync export --force`,
+  so later exports detect a server restored to an earlier version. (#1120)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
