@@ -33,6 +33,7 @@ import {
   sessionActivity,
   statusCounts,
   str,
+  truncation,
   untrusted,
 } from "./decode.js";
 import { ArgumentError, ProtocolError, ScopeError } from "./errors.js";
@@ -620,7 +621,11 @@ export class HandoffsNamespace {
       options,
     );
     const o = record(decoded, "memory_handoff_begin");
-    return { handoffId: str(o, "handoff_id", "memory_handoff_begin"), raw: o };
+    return {
+      handoffId: str(o, "handoff_id", "memory_handoff_begin"),
+      ...truncation(o, "memory_handoff_begin"),
+      raw: o,
+    };
   }
 
   /** List open handoffs without claiming any. Calls `memory_handoff_list`. */
@@ -762,7 +767,11 @@ export class MessagesNamespace {
       options,
     );
     const o = record(decoded, "memory_message_send");
-    return { messageId: str(o, "message_id", "memory_message_send"), raw: o };
+    return {
+      messageId: str(o, "message_id", "memory_message_send"),
+      ...truncation(o, "memory_message_send"),
+      raw: o,
+    };
   }
 
   /** List pending messages in the inbox (default) or outbox. Calls `memory_message_list`. */

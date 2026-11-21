@@ -207,7 +207,8 @@ separate operator-mailbox flag.
   it within 8,000 characters; a longer body is truncated on send, and the
   response then carries `truncated: true` and
   `truncated_fields.body.original_chars` / `stored_chars`. Secrets are
-  scrubbed on the way in.
+  scrubbed on the way in, before the cap: the counts are of the scrubbed text,
+  so a redaction can push a body at the limit over it.
 
 The call returns `message_id`. Keep it. The reply names that id.
 

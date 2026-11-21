@@ -1649,15 +1649,18 @@ struct HandoffBeginArgs {
     /// Short prose summary of where the session left off. Capped at 3000 chars.
     summary: String,
     /// Questions the next agent should resolve. Each item is capped at
-    /// 1500 chars; the list keeps at most 20 items and 6000 chars.
+    /// 1500 chars; the list keeps at most 20 items and 6000 chars, counting
+    /// one separator char between items and the marker on a clipped item.
     #[serde(default)]
     open_questions: Vec<String>,
     /// Suggested next steps. Each item is capped at 1500 chars; the list keeps
-    /// at most 20 items and 6000 chars.
+    /// at most 20 items and 6000 chars, counting one separator char between
+    /// items and the marker on a clipped item.
     #[serde(default)]
     next_steps: Vec<String>,
     /// Files touched during the session. Each entry is capped at 512 chars;
-    /// the list keeps at most 20 entries and 4096 chars.
+    /// the list keeps at most 20 entries and 4096 chars, counting one
+    /// separator char between entries and the marker on a clipped entry.
     #[serde(default)]
     files_touched: Vec<String>,
     /// Working directory at the time of handoff. Recorded on the handoff and
@@ -7383,6 +7386,10 @@ impl AiMemoryServer {
         Limits: `summary` 3000 chars; each `open_questions` / `next_steps` \
         item 1500 chars, at most 20 items and 6000 chars per list; each \
         `files_touched` entry 512 chars, at most 20 entries and 4096 chars. \
+        A list's char budget also counts one separator char between items \
+        and the marker on a clipped item, so 4 items of exactly 1500 chars \
+        keep only 3. Text is secret-scrubbed first and the limits count the \
+        scrubbed text, so a redaction can push text at a limit over it. \
         Excess is cut. When anything was cut the response adds \
         `truncated: true` and `truncated_fields`: per text field \
         `original_chars`/`stored_chars`, per list also \
@@ -8006,7 +8013,9 @@ impl AiMemoryServer {
         is refused). `from_agent` is for static clients whose session does not \
         record the sender harness. Text is secret-scrubbed, then capped: \
         `body` at 8000 chars, `subject` at 200, `evidence` at 1000; split a \
-        longer body across several messages. Returns `{ \"message_id\": ... }`; \
+        longer body across several messages. The limits count the scrubbed \
+        text, so a redaction can push text at a limit over it. \
+        Returns `{ \"message_id\": ... }`; \
         when a cap cut anything it also returns `truncated: true` and \
         `truncated_fields`, e.g. `{ \"body\": { \"original_chars\": 9000, \
         \"stored_chars\": 8000 } }`, so you can send the rest."
@@ -27334,6 +27343,41 @@ mod tests {
         );
     }
 
+    /// The list budget charges a separator between items, so items at exactly
+    /// the per-item cap fill it one short of budget / cap; the report must say
+    /// so rather than claim everything fit.
+    #[test]
+    fn handoff_list_budget_counts_separators_at_the_boundary() {
+        let items: Vec<String> = (0..4).map(|_| "x".repeat(HANDOFF_ITEM_MAX_CHARS)).collect();
+        let (_, kept) = cap_handoff_list(
+            &items,
+            HANDOFF_ITEM_MAX_CHARS,
+            HANDOFF_TEXT_LIST_MAX_CHARS,
+            "item",
+            "list",
+        );
+        assert_eq!(kept, 3);
+        assert_eq!(
+            list_truncation(&items, kept, HANDOFF_ITEM_MAX_CHARS),
+            Some(serde_json::json!({
+                "original_items": 4,
+                "stored_items": 3,
+                "original_chars": 4 * HANDOFF_ITEM_MAX_CHARS,
+                "stored_chars": 3 * HANDOFF_ITEM_MAX_CHARS,
+            }))
+        );
+
+        let files: Vec<String> = (0..8).map(|_| "f".repeat(HANDOFF_FILE_MAX_CHARS)).collect();
+        let (_, kept) = cap_handoff_list(
+            &files,
+            HANDOFF_FILE_MAX_CHARS,
+            HANDOFF_FILE_LIST_MAX_CHARS,
+            "file",
+            "files",
+        );
+        assert_eq!(kept, 7);
+    }
+
     #[tokio::test]
     async fn handoff_begin_without_truncation_keeps_response_shape() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
@@ -27457,7 +27501,12 @@ mod tests {
             assert!(send.contains(&format!("`{field}` at {cap}")), "{send}");
             assert!(field_doc(&send_schema, field).contains(&stated), "{field}");
         }
+        assert!(send.contains("count the scrubbed"), "{send}");
         let (begin, begin_schema) = tool("memory_handoff_begin");
+        assert!(
+            begin.contains("one separator char") && begin.contains("count the scrubbed text"),
+            "{begin}"
+        );
         for stated in [
             format!("`summary` {HANDOFF_SUMMARY_MAX_CHARS} chars"),
             format!("item {HANDOFF_ITEM_MAX_CHARS} chars"),

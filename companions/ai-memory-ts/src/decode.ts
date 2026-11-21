@@ -12,6 +12,7 @@ import type {
   ActivityWindow,
   AnsweredScope,
   ApiHandoff,
+  FieldTruncation,
   ApiPage,
   ApiSearchHit,
   Briefing,
@@ -97,6 +98,34 @@ export function bool(o: Raw, key: string, where: string): boolean {
     throw new ProtocolError(`${where}: field ${key} is missing or not a boolean`);
   }
   return value;
+}
+
+/**
+ * The optional `truncated` / `truncated_fields` report on a write result:
+ * both `undefined` when the server cut nothing.
+ */
+export function truncation(
+  o: Raw,
+  where: string,
+): {
+  truncated: boolean | undefined;
+  truncatedFields: Readonly<Record<string, FieldTruncation>> | undefined;
+} {
+  const truncated = typeof o["truncated"] === "boolean" ? o["truncated"] : undefined;
+  if (o["truncated_fields"] === undefined) return { truncated, truncatedFields: undefined };
+  const fields = record(o["truncated_fields"], `${where} truncated_fields`);
+  const truncatedFields: Record<string, FieldTruncation> = {};
+  for (const [name, value] of Object.entries(fields)) {
+    const f = record(value, `${where} truncated_fields.${name}`);
+    const at = `${where} truncated_fields.${name}`;
+    truncatedFields[name] = {
+      originalChars: num(f, "original_chars", at),
+      storedChars: num(f, "stored_chars", at),
+      originalItems: typeof f["original_items"] === "number" ? f["original_items"] : undefined,
+      storedItems: typeof f["stored_items"] === "number" ? f["stored_items"] : undefined,
+    };
+  }
+  return { truncated, truncatedFields };
 }
 
 /** An optional boolean, false when absent. */
