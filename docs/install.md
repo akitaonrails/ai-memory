@@ -3082,7 +3082,7 @@ No dedicated mise plugin or
 registry entry is required; the backend works against any repo whose
 release assets follow this naming convention. By default mise also holds back
 the very newest release for a short safety window
-([`minimum_release_age`](https://mise.jdx.dev/dev-tools/github-backend.html)),
+([`minimum_release_age`](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)),
 so a fresh tag may resolve to the previous version for a day or so; pin an
 exact tag with `mise use -g github:akitaonrails/ai-memory@1.30.0` to bypass
 that.
