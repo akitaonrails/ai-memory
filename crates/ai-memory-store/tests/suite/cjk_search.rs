@@ -553,3 +553,41 @@ async fn cjk_search_finds_a_word_written_with_the_iteration_mark() {
         "日々 degraded to a bare 日 character match: {paths:?}"
     );
 }
+
+
+#[tokio::test]
+async fn arabic_vocalized_and_indic_numerals_search_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "demo-project").await;
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "team-hr.md",
+            "خطة الموارد البشرية ٢٠٢٦",
+            "أَحْمَدُ المَنْصُورُ يقود مشروع إدارة المعرفة والتوثيق.",
+        ))
+        .await
+        .unwrap();
+
+    // Unvocalized search against vocalized Tashkeel content
+    let hits_name = store
+        .reader
+        .search_pages_for_project(ws, project, "احمد المنصور".into(), 10, None)
+        .await
+        .unwrap();
+    assert_eq!(hits_name.len(), 1);
+    assert_eq!(hits_name[0].path.as_str(), "team-hr.md");
+
+    // Bare Alef + ASCII digits against Hamza-Alef + Eastern Arabic-Indic digits
+    let hits_admin = store
+        .reader
+        .search_pages_for_project(ws, project, "ادارة 2026".into(), 10, None)
+        .await
+        .unwrap();
+    assert_eq!(hits_admin.len(), 1);
+    assert_eq!(hits_admin[0].path.as_str(), "team-hr.md");
+}

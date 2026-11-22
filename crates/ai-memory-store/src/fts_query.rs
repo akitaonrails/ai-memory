@@ -230,6 +230,56 @@ fn fts5_query_tokens(raw: &str) -> impl Iterator<Item = &str> {
 /// text out of the derived index, while the bigrams retain enough adjacency
 /// to avoid the very broad matches a character-only index would produce.
 #[must_use]
+pub(crate) fn is_arabic_or_indic_digit(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0600..=0x06FF
+            | 0x0750..=0x077F
+            | 0x08A0..=0x08FF
+            | 0xFB50..=0xFDFF
+            | 0xFE70..=0xFEFF
+    )
+}
+
+pub(crate) fn normalize_arabic_term(raw: &str) -> Option<String> {
+    if !raw.chars().any(is_arabic_or_indic_digit) {
+        return None;
+    }
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            // Strip Arabic Tashkeel (harakat), Tatweel (kashida), and BiDi controls
+            '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+            | '\u{06D6}'..='\u{06ED}'
+            | '\u{0640}'
+            | '\u{061C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}' => {}
+            // Normalize Alef variants to bare Alef
+            'أ' | 'إ' | 'آ' | 'ٱ' => out.push('ا'),
+            // Normalize Alef Maksura to Yeh, Teh Marbuta to Heh, Hamza carriers
+            'ى' => out.push('ي'),
+            'ة' => out.push('ه'),
+            'ؤ' => out.push('و'),
+            'ئ' => out.push('ي'),
+            // Convert Eastern Arabic-Indic (٠-٩) and Extended Arabic-Indic (۰-۹) digits to ASCII
+            '\u{0660}'..='\u{0669}' => {
+                let d = (ch as u32) - 0x0660;
+                out.push(char::from_u32(b'0' as u32 + d).unwrap_or(ch));
+            }
+            '\u{06F0}'..='\u{06F9}' => {
+                let d = (ch as u32) - 0x06F0;
+                out.push(char::from_u32(b'0' as u32 + d).unwrap_or(ch));
+            }
+            c if c.is_alphanumeric() => out.push(c),
+            _ => {}
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 pub(crate) fn cjk_index_terms(raw: &str) -> String {
     let mut terms = Vec::new();
     let mut run = Vec::new();
@@ -241,6 +291,11 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
         }
     }
     append_cjk_terms(&mut terms, &mut run);
+    for token in raw.split_whitespace() {
+        if let Some(norm) = normalize_arabic_term(token) {
+            terms.push(norm);
+        }
+    }
     terms.join(" ")
 }
 
@@ -296,6 +351,10 @@ pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
             }
         }
         append_cjk_query(&mut phrases, &mut run, column);
+        if let Some(norm) = normalize_arabic_term(text) {
+            let prefix = column.map_or_else(String::new, |c| format!("{c}:"));
+            phrases.push(format!("{prefix}\"{norm}\""));
+        }
     }
     (!phrases.is_empty()).then(|| phrases.join(" OR "))
 }

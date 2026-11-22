@@ -6633,7 +6633,7 @@ fn derive_open_questions(facts: &HandoffFacts, last_prompt: &Option<String>) -> 
     // Heuristic 1: last prompt is a question → it is the open question.
     if let Some(p) = last_prompt_obs {
         let body = p.body.trim();
-        if body.ends_with('?') || body.ends_with('？') {
+        if body.ends_with('?') || body.ends_with('？') || body.ends_with('؟') {
             return vec![format!("Unresolved question: {}", cap_handoff_text(body))];
         }
     }
@@ -6726,6 +6726,17 @@ fn is_acknowledgment(text: &str) -> bool {
         "明白",
         "了解",
         "可以的",
+        // Arabic acknowledgments.
+        "تمام",
+        "شكرا",
+        "شكراً",
+        "حسنا",
+        "حسناً",
+        "ممتاز",
+        "واضح",
+        "مفهوم",
+        "تم",
+        "طيب",
     ];
     if trimmed.chars().count() <= 20 && ACK_PHRASES.contains(&trimmed) {
         return true;
@@ -6743,7 +6754,7 @@ fn is_acknowledgment(text: &str) -> bool {
         // Any whitespace separates phrases: a multi-line "ok\nthanks" is
         // the same acknowledgment as "ok thanks".
         rest = rest.trim_start_matches(|c: char| {
-            c.is_whitespace() || matches!(c, ',' | '.' | '!' | '，' | '。' | '！')
+            c.is_whitespace() || matches!(c, ',' | '.' | '!' | '，' | '。' | '！' | '،' | '؛')
         });
         if rest.is_empty() {
             return true;
@@ -6752,11 +6763,11 @@ fn is_acknowledgment(text: &str) -> bool {
             .iter()
             .filter(|phrase| {
                 rest.strip_prefix(**phrase).is_some_and(|after| {
-                    !phrase.is_ascii()
+                    phrase.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
                         || !after
                             .chars()
                             .next()
-                            .is_some_and(|c| c.is_ascii_alphanumeric())
+                            .is_some_and(char::is_alphanumeric)
                 })
             })
             .max_by_key(|phrase| phrase.len());
@@ -29843,6 +29854,21 @@ pub(crate) mod tests {
         let last = None;
         let q = derive_open_questions(&obs, &last);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn open_questions_arabic_question_mark_and_ack_detected() {
+        let obs = vec![mk_obs(
+            ObservationKind::UserPrompt,
+            "q",
+            "هل يمكننا ترحيل قاعدة البيانات؟",
+        )];
+        let last = Some("هل يمكننا ترحيل قاعدة البيانات؟".to_string());
+        let qs = derive_open_questions(&obs, &last);
+        assert_eq!(qs, vec!["Unresolved question: هل يمكننا ترحيل قاعدة البيانات؟"]);
+        assert!(is_acknowledgment("تم، شكراً!"));
+        assert!(is_acknowledgment("تمام"));
+        assert!(!is_acknowledgment("تمكين المصادقة الثنائية"));
     }
 
     #[test]
