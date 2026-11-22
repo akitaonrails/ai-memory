@@ -905,6 +905,15 @@ async fn run_once_with_wiring(
         )
         .await;
     }
+    let (legacy_repo_fingerprint, legacy_worktree_fingerprint) = repository
+        .legacy_fingerprints
+        .as_ref()
+        .map_or((None, None), |legacy| {
+            (
+                Some(legacy.repo_fingerprint.clone()),
+                Some(legacy.worktree_fingerprint.clone()),
+            )
+        });
     let mut prepare = PrepareManagedRunRequest {
         project_id,
         workspace: workspace.clone(),
@@ -916,6 +925,8 @@ async fn run_once_with_wiring(
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint.clone(),
         worktree_fingerprint: repository.worktree_fingerprint.clone(),
+        legacy_repo_fingerprint,
+        legacy_worktree_fingerprint,
         agent: provisional_harness.agent_kind(),
         automatic_harness,
         available_agents: unique_auto_agents(&auto_candidates),
@@ -8628,6 +8639,8 @@ mod tests {
             cwd: "/tmp/project".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),
@@ -9111,6 +9124,8 @@ mod tests {
             cwd: "/tmp/project".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::ClaudeCode,
             automatic_harness: false,
             available_agents: Vec::new(),

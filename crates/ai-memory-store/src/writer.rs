@@ -37,9 +37,10 @@ use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::web_sessions::{self, WebSession};
 use crate::workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
-    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LegacyWorkstreamFingerprints,
+    LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
+    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    StoredWorkstreamSummary,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -895,6 +896,7 @@ pub(crate) enum WriteCmd {
     },
     PrepareWorkstreamRun {
         input: PrepareWorkstreamRun,
+        legacy: Option<LegacyWorkstreamFingerprints>,
         owner_user: Option<String>,
         force_unlock: bool,
         reply: oneshot::Sender<StoreResult<PreparedWorkstreamRun>>,
@@ -941,7 +943,18 @@ pub(crate) enum WriteCmd {
     },
     RenameWorkstream {
         input: RenameWorkstream,
+        legacy: Option<LegacyWorkstreamFingerprints>,
         reply: oneshot::Sender<StoreResult<RenamedWorkstream>>,
+    },
+    ListRecentWorkstreams {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        limit: usize,
+        offset: usize,
+        reply: oneshot::Sender<StoreResult<Vec<StoredWorkstreamSummary>>>,
     },
     AuthorizeProject {
         workspace_id: WorkspaceId,
@@ -3952,9 +3965,24 @@ impl WriterHandle {
         owner_user: Option<String>,
         force_unlock: bool,
     ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_with_legacy(input, None, owner_user, force_unlock)
+            .await
+    }
+
+    /// Select a workstream after migrating any legacy remote-seeded workstreams
+    /// onto the canonical fingerprints, optionally replacing this same
+    /// operator's active lease in the same writer transaction (#2423).
+    pub async fn prepare_workstream_run_with_legacy(
+        &self,
+        input: PrepareWorkstreamRun,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        owner_user: Option<String>,
+        force_unlock: bool,
+    ) -> StoreResult<PreparedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PrepareWorkstreamRun {
             input,
+            legacy,
             owner_user,
             force_unlock,
             reply: tx,
@@ -4124,9 +4152,51 @@ impl WriterHandle {
         &self,
         input: RenameWorkstream,
     ) -> StoreResult<RenamedWorkstream> {
+        self.rename_workstream_with_legacy(input, None).await
+    }
+
+    /// Retitle one checkout-local workstream after migrating any legacy
+    /// remote-seeded workstreams onto the canonical fingerprints (#2423).
+    pub async fn rename_workstream_with_legacy(
+        &self,
+        input: RenameWorkstream,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+    ) -> StoreResult<RenamedWorkstream> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::RenameWorkstream { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::RenameWorkstream {
+            input,
+            legacy,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Migrate any legacy remote-seeded workstreams onto the canonical
+    /// fingerprints and list one bounded page for that checkout (#2423).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn recent_workstreams_page_migrating(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ListRecentWorkstreams {
+            workspace_id,
+            project_id,
+            repo_fingerprint,
+            worktree_fingerprint,
+            legacy,
+            limit,
+            offset,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -5618,13 +5688,15 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             }
             WriteCmd::PrepareWorkstreamRun {
                 input,
+                legacy,
                 owner_user,
                 force_unlock,
                 reply,
             } => {
-                let result = crate::workstream::prepare_run(
+                let result = crate::workstream::prepare_run_with_legacy(
                     &mut conn,
                     &input,
+                    legacy.as_ref(),
                     owner_user.as_deref(),
                     force_unlock,
                 );
@@ -5749,9 +5821,36 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 };
                 send_or_warn(reply, result, "finish_workstream_run");
             }
-            WriteCmd::RenameWorkstream { input, reply } => {
-                let result = crate::workstream::rename(&mut conn, &input);
+            WriteCmd::RenameWorkstream {
+                input,
+                legacy,
+                reply,
+            } => {
+                let result =
+                    crate::workstream::rename_with_legacy(&mut conn, &input, legacy.as_ref());
                 send_or_warn(reply, result, "rename_workstream");
+            }
+            WriteCmd::ListRecentWorkstreams {
+                workspace_id,
+                project_id,
+                repo_fingerprint,
+                worktree_fingerprint,
+                legacy,
+                limit,
+                offset,
+                reply,
+            } => {
+                let result = crate::workstream::list_recent_migrating(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &repo_fingerprint,
+                    &worktree_fingerprint,
+                    legacy.as_ref(),
+                    limit,
+                    offset,
+                );
+                send_or_warn(reply, result, "list_recent_workstreams");
             }
         }
     }

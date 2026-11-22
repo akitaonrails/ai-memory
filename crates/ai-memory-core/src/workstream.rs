@@ -239,6 +239,14 @@ pub struct PrepareManagedRunRequest {
     pub repo_fingerprint: String,
     /// Stable worktree identity hash (distinct across linked worktrees).
     pub worktree_fingerprint: String,
+    /// Optional legacy remote-seeded repository fingerprint for transparent
+    /// migration of workstreams created before remote decoupling (#2423).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_repo_fingerprint: Option<String>,
+    /// Optional legacy remote-seeded worktree fingerprint paired with
+    /// `legacy_repo_fingerprint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_worktree_fingerprint: Option<String>,
     /// Harness being launched.
     pub agent: AgentKind,
     /// Resolve the harness from the established workstream when possible.
@@ -415,6 +423,14 @@ pub struct ListManagedWorkstreamsRequest {
     pub repo_fingerprint: String,
     /// Stable worktree identity hash (distinct across linked worktrees).
     pub worktree_fingerprint: String,
+    /// Optional legacy remote-seeded repository fingerprint for transparent
+    /// migration of workstreams created before remote decoupling (#2423).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_repo_fingerprint: Option<String>,
+    /// Optional legacy remote-seeded worktree fingerprint paired with
+    /// `legacy_repo_fingerprint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_worktree_fingerprint: Option<String>,
     /// Maximum number of workstreams to return.
     pub limit: usize,
     /// Number of workstreams to skip in the same stable checkout-local order.
@@ -487,6 +503,14 @@ pub struct RenameManagedWorkstreamRequest {
     pub repo_fingerprint: String,
     /// Stable worktree identity hash (distinct across linked worktrees).
     pub worktree_fingerprint: String,
+    /// Optional legacy remote-seeded repository fingerprint for transparent
+    /// migration of workstreams created before remote decoupling (#2423).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_repo_fingerprint: Option<String>,
+    /// Optional legacy remote-seeded worktree fingerprint paired with
+    /// `legacy_repo_fingerprint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_worktree_fingerprint: Option<String>,
     /// Current name of the workstream to retitle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,

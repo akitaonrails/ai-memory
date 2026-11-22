@@ -11,7 +11,9 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use ai_memory_core::ManagedProjectScope;
-use ai_memory_workstream::inspect_repository_fingerprints;
+use ai_memory_workstream::{
+    inspect_repository_fingerprints, inspect_repository_fingerprints_with_legacy,
+};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -129,7 +131,8 @@ pub(super) fn project_binding_for_server(
     let canonical = path
         .canonicalize()
         .context(i18n.text("cli-project-registry-canonicalizing-project-binding-checkout"))?;
-    let fingerprints = inspect_repository_fingerprints(&canonical)?;
+    let (fingerprints, legacy_fingerprints) =
+        inspect_repository_fingerprints_with_legacy(&canonical)?;
     let registry = match load_registry(&registry_path(config)) {
         Ok(registry) => registry,
         Err(error) => {
@@ -147,19 +150,53 @@ pub(super) fn project_binding_for_server(
             return Ok(None);
         }
     };
-    Ok(registry
-        .bindings
-        .into_iter()
-        .find(|binding| {
-            binding.server == server
-                && binding.workspace == workspace
-                && (binding.requested_project == project || binding.scope.project == project)
-                && binding.scope.workspace == workspace
-                && binding.path == canonical
-                && binding.repo_fingerprint == fingerprints.repo_fingerprint
-                && binding.worktree_fingerprint == fingerprints.worktree_fingerprint
-        })
-        .map(|binding| binding.scope))
+    let matches_scope = |binding: &CheckoutBinding| {
+        binding.server == server
+            && binding.workspace == workspace
+            && (binding.requested_project == project || binding.scope.project == project)
+            && binding.scope.workspace == workspace
+            && binding.path == canonical
+    };
+    if let Some(binding) = registry.bindings.iter().find(|binding| {
+        matches_scope(binding)
+            && binding.repo_fingerprint == fingerprints.repo_fingerprint
+            && binding.worktree_fingerprint == fingerprints.worktree_fingerprint
+    }) {
+        return Ok(Some(binding.scope.clone()));
+    }
+    if let Some(legacy) = legacy_fingerprints
+        && let Some(matched_scope) = registry
+            .bindings
+            .iter()
+            .find(|binding| {
+                matches_scope(binding)
+                    && binding.repo_fingerprint == legacy.repo_fingerprint
+                    && binding.worktree_fingerprint == legacy.worktree_fingerprint
+            })
+            .map(|binding| binding.scope.clone())
+    {
+        // Refresh the stored binding to canonical fingerprints so future
+        // remote edits keep hitting the binding (#2423).
+        let _ = update_registry(config, |registry| {
+            let mut updated = false;
+            for binding in &mut registry.bindings {
+                if binding.server == server
+                    && binding.workspace == workspace
+                    && binding.scope.workspace == workspace
+                    && binding.path == canonical
+                    && binding.repo_fingerprint == legacy.repo_fingerprint
+                    && binding.worktree_fingerprint == legacy.worktree_fingerprint
+                {
+                    binding.repo_fingerprint = fingerprints.repo_fingerprint.clone();
+                    binding.worktree_fingerprint = fingerprints.worktree_fingerprint.clone();
+                    updated = true;
+                }
+            }
+            Ok(updated)
+        });
+        return Ok(Some(matched_scope));
+    }
+    Ok(None)
 }
 
 /// Persist only a server-confirmed scope or an explicit authorized selection.
@@ -665,12 +702,21 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // Changing the origin remote URL must NOT invalidate the checkout binding (#2423).
         git(&[
             "remote",
             "set-url",
             "origin",
             "https://example.test/other/api.git",
         ]);
+        assert_eq!(
+            project_binding(&reloaded, &server, "default", "api", &checkout).unwrap(),
+            Some(scope.clone())
+        );
+        // Replacing the git repository identity (e.g. removing .git) still invalidates it.
+        let git_dir = checkout.join(".git");
+        let stashed_git = tmp.path().join("stashed-git");
+        fs::rename(&git_dir, &stashed_git).unwrap();
         assert!(
             project_binding(&reloaded, &server, "default", "api", &checkout)
                 .unwrap()
@@ -682,12 +728,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(registry_path(&config)).unwrap(), before);
-        git(&[
-            "remote",
-            "set-url",
-            "origin",
-            "https://example.test/acme/api.git",
-        ]);
+        fs::rename(&stashed_git, &git_dir).unwrap();
         let replacement = ManagedProjectScope {
             project_id: ai_memory_core::ProjectId::new(),
             ..scope
@@ -711,6 +752,97 @@ mod tests {
                 .bindings
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn project_binding_survives_origin_changes_and_refreshes_legacy_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&checkout)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        let config = config_at(&tmp.path().join("data"));
+        let server = endpoint("http://memory:49374");
+        let scope = ManagedProjectScope {
+            workspace_id: ai_memory_core::WorkspaceId::new(),
+            project_id: ai_memory_core::ProjectId::new(),
+            workspace: "default".into(),
+            project: "acme-api".into(),
+        };
+
+        // 1. Canonical binding recorded before `origin` exists survives add, set-url, remove.
+        let initial_fps = inspect_repository_fingerprints(&checkout).unwrap();
+        record_project_binding(
+            &config,
+            &server,
+            "acme-api",
+            &checkout,
+            &scope,
+            &initial_fps,
+        )
+        .unwrap();
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://git.example.invalid/acme/api.git",
+        ]);
+        assert_eq!(
+            project_binding(&config, &server, "default", "acme-api", &checkout).unwrap(),
+            Some(scope.clone())
+        );
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "git@git.example.invalid:acme/api.git",
+        ]);
+        assert_eq!(
+            project_binding(&config, &server, "default", "acme-api", &checkout).unwrap(),
+            Some(scope.clone())
+        );
+
+        // 2. Legacy remote-seeded binding (from pre-#2423 binaries) matches and refreshes to canonical.
+        let (canonical_fps, legacy_fps) =
+            inspect_repository_fingerprints_with_legacy(&checkout).unwrap();
+        let legacy_fps = legacy_fps.expect("origin should yield legacy fingerprints");
+        update_registry(&config, |registry| {
+            registry.bindings[0].repo_fingerprint = legacy_fps.repo_fingerprint.clone();
+            registry.bindings[0].worktree_fingerprint = legacy_fps.worktree_fingerprint.clone();
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(
+            project_binding(&config, &server, "default", "acme-api", &checkout).unwrap(),
+            Some(scope.clone())
+        );
+        let refreshed = load_registry(&registry_path(&config)).unwrap();
+        assert_eq!(
+            refreshed.bindings[0].repo_fingerprint,
+            canonical_fps.repo_fingerprint
+        );
+        assert_eq!(
+            refreshed.bindings[0].worktree_fingerprint,
+            canonical_fps.worktree_fingerprint
+        );
+        // Subsequent origin removal still hits the refreshed canonical binding.
+        git(&["remote", "remove", "origin"]);
+        assert_eq!(
+            project_binding(&config, &server, "default", "acme-api", &checkout).unwrap(),
+            Some(scope)
         );
     }
 

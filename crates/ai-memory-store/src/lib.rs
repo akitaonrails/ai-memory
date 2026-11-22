@@ -144,10 +144,10 @@ pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_toke
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
     ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
-    LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
-    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    LegacyWorkstreamFingerprints, LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession,
+    ManagedRunAuthority, ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink,
+    NativeSessionHolder, OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
     WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
@@ -9292,6 +9292,300 @@ mod tests {
                 "name {bad:?} should be rejected, got {failure:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_workstream_fingerprints_migrate_on_select_list_and_rename() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-legacy-migration").await;
+
+        let legacy = || LegacyWorkstreamFingerprints {
+            repo_fingerprint: "legacy-repo".into(),
+            worktree_fingerprint: "legacy-tree".into(),
+        };
+        let prepare_on =
+            |repo: &str, tree: &str, selection: WorkstreamSelection| PrepareWorkstreamRun {
+                scope_by_id: false,
+                repo_fingerprint: repo.into(),
+                worktree_fingerprint: tree.into(),
+                selection,
+                ..managed_prepare_input(ws, proj, "test:1")
+            };
+
+        // 1. Seed a legacy workstream, then select it via Named on canonical fingerprints.
+        let legacy_named = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo",
+                "legacy-tree",
+                WorkstreamSelection::New("feature-a".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_named.run_id)
+            .await
+            .unwrap();
+
+        let migrated_named = store
+            .writer
+            .prepare_workstream_run_with_legacy(
+                prepare_on(
+                    "canonical-repo",
+                    "canonical-tree",
+                    WorkstreamSelection::Named("feature-a".into()),
+                ),
+                Some(legacy()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(migrated_named.workstream_id, legacy_named.workstream_id);
+        assert_eq!(migrated_named.workstream_name, "feature-a");
+        store
+            .writer
+            .cancel_managed_run(migrated_named.run_id)
+            .await
+            .unwrap();
+
+        // After migration, canonical queries without legacy aliases find it directly.
+        let canonical_list = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo".into(),
+                "canonical-tree".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(canonical_list.len(), 1);
+        assert_eq!(canonical_list[0].workstream_id, legacy_named.workstream_id);
+
+        // 2. Seed another legacy workstream in a fresh checkout key, then migrate via Current.
+        let legacy_current = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-2",
+                "legacy-tree-2",
+                WorkstreamSelection::New("wip".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_current.run_id)
+            .await
+            .unwrap();
+
+        let migrated_current = store
+            .writer
+            .prepare_workstream_run_with_legacy(
+                prepare_on(
+                    "canonical-repo-2",
+                    "canonical-tree-2",
+                    WorkstreamSelection::Current,
+                ),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-2".into(),
+                    worktree_fingerprint: "legacy-tree-2".into(),
+                }),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(migrated_current.workstream_id, legacy_current.workstream_id);
+        assert_eq!(migrated_current.workstream_name, "wip");
+        store
+            .writer
+            .cancel_managed_run(migrated_current.run_id)
+            .await
+            .unwrap();
+
+        // 3. Seed a legacy workstream and migrate via list_recent_migrating.
+        let legacy_listed = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-3",
+                "legacy-tree-3",
+                WorkstreamSelection::New("listed".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_listed.run_id)
+            .await
+            .unwrap();
+
+        let listed = store
+            .writer
+            .recent_workstreams_page_migrating(
+                ws,
+                proj,
+                "canonical-repo-3".into(),
+                "canonical-tree-3".into(),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-3".into(),
+                    worktree_fingerprint: "legacy-tree-3".into(),
+                }),
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].workstream_id, legacy_listed.workstream_id);
+        // Verify persisted under canonical coordinates.
+        let persisted = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo-3".into(),
+                "canonical-tree-3".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].workstream_id, legacy_listed.workstream_id);
+
+        // 4. Seed a legacy workstream and migrate via rename_with_legacy.
+        let legacy_renamed = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-4",
+                "legacy-tree-4",
+                WorkstreamSelection::New("old-name".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_renamed.run_id)
+            .await
+            .unwrap();
+
+        let renamed = store
+            .writer
+            .rename_workstream_with_legacy(
+                RenameWorkstream {
+                    workspace_id: ws,
+                    project_id: proj,
+                    repo_fingerprint: "canonical-repo-4".into(),
+                    worktree_fingerprint: "canonical-tree-4".into(),
+                    selector: WorkstreamSelector::Name("old-name".into()),
+                    new_name: "new-name".into(),
+                },
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-4".into(),
+                    worktree_fingerprint: "legacy-tree-4".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.workstream_id, legacy_renamed.workstream_id);
+        assert_eq!(renamed.from, "old-name");
+        assert_eq!(renamed.to, "new-name");
+        let after_rename = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo-4".into(),
+                "canonical-tree-4".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_rename.len(), 1);
+        assert_eq!(after_rename[0].name, "new-name");
+    }
+
+    #[tokio::test]
+    async fn legacy_workstream_migration_disambiguates_name_collisions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-legacy-collision").await;
+
+        let prepare_on =
+            |repo: &str, tree: &str, selection: WorkstreamSelection| PrepareWorkstreamRun {
+                scope_by_id: false,
+                repo_fingerprint: repo.into(),
+                worktree_fingerprint: tree.into(),
+                selection,
+                ..managed_prepare_input(ws, proj, "test:1")
+            };
+
+        let legacy_ws = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo",
+                "legacy-tree",
+                WorkstreamSelection::New("default".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_ws.run_id)
+            .await
+            .unwrap();
+
+        let canonical_ws = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "canonical-repo",
+                "canonical-tree",
+                WorkstreamSelection::New("default".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(canonical_ws.run_id)
+            .await
+            .unwrap();
+
+        let listed = store
+            .writer
+            .recent_workstreams_page_migrating(
+                ws,
+                proj,
+                "canonical-repo".into(),
+                "canonical-tree".into(),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo".into(),
+                    worktree_fingerprint: "legacy-tree".into(),
+                }),
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2, "both colliding workstreams must be kept");
+
+        let kept_canonical = listed
+            .iter()
+            .find(|row| row.workstream_id == canonical_ws.workstream_id)
+            .expect("canonical workstream must remain intact");
+        assert_eq!(kept_canonical.name, "default");
+
+        let kept_legacy = listed
+            .iter()
+            .find(|row| row.workstream_id == legacy_ws.workstream_id)
+            .expect("legacy workstream must be preserved with disambiguated name");
+        assert!(
+            kept_legacy.name.starts_with("default-legacy-"),
+            "unexpected disambiguated name: {}",
+            kept_legacy.name
+        );
     }
 
     #[tokio::test]
