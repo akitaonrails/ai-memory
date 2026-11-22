@@ -18,7 +18,7 @@ use ai_memory_core::SessionId;
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
 use super::api::session_owner_filter_for;
@@ -99,13 +99,14 @@ pub(crate) async fn handler(
         .limit
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE);
+    let offset = query.offset.unwrap_or(0);
     let page = match state
         .reader
         .retrieval_history_page(
             scope.workspace_id,
             scope.project_id,
             session_id,
-            i64::try_from(query.offset.unwrap_or(0)).unwrap_or(i64::MAX),
+            i64::try_from(offset).unwrap_or(i64::MAX),
             i64::try_from(limit).unwrap_or(i64::MAX),
         )
         .await
@@ -116,7 +117,14 @@ pub(crate) async fn handler(
 
     let total = u64::try_from(page.total).unwrap_or(0);
     let total_usize = usize::try_from(page.total).unwrap_or(usize::MAX);
-    let offset = query.offset.unwrap_or(0).min(total_usize.saturating_sub(1));
+    let last_offset = total_usize.saturating_sub(1) / limit * limit;
+    if total_usize > 0 && offset >= total_usize {
+        // Retention may have made a previously valid bookmark stale. Use this
+        // snapshot's total and a query-only location to keep the mount path.
+        return Redirect::temporary(&format!("?offset={last_offset}&limit={limit}"))
+            .into_response();
+    }
+    let offset = offset.min(total_usize);
     let shown = page.records.len();
     let records: Vec<RetrievalRecordRow> = page
         .records
@@ -156,7 +164,6 @@ pub(crate) async fn handler(
 
     let base = retrievals_href(&workspace, &project, &session_id.to_string());
     let page_link = |offset: usize| format!("{base}?offset={offset}&limit={limit}");
-    let last_offset = total_usize.saturating_sub(1) / limit * limit;
     let view = RetrievalHistoryView {
         i18n: i18n.clone(),
         workspace: workspace.clone(),
