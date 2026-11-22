@@ -826,6 +826,15 @@ pub fn discover_assets(
         let kimi_dir = cwd.join(crate::commands::install_mcp::kimi_code_home(
             std::env::var_os("KIMI_CODE_HOME"),
         )?);
+        push_if_file(
+            &mut assets,
+            AgentKind::KimiCode,
+            AgentAssetKind::McpConfig,
+            AgentAssetScope::Global,
+            kimi_dir.join("config.toml"),
+            ".kimi-code/config.toml",
+            "kimi-code/config.toml",
+        );
         let legacy_dir = home.join(".kimi");
         for (dir, name) in [(&kimi_dir, "kimi-code"), (&legacy_dir, "kimi")] {
             // An override can point at the legacy directory. Archive it once

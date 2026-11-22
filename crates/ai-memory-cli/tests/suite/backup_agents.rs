@@ -696,7 +696,7 @@ fn restore_agents_limits_copilot_destinations_to_skill_roots() {
 }
 
 #[test]
-fn kimi_code_backup_round_trips_mcp_config_and_skills() {
+fn kimi_code_backup_round_trips_mcp_hooks_and_skills() {
     let _guard = cli_test_lock();
     for (source_dir, restore_dir) in [
         (".kimi-code", ".kimi-code"),
@@ -732,6 +732,37 @@ fn kimi_code_backup_round_trips_mcp_config_and_skills() {
                 .unwrap()
                 .contains(token)
         );
+        let hook_config = kimi_home.join("config.toml");
+        fs::write(
+            &hook_config,
+            format!(
+                "default_model = \"fixture-model\"\n\n[providers.fixture]\napi_key = \"{token}\"\n"
+            ),
+        )
+        .unwrap();
+        let hooks_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../hooks");
+        let hooks = command()
+            .args([
+                "install-hooks",
+                "--agent",
+                "kimi-code",
+                "--apply",
+                "--hooks-dir",
+            ])
+            .arg(hooks_dir)
+            .args(["--server-url", "http://127.0.0.1:49374"])
+            .output()
+            .unwrap();
+        assert_success(&hooks, "install hook config");
+        let installed_toml = fs::read_to_string(hook_config)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let installed_hooks = installed_toml["hooks"].as_array_of_tables().unwrap();
+        assert!(!installed_hooks.is_empty());
+        let credentials = kimi_home.join("credentials");
+        fs::create_dir_all(&credentials).unwrap();
+        fs::write(credentials.join("fixture.json"), "{}").unwrap();
         let skill = kimi_home.join("skills/current/SKILL.md");
         fs::create_dir_all(skill.parent().unwrap()).unwrap();
         fs::write(&skill, "# Current Kimi skill").unwrap();
@@ -765,6 +796,21 @@ fn kimi_code_backup_round_trips_mcp_config_and_skills() {
             mcp["mcpServers"]["ai-memory"]["url"],
             "http://127.0.0.1:49374/mcp?flavor=moonshot"
         );
+        let restored_config = fs::read_to_string(restored_kimi_home.join("config.toml")).unwrap();
+        assert!(!restored_config.contains(token));
+        let restored_toml = restored_config.parse::<toml_edit::DocumentMut>().unwrap();
+        let restored_hooks = restored_toml["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(restored_hooks.to_string(), installed_hooks.to_string());
+        assert_eq!(
+            restored_toml["default_model"].as_str(),
+            Some("fixture-model")
+        );
+        assert!(
+            restored_toml["providers"]["fixture"]["api_key"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("[REDACTED"))
+        );
+        assert!(!restored_kimi_home.join("credentials").exists());
         assert_eq!(
             fs::read_to_string(restored_kimi_home.join("skills/current/SKILL.md")).unwrap(),
             "# Current Kimi skill"
