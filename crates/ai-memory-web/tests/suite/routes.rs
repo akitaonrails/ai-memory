@@ -5660,6 +5660,55 @@ async fn api_recent_incremental_paginates_over_120_pages_and_binds_cursor() {
 }
 
 #[tokio::test]
+async fn api_recent_incremental_continues_after_a_long_nested_path() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let directory = "section".repeat(16) + "/";
+    let long_path = format!("docs/{}first.md", directory.repeat(20));
+    assert!(long_path.len() > 2048);
+    // Seed via the writer so the cursor regression does not depend on the
+    // host filesystem supporting this total path length.
+    for path in [long_path.as_str(), "other.md"] {
+        store
+            .writer
+            .upsert_page(new_page(ws, proj, path, "Page", "Body"))
+            .await
+            .unwrap();
+    }
+
+    let app = api_router(store.reader.clone(), wiki);
+    let base = "/workspaces/default/projects/scratch/recent";
+    let (status, body) = get_body(
+        &app,
+        &format!("{base}?updated_since=2000-01-01T00:00:00Z&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first: Value = serde_json::from_str(&body).unwrap();
+    let pages = first["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["path"], long_path);
+    let cursor = first["next_cursor"].as_str().unwrap();
+
+    let (status, body) = get_body(&app, &format!("{base}?cursor={cursor}&limit=1")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let last: Value = serde_json::from_str(&body).unwrap();
+    let pages = last["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0]["path"], "other.md");
+    assert_eq!(last["next_cursor"], Value::Null);
+}
+
+#[tokio::test]
 async fn api_recent_incremental_rechecks_restricted_scope_on_cursor() {
     use ai_memory_core::{AuthorizedViewer, NewUser, UserRole};
     use ai_memory_store::{AccessMode, GrantLevel};

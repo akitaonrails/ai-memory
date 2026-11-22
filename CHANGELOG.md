@@ -17,6 +17,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `doctor`, so it can read home markers and harness stores instead of
   reporting an invalid home route map when access is denied. (#2403)
 
+- Fixed incremental page listing when a long nested wiki path fits in the
+  cursor but falls on a page boundary. (#2408)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
