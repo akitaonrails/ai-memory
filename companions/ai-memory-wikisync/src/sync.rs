@@ -430,6 +430,7 @@ async fn run_batch(
             .read_page(&args.workspace, &args.project, &page.path, etag_hint)
             .await?;
         let mut body = read.page.as_ref().map(render_page).transpose()?;
+        let mut etag = read.etag;
         let mut page_id = read.page.as_ref().and_then(|page| page.id.clone());
         let mut decision = classify(
             disk.as_deref(),
@@ -443,6 +444,7 @@ async fn run_batch(
                 .read_page(&args.workspace, &args.project, &page.path, None)
                 .await?;
             body = refetch.page.as_ref().map(render_page).transpose()?;
+            etag = refetch.etag;
             page_id = refetch.page.as_ref().and_then(|page| page.id.clone());
             decision = classify(
                 disk.as_deref(),
@@ -456,10 +458,7 @@ async fn run_batch(
             page,
             disk.as_deref(),
             body,
-            Versions {
-                etag: read.etag,
-                page_id,
-            },
+            Versions { etag, page_id },
             decision,
             args.force,
         )?;

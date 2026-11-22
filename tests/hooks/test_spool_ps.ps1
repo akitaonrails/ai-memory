@@ -229,6 +229,69 @@ try {
     $contacted.Dispose()
 }
 
+# 10. Windows: a spool directory this bundle creates must not inherit a read
+#     grant from the folder above the data dir (#2396 follow-up). The fixture
+#     grants the built-in Users group (S-1-5-32-545) inherited read on a temp
+#     root, the way a sandbox group's grant on %LOCALAPPDATA% reaches it.
+$windowsChecks = 0
+if (Test-AiMemoryWindows) {
+    $usersSid = "S-1-5-32-545"
+    $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    function Get-ProbeSids([string] $Path) {
+        return @((Get-Acl -LiteralPath $Path).Access | ForEach-Object {
+            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        })
+    }
+    $aclRoot = Join-Path $root "acl"
+    New-Item -ItemType Directory -Force -Path $aclRoot | Out-Null
+    & icacls.exe $aclRoot /grant "*${usersSid}:(OI)(CI)R" | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) "fixture grant applied"
+
+    # Control: an ordinary file under the root does receive the grant.
+    $control = Join-Path $aclRoot "control.txt"
+    [IO.File]::WriteAllText($control, "x")
+    Assert-True ((Get-ProbeSids $control) -contains $usersSid) "control file inherits the Users grant"
+
+    # A fresh data dir and spool dir, created by the spool writer itself.
+    $env:AI_MEMORY_DATA_DIR = Join-Path $aclRoot "data"
+    $env:AI_MEMORY_AUTH_TOKEN = "probe-bearer"
+    Write-AiMemorySpoolEvent -Url $RefusedUrl -Body '{"e":"acl"}'
+    Remove-Item Env:\AI_MEMORY_AUTH_TOKEN -ErrorAction SilentlyContinue
+    $aclSpool = Get-AiMemorySpoolDir
+    $aclEntry = @(Get-ChildItem -LiteralPath $aclSpool -Filter "*.json" -File)
+    Assert-True ($aclEntry.Count -eq 1) "entry written under a granted root"
+    foreach ($p in @($env:AI_MEMORY_DATA_DIR, $aclSpool, $aclEntry[0].FullName)) {
+        $sids = Get-ProbeSids $p
+        Assert-True (-not ($sids -contains $usersSid)) "no Users grant on $p"
+        Assert-True ($sids -contains $mySid) "owner keeps access to $p"
+    }
+    Assert-True ((Get-Acl -LiteralPath $aclSpool).AreAccessRulesProtected) "spool dir does not inherit"
+    Assert-True (@(Get-ChildItem -LiteralPath $aclRoot -Filter "*.tmp" -Force).Count -eq 0) "no staging dir left in the root"
+    Assert-True (@(Get-ChildItem -LiteralPath $env:AI_MEMORY_DATA_DIR -Filter "*.tmp" -Force).Count -eq 0) "no staging dir left in the data dir"
+
+    # An existing spool dir keeps its list, like the native writer: never
+    # widened, never narrowed.
+    $env:AI_MEMORY_DATA_DIR = Join-Path $aclRoot "existing"
+    New-Item -ItemType Directory -Force -Path (Get-AiMemorySpoolDir) | Out-Null
+    Write-AiMemorySpoolEvent -Url $RefusedUrl -Body '{"e":"existing"}'
+    Assert-True ((Get-ProbeSids (Get-AiMemorySpoolDir)) -contains $usersSid) "existing spool dir is not narrowed"
+    Assert-True (@(Get-ChildItem -LiteralPath (Get-AiMemorySpoolDir) -Filter "*.json" -File).Count -eq 1) "existing spool dir still takes entries"
+
+    # When the directory cannot be made private, nothing is spooled and no
+    # wide directory is left behind for a later write to reuse.
+    $env:AI_MEMORY_DATA_DIR = Join-Path $aclRoot "unrestrictable"
+    $savedRoot = $env:SystemRoot
+    $env:SystemRoot = Join-Path $root "no-such-windows"
+    try {
+        Write-AiMemorySpoolEvent -Url $RefusedUrl -Body '{"e":"refused"}'
+    } finally {
+        $env:SystemRoot = $savedRoot
+    }
+    Assert-True (-not (Test-Path -LiteralPath $env:AI_MEMORY_DATA_DIR)) "failed restriction leaves no data dir"
+    Assert-True (@(Get-ChildItem -LiteralPath $aclRoot -Filter "unrestrictable*" -Force).Count -eq 0) "failed restriction leaves no staging dir"
+    $windowsChecks = 16
+}
+
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
-Write-Output "spool ps behavioral probe: ok checks=31"
+Write-Output "spool ps behavioral probe: ok checks=$(31 + $windowsChecks)"
 exit 0

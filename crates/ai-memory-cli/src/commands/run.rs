@@ -171,6 +171,14 @@ pub(crate) struct ExecutableSearch<'a> {
     extensions: Option<&'a OsStr>,
 }
 
+impl<'a> ExecutableSearch<'a> {
+    /// Search over an explicit `PATH` and `PATHEXT`, for callers that hold
+    /// the captured process environment rather than an [`EffectiveEnv`].
+    pub(crate) fn new(path: Option<&'a OsStr>, extensions: Option<&'a OsStr>) -> Self {
+        Self { path, extensions }
+    }
+}
+
 const AUTO_HARNESSES: [ManagedHarness; 9] = [
     ManagedHarness::Claude,
     ManagedHarness::Codex,
@@ -905,6 +913,15 @@ async fn run_once_with_wiring(
         )
         .await;
     }
+    let (legacy_repo_fingerprint, legacy_worktree_fingerprint) = repository
+        .legacy_fingerprints
+        .as_ref()
+        .map_or((None, None), |legacy| {
+            (
+                Some(legacy.repo_fingerprint.clone()),
+                Some(legacy.worktree_fingerprint.clone()),
+            )
+        });
     let mut prepare = PrepareManagedRunRequest {
         project_id,
         workspace: workspace.clone(),
@@ -916,12 +933,15 @@ async fn run_once_with_wiring(
         cwd: repository.cwd.to_string_lossy().into_owned(),
         repo_fingerprint: repository.repo_fingerprint.clone(),
         worktree_fingerprint: repository.worktree_fingerprint.clone(),
+        legacy_repo_fingerprint,
+        legacy_worktree_fingerprint,
         agent: provisional_harness.agent_kind(),
         automatic_harness,
         available_agents: unique_auto_agents(&auto_candidates),
         workstream: args.workstream,
         new_workstream: args.new_workstream,
         force_unlock,
+        fresh: force_fresh,
         lease_owner: lease_owner(),
         repository_identity: project_id
             .is_none()
@@ -5066,7 +5086,7 @@ async fn claude_background_attach_id(
 /// to spawn with "program not found". Resolving to the concrete file keeps the
 /// availability check and the launch agreeing on one answer, and lets the
 /// launch use a path that works.
-pub(super) fn resolve_program(
+pub(crate) fn resolve_program(
     program: &OsStr,
     search: ExecutableSearch<'_>,
 ) -> Option<std::path::PathBuf> {
@@ -8628,12 +8648,15 @@ mod tests {
             cwd: "/tmp/project".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
             force_unlock: false,
+            fresh: false,
             lease_owner: "workstation:43".into(),
             repository_identity: None,
         };
@@ -9111,12 +9134,15 @@ mod tests {
             cwd: "/tmp/project".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::ClaudeCode,
             automatic_harness: false,
             available_agents: Vec::new(),
             workstream: None,
             new_workstream: None,
             force_unlock: false,
+            fresh: false,
             lease_owner: "workstation:43".into(),
             repository_identity: None,
         }
@@ -12611,6 +12637,101 @@ mod tests {
         }
         assert_eq!(requests[2].project, "override");
         assert!(requests[2].project_id.is_none());
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_run_fresh_sends_fresh_flag_and_does_not_prefill_native_session() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<PrepareManagedRunRequest>::new()));
+        let linked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/workstream/runs",
+                post({
+                    let requests = requests.clone();
+                    move |axum::Json(request): axum::Json<PrepareManagedRunRequest>| {
+                        let requests = requests.clone();
+                        async move {
+                            let native_session_id =
+                                (!request.fresh).then(|| "prior-codex-thread".to_owned());
+                            requests.lock().unwrap().push(request);
+                            axum::Json(PrepareManagedRunResponse {
+                                resolved_project: None,
+                                workstream_id: WorkstreamId::new(),
+                                workstream_name: "default".into(),
+                                run_id: ManagedRunId::new(),
+                                resolved_agent: Some(AgentKind::Codex),
+                                native_session_id,
+                                source_cursor: None,
+                                previous_native_session: None,
+                                sync_after: 0,
+                                sync_through: 0,
+                                may_adopt_existing_session: false,
+                                manifest_warning: None,
+                            })
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/link",
+                post({
+                    let linked = linked.clone();
+                    move || {
+                        let linked = linked.clone();
+                        async move {
+                            linked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/workstream/runs/{run_id}/finish",
+                post(|| async {
+                    axum::Json(FinishManagedRunResponse {
+                        imported_events: 0,
+                        latest_sequence: 0,
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (script, _captured) = capture_env_script(repo.path(), "AI_MEMORY_RUN_ID");
+        let mut config = launch_config(home.path(), data.path(), address);
+        config.run_autowire = false;
+
+        let mut args = run_args(RunHarnessChoice::Codex, script.clone(), Vec::new(), &[]);
+        args.fresh = true;
+        args.no_autowire = true;
+        args.no_exit_prompt = true;
+        assert_eq!(run_from(&config, args, repo.path()).await.unwrap(), 0);
+
+        let mut trailing_args = run_args(RunHarnessChoice::Codex, script, Vec::new(), &["--fresh"]);
+        trailing_args.no_autowire = true;
+        trailing_args.no_exit_prompt = true;
+        assert_eq!(
+            run_from(&config, trailing_args, repo.path()).await.unwrap(),
+            0
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].fresh, "--fresh flag sets request.fresh = true");
+        assert!(
+            requests[1].fresh,
+            "trailing --fresh sets request.fresh = true"
+        );
+        assert_eq!(
+            linked.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "--fresh must not pre-link a prior native session"
+        );
         server.abort();
     }
 

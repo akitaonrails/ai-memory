@@ -656,11 +656,14 @@ cargo run --release -p ai-memory-eval -- retrieval-compare \
 Moves of one cutoff in both directions, spread across types, are what
 questions near a cutoff trading places look like. Moves that skip cutoffs,
 all go one way, or cluster in one type point at a ranking change (#1854).
-`--fts` takes the candidate build's FTS run and marks moved questions whose
-candidate row equals the FTS row in every hit, recall, retrieved-session
-and context-token value. With a latency at or above the 250 ms query
-embedding wait, that is a local query that ran without its vector. An A/B
-`report.json` is refused; compare the single-config runs instead.
+`--fts` takes the candidate build's FTS run. The comparison marks a moved
+question `yes` if its row matches the FTS row's hit, recall,
+retrieved-session, and context-token values, or `no` if those values differ.
+A question missing from the FTS run is marked `unavailable`. A match near
+the 250 ms query embedding wait can suggest fallback. To confirm whether
+the vector stream ran, check `vector_stream_active` in retrieval reports
+generated with `--query-arg explain=true`. Compare single-config reports
+when starting from an A/B run.
 
 Strict `recall-all@k` scores each question as 1 only when every evidence
 session appears in the top k distinct retrieved sessions, otherwise 0.

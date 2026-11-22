@@ -34,6 +34,14 @@ pub async fn run(config: &Config, args: RenameWorkstreamArgs) -> Result<()> {
     let (workspace, project) =
         super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
     let endpoint = ServerEndpoint::for_checkout(config).await?;
+    let (legacy_repo_fingerprint, legacy_worktree_fingerprint) = repository
+        .legacy_fingerprints
+        .map_or((None, None), |legacy| {
+            (
+                Some(legacy.repo_fingerprint),
+                Some(legacy.worktree_fingerprint),
+            )
+        });
     let renamed: RenamedManagedWorkstream = post_json(
         &endpoint,
         "/workstream/rename",
@@ -42,6 +50,8 @@ pub async fn run(config: &Config, args: RenameWorkstreamArgs) -> Result<()> {
             project,
             repo_fingerprint: repository.repo_fingerprint,
             worktree_fingerprint: repository.worktree_fingerprint,
+            legacy_repo_fingerprint,
+            legacy_worktree_fingerprint,
             from: args.from,
             workstream_id: args.workstream_id,
             to: args.to,

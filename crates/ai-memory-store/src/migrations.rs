@@ -355,7 +355,7 @@ mod tests {
             selection: crate::WorkstreamSelection::Named("default".into()),
             lease_owner: "host:2".into(),
         };
-        assert!(crate::workstream::prepare_run(&mut conn, &input, None, true).is_err());
+        assert!(crate::workstream::prepare_run(&mut conn, &input, None, true, false).is_err());
         assert_eq!(
             snapshot(&conn),
             ("active".into(), 3, 7, true, false),
@@ -366,7 +366,8 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         conn.execute_batch("DROP TRIGGER reject_new_run;").unwrap();
-        let prepared = crate::workstream::prepare_run(&mut conn, &input, None, true).unwrap();
+        let prepared =
+            crate::workstream::prepare_run(&mut conn, &input, None, true, false).unwrap();
         let pinned: bool = conn
             .query_row(
                 "SELECT scope_by_id FROM managed_runs WHERE id = ?1",

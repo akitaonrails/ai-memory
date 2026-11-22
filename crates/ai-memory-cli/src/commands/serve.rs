@@ -1296,7 +1296,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     // Guard the data dir before anything opens it: a second serve process
     // means a second writer actor, a second git handle on the wiki, and a
     // second active-project pointer (#563). Held until `run` returns.
-    let _serve_lock = acquire_serve_lock(&config.data_dir, args.force)?;
+    let serve_lock = acquire_serve_lock(&config.data_dir, args.force)?;
 
     // #633: take the pre-migration safety archive BEFORE `Store::open` advances
     // the SQLite schema, so the archive captures the true pre-2.0 state a 1.x
@@ -1548,6 +1548,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         config.consolidate_on_session_end,
         consolidator.is_some(),
         config.consolidation.output_language.clone(),
+        serve_lock.is_some(),
     )
     .await;
 
@@ -2268,6 +2269,7 @@ async fn start_maintenance_scheduler(
     consolidate_on_session_end: bool,
     has_session_consolidator: bool,
     output_language: Option<String>,
+    has_serve_lock: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -2577,6 +2579,28 @@ async fn start_maintenance_scheduler(
                 }
             }),
         };
+        if has_serve_lock {
+            match writer
+                .park_interrupted_auto_improve_claims(jiff::Timestamp::now())
+                .await
+            {
+                Ok(parked) => {
+                    for claim in parked {
+                        tracing::warn!(
+                            workspace = %claim.workspace_id,
+                            project = %claim.project_id,
+                            session_id = %claim.session_id,
+                            "parked interrupted auto-improve scheduler claim from prior server run; rerun manually with `ai-memory auto-improve --session-id {}`",
+                            claim.session_id
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "failed to park interrupted auto-improve scheduler claims on startup"
+                ),
+            }
+        }
         match ai_memory_consolidate::initialize_auto_improve_scheduler_scopes(&reader, &writer)
             .await
         {
@@ -4863,6 +4887,7 @@ mod tests {
             false,
             false,
             None,
+            true,
         )
         .await;
         assert!(tasks.is_empty());
@@ -4919,6 +4944,7 @@ mod tests {
                 false,
                 false,
                 None,
+                true,
             )
             .await;
             assert_eq!(
@@ -4931,6 +4957,230 @@ mod tests {
                 task.abort();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn auto_improve_scheduler_startup_parks_interrupted_claims_only_with_serve_lock() {
+        struct NoOpAutoImproveLlm;
+
+        impl LlmProvider for NoOpAutoImproveLlm {
+            fn name(&self) -> &'static str {
+                "noop-auto-improve"
+            }
+
+            fn model(&self) -> &str {
+                "noop-model"
+            }
+
+            fn complete<'life0, 'async_trait>(
+                &'life0 self,
+                _request: ChatRequest,
+            ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(async move {
+                    Ok(ChatResponse {
+                        text: String::new(),
+                        model: "noop-model".into(),
+                        usage: None,
+                    })
+                })
+            }
+
+            fn complete_structured_raw<'life0, 'async_trait>(
+                &'life0 self,
+                _request: ChatRequest,
+                _schema: serde_json::Value,
+            ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(async move {
+                    Ok(serde_json::json!({
+                        "summary": "manual rerun succeeded",
+                        "proposals": [],
+                        "rejected_candidates": [],
+                        "warnings": []
+                    }))
+                })
+            }
+        }
+
+        let (_tmp, store, wiki, ws, proj, _second) = two_project_wiki().await;
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+                occurred_at: None,
+                origin: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "interrupted review session".into(),
+                    body: "verify startup recovery and manual rerun".into(),
+                    importance: 5,
+                    occurred_at: None,
+                    file_path: None,
+                    trust_class: None,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(sid, None).await.unwrap();
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            store
+                .writer
+                .claim_auto_improve_scheduler_session(ws, proj, sid, candidates[0].ended_at)
+                .await
+                .unwrap()
+        );
+
+        let mut auto_improve = AutoImproveSettings::default();
+        auto_improve.scheduler.enabled = true;
+        auto_improve.scheduler.interval_secs = 3600;
+        auto_improve.scheduler.max_sessions_per_tick = 1;
+        let mut providers = LlmProviders::default();
+        providers
+            .overrides
+            .insert(LlmWorkload::AutoImprove, Arc::new(PanicLlm));
+
+        // Without the exclusive serve lock (`serve_lock.is_none()`), startup
+        // must NOT park in-flight claims so an unguarded `--force` process
+        // cannot disrupt an active sibling.
+        let unguarded_tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: false,
+                ..MaintenanceSettings::default()
+            },
+            auto_improve.clone(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            None,
+            providers.clone(),
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
+            None,
+            false,
+        )
+        .await;
+        for task in unguarded_tasks {
+            task.abort();
+        }
+        assert!(
+            store
+                .reader
+                .auto_improve_parked_claims(ws, proj)
+                .await
+                .unwrap()
+                .is_empty(),
+            "startup without exclusive serve lock must not park in-flight claims"
+        );
+
+        // With the exclusive serve lock (`serve_lock.is_some()`), startup
+        // parks the orphaned in-flight claim into `auto_improve_parked_claims`.
+        let locked_tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: false,
+                ..MaintenanceSettings::default()
+            },
+            auto_improve,
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            providers,
+            crate::config::DecaySettings::default(),
+            crate::config::SessionsSettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
+            ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
+            false,
+            false,
+            None,
+            true,
+        )
+        .await;
+        for task in locked_tasks {
+            task.abort();
+        }
+
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].session_id, sid);
+        assert_eq!(
+            parked[0].attempts,
+            ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            parked[0].last_error.as_deref(),
+            Some(ai_memory_store::INTERRUPTED_REVIEW_CLAIM_ERROR)
+        );
+
+        // Manual auto-improve still runs on the parked session.
+        let review_cfg = ai_memory_consolidate::AutoImproveReviewConfig {
+            min_observations: 0,
+            min_session_duration_secs: 0,
+            ..Default::default()
+        };
+        let report = ai_memory_consolidate::run_auto_improve_review(
+            &store.reader,
+            &NoOpAutoImproveLlm,
+            ws,
+            proj,
+            sid,
+            review_cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.provider, "noop-auto-improve");
+        assert_eq!(report.model, "noop-model");
+        assert_eq!(report.session_id, sid.to_string());
     }
 
     #[tokio::test]
@@ -4971,6 +5221,7 @@ mod tests {
                 false,
                 false,
                 None,
+                true,
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -5013,6 +5264,7 @@ mod tests {
             false,
             false,
             None,
+            true,
         )
         .await;
         assert_eq!(tasks.len(), 2);
@@ -5041,6 +5293,7 @@ mod tests {
             false,
             false,
             None,
+            true,
         )
         .await;
         assert_eq!(tasks.len(), 3);
@@ -5072,6 +5325,7 @@ mod tests {
             true,
             true,
             None,
+            true,
         )
         .await;
         assert!(tasks.is_empty());
@@ -5150,6 +5404,7 @@ mod tests {
             true,
             true,
             None,
+            true,
         )
         .await;
 
@@ -7337,6 +7592,7 @@ mod tests {
                 false,
                 false,
                 None,
+                true,
             )
         };
 

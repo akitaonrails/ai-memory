@@ -54,9 +54,10 @@ pub use auto_improve::{
     ApproveAutoImproveProposalResult, AutoImproveProposalDetail, AutoImproveProposalEvent,
     AutoImproveProposalOperation, AutoImproveProposalStatus, AutoImproveProposalSummary,
     AutoImproveRejectionSummary, AutoImproveTelemetryAggregate, AutoImproveTelemetryCount,
-    FailAutoImproveProposal, NewAutoImproveProposal, OwnedAutoImproveProposalDetail,
-    PendingAutoImproveReview, PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal,
-    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    FailAutoImproveProposal, INTERRUPTED_REVIEW_CLAIM_ERROR, InterruptedAutoImproveClaim,
+    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, PendingAutoImproveReview,
+    PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun,
+    StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use dashboard::{AgentUsage, RegisteredAgent};
@@ -143,11 +144,11 @@ pub use session_consolidation::{
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LegacyWorkstreamFingerprints,
     LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
-    OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
-    RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
+    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, ManagedSessionBoundary,
+    NativeSessionHolder, OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun,
+    RenameWorkstream, RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
     WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
 };
 pub use writer::{StartupContextAcceptance, WriterHandle};
@@ -5709,6 +5710,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_improve_park_interrupted_claims_only_parks_orphaned_inflight_claims() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let make_ended_session = || async {
+            let sid = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                    origin: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(sid, None).await.unwrap();
+            sid
+        };
+
+        // (a) Orphaned in-flight claim: claimed, no run row, last_failed_at IS NULL.
+        let orphaned_sid = make_ended_session().await;
+        // (b) Completed claim: claimed, matching auto_improve_runs row, last_failed_at IS NULL.
+        let completed_sid = make_ended_session().await;
+        // (c) Retryable failed claim: claimed then failed once (attempts = 1, last_failed_at IS NOT NULL).
+        let retryable_sid = make_ended_session().await;
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 3);
+        for candidate in &candidates {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(
+                        ws,
+                        proj,
+                        candidate.session_id,
+                        candidate.ended_at,
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+
+        // Record a completed review run for (b).
+        let mut completed_run = stage_input(ws, proj, Vec::new());
+        completed_run.session_id = Some(completed_sid);
+        store
+            .writer
+            .stage_auto_improve_run(completed_run)
+            .await
+            .unwrap();
+
+        // Record one retryable failure for (c).
+        let retryable_attempts = store
+            .writer
+            .record_auto_improve_claim_failure(ws, proj, retryable_sid, "transient timeout")
+            .await
+            .unwrap();
+        assert_eq!(retryable_attempts, 1);
+
+        // Before startup recovery, (a) is hidden from both candidates and parked claims.
+        assert!(
+            store
+                .reader
+                .auto_improve_parked_claims(ws, proj)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let now = jiff::Timestamp::from_microsecond(1_700_000_000_000_000).unwrap();
+        let parked_now = store
+            .writer
+            .park_interrupted_auto_improve_claims(now)
+            .await
+            .unwrap();
+        assert_eq!(
+            parked_now,
+            vec![InterruptedAutoImproveClaim {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: orphaned_sid,
+            }]
+        );
+
+        // Only (a) is surfaced in auto_improve_parked_claims with the interrupted error.
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].session_id, orphaned_sid);
+        assert_eq!(parked[0].attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            parked[0].last_error.as_deref(),
+            Some(INTERRUPTED_REVIEW_CLAIM_ERROR)
+        );
+        assert_eq!(parked[0].last_failed_at, Some(now.as_microsecond()));
+
+        // (c) remains a retryable candidate; (a) and (b) are not candidates.
+        let remaining_candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining_candidates.len(), 1);
+        assert_eq!(remaining_candidates[0].session_id, retryable_sid);
+
+        // Second call is idempotent and returns no rows.
+        let parked_again = store
+            .writer
+            .park_interrupted_auto_improve_claims(
+                jiff::Timestamp::from_microsecond(1_700_000_005_000_000).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(parked_again.is_empty());
+        // Timestamp on (a) was not overwritten by the idempotent second call.
+        let parked_after = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked_after.len(), 1);
+        assert_eq!(parked_after[0].last_failed_at, Some(now.as_microsecond()));
+    }
+
+    #[tokio::test]
     async fn auto_improve_scheduler_claim_is_unique_across_store_instances() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -7741,7 +7897,7 @@ mod tests {
             native_session_id: "native-session".into(),
             owner_user: None,
             session_start: true,
-            claude_boundary: ClaudeSessionBoundary::Other,
+            session_boundary: ManagedSessionBoundary::Other,
         };
 
         set_managed_run_lease(store.db_path(), run.run_id, 1);
@@ -7769,7 +7925,7 @@ mod tests {
                     native_session_id: "native-session".into(),
                     owner_user: None,
                     session_start: true,
-                    claude_boundary: ClaudeSessionBoundary::Other,
+                    session_boundary: ManagedSessionBoundary::Other,
                 })
                 .await
                 .unwrap(),
@@ -9305,6 +9461,302 @@ mod tests {
                 "name {bad:?} should be rejected, got {failure:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_workstream_fingerprints_migrate_on_select_list_and_rename() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-legacy-migration").await;
+
+        let legacy = || LegacyWorkstreamFingerprints {
+            repo_fingerprint: "legacy-repo".into(),
+            worktree_fingerprint: "legacy-tree".into(),
+        };
+        let prepare_on =
+            |repo: &str, tree: &str, selection: WorkstreamSelection| PrepareWorkstreamRun {
+                scope_by_id: false,
+                repo_fingerprint: repo.into(),
+                worktree_fingerprint: tree.into(),
+                selection,
+                ..managed_prepare_input(ws, proj, "test:1")
+            };
+
+        // 1. Seed a legacy workstream, then select it via Named on canonical fingerprints.
+        let legacy_named = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo",
+                "legacy-tree",
+                WorkstreamSelection::New("feature-a".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_named.run_id)
+            .await
+            .unwrap();
+
+        let migrated_named = store
+            .writer
+            .prepare_workstream_run_with_legacy(
+                prepare_on(
+                    "canonical-repo",
+                    "canonical-tree",
+                    WorkstreamSelection::Named("feature-a".into()),
+                ),
+                Some(legacy()),
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(migrated_named.workstream_id, legacy_named.workstream_id);
+        assert_eq!(migrated_named.workstream_name, "feature-a");
+        store
+            .writer
+            .cancel_managed_run(migrated_named.run_id)
+            .await
+            .unwrap();
+
+        // After migration, canonical queries without legacy aliases find it directly.
+        let canonical_list = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo".into(),
+                "canonical-tree".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(canonical_list.len(), 1);
+        assert_eq!(canonical_list[0].workstream_id, legacy_named.workstream_id);
+
+        // 2. Seed another legacy workstream in a fresh checkout key, then migrate via Current.
+        let legacy_current = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-2",
+                "legacy-tree-2",
+                WorkstreamSelection::New("wip".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_current.run_id)
+            .await
+            .unwrap();
+
+        let migrated_current = store
+            .writer
+            .prepare_workstream_run_with_legacy(
+                prepare_on(
+                    "canonical-repo-2",
+                    "canonical-tree-2",
+                    WorkstreamSelection::Current,
+                ),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-2".into(),
+                    worktree_fingerprint: "legacy-tree-2".into(),
+                }),
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(migrated_current.workstream_id, legacy_current.workstream_id);
+        assert_eq!(migrated_current.workstream_name, "wip");
+        store
+            .writer
+            .cancel_managed_run(migrated_current.run_id)
+            .await
+            .unwrap();
+
+        // 3. Seed a legacy workstream and migrate via list_recent_migrating.
+        let legacy_listed = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-3",
+                "legacy-tree-3",
+                WorkstreamSelection::New("listed".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_listed.run_id)
+            .await
+            .unwrap();
+
+        let listed = store
+            .writer
+            .recent_workstreams_page_migrating(
+                ws,
+                proj,
+                "canonical-repo-3".into(),
+                "canonical-tree-3".into(),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-3".into(),
+                    worktree_fingerprint: "legacy-tree-3".into(),
+                }),
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].workstream_id, legacy_listed.workstream_id);
+        // Verify persisted under canonical coordinates.
+        let persisted = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo-3".into(),
+                "canonical-tree-3".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].workstream_id, legacy_listed.workstream_id);
+
+        // 4. Seed a legacy workstream and migrate via rename_with_legacy.
+        let legacy_renamed = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo-4",
+                "legacy-tree-4",
+                WorkstreamSelection::New("old-name".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_renamed.run_id)
+            .await
+            .unwrap();
+
+        let renamed = store
+            .writer
+            .rename_workstream_with_legacy(
+                RenameWorkstream {
+                    workspace_id: ws,
+                    project_id: proj,
+                    repo_fingerprint: "canonical-repo-4".into(),
+                    worktree_fingerprint: "canonical-tree-4".into(),
+                    selector: WorkstreamSelector::Name("old-name".into()),
+                    new_name: "new-name".into(),
+                },
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo-4".into(),
+                    worktree_fingerprint: "legacy-tree-4".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.workstream_id, legacy_renamed.workstream_id);
+        assert_eq!(renamed.from, "old-name");
+        assert_eq!(renamed.to, "new-name");
+        let after_rename = store
+            .reader
+            .recent_workstreams(
+                ws,
+                proj,
+                "canonical-repo-4".into(),
+                "canonical-tree-4".into(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_rename.len(), 1);
+        assert_eq!(after_rename[0].name, "new-name");
+    }
+
+    #[tokio::test]
+    async fn legacy_workstream_migration_disambiguates_name_collisions() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (ws, proj) = open_managed_scope(&store, "managed-legacy-collision").await;
+
+        let prepare_on =
+            |repo: &str, tree: &str, selection: WorkstreamSelection| PrepareWorkstreamRun {
+                scope_by_id: false,
+                repo_fingerprint: repo.into(),
+                worktree_fingerprint: tree.into(),
+                selection,
+                ..managed_prepare_input(ws, proj, "test:1")
+            };
+
+        let legacy_ws = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "legacy-repo",
+                "legacy-tree",
+                WorkstreamSelection::New("default".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(legacy_ws.run_id)
+            .await
+            .unwrap();
+
+        let canonical_ws = store
+            .writer
+            .prepare_workstream_run(prepare_on(
+                "canonical-repo",
+                "canonical-tree",
+                WorkstreamSelection::New("default".into()),
+            ))
+            .await
+            .unwrap();
+        store
+            .writer
+            .cancel_managed_run(canonical_ws.run_id)
+            .await
+            .unwrap();
+
+        let listed = store
+            .writer
+            .recent_workstreams_page_migrating(
+                ws,
+                proj,
+                "canonical-repo".into(),
+                "canonical-tree".into(),
+                Some(LegacyWorkstreamFingerprints {
+                    repo_fingerprint: "legacy-repo".into(),
+                    worktree_fingerprint: "legacy-tree".into(),
+                }),
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2, "both colliding workstreams must be kept");
+
+        let kept_canonical = listed
+            .iter()
+            .find(|row| row.workstream_id == canonical_ws.workstream_id)
+            .expect("canonical workstream must remain intact");
+        assert_eq!(kept_canonical.name, "default");
+
+        let kept_legacy = listed
+            .iter()
+            .find(|row| row.workstream_id == legacy_ws.workstream_id)
+            .expect("legacy workstream must be preserved with disambiguated name");
+        assert!(
+            kept_legacy.name.starts_with("default-legacy-"),
+            "unexpected disambiguated name: {}",
+            kept_legacy.name
+        );
     }
 
     #[tokio::test]

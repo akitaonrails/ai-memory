@@ -125,6 +125,6 @@ pub(crate) async fn search_scopes(
     Ok(RecallResult {
         hits,
         timings,
-        streams_active: state.reader.active_streams(query_vector.is_some()),
+        streams_active: state.reader.active_streams(query_vector.is_some(), filter),
     })
 }

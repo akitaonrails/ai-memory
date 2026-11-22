@@ -149,6 +149,16 @@ pub(crate) fn authorize_run_mutation(
     }
 }
 
+/// Legacy remote-seeded checkout fingerprints to migrate onto canonical
+/// fingerprints before selecting, listing, or renaming workstreams (#2423).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyWorkstreamFingerprints {
+    /// Legacy repository fingerprint (`git-remotes\n{origin}`).
+    pub repo_fingerprint: String,
+    /// Legacy worktree fingerprint derived from `repo_fingerprint`.
+    pub worktree_fingerprint: String,
+}
+
 /// Store-level input for opening a managed run.
 #[derive(Debug, Clone)]
 pub struct PrepareWorkstreamRun {
@@ -272,34 +282,39 @@ pub struct ManagedRunHookIdentity {
     pub owner_user: Option<String>,
     /// Startup always checks the checkout, even for an already linked session.
     pub session_start: bool,
-    /// The documented Claude SessionStart boundary this hook reports.
-    pub claude_boundary: ClaudeSessionBoundary,
+    /// The documented SessionStart boundary this hook reports (Claude Code or Codex).
+    pub session_boundary: ManagedSessionBoundary,
 }
 
-/// A Claude Code SessionStart `source` that may repoint an ID-selected run
-/// already linked to another native session. Claude documents `clear` and
-/// `resume` separately from `startup` and `compact`:
-/// <https://code.claude.com/docs/en/hooks#sessionstart-input>.
+/// A SessionStart `source` that may repoint an ID-selected run already linked
+/// to another native session. Claude Code documents `clear` and `resume`
+/// separately from `startup` and `compact`
+/// (<https://code.claude.com/docs/en/hooks#sessionstart-input>); Codex emits
+/// `startup` / `clear` for a fresh thread and `resume` when switching to or
+/// resuming an existing thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaudeSessionBoundary {
+pub enum ManagedSessionBoundary {
     /// Any other event or source: the linked session must match exactly.
     Other,
-    /// `/clear` started a fresh conversation with a never-seen native id.
+    /// Fresh conversation (`/clear`, or Codex `startup` / `clear`) with a
+    /// never-seen native id.
     Clear,
-    /// `/resume` returned to a conversation this workstream already held.
+    /// Resumed conversation (`/resume`, or Codex `resume`).
     Resume,
 }
 
-impl ClaudeSessionBoundary {
+impl ManagedSessionBoundary {
     /// The boundary a hook's agent, event and `source` describe.
     #[must_use]
     pub fn from_session_start(agent: AgentKind, session_start: bool, source: Option<&str>) -> Self {
-        if agent != AgentKind::ClaudeCode || !session_start {
+        if !session_start {
             return Self::Other;
         }
-        match source {
-            Some("clear") => Self::Clear,
-            Some("resume") => Self::Resume,
+        match (agent, source) {
+            (AgentKind::ClaudeCode, Some("clear")) => Self::Clear,
+            (AgentKind::ClaudeCode, Some("resume")) => Self::Resume,
+            (AgentKind::Codex, Some("clear" | "startup")) => Self::Clear,
+            (AgentKind::Codex, Some("resume")) => Self::Resume,
             _ => Self::Other,
         }
     }
@@ -326,14 +341,28 @@ pub(crate) fn pinned_hook_scope(
     let run = ManagedRunBoundaryRow::read(&tx, input.run_id)?.ok_or_else(refused)?;
     let native = NativeSessionIdentity::parse(&input.native_session_id, &Sanitizer::builtin())
         .map_err(|_| refused())?;
-    if run.state != "active"
-        || run.agent != input.agent.as_str()
+    if run.state != "active" {
+        // A shared Codex daemon can carry a terminal run id into the next
+        // managed launch. Let Codex SessionStart fall through to
+        // `link_or_adopt_native_session`, which enforces exact scope, cwd,
+        // owner, agent, live lease, undelivered, never-linked, and
+        // single-candidate uniqueness; keep non-Codex and non-SessionStart
+        // terminal pins refused.
+        if input.agent == AgentKind::Codex
+            && input.session_start
+            && run.agent == AgentKind::Codex.as_str()
+        {
+            return Ok(None);
+        }
+        return Err(refused());
+    }
+    if run.agent != input.agent.as_str()
         || run.owner_user != input.owner_user
         || ((linked || delivered)
             && run.native_session.as_deref() != Some(native.as_str())
-            && !(input.claude_boundary != ClaudeSessionBoundary::Other
+            && !(input.session_boundary != ManagedSessionBoundary::Other
                 && input.session_start
-                && input.agent == AgentKind::ClaudeCode))
+                && matches!(input.agent, AgentKind::ClaudeCode | AgentKind::Codex)))
         || ((input.session_start || !linked) && input.cwd.as_deref() != Some(run.cwd.as_str()))
     {
         return Err(refused());
@@ -668,11 +697,26 @@ impl ManagedRunBoundaryRow {
 }
 
 /// Atomically select a workstream, expire stale leases, and open one run.
+#[cfg(test)]
 pub(crate) fn prepare_run(
     conn: &mut Connection,
     input: &PrepareWorkstreamRun,
     owner_user: Option<&str>,
     force_unlock: bool,
+    fresh: bool,
+) -> StoreResult<PreparedWorkstreamRun> {
+    prepare_run_with_legacy(conn, input, None, owner_user, force_unlock, fresh)
+}
+
+/// Atomically migrate any legacy remote-seeded workstreams, select a
+/// workstream, expire stale leases, and open one run.
+pub(crate) fn prepare_run_with_legacy(
+    conn: &mut Connection,
+    input: &PrepareWorkstreamRun,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
+    owner_user: Option<&str>,
+    force_unlock: bool,
+    fresh: bool,
 ) -> StoreResult<PreparedWorkstreamRun> {
     if owner_user
         .is_some_and(|owner| ai_memory_core::IdentityKey::from_storage_key(owner).is_none())
@@ -689,7 +733,7 @@ pub(crate) fn prepare_run(
         params![now],
     )?;
 
-    let (workstream_id, workstream_name) = select_workstream(&tx, input, now)?;
+    let (workstream_id, workstream_name) = select_workstream(&tx, input, legacy, now)?;
     let busy: Option<(Vec<u8>, String, i64, Option<String>)> = tx
         .query_row(
             "SELECT id, lease_owner, lease_expires_at, owner_user FROM managed_runs \
@@ -725,15 +769,18 @@ pub(crate) fn prepare_run(
     } else {
         input.agent
     };
-    let native: Option<(String, Option<String>, i64)> = tx
-        .query_row(
+    let native: Option<(String, Option<String>, i64)> = if fresh {
+        None
+    } else {
+        tx.query_row(
             "SELECT native_session_id, source_cursor, delivery_cursor \
              FROM workstream_native_sessions \
              WHERE workstream_id = ?1 AND agent_kind = ?2 AND is_current = 1",
             params![workstream_id.as_bytes(), agent.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .optional()?;
+        .optional()?
+    };
     let (native_session_id, source_cursor, sync_after) = native
         .map_or((None, None, 0), |(session, cursor, delivery)| {
             (Some(session), cursor, delivery)
@@ -833,11 +880,83 @@ fn newest_available_agent(
     Ok(None)
 }
 
+/// Re-key legacy remote-seeded workstreams in `(workspace_id, project_id)` to
+/// canonical `(repo_fingerprint, worktree_fingerprint)` inside an active
+/// transaction (#2423).
+///
+/// Any `UNIQUE(workspace_id, project_id, repo_fingerprint, worktree_fingerprint, name)`
+/// collision with an already-canonical workstream is preserved by giving only
+/// the legacy row a deterministic disambiguator before the coordinate update
+/// (matching `merge_project`).
+fn rekey_legacy_workstreams(
+    tx: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    repo_fingerprint: &str,
+    worktree_fingerprint: &str,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
+) -> StoreResult<u64> {
+    let Some(legacy) = legacy else {
+        return Ok(0);
+    };
+    if legacy.repo_fingerprint.trim().is_empty()
+        || legacy.worktree_fingerprint.trim().is_empty()
+        || (legacy.repo_fingerprint == repo_fingerprint
+            && legacy.worktree_fingerprint == worktree_fingerprint)
+    {
+        return Ok(0);
+    }
+    tx.execute(
+        "UPDATE workstreams \
+         SET name = name || '-legacy-' || lower(hex(id)) \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+           AND repo_fingerprint = ?3 AND worktree_fingerprint = ?4 \
+           AND EXISTS ( \
+               SELECT 1 FROM workstreams d \
+               WHERE d.workspace_id = ?1 AND d.project_id = ?2 \
+                 AND d.repo_fingerprint = ?5 AND d.worktree_fingerprint = ?6 \
+                 AND d.name = workstreams.name \
+           )",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            legacy.repo_fingerprint,
+            legacy.worktree_fingerprint,
+            repo_fingerprint,
+            worktree_fingerprint,
+        ],
+    )?;
+    let moved = tx.execute(
+        "UPDATE workstreams \
+         SET repo_fingerprint = ?5, worktree_fingerprint = ?6 \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+           AND repo_fingerprint = ?3 AND worktree_fingerprint = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            legacy.repo_fingerprint,
+            legacy.worktree_fingerprint,
+            repo_fingerprint,
+            worktree_fingerprint,
+        ],
+    )?;
+    Ok(moved as u64)
+}
+
 fn select_workstream(
     tx: &Transaction<'_>,
     input: &PrepareWorkstreamRun,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
     now: i64,
 ) -> StoreResult<(WorkstreamId, String)> {
+    rekey_legacy_workstreams(
+        tx,
+        input.workspace_id,
+        input.project_id,
+        &input.repo_fingerprint,
+        &input.worktree_fingerprint,
+        legacy,
+    )?;
     match &input.selection {
         WorkstreamSelection::New(name) => {
             validate_workstream_name(name)?;
@@ -1004,7 +1123,7 @@ pub(crate) fn link_native_session(
         agent,
         &native_identity,
         now,
-        ClaudeSessionBoundary::Other,
+        ManagedSessionBoundary::Other,
     )?;
     tx.commit()?;
     Ok(linked)
@@ -1016,7 +1135,7 @@ fn link_native_session_in_transaction(
     agent: AgentKind,
     native_session_id: &NativeSessionIdentity,
     now: i64,
-    boundary: ClaudeSessionBoundary,
+    boundary: ManagedSessionBoundary,
 ) -> StoreResult<bool> {
     let native_session_id = native_session_id.as_str();
     let run: Option<LinkRunRow> = tx
@@ -1068,14 +1187,14 @@ fn link_native_session_in_transaction(
             .as_deref()
             .is_some_and(|linked| linked != native_session_id)
     {
-        if boundary == ClaudeSessionBoundary::Other
+        if boundary == ManagedSessionBoundary::Other
             || !run.scope_by_id
-            || agent != AgentKind::ClaudeCode
+            || !matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex)
         {
             return Ok(false);
         }
-        let admitted = if boundary == ClaudeSessionBoundary::Clear {
-            // A clear starts a fresh conversation. Refuse an old binding
+        let admitted = if boundary == ManagedSessionBoundary::Clear {
+            // A clear/startup starts a fresh conversation. Refuse an old binding
             // (including another workstream's) so a delayed spool replay of a
             // clear cannot rewind the run.
             !tx.query_row(
@@ -1084,8 +1203,8 @@ fn link_native_session_in_transaction(
                 params![agent.as_str(), native_session_id],
                 |row| row.get::<_, bool>(0),
             )?
-        } else {
-            // A resume returns to an earlier conversation, so only one this
+        } else if agent == AgentKind::ClaudeCode {
+            // A Claude resume returns to an earlier conversation, so only one this
             // workstream already held qualifies, and never one another live
             // run currently holds: a parallel harness keeps its own session.
             tx.query_row(
@@ -1099,6 +1218,33 @@ fn link_native_session_in_transaction(
                     agent.as_str(),
                     native_session_id,
                     run_id.as_bytes()
+                ],
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            // A Codex resume may switch to any thread in the same scope and
+            // operator bucket that is not currently held by another active run,
+            // not bound to a foreign workstream scope, and not previously held
+            // by another operator's managed run. (The `sessions` table foreign
+            // check already ran above for `run.scope_by_id`.)
+            tx.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM managed_runs \
+                     WHERE id <> ?1 AND agent_kind = ?2 AND native_session_id = ?3 \
+                       AND state = 'active') \
+                 AND NOT EXISTS(SELECT 1 FROM workstream_native_sessions wns \
+                     JOIN workstreams w ON w.id = wns.workstream_id \
+                     JOIN workstreams cur ON cur.id = ?4 \
+                     WHERE wns.agent_kind = ?2 AND wns.native_session_id = ?3 \
+                       AND (w.workspace_id <> cur.workspace_id OR w.project_id <> cur.project_id)) \
+                 AND NOT EXISTS(SELECT 1 FROM managed_runs mr \
+                     JOIN managed_runs cur ON cur.id = ?1 \
+                     WHERE mr.id <> cur.id AND mr.agent_kind = ?2 AND mr.native_session_id = ?3 \
+                       AND mr.owner_user IS NOT cur.owner_user)",
+                params![
+                    run_id.as_bytes(),
+                    agent.as_str(),
+                    native_session_id,
+                    run.workstream,
                 ],
                 |row| row.get::<_, bool>(0),
             )?
@@ -1158,7 +1304,7 @@ fn link_native_session_in_transaction(
 pub(crate) fn link_or_adopt_native_session(
     conn: &mut Connection,
     input: &LinkOrAdoptManagedRunSession,
-    boundary: ClaudeSessionBoundary,
+    boundary: ManagedSessionBoundary,
 ) -> StoreResult<ManagedRunSessionLink> {
     if input.native_session_id.trim().is_empty()
         || input.cwd.trim().is_empty()
@@ -1179,14 +1325,14 @@ pub(crate) fn link_or_adopt_native_session(
     let tx = conn.transaction()?;
     let supplied = ManagedRunBoundaryRow::read(&tx, input.supplied_run_id)?;
 
-    if boundary != ClaudeSessionBoundary::Other {
+    if boundary != ManagedSessionBoundary::Other {
         let live_pin: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM managed_runs WHERE id = ?1 \
              AND state = 'active' AND scope_by_id = 1 AND lease_expires_at > ?2)",
             params![input.supplied_run_id.as_bytes(), now],
             |row| row.get(0),
         )?;
-        if input.agent != AgentKind::ClaudeCode || !live_pin {
+        if !matches!(input.agent, AgentKind::ClaudeCode | AgentKind::Codex) || !live_pin {
             return Ok(ManagedRunSessionLink::Refused);
         }
     }
@@ -1317,7 +1463,7 @@ pub(crate) fn link_native_session_in_scope(
         input.agent,
         &native_identity,
         now,
-        ClaudeSessionBoundary::Other,
+        ManagedSessionBoundary::Other,
     )?;
     tx.commit()?;
     Ok(if linked {
@@ -1948,6 +2094,41 @@ pub(crate) fn list_recent(
     Ok(summaries)
 }
 
+/// Migrate any legacy remote-seeded workstreams to canonical fingerprints and
+/// list recent workstreams for that checkout inside one transaction (#2423).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn list_recent_migrating(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    repo_fingerprint: &str,
+    worktree_fingerprint: &str,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
+    limit: usize,
+    offset: usize,
+) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+    let tx = conn.transaction()?;
+    rekey_legacy_workstreams(
+        &tx,
+        workspace_id,
+        project_id,
+        repo_fingerprint,
+        worktree_fingerprint,
+        legacy,
+    )?;
+    let summaries = list_recent(
+        &tx,
+        workspace_id,
+        project_id,
+        repo_fingerprint,
+        worktree_fingerprint,
+        limit,
+        offset,
+    )?;
+    tx.commit()?;
+    Ok(summaries)
+}
+
 /// List managed workstreams across every scope for the root/operator console.
 ///
 /// The page is selected before current harness links are joined, so a
@@ -2099,13 +2280,22 @@ pub(crate) fn list_operational(
 /// workstream in the same checkout already holds is refused before the
 /// update, turning the `UNIQUE` constraint into a named error rather than a
 /// bare SQLite failure.
-pub(crate) fn rename(
+pub(crate) fn rename_with_legacy(
     conn: &mut Connection,
     input: &RenameWorkstream,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
 ) -> StoreResult<RenamedWorkstream> {
     validate_workstream_name(&input.new_name)?;
     let new_name = input.new_name.trim();
     let tx = conn.transaction()?;
+    rekey_legacy_workstreams(
+        &tx,
+        input.workspace_id,
+        input.project_id,
+        &input.repo_fingerprint,
+        &input.worktree_fingerprint,
+        legacy,
+    )?;
     let found = match &input.selector {
         WorkstreamSelector::Name(name) => tx
             .query_row(
@@ -2149,6 +2339,7 @@ pub(crate) fn rename(
     })?;
     let workstream_id = WorkstreamId::from_slice(&id_bytes)?;
     if current_name == new_name {
+        tx.commit()?;
         return Ok(RenamedWorkstream {
             workstream_id,
             from: current_name.clone(),

@@ -28,7 +28,8 @@ pub use jail_contract::{
     parse_capabilities, parse_status, server_reach, status_refusal,
 };
 pub use repository::{
-    RepositoryFingerprints, RepositoryIdentity, inspect_repository, inspect_repository_fingerprints,
+    RepositoryFingerprints, RepositoryIdentity, inspect_repository,
+    inspect_repository_fingerprints, inspect_repository_fingerprints_with_legacy,
 };
 pub use transcript::{
     AmbiguousNativeSession, ClaudeContinuation, ExportedTranscript, NativeSessionCandidate,

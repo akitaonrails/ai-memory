@@ -95,12 +95,71 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Applied the container wrapper's host-file UID and SELinux handling to
+  `doctor`, so it can read home markers and harness stores instead of
+  reporting an invalid home route map when access is denied. (#2403)
+
+- Fixed incremental page listing when a long nested wiki path fits in the
+  cursor but falls on a page boundary. (#2408)
+
+- Fixed installation-guide links whose GitHub fragments contain repeated
+  hyphens so they jump to the matching heading in the bundled web docs. (#2419)
+
+- Kept the ETag from the page version written by `ai-memory-wikisync export --force`,
+  so later exports detect a server restored to an earlier version. (#1120)
+
+- Renewed an expired Codex token on Windows when Codex is installed through
+  npm. Without `AI_MEMORY_CODEX_EXECUTABLE`, the recovery now resolves `codex`
+  through `PATH` and `PATHEXT` like `ai-memory run` does, so it finds the
+  `codex.cmd` shim (a native `codex.exe` still wins), and a failed start now
+  names the executable and keeps the OS error. (#2404)
+
+- Skipped the observation retrieval stream when a query's `path_prefix`
+  cannot match `sessions/` pages (and omitted `"observation"` from
+  `streams_active`), and added an indexed pre-flight check so metadata
+  filters (`kind`, `tier`, `tag`) that exclude all session pages avoid
+  scanning `observations_fts` and `observations_cjk_fts`. (#2427)
+
+- Parked interrupted auto-improve scheduler claims on the next
+  exclusively-locked server startup instead of leaving sessions that were
+  mid-review during a shutdown or crash silently hidden from both candidate
+  selection and parked-claim listings, logging a warning with the
+  `ai-memory auto-improve --session-id <id>` rerun command. (#2414)
+
+- Preserved valid TOML, JSON, and JSONC syntax when `ai-memory backup-agents`
+  redacts secrets from MCP configuration files, scrubbing string values and
+  comments structurally instead of running raw free-text regex replacement over
+  the serialized bytes. (#2415)
+
+- Decoupled managed workstream repository and worktree fingerprints from the
+  `origin` git remote URL so adding, changing, or removing `origin` no longer
+  orphans checkout workstreams or project bindings. Existing checkouts with
+  remote-seeded fingerprints migrate transparently to canonical fingerprints on
+  first run, list, or rename, preserving colliding names via deterministic
+  disambiguation. (#2423)
+
+- Allowed ID-selected (`scope_by_id = 1`) Codex managed runs to relink on
+  `SessionStart` (`startup`/`clear` to a fresh thread, `resume` to a
+  same-scope thread not held by another active run) under the same strict
+  scope, operator, checkout, lease, and foreign-session checks as Claude Code,
+  allowed stale shared Codex daemons carrying a terminal pinned `run_id` to
+  fall through on `SessionStart` to single-candidate adoption, and honored
+  `--fresh` when preparing a managed run so `managed_runs.native_session_id`
+  is left unset instead of pre-filling the prior session. (#2413)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
 
+- Included Codex hook settings in agent backups and used the effective
+  `CODEX_HOME` for Codex configuration, skills, and plugins on backup and
+  restore. (#2409)
+
 - Avoided scanning every pending wiki path for the next debounce deadline on
   each filesystem notification, reducing watcher work during bulk edits. (#2354)
+
+- Let wiki debounce and reconciliation timers run during sustained filesystem
+  activity, so a busy event queue cannot keep settled edits out of checkpoints. (#2354)
 
 - Resumed a reclaimed final session consolidation attempt after graceful
   shutdown. The pending job stays claimable at the same attempt count after
@@ -116,12 +175,21 @@ version in [`docs/changelog/`](docs/changelog/):
 - Kept queued session consolidation eligible for outage recovery when every
   fallback candidate is unreachable at the HTTP transport layer. (#2384)
 
+- Recovered stale retrieval-history bookmarks by opening the last retained
+  page after older records were pruned. (#2038)
+
 - Recorded query vector-stream activity in retrieval eval reports when
   `explain=true` was requested, exposing queries that ran without the vector
   stream during local-embedding evaluations. (#1854)
 
+- Marked questions missing from a partial FTS control as unavailable in
+  retrieval comparison reports. (#1854)
+
 - Kept the macOS menu bar status on the latest poll when an earlier response
   arrived after a settings or lifecycle refresh. (#2383)
+
+- Rewrote wikilinks that explicitly name the exported workspace and project as
+  bundle-relative Markdown links in OKF exports. (#2410)
 
 - On Windows, the hook credential files (`auth-token`, `auth-header`) and the
   directories ai-memory creates as private (the hook spool, `auth-tokens/`, the
@@ -133,6 +201,24 @@ version in [`docs/changelog/`](docs/changelog/):
   The credential files are narrowed again the next time `install-hooks` or
   `setup` writes them; an existing spool or token directory keeps its access
   list (see `docs/security-boundaries.md` row 10m). (#2396)
+
+- Deduplicated repeated native Codex and Claude Code tool callbacks with a
+  stable call identity while preserving separate calls and callback phases.
+  Callbacks without sufficient identity retain at-least-once delivery.
+  ([#2399](https://github.com/akitaonrails/ai-memory/pull/2399))
+
+- On Windows, the PowerShell hook bundle and the generated TypeScript plugins
+  (OpenCode, OMP/Pi, OpenClaw) no longer create the hook spool with the access
+  list of the folder above the data dir. Both write the bearer into every
+  spooled entry, and on a fresh install where one of them spools first, an
+  account given read on `%LOCALAPPDATA%` could read it. A spool directory they
+  create is now restricted to the account that writes it, as the native writer
+  does since #2396; an existing one keeps its access list (see
+  `docs/security-boundaries.md` row 10n). (#2401)
+
+- Backed up Kimi Code's MCP settings and skills from its active home.
+  Restores honor `KIMI_CODE_HOME` and keep the recorded destinations for
+  older `.kimi/` archives. (#2418)
 
 ## [3.5.1] - 2026-11-19
 

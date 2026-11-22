@@ -2983,7 +2983,7 @@ Nenhum plugin dedicado do mise ou entrada em registro
 é necessário; o backend funciona para qualquer repositório cujos artefatos de
 release sigam essa convenção de nomenclatura. Por padrão o mise também retém
 a versão mais recente por uma curta janela de segurança
-([`minimum_release_age`](https://mise.jdx.dev/dev-tools/github-backend.html)),
+([`minimum_release_age`](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)),
 portanto uma tag recém-lançada pode resolver para a versão anterior por um dia ou mais;
 fixe uma tag exata com `mise use -g github:akitaonrails/ai-memory@1.30.0` para
 contornar isso.

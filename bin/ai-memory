@@ -935,7 +935,7 @@ fi
 # cannot skip. So readers need the same treatment as writers.
 READS_HOST_FILES=0
 case "${WRAPPER_SUBCOMMAND}" in
-    bootstrap | restore)
+    bootstrap | restore | doctor)
       READS_HOST_FILES=1
       ;;
 esac

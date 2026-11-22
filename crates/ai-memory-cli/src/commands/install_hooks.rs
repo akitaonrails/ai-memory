@@ -5620,7 +5620,7 @@ fn add_hook_spooling(source: String) -> Result<String> {
     }
     out = out.replacen(
         import_anchor,
-        "import { closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from \"node:fs\";",
+        "import { closeSync, existsSync, mkdirSync, opendirSync, openSync, readFileSync as readMarkerText, readSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from \"node:fs\";",
         1,
     );
     Ok(out)
@@ -14885,9 +14885,9 @@ model = "gpt-5"
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
         assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
-        // Three spool-delivery spawns plus the two #2122 server-routed native
-        // spawns (capture and handoff).
-        assert_eq!(plugin.matches("windowsHide: true").count(), 5);
+        // Three spool-delivery spawns, the two #2122 server-routed native
+        // spawns (capture and handoff), and the spool dir's whoami and icacls.
+        assert_eq!(plugin.matches("windowsHide: true").count(), 7);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -15492,7 +15492,7 @@ model = "gpt-5"
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(extension.contains("function repoRootProject"));
         assert!(extension.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(extension.matches("windowsHide: true").count(), 3);
+        assert_eq!(extension.matches("windowsHide: true").count(), 5); // three before, plus the spool dir's whoami and icacls
         assert!(extension.contains("--git-common-dir"));
         assert!(
             extension
@@ -16384,12 +16384,11 @@ const ctx = (id: string, cwd?: string) => ({
 });
 const unscoped = await handlers["before_agent_start"]({ prompt: "continue" }, ctx("s-unscoped", ""));
 const scoped = await handlers["before_agent_start"]({ prompt: "continue" }, ctx("s-scoped", project));
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   claims,
   unscoped: unscoped?.message?.content ?? null,
   scoped: scoped?.message?.content ?? null,
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         fn node_strips_types() -> bool {
@@ -16578,8 +16577,7 @@ while (!hooks.some((hook) => hook.event === "session-end" && hook.sessionID === 
   if (Date.now() > deadline) break;
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
-console.log(JSON.stringify({ claims, delivered, hooks }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ claims, delivered, hooks }) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -16741,8 +16739,7 @@ while (!sessions.every(ended)) {
   if (Date.now() > deadline) break;
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
-console.log(JSON.stringify({ claims, delivered, hooks }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ claims, delivered, hooks }) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -16886,8 +16883,8 @@ const reload = await modelCall("root");
 await compacting("root");
 const afterNext = await modelCall("root");
 await plugin.dispose();
-console.log(JSON.stringify({ oldAfter, before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ oldAfter, before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }) + "\n",
+  (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -17008,13 +17005,12 @@ for (let i = 0; i < 100 && !drained(); i++) {
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
 await new Promise((resolve) => setTimeout(resolve, 300));
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   handoff: reply?.message?.content ?? null,
   loginHits,
   drained: drained(),
   spooled: readdirSync(spool).filter((name) => name.endsWith(".json")).sort(),
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         /// Followed, the gateway's redirect would put its login page in the
@@ -17135,7 +17131,7 @@ process.exit(0);
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(!extension.contains(".omp"));
         assert!(extension.contains("repoProjectCache.set(cwd, project);"));
-        assert_eq!(extension.matches("windowsHide: true").count(), 3);
+        assert_eq!(extension.matches("windowsHide: true").count(), 5); // three before, plus the spool dir's whoami and icacls
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
         // #676: the pi string-transform (api.on( -> pi.on() must still
@@ -17436,14 +17432,13 @@ for (let i = 0; i < 200 && tools.length === 0; i++) await new Promise((r) => set
 const ctx = { cwd: process.cwd(), sessionManager: { getSessionId: () => "pi-codemode-session" } };
 const result = await tools[0].execute("call-1", { query: "x" }, undefined, undefined, ctx);
 const call = calls.find((c) => c.method === "tools/call");
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   names: tools.map((t) => t.name),
   exposure: tools[0].exposure ?? null,
   text: result.content[0].text,
   actor: call.headers["X-Memory-Actor-Session-Id"] ?? null,
   mcp: call.headers["Mcp-Session-Id"] ?? null,
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
         for (exposure, expected) in [
             (PiToolExposure::Direct, serde_json::Value::Null),

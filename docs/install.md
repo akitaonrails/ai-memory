@@ -3082,7 +3082,7 @@ No dedicated mise plugin or
 registry entry is required; the backend works against any repo whose
 release assets follow this naming convention. By default mise also holds back
 the very newest release for a short safety window
-([`minimum_release_age`](https://mise.jdx.dev/dev-tools/github-backend.html)),
+([`minimum_release_age`](https://mise.jdx.dev/configuration/settings.html#minimum_release_age)),
 so a fresh tag may resolve to the previous version for a day or so; pin an
 exact tag with `mise use -g github:akitaonrails/ai-memory@1.30.0` to bypass
 that.
@@ -4073,9 +4073,9 @@ home-directory labels can prevent the helper container from reaching agent
 config even when its UID and GID match the host user. The wrapper checks both
 the host enforcement mode and the engine's advertised security options. For the
 short-lived helper commands that touch host files (`install-*`, `setup-agent`,
-`uninstall`, `backup`, `restore`, and `bootstrap`), it adds `--security-opt
-label=disable`; thin-client commands remain confined when they use the named
-data volume and implicit configuration. An explicit `--config` path or a valid
+`uninstall`, `backup`, `restore`, `bootstrap`, and `doctor`), it adds
+`--security-opt label=disable`; thin-client commands remain confined when they
+use the named data volume and implicit configuration. An explicit `--config` path or a valid
 host-backed `AI_MEMORY_DATA_DIR` also activates the host-file treatment. This
 relaxes SELinux label confinement only for that trusted helper invocation. It
 does not modify the long-lived ai-memory server, which uses an engine-managed
@@ -4086,6 +4086,10 @@ unmapped UID and a confined label block reads just as hard, and the failure is
 misleading: it degrades silently to `no .git found at /work; bootstrapping
 from README/docs/rules only` before dying with `Permission denied (os error
 13)`.
+
+`doctor` also reads host files: the home marker and local harness session
+stores. Without the host-file treatment, a denied read of the home marker
+is reported as `invalid home route map`, even when the marker does not exist.
 
 The two engines report these facts under different keys. Docker answers
 `docker info --format '{{.SecurityOptions}}'`; podman has no such field and

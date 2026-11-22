@@ -236,6 +236,31 @@ async fn documentation_translated_links_resolve_like_the_english_guides() {
     assert!(!usage.contains("/p/install.md"));
 }
 
+#[tokio::test]
+async fn installation_guide_links_reach_their_rendered_headings() {
+    let (_tmp, web, _) = setup();
+    for language in ["en", "pt-BR"] {
+        let (status, html) = get_in(&web, "/docs/install", language).await;
+        assert_eq!(status, StatusCode::OK, "{language}");
+        assert!(html.contains(r#"id="nix-nixos""#), "{language}");
+        assert!(
+            html.contains(r#"href="docs/install#nix-nixos">Nix / NixOS</a>"#),
+            "{language}: the installation table of contents must link to the heading"
+        );
+        assert!(
+            !html.contains(r#"href="docs/install#nix--nixos""#),
+            "{language}"
+        );
+    }
+
+    let (_, html) = get_in(&web, "/docs/install", "en").await;
+    let native = "one-step-native-install-installsh-ai-memory-setup";
+    assert!(html.contains(&format!(r#"id="{native}""#)));
+    assert!(html.contains(&format!(
+        r#"href="docs/install#{native}">One-step native install</a>"#
+    )));
+}
+
 /// Browsers decode a fragment before matching it to an element id.
 fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();

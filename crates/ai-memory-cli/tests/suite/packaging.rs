@@ -4005,6 +4005,50 @@ mod slow {
 
     #[cfg(unix)]
     #[test]
+    fn doctor_gets_host_file_treatment() {
+        for (info, rootless, selinux) in [
+            (FakeInfo::Docker("[name=rootless]"), true, false),
+            (FakeInfo::Docker("[name=seccomp]"), false, false),
+            (
+                FakeInfo::Podman {
+                    rootless: true,
+                    selinux: true,
+                },
+                true,
+                true,
+            ),
+            (
+                FakeInfo::Podman {
+                    rootless: false,
+                    selinux: true,
+                },
+                false,
+                true,
+            ),
+        ] {
+            let args = run_wrapper_with_fake_docker_env(
+                &["doctor"],
+                info,
+                Some("Linux"),
+                None,
+                Some("Enforcing"),
+                &[],
+            );
+            assert_eq!(
+                args.contains("-u\n0:0"),
+                rootless,
+                "doctor must map the host user correctly when reading the home marker; got {args}"
+            );
+            assert_eq!(
+                args.contains("--security-opt\nlabel=disable"),
+                selinux,
+                "doctor must get the host-file SELinux exception only when required; got {args}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn explicit_config_gets_host_file_treatment() {
         let args = run_wrapper_with_fake_podman(
             &["--config", "/tmp/config.toml", "status"],

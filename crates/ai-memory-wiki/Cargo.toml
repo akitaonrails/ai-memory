@@ -38,6 +38,7 @@ futures-util.workspace = true
 winapi-util = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # Mock HTTP server for admission chain integration tests.
 axum.workspace = true
 tower.workspace = true

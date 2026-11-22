@@ -37,9 +37,10 @@ use crate::session_consolidation::SessionConsolidationJob;
 use crate::users::{self, TOKEN_HASH_LEN};
 use crate::web_sessions::{self, WebSession};
 use crate::workstream::{
-    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
-    LinkOrAdoptManagedRunSession, ManagedRunSessionLink, PrepareWorkstreamRun,
-    PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LegacyWorkstreamFingerprints,
+    LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
+    PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream, RenamedWorkstream,
+    StoredWorkstreamSummary,
 };
 
 /// Result of atomically claiming the startup context assembled for one hook.
@@ -889,14 +890,20 @@ pub(crate) enum WriteCmd {
         error: String,
         reply: oneshot::Sender<StoreResult<u32>>,
     },
+    ParkInterruptedAutoImproveClaims {
+        now: jiff::Timestamp,
+        reply: oneshot::Sender<StoreResult<Vec<crate::auto_improve::InterruptedAutoImproveClaim>>>,
+    },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
     },
     PrepareWorkstreamRun {
         input: PrepareWorkstreamRun,
+        legacy: Option<LegacyWorkstreamFingerprints>,
         owner_user: Option<String>,
         force_unlock: bool,
+        fresh: bool,
         reply: oneshot::Sender<StoreResult<PreparedWorkstreamRun>>,
     },
     HeartbeatManagedRun {
@@ -915,7 +922,7 @@ pub(crate) enum WriteCmd {
     },
     LinkOrAdoptManagedRunSession {
         input: LinkOrAdoptManagedRunSession,
-        boundary: crate::workstream::ClaudeSessionBoundary,
+        boundary: crate::workstream::ManagedSessionBoundary,
         reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
     LinkManagedRunSessionInScope {
@@ -941,7 +948,18 @@ pub(crate) enum WriteCmd {
     },
     RenameWorkstream {
         input: RenameWorkstream,
+        legacy: Option<LegacyWorkstreamFingerprints>,
         reply: oneshot::Sender<StoreResult<RenamedWorkstream>>,
+    },
+    ListRecentWorkstreams {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        limit: usize,
+        offset: usize,
+        reply: oneshot::Sender<StoreResult<Vec<StoredWorkstreamSummary>>>,
     },
     AuthorizeProject {
         workspace_id: WorkspaceId,
@@ -3915,6 +3933,24 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Park any in-flight auto-improve scheduler claims left behind by a prior
+    /// server shutdown or crash before a review run was recorded.
+    ///
+    /// Callers must invoke this only while holding the exclusive serve lock so
+    /// a second unguarded process cannot park an active sibling's claim.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the transaction fails.
+    pub async fn park_interrupted_auto_improve_claims(
+        &self,
+        now: jiff::Timestamp,
+    ) -> StoreResult<Vec<crate::auto_improve::InterruptedAutoImproveClaim>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ParkInterruptedAutoImproveClaims { now, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -3952,11 +3988,42 @@ impl WriterHandle {
         owner_user: Option<String>,
         force_unlock: bool,
     ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_owned_with_options(input, owner_user, force_unlock, false)
+            .await
+    }
+
+    /// Select a workstream, optionally replacing this same operator's active
+    /// lease and/or leaving `native_session_id` unset for a `--fresh` launch.
+    pub async fn prepare_workstream_run_owned_with_options(
+        &self,
+        input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
+        force_unlock: bool,
+        fresh: bool,
+    ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_with_legacy(input, None, owner_user, force_unlock, fresh)
+            .await
+    }
+
+    /// Select a workstream after migrating any legacy remote-seeded workstreams
+    /// onto the canonical fingerprints, optionally replacing this same
+    /// operator's active lease and/or leaving `native_session_id` unset for a
+    /// `--fresh` launch (#2413, #2423).
+    pub async fn prepare_workstream_run_with_legacy(
+        &self,
+        input: PrepareWorkstreamRun,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        owner_user: Option<String>,
+        force_unlock: bool,
+        fresh: bool,
+    ) -> StoreResult<PreparedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PrepareWorkstreamRun {
             input,
+            legacy,
             owner_user,
             force_unlock,
+            fresh,
             reply: tx,
         })
         .await?;
@@ -4005,22 +4072,24 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::LinkOrAdoptManagedRunSession {
             input,
-            boundary: crate::workstream::ClaudeSessionBoundary::Other,
+            boundary: crate::workstream::ManagedSessionBoundary::Other,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Relink an ID-selected Claude run after an authorized SessionStart
-    /// `clear` (to a never-seen native id) or `resume` (to one this
-    /// workstream held and no other live run holds). Rechecks the checkout,
-    /// operator, live lease and native-session boundary in the same
-    /// transaction that publishes the new current session.
-    pub async fn relink_managed_claude_session(
+    /// Relink an ID-selected Claude Code or Codex run after an authorized
+    /// SessionStart `clear` / `startup` (to a never-seen native id) or `resume`
+    /// (for Claude Code, to one this workstream held and no other live run
+    /// holds; for Codex, to one not held by another live run and not foreign to
+    /// the run's scope or operator). Rechecks the checkout, operator, live
+    /// lease and native-session boundary in the same transaction that publishes
+    /// the new current session.
+    pub async fn relink_managed_session(
         &self,
         input: LinkOrAdoptManagedRunSession,
-        boundary: crate::workstream::ClaudeSessionBoundary,
+        boundary: crate::workstream::ManagedSessionBoundary,
     ) -> StoreResult<ManagedRunSessionLink> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::LinkOrAdoptManagedRunSession {
@@ -4124,9 +4193,51 @@ impl WriterHandle {
         &self,
         input: RenameWorkstream,
     ) -> StoreResult<RenamedWorkstream> {
+        self.rename_workstream_with_legacy(input, None).await
+    }
+
+    /// Retitle one checkout-local workstream after migrating any legacy
+    /// remote-seeded workstreams onto the canonical fingerprints (#2423).
+    pub async fn rename_workstream_with_legacy(
+        &self,
+        input: RenameWorkstream,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+    ) -> StoreResult<RenamedWorkstream> {
         let (tx, rx) = oneshot::channel();
-        self.send(WriteCmd::RenameWorkstream { input, reply: tx })
-            .await?;
+        self.send(WriteCmd::RenameWorkstream {
+            input,
+            legacy,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Migrate any legacy remote-seeded workstreams onto the canonical
+    /// fingerprints and list one bounded page for that checkout (#2423).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn recent_workstreams_page_migrating(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        repo_fingerprint: String,
+        worktree_fingerprint: String,
+        legacy: Option<LegacyWorkstreamFingerprints>,
+        limit: usize,
+        offset: usize,
+    ) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ListRecentWorkstreams {
+            workspace_id,
+            project_id,
+            repo_fingerprint,
+            worktree_fingerprint,
+            legacy,
+            limit,
+            offset,
+            reply: tx,
+        })
+        .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
@@ -5612,21 +5723,29 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 );
                 send_or_warn(reply, result, "record_auto_improve_claim_failure");
             }
+            WriteCmd::ParkInterruptedAutoImproveClaims { now, reply } => {
+                let result = crate::auto_improve::park_interrupted_claims(&mut conn, now);
+                send_or_warn(reply, result, "park_interrupted_auto_improve_claims");
+            }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);
                 send_or_warn(reply, result, "record_maintenance_job_success");
             }
             WriteCmd::PrepareWorkstreamRun {
                 input,
+                legacy,
                 owner_user,
                 force_unlock,
+                fresh,
                 reply,
             } => {
-                let result = crate::workstream::prepare_run(
+                let result = crate::workstream::prepare_run_with_legacy(
                     &mut conn,
                     &input,
+                    legacy.as_ref(),
                     owner_user.as_deref(),
                     force_unlock,
+                    fresh,
                 );
                 send_or_warn(reply, result, "prepare_workstream_run");
             }
@@ -5749,9 +5868,36 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 };
                 send_or_warn(reply, result, "finish_workstream_run");
             }
-            WriteCmd::RenameWorkstream { input, reply } => {
-                let result = crate::workstream::rename(&mut conn, &input);
+            WriteCmd::RenameWorkstream {
+                input,
+                legacy,
+                reply,
+            } => {
+                let result =
+                    crate::workstream::rename_with_legacy(&mut conn, &input, legacy.as_ref());
                 send_or_warn(reply, result, "rename_workstream");
+            }
+            WriteCmd::ListRecentWorkstreams {
+                workspace_id,
+                project_id,
+                repo_fingerprint,
+                worktree_fingerprint,
+                legacy,
+                limit,
+                offset,
+                reply,
+            } => {
+                let result = crate::workstream::list_recent_migrating(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    &repo_fingerprint,
+                    &worktree_fingerprint,
+                    legacy.as_ref(),
+                    limit,
+                    offset,
+                );
+                send_or_warn(reply, result, "list_recent_workstreams");
             }
         }
     }

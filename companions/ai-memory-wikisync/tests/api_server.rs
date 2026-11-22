@@ -720,6 +720,36 @@ async fn reexport_revalidates_with_etag_and_writes_nothing() {
 }
 
 #[tokio::test]
+async fn forced_export_keeps_the_etag_of_the_bytes_it_wrote() {
+    let path = "notes/a.md";
+    let original = FixturePage::new(path, "Original server version\n");
+    let mut fixture = Fixture::with_pages(vec![original.clone()]);
+    fixture.edit_after_read = Some((path, 2));
+    let (addr, fixture) = serve(fixture).await;
+    let (_tmp, dest) = temp_dest();
+    let export = args(addr, &dest, &["notes"]);
+    run(&export, Mode::Apply).await.unwrap();
+    let original_bytes = fs::read(dest.join(path)).unwrap();
+
+    fs::write(dest.join(path), b"A local edit\n").unwrap();
+    let mut force = export.clone();
+    force.force = true;
+    run(&force, Mode::Apply).await.unwrap();
+    assert_eq!(fixture.page_reads_304.load(Ordering::SeqCst), 1);
+    assert!(
+        fs::read_to_string(dest.join(path))
+            .unwrap()
+            .contains("edited concurrently")
+    );
+
+    // Restoring the original server snapshot makes its old ETag valid again.
+    // The next export must fetch those bytes to replace the newer local copy.
+    *fixture.pages.lock().unwrap() = vec![original];
+    run(&export, Mode::Apply).await.unwrap();
+    assert_eq!(fs::read(dest.join(path)).unwrap(), original_bytes);
+}
+
+#[tokio::test]
 async fn local_edits_are_refused_until_forced() {
     let (addr, _fixture) = serve(Fixture::new(fixture_pages())).await;
     let (_tmp, dest) = temp_dest();
