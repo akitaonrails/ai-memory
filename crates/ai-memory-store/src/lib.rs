@@ -143,9 +143,9 @@ pub use session_consolidation::{
 pub use users::{LoginUser, TOKEN_HASH_LEN, TOKEN_RAW_LEN, TokenPepper, hash_token};
 pub use web_sessions::{LiveWebSession, WebSession, hash_session_secret};
 pub use workstream::{
-    ClaudeSessionBoundary, FinishWorkstreamRun, FinishedWorkstreamRun,
-    LinkManagedRunSessionInScope, LinkOrAdoptManagedRunSession, ManagedRunAuthority,
-    ManagedRunContext, ManagedRunHookIdentity, ManagedRunSessionLink, NativeSessionHolder,
+    FinishWorkstreamRun, FinishedWorkstreamRun, LinkManagedRunSessionInScope,
+    LinkOrAdoptManagedRunSession, ManagedRunAuthority, ManagedRunContext, ManagedRunHookIdentity,
+    ManagedRunSessionLink, ManagedSessionBoundary, NativeSessionHolder,
     OperationalWorkstreamSummary, PrepareWorkstreamRun, PreparedWorkstreamRun, RenameWorkstream,
     RenamedWorkstream, StoredManagedRunStatus, StoredWorkstreamSummary,
     WorkstreamOperationalStatus, WorkstreamSelection, WorkstreamSelector,
@@ -7728,7 +7728,7 @@ mod tests {
             native_session_id: "native-session".into(),
             owner_user: None,
             session_start: true,
-            claude_boundary: ClaudeSessionBoundary::Other,
+            session_boundary: ManagedSessionBoundary::Other,
         };
 
         set_managed_run_lease(store.db_path(), run.run_id, 1);
@@ -7756,7 +7756,7 @@ mod tests {
                     native_session_id: "native-session".into(),
                     owner_user: None,
                     session_start: true,
-                    claude_boundary: ClaudeSessionBoundary::Other,
+                    session_boundary: ManagedSessionBoundary::Other,
                 })
                 .await
                 .unwrap(),

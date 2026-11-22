@@ -897,6 +897,7 @@ pub(crate) enum WriteCmd {
         input: PrepareWorkstreamRun,
         owner_user: Option<String>,
         force_unlock: bool,
+        fresh: bool,
         reply: oneshot::Sender<StoreResult<PreparedWorkstreamRun>>,
     },
     HeartbeatManagedRun {
@@ -915,7 +916,7 @@ pub(crate) enum WriteCmd {
     },
     LinkOrAdoptManagedRunSession {
         input: LinkOrAdoptManagedRunSession,
-        boundary: crate::workstream::ClaudeSessionBoundary,
+        boundary: crate::workstream::ManagedSessionBoundary,
         reply: oneshot::Sender<StoreResult<ManagedRunSessionLink>>,
     },
     LinkManagedRunSessionInScope {
@@ -3952,11 +3953,25 @@ impl WriterHandle {
         owner_user: Option<String>,
         force_unlock: bool,
     ) -> StoreResult<PreparedWorkstreamRun> {
+        self.prepare_workstream_run_owned_with_options(input, owner_user, force_unlock, false)
+            .await
+    }
+
+    /// Select a workstream, optionally replacing this same operator's active
+    /// lease and/or leaving `native_session_id` unset for a `--fresh` launch.
+    pub async fn prepare_workstream_run_owned_with_options(
+        &self,
+        input: PrepareWorkstreamRun,
+        owner_user: Option<String>,
+        force_unlock: bool,
+        fresh: bool,
+    ) -> StoreResult<PreparedWorkstreamRun> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::PrepareWorkstreamRun {
             input,
             owner_user,
             force_unlock,
+            fresh,
             reply: tx,
         })
         .await?;
@@ -4005,22 +4020,24 @@ impl WriterHandle {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::LinkOrAdoptManagedRunSession {
             input,
-            boundary: crate::workstream::ClaudeSessionBoundary::Other,
+            boundary: crate::workstream::ManagedSessionBoundary::Other,
             reply: tx,
         })
         .await?;
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Relink an ID-selected Claude run after an authorized SessionStart
-    /// `clear` (to a never-seen native id) or `resume` (to one this
-    /// workstream held and no other live run holds). Rechecks the checkout,
-    /// operator, live lease and native-session boundary in the same
-    /// transaction that publishes the new current session.
-    pub async fn relink_managed_claude_session(
+    /// Relink an ID-selected Claude Code or Codex run after an authorized
+    /// SessionStart `clear` / `startup` (to a never-seen native id) or `resume`
+    /// (for Claude Code, to one this workstream held and no other live run
+    /// holds; for Codex, to one not held by another live run and not foreign to
+    /// the run's scope or operator). Rechecks the checkout, operator, live
+    /// lease and native-session boundary in the same transaction that publishes
+    /// the new current session.
+    pub async fn relink_managed_session(
         &self,
         input: LinkOrAdoptManagedRunSession,
-        boundary: crate::workstream::ClaudeSessionBoundary,
+        boundary: crate::workstream::ManagedSessionBoundary,
     ) -> StoreResult<ManagedRunSessionLink> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::LinkOrAdoptManagedRunSession {
@@ -5620,6 +5637,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                 input,
                 owner_user,
                 force_unlock,
+                fresh,
                 reply,
             } => {
                 let result = crate::workstream::prepare_run(
@@ -5627,6 +5645,7 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &input,
                     owner_user.as_deref(),
                     force_unlock,
+                    fresh,
                 );
                 send_or_warn(reply, result, "prepare_workstream_run");
             }

@@ -2002,6 +2002,10 @@ pub struct HandoffQuery {
     pub managed_run: Option<String>,
     /// Native session identifier observed in the SessionStart payload.
     pub session_id: Option<String>,
+    /// Optional SessionStart `source` (`startup`, `clear`, `resume`, `compact`)
+    /// forwarded from the hook payload so pinned managed runs can apply the
+    /// same SessionStart relink boundary on `GET /handoff` as on `POST /hook`.
+    pub source: Option<String>,
     /// Repository identity the client resolved (#708). Same contract as
     /// [`crate::payload::HookQuery::identity`].
     pub identity: Option<String>,
@@ -2489,7 +2493,7 @@ struct ManagedHookHint<'a> {
     cwd: Option<&'a str>,
     native_session: Option<&'a str>,
     session_start: bool,
-    claude_boundary: ai_memory_store::ClaudeSessionBoundary,
+    session_boundary: ai_memory_store::ManagedSessionBoundary,
 }
 
 /// Only a run prepared through the ID selector may supply its stored scope.
@@ -2519,7 +2523,7 @@ async fn pinned_managed_hook_scope(
             native_session_id: hint.native_session.unwrap_or_default().to_owned(),
             owner_user: owner_user.clone(),
             session_start: hint.session_start,
-            claude_boundary: hint.claude_boundary,
+            session_boundary: hint.session_boundary,
         })
         .await?;
     let Some((workspace_id, project_id)) = scope else {
@@ -2540,10 +2544,10 @@ async fn pinned_managed_hook_scope(
         ai_memory_store::ProjectAccess::Write,
     )
     .await?;
-    let linked = if hint.claude_boundary != ai_memory_store::ClaudeSessionBoundary::Other {
+    let linked = if hint.session_boundary != ai_memory_store::ManagedSessionBoundary::Other {
         state
             .writer
-            .relink_managed_claude_session(
+            .relink_managed_session(
                 ai_memory_store::LinkOrAdoptManagedRunSession {
                     supplied_run_id: run_id,
                     workspace_id,
@@ -2553,7 +2557,7 @@ async fn pinned_managed_hook_scope(
                     native_session_id: native.into_string(),
                     owner_user,
                 },
-                hint.claude_boundary,
+                hint.session_boundary,
             )
             .await?
     } else {
@@ -2585,15 +2589,20 @@ async fn resolve_authorized_startup_scope(
     actor: Option<&IdentityKey>,
     viewer: Option<ai_memory_core::UserId>,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
+    let agent = query.agent.as_deref().map_or(AgentKind::Other, parse_agent);
     if let Some(scope) = pinned_managed_hook_scope(
         state,
         ManagedHookHint {
             run: query.managed_run.as_deref(),
-            agent: query.agent.as_deref().map_or(AgentKind::Other, parse_agent),
+            agent,
             cwd: query.cwd.as_deref(),
             native_session: query.session_id.as_deref(),
             session_start: true,
-            claude_boundary: ai_memory_store::ClaudeSessionBoundary::Other,
+            session_boundary: ai_memory_store::ManagedSessionBoundary::from_session_start(
+                agent,
+                true,
+                query.source.as_deref(),
+            ),
         },
         actor,
         viewer,
@@ -5384,9 +5393,12 @@ async fn process_authorized(
             cwd: env.cwd.as_deref(),
             native_session: env.session_id.as_deref(),
             session_start: env.event == HookEvent::SessionStart,
-            // Claude documents `clear` and `resume` separately from startup
-            // and compact: https://code.claude.com/docs/en/hooks#sessionstart-input
-            claude_boundary: ai_memory_store::ClaudeSessionBoundary::from_session_start(
+            // Claude Code documents `clear` and `resume` separately from
+            // startup and compact
+            // (https://code.claude.com/docs/en/hooks#sessionstart-input);
+            // Codex emits `startup`/`clear` for a new thread and `resume` when
+            // resuming/switching threads.
+            session_boundary: ai_memory_store::ManagedSessionBoundary::from_session_start(
                 env.agent,
                 env.event == HookEvent::SessionStart,
                 env.raw.get("source").and_then(serde_json::Value::as_str),
@@ -7166,6 +7178,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -16774,6 +16787,325 @@ pub(crate) mod tests {
         );
     }
 
+    /// A `scope_by_id = 1` Codex run pre-linked to `N` relinks on `SessionStart`
+    /// (`startup`/`clear` to fresh `F`, `resume` to existing `S`) and keeps
+    /// capturing `/hook/batch` `PreToolUse`/`PostToolUse` events, while refusing
+    /// non-`SessionStart` switches and delayed events for abandoned `N`.
+    #[tokio::test]
+    async fn managed_codex_pinned_run_relinks_on_session_start_and_captures_batch() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let run = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "codex-repo".into(),
+                worktree_fingerprint: "codex-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "codex-test".into(),
+            })
+            .await
+            .unwrap();
+        // Pre-link to prior thread `N` as `ai-memory run` does (#1993).
+        assert!(
+            state
+                .writer
+                .link_managed_run_session(run.run_id, AgentKind::Codex, "thread-n")
+                .await
+                .unwrap()
+        );
+
+        // Switch to fresh thread `F` via `SessionStart` (`source: "startup"`)
+        // followed by `PreToolUse` and `PostToolUse` in `/hook/batch`.
+        let batch_fresh = vec![
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=session-start&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-f",
+                    "cwd": "/tmp/scratch",
+                    "source": "startup"
+                }),
+            },
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=pre-tool-use&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-f",
+                    "cwd": "/tmp/scratch",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "cargo test"}
+                }),
+            },
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=post-tool-use&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-f",
+                    "cwd": "/tmp/scratch",
+                    "tool_name": "Bash",
+                    "tool_response": "ok"
+                }),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(batch_fresh),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 3);
+        assert_eq!(state.ingest_metrics.snapshot().dropped_invalid, 0);
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("thread-f")
+        );
+        let fresh_sid = ai_memory_core::SessionId::from_native("thread-f");
+        assert!(
+            state
+                .reader
+                .observations_for_session(fresh_sid)
+                .await
+                .unwrap()
+                .len()
+                >= 2
+        );
+
+        // Non-SessionStart for abandoned `thread-n` is refused, and `startup`
+        // cannot rewind to already-bound `thread-n`.
+        let mut stale_tool = session_envelope("pre-tool-use", "thread-n", "/tmp/scratch");
+        stale_tool.agent = AgentKind::Codex;
+        stale_tool.managed_run = Some(run.run_id.to_string());
+        assert!(process(&state, stale_tool, None, Vec::new()).await.is_err());
+
+        let mut rewind = session_envelope("session-start", "thread-n", "/tmp/scratch");
+        rewind.agent = AgentKind::Codex;
+        rewind.managed_run = Some(run.run_id.to_string());
+        rewind.raw["source"] = serde_json::json!("startup");
+        assert!(process(&state, rewind, None, Vec::new()).await.is_err());
+
+        // `GET /handoff` with `source=resume` relinks to resumed thread `S`.
+        let handoff_resp = handle_handoff(
+            State(state.clone()),
+            Query(HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/scratch".into()),
+                managed_run: Some(run.run_id.to_string()),
+                session_id: Some("thread-s".into()),
+                source: Some("resume".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(handoff_resp.status(), StatusCode::OK);
+        assert_eq!(
+            run_native_session(&state, run.run_id).await.as_deref(),
+            Some("thread-s")
+        );
+
+        // Subsequent `/hook/batch` `PreToolUse`/`PostToolUse` on `thread-s` capture.
+        let batch_resume = vec![
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=pre-tool-use&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-s",
+                    "cwd": "/tmp/scratch",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "git status"}
+                }),
+            },
+            HookBatchItem {
+                url: format!(
+                    "http://h/hook?event=post-tool-use&agent=codex&managed_run={}",
+                    run.run_id
+                ),
+                body: serde_json::json!({
+                    "session_id": "thread-s",
+                    "cwd": "/tmp/scratch",
+                    "tool_name": "Bash",
+                    "tool_response": "clean"
+                }),
+            },
+        ];
+        let response = handle_hook_batch(
+            State(state.clone()),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+            Json(batch_resume),
+        )
+        .await
+        .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(ack["accepted"], 2);
+        let resumed_sid = ai_memory_core::SessionId::from_native("thread-s");
+        assert!(
+            !state
+                .reader
+                .observations_for_session(resumed_sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A shared Codex daemon carrying a terminal `scope_by_id = 1` run id
+    /// falls through `pinned_hook_scope` on `SessionStart` and adopts the sole
+    /// live, undelivered, unlinked Codex run in the same scope/cwd/owner.
+    /// Non-Codex and non-`SessionStart` terminal pins remain refused.
+    #[tokio::test]
+    async fn managed_codex_stale_terminal_pinned_run_adopts_sole_live_unlinked_run() {
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(make_state(&tmp).await);
+        let old_codex = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "codex-adopt-repo".into(),
+                worktree_fingerprint: "codex-adopt-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "codex-old".into(),
+            })
+            .await
+            .unwrap();
+        state
+            .writer
+            .cancel_managed_run(old_codex.run_id)
+            .await
+            .unwrap();
+
+        let live_codex = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "codex-adopt-repo".into(),
+                worktree_fingerprint: "codex-adopt-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::Codex,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "codex-live".into(),
+            })
+            .await
+            .unwrap();
+
+        // Non-SessionStart on the terminal Codex pin stays refused.
+        let mut stale_tool = session_envelope("pre-tool-use", "adopted-thread", "/tmp/scratch");
+        stale_tool.agent = AgentKind::Codex;
+        stale_tool.managed_run = Some(old_codex.run_id.to_string());
+        assert!(process(&state, stale_tool, None, Vec::new()).await.is_err());
+
+        // Non-Codex (ClaudeCode) terminal pin stays refused even on SessionStart.
+        let old_claude = state
+            .writer
+            .prepare_workstream_run(PrepareWorkstreamRun {
+                scope_by_id: true,
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                repo_fingerprint: "claude-term-repo".into(),
+                worktree_fingerprint: "claude-term-tree".into(),
+                cwd: "/tmp/scratch".into(),
+                agent: AgentKind::ClaudeCode,
+                automatic_harness: false,
+                available_agents: Vec::new(),
+                selection: WorkstreamSelection::Current,
+                lease_owner: "claude-old".into(),
+            })
+            .await
+            .unwrap();
+        state
+            .writer
+            .cancel_managed_run(old_claude.run_id)
+            .await
+            .unwrap();
+        let mut claude_start = session_envelope("session-start", "claude-fresh", "/tmp/scratch");
+        claude_start.agent = AgentKind::ClaudeCode;
+        claude_start.managed_run = Some(old_claude.run_id.to_string());
+        assert!(
+            process(&state, claude_start, None, Vec::new())
+                .await
+                .is_err()
+        );
+
+        // Codex SessionStart (`POST /hook` + `GET /handoff`) carrying the stale
+        // terminal `scope_by_id = 1` run id falls through and adopts `live_codex`.
+        let mut codex_start = session_envelope("session-start", "adopted-thread", "/tmp/scratch");
+        codex_start.agent = AgentKind::Codex;
+        codex_start.managed_run = Some(old_codex.run_id.to_string());
+        codex_start.workspace_override = Some("default".into());
+        codex_start.project_override = Some("scratch".into());
+        process(&state, codex_start, None, Vec::new())
+            .await
+            .unwrap();
+
+        let handoff_resp = handle_handoff(
+            State(state.clone()),
+            Query(HandoffQuery {
+                agent: Some("codex".into()),
+                cwd: Some("/tmp/scratch".into()),
+                workspace: Some("default".into()),
+                project: Some("scratch".into()),
+                managed_run: Some(old_codex.run_id.to_string()),
+                session_id: Some("adopted-thread".into()),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(handoff_resp.status(), StatusCode::OK);
+        assert_eq!(
+            run_native_session(&state, live_codex.run_id)
+                .await
+                .as_deref(),
+            Some("adopted-thread")
+        );
+    }
+
     /// `/clear` then an in-session `/resume` back to the pre-clear
     /// conversation: Claude sends SessionStart `resume` with the old id, the
     /// run follows it and capture continues there. A `resume` to an id the
@@ -21696,6 +22028,7 @@ pub(crate) mod tests {
                     briefing: None,
                     briefing_budget: None,
                     managed_run: None,
+                    source: None,
                     session_id: None,
                     identity: None,
                     identity_src: None,
@@ -22329,6 +22662,7 @@ pub(crate) mod tests {
             briefing: Some("1".into()),
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -22425,6 +22759,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -22540,6 +22875,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -22742,6 +23078,7 @@ pub(crate) mod tests {
                     briefing: None,
                     briefing_budget: None,
                     managed_run: None,
+                    source: None,
                     session_id: None,
                     identity: None,
                     identity_src: None,
@@ -23923,6 +24260,7 @@ pub(crate) mod tests {
                 briefing: None,
                 briefing_budget: None,
                 managed_run: None,
+                source: None,
                 session_id: None,
                 identity: None,
                 identity_src: None,
@@ -24014,6 +24352,7 @@ pub(crate) mod tests {
                 briefing: None,
                 briefing_budget: None,
                 managed_run: None,
+                source: None,
                 session_id: None,
                 identity: None,
                 identity_src: None,
@@ -24096,6 +24435,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: Some(session_id.into()),
             identity: None,
             identity_src: None,
@@ -24261,6 +24601,7 @@ pub(crate) mod tests {
             // Codex's shared app-server may retain the previous finished run
             // id even though this launcher opened `run` (#987).
             managed_run: Some(first.run_id.to_string()),
+            source: None,
             session_id: Some("native-2".into()),
             identity: None,
             identity_src: None,
@@ -24388,6 +24729,7 @@ pub(crate) mod tests {
             briefing: Some("true".into()),
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -24479,6 +24821,7 @@ pub(crate) mod tests {
             briefing: Some("true".into()),
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -25186,6 +25529,7 @@ pub(crate) mod tests {
             briefing: briefing.map(str::to_owned),
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,
@@ -25359,6 +25703,7 @@ pub(crate) mod tests {
             briefing: briefing.map(str::to_owned),
             briefing_budget: None,
             managed_run: Some(kimi.run_id.to_string()),
+            source: None,
             session_id: Some("kimi-session".into()),
             identity: None,
             identity_src: None,
@@ -26221,6 +26566,7 @@ pub(crate) mod tests {
                 briefing: None,
                 briefing_budget: None,
                 managed_run: None,
+                source: None,
                 session_id: None,
                 identity: None,
                 identity_src: None,
@@ -30513,6 +30859,7 @@ pub(crate) mod tests {
             briefing: None,
             briefing_budget: None,
             managed_run: None,
+            source: None,
             session_id: None,
             identity: None,
             identity_src: None,

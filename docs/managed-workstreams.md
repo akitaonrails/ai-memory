@@ -362,9 +362,15 @@ sessions already linked to the selected workstream remain resumable.
 ID-selected runs require a reachable server. Their SessionStart context and
 capture hooks use the run's pinned project after validating the launching
 operator, active lease, harness and native session. Startup and initial binding
-also require the original checkout. A stale, expired or foreign pinned run is
-refused rather than routed by the ambiguous name. Existing runs retain their
-original marker/name routing; the additive schema flag defaults to off.
+also require the original checkout. On `SessionStart`, Claude Code (`clear`,
+`resume`) and Codex (`startup`, `clear`, `resume`) may atomically relink an
+active pinned run to a fresh or same-scope resumed native session under the
+same scope, operator, checkout, lease, and foreign-session checks; a stale
+shared Codex daemon carrying a terminal pinned run ID falls through on
+`SessionStart` to single-candidate adoption of the sole live unlinked run. A
+non-Codex or non-`SessionStart` stale, expired or foreign pinned run is refused
+rather than routed by the ambiguous name. Existing runs retain their original
+marker/name routing; the additive schema flag defaults to off.
 
 The wire requests for `/workstream/runs` and `/workstream/recent` accept an
 optional `project_id`, mutually exclusive with a non-empty `project`. Clients
