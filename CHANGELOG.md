@@ -30,6 +30,9 @@ version in [`docs/changelog/`](docs/changelog/):
 - Avoided scanning every pending wiki path for the next debounce deadline on
   each filesystem notification, reducing watcher work during bulk edits. (#2354)
 
+- Let wiki debounce and reconciliation timers run during sustained filesystem
+  activity, so a busy event queue cannot keep settled edits out of checkpoints. (#2354)
+
 - Resumed a reclaimed final session consolidation attempt after graceful
   shutdown. The pending job stays claimable at the same attempt count after
   restart, and a provider failure on that attempt still ends it. (#2360)
