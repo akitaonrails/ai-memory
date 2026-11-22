@@ -20,6 +20,9 @@ version in [`docs/changelog/`](docs/changelog/):
 - Fixed incremental page listing when a long nested wiki path fits in the
   cursor but falls on a page boundary. (#2408)
 
+- Kept keyboard focus on token-usage selectors when using arrow keys in
+  the session timeline. (#2432)
+
 - Fixed installation-guide links whose GitHub fragments contain repeated
   hyphens so they jump to the matching heading in the bundled web docs. (#2419)
 

@@ -15,6 +15,7 @@ const faults = [
   ['retain-write-token', 'delivery'],
   ['disable-live-refresh', 'live-usage'],
   ['disable-session-live-refresh', 'session-live-usage'],
+  ['steal-session-select-key', 'session-scrubber-select'],
   ['drop-usage-query', 'call-history'],
   ['forget-theme', 'themes'],
   ['resolve-fragments-at-mount', 'fragment-navigation'],

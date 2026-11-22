@@ -82,6 +82,7 @@ guessed coordinates.
 | More than 256 responses and a transcript larger than 4 MiB recover across successive hook processes, without advancing on enqueue failure or duplicating responses | Browser `capture-backlog` uses native hooks, spool drain, the real server and dashboard; CLI `native_hook_recovers_a_response_backlog_and_does_not_advance_on_spool_failure`, `live_token_cursor_replays_until_commit_then_recovers_every_response`, `live_token_cursor_crosses_byte_windows_and_retries_partial_usage` |
 | Search and recent ordering include small responses beyond the largest fifty; pagination and reload keep query state | Browser `call-history`; store `token_call_queries_search_and_order_before_pagination_with_scope_and_owner_guards`; web `operations_response_search_and_pagination_cover_the_full_project_and_session` |
 | Session usage updates without reload and preserves filter focus | Browser `session-live-usage` |
+| Session timeline shortcuts leave arrow keys to a focused token-usage selector | Browser `session-scrubber-select` |
 | The native hook actually reads Claude/Codex transcripts for each supported event | CLI `native_hook_reports_live_usage_for_every_supported_event_and_harness` uses the built executable and inspects the delivered spool payload |
 | Streaming/replayed counters cannot decrease the displayed response or disagree with session totals | Store `token_calls_keep_partial_reports_monotonic_in_rows_and_aggregates` |
 | Reused response ids stay separate across sessions, agents and projects | Store `token_calls_group_by_session_and_agent_without_merging_foreign_responses`; web ownership/aggregate tests |
@@ -107,6 +108,7 @@ counts only if the response was changed and the intended behavioral case failed.
 | Ignore response search before selecting the page | Full-history response query regression |
 | Remove response-owner filtering | Full-history query ownership regression with root control |
 | Disable periodic refresh on the session page | `session-live-usage` |
+| Capture a token-usage selector's arrow keys in the timeline | `session-scrubber-select` |
 | Drop server query fields from response controls | `call-history` |
 | Display every tab panel | `tabs` |
 | Ignore recipient workspace | `recipients` |
