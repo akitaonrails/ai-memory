@@ -644,6 +644,29 @@ pub const AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS: u32 = 3;
 pub const ABANDONED_SWEEP_CLAIM_ERROR: &str =
     "parked by the abandoned-session sweep; no scheduled review was run";
 
+/// The `last_error` a claim parked at startup carries when a previous server
+/// exited or crashed mid-review before recording an `auto_improve_runs` row.
+///
+/// The scheduler claims a session before awaiting the LLM and writes the run
+/// row only after the review completes, so an abrupt shutdown leaves a bare
+/// claim (`last_failed_at IS NULL`, no `auto_improve_runs` row). Parking it on
+/// the next exclusively-locked startup surfaces it in
+/// `auto_improve_parked_claims` instead of leaving it silently skipped forever,
+/// while manual `ai-memory auto-improve --session-id <id>` remains available.
+pub const INTERRUPTED_REVIEW_CLAIM_ERROR: &str = "interrupted by server shutdown or crash before a review run was recorded; rerun manually with ai-memory auto-improve --session-id <id>";
+
+/// A scheduler claim parked at startup because a prior server process was
+/// interrupted mid-review before recording an `auto_improve_runs` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterruptedAutoImproveClaim {
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Owning project.
+    pub project_id: ProjectId,
+    /// Session whose in-flight review was interrupted.
+    pub session_id: SessionId,
+}
+
 /// Atomically claim one ended session for background review. Returns `true`
 /// only for the first claimer: the insert requires the session to be past
 /// the scope's watermark and not already covered by a run, so concurrent
@@ -762,6 +785,75 @@ pub fn record_claim_failure(
         |row| row.get(0),
     )?;
     Ok(attempts)
+}
+
+/// Park any in-flight scheduler claims left behind by a previous server
+/// shutdown or crash before a review run was recorded.
+///
+/// Selects and updates in a single transaction every row in
+/// `auto_improve_scheduler_claims` where `last_failed_at IS NULL` and no
+/// matching `auto_improve_runs` row exists, setting
+/// `attempts = AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS`, `last_failed_at = now`, and
+/// `last_error = INTERRUPTED_REVIEW_CLAIM_ERROR`.
+///
+/// Callers must invoke this only while holding the exclusive serve lock so a
+/// second unguarded process cannot park an active sibling's in-flight claim.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statements fail.
+pub fn park_interrupted_claims(
+    conn: &mut Connection,
+    now: Timestamp,
+) -> StoreResult<Vec<InterruptedAutoImproveClaim>> {
+    let now_us = now.as_microsecond();
+    let tx = conn.transaction()?;
+    let parked: Vec<InterruptedAutoImproveClaim> = {
+        let mut stmt = tx.prepare(
+            "SELECT c.workspace_id, c.project_id, c.session_id \
+             FROM auto_improve_scheduler_claims c \
+             WHERE c.last_failed_at IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM auto_improve_runs r \
+                   WHERE r.workspace_id = c.workspace_id \
+                     AND r.project_id = c.project_id \
+                     AND r.session_id = c.session_id \
+               ) \
+             ORDER BY c.claimed_at ASC, c.session_id ASC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(InterruptedAutoImproveClaim {
+                workspace_id: WorkspaceId::from_slice(&row.get::<_, Vec<u8>>(0)?)
+                    .map_err(to_sql_err)?,
+                project_id: ProjectId::from_slice(&row.get::<_, Vec<u8>>(1)?)
+                    .map_err(to_sql_err)?,
+                session_id: SessionId::from_slice(&row.get::<_, Vec<u8>>(2)?)
+                    .map_err(to_sql_err)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    if !parked.is_empty() {
+        tx.execute(
+            "UPDATE auto_improve_scheduler_claims \
+             SET attempts = ?1, last_failed_at = ?2, last_error = ?3 \
+             WHERE last_failed_at IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM auto_improve_runs r \
+                   WHERE r.workspace_id = auto_improve_scheduler_claims.workspace_id \
+                     AND r.project_id = auto_improve_scheduler_claims.project_id \
+                     AND r.session_id = auto_improve_scheduler_claims.session_id \
+               )",
+            params![
+                AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
+                now_us,
+                INTERRUPTED_REVIEW_CLAIM_ERROR,
+            ],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(parked)
 }
 
 /// Persist one review run and stage its proposals as `pending`, all in one

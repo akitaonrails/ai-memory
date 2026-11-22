@@ -13,6 +13,12 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Parked interrupted auto-improve scheduler claims on the next
+  exclusively-locked server startup instead of leaving sessions that were
+  mid-review during a shutdown or crash silently hidden from both candidate
+  selection and parked-claim listings, logging a warning with the
+  `ai-memory auto-improve --session-id <id>` rerun command. (#2414)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
