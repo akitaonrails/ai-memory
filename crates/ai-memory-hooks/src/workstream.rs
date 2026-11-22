@@ -15,9 +15,10 @@ use ai_memory_core::{
     RenamedManagedWorkstream, Sanitizer, WorkstreamEventKind, WorkstreamId,
 };
 use ai_memory_store::{
-    FinishWorkstreamRun, PrepareWorkstreamRun, ReaderPool, RenameWorkstream, ScopeResolutionError,
-    StoreError, WorkstreamSelection, WorkstreamSelector, WriterHandle, authorize_scope_for,
-    create_explicit_scope_guarded, lookup_existing_scope_guarded, lookup_project_id_guarded,
+    FinishWorkstreamRun, LegacyWorkstreamFingerprints, PrepareWorkstreamRun, ReaderPool,
+    RenameWorkstream, ScopeResolutionError, StoreError, WorkstreamSelection, WorkstreamSelector,
+    WriterHandle, authorize_scope_for, create_explicit_scope_guarded,
+    lookup_existing_scope_guarded, lookup_project_id_guarded,
 };
 use ai_memory_wiki::Wiki;
 use axum::extract::{Path as AxumPath, Query, State};
@@ -420,6 +421,15 @@ async fn prepare_run(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
+    let legacy_fingerprints = match parse_legacy_fingerprints(
+        request.legacy_repo_fingerprint.clone(),
+        request.legacy_worktree_fingerprint.clone(),
+        &request.repo_fingerprint,
+        &request.worktree_fingerprint,
+    ) {
+        Ok(legacy) => legacy,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let selection = match (&request.workstream, &request.new_workstream) {
         (Some(name), None) => WorkstreamSelection::Named(name.trim().to_string()),
         (None, Some(name)) => WorkstreamSelection::New(name.trim().to_string()),
@@ -506,7 +516,7 @@ async fn prepare_run(
     };
     let prepared = state
         .writer
-        .prepare_workstream_run_owned_with_unlock(
+        .prepare_workstream_run_with_legacy(
             PrepareWorkstreamRun {
                 workspace_id: scope.workspace_id,
                 project_id: scope.project_id,
@@ -520,6 +530,7 @@ async fn prepare_run(
                 selection,
                 lease_owner: request.lease_owner,
             },
+            legacy_fingerprints,
             owner_user,
             force_unlock,
         )
@@ -823,6 +834,15 @@ async fn list_recent_workstreams(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
+    let legacy_fingerprints = match parse_legacy_fingerprints(
+        request.legacy_repo_fingerprint,
+        request.legacy_worktree_fingerprint,
+        &request.repo_fingerprint,
+        &request.worktree_fingerprint,
+    ) {
+        Ok(legacy) => legacy,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let resolved = if let Some(project_id) = request.project_id {
         lookup_project_id_guarded(
             &state.reader,
@@ -863,20 +883,40 @@ async fn list_recent_workstreams(
         }
         Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
     };
-    let summaries = match state
-        .reader
-        .recent_workstreams_page(
-            scope.workspace_id,
-            scope.project_id,
-            request.repo_fingerprint,
-            request.worktree_fingerprint,
-            request.limit.clamp(1, 100),
-            request.offset,
-        )
-        .await
-    {
-        Ok(summaries) => summaries,
-        Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+    let limit = request.limit.clamp(1, 100);
+    let summaries = if legacy_fingerprints.is_some() {
+        match state
+            .writer
+            .recent_workstreams_page_migrating(
+                scope.workspace_id,
+                scope.project_id,
+                request.repo_fingerprint,
+                request.worktree_fingerprint,
+                legacy_fingerprints,
+                limit,
+                request.offset,
+            )
+            .await
+        {
+            Ok(summaries) => summaries,
+            Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+        }
+    } else {
+        match state
+            .reader
+            .recent_workstreams_page(
+                scope.workspace_id,
+                scope.project_id,
+                request.repo_fingerprint,
+                request.worktree_fingerprint,
+                limit,
+                request.offset,
+            )
+            .await
+        {
+            Ok(summaries) => summaries,
+            Err(failure) => return error(StatusCode::INTERNAL_SERVER_ERROR, failure.to_string()),
+        }
     };
     let mut response = Vec::with_capacity(summaries.len());
     for summary in summaries {
@@ -933,6 +973,15 @@ async fn rename_workstream(
             return error(StatusCode::BAD_REQUEST, format!("{label} is too long"));
         }
     }
+    let legacy_fingerprints = match parse_legacy_fingerprints(
+        request.legacy_repo_fingerprint,
+        request.legacy_worktree_fingerprint,
+        &request.repo_fingerprint,
+        &request.worktree_fingerprint,
+    ) {
+        Ok(legacy) => legacy,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let selector = match (request.from.as_deref(), request.workstream_id) {
         (Some(name), None) => {
             let name = name.trim();
@@ -984,14 +1033,17 @@ async fn rename_workstream(
     };
     let renamed = match state
         .writer
-        .rename_workstream(RenameWorkstream {
-            workspace_id: scope.workspace_id,
-            project_id: scope.project_id,
-            repo_fingerprint: request.repo_fingerprint,
-            worktree_fingerprint: request.worktree_fingerprint,
-            selector,
-            new_name: request.to,
-        })
+        .rename_workstream_with_legacy(
+            RenameWorkstream {
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+                repo_fingerprint: request.repo_fingerprint,
+                worktree_fingerprint: request.worktree_fingerprint,
+                selector,
+                new_name: request.to,
+            },
+            legacy_fingerprints,
+        )
         .await
     {
         Ok(renamed) => renamed,
@@ -1003,6 +1055,40 @@ async fn rename_workstream(
         to: renamed.to,
     })
     .into_response()
+}
+
+fn parse_legacy_fingerprints(
+    legacy_repo: Option<String>,
+    legacy_worktree: Option<String>,
+    canonical_repo: &str,
+    canonical_worktree: &str,
+) -> Result<Option<LegacyWorkstreamFingerprints>, String> {
+    match (legacy_repo, legacy_worktree) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(
+            "legacy_repo_fingerprint and legacy_worktree_fingerprint must be sent together".into(),
+        ),
+        (Some(repo), Some(worktree)) => {
+            for (label, value) in [
+                ("legacy_repo_fingerprint", repo.as_str()),
+                ("legacy_worktree_fingerprint", worktree.as_str()),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!("{label} cannot be empty"));
+                }
+                if value.len() > MAX_NAME_BYTES {
+                    return Err(format!("{label} is too long"));
+                }
+            }
+            if repo == canonical_repo && worktree == canonical_worktree {
+                return Ok(None);
+            }
+            Ok(Some(LegacyWorkstreamFingerprints {
+                repo_fingerprint: repo,
+                worktree_fingerprint: worktree,
+            }))
+        }
+    }
 }
 
 async fn search_events(
@@ -1819,6 +1905,8 @@ mod tests {
             cwd: "/repo".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),
@@ -1928,6 +2016,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -1999,6 +2089,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -2096,6 +2188,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -2181,6 +2275,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -2769,6 +2865,8 @@ mod tests {
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 from: from.map(str::to_owned),
                 workstream_id: None,
                 to: to.into(),
@@ -2895,6 +2993,8 @@ mod tests {
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 limit: 20,
                 offset: 0,
             }),
@@ -2923,6 +3023,8 @@ mod tests {
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "other-worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 limit: 20,
                 offset: 0,
             }),
@@ -2946,6 +3048,8 @@ mod tests {
                 project: "managed".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 limit: 20,
                 offset: 0,
             }),
@@ -3036,6 +3140,8 @@ mod tests {
                     project: "managed".into(),
                     repo_fingerprint: "repo".into(),
                     worktree_fingerprint: "worktree".into(),
+                    legacy_repo_fingerprint: None,
+                    legacy_worktree_fingerprint: None,
                     limit: 100,
                     offset,
                 }),
@@ -3111,6 +3217,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::Codex, AgentKind::ClaudeCode],
@@ -3151,6 +3259,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::KimiCode,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -3203,6 +3313,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::KimiCode,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::KimiCode, AgentKind::ClaudeCode],
@@ -3252,6 +3364,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Codex,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -3356,6 +3470,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Grok,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -3495,6 +3611,8 @@ mod tests {
             cwd: "/repo".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),
@@ -3581,6 +3699,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::KiroCli,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -3632,6 +3752,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::KiroCli,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::KiroCli],
@@ -3664,6 +3786,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::CommandCode,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -3715,6 +3839,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::CommandCode,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::CommandCode, AgentKind::ClaudeCode],
@@ -3747,6 +3873,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Grok,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -3798,6 +3926,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::Grok,
                 automatic_harness: true,
                 available_agents: vec![AgentKind::Grok],
@@ -3850,6 +3980,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -3901,6 +4033,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent,
                 automatic_harness: true,
                 available_agents: vec![agent],
@@ -4187,6 +4321,8 @@ mod tests {
                 cwd: "/repo".into(),
                 repo_fingerprint: "repo".into(),
                 worktree_fingerprint: "worktree".into(),
+                legacy_repo_fingerprint: None,
+                legacy_worktree_fingerprint: None,
                 agent: AgentKind::ClaudeCode,
                 automatic_harness: false,
                 available_agents: Vec::new(),
@@ -5066,6 +5202,8 @@ mod tests {
             cwd: "/repo/new-space-game".into(),
             repo_fingerprint: "repo".into(),
             worktree_fingerprint: "worktree".into(),
+            legacy_repo_fingerprint: None,
+            legacy_worktree_fingerprint: None,
             agent: AgentKind::Codex,
             automatic_harness: false,
             available_agents: Vec::new(),

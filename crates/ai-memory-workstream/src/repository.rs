@@ -16,6 +16,11 @@ pub struct RepositoryIdentity {
     pub repo_fingerprint: String,
     /// Worktree-specific identity hash.
     pub worktree_fingerprint: String,
+    /// Legacy remote-seeded fingerprints (`git-remotes\n{origin}`), present
+    /// when `origin` exists and yields fingerprints different from canonical.
+    /// Callers pass these alongside canonical fingerprints so existing
+    /// workstreams created before remote decoupling migrate transparently.
+    pub legacy_fingerprints: Option<RepositoryFingerprints>,
     /// Current non-mutating Git checkpoint.
     pub checkpoint: WorkstreamCheckpoint,
     /// The URL `git push` to `origin` uses (`pushurl`, or `url` after any
@@ -39,6 +44,7 @@ pub struct RepositoryFingerprints {
 struct RepositoryMetadata {
     cwd: PathBuf,
     fingerprints: RepositoryFingerprints,
+    legacy_fingerprints: Option<RepositoryFingerprints>,
     linked_worktree: bool,
 }
 
@@ -57,6 +63,7 @@ pub fn inspect_repository(cwd: &Path) -> Result<RepositoryIdentity> {
         cwd: metadata.cwd,
         repo_fingerprint: metadata.fingerprints.repo_fingerprint,
         worktree_fingerprint: metadata.fingerprints.worktree_fingerprint,
+        legacy_fingerprints: metadata.legacy_fingerprints,
         linked_worktree: metadata.linked_worktree,
     })
 }
@@ -67,6 +74,15 @@ pub fn inspect_repository(cwd: &Path) -> Result<RepositoryIdentity> {
 /// filesystem-monitor hook can otherwise block the picker before its first frame.
 pub fn inspect_repository_fingerprints(cwd: &Path) -> Result<RepositoryFingerprints> {
     Ok(inspect_metadata(cwd)?.fingerprints)
+}
+
+/// Inspect canonical and optional legacy (remote-seeded) checkout fingerprints
+/// without running `git status`.
+pub fn inspect_repository_fingerprints_with_legacy(
+    cwd: &Path,
+) -> Result<(RepositoryFingerprints, Option<RepositoryFingerprints>)> {
+    let metadata = inspect_metadata(cwd)?;
+    Ok((metadata.fingerprints, metadata.legacy_fingerprints))
 }
 
 fn inspect_metadata(cwd: &Path) -> Result<RepositoryMetadata> {
@@ -84,28 +100,61 @@ fn inspect_metadata(cwd: &Path) -> Result<RepositoryMetadata> {
     );
     let remotes = git(&canonical, &["remote", "get-url", "--all", "origin"]);
 
-    let repo_seed = match (&git_root, &common_dir, &remotes) {
-        (_, _, Some(remotes)) if !remotes.trim().is_empty() => format!("git-remotes\n{remotes}"),
-        (_, Some(common), _) => format!("git-common\n{common}"),
-        (Some(root), _, _) => format!("git-root\n{root}"),
+    // Seed canonical fingerprints from local git metadata only (never `origin`
+    // URLs), so adding, changing, or removing `origin` cannot orphan checkout
+    // workstreams (#2423). `--git-common-dir` is still shared across linked
+    // worktrees while `--git-dir` distinguishes each worktree.
+    let repo_seed = match (&git_root, &common_dir) {
+        (_, Some(common)) => format!("git-common\n{common}"),
+        (Some(root), _) => format!("git-root\n{root}"),
         _ => format!("directory\n{}", canonical.display()),
     };
-    let worktree_seed = match (&git_dir, &git_root) {
-        (Some(git_dir), _) => format!("{}\ngit-dir\n{git_dir}", sha256(&repo_seed)),
-        (_, Some(root)) => format!("{}\nroot\n{root}", sha256(&repo_seed)),
-        _ => format!("{}\ncwd\n{}", sha256(&repo_seed), canonical.display()),
-    };
+    let fingerprints = fingerprints_for_repo_seed(
+        &repo_seed,
+        git_dir.as_deref(),
+        git_root.as_deref(),
+        &canonical,
+    );
+    let legacy_fingerprints = remotes
+        .as_deref()
+        .filter(|remotes| !remotes.trim().is_empty())
+        .map(|remotes| {
+            let legacy_seed = format!("git-remotes\n{remotes}");
+            fingerprints_for_repo_seed(
+                &legacy_seed,
+                git_dir.as_deref(),
+                git_root.as_deref(),
+                &canonical,
+            )
+        })
+        .filter(|legacy| legacy != &fingerprints);
     Ok(RepositoryMetadata {
         cwd: canonical,
-        fingerprints: RepositoryFingerprints {
-            repo_fingerprint: sha256(&repo_seed),
-            worktree_fingerprint: sha256(&worktree_seed),
-        },
+        fingerprints,
+        legacy_fingerprints,
         linked_worktree: matches!(
             (&git_dir, &common_dir),
             (Some(git_dir), Some(common)) if git_dir != common
         ),
     })
+}
+
+fn fingerprints_for_repo_seed(
+    repo_seed: &str,
+    git_dir: Option<&str>,
+    git_root: Option<&str>,
+    canonical: &Path,
+) -> RepositoryFingerprints {
+    let repo_fingerprint = sha256(repo_seed);
+    let worktree_seed = match (git_dir, git_root) {
+        (Some(git_dir), _) => format!("{repo_fingerprint}\ngit-dir\n{git_dir}"),
+        (_, Some(root)) => format!("{repo_fingerprint}\nroot\n{root}"),
+        _ => format!("{repo_fingerprint}\ncwd\n{}", canonical.display()),
+    };
+    RepositoryFingerprints {
+        repo_fingerprint,
+        worktree_fingerprint: sha256(&worktree_seed),
+    }
 }
 
 fn checkpoint(cwd: &Path) -> WorkstreamCheckpoint {
@@ -339,5 +388,114 @@ mod tests {
     fn status_parser_preserves_both_rename_paths() {
         let paths = parse_status_paths(b"R  new name.rs\0old name.rs\0");
         assert_eq!(paths, ["new name.rs", "old name.rs"]);
+    }
+
+    #[test]
+    fn origin_remote_changes_do_not_change_canonical_fingerprints() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git_fixture(&main, &["init", "-q"]);
+        git_fixture(
+            &main,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "init",
+            ],
+        );
+
+        let before = inspect_repository(&main).unwrap();
+        assert!(before.legacy_fingerprints.is_none());
+
+        // Adding origin must not change canonical fingerprints, and exposes legacy alias.
+        git_fixture(
+            &main,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://git.example.invalid/example/repo.git",
+            ],
+        );
+        let with_https = inspect_repository(&main).unwrap();
+        assert_eq!(with_https.repo_fingerprint, before.repo_fingerprint);
+        assert_eq!(with_https.worktree_fingerprint, before.worktree_fingerprint);
+        let legacy_https = with_https
+            .legacy_fingerprints
+            .clone()
+            .expect("origin should expose legacy remote-seeded fingerprints");
+        assert_ne!(legacy_https.repo_fingerprint, before.repo_fingerprint);
+        assert_ne!(
+            legacy_https.worktree_fingerprint,
+            before.worktree_fingerprint
+        );
+        let (light_canonical, light_legacy) =
+            inspect_repository_fingerprints_with_legacy(&main).unwrap();
+        assert_eq!(light_canonical.repo_fingerprint, before.repo_fingerprint);
+        assert_eq!(
+            light_canonical.worktree_fingerprint,
+            before.worktree_fingerprint
+        );
+        assert_eq!(light_legacy, Some(legacy_https.clone()));
+
+        // Changing origin https -> ssh must not change canonical fingerprints.
+        git_fixture(
+            &main,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@git.example.invalid:example/repo.git",
+            ],
+        );
+        let with_ssh = inspect_repository(&main).unwrap();
+        assert_eq!(with_ssh.repo_fingerprint, before.repo_fingerprint);
+        assert_eq!(with_ssh.worktree_fingerprint, before.worktree_fingerprint);
+        assert_eq!(
+            with_ssh.origin_push_url.as_deref(),
+            Some("git@git.example.invalid:example/repo.git")
+        );
+        assert_ne!(with_ssh.legacy_fingerprints, Some(legacy_https));
+
+        // Linked worktree still shares canonical repo_fingerprint and differs on worktree_fingerprint.
+        let linked = temp.path().join("linked");
+        git_fixture(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let linked_id = inspect_repository(&linked).unwrap();
+        assert!(linked_id.linked_worktree);
+        assert_eq!(linked_id.repo_fingerprint, before.repo_fingerprint);
+        assert_ne!(linked_id.worktree_fingerprint, before.worktree_fingerprint);
+
+        // Removing origin must not change canonical fingerprints and clears legacy alias.
+        git_fixture(&main, &["remote", "remove", "origin"]);
+        let without_origin = inspect_repository(&main).unwrap();
+        assert_eq!(without_origin.repo_fingerprint, before.repo_fingerprint);
+        assert_eq!(
+            without_origin.worktree_fingerprint,
+            before.worktree_fingerprint
+        );
+        assert!(without_origin.legacy_fingerprints.is_none());
+        let linked_without_origin = inspect_repository(&linked).unwrap();
+        assert_eq!(
+            linked_without_origin.repo_fingerprint,
+            before.repo_fingerprint
+        );
+        assert_eq!(
+            linked_without_origin.worktree_fingerprint,
+            linked_id.worktree_fingerprint
+        );
     }
 }

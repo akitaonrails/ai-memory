@@ -149,6 +149,16 @@ pub(crate) fn authorize_run_mutation(
     }
 }
 
+/// Legacy remote-seeded checkout fingerprints to migrate onto canonical
+/// fingerprints before selecting, listing, or renaming workstreams (#2423).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyWorkstreamFingerprints {
+    /// Legacy repository fingerprint (`git-remotes\n{origin}`).
+    pub repo_fingerprint: String,
+    /// Legacy worktree fingerprint derived from `repo_fingerprint`.
+    pub worktree_fingerprint: String,
+}
+
 /// Store-level input for opening a managed run.
 #[derive(Debug, Clone)]
 pub struct PrepareWorkstreamRun {
@@ -668,9 +678,22 @@ impl ManagedRunBoundaryRow {
 }
 
 /// Atomically select a workstream, expire stale leases, and open one run.
+#[cfg(test)]
 pub(crate) fn prepare_run(
     conn: &mut Connection,
     input: &PrepareWorkstreamRun,
+    owner_user: Option<&str>,
+    force_unlock: bool,
+) -> StoreResult<PreparedWorkstreamRun> {
+    prepare_run_with_legacy(conn, input, None, owner_user, force_unlock)
+}
+
+/// Atomically migrate any legacy remote-seeded workstreams, select a
+/// workstream, expire stale leases, and open one run.
+pub(crate) fn prepare_run_with_legacy(
+    conn: &mut Connection,
+    input: &PrepareWorkstreamRun,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
     owner_user: Option<&str>,
     force_unlock: bool,
 ) -> StoreResult<PreparedWorkstreamRun> {
@@ -689,7 +712,7 @@ pub(crate) fn prepare_run(
         params![now],
     )?;
 
-    let (workstream_id, workstream_name) = select_workstream(&tx, input, now)?;
+    let (workstream_id, workstream_name) = select_workstream(&tx, input, legacy, now)?;
     let busy: Option<(Vec<u8>, String, i64, Option<String>)> = tx
         .query_row(
             "SELECT id, lease_owner, lease_expires_at, owner_user FROM managed_runs \
@@ -833,11 +856,83 @@ fn newest_available_agent(
     Ok(None)
 }
 
+/// Re-key legacy remote-seeded workstreams in `(workspace_id, project_id)` to
+/// canonical `(repo_fingerprint, worktree_fingerprint)` inside an active
+/// transaction (#2423).
+///
+/// Any `UNIQUE(workspace_id, project_id, repo_fingerprint, worktree_fingerprint, name)`
+/// collision with an already-canonical workstream is preserved by giving only
+/// the legacy row a deterministic disambiguator before the coordinate update
+/// (matching `merge_project`).
+fn rekey_legacy_workstreams(
+    tx: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    repo_fingerprint: &str,
+    worktree_fingerprint: &str,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
+) -> StoreResult<u64> {
+    let Some(legacy) = legacy else {
+        return Ok(0);
+    };
+    if legacy.repo_fingerprint.trim().is_empty()
+        || legacy.worktree_fingerprint.trim().is_empty()
+        || (legacy.repo_fingerprint == repo_fingerprint
+            && legacy.worktree_fingerprint == worktree_fingerprint)
+    {
+        return Ok(0);
+    }
+    tx.execute(
+        "UPDATE workstreams \
+         SET name = name || '-legacy-' || lower(hex(id)) \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+           AND repo_fingerprint = ?3 AND worktree_fingerprint = ?4 \
+           AND EXISTS ( \
+               SELECT 1 FROM workstreams d \
+               WHERE d.workspace_id = ?1 AND d.project_id = ?2 \
+                 AND d.repo_fingerprint = ?5 AND d.worktree_fingerprint = ?6 \
+                 AND d.name = workstreams.name \
+           )",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            legacy.repo_fingerprint,
+            legacy.worktree_fingerprint,
+            repo_fingerprint,
+            worktree_fingerprint,
+        ],
+    )?;
+    let moved = tx.execute(
+        "UPDATE workstreams \
+         SET repo_fingerprint = ?5, worktree_fingerprint = ?6 \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+           AND repo_fingerprint = ?3 AND worktree_fingerprint = ?4",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            legacy.repo_fingerprint,
+            legacy.worktree_fingerprint,
+            repo_fingerprint,
+            worktree_fingerprint,
+        ],
+    )?;
+    Ok(moved as u64)
+}
+
 fn select_workstream(
     tx: &Transaction<'_>,
     input: &PrepareWorkstreamRun,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
     now: i64,
 ) -> StoreResult<(WorkstreamId, String)> {
+    rekey_legacy_workstreams(
+        tx,
+        input.workspace_id,
+        input.project_id,
+        &input.repo_fingerprint,
+        &input.worktree_fingerprint,
+        legacy,
+    )?;
     match &input.selection {
         WorkstreamSelection::New(name) => {
             validate_workstream_name(name)?;
@@ -1948,6 +2043,41 @@ pub(crate) fn list_recent(
     Ok(summaries)
 }
 
+/// Migrate any legacy remote-seeded workstreams to canonical fingerprints and
+/// list recent workstreams for that checkout inside one transaction (#2423).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn list_recent_migrating(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    repo_fingerprint: &str,
+    worktree_fingerprint: &str,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
+    limit: usize,
+    offset: usize,
+) -> StoreResult<Vec<StoredWorkstreamSummary>> {
+    let tx = conn.transaction()?;
+    rekey_legacy_workstreams(
+        &tx,
+        workspace_id,
+        project_id,
+        repo_fingerprint,
+        worktree_fingerprint,
+        legacy,
+    )?;
+    let summaries = list_recent(
+        &tx,
+        workspace_id,
+        project_id,
+        repo_fingerprint,
+        worktree_fingerprint,
+        limit,
+        offset,
+    )?;
+    tx.commit()?;
+    Ok(summaries)
+}
+
 /// List managed workstreams across every scope for the root/operator console.
 ///
 /// The page is selected before current harness links are joined, so a
@@ -2099,13 +2229,22 @@ pub(crate) fn list_operational(
 /// workstream in the same checkout already holds is refused before the
 /// update, turning the `UNIQUE` constraint into a named error rather than a
 /// bare SQLite failure.
-pub(crate) fn rename(
+pub(crate) fn rename_with_legacy(
     conn: &mut Connection,
     input: &RenameWorkstream,
+    legacy: Option<&LegacyWorkstreamFingerprints>,
 ) -> StoreResult<RenamedWorkstream> {
     validate_workstream_name(&input.new_name)?;
     let new_name = input.new_name.trim();
     let tx = conn.transaction()?;
+    rekey_legacy_workstreams(
+        &tx,
+        input.workspace_id,
+        input.project_id,
+        &input.repo_fingerprint,
+        &input.worktree_fingerprint,
+        legacy,
+    )?;
     let found = match &input.selector {
         WorkstreamSelector::Name(name) => tx
             .query_row(
@@ -2149,6 +2288,7 @@ pub(crate) fn rename(
     })?;
     let workstream_id = WorkstreamId::from_slice(&id_bytes)?;
     if current_name == new_name {
+        tx.commit()?;
         return Ok(RenamedWorkstream {
             workstream_id,
             from: current_name.clone(),

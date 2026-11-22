@@ -49,6 +49,13 @@ version in [`docs/changelog/`](docs/changelog/):
   comments structurally instead of running raw free-text regex replacement over
   the serialized bytes. (#2415)
 
+- Decoupled managed workstream repository and worktree fingerprints from the
+  `origin` git remote URL so adding, changing, or removing `origin` no longer
+  orphans checkout workstreams or project bindings. Existing checkouts with
+  remote-seeded fingerprints migrate transparently to canonical fingerprints on
+  first run, list, or rename, preserving colliding names via deterministic
+  disambiguation. (#2423)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)

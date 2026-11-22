@@ -6,7 +6,9 @@ use std::io::IsTerminal as _;
 use std::path::Path;
 
 use ai_memory_core::{ListManagedWorkstreamsRequest, ManagedWorkstreamSummary};
-use ai_memory_workstream::inspect_repository_fingerprints;
+use ai_memory_workstream::{
+    inspect_repository_fingerprints, inspect_repository_fingerprints_with_legacy,
+};
 use anyhow::{Context as _, Result};
 
 use super::show::terminal_text;
@@ -92,8 +94,15 @@ pub(super) async fn list_for_checkout(
     limit: usize,
     project_id: Option<ai_memory_core::ProjectId>,
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
-    let repository = inspect_repository_fingerprints(checkout)
+    let (repository, legacy) = inspect_repository_fingerprints_with_legacy(checkout)
         .context("inspecting managed workstream checkout")?;
+    let (legacy_repo_fingerprint, legacy_worktree_fingerprint) =
+        legacy.map_or((None, None), |legacy| {
+            (
+                Some(legacy.repo_fingerprint),
+                Some(legacy.worktree_fingerprint),
+            )
+        });
     post_json(
         endpoint,
         "/workstream/recent",
@@ -107,6 +116,8 @@ pub(super) async fn list_for_checkout(
             },
             repo_fingerprint: repository.repo_fingerprint,
             worktree_fingerprint: repository.worktree_fingerprint,
+            legacy_repo_fingerprint,
+            legacy_worktree_fingerprint,
             limit,
             offset: 0,
         },
@@ -123,8 +134,15 @@ pub(super) async fn list_all_for_checkout(
     checkout: &Path,
 ) -> Result<Vec<ManagedWorkstreamSummary>> {
     let i18n = &config.i18n;
-    let repository = inspect_repository_fingerprints(checkout)
+    let (repository, legacy) = inspect_repository_fingerprints_with_legacy(checkout)
         .context(i18n.text("cli-workstreams-inspecting-managed-workstream-checkout"))?;
+    let (legacy_repo_fingerprint, legacy_worktree_fingerprint) =
+        legacy.map_or((None, None), |legacy| {
+            (
+                Some(legacy.repo_fingerprint),
+                Some(legacy.worktree_fingerprint),
+            )
+        });
     let project_id =
         super::project_registry::project_binding(config, endpoint, workspace, project, checkout)?
             .map(|scope| scope.project_id);
@@ -138,6 +156,8 @@ pub(super) async fn list_all_for_checkout(
         },
         repo_fingerprint: repository.repo_fingerprint.clone(),
         worktree_fingerprint: repository.worktree_fingerprint.clone(),
+        legacy_repo_fingerprint,
+        legacy_worktree_fingerprint,
         limit: 100,
         offset: 0,
     };
