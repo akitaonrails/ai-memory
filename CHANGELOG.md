@@ -103,6 +103,10 @@ version in [`docs/changelog/`](docs/changelog/):
   does since #2396; an existing one keeps its access list (see
   `docs/security-boundaries.md` row 10n). (#2401)
 
+- Backed up Kimi Code's MCP settings and skills from its active home.
+  Restores honor `KIMI_CODE_HOME` and keep the recorded destinations for
+  older `.kimi/` archives. (#2418)
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed

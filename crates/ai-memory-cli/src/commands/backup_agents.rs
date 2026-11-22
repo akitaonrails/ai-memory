@@ -823,25 +823,35 @@ pub fn discover_assets(
 
     // 11. Kimi Code
     if filter_agent(AgentKind::KimiCode) && want_global {
-        let kimi_dir = home.join(".kimi");
-        push_if_file(
-            &mut assets,
-            AgentKind::KimiCode,
-            AgentAssetKind::McpConfig,
-            AgentAssetScope::Global,
-            kimi_dir.join("mcp.json"),
-            ".kimi/mcp.json",
-            "kimi/mcp.json",
-        );
-        collect_dir_assets(
-            &mut assets,
-            AgentKind::KimiCode,
-            AgentAssetKind::Skill,
-            AgentAssetScope::Global,
-            &kimi_dir.join("skills"),
-            ".kimi/skills",
-            "kimi/skills",
-        )?;
+        let kimi_dir = cwd.join(crate::commands::install_mcp::kimi_code_home(
+            std::env::var_os("KIMI_CODE_HOME"),
+        )?);
+        let legacy_dir = home.join(".kimi");
+        for (dir, name) in [(&kimi_dir, "kimi-code"), (&legacy_dir, "kimi")] {
+            // An override can point at the legacy directory. Archive it once
+            // using the portable Kimi Code destination in that case.
+            if name == "kimi" && kimi_dir == legacy_dir {
+                continue;
+            }
+            push_if_file(
+                &mut assets,
+                AgentKind::KimiCode,
+                AgentAssetKind::McpConfig,
+                AgentAssetScope::Global,
+                dir.join("mcp.json"),
+                &format!(".{name}/mcp.json"),
+                &format!("{name}/mcp.json"),
+            );
+            collect_dir_assets(
+                &mut assets,
+                AgentKind::KimiCode,
+                AgentAssetKind::Skill,
+                AgentAssetScope::Global,
+                &dir.join("skills"),
+                &format!(".{name}/skills"),
+                &format!("{name}/skills"),
+            )?;
+        }
     }
 
     // 12. GitHub Copilot CLI: the same skill roots `install-skills --agent
