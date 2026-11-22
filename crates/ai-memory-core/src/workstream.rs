@@ -269,6 +269,10 @@ pub struct PrepareManagedRunRequest {
     /// takeover.
     #[serde(default)]
     pub force_unlock: bool,
+    /// Start a fresh native session instead of pre-filling the workstream's
+    /// previous current `native_session_id` on the new managed run.
+    #[serde(default)]
+    pub fresh: bool,
     /// Diagnostic owner label (host and process id), not an authorization key.
     pub lease_owner: String,
     /// The checkout's git-remote identity (`github.com/acme/api`), sent only

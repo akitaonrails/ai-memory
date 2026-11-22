@@ -56,6 +56,15 @@ version in [`docs/changelog/`](docs/changelog/):
   first run, list, or rename, preserving colliding names via deterministic
   disambiguation. (#2423)
 
+- Allowed ID-selected (`scope_by_id = 1`) Codex managed runs to relink on
+  `SessionStart` (`startup`/`clear` to a fresh thread, `resume` to a
+  same-scope thread not held by another active run) under the same strict
+  scope, operator, checkout, lease, and foreign-session checks as Claude Code,
+  allowed stale shared Codex daemons carrying a terminal pinned `run_id` to
+  fall through on `SessionStart` to single-candidate adoption, and honored
+  `--fresh` when preparing a managed run so `managed_runs.native_session_id`
+  is left unset instead of pre-filling the prior session. (#2413)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)

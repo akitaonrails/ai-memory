@@ -16916,6 +16916,7 @@ pub(crate) mod tests {
             },
             None,
             false,
+            false,
         )
         .unwrap();
 
@@ -20228,6 +20229,7 @@ pub(crate) mod tests {
                 lease_owner: "test".to_string(),
             },
             None,
+            false,
             false,
         )
         .expect("opening a managed run should succeed")

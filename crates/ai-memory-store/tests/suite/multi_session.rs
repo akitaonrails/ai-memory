@@ -22,8 +22,8 @@ use ai_memory_core::{
     UserRole, WorkspaceId, owner_stamp,
 };
 use ai_memory_store::{
-    ClaudeSessionBoundary, ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession,
-    ManagedRunSessionLink, PagePrecondition, PrepareWorkstreamRun, Store, StoreError,
+    ConditionalUpsert, DecayParams, LinkOrAdoptManagedRunSession, ManagedRunSessionLink,
+    ManagedSessionBoundary, PagePrecondition, PrepareWorkstreamRun, Store, StoreError,
     WorkstreamSelection,
 };
 
@@ -2471,7 +2471,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
         assert_eq!(
             store
                 .writer
-                .relink_managed_claude_session(rejected, ClaudeSessionBoundary::Clear)
+                .relink_managed_session(rejected, ManagedSessionBoundary::Clear)
                 .await
                 .unwrap(),
             ManagedRunSessionLink::Refused,
@@ -2499,7 +2499,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_session(input("expired"), ClaudeSessionBoundary::Clear)
+            .relink_managed_session(input("expired"), ManagedSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
@@ -2512,7 +2512,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_session(input("cleared"), ClaudeSessionBoundary::Clear)
+            .relink_managed_session(input("cleared"), ManagedSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Exact(run.run_id)
@@ -2526,7 +2526,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_session(input("original"), ClaudeSessionBoundary::Clear)
+            .relink_managed_session(input("original"), ManagedSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
@@ -2535,7 +2535,7 @@ async fn managed_claude_clear_rechecks_scope_owner_checkout_and_lease() {
     assert_eq!(
         store
             .writer
-            .relink_managed_claude_session(input("terminal"), ClaudeSessionBoundary::Clear)
+            .relink_managed_session(input("terminal"), ManagedSessionBoundary::Clear)
             .await
             .unwrap(),
         ManagedRunSessionLink::Refused
@@ -2596,7 +2596,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
         async move {
             store
                 .writer
-                .relink_managed_claude_session(i, boundary)
+                .relink_managed_session(i, boundary)
                 .await
                 .unwrap()
         }
@@ -2629,7 +2629,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "cleared", &alice),
-            ClaudeSessionBoundary::Clear
+            ManagedSessionBoundary::Clear
         )
         .await,
         ManagedRunSessionLink::Exact(run.run_id)
@@ -2649,7 +2649,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
         }),
     ] {
         assert_eq!(
-            link(i, ClaudeSessionBoundary::Resume).await,
+            link(i, ManagedSessionBoundary::Resume).await,
             ManagedRunSessionLink::Refused,
             "{case}"
         );
@@ -2662,7 +2662,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "original", &alice),
-            ClaudeSessionBoundary::Clear
+            ManagedSessionBoundary::Clear
         )
         .await,
         ManagedRunSessionLink::Refused,
@@ -2677,7 +2677,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "original", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Refused,
@@ -2693,7 +2693,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "original", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Exact(run.run_id)
@@ -2716,7 +2716,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(other.run_id, "cleared", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Refused,
@@ -2738,7 +2738,7 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "cleared", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Refused,
@@ -2753,11 +2753,375 @@ async fn managed_claude_resume_relinks_only_to_a_session_its_workstream_held() {
     assert_eq!(
         link(
             input(run.run_id, "cleared", &alice),
-            ClaudeSessionBoundary::Resume
+            ManagedSessionBoundary::Resume
         )
         .await,
         ManagedRunSessionLink::Exact(run.run_id),
         "once the parallel run ends, the held id resumes again"
+    );
+}
+
+/// An ID-selected Codex run pre-linked to `N` may relink on `SessionStart`
+/// (`Clear` for `startup`/`clear` to a fresh thread `F`, `Resume` for `resume`
+/// to an existing thread `S` in the same scope/operator not held by another
+/// active run), while enforcing every boundary check: foreign workspace/project,
+/// foreign operator, shared ownership, wrong cwd, wrong agent, dirty id, lapsed
+/// lease, terminal run, non-SessionStart (`Other`), another active run's
+/// session, a foreign workstream's session, and a foreign captured session.
+#[tokio::test]
+async fn managed_codex_relink_rechecks_scope_owner_checkout_lease_and_parallel_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let other_ws = store
+        .writer
+        .get_or_create_workspace("elsewhere")
+        .await
+        .unwrap();
+    let other_proj = store
+        .writer
+        .get_or_create_project(ws, "other", None)
+        .await
+        .unwrap();
+    let alice = operator("alice");
+    let bob = operator("bob");
+    let prepare = |workspace_id, project_id, tree: &str, lease: &str, owner: String| {
+        let store = &store;
+        let tree = tree.to_owned();
+        let lease = lease.to_owned();
+        async move {
+            store
+                .writer
+                .prepare_workstream_run_owned(
+                    PrepareWorkstreamRun {
+                        scope_by_id: true,
+                        workspace_id,
+                        project_id,
+                        repo_fingerprint: "codex-relink-repo".into(),
+                        worktree_fingerprint: tree,
+                        cwd: "/repo".into(),
+                        agent: AgentKind::Codex,
+                        automatic_harness: false,
+                        available_agents: Vec::new(),
+                        selection: WorkstreamSelection::Current,
+                        lease_owner: lease,
+                    },
+                    Some(owner),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let run = prepare(ws, proj, "tree-a", "codex-a", alice.clone()).await;
+    let input = |run_id, native: &str| LinkOrAdoptManagedRunSession {
+        supplied_run_id: run_id,
+        workspace_id: ws,
+        project_id: proj,
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        native_session_id: native.into(),
+        owner_user: Some(alice.clone()),
+    };
+    let current = |run_id| {
+        let store = &store;
+        async move {
+            store
+                .reader
+                .managed_run_status(run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .native_session_id
+        }
+    };
+
+    // Pre-link to prior thread `N`.
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(run.run_id, "thread-n"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    store
+        .writer
+        .accept_managed_run_context(run.run_id)
+        .await
+        .unwrap();
+
+    // Non-SessionStart (`Other`) cannot switch away from `thread-n`.
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(run.run_id, "thread-other"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // Every boundary mismatch is refused for both Clear and Resume.
+    for boundary in [
+        ManagedSessionBoundary::Clear,
+        ManagedSessionBoundary::Resume,
+    ] {
+        for case in [
+            "workspace",
+            "project",
+            "owner",
+            "shared",
+            "cwd",
+            "agent",
+            "dirty-id",
+        ] {
+            let mut rejected = input(run.run_id, case);
+            match case {
+                "workspace" => rejected.workspace_id = other_ws,
+                "project" => rejected.project_id = other_proj,
+                "owner" => rejected.owner_user = Some(bob.clone()),
+                "shared" => rejected.owner_user = None,
+                "cwd" => rejected.cwd = "/other-checkout".into(),
+                "agent" => rejected.agent = AgentKind::ClaudeCode,
+                "dirty-id" => rejected.native_session_id = "sk-abcdefghijklmnopqrstuvwx".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                store
+                    .writer
+                    .relink_managed_session(rejected, boundary)
+                    .await
+                    .unwrap(),
+                ManagedRunSessionLink::Refused,
+                "{boundary:?}/{case}"
+            );
+            assert_eq!(current(run.run_id).await.as_deref(), Some("thread-n"));
+        }
+    }
+
+    // Lapsed lease is refused; renewing restores relinking.
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE managed_runs SET lease_expires_at = 1 WHERE id = ?1",
+        [run.run_id.as_bytes()],
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(input(run.run_id, "thread-f"), ManagedSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+    store
+        .writer
+        .heartbeat_managed_run(run.run_id)
+        .await
+        .unwrap();
+
+    // `Clear` (Codex `startup`/`clear`) relinks to fresh thread `F`, and refuses
+    // rewinding to already-bound `thread-n`.
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(input(run.run_id, "thread-f"), ManagedSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("thread-f"));
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(input(run.run_id, "thread-n"), ManagedSessionBoundary::Clear)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // `Resume` relinks to an existing same-scope thread `S` even if this
+    // workstream did not hold it before.
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-s"),
+                ManagedSessionBoundary::Resume
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(run.run_id)
+    );
+    assert_eq!(current(run.run_id).await.as_deref(), Some("thread-s"));
+
+    // `Resume` refuses a session currently held by another active run.
+    let parallel = prepare(ws, proj, "tree-b", "codex-b", alice.clone()).await;
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(input(parallel.run_id, "thread-live"))
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(parallel.run_id)
+    );
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-live"),
+                ManagedSessionBoundary::Resume
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // `Resume` refuses a session bound to a foreign project's workstream.
+    let foreign_run = prepare(ws, other_proj, "tree-foreign", "codex-f", alice.clone()).await;
+    let mut foreign_link = input(foreign_run.run_id, "thread-foreign-proj");
+    foreign_link.project_id = other_proj;
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(foreign_link)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(foreign_run.run_id)
+    );
+    store
+        .writer
+        .cancel_managed_run(foreign_run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-foreign-proj"),
+                ManagedSessionBoundary::Resume
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // `Resume` refuses a session previously held by another operator's run.
+    let bob_run = prepare(ws, proj, "tree-bob", "codex-bob", bob.clone()).await;
+    let mut bob_link = input(bob_run.run_id, "thread-bob");
+    bob_link.owner_user = Some(bob.clone());
+    assert_eq!(
+        store
+            .writer
+            .link_or_adopt_managed_run_session(bob_link)
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Exact(bob_run.run_id)
+    );
+    store
+        .writer
+        .cancel_managed_run(bob_run.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-bob"),
+                ManagedSessionBoundary::Resume
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+
+    // Terminal run refuses relink.
+    store.writer.cancel_managed_run(run.run_id).await.unwrap();
+    assert_eq!(
+        store
+            .writer
+            .relink_managed_session(
+                input(run.run_id, "thread-after-cancel"),
+                ManagedSessionBoundary::Clear
+            )
+            .await
+            .unwrap(),
+        ManagedRunSessionLink::Refused
+    );
+}
+
+#[tokio::test]
+async fn prepare_workstream_run_fresh_leaves_native_session_unset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, proj) = scope(&store).await;
+    let base = |lease: &str| PrepareWorkstreamRun {
+        scope_by_id: true,
+        workspace_id: ws,
+        project_id: proj,
+        repo_fingerprint: "fresh-repo".into(),
+        worktree_fingerprint: "fresh-tree".into(),
+        cwd: "/repo".into(),
+        agent: AgentKind::Codex,
+        automatic_harness: false,
+        available_agents: Vec::new(),
+        selection: WorkstreamSelection::Current,
+        lease_owner: lease.into(),
+    };
+    let first = store
+        .writer
+        .prepare_workstream_run(base("first"))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .writer
+            .link_managed_run_session(first.run_id, AgentKind::Codex, "prior-thread")
+            .await
+            .unwrap()
+    );
+    store.writer.cancel_managed_run(first.run_id).await.unwrap();
+
+    // Control: normal prepare copies `prior-thread`.
+    let resumed = store
+        .writer
+        .prepare_workstream_run_owned_with_options(base("resumed"), None, false, false)
+        .await
+        .unwrap();
+    assert_eq!(resumed.native_session_id.as_deref(), Some("prior-thread"));
+    assert_eq!(
+        store
+            .reader
+            .managed_run_status(resumed.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_session_id
+            .as_deref(),
+        Some("prior-thread")
+    );
+    store
+        .writer
+        .cancel_managed_run(resumed.run_id)
+        .await
+        .unwrap();
+
+    // `--fresh` leaves `managed_runs.native_session_id` as NULL and `sync_after = 0`.
+    let fresh = store
+        .writer
+        .prepare_workstream_run_owned_with_options(base("fresh"), None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(fresh.native_session_id, None);
+    assert_eq!(fresh.sync_after, 0);
+    assert_eq!(
+        store
+            .reader
+            .managed_run_status(fresh.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .native_session_id,
+        None
     );
 }
 
