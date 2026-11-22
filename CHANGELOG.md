@@ -48,6 +48,9 @@ version in [`docs/changelog/`](docs/changelog/):
   `explain=true` was requested, exposing queries that ran without the vector
   stream during local-embedding evaluations. (#1854)
 
+- Marked questions missing from a partial FTS control as unavailable in
+  retrieval comparison reports. (#1854)
+
 - Kept the macOS menu bar status on the latest poll when an earlier response
   arrived after a settings or lifecycle refresh. (#2383)
 
