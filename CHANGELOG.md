@@ -66,6 +66,15 @@ version in [`docs/changelog/`](docs/changelog/):
   It sends one bounded Choice request per eligible query, retains local order on failure, and records validated usage even when an answer is refused.
   Choice probabilities are relative to the candidate pool; leave `min_relevance` unset with this backend. (#2296)
 
+- Reported write-time truncation to the sender of `memory_message_send` and
+  `memory_handoff_begin`. When a size cap cut any text, the response adds
+  `truncated: true` and a `truncated_fields` map with `original_chars` and
+  `stored_chars` per cut field, plus `original_items` and `stored_items` for
+  handoff lists; a call that fits returns the same keys as before. Both tool
+  descriptions and their field descriptions now state the exact limits, and
+  the TypeScript SDK exposes the report as `truncated` / `truncatedFields`.
+  (#2411)
+
 ### Fixed
 
 - Kept scheduled mirror and online backups running when a native install

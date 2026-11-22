@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pages.write`, `pages.writeBatch` and `pages.update` accept `sourceFiles`
   (sent as `source_files`), the repository files a page describes with the
   commit it was checked against; `pages.update` carries it over. (#1957)
+- `messages.send` and `handoffs.begin` return `truncated` and
+  `truncatedFields` when the server cut any of the sent text to its size caps:
+  `originalChars` / `storedChars` per field, plus `originalItems` /
+  `storedItems` for handoff lists. Both stay `undefined` when nothing was cut.
+  (#2411)
 
 ### Fixed
 
