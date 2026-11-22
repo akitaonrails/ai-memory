@@ -1820,3 +1820,359 @@ fn failed_backup_leaves_the_previous_archive_intact() {
         b"previous valid archive placeholder"
     );
 }
+
+fn read_archive_entries_bytes(archive_path: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(
+        fs::File::open(archive_path).unwrap(),
+    ));
+    tar.entries()
+        .unwrap()
+        .map(|entry| {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut buf).unwrap();
+            (path, buf)
+        })
+        .collect()
+}
+
+#[test]
+fn backup_and_restore_redacts_toml_json_and_jsonc_without_corrupting_syntax() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let codex_secret = "fixture-only-abcdef00112233445566778899";
+    let grok_secret = "fixture-only-grok00112233445566778899aa";
+    let grok_comment_secret = "fixture-only-comment112233445566778899";
+    let bearer_secret = "fixture-only-bearer00112233445566778899";
+    let openai_secret = "fixture-only-openai00112233445566778899";
+    let bare_token_secret = "FAKEfake0123456789ABCDEF0123456789";
+    let jsonc_header_secret = "fixture-only-jsonc00112233445566778899aa";
+    let jsonc_comment_secret = "fixture-only-jcomment112233445566778899";
+    let jsonc_block_secret = "fixture-only-jblock112233445566778899aa";
+
+    // 1. Codex .codex/config.toml (TOML with X-API-Key header + non-secret url)
+    let codex_toml = home.path().join(".codex/config.toml");
+    fs::create_dir_all(codex_toml.parent().unwrap()).unwrap();
+    fs::write(
+        &codex_toml,
+        format!(
+            "[mcp_servers.ai-memory]\n\
+             url = \"http://127.0.0.1:49374/mcp\"\n\
+             \n\
+             [mcp_servers.ai-memory.http_headers]\n\
+             X-API-Key = \"{codex_secret}\"\n"
+        ),
+    )
+    .unwrap();
+
+    // 2. Grok .grok/config.toml (TOML with api_key + commented-out secret)
+    let grok_toml = home.path().join(".grok/config.toml");
+    fs::create_dir_all(grok_toml.parent().unwrap()).unwrap();
+    fs::write(
+        &grok_toml,
+        format!(
+            "# X-API-Key = \"{grok_comment_secret}\"\n\
+             api_key = \"{grok_secret}\"\n\
+             model = \"grok-code\"\n"
+        ),
+    )
+    .unwrap();
+
+    // 3. JSON configs (.claude/settings.json, .cursor/mcp.json, .codex/mcp.json)
+    let claude_json = home.path().join(".claude/settings.json");
+    fs::create_dir_all(claude_json.parent().unwrap()).unwrap();
+    fs::write(
+        &claude_json,
+        format!(
+            r#"{{"mcpServers":{{"ai-memory":{{"url":"http://127.0.0.1:49374/mcp","headers":{{"X-API-Key":"{codex_secret}","Authorization":"Bearer {bearer_secret}"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let cursor_json = home.path().join(".cursor/mcp.json");
+    fs::create_dir_all(cursor_json.parent().unwrap()).unwrap();
+    fs::write(
+        &cursor_json,
+        format!(
+            r#"{{"mcpServers":{{"remote":{{"command":"npx","env":{{"OPENAI_API_KEY":"{openai_secret}","LOG_LEVEL":"info"}}}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let codex_json = home.path().join(".codex/mcp.json");
+    fs::write(
+        &codex_json,
+        format!(
+            r#"{{"mcpServers":{{"vault":{{"url":"https://vault.example/mcp","token":"{bare_token_secret}"}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    // 4. JSONC config (.config/opencode/opencode.jsonc) with line + block comments and trailing comma
+    let opencode_jsonc = home.path().join(".config/opencode/opencode.jsonc");
+    fs::create_dir_all(opencode_jsonc.parent().unwrap()).unwrap();
+    fs::write(
+        &opencode_jsonc,
+        format!(
+            "{{\n\
+             // X-API-Key: {jsonc_comment_secret}\n\
+             /* api_key = \"{jsonc_block_secret}\" */\n\
+             \"mcp\": {{\n\
+               \"ai-memory\": {{\n\
+                 \"url\": \"http://127.0.0.1:49374/mcp\",\n\
+                 \"headers\": {{\n\
+                   \"X-API-Key\": \"{jsonc_header_secret}\",\n\
+                 }},\n\
+               }},\n\
+             }},\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+
+    let backup_tar = project.path().join("structured-sanitized.tar.gz");
+    let backup = command_with_env(home.path(), project.path())
+        .args(["backup-agents", "-o", backup_tar.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        backup.status.success(),
+        "backup-agents failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+
+    // Every raw secret must be completely absent from every archived entry.
+    let all_secrets = [
+        codex_secret,
+        grok_secret,
+        grok_comment_secret,
+        bearer_secret,
+        openai_secret,
+        bare_token_secret,
+        jsonc_header_secret,
+        jsonc_comment_secret,
+        jsonc_block_secret,
+    ];
+    for (entry_path, bytes) in read_archive_entries_bytes(&backup_tar) {
+        let text = String::from_utf8_lossy(&bytes);
+        for secret in all_secrets {
+            assert!(
+                !text.contains(secret),
+                "raw secret `{secret}` leaked into archived entry {entry_path}"
+            );
+        }
+    }
+
+    // Restore into a clean sandbox.
+    let restore_home = tempfile::tempdir().unwrap();
+    let restore_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restore_home.path(), restore_project.path())
+        .args([
+            "restore-agents",
+            "-i",
+            backup_tar.to_str().unwrap(),
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore-agents failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+
+    // Verify Codex TOML parses cleanly and preserves non-secret fields + redacted key.
+    let restored_codex_toml =
+        fs::read_to_string(restore_home.path().join(".codex/config.toml")).unwrap();
+    let codex_doc: toml_edit::DocumentMut = restored_codex_toml
+        .parse()
+        .unwrap_or_else(|e| panic!("restored Codex TOML is invalid: {e}\n{restored_codex_toml}"));
+    assert_eq!(
+        codex_doc["mcp_servers"]["ai-memory"]["url"].as_str(),
+        Some("http://127.0.0.1:49374/mcp")
+    );
+    let codex_key = codex_doc["mcp_servers"]["ai-memory"]["http_headers"]["X-API-Key"]
+        .as_str()
+        .expect("X-API-Key must remain a valid TOML string");
+    assert!(
+        codex_key.starts_with("[REDACTED:"),
+        "expected redacted marker, got: {codex_key}"
+    );
+
+    // Verify Grok TOML parses cleanly and redacts both value and comment.
+    let restored_grok_toml =
+        fs::read_to_string(restore_home.path().join(".grok/config.toml")).unwrap();
+    let grok_doc: toml_edit::DocumentMut = restored_grok_toml
+        .parse()
+        .unwrap_or_else(|e| panic!("restored Grok TOML is invalid: {e}\n{restored_grok_toml}"));
+    assert_eq!(grok_doc["model"].as_str(), Some("grok-code"));
+    let grok_key = grok_doc["api_key"]
+        .as_str()
+        .expect("api_key must remain a valid TOML string");
+    assert!(
+        grok_key.starts_with("[REDACTED:"),
+        "expected redacted marker, got: {grok_key}"
+    );
+    assert!(!restored_grok_toml.contains(grok_comment_secret));
+    assert!(
+        restored_grok_toml.lines().next().unwrap().starts_with('#'),
+        "comment line must keep `#` prefix: {restored_grok_toml}"
+    );
+
+    // Verify Claude JSON parses cleanly and preserves structure + non-secret url.
+    let restored_claude =
+        fs::read_to_string(restore_home.path().join(".claude/settings.json")).unwrap();
+    let claude_val: serde_json::Value = serde_json::from_str(&restored_claude)
+        .unwrap_or_else(|e| panic!("restored Claude JSON is invalid: {e}\n{restored_claude}"));
+    assert_eq!(
+        claude_val["mcpServers"]["ai-memory"]["url"].as_str(),
+        Some("http://127.0.0.1:49374/mcp")
+    );
+    assert!(
+        claude_val["mcpServers"]["ai-memory"]["headers"]["X-API-Key"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:")
+    );
+    assert!(
+        claude_val["mcpServers"]["ai-memory"]["headers"]["Authorization"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:")
+    );
+
+    // Verify Cursor JSON parses cleanly.
+    let restored_cursor = fs::read_to_string(restore_home.path().join(".cursor/mcp.json")).unwrap();
+    let cursor_val: serde_json::Value = serde_json::from_str(&restored_cursor)
+        .unwrap_or_else(|e| panic!("restored Cursor JSON is invalid: {e}\n{restored_cursor}"));
+    assert_eq!(
+        cursor_val["mcpServers"]["remote"]["command"].as_str(),
+        Some("npx")
+    );
+    assert_eq!(
+        cursor_val["mcpServers"]["remote"]["env"]["LOG_LEVEL"].as_str(),
+        Some("info")
+    );
+    assert!(
+        cursor_val["mcpServers"]["remote"]["env"]["OPENAI_API_KEY"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:")
+    );
+
+    // Verify Codex mcp.json parses cleanly and redacts bare 32+ char `token`.
+    let restored_codex_json =
+        fs::read_to_string(restore_home.path().join(".codex/mcp.json")).unwrap();
+    let codex_json_val: serde_json::Value = serde_json::from_str(&restored_codex_json)
+        .unwrap_or_else(|e| panic!("restored Codex JSON is invalid: {e}\n{restored_codex_json}"));
+    assert_eq!(
+        codex_json_val["mcpServers"]["vault"]["url"].as_str(),
+        Some("https://vault.example/mcp")
+    );
+    assert!(
+        codex_json_val["mcpServers"]["vault"]["token"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:")
+    );
+
+    // Verify OpenCode JSONC parses cleanly and redacts values + comments.
+    let restored_opencode =
+        fs::read_to_string(restore_home.path().join(".config/opencode/opencode.jsonc")).unwrap();
+    let opencode_ast = jsonc_parser::parse_to_ast(
+        &restored_opencode,
+        &jsonc_parser::CollectOptions::default(),
+        &jsonc_parser::ParseOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("restored OpenCode JSONC is invalid: {e}\n{restored_opencode}"));
+    let opencode_val: serde_json::Value = opencode_ast
+        .value
+        .map_or(serde_json::Value::Null, Into::into);
+    assert_eq!(
+        opencode_val["mcp"]["ai-memory"]["url"].as_str(),
+        Some("http://127.0.0.1:49374/mcp")
+    );
+    assert!(
+        opencode_val["mcp"]["ai-memory"]["headers"]["X-API-Key"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:")
+    );
+    assert!(!restored_opencode.contains(jsonc_comment_secret));
+    assert!(!restored_opencode.contains(jsonc_block_secret));
+}
+
+#[test]
+fn backup_agents_include_secrets_and_malformed_config_fallback() {
+    let _guard = cli_test_lock();
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let secret = "fixture-only-abcdef00112233445566778899";
+
+    // Valid Codex TOML for --include-secrets control
+    let codex_toml = home.path().join(".codex/config.toml");
+    fs::create_dir_all(codex_toml.parent().unwrap()).unwrap();
+    let raw_codex = format!("[mcp_servers.ai-memory.http_headers]\nX-API-Key = \"{secret}\"\n");
+    fs::write(&codex_toml, &raw_codex).unwrap();
+
+    // Malformed Grok TOML + malformed Claude JSON on disk
+    let grok_toml = home.path().join(".grok/config.toml");
+    fs::create_dir_all(grok_toml.parent().unwrap()).unwrap();
+    fs::write(&grok_toml, format!("broken = [\napi_key = \"{secret}\"\n")).unwrap();
+
+    let claude_json = home.path().join(".claude/settings.json");
+    fs::create_dir_all(claude_json.parent().unwrap()).unwrap();
+    fs::write(
+        &claude_json,
+        format!("{{\"broken\": , \"OPENAI_API_KEY\": \"{secret}\"}}"),
+    )
+    .unwrap();
+
+    // 1. Default sanitized backup: malformed files must still succeed and redact secrets.
+    let sanitized_tar = project.path().join("malformed-sanitized.tar.gz");
+    let sanitized = command_with_env(home.path(), project.path())
+        .args(["backup-agents", "-o", sanitized_tar.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        sanitized.status.success(),
+        "backup-agents failed on malformed configs: {}",
+        String::from_utf8_lossy(&sanitized.stderr)
+    );
+    for (entry_path, bytes) in read_archive_entries_bytes(&sanitized_tar) {
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains(secret),
+            "raw secret leaked into malformed fallback entry {entry_path}"
+        );
+    }
+
+    // 2. --include-secrets control: raw bytes preserved verbatim.
+    let raw_tar = project.path().join("include-secrets.tar.gz");
+    let raw = command_with_env(home.path(), project.path())
+        .args([
+            "backup-agents",
+            "-o",
+            raw_tar.to_str().unwrap(),
+            "--include-secrets",
+        ])
+        .output()
+        .unwrap();
+    assert!(raw.status.success());
+
+    let restore_home = tempfile::tempdir().unwrap();
+    let restore_project = tempfile::tempdir().unwrap();
+    let restore = command_with_env(restore_home.path(), restore_project.path())
+        .args(["restore-agents", "-i", raw_tar.to_str().unwrap(), "--apply"])
+        .output()
+        .unwrap();
+    assert!(restore.status.success());
+    assert_eq!(
+        fs::read_to_string(restore_home.path().join(".codex/config.toml")).unwrap(),
+        raw_codex
+    );
+}

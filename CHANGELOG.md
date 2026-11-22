@@ -44,6 +44,11 @@ version in [`docs/changelog/`](docs/changelog/):
   selection and parked-claim listings, logging a warning with the
   `ai-memory auto-improve --session-id <id>` rerun command. (#2414)
 
+- Preserved valid TOML, JSON, and JSONC syntax when `ai-memory backup-agents`
+  redacts secrets from MCP configuration files, scrubbing string values and
+  comments structurally instead of running raw free-text regex replacement over
+  the serialized bytes. (#2415)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)

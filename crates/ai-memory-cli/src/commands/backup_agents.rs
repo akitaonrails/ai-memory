@@ -1023,8 +1023,7 @@ fn build_archive(
             && matches!(asset.kind, AgentAssetKind::McpConfig)
         {
             if let Ok(text) = std::str::from_utf8(&raw_bytes) {
-                let sanitized_text = sc.scrub(text);
-                let changed = sanitized_text != text;
+                let (sanitized_text, changed) = scrub_mcp_config(&asset.source_path, text, sc)?;
                 (sanitized_text.into_bytes(), changed)
             } else {
                 (raw_bytes, false)
@@ -1092,6 +1091,340 @@ fn build_archive(
     Ok(discovered.len())
 }
 
+/// Redact secrets inside an MCP configuration file while preserving valid
+/// TOML, JSON, or JSONC syntax. Falls back to free-text scrubbing when the
+/// source file is already malformed on disk or uses an unrecognized extension.
+fn scrub_mcp_config(path: &Path, text: &str, sanitizer: &Sanitizer) -> Result<(String, bool)> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("toml") => scrub_toml_config(path, text, sanitizer),
+        Some("json") => scrub_json_config(path, text, sanitizer),
+        Some("jsonc") => scrub_jsonc_config(path, text, sanitizer),
+        _ => Ok(scrub_plain_text(text, sanitizer)),
+    }
+}
+
+fn scrub_plain_text(text: &str, sanitizer: &Sanitizer) -> (String, bool) {
+    let scrubbed = sanitizer.scrub(text);
+    let changed = scrubbed != text;
+    (scrubbed, changed)
+}
+
+fn scrub_string_value(key: Option<&str>, value: &str, sanitizer: &Sanitizer) -> Option<String> {
+    let direct = sanitizer.scrub(value);
+    if direct != value {
+        return Some(direct);
+    }
+
+    let key = key?;
+    if value.trim().is_empty() {
+        return None;
+    }
+
+    let quoted = serde_json::to_string(value).ok()?;
+    let probes = [
+        format!("{key} = {quoted}"),
+        format!("{key}: {quoted}"),
+        format!("{key}={value}"),
+    ];
+    for probe in &probes {
+        let scrubbed = sanitizer.scrub(probe);
+        if scrubbed != *probe {
+            let marker =
+                extract_redaction_marker(&scrubbed).unwrap_or_else(|| "[REDACTED]".to_owned());
+            return (marker != value).then_some(marker);
+        }
+    }
+    None
+}
+
+fn extract_redaction_marker(scrubbed: &str) -> Option<String> {
+    let start = scrubbed.find("[REDACTED:")?;
+    let rest = &scrubbed[start..];
+    let end = rest.find(']')?;
+    Some(rest[..=end].to_owned())
+}
+
+fn scrub_toml_config(path: &Path, text: &str, sanitizer: &Sanitizer) -> Result<(String, bool)> {
+    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return Ok(scrub_plain_text(text, sanitizer));
+    };
+
+    let mut changed = scrub_toml_table(doc.as_table_mut(), sanitizer);
+    if let Some(raw) = doc.trailing().as_str()
+        && let Some(scrubbed) = scrub_toml_comments(raw, sanitizer)
+    {
+        doc.set_trailing(scrubbed);
+        changed = true;
+    }
+
+    if !changed {
+        return Ok((text.to_owned(), false));
+    }
+
+    let rendered = doc.to_string();
+    rendered
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("verifying redacted config for {}", path.display()))?;
+    Ok((rendered, true))
+}
+
+fn scrub_toml_table(table: &mut toml_edit::Table, sanitizer: &Sanitizer) -> bool {
+    let mut changed = scrub_toml_decor(table.decor_mut(), sanitizer);
+    for (mut key, item) in table.iter_mut() {
+        changed |= scrub_toml_decor(key.leaf_decor_mut(), sanitizer);
+        changed |= scrub_toml_decor(key.dotted_decor_mut(), sanitizer);
+        let key_name = key.get().to_owned();
+        match item {
+            toml_edit::Item::Value(val) => {
+                changed |= scrub_toml_value(Some(&key_name), val, sanitizer);
+            }
+            toml_edit::Item::Table(sub) => {
+                changed |= scrub_toml_table(sub, sanitizer);
+            }
+            toml_edit::Item::ArrayOfTables(aot) => {
+                for sub in aot.iter_mut() {
+                    changed |= scrub_toml_table(sub, sanitizer);
+                }
+            }
+            toml_edit::Item::None => {}
+        }
+    }
+    changed
+}
+
+fn scrub_toml_value(key: Option<&str>, val: &mut toml_edit::Value, sanitizer: &Sanitizer) -> bool {
+    let mut changed = scrub_toml_decor(val.decor_mut(), sanitizer);
+    match val {
+        toml_edit::Value::String(formatted) => {
+            if let Some(redacted) = scrub_string_value(key, formatted.value(), sanitizer) {
+                let decor = formatted.decor().clone();
+                *formatted = toml_edit::Formatted::new(redacted);
+                *formatted.decor_mut() = decor;
+                changed = true;
+            }
+        }
+        toml_edit::Value::Array(arr) => {
+            if let Some(raw) = arr.trailing().as_str()
+                && let Some(scrubbed) = scrub_toml_comments(raw, sanitizer)
+            {
+                arr.set_trailing(scrubbed);
+                changed = true;
+            }
+            for elem in arr.iter_mut() {
+                changed |= scrub_toml_value(None, elem, sanitizer);
+            }
+        }
+        toml_edit::Value::InlineTable(inline) => {
+            if let Some(raw) = inline.preamble().as_str()
+                && let Some(scrubbed) = scrub_toml_comments(raw, sanitizer)
+            {
+                inline.set_preamble(scrubbed);
+                changed = true;
+            }
+            for (mut k, v) in inline.iter_mut() {
+                changed |= scrub_toml_decor(k.leaf_decor_mut(), sanitizer);
+                changed |= scrub_toml_decor(k.dotted_decor_mut(), sanitizer);
+                let key_name = k.get().to_owned();
+                changed |= scrub_toml_value(Some(&key_name), v, sanitizer);
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+fn scrub_toml_decor(decor: &mut toml_edit::Decor, sanitizer: &Sanitizer) -> bool {
+    let mut changed = false;
+    if let Some(prefix) = decor.prefix().and_then(toml_edit::RawString::as_str)
+        && let Some(scrubbed) = scrub_toml_comments(prefix, sanitizer)
+    {
+        decor.set_prefix(scrubbed);
+        changed = true;
+    }
+    if let Some(suffix) = decor.suffix().and_then(toml_edit::RawString::as_str)
+        && let Some(scrubbed) = scrub_toml_comments(suffix, sanitizer)
+    {
+        decor.set_suffix(scrubbed);
+        changed = true;
+    }
+    changed
+}
+
+fn scrub_toml_comments(raw: &str, sanitizer: &Sanitizer) -> Option<String> {
+    if !raw.contains('#') {
+        return None;
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut changed = false;
+    for line in raw.split_inclusive('\n') {
+        if let Some(hash_idx) = line.find('#') {
+            let prefix = &line[..=hash_idx];
+            let rest = &line[hash_idx + 1..];
+            let (body, ending) = if let Some(stripped) = rest.strip_suffix("\r\n") {
+                (stripped, "\r\n")
+            } else if let Some(stripped) = rest.strip_suffix('\n') {
+                (stripped, "\n")
+            } else {
+                (rest, "")
+            };
+            let scrubbed = sanitizer.scrub(body).replace(['\r', '\n'], " ");
+            if scrubbed != body {
+                changed = true;
+            }
+            out.push_str(prefix);
+            out.push_str(&scrubbed);
+            out.push_str(ending);
+        } else {
+            out.push_str(line);
+        }
+    }
+    changed.then_some(out)
+}
+
+fn scrub_json_config(path: &Path, text: &str, sanitizer: &Sanitizer) -> Result<(String, bool)> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return scrub_jsonc_config(path, text, sanitizer);
+    };
+    if !scrub_json_value(None, &mut value, sanitizer) {
+        return Ok((text.to_owned(), false));
+    }
+    let mut rendered = serde_json::to_string_pretty(&value)
+        .with_context(|| format!("serializing redacted config for {}", path.display()))?;
+    if text.ends_with('\n') {
+        rendered.push('\n');
+    }
+    serde_json::from_str::<serde_json::Value>(&rendered)
+        .with_context(|| format!("verifying redacted config for {}", path.display()))?;
+    Ok((rendered, true))
+}
+
+fn scrub_json_value(
+    key: Option<&str>,
+    value: &mut serde_json::Value,
+    sanitizer: &Sanitizer,
+) -> bool {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Some(redacted) = scrub_string_value(key, s, sanitizer) {
+                *s = redacted;
+                true
+            } else {
+                false
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= scrub_json_value(None, item, sanitizer);
+            }
+            changed
+        }
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            for (k, v) in map.iter_mut() {
+                changed |= scrub_json_value(Some(k), v, sanitizer);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn scrub_jsonc_config(path: &Path, text: &str, sanitizer: &Sanitizer) -> Result<(String, bool)> {
+    let collect = jsonc_parser::CollectOptions {
+        comments: jsonc_parser::CommentCollectionStrategy::Separate,
+        tokens: false,
+    };
+    let Ok(ast) =
+        jsonc_parser::parse_to_ast(text, &collect, &jsonc_parser::ParseOptions::default())
+    else {
+        return Ok(scrub_plain_text(text, sanitizer));
+    };
+
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    if let Some(ref root) = ast.value {
+        collect_jsonc_value_edits(None, root, sanitizer, &mut edits)?;
+    }
+    if let Some(comments) = ast.comments {
+        for list in comments.values() {
+            for comment in list.iter() {
+                match comment {
+                    jsonc_parser::ast::Comment::Line(line) => {
+                        let scrubbed = sanitizer.scrub(line.text).replace(['\r', '\n'], " ");
+                        if scrubbed != line.text {
+                            edits.push((line.range.start..line.range.end, format!("//{scrubbed}")));
+                        }
+                    }
+                    jsonc_parser::ast::Comment::Block(block) => {
+                        let scrubbed = sanitizer.scrub(block.text).replace("*/", "* /");
+                        if scrubbed != block.text {
+                            edits.push((
+                                block.range.start..block.range.end,
+                                format!("/*{scrubbed}*/"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return Ok((text.to_owned(), false));
+    }
+
+    edits.sort_by(|a, b| {
+        b.0.start
+            .cmp(&a.0.start)
+            .then_with(|| b.0.end.cmp(&a.0.end))
+    });
+    edits.dedup_by(|a, b| a.0 == b.0);
+    let mut rendered = text.to_owned();
+    for (range, replacement) in edits {
+        rendered.replace_range(range, &replacement);
+    }
+
+    jsonc_parser::parse_to_ast(
+        &rendered,
+        &jsonc_parser::CollectOptions::default(),
+        &jsonc_parser::ParseOptions::default(),
+    )
+    .with_context(|| format!("verifying redacted config for {}", path.display()))?;
+    Ok((rendered, true))
+}
+
+fn collect_jsonc_value_edits(
+    key: Option<&str>,
+    value: &jsonc_parser::ast::Value<'_>,
+    sanitizer: &Sanitizer,
+    edits: &mut Vec<(std::ops::Range<usize>, String)>,
+) -> Result<()> {
+    match value {
+        jsonc_parser::ast::Value::StringLit(lit) => {
+            if let Some(redacted) = scrub_string_value(key, &lit.value, sanitizer) {
+                let encoded = serde_json::to_string(&redacted)?;
+                edits.push((lit.range.start..lit.range.end, encoded));
+            }
+        }
+        jsonc_parser::ast::Value::Array(arr) => {
+            for elem in &arr.elements {
+                collect_jsonc_value_edits(None, elem, sanitizer, edits)?;
+            }
+        }
+        jsonc_parser::ast::Value::Object(obj) => {
+            for prop in &obj.properties {
+                collect_jsonc_value_edits(Some(prop.name.as_str()), &prop.value, sanitizer, edits)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn portable_mode(path: &Path) -> Result<Option<u32>> {
     #[cfg(unix)]
     {
@@ -1122,4 +1455,77 @@ pub(crate) fn matches_agent_filter(agent: AgentKind, filter_list: &[String]) -> 
         }
         AgentKind::from_wire(&normalized) == agent
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_sanitizer() -> Sanitizer {
+        Sanitizer::new(&SanitizeConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn scrub_toml_handles_inline_tables_arrays_and_trailing_comments() {
+        let sc = test_sanitizer();
+        let secret = "fixture-only-abcdef00112233445566778899";
+        let input = format!(
+            "[mcp_servers.demo]\n\
+             url = \"http://127.0.0.1:49374/mcp\"\n\
+             http_headers = {{ \"X-API-Key\" = \"{secret}\" }}\n\
+             args = [\"--token\", \"ghp_FAKEfakeFAKEfakeFAKEfake012345678\"]\n\
+             \n\
+             [[servers]]\n\
+             api_key = \"{secret}\"\n\
+             # trailing comment: X-API-Key = \"{secret}\"\n"
+        );
+        let (scrubbed, changed) = scrub_mcp_config(Path::new("config.toml"), &input, &sc).unwrap();
+        assert!(changed);
+        assert!(!scrubbed.contains(secret));
+        assert!(!scrubbed.contains("ghp_FAKEfakeFAKEfakeFAKEfake012345678"));
+
+        let doc: toml_edit::DocumentMut = scrubbed.parse().expect("must remain valid TOML");
+        assert_eq!(
+            doc["mcp_servers"]["demo"]["url"].as_str(),
+            Some("http://127.0.0.1:49374/mcp")
+        );
+        assert!(
+            doc["mcp_servers"]["demo"]["http_headers"]["X-API-Key"]
+                .as_str()
+                .unwrap()
+                .starts_with("[REDACTED:")
+        );
+        assert!(
+            doc["mcp_servers"]["demo"]["args"][1]
+                .as_str()
+                .unwrap()
+                .starts_with("[REDACTED:")
+        );
+        assert!(
+            doc["servers"][0]["api_key"]
+                .as_str()
+                .unwrap()
+                .starts_with("[REDACTED:")
+        );
+
+        // Idempotent on second pass.
+        let (second, changed_again) =
+            scrub_mcp_config(Path::new("config.toml"), &scrubbed, &sc).unwrap();
+        assert!(!changed_again);
+        assert_eq!(second, scrubbed);
+    }
+
+    #[test]
+    fn scrub_clean_configs_are_returned_verbatim() {
+        let sc = test_sanitizer();
+        let clean_json = r#"{"mcpServers":{"local":{"url":"http://127.0.0.1:49374/mcp"}}}"#;
+        let (out, changed) = scrub_mcp_config(Path::new("settings.json"), clean_json, &sc).unwrap();
+        assert!(!changed);
+        assert_eq!(out, clean_json);
+
+        let clean_toml = "[mcp_servers.local]\nurl = \"http://127.0.0.1:49374/mcp\"\n";
+        let (out, changed) = scrub_mcp_config(Path::new("config.toml"), clean_toml, &sc).unwrap();
+        assert!(!changed);
+        assert_eq!(out, clean_toml);
+    }
 }
