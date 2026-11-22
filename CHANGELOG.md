@@ -77,6 +77,13 @@ version in [`docs/changelog/`](docs/changelog/):
   `setup` writes them; an existing spool or token directory keeps its access
   list (see `docs/security-boundaries.md` row 10m). (#2396)
 
+### Fixed
+
+- Deduplicated repeated native Codex and Claude Code tool callbacks with a
+  stable call identity while preserving separate calls and callback phases.
+  Callbacks without sufficient identity retain at-least-once delivery.
+  ([#2399](https://github.com/akitaonrails/ai-memory/pull/2399))
+
 ## [3.5.1] - 2026-11-19
 
 ### Fixed
