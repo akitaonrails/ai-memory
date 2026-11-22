@@ -263,8 +263,11 @@ async fn recover_with_codex(auth: &CodexAuth, request_timeout: Duration) -> LlmR
     if let Some(codex_home) = auth.auth_file.parent() {
         command.env("CODEX_HOME", codex_home);
     }
-    let mut child = command.spawn().map_err(|_| {
-        codex_reauth_error("Could not start `codex app-server --stdio` for recovery")
+    let mut child = command.spawn().map_err(|error| {
+        codex_reauth_error(&format!(
+            "Could not start `{} app-server --stdio` for recovery ({error})",
+            auth.executable.display()
+        ))
     })?;
     let timeout = request_timeout.min(Duration::from_secs(MAX_RECOVERY_SECS));
     let result = tokio::time::timeout(timeout, run_recovery_protocol(&mut child)).await;
@@ -793,6 +796,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(value, json!({"answer": 42}));
+    }
+
+    #[tokio::test]
+    async fn recovery_spawn_failure_names_the_executable_and_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-codex");
+        let auth = CodexAuth {
+            auth_file: dir.path().join("auth.json"),
+            executable: missing.clone(),
+        };
+
+        let error = recover_with_codex(&auth, Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(&missing.display().to_string()),
+            "the executable that failed to start must be named, got {error}"
+        );
+        // The OS message for the same failed spawn, whatever the platform says.
+        let cause = StdCommand::new(&missing).spawn().unwrap_err().to_string();
+        assert!(
+            error.contains(&cause),
+            "the spawn error must be kept, got {error}"
+        );
+        assert!(error.contains("run `codex login status`"));
     }
 
     #[tokio::test]

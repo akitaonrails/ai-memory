@@ -171,6 +171,14 @@ pub(crate) struct ExecutableSearch<'a> {
     extensions: Option<&'a OsStr>,
 }
 
+impl<'a> ExecutableSearch<'a> {
+    /// Search over an explicit `PATH` and `PATHEXT`, for callers that hold
+    /// the captured process environment rather than an [`EffectiveEnv`].
+    pub(crate) fn new(path: Option<&'a OsStr>, extensions: Option<&'a OsStr>) -> Self {
+        Self { path, extensions }
+    }
+}
+
 const AUTO_HARNESSES: [ManagedHarness; 9] = [
     ManagedHarness::Claude,
     ManagedHarness::Codex,
@@ -5066,7 +5074,7 @@ async fn claude_background_attach_id(
 /// to spawn with "program not found". Resolving to the concrete file keeps the
 /// availability check and the launch agreeing on one answer, and lets the
 /// launch use a path that works.
-pub(super) fn resolve_program(
+pub(crate) fn resolve_program(
     program: &OsStr,
     search: ExecutableSearch<'_>,
 ) -> Option<std::path::PathBuf> {
