@@ -16379,12 +16379,11 @@ const ctx = (id: string, cwd?: string) => ({
 });
 const unscoped = await handlers["before_agent_start"]({ prompt: "continue" }, ctx("s-unscoped", ""));
 const scoped = await handlers["before_agent_start"]({ prompt: "continue" }, ctx("s-scoped", project));
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   claims,
   unscoped: unscoped?.message?.content ?? null,
   scoped: scoped?.message?.content ?? null,
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         fn node_strips_types() -> bool {
@@ -16573,8 +16572,7 @@ while (!hooks.some((hook) => hook.event === "session-end" && hook.sessionID === 
   if (Date.now() > deadline) break;
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
-console.log(JSON.stringify({ claims, delivered, hooks }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ claims, delivered, hooks }) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -16736,8 +16734,7 @@ while (!sessions.every(ended)) {
   if (Date.now() > deadline) break;
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
-console.log(JSON.stringify({ claims, delivered, hooks }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ claims, delivered, hooks }) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -16881,8 +16878,8 @@ const reload = await modelCall("root");
 await compacting("root");
 const afterNext = await modelCall("root");
 await plugin.dispose();
-console.log(JSON.stringify({ oldAfter, before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }));
-process.exit(0);
+process.stdout.write(JSON.stringify({ oldAfter, before, rootCompacting, taskCompacting, after, taskAfter, reload, afterNext, recaps }) + "\n",
+  (error) => process.exit(error ? 1 : 0));
 "#;
 
         #[test]
@@ -17003,13 +17000,12 @@ for (let i = 0; i < 100 && !drained(); i++) {
   await new Promise((resolve) => setTimeout(resolve, 50));
 }
 await new Promise((resolve) => setTimeout(resolve, 300));
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   handoff: reply?.message?.content ?? null,
   loginHits,
   drained: drained(),
   spooled: readdirSync(spool).filter((name) => name.endsWith(".json")).sort(),
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
 
         /// Followed, the gateway's redirect would put its login page in the
@@ -17431,14 +17427,13 @@ for (let i = 0; i < 200 && tools.length === 0; i++) await new Promise((r) => set
 const ctx = { cwd: process.cwd(), sessionManager: { getSessionId: () => "pi-codemode-session" } };
 const result = await tools[0].execute("call-1", { query: "x" }, undefined, undefined, ctx);
 const call = calls.find((c) => c.method === "tools/call");
-console.log(JSON.stringify({
+process.stdout.write(JSON.stringify({
   names: tools.map((t) => t.name),
   exposure: tools[0].exposure ?? null,
   text: result.content[0].text,
   actor: call.headers["X-Memory-Actor-Session-Id"] ?? null,
   mcp: call.headers["Mcp-Session-Id"] ?? null,
-}));
-process.exit(0);
+}) + "\n", (error) => process.exit(error ? 1 : 0));
 "#;
         for (exposure, expected) in [
             (PiToolExposure::Direct, serde_json::Value::Null),

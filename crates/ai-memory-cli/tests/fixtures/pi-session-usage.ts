@@ -35,6 +35,5 @@ for (const step of scenario.steps) {
     assert.deepEqual(hook.body._ai_memory_usage ?? null, step.expected);
   }
 }
-console.log(JSON.stringify(hooks));
-// The fixture owns no production resources. MCP bootstrap/flush timers need not keep Node alive.
-process.exit(0);
+// MCP bootstrap/flush timers need not keep Node alive once stdout is flushed.
+process.stdout.write(JSON.stringify(hooks) + "\n", (error) => process.exit(error ? 1 : 0));

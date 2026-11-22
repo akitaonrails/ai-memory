@@ -813,6 +813,13 @@ mod slow {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        // The refusal can fill a small pipe before the child has exited.
+        let mut child_stderr = child.stderr.take().unwrap();
+        let stderr = std::thread::spawn(move || {
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(&mut child_stderr, &mut stderr).unwrap();
+            stderr
+        });
         let deadline = Instant::now() + Duration::from_secs(20);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -820,12 +827,12 @@ mod slow {
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
+                let _ = child.wait();
                 panic!("the bridge hung on a refused connection");
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        let mut stderr = String::new();
-        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        let stderr = stderr.join().unwrap();
         assert!(!status.success());
         assert!(stderr.contains("sent without a bearer token"), "{stderr}");
         assert!(
