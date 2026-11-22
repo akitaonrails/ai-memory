@@ -691,9 +691,11 @@ Tests:
 Status: implemented as a server-side scheduler, not a SessionEnd hook trigger.
 The scheduler is enabled by default when an LLM provider exists, sleeps after
 each non-overlapping tick, and reviews newly completed sessions across every
-project after each project's persisted first-run watermark. It records a
-per-session claim before calling the LLM, so scheduled review is at-most-once per
-completed session unless an admin reruns auto-improve manually.
+project after each project's persisted first-run watermark. It records a per-session claim before calling the LLM, so scheduled review is
+at-most-once per completed session unless an admin reruns auto-improve manually.
+If the server shuts down or crashes while a review is in flight, the next
+exclusively-locked startup parks that orphaned claim with a warning pointing to
+`ai-memory auto-improve --session-id <id>`.
 
 Tests:
 

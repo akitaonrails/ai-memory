@@ -54,9 +54,10 @@ pub use auto_improve::{
     ApproveAutoImproveProposalResult, AutoImproveProposalDetail, AutoImproveProposalEvent,
     AutoImproveProposalOperation, AutoImproveProposalStatus, AutoImproveProposalSummary,
     AutoImproveRejectionSummary, AutoImproveTelemetryAggregate, AutoImproveTelemetryCount,
-    FailAutoImproveProposal, NewAutoImproveProposal, OwnedAutoImproveProposalDetail,
-    PendingAutoImproveReview, PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal,
-    StageAutoImproveRun, StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
+    FailAutoImproveProposal, INTERRUPTED_REVIEW_CLAIM_ERROR, InterruptedAutoImproveClaim,
+    NewAutoImproveProposal, OwnedAutoImproveProposalDetail, PendingAutoImproveReview,
+    PendingAutoImproveScope, RejectAutoImproveProposal, SkippedProposal, StageAutoImproveRun,
+    StagedAutoImproveRun, StagedAutoImproveRunReport, artifact_path_for,
 };
 pub use belief::{BeliefInputs, CONFIDENCE_CAP, confidence};
 pub use dashboard::{AgentUsage, RegisteredAgent};
@@ -5695,6 +5696,161 @@ mod tests {
             parked[0].last_error.as_deref(),
             Some("create proposal target already exists")
         );
+    }
+
+    #[tokio::test]
+    async fn auto_improve_park_interrupted_claims_only_parks_orphaned_inflight_claims() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .ensure_auto_improve_scheduler_state(ws, proj)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let make_ended_session = || async {
+            let sid = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id: sid,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::OpenCode,
+                    cwd: None,
+                    actor_user: None,
+                    origin: None,
+                })
+                .await
+                .unwrap();
+            store.writer.end_session(sid, None).await.unwrap();
+            sid
+        };
+
+        // (a) Orphaned in-flight claim: claimed, no run row, last_failed_at IS NULL.
+        let orphaned_sid = make_ended_session().await;
+        // (b) Completed claim: claimed, matching auto_improve_runs row, last_failed_at IS NULL.
+        let completed_sid = make_ended_session().await;
+        // (c) Retryable failed claim: claimed then failed once (attempts = 1, last_failed_at IS NOT NULL).
+        let retryable_sid = make_ended_session().await;
+
+        let candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 3);
+        for candidate in &candidates {
+            assert!(
+                store
+                    .writer
+                    .claim_auto_improve_scheduler_session(
+                        ws,
+                        proj,
+                        candidate.session_id,
+                        candidate.ended_at,
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+
+        // Record a completed review run for (b).
+        let mut completed_run = stage_input(ws, proj, Vec::new());
+        completed_run.session_id = Some(completed_sid);
+        store
+            .writer
+            .stage_auto_improve_run(completed_run)
+            .await
+            .unwrap();
+
+        // Record one retryable failure for (c).
+        let retryable_attempts = store
+            .writer
+            .record_auto_improve_claim_failure(ws, proj, retryable_sid, "transient timeout")
+            .await
+            .unwrap();
+        assert_eq!(retryable_attempts, 1);
+
+        // Before startup recovery, (a) is hidden from both candidates and parked claims.
+        assert!(
+            store
+                .reader
+                .auto_improve_parked_claims(ws, proj)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let now = jiff::Timestamp::from_microsecond(1_700_000_000_000_000).unwrap();
+        let parked_now = store
+            .writer
+            .park_interrupted_auto_improve_claims(now)
+            .await
+            .unwrap();
+        assert_eq!(
+            parked_now,
+            vec![InterruptedAutoImproveClaim {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: orphaned_sid,
+            }]
+        );
+
+        // Only (a) is surfaced in auto_improve_parked_claims with the interrupted error.
+        let parked = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].session_id, orphaned_sid);
+        assert_eq!(parked[0].attempts, AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+        assert_eq!(
+            parked[0].last_error.as_deref(),
+            Some(INTERRUPTED_REVIEW_CLAIM_ERROR)
+        );
+        assert_eq!(parked[0].last_failed_at, Some(now.as_microsecond()));
+
+        // (c) remains a retryable candidate; (a) and (b) are not candidates.
+        let remaining_candidates = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining_candidates.len(), 1);
+        assert_eq!(remaining_candidates[0].session_id, retryable_sid);
+
+        // Second call is idempotent and returns no rows.
+        let parked_again = store
+            .writer
+            .park_interrupted_auto_improve_claims(
+                jiff::Timestamp::from_microsecond(1_700_000_005_000_000).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(parked_again.is_empty());
+        // Timestamp on (a) was not overwritten by the idempotent second call.
+        let parked_after = store
+            .reader
+            .auto_improve_parked_claims(ws, proj)
+            .await
+            .unwrap();
+        assert_eq!(parked_after.len(), 1);
+        assert_eq!(parked_after[0].last_failed_at, Some(now.as_microsecond()));
     }
 
     #[tokio::test]

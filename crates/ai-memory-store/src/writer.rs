@@ -889,6 +889,10 @@ pub(crate) enum WriteCmd {
         error: String,
         reply: oneshot::Sender<StoreResult<u32>>,
     },
+    ParkInterruptedAutoImproveClaims {
+        now: jiff::Timestamp,
+        reply: oneshot::Sender<StoreResult<Vec<crate::auto_improve::InterruptedAutoImproveClaim>>>,
+    },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -3915,6 +3919,24 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Park any in-flight auto-improve scheduler claims left behind by a prior
+    /// server shutdown or crash before a review run was recorded.
+    ///
+    /// Callers must invoke this only while holding the exclusive serve lock so
+    /// a second unguarded process cannot park an active sibling's claim.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the transaction fails.
+    pub async fn park_interrupted_auto_improve_claims(
+        &self,
+        now: jiff::Timestamp,
+    ) -> StoreResult<Vec<crate::auto_improve::InterruptedAutoImproveClaim>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ParkInterruptedAutoImproveClaims { now, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -5611,6 +5633,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &error,
                 );
                 send_or_warn(reply, result, "record_auto_improve_claim_failure");
+            }
+            WriteCmd::ParkInterruptedAutoImproveClaims { now, reply } => {
+                let result = crate::auto_improve::park_interrupted_claims(&mut conn, now);
+                send_or_warn(reply, result, "park_interrupted_auto_improve_claims");
             }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);
