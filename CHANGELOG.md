@@ -36,6 +36,10 @@ version in [`docs/changelog/`](docs/changelog/):
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)
 
+- Included Codex hook settings in agent backups and used the effective
+  `CODEX_HOME` for Codex configuration, skills, and plugins on backup and
+  restore. (#2409)
+
 - Avoided scanning every pending wiki path for the next debounce deadline on
   each filesystem notification, reducing watcher work during bulk edits. (#2354)
 
