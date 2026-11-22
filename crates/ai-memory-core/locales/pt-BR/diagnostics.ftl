@@ -1001,6 +1001,7 @@ diag-building-profile = criando provedor alternativo LLM { $item }
 diag-profile-api-key-unsupported = provedor não configurado: api_key_env não é compatível com o provedor { $provider }
 diag-building-llm-provider-chains = criando cadeias de provedores LLM a partir da configuração
 diag-reranker-llm-provider-required = AI_MEMORY_RERANKER=llm requer AI_MEMORY_LLM_PROVIDER ou um provedor llm.rerank
+diag-reranker-decisions-choice-requires-key-and-model = AI_MEMORY_RERANKER=decisions-choice requer OPENAI_API_KEY e llm_model
 diag-jail-encoding-choices = codificando as escolhas do jail
 diag-jail-checklist-header = 🔒 ai-jail: o que o agente pode acessar
 diag-jail-checklist-enter-keeps = (Enter mantém as marcas)

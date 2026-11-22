@@ -100,6 +100,7 @@ async fn harness() -> Harness {
             expires_at: None,
             entities: vec![],
             evidence: vec![],
+            trust_class: None,
         })
         .await
         .unwrap();

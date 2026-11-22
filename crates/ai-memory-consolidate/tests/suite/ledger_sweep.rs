@@ -349,6 +349,7 @@ async fn a_legacy_page_row_is_left_alone_and_reported() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

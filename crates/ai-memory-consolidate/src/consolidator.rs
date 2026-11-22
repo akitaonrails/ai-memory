@@ -173,6 +173,7 @@ impl PreparedSessionPage {
                 // the projection omits rows on a long session (#2164).
                 observations: ai_memory_core::SourceObservations::Listed(self.source_ids.clone()),
             }],
+            trust_class: None,
         }
     }
 }
@@ -1118,10 +1119,14 @@ impl Consolidator {
             &existing_titles,
         );
         let cfg = batch_projection_cfg(plan.observation_chars, self.verbatim_residue);
-        let projected = self
+        let projected_and_trust = self
             .reader
             .read_session_observations_in_scope(ws, proj, session_id, move |snap| {
-                Ok(project_session_observations(snap, &cfg)?.map(|(projected, _stats)| projected))
+                let Some((projected, _stats)) = project_session_observations(snap, &cfg)? else {
+                    return Ok(None);
+                };
+                let tool_result_only = snap.sources_are_tool_result_only(&projected.source_ids)?;
+                Ok(Some((projected, tool_result_only)))
             })
             .await
             .map_err(|e| match e {
@@ -1130,7 +1135,7 @@ impl Consolidator {
                 StoreError::SessionCollision => ConsolidatorError::EmptySession(session_id),
                 other => other.into(),
             })?;
-        let Some(projected) = projected else {
+        let Some((projected, tool_result_only)) = projected_and_trust else {
             return Err(ConsolidatorError::EmptySession(session_id));
         };
         // One LLM operation, one identity (see `consolidate_session`): the
@@ -1181,6 +1186,32 @@ impl Consolidator {
                 }
                 Err(e) => return Err(e),
             };
+            // Step 3 (#2164): refuse `_rules/` emission when every supporting
+            // source observation is `tool_result` (no `operator_authored` or
+            // `model_generated` rule backing). Downgrade to `gotchas/` so the
+            // note is still searchable without entering the always-on rule
+            // surface; restating the rule in a `user-prompt` lifts the gate.
+            if tool_result_only
+                && (upd.kind == crate::types::PageKind::Rule
+                    || req.path.as_str().starts_with("_rules/"))
+            {
+                let slug = slugify_for_rule(&outcome.new_title);
+                let downgraded = PagePath::new(format!("gotchas/{slug}.md"))?;
+                warn!(
+                    session = %session_id,
+                    original_path = %req.path.as_str(),
+                    downgraded_path = %downgraded.as_str(),
+                    "refused _rules/ emission from tool_result-only observations; downgraded to gotchas/",
+                );
+                req.path = downgraded.clone();
+                outcome.path = downgraded;
+                if let Some(obj) = req.frontmatter.as_object_mut() {
+                    obj.insert(
+                        "kind".into(),
+                        serde_json::Value::String(crate::types::PageKind::Gotcha.as_str().into()),
+                    );
+                }
+            }
             if req.path == anchor {
                 stamp_session_origin(&mut req.frontmatter, session_id, agent_kind);
                 // Deterministic backstop for the title-uniqueness prompt
@@ -1494,6 +1525,7 @@ fn build_update(
         author_id,
         actor: actor.clone(),
         evidence: Vec::new(),
+        trust_class: None,
     };
     let outcome = ConsolidationOutcome {
         path,
@@ -2916,6 +2948,7 @@ mod tests {
             importance: 5,
             extension: None,
             source_event: None,
+            trust_class: ai_memory_core::TrustClass::ModelGenerated,
         }
     }
 
@@ -3744,6 +3777,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::default(),
             evidence: vec![],
+            trust_class: None,
         };
         let mut outcome = ConsolidationOutcome {
             path: colliding.path.clone(),
@@ -4748,6 +4782,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -5955,6 +5990,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -7121,6 +7157,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -7158,6 +7195,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -7191,6 +7229,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -7234,6 +7273,7 @@ mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -7328,6 +7368,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -7352,6 +7393,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -7495,6 +7537,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

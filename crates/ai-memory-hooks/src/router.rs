@@ -5606,6 +5606,7 @@ async fn process_authorized(
                 .clone()
                 .unwrap_or_else(|| kind.as_str().to_string())
         };
+        let trust_class = ai_memory_core::TrustClass::from_observation_kind(kind);
         let raw_obs = NewObservation {
             session_id,
             workspace_id: ws,
@@ -5618,6 +5619,7 @@ async fn process_authorized(
             importance: importance_for(env.event),
             occurred_at: env.occurred_at_micros(),
             file_path: env.file_path.clone(),
+            trust_class: Some(trust_class),
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -6156,6 +6158,7 @@ async fn process_authorized(
                         // predate owner recording.
                         actor: session_actor.clone(),
                         evidence: Vec::new(),
+                        trust_class: new_page.trust_class,
                     })
                     .await?
             }
@@ -6880,6 +6883,7 @@ async fn write_checkpoint_page(
             author_id: None,
             actor,
             evidence: Vec::new(),
+            trust_class: new_page.trust_class,
         })
         .await?;
     if checkpoint.track_page_write && previous_page_id != Some(page_id) {
@@ -7302,6 +7306,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -9912,6 +9917,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -11790,6 +11796,7 @@ pub(crate) mod tests {
                     body: "hello".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &state.sanitizer,
             )
@@ -17442,6 +17449,7 @@ pub(crate) mod tests {
                                 body: String::new(),
                                 importance: 1,
                                 file_path: None,
+                                trust_class: None,
                             },
                             &state.sanitizer
                         ),
@@ -18049,6 +18057,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -18610,6 +18619,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -23448,6 +23458,7 @@ pub(crate) mod tests {
                     body: "finish".into(),
                     importance: 7,
                     file_path: None,
+                    trust_class: None,
                 },
                 &state.sanitizer,
             )
@@ -23491,6 +23502,7 @@ pub(crate) mod tests {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -24342,6 +24354,7 @@ pub(crate) mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 
@@ -29105,6 +29118,7 @@ pub(crate) mod tests {
             body: body.into(),
             importance: 5,
             created_at: jiff::Timestamp::now(),
+            trust_class: ai_memory_core::TrustClass::from_observation_kind(kind),
         }
     }
 
@@ -30948,6 +30962,7 @@ pub(crate) mod tests {
                         body: habit.into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &ai_memory_core::Sanitizer::builtin(),
                 ))

@@ -27,6 +27,7 @@ fn page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str, pinned: bool) 
         expires_at: None,
         entities: Vec::new(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 

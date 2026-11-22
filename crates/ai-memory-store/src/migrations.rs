@@ -766,6 +766,7 @@ mod tests {
                 body: "continue".into(),
                 importance: 8,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -2689,6 +2690,7 @@ mod tests {
             body: body.into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         let body = "edited crates/ai-memory-store/src/reader.rs in ai-memory";
         let page = [4_u8; 16];
@@ -2803,6 +2805,7 @@ mod tests {
                 body: BODY.into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -2983,6 +2986,7 @@ mod tests {
                 body: "after V99".into(),
                 importance: 5,
                 file_path: Some("src/lib.rs".into()),
+                trust_class: None,
             },
         )
         .unwrap();
@@ -3042,6 +3046,7 @@ mod tests {
                 body: "before V112".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -3063,6 +3068,7 @@ mod tests {
                 source_id: session_id.to_string(),
                 observations,
             }],
+            trust_class: None,
         };
         // What the older build wrote: the session citation alone.
         let old_page =
@@ -3175,6 +3181,133 @@ mod tests {
             applied_max(&fresh),
             max_supported_version(),
             "the fresh install is at the newest embedded migration"
+        );
+    }
+
+    /// V113 adds `trust_class` to `observations` and `pages`: pre-V113 rows
+    /// default to `model_generated`, post-V113 rows persist their assigned or
+    /// derived class, and the CHECK constraint rejects unknown values.
+    #[test]
+    fn v113_adds_trust_class_columns_with_model_generated_default() {
+        use ai_memory_core::{NewPage, PagePath, Tier, TrustClass};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_to(&mut conn, 112).unwrap();
+        let workspace_id = crate::ops::get_or_create_workspace(&mut conn, "default").unwrap();
+        let project_id =
+            crate::ops::get_or_create_project(&mut conn, &workspace_id, "proj", None).unwrap();
+        let session_id = SessionId::new();
+        crate::ops::begin_session(
+            &mut conn,
+            &NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+                origin: None,
+            },
+        )
+        .unwrap();
+        let legacy_obs = crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "legacy obs".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: None,
+            },
+        )
+        .unwrap();
+        let legacy_page = crate::ops::upsert_page(
+            &mut conn,
+            &NewPage {
+                workspace_id,
+                project_id,
+                path: PagePath::new("notes/legacy.md").unwrap(),
+                title: "legacy".into(),
+                body: "before V113".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+                trust_class: None,
+            },
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        run(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let obs_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM observations WHERE id = ?1",
+                [legacy_obs.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(obs_trust, "model_generated");
+
+        let page_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM pages WHERE id = ?1",
+                [legacy_page.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_trust, "model_generated");
+
+        // Post-V113 observation persists its ingress trust class.
+        let new_obs = crate::ops::insert_observation(
+            &mut conn,
+            &NewObservation {
+                occurred_at: None,
+                session_id,
+                workspace_id,
+                project_id,
+                kind: ObservationKind::PostToolUse,
+                extension: None,
+                source_event: None,
+                title: "tool".into(),
+                body: "after V113".into(),
+                importance: 5,
+                file_path: None,
+                trust_class: Some(TrustClass::ToolResult),
+            },
+        )
+        .unwrap();
+        let new_obs_trust: String = conn
+            .query_row(
+                "SELECT trust_class FROM observations WHERE id = ?1",
+                [new_obs.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_obs_trust, "tool_result");
+
+        // CHECK constraint rejects invalid trust_class values.
+        let invalid = conn.execute(
+            "UPDATE pages SET trust_class = 'forged' WHERE id = ?1",
+            [legacy_page.as_bytes()],
+        );
+        assert!(
+            invalid.is_err(),
+            "CHECK constraint must reject invalid trust_class"
         );
     }
 }

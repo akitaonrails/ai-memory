@@ -260,6 +260,8 @@ embedding provider, model and credentials described in
 Availability and defaults depend on the provider configuration and build.
 LLM reranking is separately opt-in through `AI_MEMORY_RERANKER=llm` and requires
 an appropriate configured LLM provider.
+`AI_MEMORY_RERANKER=decisions-choice` uses OpenAI Decisions directly with `OPENAI_API_KEY` and an explicit `llm_model`, without a generative provider.
+Choice probabilities are relative to the candidate pool; leave `min_relevance` unset.
 
 Verify: use query explanations and diagnostics to inspect the active ranking
 streams. Keep provider/model/dimension aligned with stored embeddings; stale

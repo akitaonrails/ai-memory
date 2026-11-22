@@ -24,6 +24,8 @@ pub enum CredentialSource {
     },
     /// On-disk token file under ai-memory's data dir.
     TokenFile,
+    /// Operator-maintained key file named by `llm_api_key_file`.
+    ApiKeyFile,
     /// No credential was supplied.
     NotProvided,
 }
@@ -150,6 +152,9 @@ impl std::fmt::Debug for CursorAuth {
 pub enum Credential {
     /// Static API key / bearer secret.
     ApiKey(SecretString),
+    /// File holding the API key, read by the provider when it needs the key
+    /// and re-read after the endpoint rejects it.
+    ApiKeyFile(PathBuf),
     /// Path to the OpenAI OAuth token file.
     OpenAiOAuthTokenFile(PathBuf),
     /// Paths needed to reuse Codex CLI authentication.
@@ -194,6 +199,17 @@ impl ProviderAuth {
             key,
             CredentialSource::Environment { name: env_var },
         )
+    }
+
+    /// Resolve an optional API-key auth method from a key file the operator
+    /// keeps current (`llm_api_key_file`).
+    #[must_use]
+    pub fn optional_api_key_file(env_var: &'static str, path: impl Into<PathBuf>) -> Self {
+        Self {
+            requirement: AuthRequirement::OptionalApiKey { env_var },
+            credential: Some(Credential::ApiKeyFile(path.into())),
+            source: CredentialSource::ApiKeyFile,
+        }
     }
 
     /// Resolve OpenAI OAuth auth from a token file path.
@@ -343,6 +359,9 @@ impl ProviderAuth {
     pub fn require_api_key(&self) -> LlmResult<SecretString> {
         match (&self.requirement, &self.credential) {
             (_, Some(Credential::ApiKey(key))) => Ok(key.clone()),
+            (_, Some(Credential::ApiKeyFile(_))) => Err(LlmError::NotConfigured(
+                "API key credential expected, got API key file".into(),
+            )),
             (_, Some(Credential::OpenAiOAuthTokenFile(_))) => Err(LlmError::NotConfigured(
                 "API key credential expected, got openai-oauth token file".into(),
             )),
@@ -399,7 +418,8 @@ impl ProviderAuth {
         match &self.credential {
             Some(Credential::ApiKey(key)) => Some(key.clone()),
             Some(
-                Credential::OpenAiOAuthTokenFile(_)
+                Credential::ApiKeyFile(_)
+                | Credential::OpenAiOAuthTokenFile(_)
                 | Credential::Codex(_)
                 | Credential::Copilot(_)
                 | Credential::AnthropicOAuthToken(_)
@@ -407,6 +427,15 @@ impl ProviderAuth {
                 | Credential::Vertex(_),
             )
             | None => None,
+        }
+    }
+
+    /// The API key file, when the key is read from one.
+    #[must_use]
+    pub fn api_key_file(&self) -> Option<&Path> {
+        match &self.credential {
+            Some(Credential::ApiKeyFile(path)) => Some(path),
+            _ => None,
         }
     }
 

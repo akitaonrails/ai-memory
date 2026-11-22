@@ -31,11 +31,11 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `pi_tool_exposure` | `"direct"` | `AI_MEMORY_PI_TOOL_EXPOSURE` | How the generated Pi extension registers ai-memory's MCP tools: `direct` (declared to the model) or `codemode` (reached through Pi's codemode tool). |
 | `strip_root_combinators` | `false` | `AI_MEMORY_STRIP_ROOT_COMBINATORS` | Strip root level `anyOf`, `oneOf` and `allOf` from MCP tool input schemas on every `tools/list`. |
 | `gemini_safe_schemas` | `false` | `AI_MEMORY_GEMINI_SAFE_SCHEMAS` | Serve MCP tool schemas in the subset Vertex and Gemini accept. Implies `strip_root_combinators`. |
-| `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`. The only value is `llm`, which needs an LLM provider. |
+| `reranker` | unset | `AI_MEMORY_RERANKER` | Post-fusion reranker for `memory_query`: `llm` needs a generative provider; `decisions-choice` needs `OPENAI_API_KEY` and explicit `llm_model`, without a generative provider. Case-insensitive; other values refuse startup. Choice probabilities are relative: leave `min_relevance` unset. |
 | `rerank_timeout_secs` | `20` (`ai_memory_llm::reranker::RERANK_TIMEOUT`) | `AI_MEMORY_RERANK_TIMEOUT_SECS` | Seconds one rerank call may take before `memory_query` keeps the pre-rerank order. Must be at least 1. |
 | `llm_provider` | unset | `AI_MEMORY_LLM_PROVIDER` | LLM provider: `anthropic`, `openai`, `gemini`, `openai-compat`, `openai-oauth`, `anthropic-oauth`, `codex`, `copilot`, `opencode`, `cursor` or `vertex`. |
-| `llm_model` | unset | `AI_MEMORY_LLM_MODEL` | Model override for the LLM provider. |
-| `llm_base_url` | unset | `AI_MEMORY_LLM_BASE_URL` | Endpoint override for the LLM provider. Required for `openai-compat`. |
+| `llm_model` | unset | `AI_MEMORY_LLM_MODEL` | Model override for the LLM provider; required explicitly by `decisions-choice`. |
+| `llm_base_url` | unset | `AI_MEMORY_LLM_BASE_URL` | Endpoint override for the LLM provider. Required for `openai-compat`; `decisions-choice` accepts only the canonical OpenAI origin or credential-free HTTP loopback IP origins. |
 | `llm_compat_strict` | `true` | `AI_MEMORY_LLM_COMPAT_STRICT` | Send `response_format=json_schema` (strict) to the `openai-compat` provider. |
 | `llm_compat_disable_thinking` | `false` | `AI_MEMORY_LLM_COMPAT_DISABLE_THINKING` | Send `chat_template_kwargs: {"enable_thinking": false}` on every `openai-compat` chat request. |
 | `llm_compat_stream` | unset | `AI_MEMORY_LLM_COMPAT_STREAM` | Set `false` to request non-streaming JSON from `openai-compat`; `true` is rejected because SSE is unsupported. |
@@ -43,10 +43,11 @@ Defaults that come from a named constant or from another crate say so in the Def
 | `llm_request_metadata_headers` | `false` | `AI_MEMORY_LLM_REQUEST_METADATA_HEADERS` | Add `x-ai-memory-workload` (`consolidation`, `profile`, `dream`, `lint`, ...) to every `openai-compat` chat attempt, plus `x-ai-memory-workspace`, `x-ai-memory-project` and `x-ai-memory-user` when the operation reads one scope or acts for one user. Values are names, never page content. Other providers never send them. |
 | `bootstrap_max_concurrent` | `1` | `AI_MEMORY_BOOTSTRAP_MAX_CONCURRENT` | How many live `bootstrap` runs may call the LLM at once across projects. Runs for the same project always wait for each other. Must be at least 1. |
 | `llm_reasoning_effort` | unset (the model default applies) | `AI_MEMORY_LLM_REASONING_EFFORT` | Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` or `persistent`. |
+| `llm_api_key_file` | unset | `AI_MEMORY_LLM_API_KEY_FILE` | `openai-compat` only: read the API key from this file instead of `LLM_API_KEY`, on first use and once more after a `401`, so a rotated token reaches a running server. Relative paths resolve against the data dir. Wins over an ambient `LLM_API_KEY`. |
 | `llm_headers` | `[]` | `AI_MEMORY_LLM_HEADERS` | Extra HTTP headers on every LLM chat request, as `Name: Value` or `Name=Value` entries. |
 | `llm_quota_cooldown_secs` | `900` (`ai_memory_llm::DEFAULT_QUOTA_COOLDOWN`) | `AI_MEMORY_LLM_QUOTA_COOLDOWN_SECS` | How long a fallback chain (`[[llm_fallbacks]]` or a task's `[[llm.<task>.fallbacks]]`) skips a candidate that reported exhausted credit, quota or billing before the next call tries it again. Accepted range 30 to 86400. |
 | `embedding_provider` | unset (in-process local embeddings) | `AI_MEMORY_EMBEDDING_PROVIDER` | Embedding provider: `none`, `openai`, `voyage`, `google` or `gemini`, or `openai-compat`. |
-| `embedding_model` | unset | `AI_MEMORY_EMBEDDING_MODEL` | Provider-specific embedding model override. |
+| `embedding_model` | unset | `AI_MEMORY_EMBEDDING_MODEL` | Provider-specific embedding model override. For `local`, accepts `all-MiniLM-L6-v2` (default) or `intfloat/multilingual-e5-small` (alias `multilingual-e5-small`). |
 | `embedding_dim` | unset | `AI_MEMORY_EMBEDDING_DIM` | Embedding dimension override. It must match the model. |
 | `embedding_base_url` | unset | `AI_MEMORY_EMBEDDING_BASE_URL` | Embedding endpoint override. Required when `embedding_provider` is `openai-compat`. |
 | `embedding_query_prefix` | unset | `AI_MEMORY_EMBEDDING_QUERY_PREFIX` | Text prepended to every embedding query for the `openai` and `openai-compat` embedders. Kept verbatim. |

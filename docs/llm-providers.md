@@ -343,6 +343,24 @@ alone does not redirect embeddings; set `AI_MEMORY_EMBEDDING_BASE_URL` too.
 > only when every `openai-compat` endpoint you configure may see your
 > workspace, project and user names.
 
+### Gateways whose token rotates
+
+`LLM_API_KEY` is read once at startup, so a gateway whose bearer token is
+rewritten in a file (by a login CLI or a secrets agent) needs a restart after
+every rotation. Point `llm_api_key_file` (`AI_MEMORY_LLM_API_KEY_FILE`) at the
+file instead:
+
+```toml
+llm_provider = "openai-compat"
+llm_base_url = "https://gateway.example.com/v1"
+llm_model = "your-model"
+llm_api_key_file = "/path/to/api-key"
+```
+
+The key is cached after the first read. On a `401` the file is read again, and
+the request is retried once only if the key changed; a file still holding the
+rejected key returns the `401` without a second request.
+
 ### Falling back when credit or quota runs out
 
 An ordered `[[llm_fallbacks]]` chain moves to the next provider on a transient
@@ -571,11 +589,26 @@ when a slow provider or a fallback chain needs longer to answer. `global=true` a
 hits keep their existing non-RRF ranking. Concurrent provider calls are capped
 at four; saturated queries keep their local ranking without waiting.
 
+`reranker = "decisions-choice"` (or `AI_MEMORY_RERANKER=decisions-choice`) sends one typed `POST /v1/decisions` request to OpenAI for each eligible query.
+It requires `OPENAI_API_KEY` through the existing configuration auth resolver and an explicit `llm_model`; it needs no generative provider.
+The request contains one Choice question over the candidate IDs, with the same query/title/snippet budgets and 30-candidate cap.
+The request body is capped at 64 KiB and the response at 1 MiB.
+Timeouts, refusals, HTTP errors and malformed probabilities keep the local order, without retries or redirects.
+The key goes only to `https://api.openai.com:443`; `llm_base_url` may select an HTTP loopback IP origin for tests, which receives no Authorization header.
+The client ignores inherited proxy settings so loopback traffic stays local.
+
+Choice probabilities express relative competition within the candidate pool, not calibrated relevance.
+Leave `min_relevance` unset globally, in project markers and on individual calls with this backend.
+The existing filter behavior is unchanged; a fixed floor can remove different hits as the pool size changes.
+For an external judge endpoint instead, see the [Jev adapter](jev-reranker-adapter.md).
+
 ## Workload telemetry
 
 `ai-memory status --json` (the root-protected `GET /admin/status` response)
-includes `providers.llm_workloads` whenever an LLM provider is configured. Its
-closed labels are `unspecified`, `consolidation`, `rerank`, `auto-improve`,
+includes `providers.llm_workloads` whenever a generative provider is configured or after a direct Decisions Choice call.
+Choice records its calls in the existing `rerank` row even without a generative provider.
+Validated reported usage remains counted when the answer is refused or invalid; an invalid model or usage envelope supplies no trusted token count.
+The closed labels are `unspecified`, `consolidation`, `rerank`, `auto-improve`,
 `bootstrap`, `query-answer`, `lint`, `profile`, `dream`, and `experience`.
 Each row reports process-lifetime calls, successes and errors, total/max
 latency, fixed-bucket p50/p95 upper bounds, last outcome, and token counts. The
@@ -682,9 +715,11 @@ test against Copilot here; treat it as needing a real-Copilot smoke test
 before relying on it in production.
 
 `AI_MEMORY_EMBEDDING_PROVIDER=local` needs no key and no server at all:
-sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2`,
-384-dim), with the model fetched once into `<data_dir>/models/` under
-pinned checksums; see [`docs/local-embeddings.md`](local-embeddings.md).
+sentence embeddings run in-process (pure-Rust `all-MiniLM-L6-v2` by
+default, or `intfloat/multilingual-e5-small` / `multilingual-e5-small` for
+non-English wikis; both 384-dim), with the model fetched once into
+`<data_dir>/models/` under pinned checksums; see
+[`docs/local-embeddings.md`](local-embeddings.md).
 
 See [`docs/install.md#llm-provider-tiers`](install.md#llm-provider-tiers)
 for env vars and Ollama/OpenRouter/Atlas Cloud/OrcaRouter/Cheaper Inference/API Route/FutureInfra/Standard Compute

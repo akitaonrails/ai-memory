@@ -10,7 +10,7 @@ use ai_memory_core::{
     AgentKind, EntityId, HandoffAcceptance, HandoffId, IdentityKey, LinkTarget, MessageClaim,
     MessageId, NewAgentMessage, NewHandoff, NewObservation, NewPage, NewSession, NewSessionUsage,
     ObservationId, ObservationKind, OwnerFilter, PageEvidence, PageEvidenceKind, PageId, PagePath,
-    ProjectId, SessionId, SourceObservations, WorkspaceId,
+    ProjectId, SessionId, SourceObservations, TrustClass, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -1480,6 +1480,46 @@ struct ExistingPageVersion {
     title: String,
     tier: String,
     pinned: i64,
+    trust_class: TrustClass,
+}
+
+/// Convert the SQL rank (`0 = tool_result`, `1 = model_generated`,
+/// `2 = operator_authored`) back to [`TrustClass`].
+pub(crate) const fn trust_class_from_rank(rank: i64) -> TrustClass {
+    match rank {
+        0 => TrustClass::ToolResult,
+        1 => TrustClass::ModelGenerated,
+        _ => TrustClass::OperatorAuthored,
+    }
+}
+
+/// Parse a stored `trust_class` column string, defaulting to
+/// [`TrustClass::ModelGenerated`] only if unrecognized (CHECK constraint
+/// prevents unknown values in migrated databases).
+pub(crate) fn parse_trust_class_str(raw: &str) -> TrustClass {
+    raw.parse::<TrustClass>()
+        .unwrap_or(TrustClass::ModelGenerated)
+}
+
+#[cfg(test)]
+fn has_trust_class_column(conn: &Connection, table: &str) -> bool {
+    let sql = match table {
+        "pages" => "SELECT 1 FROM pragma_table_info('pages') WHERE name = 'trust_class' LIMIT 1",
+        "observations" => {
+            "SELECT 1 FROM pragma_table_info('observations') WHERE name = 'trust_class' LIMIT 1"
+        }
+        _ => return false,
+    };
+    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+#[cfg(not(test))]
+const fn has_trust_class_column(_conn: &Connection, _table: &str) -> bool {
+    true
 }
 
 /// Normalise a page path into FTS-friendly search text, indexing BOTH forms
@@ -2191,8 +2231,32 @@ pub(crate) fn upsert_page_in_tx(
         .and_then(serde_json::Value::as_bool)
         .and_then(|flag| flag.then_some(now));
 
-    let existing: Option<ExistingPageVersion> = tx
-        .query_row(
+    let has_trust_class = has_trust_class_column(tx, "pages");
+    let existing: Option<ExistingPageVersion> = if has_trust_class {
+        tx.query_row(
+            "SELECT id, body_sha256, frontmatter_json, title, tier, pinned, trust_class FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| {
+                let trust_str: String = row.get(6)?;
+                Ok(ExistingPageVersion {
+                    id: row.get(0)?,
+                    body_sha256: row.get(1)?,
+                    frontmatter_json: row.get(2)?,
+                    title: row.get(3)?,
+                    tier: row.get(4)?,
+                    pinned: row.get(5)?,
+                    trust_class: parse_trust_class_str(&trust_str),
+                })
+            },
+        )
+        .optional()?
+    } else {
+        tx.query_row(
             "SELECT id, body_sha256, frontmatter_json, title, tier, pinned FROM pages \
              WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
             params![
@@ -2208,10 +2272,12 @@ pub(crate) fn upsert_page_in_tx(
                     title: row.get(3)?,
                     tier: row.get(4)?,
                     pinned: row.get(5)?,
+                    trust_class: TrustClass::ModelGenerated,
                 })
             },
         )
-        .optional()?;
+        .optional()?
+    };
 
     if let Some(existing) = existing {
         let existing_fm: serde_json::Value =
@@ -2229,10 +2295,26 @@ pub(crate) fn upsert_page_in_tx(
             // page it reaffirmed (P2, docs/design-hindsight-borrowings.md
             // §3) — record the evidence against the still-current id.
             insert_evidence_in_tx(tx, &unchanged_id, page, now)?;
+            if has_trust_class
+                && let Some(sources_trust) = page_sources_trust_class_in_tx(tx, &unchanged_id)?
+            {
+                let folded = TrustClass::least_trusted(existing.trust_class, sources_trust);
+                if folded != existing.trust_class {
+                    tx.execute(
+                        "UPDATE pages SET trust_class = ?1 WHERE id = ?2",
+                        params![folded.as_str(), unchanged_id.as_bytes()],
+                    )?;
+                }
+            }
             return Ok(unchanged_id);
         }
         let frontmatter_str = stamped_frontmatter(conformed, now)?;
         let new_id = PageId::new();
+        // Citationless rewrites (`page.trust_class == None` and no
+        // `page_sources`) inherit the superseded version's trust class so a
+        // patch or automated rewrite cannot launder `tool_result` into
+        // `operator_authored` (#2164).
+        let initial_trust = page.trust_class.unwrap_or(existing.trust_class);
         // The page-grain ingestion window closes in the same statement,
         // same instant (issue #656, docs/design-page-ingestion-windows.md).
         tx.execute(
@@ -2246,31 +2328,60 @@ pub(crate) fn upsert_page_in_tx(
              WHERE page_id = ?1 AND superseded_at IS NULL",
             params![&existing.id, now],
         )?;
-        tx.execute(
-            "INSERT INTO pages \
-             (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-              frontmatter_json, is_latest, supersedes, pinned, author_id, \
-              created_at, updated_at, expires_at, valid_from, compacted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
-            params![
-                new_id.as_bytes(),
-                page.workspace_id.as_bytes(),
-                page.project_id.as_bytes(),
-                page.path.as_str(),
-                path_search,
-                page.title,
-                tier_str,
-                page.body,
-                body_sha256.as_slice(),
-                frontmatter_str,
-                &existing.id,
-                i64::from(page.pinned),
-                page.author_id.map(|id| id.as_bytes().to_vec()),
-                now,
-                page.expires_at.map(|ts| ts.as_microsecond()),
-                compacted_at,
-            ],
-        )?;
+        if has_trust_class {
+            tx.execute(
+                "INSERT INTO pages \
+                 (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
+                  frontmatter_json, is_latest, supersedes, pinned, author_id, \
+                  created_at, updated_at, expires_at, valid_from, compacted_at, trust_class) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16, ?17)",
+                params![
+                    new_id.as_bytes(),
+                    page.workspace_id.as_bytes(),
+                    page.project_id.as_bytes(),
+                    page.path.as_str(),
+                    path_search,
+                    page.title,
+                    tier_str,
+                    page.body,
+                    body_sha256.as_slice(),
+                    frontmatter_str,
+                    &existing.id,
+                    i64::from(page.pinned),
+                    page.author_id.map(|id| id.as_bytes().to_vec()),
+                    now,
+                    page.expires_at.map(|ts| ts.as_microsecond()),
+                    compacted_at,
+                    initial_trust.as_str(),
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO pages \
+                 (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
+                  frontmatter_json, is_latest, supersedes, pinned, author_id, \
+                  created_at, updated_at, expires_at, valid_from, compacted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
+                params![
+                    new_id.as_bytes(),
+                    page.workspace_id.as_bytes(),
+                    page.project_id.as_bytes(),
+                    page.path.as_str(),
+                    path_search,
+                    page.title,
+                    tier_str,
+                    page.body,
+                    body_sha256.as_slice(),
+                    frontmatter_str,
+                    &existing.id,
+                    i64::from(page.pinned),
+                    page.author_id.map(|id| id.as_bytes().to_vec()),
+                    now,
+                    page.expires_at.map(|ts| ts.as_microsecond()),
+                    compacted_at,
+                ],
+            )?;
+        }
         index_page_cjk(
             tx,
             tx.last_insert_rowid(),
@@ -2282,6 +2393,19 @@ pub(crate) fn upsert_page_in_tx(
         attach_entities_in_tx(tx, &new_id, page, now)?;
         refresh_incoming_links_for_path(tx, page, &new_id)?;
         insert_evidence_in_tx(tx, &new_id, page, now)?;
+        if has_trust_class && let Some(sources_trust) = page_sources_trust_class_in_tx(tx, &new_id)?
+        {
+            let final_trust = match page.trust_class {
+                Some(explicit) => TrustClass::least_trusted(sources_trust, explicit),
+                None => sources_trust,
+            };
+            if final_trust != initial_trust {
+                tx.execute(
+                    "UPDATE pages SET trust_class = ?1 WHERE id = ?2",
+                    params![final_trust.as_str(), new_id.as_bytes()],
+                )?;
+            }
+        }
         audit(
             tx,
             "supersede_page",
@@ -2329,6 +2453,23 @@ pub(crate) fn upsert_page_in_tx(
     // inventing a new one. `valid_to` is left as the tombstone wrote it
     // (the instant the page actually went missing), not bumped to `now`.
     let tombstone = most_recent_tombstone_at_path(tx, page)?;
+    let tombstone_trust = if has_trust_class {
+        tombstone
+            .as_ref()
+            .and_then(|tombstone_id| {
+                tx.query_row(
+                    "SELECT trust_class FROM pages WHERE id = ?1",
+                    params![tombstone_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            })
+            .map(|raw| parse_trust_class_str(&raw))
+    } else {
+        None
+    };
     if let Some(tombstone_id) = &tombstone {
         tx.execute(
             "UPDATE pages SET superseded_at = NULL WHERE id = ?1",
@@ -2337,31 +2478,63 @@ pub(crate) fn upsert_page_in_tx(
     }
     let frontmatter_str = stamped_frontmatter(conformed, now)?;
     let new_id = PageId::new();
-    tx.execute(
-        "INSERT INTO pages \
-         (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, supersedes, pinned, author_id, created_at, updated_at, \
-          expires_at, valid_from, compacted_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
-        params![
-            new_id.as_bytes(),
-            page.workspace_id.as_bytes(),
-            page.project_id.as_bytes(),
-            page.path.as_str(),
-            path_search,
-            page.title,
-            tier_str,
-            page.body,
-            body_sha256.as_slice(),
-            frontmatter_str,
-            tombstone,
-            i64::from(page.pinned),
-            page.author_id.map(|id| id.as_bytes().to_vec()),
-            now,
-            page.expires_at.map(|ts| ts.as_microsecond()),
-            compacted_at,
-        ],
-    )?;
+    let initial_trust = page
+        .trust_class
+        .unwrap_or_else(|| tombstone_trust.unwrap_or(TrustClass::ModelGenerated));
+    if has_trust_class {
+        tx.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, supersedes, pinned, author_id, created_at, updated_at, \
+              expires_at, valid_from, compacted_at, trust_class) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16, ?17)",
+            params![
+                new_id.as_bytes(),
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+                path_search,
+                page.title,
+                tier_str,
+                page.body,
+                body_sha256.as_slice(),
+                frontmatter_str,
+                tombstone,
+                i64::from(page.pinned),
+                page.author_id.map(|id| id.as_bytes().to_vec()),
+                now,
+                page.expires_at.map(|ts| ts.as_microsecond()),
+                compacted_at,
+                initial_trust.as_str(),
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, path_search, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, supersedes, pinned, author_id, created_at, updated_at, \
+              expires_at, valid_from, compacted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14, ?14, ?15, ?14, ?16)",
+            params![
+                new_id.as_bytes(),
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+                path_search,
+                page.title,
+                tier_str,
+                page.body,
+                body_sha256.as_slice(),
+                frontmatter_str,
+                tombstone,
+                i64::from(page.pinned),
+                page.author_id.map(|id| id.as_bytes().to_vec()),
+                now,
+                page.expires_at.map(|ts| ts.as_microsecond()),
+                compacted_at,
+            ],
+        )?;
+    }
     index_page_cjk(
         tx,
         tx.last_insert_rowid(),
@@ -2373,6 +2546,18 @@ pub(crate) fn upsert_page_in_tx(
     attach_entities_in_tx(tx, &new_id, page, now)?;
     refresh_incoming_links_for_path(tx, page, &new_id)?;
     insert_evidence_in_tx(tx, &new_id, page, now)?;
+    if has_trust_class && let Some(sources_trust) = page_sources_trust_class_in_tx(tx, &new_id)? {
+        let final_trust = match page.trust_class {
+            Some(explicit) => TrustClass::least_trusted(sources_trust, explicit),
+            None => sources_trust,
+        };
+        if final_trust != initial_trust {
+            tx.execute(
+                "UPDATE pages SET trust_class = ?1 WHERE id = ?2",
+                params![final_trust.as_str(), new_id.as_bytes()],
+            )?;
+        }
+    }
     audit(
         tx,
         if tombstone.is_some() {
@@ -2621,6 +2806,28 @@ fn insert_page_sources_in_tx(
         }
     }
     Ok(())
+}
+
+/// Least-trusted `observations.trust_class` among the `page_sources` rows
+/// recorded for `page_id` in this transaction, or `None` when `page_id` has
+/// no `page_sources` rows whose observation is still present (#2164).
+fn page_sources_trust_class_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page_id: &PageId,
+) -> StoreResult<Option<TrustClass>> {
+    let rank: Option<i64> = tx.query_row(
+        "SELECT MIN(CASE o.trust_class \
+             WHEN 'tool_result' THEN 0 \
+             WHEN 'model_generated' THEN 1 \
+             ELSE 2 \
+         END) \
+         FROM page_sources ps \
+         JOIN observations o ON o.id = ps.observation_id \
+         WHERE ps.page_id = ?1",
+        params![page_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    Ok(rank.map(trust_class_from_rank))
 }
 
 /// Workspace recorded on a scoped link. A project-only `[[_global:path]]`
@@ -4446,26 +4653,51 @@ fn insert_observation_row(conn: &Connection, obs: &NewObservation) -> StoreResul
         }
         _ => (None, None),
     };
-    let result = conn.execute(
-        "INSERT INTO observations \
-         (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
-          importance, created_at, file_path) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            id.as_bytes(),
-            obs.session_id.as_bytes(),
-            obs.workspace_id.as_bytes(),
-            obs.project_id.as_bytes(),
-            kind,
-            extension,
-            source_event,
-            obs.title,
-            obs.body,
-            importance,
-            now,
-            obs.file_path,
-        ],
-    );
+    let trust_class = obs.effective_trust_class().as_str();
+    let result = if has_trust_class_column(conn, "observations") {
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
+              importance, created_at, file_path, trust_class) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                id.as_bytes(),
+                obs.session_id.as_bytes(),
+                obs.workspace_id.as_bytes(),
+                obs.project_id.as_bytes(),
+                kind,
+                extension,
+                source_event,
+                obs.title,
+                obs.body,
+                importance,
+                now,
+                obs.file_path,
+                trust_class,
+            ],
+        )
+    } else {
+        conn.execute(
+            "INSERT INTO observations \
+             (id, session_id, workspace_id, project_id, kind, extension, source_event, title, body, \
+              importance, created_at, file_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                id.as_bytes(),
+                obs.session_id.as_bytes(),
+                obs.workspace_id.as_bytes(),
+                obs.project_id.as_bytes(),
+                kind,
+                extension,
+                source_event,
+                obs.title,
+                obs.body,
+                importance,
+                now,
+                obs.file_path,
+            ],
+        )
+    };
     // Historical migration tests stop before V99 and exercise this helper
     // against that frozen schema, as with `finish_cjk_index_write`. A real
     // Store migrates first, so a missing column stays a fatal error in every
@@ -10703,6 +10935,7 @@ pub(crate) mod tests {
             body: "observation".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         }
     }
 
@@ -10995,6 +11228,7 @@ pub(crate) mod tests {
 
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         insert_observation(&mut conn, &stray).unwrap();
 
@@ -11103,6 +11337,7 @@ pub(crate) mod tests {
 
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -11440,6 +11675,7 @@ pub(crate) mod tests {
 
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         insert_observation(&mut conn, &collateral_obs).unwrap();
 
@@ -13209,6 +13445,7 @@ pub(crate) mod tests {
 
             occurred_at: None,
             file_path: None,
+            trust_class: None,
         };
         insert_observation(&mut conn, &stray_observation).unwrap();
 
@@ -13529,6 +13766,7 @@ pub(crate) mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 
@@ -15411,6 +15649,7 @@ pub(crate) mod tests {
                 body: "README.md".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -15474,6 +15713,7 @@ pub(crate) mod tests {
                 body: String::new(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -15523,6 +15763,7 @@ pub(crate) mod tests {
                 body: "do the thing".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -15586,6 +15827,7 @@ pub(crate) mod tests {
                     body: "b".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -16052,6 +16294,7 @@ pub(crate) mod tests {
                 body: "observation".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -16099,6 +16342,7 @@ pub(crate) mod tests {
                 body: "observation".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -16883,6 +17127,7 @@ pub(crate) mod tests {
                 body: "b".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
         )
         .unwrap();
@@ -17653,6 +17898,7 @@ pub(crate) mod tests {
                     body: "zebra token body".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -18206,6 +18452,7 @@ pub(crate) mod tests {
                     body: "zebra token body".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -18822,6 +19069,7 @@ pub(crate) mod tests {
                     body: "body".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -19187,6 +19435,7 @@ pub(crate) mod tests {
                     body: "body".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -19280,6 +19529,7 @@ pub(crate) mod tests {
                     body: "existing observation survives table rebuild".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -19813,6 +20063,7 @@ pub(crate) mod tests {
             body: "b".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
         assert!(
             insert_observation(&mut conn, &mismatched_obs).is_err(),

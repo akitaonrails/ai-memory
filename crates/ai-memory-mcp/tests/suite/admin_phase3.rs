@@ -348,6 +348,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 body: "".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -384,6 +385,7 @@ async fn seed_sessions_for_reorg(store: &Store) -> (SessionId, SessionId) {
                 body: "".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -550,6 +552,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -580,6 +583,7 @@ async fn reorg_live_graveyards_only_default_workspace_pages() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -661,6 +665,7 @@ async fn lint_dry_run_returns_lint_report_shape() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -831,6 +836,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -849,6 +855,7 @@ async fn embed_all_projects_rebuilds_workspace_projects() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -942,6 +949,7 @@ async fn commit_with_new_page_returns_committed_true_and_40char_oid() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -993,6 +1001,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1013,6 +1022,7 @@ async fn checkpoints_list_and_restore_page_round_trip() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1120,6 +1130,7 @@ async fn check_restore_source_is_pinned_before_the_backup(source: &str) {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -1226,6 +1237,7 @@ async fn restore_page_from_an_unknown_rev_is_404_and_writes_no_checkpoint() {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     };
     state
         .wiki
@@ -1328,6 +1340,7 @@ async fn check_session_restore(source: &str, case: SessionRestoreCase) {
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     };
     if matches!(
         case,

@@ -60,6 +60,7 @@ Methods: `pages.patch`
 |---|---|
 | `workspace` | `workspace` |
 | `project` | `project` |
+| `scope` | `scope` |
 | `path` | `path` |
 | `expected_page_id` | `expectedPageId` |
 | `edits` | `edits` |

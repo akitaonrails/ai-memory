@@ -141,6 +141,7 @@ async fn session(store: &Store, ws: WorkspaceId, proj: ProjectId, n: u8, body: &
                     body: body.to_string(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &sanitizer,
             ))
@@ -172,6 +173,7 @@ async fn write_page(
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .expect("upsert page")

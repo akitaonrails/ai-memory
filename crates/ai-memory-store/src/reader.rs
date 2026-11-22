@@ -17,8 +17,8 @@ use ai_memory_core::{
     Handoff, HandoffContent, HandoffId, HandoffLifecycle, HandoffOrigin, HandoffScope,
     HandoffState, IdentityKey, ManagedRunId, MessageBox, MessageId, Observation, ObservationId,
     ObservationKind, OwnerFilter, PageId, PagePath, ProjectId, SessionId,
-    TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, User, UserId, WorkspaceId, WorkstreamEvent,
-    WorkstreamId,
+    TOOL_BODY_HEADER_MAX_CHARS, TOOL_BODY_SEPARATOR, TrustClass, User, UserId, WorkspaceId,
+    WorkstreamEvent, WorkstreamId,
 };
 use jiff::Timestamp;
 use parking_lot::Mutex;
@@ -1414,6 +1414,8 @@ pub struct PageHit {
     /// and default retrieval output is unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// Origin trust class of this page version (V113, #2164).
+    pub trust_class: TrustClass,
 }
 
 /// Completed session selected for scheduled auto-improvement.
@@ -1864,6 +1866,8 @@ pub struct PageHitWithMeta {
     pub snippet: String,
     /// Relevance rank after the bounded authority adjustment (lower is better).
     pub rank: f64,
+    /// Origin trust class of this page version (V113, #2164).
+    pub trust_class: TrustClass,
 }
 
 /// One raw observation fallback hit returned when compiled wiki pages miss.
@@ -3496,7 +3500,7 @@ impl ReaderPool {
                 "SELECT pages.id, pages.path, pages.title, \
                         snippet(pages_fts, 1, char(30), char(31), '…', 24) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
-                        pages.frontmatter_json, {kind_expr} AS kind \
+                        pages.frontmatter_json, {kind_expr} AS kind, pages.trust_class \
                  FROM pages_fts \
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  WHERE pages_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible} \
@@ -3522,6 +3526,7 @@ impl ReaderPool {
                 let pinned = row.get::<_, i64>(6)? != 0;
                 let frontmatter_json: String = row.get(7)?;
                 let kind: String = row.get(8)?;
+                let trust_class: String = row.get(9)?;
                 Ok((
                     id_bytes,
                     path,
@@ -3532,13 +3537,24 @@ impl ReaderPool {
                     pinned,
                     frontmatter_json,
                     kind,
+                    trust_class,
                 ))
             })?;
 
             let mut candidates = Vec::new();
             for row in rows {
-                let (id_bytes, path, title, snippet, rank, tier, pinned, frontmatter_json, kind) =
-                    row?;
+                let (
+                    id_bytes,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                    tier,
+                    pinned,
+                    frontmatter_json,
+                    kind,
+                    trust_class,
+                ) = row?;
                 let authority =
                     PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter_json);
                 candidates.push((
@@ -3550,6 +3566,7 @@ impl ReaderPool {
                         rank,
                         superseded: false,
                         pinned: false,
+                        trust_class: crate::ops::parse_trust_class_str(&trust_class),
                     },
                     authority,
                 ));
@@ -3560,7 +3577,7 @@ impl ReaderPool {
                 let sql = format!(
                     "SELECT pages.id, pages.path, pages.title, {descriptor}, \
                             pages_cjk_fts.rank, pages.tier, pages.pinned, \
-                            pages.frontmatter_json, {kind_expr} AS kind \
+                            pages.frontmatter_json, {kind_expr} AS kind, pages.trust_class \
                      FROM pages_cjk_fts \
                      JOIN pages ON pages.rowid = pages_cjk_fts.rowid \
                      WHERE pages_cjk_fts MATCH ?1 AND pages.is_latest = 1{not_expired}{visible} \
@@ -3586,10 +3603,22 @@ impl ReaderPool {
                         row.get::<_, i64>(6)? != 0,
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
                     ))
                 })?;
                 for row in rows {
-                    let (id, path, title, descriptor, rank, tier, pinned, frontmatter, kind) = row?;
+                    let (
+                        id,
+                        path,
+                        title,
+                        descriptor,
+                        rank,
+                        tier,
+                        pinned,
+                        frontmatter,
+                        kind,
+                        trust_class,
+                    ) = row?;
                     let authority =
                         PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter);
                     cjk_candidates.push((
@@ -3601,6 +3630,7 @@ impl ReaderPool {
                             rank,
                             superseded: false,
                             pinned: false,
+                            trust_class: crate::ops::parse_trust_class_str(&trust_class),
                         },
                         authority,
                     ));
@@ -3653,7 +3683,7 @@ impl ReaderPool {
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         snippet(pages_fts, 1, char(30), char(31), '…', 24) AS snip, \
                         pages_fts.rank, pages.tier, pages.pinned, \
-                        pages.frontmatter_json, {kind_expr} AS kind, pages.id \
+                        pages.frontmatter_json, {kind_expr} AS kind, pages.id, pages.trust_class \
                  FROM pages_fts \
                  JOIN pages ON pages.rowid = pages_fts.rowid \
                  JOIN projects ON projects.id = pages.project_id \
@@ -3684,6 +3714,7 @@ impl ReaderPool {
                 let frontmatter_json: String = row.get(8)?;
                 let kind: String = row.get(9)?;
                 let id_bytes: Vec<u8> = row.get(10)?;
+                let trust_class: String = row.get(11)?;
                 Ok((
                     id_bytes,
                     workspace_name,
@@ -3696,6 +3727,7 @@ impl ReaderPool {
                     pinned,
                     frontmatter_json,
                     kind,
+                    trust_class,
                 ))
             })?;
 
@@ -3713,6 +3745,7 @@ impl ReaderPool {
                     pinned,
                     frontmatter_json,
                     kind,
+                    trust_class,
                 ) = row?;
                 let authority =
                     PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter_json);
@@ -3725,6 +3758,7 @@ impl ReaderPool {
                         title,
                         snippet,
                         rank,
+                        trust_class: crate::ops::parse_trust_class_str(&trust_class),
                     },
                     authority,
                 ));
@@ -3735,7 +3769,7 @@ impl ReaderPool {
                 let sql = format!(
                     "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                             {descriptor}, pages_cjk_fts.rank, pages.tier, pages.pinned, \
-                            pages.frontmatter_json, {kind_expr} AS kind, pages.id \
+                            pages.frontmatter_json, {kind_expr} AS kind, pages.id, pages.trust_class \
                      FROM pages_cjk_fts \
                      JOIN pages ON pages.rowid = pages_cjk_fts.rowid \
                      JOIN projects ON projects.id = pages.project_id \
@@ -3766,10 +3800,24 @@ impl ReaderPool {
                         row.get::<_, String>(8)?,
                         row.get::<_, String>(9)?,
                         row.get::<_, Vec<u8>>(10)?,
+                        row.get::<_, String>(11)?,
                     ))
                 })?;
                 for row in rows {
-                    let (workspace_name, project_name, path, title, descriptor, rank, tier, pinned, frontmatter, kind, id) = row?;
+                    let (
+                        workspace_name,
+                        project_name,
+                        path,
+                        title,
+                        descriptor,
+                        rank,
+                        tier,
+                        pinned,
+                        frontmatter,
+                        kind,
+                        id,
+                        trust_class,
+                    ) = row?;
                     let authority =
                         PageAuthority::from_stored(&path, &kind, &tier, pinned, &frontmatter);
                     cjk_candidates.push((
@@ -3781,6 +3829,7 @@ impl ReaderPool {
                             snippet: page_descriptor(&descriptor, &title),
                             title,
                             rank,
+                            trust_class: crate::ops::parse_trust_class_str(&trust_class),
                         },
                         authority,
                     ));
@@ -3915,6 +3964,7 @@ impl ReaderPool {
                         rank,
                         superseded: false,
                         pinned: false,
+                        trust_class: TrustClass::ModelGenerated,
                     },
                     authority,
                 ));
@@ -3971,6 +4021,7 @@ impl ReaderPool {
                             rank,
                             superseded: false,
                             pinned: false,
+                            trust_class: TrustClass::ModelGenerated,
                         },
                         authority,
                     ));
@@ -4077,6 +4128,7 @@ impl ReaderPool {
                         rank,
                         superseded: false,
                         pinned: false,
+                        trust_class: TrustClass::ModelGenerated,
                     },
                     authority,
                 ));
@@ -4135,6 +4187,7 @@ impl ReaderPool {
                             rank,
                             superseded: false,
                             pinned: false,
+                            trust_class: TrustClass::ModelGenerated,
                         },
                         authority,
                     ));
@@ -4303,6 +4356,7 @@ impl ReaderPool {
                         rank: -entry.score, // lower = better (matches FTS5 convention)
                         superseded: false,
                         pinned: false,
+                        trust_class: TrustClass::ModelGenerated,
                     },
                     entry.explain,
                 )
@@ -4325,6 +4379,15 @@ impl ReaderPool {
                 .then_with(|| a.0.path.as_str().cmp(b.0.path.as_str()))
         });
         out.truncate(limit);
+        let result_ids: Vec<PageId> = out.iter().map(|(hit, _)| hit.id).collect();
+        let trust_classes = self
+            .page_trust_classes_for_ids(workspace_id, project_id, result_ids)
+            .await?;
+        for (hit, _) in &mut out {
+            if let Some(&trust_class) = trust_classes.get(&hit.id) {
+                hit.trust_class = trust_class;
+            }
+        }
         Ok(out)
     }
     /// Raw-observation FTS over one project, with no owner filter: every
@@ -4861,7 +4924,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT id, path, title, \
                         {descriptor} AS snip, \
-                        CAST(updated_at AS REAL) AS rank \
+                        CAST(updated_at AS REAL) AS rank, trust_class \
                  FROM pages \
                  WHERE is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
@@ -4877,11 +4940,12 @@ impl ReaderPool {
                 let title: String = row.get(2)?;
                 let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
                 let rank: f64 = row.get(4)?;
-                Ok((id_bytes, path, title, snippet, rank))
+                let trust_class: String = row.get(5)?;
+                Ok((id_bytes, path, title, snippet, rank, trust_class))
             })?;
             let mut hits = Vec::new();
             for row in rows {
-                let (id_bytes, path, title, snippet, rank) = row?;
+                let (id_bytes, path, title, snippet, rank, trust_class) = row?;
                 hits.push(PageHit {
                     id: PageId::from_slice(&id_bytes)?,
                     path: PagePath::new(path)?,
@@ -4890,6 +4954,7 @@ impl ReaderPool {
                     rank,
                     superseded: false,
                     pinned: false,
+                    trust_class: crate::ops::parse_trust_class_str(&trust_class),
                 });
             }
             Ok(hits)
@@ -4939,7 +5004,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT id, path, title, \
                         {descriptor} AS snip, \
-                        CAST(updated_at AS REAL) AS rank \
+                        CAST(updated_at AS REAL) AS rank, trust_class \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
                    AND is_latest = 1 AND pinned = 1{not_expired}{kept} \
@@ -4963,11 +5028,12 @@ impl ReaderPool {
                 let title: String = row.get(2)?;
                 let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
                 let rank: f64 = row.get(4)?;
-                Ok((id_bytes, path, title, snippet, rank))
+                let trust_class: String = row.get(5)?;
+                Ok((id_bytes, path, title, snippet, rank, trust_class))
             })?;
             let mut hits = Vec::new();
             for row in rows {
-                let (id_bytes, path, title, snippet, rank) = row?;
+                let (id_bytes, path, title, snippet, rank, trust_class) = row?;
                 hits.push(PageHit {
                     id: PageId::from_slice(&id_bytes)?,
                     path: PagePath::new(path)?,
@@ -4976,6 +5042,7 @@ impl ReaderPool {
                     rank,
                     superseded: false,
                     pinned: true,
+                    trust_class: crate::ops::parse_trust_class_str(&trust_class),
                 });
             }
             Ok(hits)
@@ -4997,7 +5064,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT id, path, title, \
                         {descriptor} AS snip, \
-                        CAST(updated_at AS REAL) AS rank \
+                        CAST(updated_at AS REAL) AS rank, trust_class \
                  FROM pages \
                  WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1{not_expired} \
                  ORDER BY updated_at DESC \
@@ -5020,12 +5087,13 @@ impl ReaderPool {
                     let title: String = row.get(2)?;
                     let snippet = page_descriptor(&row.get::<_, String>(3)?, &title);
                     let rank: f64 = row.get(4)?;
-                    Ok((id_bytes, path, title, snippet, rank))
+                    let trust_class: String = row.get(5)?;
+                    Ok((id_bytes, path, title, snippet, rank, trust_class))
                 },
             )?;
             let mut hits = Vec::new();
             for row in rows {
-                let (id_bytes, path, title, snippet, rank) = row?;
+                let (id_bytes, path, title, snippet, rank, trust_class) = row?;
                 hits.push(PageHit {
                     id: PageId::from_slice(&id_bytes)?,
                     path: PagePath::new(path)?,
@@ -5034,6 +5102,7 @@ impl ReaderPool {
                     rank,
                     superseded: false,
                     pinned: false,
+                    trust_class: crate::ops::parse_trust_class_str(&trust_class),
                 });
             }
             Ok(hits)
@@ -5067,7 +5136,7 @@ impl ReaderPool {
             let sql = format!(
                 "SELECT workspaces.name, projects.name, pages.path, pages.title, \
                         {descriptor} AS snip, \
-                        CAST(pages.updated_at AS REAL) AS rank, pages.id \
+                        CAST(pages.updated_at AS REAL) AS rank, pages.id, pages.trust_class \
                  FROM pages \
                  JOIN projects ON projects.id = pages.project_id \
                  JOIN workspaces ON workspaces.id = pages.workspace_id \
@@ -5089,6 +5158,7 @@ impl ReaderPool {
                 let snippet = page_descriptor(&row.get::<_, String>(4)?, &title);
                 let rank: f64 = row.get(5)?;
                 let id_bytes: Vec<u8> = row.get(6)?;
+                let trust_class: String = row.get(7)?;
                 Ok((
                     id_bytes,
                     workspace_name,
@@ -5097,11 +5167,21 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    trust_class,
                 ))
             })?;
             let mut hits = Vec::new();
             for row in rows {
-                let (id_bytes, workspace_name, project_name, path, title, snippet, rank) = row?;
+                let (
+                    id_bytes,
+                    workspace_name,
+                    project_name,
+                    path,
+                    title,
+                    snippet,
+                    rank,
+                    trust_class,
+                ) = row?;
                 hits.push(PageHitWithMeta {
                     id: PageId::from_slice(&id_bytes)?,
                     workspace_name,
@@ -5110,6 +5190,7 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                    trust_class: crate::ops::parse_trust_class_str(&trust_class),
                 });
             }
             Ok(hits)
@@ -5129,7 +5210,7 @@ impl ReaderPool {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare_cached(
                 "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
-                        title, body, importance, created_at \
+                        title, body, importance, created_at, trust_class \
                  FROM observations \
                  WHERE session_id = ?1 \
                  ORDER BY created_at ASC",
@@ -8094,6 +8175,7 @@ impl ReaderPool {
                         rank: 0.0,
                         superseded: false,
                         pinned: false,
+                        trust_class: TrustClass::ModelGenerated,
                     },
                     weight,
                     matched,
@@ -8307,6 +8389,7 @@ impl ReaderPool {
                         rank: 0.0,
                         superseded: false,
                         pinned: false,
+                        trust_class: TrustClass::ModelGenerated,
                     },
                     seed_ord,
                     incoming: stream_ord % 2 == 1,
@@ -9196,6 +9279,7 @@ impl ReaderPool {
                         rank: -entry.score, // lower = better (matches FTS5 convention)
                         superseded: false,
                         pinned: false,
+                        trust_class: TrustClass::ModelGenerated,
                     },
                     entry.explain,
                 )
@@ -9371,7 +9455,105 @@ impl ReaderPool {
                 hit.superseded = superseded.contains(&hit.id);
             }
         }
+        // Populate `trust_class` on the final bounded hits in one batch lookup
+        // (V113, #2164) without altering RRF ranking weights.
+        if !out.is_empty() {
+            let result_ids: Vec<PageId> = out.iter().map(|(hit, _)| hit.id).collect();
+            let trust_classes = self
+                .page_trust_classes_for_ids(workspace_id, project_id, result_ids)
+                .await?;
+            for (hit, _) in &mut out {
+                if let Some(&trust_class) = trust_classes.get(&hit.id) {
+                    hit.trust_class = trust_class;
+                }
+            }
+        }
         Ok((out, timings, lexical_match))
+    }
+
+    /// Batch-fetch `pages.trust_class` for a bounded set of page version ids
+    /// inside `(workspace_id, project_id)` (V113, #2164).
+    async fn page_trust_classes_for_ids(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        page_ids: Vec<PageId>,
+    ) -> StoreResult<std::collections::HashMap<PageId, TrustClass>> {
+        if page_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        self.with_conn(move |conn| {
+            let (values_clause, mut sql_params) = id_values_clause(&page_ids);
+            sql_params.push(Value::Blob(workspace_id.as_bytes().to_vec()));
+            sql_params.push(Value::Blob(project_id.as_bytes().to_vec()));
+
+            let sql = format!(
+                "WITH requested(id) AS (VALUES {values_clause}) \
+                 SELECT pages.id, pages.trust_class \
+                 FROM requested \
+                 JOIN pages ON pages.id = requested.id \
+                 WHERE pages.workspace_id = ? \
+                   AND pages.project_id = ?"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(sql_params.iter()), |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut out = std::collections::HashMap::with_capacity(page_ids.len());
+            for row in rows {
+                let (id_bytes, trust_str) = row?;
+                out.insert(
+                    PageId::from_slice(&id_bytes)?,
+                    crate::ops::parse_trust_class_str(&trust_str),
+                );
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Read the stored `trust_class` for one page version id (V113, #2164).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_trust_class(&self, page_id: PageId) -> StoreResult<Option<TrustClass>> {
+        self.with_conn(move |conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT trust_class FROM pages WHERE id = ?1",
+                    params![page_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(raw.as_deref().map(crate::ops::parse_trust_class_str))
+        })
+        .await
+    }
+
+    /// Read the stored `trust_class` for the current latest version of `path`
+    /// inside `(workspace_id, project_id)` (V113, #2164).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn page_trust_class_by_path(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &str,
+    ) -> StoreResult<Option<TrustClass>> {
+        let path = path.to_owned();
+        self.with_conn(move |conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT trust_class FROM pages \
+                     WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+                    params![workspace_id.as_bytes(), project_id.as_bytes(), path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(raw.as_deref().map(crate::ops::parse_trust_class_str))
+        })
+        .await
     }
 
     /// The subset of `page_ids` that are superseded (non-latest) versions in
@@ -15991,7 +16173,7 @@ impl SessionObservationSnapshot<'_> {
         };
         let mut sql = String::from(
             "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
-                    title, body, importance, created_at \
+                    title, body, importance, created_at, trust_class \
              FROM observations \
              WHERE session_id = ? AND workspace_id = ? AND project_id = ?",
         );
@@ -16047,7 +16229,7 @@ impl SessionObservationSnapshot<'_> {
     ) -> StoreResult<()> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT rowid, id, session_id, workspace_id, project_id, kind, extension, \
-                    source_event, title, body, importance, created_at \
+                    source_event, title, body, importance, created_at, trust_class \
              FROM observations \
              WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3 \
              ORDER BY created_at ASC, rowid ASC",
@@ -16073,7 +16255,7 @@ impl SessionObservationSnapshot<'_> {
     pub fn row_by_rowid(&self, rowid: i64) -> StoreResult<Option<Observation>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
-                    title, body, importance, created_at \
+                    title, body, importance, created_at, trust_class \
              FROM observations \
              WHERE session_id = ?1 AND rowid = ?2 \
                AND workspace_id = ?3 AND project_id = ?4",
@@ -16092,6 +16274,72 @@ impl SessionObservationSnapshot<'_> {
             }
             None => Ok(None),
         }
+    }
+
+    /// Least-trusted `observations.trust_class` across this session's rows
+    /// inside the bound `(workspace_id, project_id)` scope (#2164), or `None`
+    /// when the session has no observations in that scope.
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn least_trusted_class(&self) -> StoreResult<Option<TrustClass>> {
+        let rank: Option<i64> = self.conn.query_row(
+            "SELECT MIN(CASE trust_class \
+                 WHEN 'tool_result' THEN 0 \
+                 WHEN 'model_generated' THEN 1 \
+                 ELSE 2 \
+             END) \
+             FROM observations \
+             WHERE session_id = ?1 AND workspace_id = ?2 AND project_id = ?3",
+            params![self.session_id, self.workspace_id, self.project_id],
+            |row| row.get(0),
+        )?;
+        Ok(rank.map(crate::ops::trust_class_from_rank))
+    }
+
+    /// Whether `source_ids` (scoped to this snapshot's session, workspace, and
+    /// project) contain at least one `tool_result` observation and NO
+    /// substantive non-tool-result rule backing (`user-prompt` or `stop` with
+    /// `trust_class != 'tool_result'`) (#2164).
+    ///
+    /// # Errors
+    /// Propagates any SQL error.
+    pub fn sources_are_tool_result_only(&self, source_ids: &[ObservationId]) -> StoreResult<bool> {
+        if source_ids.is_empty() {
+            return Ok(false);
+        }
+        let mut has_tool_result = false;
+        let mut has_rule_backing = false;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT kind, trust_class FROM observations \
+             WHERE id = ?1 AND session_id = ?2 AND workspace_id = ?3 AND project_id = ?4",
+        )?;
+        for id in source_ids {
+            let row: Option<(String, String)> = stmt
+                .query_row(
+                    params![
+                        id.as_bytes(),
+                        self.session_id,
+                        self.workspace_id,
+                        self.project_id
+                    ],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((kind_str, trust_str)) = row {
+                let kind = kind_str
+                    .parse::<ObservationKind>()
+                    .unwrap_or(ObservationKind::Other);
+                let trust = crate::ops::parse_trust_class_str(&trust_str);
+                if trust == TrustClass::ToolResult {
+                    has_tool_result = true;
+                } else if kind.can_back_rule() {
+                    has_rule_backing = true;
+                    break;
+                }
+            }
+        }
+        Ok(has_tool_result && !has_rule_backing)
     }
 }
 
@@ -16116,6 +16364,7 @@ fn row_to_observation_at(
     let body: String = row.get(base + 8)?;
     let importance: i64 = row.get(base + 9)?;
     let created_us: i64 = row.get(base + 10)?;
+    let trust_str: String = row.get(base + 11)?;
     Ok(materialise_observation(
         id_bytes,
         session_bytes,
@@ -16128,6 +16377,7 @@ fn row_to_observation_at(
         body,
         importance,
         created_us,
+        trust_str,
     ))
 }
 
@@ -16175,6 +16425,7 @@ fn materialise_observation(
     body: String,
     importance: i64,
     created_us: i64,
+    trust_str: String,
 ) -> StoreResult<Observation> {
     Ok(Observation {
         id: ObservationId::from_slice(&id_bytes)?,
@@ -16194,6 +16445,7 @@ fn materialise_observation(
                 "bad timestamp: {e}"
             )))
         })?,
+        trust_class: crate::ops::parse_trust_class_str(&trust_str),
     })
 }
 
@@ -18742,6 +18994,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 

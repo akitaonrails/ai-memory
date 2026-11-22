@@ -104,13 +104,17 @@ log_level = "info"
 # MCP URL. Env equivalent: `AI_MEMORY_GEMINI_SAFE_SCHEMAS=true`.
 # gemini_safe_schemas = false
 
-# Optional final LLM relevance pass for project/scopes memory_query calls.
-# Requires an LLM provider and adds at most one provider call per eligible
-# query. The bounded query, page titles, and search snippets are sent to that
-# provider as JSON-encoded untrusted data. Any failed or invalid response keeps
-# the normal ranking. Concurrent provider calls are capped at four; saturated
-# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER=llm`.
+# Optional final relevance pass for project/scopes memory_query calls.
+# The "llm" value requires a generative provider. Both backends add at most one
+# provider call per eligible query and send the bounded query, page titles,
+# and snippets as JSON-encoded untrusted data. Failed or invalid responses
+# keep the normal ranking. Concurrent calls are capped at four; saturated
+# queries keep local order. Env equivalent: `AI_MEMORY_RERANKER`.
 # reranker = "llm"
+# The other value, "decisions-choice", uses OpenAI Decisions directly and needs
+# OPENAI_API_KEY plus an explicit llm_model, but no generative provider.
+# Choice probabilities are relative to the pool; leave min_relevance unset.
+#   reranker = "decisions-choice"
 
 # Seconds one reranker call may take before memory_query keeps its pre-rerank
 # order. Raise it when an LLM fallback chain answers slowly. Must be at least 1.
@@ -175,6 +179,15 @@ log_level = "info"
 # maps the value to its own request field. Env equivalent:
 # `AI_MEMORY_LLM_REASONING_EFFORT`.
 #   llm_reasoning_effort = "medium"
+
+# openai-compat only: read the API key from this file instead of `LLM_API_KEY`,
+# for a gateway whose bearer token rotates while the server runs (a login CLI or
+# a secrets agent rewrites the file). The file is read on first use and read
+# again once after the endpoint answers 401; ai-memory never writes it. A
+# relative path resolves against the data dir. When set, an ambient
+# `LLM_API_KEY` is ignored. Unset by default. Env equivalent:
+# `AI_MEMORY_LLM_API_KEY_FILE`.
+#   llm_api_key_file = "/path/to/api-key"
 
 # Extra HTTP headers attached to every LLM chat request, as `Name: Value` or
 # `Name=Value` entries. Empty by default. Use it for a gateway that wants a
@@ -308,7 +321,9 @@ log_level = "info"
 # 384-dim), no API key, no data egress. The ~87 MB model is fetched once
 # into <data_dir>/models/ in the background (checksum-pinned; hybrid search
 # enables on the next start), and existing pages are backfilled
-# automatically at startup. See docs/local-embeddings.md.
+# automatically at startup. For non-English wikis, set embedding_model to
+# "intfloat/multilingual-e5-small" (or alias "multilingual-e5-small", ~470 MB,
+# 384-dim, automatic "query: " / "passage: " prefixes). See docs/local-embeddings.md.
 #   embedding_provider = "none"           # opt out (FTS + entity + graph only)
 #   embedding_provider = "openai"         # or voyage | google | gemini |
 #                                         # openai-compat | local | copilot | none

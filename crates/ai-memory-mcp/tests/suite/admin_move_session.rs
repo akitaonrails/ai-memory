@@ -171,6 +171,7 @@ async fn seed_session(
                     body: "do the thing".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -227,6 +228,7 @@ async fn seed_session(
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -515,6 +517,7 @@ async fn move_session_page_collision_returns_409_and_leaves_source_intact() {
             expires_at: None,
             entities: vec![],
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -587,6 +590,7 @@ async fn move_session_pending_job_or_open_session_needs_force() {
                 body: "one more".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -1009,6 +1013,7 @@ async fn scatter_observations(
                     body: "landed in the wrong bucket".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -1190,6 +1195,7 @@ async fn rooted_in_dst_with_stray_page(
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

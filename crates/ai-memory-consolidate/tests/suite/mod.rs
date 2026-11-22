@@ -26,5 +26,6 @@ mod recall_eval;
 mod reviewer_global_titles;
 mod rule_slug_collisions;
 mod search_quality;
+mod trust_class_rule_gate;
 mod typed_edges;
 mod verbatim_residue_consolidation;

@@ -470,6 +470,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         }
     }
 
@@ -3071,6 +3072,7 @@ mod tests {
                     body: DIRECTORY_PATH_BODY.into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -3937,6 +3939,7 @@ mod tests {
                     body: "the raw-only zebra detail lives here".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4002,6 +4005,7 @@ mod tests {
                         .into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4072,6 +4076,7 @@ mod tests {
                     body: "tool_family: file".into(),
                     importance: 5,
                     file_path: Some("src/lib.rs".into()),
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             )
@@ -4169,6 +4174,7 @@ mod tests {
             body: "hello".into(),
             importance: 5,
             file_path: None,
+            trust_class: None,
         };
 
         let first = store
@@ -4537,6 +4543,7 @@ mod tests {
                     body: "initial work".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -4582,6 +4589,7 @@ mod tests {
                     body: "new work".into(),
                     importance: 7,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5041,6 +5049,7 @@ mod tests {
                         body: "durable work".into(),
                         importance: 5,
                         file_path: None,
+                        trust_class: None,
                     },
                     &Sanitizer::builtin(),
                 ))
@@ -5202,6 +5211,7 @@ mod tests {
                     body: "more durable work".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5364,6 +5374,7 @@ mod tests {
                     body: "more durable work".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5817,6 +5828,7 @@ mod tests {
                     body: "upgrade observation survives".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
             )
             .unwrap();
@@ -6569,6 +6581,7 @@ mod tests {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         };
         store.writer.upsert_page(page).await.unwrap();
 

@@ -8458,6 +8458,12 @@ async fn copy_purge_merge(
                 author_id: None,
                 actor: actor.clone(),
                 evidence: Vec::new(),
+                trust_class: state
+                    .reader
+                    .page_trust_class_by_path(src_ws, src_proj, &p.path_str)
+                    .await
+                    .ok()
+                    .flatten(),
             })
             .await
         {
@@ -8992,6 +8998,7 @@ async fn handle_write_page(
             author_id,
             actor,
             evidence: Vec::new(),
+            trust_class: Some(ai_memory_core::TrustClass::OperatorAuthored),
         })
         .await
         .map_err(|e| {
@@ -12820,6 +12827,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -12854,6 +12862,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -12980,6 +12989,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -13014,6 +13024,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13124,6 +13135,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -13158,6 +13170,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13246,6 +13259,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -13280,6 +13294,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13385,6 +13400,7 @@ mod tests {
                     body: "focus changed and durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -13543,6 +13559,7 @@ mod tests {
                     body: "durable lesson".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))

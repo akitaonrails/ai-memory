@@ -119,6 +119,7 @@ async fn say(
                 body: body.into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))
@@ -618,6 +619,7 @@ async fn page_metadata_fields_are_never_candidates() {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -701,6 +703,7 @@ async fn auto_approved_auto_improve_pages_are_never_candidates() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -986,6 +989,7 @@ async fn a_hand_edited_entry_is_never_clobbered() {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1075,6 +1079,7 @@ async fn an_entry_past_two_hundred_profile_pages_is_not_forgotten() {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -1784,6 +1789,7 @@ async fn curated_page(fx: &Fixture, proj: ProjectId, path: &str, body: &str) {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

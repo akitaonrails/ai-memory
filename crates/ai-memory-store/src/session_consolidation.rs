@@ -603,6 +603,7 @@ mod tests {
                     body: "continue".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))

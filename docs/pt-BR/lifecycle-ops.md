@@ -1408,6 +1408,9 @@ O que não é reconstruído:
 
 - Sessões, observações, handoffs, usuários/tokens, linhas de auditoria, contadores de acesso
   e embeddings. Esses são estados exclusivos do banco de dados; mantenha um backup se precisar deles.
+- Classes de confiança das páginas (`trust_class`, #2164). O markdown não as guarda, então toda
+  página reconstruída fica `model_generated`, a classe de uma linha cuja origem nunca foi
+  registrada, e não `operator_authored`.
 
 Cada diretório de escopo traz o manifesto `_meta.md` do qual `reindex` lê o
 nome do espaço de trabalho/projeto. Manifestos de projeto com suporte a identidade também contêm

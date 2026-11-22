@@ -370,7 +370,10 @@ export class PagesNamespace {
   async patch(args: PatchPageArgs, options?: CallOptions): Promise<PatchPageResult> {
     const where = "pages.patch";
     const a = argsObject(args, where);
-    const scope = this.#core.scope(a.scope, where);
+    if (a.global === true && a.scope !== undefined) {
+      throw new ArgumentError(`${where}: global cannot be combined with scope`);
+    }
+    const scope = a.global === true ? undefined : this.#core.scope(a.scope, where);
     requireText(a.path, "path", where);
     requireText(a.expectedPageId, "expectedPageId", where);
     if (!Array.isArray(a.edits) || a.edits.length === 0) {
@@ -406,7 +409,7 @@ export class PagesNamespace {
     const decoded = await this.#core.invoke(
       "memory_patch_page",
       wire({
-        ...scopeWire(scope),
+        ...(scope === undefined ? { scope: "global" } : scopeWire(scope)),
         path: a.path,
         expected_page_id: a.expectedPageId,
         edits,

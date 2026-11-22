@@ -42,6 +42,7 @@ async fn page_fts_rows_report_index_drift() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -125,6 +126,7 @@ async fn observation_fts_rows_report_index_drift() {
                 body: "bravo zebra".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &Sanitizer::builtin(),
         ))

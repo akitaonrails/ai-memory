@@ -88,6 +88,7 @@ async fn seed_page(store: &Store, wiki: &Wiki, project: &str) -> String {
         author_id: None,
         actor: ai_memory_core::ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();

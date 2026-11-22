@@ -92,6 +92,7 @@ async fn read_page_falls_back_to_db_when_file_missing() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -143,6 +144,7 @@ async fn read_page_serves_on_disk_page() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -193,6 +195,7 @@ async fn read_page_does_not_db_fallback_through_a_symlink() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -246,6 +249,7 @@ async fn read_page_does_not_fall_back_when_disk_frontmatter_is_malformed() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -329,6 +333,7 @@ async fn delete_page_reports_whether_the_page_existed() {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -434,6 +439,7 @@ async fn read_page_marks_an_expired_page() {
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();
@@ -456,6 +462,7 @@ async fn read_page_marks_an_expired_page() {
             expires_at: Some(jiff::Timestamp::from_second(a_minute_ago).unwrap()),
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

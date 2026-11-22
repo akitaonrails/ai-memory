@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `pages.patch` accepts `global: true` (sent as `scope: "global"`) to patch a
+  page in the reserved global scope, matching `pages.read`. (#2362)
 - `messages.list` accepts `afterId` (sent as `after_id`) to page the pending
   queue with the last id from the previous page. (#2295)
 - `observations` documents the server's new `session_id: "current"`: the

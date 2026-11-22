@@ -74,14 +74,14 @@ pub trait Reranker: Send + Sync {
 /// Per-candidate snippet budget in the rerank prompt. Enough to judge
 /// relevance, small enough that 30 candidates stay well inside a
 /// single request.
-const SNIPPET_BUDGET_BYTES: usize = 600;
+pub(crate) const SNIPPET_BUDGET_BYTES: usize = 600;
 /// Title budget in the rerank prompt.
-const TITLE_BUDGET_BYTES: usize = 200;
+pub(crate) const TITLE_BUDGET_BYTES: usize = 200;
 /// Query budget in the rerank prompt.
-const QUERY_BUDGET_BYTES: usize = 1_000;
+pub(crate) const QUERY_BUDGET_BYTES: usize = 1_000;
 const ELLIPSIS_BYTES: usize = "…".len();
 
-fn truncate_prompt_value(value: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_prompt_value(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
     }

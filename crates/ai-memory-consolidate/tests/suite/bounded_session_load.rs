@@ -305,6 +305,7 @@ async fn seeded_fixture_uniform(
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -326,6 +327,7 @@ async fn seeded_fixture_uniform(
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -758,6 +760,7 @@ async fn reviewer_bounds_oversized_recent_page_titles() {
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     })
     .await
     .unwrap();
@@ -1921,6 +1924,7 @@ mod slow {
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -2082,6 +2086,7 @@ mod slow {
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

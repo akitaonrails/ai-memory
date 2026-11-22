@@ -116,6 +116,7 @@ async fn harness(user: Option<&'static str>) -> Harness {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

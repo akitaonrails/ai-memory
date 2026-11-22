@@ -50,6 +50,7 @@ fn req(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> WritePageReq
         author_id: None,
         actor: ActorContext::anonymous(),
         evidence: Vec::new(),
+        trust_class: None,
     }
 }
 
@@ -499,6 +500,7 @@ async fn project_search_shows_observation_excerpts_only_to_the_sessions_owner() 
                 body: "quokka plutonium shipment notes".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &ai_memory_core::Sanitizer::builtin(),
         ))
@@ -520,6 +522,7 @@ async fn project_search_shows_observation_excerpts_only_to_the_sessions_owner() 
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -947,6 +950,7 @@ async fn kind_and_tier_filters_hold_in_every_stream() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -980,6 +984,7 @@ async fn kind_and_tier_filters_hold_in_every_stream() {
                 body: "where does the quokka sleep".into(),
                 importance: 5,
                 file_path: None,
+                trust_class: None,
             },
             &ai_memory_core::Sanitizer::builtin(),
         ))
@@ -1002,6 +1007,7 @@ async fn kind_and_tier_filters_hold_in_every_stream() {
             expires_at: None,
             entities: Vec::new(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -1078,6 +1084,7 @@ async fn cross_project_kind_filter_sees_past_the_candidate_window() {
                 expires_at: None,
                 entities: Vec::new(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
             .unwrap();

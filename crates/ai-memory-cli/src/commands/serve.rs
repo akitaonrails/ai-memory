@@ -17,8 +17,8 @@ use ai_memory_hooks::{
     WorkstreamState, hook_router, workstream_router,
 };
 use ai_memory_llm::{
-    Embedder, EmbeddingCapacity, LlmProvider, LlmProviders, LlmWorkload, ProviderHealth,
-    build_embedder, local_capacity,
+    Embedder, EmbeddingCapacity, LlmProvider, LlmProviders, LlmWorkload, ProviderAuth,
+    ProviderChoice, ProviderHealth, build_embedder, local_capacity,
 };
 use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
 use ai_memory_mcp::{
@@ -51,7 +51,9 @@ use tracing::info;
 
 use super::eval_embedding_cache::{EvalEmbeddingCache, eval_embedding_cache_dir};
 use crate::cli::{ServeArgs, TransportKind};
-use crate::config::{AuthSettings, AutoImproveSettings, Config, MaintenanceSettings};
+use crate::config::{
+    AuthSettings, AutoImproveSettings, Config, MaintenanceSettings, RerankerBackend,
+};
 use ai_memory_mcp::auth::{AuthState, require_bearer};
 
 /// 10 MB cap on inbound HTTP bodies. The /hook ingress accepts the
@@ -3226,42 +3228,53 @@ async fn configure_embedder(
     // the files into models/ by hand and never hit the network.
     if cfg.provider == ai_memory_llm::EmbedderChoice::Local
         && let Some(models_dir) = cfg.models_dir.as_deref()
-        && !ai_memory_llm::model_present(models_dir)
     {
-        if defaulted {
-            // Best-effort default (docs/local-embeddings.md): never
-            // block startup on an ~87 MB download. Fetch in the
-            // background; THIS boot runs without an embedder (the
-            // pre-2.0 behaviour), the next start finds the files and
-            // enables hybrid search. Offline hosts just log the warn.
-            let models_dir = models_dir.to_path_buf();
-            tokio::spawn(async move {
-                tracing::info!(
-                    dir = %models_dir.display(),
-                    "fetching the default local embedding model in the \
-                     background (~87 MB, one time); hybrid search enables \
-                     on the next start"
-                );
-                if let Err(e) = ai_memory_llm::fetch_model(&models_dir).await {
-                    tracing::warn!(
-                        error = %e,
-                        "default local embedding model fetch failed; running \
-                         without an embedder. Set embedding_provider = \"none\" \
-                         to opt out, or install offline per \
-                         docs/local-embeddings.md"
+        let spec = ai_memory_llm::resolve_local_model(&cfg.model)?;
+        if !ai_memory_llm::model_present_for(models_dir, spec) {
+            if defaulted {
+                // Best-effort default (docs/local-embeddings.md): never
+                // block startup on a model download. Fetch in the
+                // background; THIS boot runs without an embedder (the
+                // pre-2.0 behaviour), the next start finds the files and
+                // enables hybrid search. Offline hosts just log the warn.
+                let models_dir = models_dir.to_path_buf();
+                tokio::spawn(async move {
+                    tracing::info!(
+                        dir = %models_dir.display(),
+                        model = spec.id,
+                        approx_mb = spec.approx_download_mb,
+                        "fetching the default local embedding model in the \
+                         background (~{} MB, one time); hybrid search enables \
+                         on the next start",
+                        spec.approx_download_mb
                     );
-                }
-            });
-            return Ok((wiki, None));
+                    if let Err(e) = ai_memory_llm::fetch_model_for(&models_dir, spec).await {
+                        tracing::warn!(
+                            model = spec.id,
+                            error = %e,
+                            "default local embedding model fetch failed; running \
+                             without an embedder. Set embedding_provider = \"none\" \
+                             to opt out, or install offline per \
+                             docs/local-embeddings.md"
+                        );
+                    }
+                });
+                return Ok((wiki, None));
+            }
+            tracing::info!(
+                dir = %models_dir.display(),
+                model = spec.id,
+                approx_mb = spec.approx_download_mb,
+                "local embedding model not present; fetching (~{} MB, one time)",
+                spec.approx_download_mb
+            );
+            ai_memory_llm::fetch_model_for(models_dir, spec)
+                .await
+                .context(
+                    "fetching the local embedding model (set up offline per \
+                     docs/local-embeddings.md if this host has no network)",
+                )?;
         }
-        tracing::info!(
-            dir = %models_dir.display(),
-            "local embedding model not present; fetching (~87 MB, one time)"
-        );
-        ai_memory_llm::fetch_model(models_dir).await.context(
-            "fetching the local embedding model (set up offline per \
-             docs/local-embeddings.md if this host has no network)",
-        )?;
     }
     let embedder = match build_embedder(cfg) {
         Ok(e) => e,
@@ -3359,7 +3372,7 @@ fn configure_consolidator(
     project_id: ProjectId,
     provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
-    let want_reranker = config.reranker_choice()?;
+    let reranker_backend = config.reranker_choice()?;
     let providers = config
         .llm_providers()
         .context("building LLM provider chains from config")?;
@@ -3401,19 +3414,51 @@ fn configure_consolidator(
     if let Some(consolidator) = &consolidator {
         server = server.with_consolidator(wiki.clone(), consolidator.clone());
     }
-    if want_reranker {
-        let llm = providers.get(LlmWorkload::Rerank).context(
-            "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider",
-        )?;
+    if let Some(backend) = reranker_backend {
+        let reranker: Arc<dyn ai_memory_llm::Reranker> = match backend {
+            RerankerBackend::Llm => {
+                let llm = providers.get(LlmWorkload::Rerank).context(
+                    "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER or an llm.rerank provider",
+                )?;
+                Arc::new(ai_memory_llm::LlmReranker::new(llm.clone()))
+            }
+            RerankerBackend::DecisionsChoice => {
+                let key = config
+                    .provider_api_key(ProviderChoice::OpenAi)
+                    .filter(|key| !key.expose_secret().trim().is_empty());
+                let model = config
+                    .llm_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let (Some(key), Some(model)) = (key, model) else {
+                    anyhow::bail!(
+                        "AI_MEMORY_RERANKER=decisions-choice requires OPENAI_API_KEY and llm_model"
+                    );
+                };
+                let auth = ProviderAuth::required_api_key_from_env("OPENAI_API_KEY", Some(key));
+                let mut adapter = ai_memory_llm::DecisionsReranker::new(auth, model)?
+                    .with_timeout_secs(config.rerank_timeout_secs)
+                    .with_health(provider_health.clone());
+                if let Some(base_url) = config
+                    .llm_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    adapter = adapter.with_base_url(base_url);
+                }
+                Arc::new(adapter)
+            }
+        };
         info!(
-            provider = llm.name(),
-            model = llm.model(),
+            provider = reranker.name(),
+            model = reranker.model(),
             timeout_secs = config.rerank_timeout_secs,
-            "project/scopes memory_query reranking enabled (adds LLM latency)",
+            "project/scopes memory_query reranking enabled",
         );
-        let stage =
-            ai_memory_llm::RerankStage::new(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())))
-                .with_timeout(std::time::Duration::from_secs(config.rerank_timeout_secs));
+        let stage = ai_memory_llm::RerankStage::new(reranker)
+            .with_timeout(std::time::Duration::from_secs(config.rerank_timeout_secs));
         server = server.with_rerank_stage(stage);
     }
     Ok(ConsolidatorSetup {
@@ -3868,6 +3913,9 @@ fn host_without_port(host: &str) -> &str {
         _ => host,
     }
 }
+
+#[cfg(test)]
+mod decisions_choice_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5067,6 +5115,7 @@ mod tests {
                     importance: 5,
                     occurred_at: Some(last_activity),
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::builtin(),
             ))
@@ -5572,6 +5621,7 @@ mod tests {
                     body: "the session that outlived the daemon".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5677,6 +5727,7 @@ mod tests {
                     body: "activity the seed would otherwise reach for".into(),
                     importance: 5,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5759,6 +5810,7 @@ mod tests {
                     body: "complete the durable job".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -5915,6 +5967,7 @@ mod tests {
                             body: "complete the durable job".into(),
                             importance: 8,
                             file_path: None,
+                            trust_class: None,
                         },
                         &Sanitizer::default(),
                     ))
@@ -6068,6 +6121,7 @@ mod tests {
                     body: "open session still running".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6177,6 +6231,7 @@ mod tests {
                     body: "owned session still running".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6277,6 +6332,7 @@ mod tests {
                     body: "end the session".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6419,6 +6475,7 @@ mod tests {
                     body: "complete the durable job".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6444,6 +6501,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -6608,6 +6666,7 @@ mod tests {
                         author_id: None,
                         actor: ai_memory_core::ActorContext::anonymous(),
                         evidence: Vec::new(),
+                        trust_class: None,
                     })
                     .await
                     .unwrap();
@@ -6731,6 +6790,7 @@ mod tests {
                     body: "end the session".into(),
                     importance: 8,
                     file_path: None,
+                    trust_class: None,
                 },
                 &Sanitizer::default(),
             ))
@@ -6973,6 +7033,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();
@@ -8617,6 +8678,7 @@ mod tests {
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
             evidence: Vec::new(),
+            trust_class: None,
         })
         .await
         .unwrap();

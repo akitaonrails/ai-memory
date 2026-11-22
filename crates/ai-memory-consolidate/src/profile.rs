@@ -2913,6 +2913,7 @@ async fn converge_target(
                 author_id: None,
                 actor: ActorContext::anonymous(),
                 evidence: Vec::new(),
+                trust_class: None,
             })
             .await
         {

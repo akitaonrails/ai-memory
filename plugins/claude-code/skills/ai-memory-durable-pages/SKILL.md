@@ -62,6 +62,8 @@ It refuses the `#` title, whose section is the whole page; use
 `memory_write_page` to change text under the title.
 All edits resolve against the same captured body and either commit together or
 write nothing. Missing, duplicate, stale, or conflicting anchors fail closed.
+A page read with `scope: "global"` is patched with `scope: "global"` too,
+without `workspace` or `project`.
 Use `memory_write_page` when replacing the whole document.
 
 When the user explicitly wants a note to be temporary, pass `expires_at` as an

@@ -36,7 +36,8 @@ unless the files are pre-seeded.
 - **A cloud LLM/embedding provider**, if you want AI-assisted consolidation,
   search, or provider-based embeddings. Skip this and use the `local`
   embedding provider (below) to stay fully offline.
-- **`capture_assistant`** and **`AI_MEMORY_RERANKER=llm`**, both off by
+- **`capture_assistant`** and **`AI_MEMORY_RERANKER=llm`** or
+  **`AI_MEMORY_RERANKER=decisions-choice`** (direct to OpenAI), all off by
   default; see `DATA_HANDLING.md`.
 
 ## Local embeddings without a network dependency
@@ -44,19 +45,21 @@ unless the files are pre-seeded.
 For semantic search without a cloud API key or a self-hosted inference
 server, set the embedding provider to `local`
 ([`docs/local-embeddings.md`](local-embeddings.md)). On first use it fetches
-three small model files (~87 MB total, Apache-2.0 licensed) into
-`<data_dir>/models/all-MiniLM-L6-v2/`, each checked against a sha256 pinned
+three model files into `<data_dir>/models/<dir>/` — either the default
+`all-MiniLM-L6-v2` (~87 MB total, Apache-2.0) in `all-MiniLM-L6-v2/`, or
+`intfloat/multilingual-e5-small` (~470 MB total, MIT, for non-English
+wikis) in `multilingual-e5-small/` — each checked against a sha256 pinned
 in source so a tampered or drifted file fails with an error instead of
 loading.
 
 For a fully offline install, download those three files
-(`model.safetensors`, `tokenizer.json`, `config.json`) from
-`huggingface.co/sentence-transformers/all-MiniLM-L6-v2` on a
-network-connected machine and place them in that directory before first
-start; the loader verifies the same checksums and never touches the network
-(`docs/local-embeddings.md`, "Offline installs"). After that, embeddings run
-entirely on-host via the bundled `candle` (pure Rust) runtime, with no ONNX
-runtime or other native library to source separately.
+(`model.safetensors`, `tokenizer.json`, `config.json`) from the pinned
+Hugging Face URL listed in `docs/local-embeddings.md` ("Offline installs")
+on a network-connected machine and place them in the model's directory
+before first start; the loader verifies the same checksums and never
+touches the network. After that, embeddings run entirely on-host via the
+bundled `candle` (pure Rust) runtime, with no ONNX runtime or other native
+library to source separately.
 
 ## What still needs a decision from you
 

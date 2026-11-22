@@ -9,3 +9,4 @@ mod powershell_marker_aliases;
 mod powershell_server_routed;
 mod powershell_spool;
 mod powershell_utf8;
+mod trust_class;

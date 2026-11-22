@@ -835,6 +835,7 @@ pub(crate) async fn run_sweep_at(
                                 author_id: None,
                                 actor: ActorContext::anonymous(),
                                 evidence: Vec::new(),
+                                trust_class: None,
                             },
                             PagePrecondition::Latest(page.id),
                         ));
@@ -1432,6 +1433,7 @@ async fn plan_cold_cluster_dedup(
                     author_id: None,
                     actor: ActorContext::anonymous(),
                     evidence: Vec::new(),
+                    trust_class: None,
                 },
                 PagePrecondition::Latest(member.id),
             ));
@@ -1474,6 +1476,7 @@ async fn plan_cold_cluster_dedup(
             author_id: None,
             actor: ActorContext::anonymous(),
             evidence,
+            trust_class: None,
         };
 
         // Record. Survivor write goes first in this cluster's slice, so its
