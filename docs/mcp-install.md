@@ -744,10 +744,21 @@ dsh` refuses to write it):
         configPath: '<data-dir>/hooks/dsh/hooks.json'
 ```
 
-Install the bridge package into the profile first (`dsh plugin --profile
-<profile> add @deepseek-ai/dsh-hooks-claude-code`), then reload or restart
-the profile. Without `--apply`, `install-hooks --agent dsh` prints the same
-`hooks.json` and patch fragment for a manual merge.
+Install the bridge package together with its required `@deepseek-ai/dsh-hook-protocol`
+peer into the profile first (DSH profiles disable automatic peer installation,
+and npm's `latest` tag can trail the running DSH prerelease, so pin both
+packages to your installed DSH version or `@next`), for example:
+
+```bash
+dsh plugin --profile <profile> add \
+  @deepseek-ai/dsh-hooks-claude-code@<dsh-version> \
+  @deepseek-ai/dsh-hook-protocol@<dsh-version>
+```
+
+(If you also install `@deepseek-ai/dsh-mcp-client` manually into a profile, pin
+it to the same DSH version or `@next`.) Then reload or restart the profile.
+Without `--apply`, `install-hooks --agent dsh` prints the same `hooks.json` and
+patch fragment for a manual merge.
 
 Two bridge constraints shape DSH capture:
 
