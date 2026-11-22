@@ -13,6 +13,11 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Fixed
 
+- Preserved valid TOML, JSON, and JSONC syntax when `ai-memory backup-agents`
+  redacts secrets from MCP configuration files, scrubbing string values and
+  comments structurally instead of running raw free-text regex replacement over
+  the serialized bytes. (#2415)
+
 - Kept scheduled mirror and online backups running when a native install
   stores its configuration in the data directory and has no default
   external configuration directory. (#2385)

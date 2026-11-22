@@ -1041,3 +1041,5 @@ diag-jail-cannot-carry-this-checkouts-server-profile = --jail cannot carry this 
 diag-this-checkouts-marker-selects-a-refused-server-profile = this checkout's .ai-memory.toml selects server profile { $value0 }, which was refused ({ $value1 }); nothing was sent. Run `ai-memory hook --check-capture` here or `ai-memory server list` to see why, or set AI_MEMORY_SERVER_URL to choose a server for this command
 diag-true-yolo-is-now-yolo = ai-memory: --true-yolo is now the same as --yolo; use --yolo
 diag-claude-true-yolo-deprecated = ai-memory: claude_true_yolo is deprecated and ignored: --yolo on Claude always forces bypassPermissions now; remove it from config.toml
+diag-serializing-redacted-config = serializing redacted config for { $value0 }
+diag-verifying-redacted-config = verifying redacted config for { $value0 }
