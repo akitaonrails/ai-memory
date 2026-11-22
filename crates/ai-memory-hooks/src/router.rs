@@ -6766,11 +6766,10 @@ fn is_acknowledgment(text: &str) -> bool {
             .iter()
             .filter(|phrase| {
                 rest.strip_prefix(**phrase).is_some_and(|after| {
-                    phrase.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
-                        || !after
-                            .chars()
-                            .next()
-                            .is_some_and(char::is_alphanumeric)
+                    phrase
+                        .chars()
+                        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+                        || !after.chars().next().is_some_and(char::is_alphanumeric)
                 })
             })
             .max_by_key(|phrase| phrase.len());
@@ -29879,7 +29878,10 @@ pub(crate) mod tests {
         )];
         let last = Some("هل يمكننا ترحيل قاعدة البيانات؟".to_string());
         let qs = derive_open_questions(&obs, &last);
-        assert_eq!(qs, vec!["Unresolved question: هل يمكننا ترحيل قاعدة البيانات؟"]);
+        assert_eq!(
+            qs,
+            vec!["Unresolved question: هل يمكننا ترحيل قاعدة البيانات؟"]
+        );
         assert!(is_acknowledgment("تم، شكراً!"));
         assert!(is_acknowledgment("تمام"));
         assert!(!is_acknowledgment("تمكين المصادقة الثنائية"));

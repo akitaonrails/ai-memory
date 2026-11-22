@@ -555,7 +555,6 @@ async fn cjk_search_finds_a_word_written_with_the_iteration_mark() {
     );
 }
 
-
 #[tokio::test]
 async fn arabic_vocalized_and_indic_numerals_search_works() {
     let tmp = tempfile::tempdir().unwrap();
@@ -591,4 +590,105 @@ async fn arabic_vocalized_and_indic_numerals_search_works() {
         .unwrap();
     assert_eq!(hits_admin.len(), 1);
     assert_eq!(hits_admin[0].path.as_str(), "team-hr.md");
+}
+
+#[tokio::test]
+async fn arabic_punctuation_separated_words_are_searchable_independently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "demo-project").await;
+
+    store
+        .writer
+        .upsert_page(page(
+            ws,
+            project,
+            "slash.md",
+            "إدارة/المعرفة",
+            "بوابة التوثيق",
+        ))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, project, "comma.md", "اللغات", "العربية،الإنجليزية"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, project, "hyphen.md", "الفريق", "أحمد-المنصور"))
+        .await
+        .unwrap();
+
+    for (query, expected_path) in [
+        ("اداره", "slash.md"),
+        ("المعرفه", "slash.md"),
+        ("العربيه", "comma.md"),
+        ("الانجليزيه", "comma.md"),
+        ("احمد", "hyphen.md"),
+        ("المنصور", "hyphen.md"),
+    ] {
+        let hits = store
+            .reader
+            .search_pages_for_project(ws, project, query.into(), 10, None)
+            .await
+            .unwrap();
+        let paths: Vec<_> = hits.iter().map(|hit| hit.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![expected_path],
+            "punctuation-separated token failed for query={query}: {paths:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn arabic_indic_numeral_search_is_non_vacuous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let (ws, project) = scope(&store, "default", "demo-project").await;
+
+    // Contains only Eastern Arabic-Indic digits — no Arabic words shared with queries below.
+    store
+        .writer
+        .upsert_page(page(ws, project, "year-only.md", "archive", "٢٠٢٦"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, project, "year-era.md", "archive", "٢٠٢٦م"))
+        .await
+        .unwrap();
+    store
+        .writer
+        .upsert_page(page(ws, project, "decoy.md", "archive", "١٩٩٩"))
+        .await
+        .unwrap();
+
+    // Extended Arabic-Indic (Persian) digits find Eastern Arabic-Indic digits.
+    let hits_extended = store
+        .reader
+        .search_pages_for_project(ws, project, "۲۰۲۶".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = hits_extended.iter().map(|hit| hit.path.as_str()).collect();
+    assert_eq!(paths, vec!["year-only.md"]);
+
+    // ASCII digits alongside an unrelated Arabic word still match Eastern Arabic-Indic digits.
+    let hits_mixed = store
+        .reader
+        .search_pages_for_project(ws, project, "غيرموجود 2026".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = hits_mixed.iter().map(|hit| hit.path.as_str()).collect();
+    assert_eq!(paths, vec!["year-only.md"]);
+
+    // Attached ASCII digits + Arabic letter matches attached Indic digits + Arabic letter.
+    let hits_era = store
+        .reader
+        .search_pages_for_project(ws, project, "2026م".into(), 10, None)
+        .await
+        .unwrap();
+    let paths: Vec<_> = hits_era.iter().map(|hit| hit.path.as_str()).collect();
+    assert_eq!(paths, vec!["year-era.md"]);
 }

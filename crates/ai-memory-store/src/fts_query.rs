@@ -223,63 +223,16 @@ fn fts5_query_tokens(raw: &str) -> impl Iterator<Item = &str> {
     .filter(|token| !token.is_empty())
 }
 
-/// Terms stored in the auxiliary CJK index.
+/// Terms stored in the auxiliary CJK/Arabic index.
 ///
 /// Each maximal Han/Kana/Hangul run contributes its scalar values and its
-/// overlapping bigrams. Splitting only those runs keeps punctuation and Latin
-/// text out of the derived index, while the bigrams retain enough adjacency
-/// to avoid the very broad matches a character-only index would produce.
+/// overlapping bigrams. Each maximal Arabic-script or Arabic-Indic numeral run
+/// contributes its normalized form (tashkeel/tatweel/BiDi stripped, letter
+/// variants folded, Arabic-Indic digits mapped to ASCII). Splitting on
+/// punctuation and keeping only CJK/Arabic runs keeps Latin text out of the
+/// derived index, while the bigrams retain enough adjacency to avoid the very
+/// broad matches a character-only index would produce.
 #[must_use]
-pub(crate) fn is_arabic_or_indic_digit(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x0600..=0x06FF
-            | 0x0750..=0x077F
-            | 0x08A0..=0x08FF
-            | 0xFB50..=0xFDFF
-            | 0xFE70..=0xFEFF
-    )
-}
-
-pub(crate) fn normalize_arabic_term(raw: &str) -> Option<String> {
-    if !raw.chars().any(is_arabic_or_indic_digit) {
-        return None;
-    }
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            // Strip Arabic Tashkeel (harakat), Tatweel (kashida), and BiDi controls
-            '\u{064B}'..='\u{065F}'
-            | '\u{0670}'
-            | '\u{06D6}'..='\u{06ED}'
-            | '\u{0640}'
-            | '\u{061C}'
-            | '\u{200E}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2066}'..='\u{2069}' => {}
-            // Normalize Alef variants to bare Alef
-            'أ' | 'إ' | 'آ' | 'ٱ' => out.push('ا'),
-            // Normalize Alef Maksura to Yeh, Teh Marbuta to Heh, Hamza carriers
-            'ى' => out.push('ي'),
-            'ة' => out.push('ه'),
-            'ؤ' => out.push('و'),
-            'ئ' => out.push('ي'),
-            // Convert Eastern Arabic-Indic (٠-٩) and Extended Arabic-Indic (۰-۹) digits to ASCII
-            '\u{0660}'..='\u{0669}' => {
-                let d = (ch as u32) - 0x0660;
-                out.push(char::from_u32(b'0' as u32 + d).unwrap_or(ch));
-            }
-            '\u{06F0}'..='\u{06F9}' => {
-                let d = (ch as u32) - 0x06F0;
-                out.push(char::from_u32(b'0' as u32 + d).unwrap_or(ch));
-            }
-            c if c.is_alphanumeric() => out.push(c),
-            _ => {}
-        }
-    }
-    (!out.is_empty()).then_some(out)
-}
-
 pub(crate) fn cjk_index_terms(raw: &str) -> String {
     let mut terms = Vec::new();
     let mut run = Vec::new();
@@ -291,19 +244,19 @@ pub(crate) fn cjk_index_terms(raw: &str) -> String {
         }
     }
     append_cjk_terms(&mut terms, &mut run);
-    for token in raw.split_whitespace() {
-        if let Some(norm) = normalize_arabic_term(token) {
-            terms.push(norm);
-        }
-    }
+    append_arabic_terms(raw, &mut terms, None);
     terms.join(" ")
 }
 
-/// A MATCH expression for the CJK portion of a bounded user query.
+/// A MATCH expression for the CJK/Arabic portion of a bounded user query.
 ///
 /// `None` is the important common case: callers then execute the existing SQL
-/// byte-for-byte. A multi-scalar run becomes an exact phrase of overlapping
-/// bigrams; a single scalar uses the unigram fallback.
+/// byte-for-byte. A multi-scalar CJK run becomes an exact phrase of overlapping
+/// bigrams; a single scalar uses the unigram fallback. Arabic-script and
+/// Arabic-Indic numeral runs become normalized terms; ASCII digit runs are also
+/// carried alongside an Arabic query so cross-script numeral queries (such as
+/// `"ادارة 2026"` against `"٢٠٢٦"`) hit the normalized index without adding
+/// sidecar queries on Latin-only searches.
 ///
 /// `None` also covers a query carrying `AND` / `NOT` / `NEAR`. This stream is
 /// auxiliary: callers UNION it into the primary stream, so a run-based
@@ -333,6 +286,9 @@ pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
         return None;
     }
     let mut phrases = Vec::new();
+    let mut arabic_terms = Vec::new();
+    let mut ascii_digit_phrases = Vec::new();
+    let mut has_arabic_query = false;
     for token in bounded.split_whitespace() {
         // Grouping must not turn `(title:term)` into an unqualified match.
         // Like prepare_fts5_token, peel opening parentheses before the column:
@@ -351,12 +307,122 @@ pub(crate) fn prepare_cjk_fts5_query(raw: &str) -> Option<String> {
             }
         }
         append_cjk_query(&mut phrases, &mut run, column);
-        if let Some(norm) = normalize_arabic_term(text) {
-            let prefix = column.map_or_else(String::new, |c| format!("{c}:"));
-            phrases.push(format!("{prefix}\"{norm}\""));
+
+        let prefix = column.map_or_else(String::new, |c| format!("{c}:"));
+        let mut ascii_digits = Vec::new();
+        append_arabic_terms(text, &mut arabic_terms, Some(&mut ascii_digits));
+        if !arabic_terms.is_empty() {
+            has_arabic_query = true;
+            for norm in arabic_terms.drain(..) {
+                phrases.push(format!("{prefix}\"{norm}\""));
+            }
+        }
+        for digits in ascii_digits {
+            ascii_digit_phrases.push(format!("{prefix}\"{digits}\""));
         }
     }
+    if has_arabic_query {
+        phrases.extend(ascii_digit_phrases);
+    }
     (!phrases.is_empty()).then(|| phrases.join(" OR "))
+}
+
+fn is_arabic_block(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0600..=0x06FF
+            | 0x0750..=0x077F
+            | 0x08A0..=0x08FF
+            | 0xFB50..=0xFDFF
+            | 0xFE70..=0xFEFF
+    )
+}
+
+fn is_arabic_ignorable(ch: char) -> bool {
+    matches!(
+        ch,
+        // Arabic Tashkeel (harakat), Tatweel (kashida), and BiDi controls
+        '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+            | '\u{06D6}'..='\u{06ED}'
+            | '\u{0640}'
+            | '\u{061C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn is_arabic_or_indic_digit(ch: char) -> bool {
+    ch != '\u{0640}' && ch.is_alphanumeric() && is_arabic_block(ch)
+}
+
+fn is_arabic_run_char(ch: char) -> bool {
+    is_arabic_ignorable(ch) || (ch.is_alphanumeric() && !is_cjk(ch))
+}
+
+fn normalize_arabic_char(ch: char) -> Option<char> {
+    if is_arabic_ignorable(ch) {
+        return None;
+    }
+    match ch {
+        // Normalize Alef variants to bare Alef
+        'أ' | 'إ' | 'آ' | 'ٱ' => Some('ا'),
+        // Normalize Alef Maksura to Yeh, Teh Marbuta to Heh, Hamza carriers
+        'ى' | 'ئ' => Some('ي'),
+        'ة' => Some('ه'),
+        'ؤ' => Some('و'),
+        // Convert Eastern Arabic-Indic (٠-٩) and Extended Arabic-Indic (۰-۹) digits to ASCII
+        '\u{0660}'..='\u{0669}' => {
+            let d = (ch as u32) - 0x0660;
+            Some(char::from_u32(u32::from(b'0') + d).unwrap_or(ch))
+        }
+        '\u{06F0}'..='\u{06F9}' => {
+            let d = (ch as u32) - 0x06F0;
+            Some(char::from_u32(u32::from(b'0') + d).unwrap_or(ch))
+        }
+        c if c.is_alphanumeric() => Some(c),
+        _ => None,
+    }
+}
+
+fn append_arabic_terms(
+    text: &str,
+    terms: &mut Vec<String>,
+    mut ascii_digits: Option<&mut Vec<String>>,
+) {
+    let mut buf = String::new();
+    let mut has_arabic = false;
+
+    let flush = |buf: &mut String,
+                 has_arabic: &mut bool,
+                 terms: &mut Vec<String>,
+                 ascii_digits: &mut Option<&mut Vec<String>>| {
+        if !buf.is_empty() {
+            if *has_arabic {
+                terms.push(std::mem::take(buf));
+            } else if let Some(digits) = ascii_digits.as_deref_mut()
+                && buf.bytes().all(|b| b.is_ascii_digit())
+            {
+                digits.push(std::mem::take(buf));
+            } else {
+                buf.clear();
+            }
+        }
+        *has_arabic = false;
+    };
+
+    for ch in text.chars() {
+        if is_arabic_run_char(ch) {
+            has_arabic |= is_arabic_or_indic_digit(ch);
+            if let Some(norm) = normalize_arabic_char(ch) {
+                buf.push(norm);
+            }
+        } else {
+            flush(&mut buf, &mut has_arabic, terms, &mut ascii_digits);
+        }
+    }
+    flush(&mut buf, &mut has_arabic, terms, &mut ascii_digits);
 }
 
 fn append_cjk_terms(terms: &mut Vec<String>, run: &mut Vec<char>) {
@@ -737,6 +803,40 @@ mod tests {
             query.len()
         );
         assert_parses(&query);
+    }
+
+    #[test]
+    fn arabic_index_and_queries_split_on_punctuation_and_preserve_latin_guard() {
+        assert_eq!(cjk_index_terms("إدارة/المعرفة"), "اداره المعرفه");
+        assert_eq!(cjk_index_terms("العربية،الإنجليزية"), "العربيه الانجليزيه");
+        assert_eq!(cjk_index_terms("أحمد-المنصور"), "احمد المنصور");
+        assert_eq!(cjk_index_terms("plain latin 2026"), "");
+        assert_eq!(cjk_index_terms("hello؟ worldـ"), "");
+
+        let slash = prepare_cjk_fts5_query("إدارة/المعرفة").unwrap();
+        assert_eq!(slash, "\"اداره\" OR \"المعرفه\"");
+        assert_parses(&slash);
+
+        let comma = prepare_cjk_fts5_query("العربية،الإنجليزية").unwrap();
+        assert_eq!(comma, "\"العربيه\" OR \"الانجليزيه\"");
+        assert_parses(&comma);
+
+        let hyphen = prepare_cjk_fts5_query("title:أحمد-المنصور").unwrap();
+        assert_eq!(hyphen, "title:\"احمد\" OR title:\"المنصور\"");
+        assert_parses(&hyphen);
+
+        // Latin/ASCII-only queries (including digits) stay None so no extra
+        // sidecar SQL runs on the common path.
+        assert_eq!(prepare_cjk_fts5_query("latin 2026"), None);
+        assert_eq!(prepare_cjk_fts5_query("2026"), None);
+
+        // Eastern/Extended Arabic-Indic digits normalize to ASCII digits, and
+        // ASCII digits alongside an Arabic query are also carried.
+        assert_eq!(prepare_cjk_fts5_query("٢٠٢٦"), Some("\"2026\"".to_string()));
+        assert_eq!(prepare_cjk_fts5_query("۲۰۲۶"), Some("\"2026\"".to_string()));
+        let mixed = prepare_cjk_fts5_query("ادارة 2026").unwrap();
+        assert_eq!(mixed, "\"اداره\" OR \"2026\"");
+        assert_parses(&mixed);
     }
 
     /// The engine, not this module, is the judge of validity: every

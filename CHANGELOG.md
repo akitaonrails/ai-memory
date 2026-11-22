@@ -13,6 +13,13 @@ version in [`docs/changelog/`](docs/changelog/):
 
 ### Added
 
+- Arabic FTS5 search normalization and hook heuristics: the auxiliary
+  CJK/Arabic FTS index strips tashkeel/tatweel/BiDi marks, folds Arabic letter
+  variants (Alef, Alef Maksura, Teh Marbuta, Hamza carriers), and normalizes
+  Eastern/Extended Arabic-Indic digits (`٠-٩`, `۰-۹`) to ASCII across
+  punctuation-separated words, while hook handoff heuristics recognize the
+  Arabic question mark (`؟`) and common Arabic acknowledgments. (#2426)
+
 - Local in-process embeddings (`embedding_provider = "local"`) now offer a
   checksum-pinned multilingual model for non-English wikis:
   `intfloat/multilingual-e5-small` (also accepted via the shorthand alias
