@@ -759,6 +759,17 @@ pub struct HookState {
     /// handoff; it renders a non-consuming notice instead and leaves the
     /// claim to an explicit `memory_handoff_accept` (design: #959).
     pub claim_handoff_on_session_start: bool,
+    /// `[handoff].deliver_on_session_start` (default `true` — unchanged
+    /// behavior). When `false`, a session start that names no `handoff` flag
+    /// reads no baton, posts no continuity notice, and claims nothing; the
+    /// handoff stays open for `memory_handoff_accept`. A request's explicit
+    /// `handoff=1` still overrides it.
+    pub deliver_handoff_on_session_start: bool,
+    /// `[recovery].deliver_on_session_start` (default `true` — unchanged
+    /// behavior). When `false`, a session start that names no `recovery` flag
+    /// skips the unfinished-session recovery snapshot and its backfill marker.
+    /// A request's explicit `recovery=1` still overrides it.
+    pub deliver_recovery_on_session_start: bool,
     /// `[handoff].create_on_session_end` (default `true` — unchanged
     /// behavior). When `false`, `SessionEnd` writes the summary page and
     /// consolidates as usual, but skips automatic handoff creation (#1043).
@@ -2033,16 +2044,20 @@ pub struct HandoffQuery {
     /// Set falsy by a client that re-fetches on every prompt (Kimi Code) once
     /// the session already received the digest, so it is delivered once.
     pub profile_digest: Option<String>,
-    /// The marker's `[handoff] deliver_on_session_start`, sent as `0` only
-    /// when the project opted out. An explicit falsy value keeps this
-    /// project's handoff and continuity notice out of its session starts: the
-    /// handoff stays open and unclaimed, and the rest of the on-start context
-    /// is delivered as usual. Absent or anything else delivers as before.
+    /// The marker's `[handoff] deliver_on_session_start`, forwarded as `0`
+    /// when falsy and `1` for any other declared value. An explicit falsy
+    /// value keeps this project's handoff and continuity notice out of its
+    /// session starts: the handoff stays open and unclaimed, and the rest of
+    /// the on-start context is delivered as usual. An explicit truthy value
+    /// delivers even when the server's `[handoff] deliver_on_session_start`
+    /// is `false`; absent or unrecognized follows that server default.
     pub handoff: Option<String>,
-    /// The marker's `[recovery] deliver_on_session_start`, sent as `0` only
-    /// when the project opted out. An explicit falsy value suppresses only the
-    /// unfinished-session recovery snapshot and its backfill marker. Absent or
-    /// anything else delivers recovery as before.
+    /// The marker's `[recovery] deliver_on_session_start`, forwarded as `0`
+    /// when falsy and `1` for any other declared value. An explicit falsy
+    /// value suppresses only the unfinished-session recovery snapshot and its
+    /// backfill marker; an explicit truthy value delivers even when the
+    /// server's `[recovery] deliver_on_session_start` is `false`, and absent
+    /// or unrecognized follows that server default.
     pub recovery: Option<String>,
     /// Per-request claim suppression, sent falsy (`claim=0`) by an execution
     /// that must not consume the pending baton — an external-capture run
@@ -2151,6 +2166,16 @@ async fn fetch_and_accept_handoff(
     .await
 }
 
+fn delivery_flag_enabled(value: Option<&str>, default: bool) -> bool {
+    if crate::payload::query_flag_falsy(value) {
+        false
+    } else if crate::payload::query_flag_truthy(value) {
+        true
+    } else {
+        default
+    }
+}
+
 async fn fetch_and_accept_handoff_at(
     state: &HookState,
     query: HandoffQuery,
@@ -2221,7 +2246,10 @@ async fn fetch_and_accept_handoff_at(
     // `[handoff] deliver_on_session_start = false` never reads the baton, so
     // there is nothing to claim, announce or render; it stays open for a
     // project that has not opted out (or for `memory_handoff_accept`).
-    let deliver_handoff = !crate::payload::query_flag_falsy(query.handoff.as_deref());
+    let deliver_handoff = delivery_flag_enabled(
+        query.handoff.as_deref(),
+        state.deliver_handoff_on_session_start,
+    );
     let handoff = if deliver_handoff {
         state
             .reader
@@ -2244,7 +2272,10 @@ async fn fetch_and_accept_handoff_at(
     // The source row stays open because it may belong to a legitimate parallel
     // agent; the packet says so explicitly and is never claimed/consumed.
     // `[recovery] deliver_on_session_start = false` skips only this packet.
-    let interrupted_md = if crate::payload::query_flag_falsy(query.recovery.as_deref()) {
+    let interrupted_md = if !delivery_flag_enabled(
+        query.recovery.as_deref(),
+        state.deliver_recovery_on_session_start,
+    ) {
         None
     } else {
         render_interrupted_session_context(state, ws, proj, owner_filter.clone(), accepting_session)
@@ -9558,6 +9589,8 @@ pub(crate) mod tests {
             capture_assistant_enabled: false,
             assistant_excerpt_max_bytes: crate::assistant_capture::ASSISTANT_EXCERPT_MAX_BYTES,
             claim_handoff_on_session_start: true,
+            deliver_handoff_on_session_start: true,
+            deliver_recovery_on_session_start: true,
             create_handoff_on_session_end: true,
             subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
             ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),
@@ -20625,6 +20658,96 @@ pub(crate) mod tests {
         assert!(!project_b.contains("RECOVERY-SOURCE-A"));
     }
 
+    /// A server with `[recovery] deliver_on_session_start = false` skips the
+    /// snapshot for a start that names no `recovery` flag (or an unrecognized
+    /// value) while the brief, profile digest and inbox notice still arrive; a
+    /// project marker's explicit `recovery=1` opts back in.
+    #[tokio::test]
+    async fn server_recovery_default_off_is_overridden_by_marker_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.deliver_recovery_on_session_start = false;
+        process(
+            &state,
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "user-prompt".into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some("/tmp/project-a".into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "56565656-5656-5656-5656-565656565656",
+                    "cwd": "/tmp/project-a",
+                    "prompt": "RECOVERY-DEFAULT-OFF-SOURCE",
+                    "occurred_at": "2020-01-01T00:00:00Z"
+                }),
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        state
+            .writer
+            .upsert_page(brief_page(
+                state.workspace_id,
+                state.project_id,
+                "_rules/recovery-default.md",
+                "RECOVERY-DEFAULT-OFF-BRIEF",
+                true,
+            ))
+            .await
+            .unwrap();
+        seed_global_profile(&state).await;
+        seed_inbox(&state, 1).await;
+
+        let query = |recovery: Option<&str>| HandoffQuery {
+            agent: Some("codex".into()),
+            cwd: Some("/tmp/project-a".into()),
+            workspace: Some("default".into()),
+            project: Some("scratch".into()),
+            briefing: Some("true".into()),
+            recovery: recovery.map(str::to_string),
+            ..Default::default()
+        };
+        for absent in [None, Some("banana")] {
+            let body = fetch_and_accept_handoff(&state, query(absent), None, Vec::new(), None)
+                .await
+                .unwrap()
+                .expect("the other startup context must survive the server default");
+            for unwanted in [
+                "unfinished-session recovery snapshot",
+                BACKFILL_MARKER_PREFIX,
+                "RECOVERY-DEFAULT-OFF-SOURCE",
+            ] {
+                assert!(!body.contains(unwanted), "{absent:?}: {unwanted}: {body}");
+            }
+            for retained in [
+                "RECOVERY-DEFAULT-OFF-BRIEF",
+                "Use pnpm, not npm.",
+                "1 cross-project message waiting",
+            ] {
+                assert!(
+                    body.contains(retained),
+                    "{absent:?}: missing {retained}: {body}"
+                );
+            }
+        }
+
+        let body = fetch_and_accept_handoff(&state, query(Some("1")), None, Vec::new(), None)
+            .await
+            .unwrap()
+            .expect("the other startup context must survive the server default");
+        assert!(
+            body.contains("unfinished-session recovery snapshot"),
+            "{body}"
+        );
+        assert!(body.contains("RECOVERY-DEFAULT-OFF-SOURCE"), "{body}");
+    }
+
     #[tokio::test]
     async fn unfinished_session_recovery_is_owner_scoped_and_excludes_receiver() {
         let tmp = TempDir::new().unwrap();
@@ -22796,6 +22919,56 @@ pub(crate) mod tests {
         }
 
         // Control: anything but an explicit falsy value delivers and claims.
+        let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", Some("1")).await;
+        assert!(body.contains("HANDOFF-MARKER"), "{body}");
+        assert!(!open_handoff_exists(&state).await);
+    }
+
+    /// A server with `[handoff] deliver_on_session_start = false` delivers no
+    /// baton or continuity notice for a start that sends no `handoff` flag (or
+    /// an unrecognized value) and leaves the handoff open; a project marker's
+    /// explicit `handoff=1` delivers and claims it.
+    #[tokio::test]
+    async fn server_handoff_default_off_is_overridden_by_marker_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state_with_admission(
+            &tmp,
+            ai_memory_wiki::AdmissionChain::new(Vec::new()).unwrap(),
+        )
+        .await;
+        state.deliver_handoff_on_session_start = false;
+        state
+            .writer
+            .insert_handoff(NewHandoff {
+                workspace_id: state.workspace_id,
+                project_id: state.project_id,
+                from_session_id: None,
+                from_agent: AgentKind::ClaudeCode,
+                to_agent: None,
+                cwd: None,
+                summary: "HANDOFF-MARKER".to_string(),
+                open_questions: Vec::new(),
+                next_steps: Vec::new(),
+                files_touched: Vec::new(),
+                owner_user: None,
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(state);
+        let cwd = tmp.path().to_string_lossy().into_owned();
+
+        for absent in [None, Some("banana")] {
+            let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", absent).await;
+            assert!(
+                !body.contains("HANDOFF-MARKER") && !body.to_lowercase().contains("handoff"),
+                "{absent:?}: a server default off must deliver no handoff or notice: {body}",
+            );
+            assert!(
+                open_handoff_exists(&state).await,
+                "{absent:?}: the server default must leave the baton open",
+            );
+        }
+
         let (body, _) = session_start_handoff_for(&state, &cwd, "scratch", Some("1")).await;
         assert!(body.contains("HANDOFF-MARKER"), "{body}");
         assert!(!open_handoff_exists(&state).await);

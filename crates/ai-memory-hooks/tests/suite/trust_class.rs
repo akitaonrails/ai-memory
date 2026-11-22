@@ -65,6 +65,8 @@ async fn hook_ingress_assigns_trust_class_and_zero_llm_session_page_derives_with
         capture_assistant_enabled: false,
         assistant_excerpt_max_bytes: crate::ASSISTANT_EXCERPT_MAX_BYTES,
         claim_handoff_on_session_start: false,
+        deliver_handoff_on_session_start: true,
+        deliver_recovery_on_session_start: true,
         create_handoff_on_session_end: false,
         subagent_sessions: Arc::new(tokio::sync::Mutex::new(SubagentSessionSet::default())),
         ingest_rate: Arc::new(tokio::sync::Mutex::new(IngestRateLimiter::disabled())),

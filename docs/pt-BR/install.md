@@ -4076,6 +4076,37 @@ base `https://`; uma base puramente `http://` não possui proteção de trânsit
 invasor on-path pode substituir tanto o arquivo compactado quanto seu checksum correspondente.
 Cada corpo de resposta é limitado a 128 MiB.
 
+### Arquivos de hook após uma atualização
+
+`ai-memory upgrade` reescreve os scripts de hook e as integrações geradas que ele
+instalou quando uma release os altera; é o único caminho de atualização que faz
+isso. Todas as outras formas de atualização mantêm os arquivos instalados na
+versão antiga:
+
+- instalações gerenciadas por pacote (Homebrew, AUR, Scoop, Nix, `/usr`), que o
+  `upgrade` recusa e entrega ao gerenciador de pacotes;
+- um binário copiado no lugar à mão, que nunca toca a árvore de hooks;
+- instalações de hooks com escopo de projeto, que ficam em cada checkout em vez
+  da árvore de hooks do diretório de dados.
+
+Depois de qualquer uma delas, execute o instalador para cada agente cujos hooks
+você usa:
+
+```bash
+ai-memory install-hooks --agent <agent> --apply
+# instalação com escopo de projeto, em cada checkout:
+ai-memory install-hooks --agent <agent> --apply --scope project
+```
+
+Isso importa quando o `.ai-memory.toml` de um projeto define `[handoff]
+deliver_on_session_start = true` ou `[recovery] deliver_on_session_start =
+true` para sobrepor um `false` do servidor, como descrito em
+[marker-file.md](marker-file.md): os clientes atuais enviam o valor declarado
+(`handoff=1` / `recovery=1`), enquanto um arquivo de hook antigo envia apenas o
+opt-out `0` e a sobreposição do projeto não tem efeito. Um marcador definido
+como `false` continua funcionando sem a atualização, porque arquivos antigos já
+enviam `0`.
+
 ### Contêiner do servidor executado por você mesmo, cliente nativo no host
 
 Algumas instalações dividem as duas metades manualmente: o servidor roda em um contêiner que

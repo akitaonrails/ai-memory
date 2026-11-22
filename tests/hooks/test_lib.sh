@@ -665,22 +665,21 @@ assert_eq "session origin rides with the managed run" \
     "&managed_run=r1&session_origin=automation" \
     "$(AI_MEMORY_RUN_ID=r1 AI_MEMORY_SESSION_ORIGIN=automation ai_memory_managed_qs)"
 
-# `[handoff] deliver_on_session_start = false` is sent as &handoff=0 only when
-# explicitly falsy, and a [handoff]-only marker is a settings boundary.
-mkdir -p "$TMP/handoff-off/inner" "$TMP/handoff-on"
+mkdir -p "$TMP/handoff-off/inner" "$TMP/handoff-on" "$TMP/ps-handoff-empty"
 printf 'workspace = "outer"\n' >"$TMP/handoff-off/.ai-memory.toml"
 printf '[handoff]\ndeliver_on_session_start = "false"\n' >"$TMP/handoff-off/inner/.ai-memory.toml"
 printf '[handoff]\ndeliver_on_session_start = true\n' >"$TMP/handoff-on/.ai-memory.toml"
+printf 'workspace = "outer"\n[handoff]\ndeliver_on_session_start = ""\n' >"$TMP/ps-handoff-empty/.ai-memory.toml"
 assert_eq "handoff-only marker is a settings boundary" \
     "$TMP/handoff-off/inner/.ai-memory.toml" "$(ai_memory_find_settings_marker "$TMP/handoff-off/inner")"
 assert_eq "marker_qs forwards the [handoff] opt-out" \
     "&cwd=$(ai_memory_url_encode "$TMP/handoff-off/inner")&profile_contribute=1&profile_consume=1&handoff=0" \
     "$(ai_memory_marker_qs "$TMP/handoff-off/inner")"
-assert_eq "marker_qs omits handoff for a sibling project and for a truthy value" \
+assert_eq "marker_qs omits handoff for a sibling project without the key" \
     "&cwd=$(ai_memory_url_encode "$TMP/handoff-off")&workspace=outer&profile_contribute=1&profile_consume=1" \
     "$(ai_memory_marker_qs "$TMP/handoff-off")"
-assert_eq "marker_qs omits handoff when deliver_on_session_start is true" \
-    "&cwd=$(ai_memory_url_encode "$TMP/handoff-on")&profile_contribute=1&profile_consume=1" \
+assert_eq "marker_qs forwards a declared handoff opt-in" \
+    "&cwd=$(ai_memory_url_encode "$TMP/handoff-on")&profile_contribute=1&profile_consume=1&handoff=1" \
     "$(ai_memory_marker_qs "$TMP/handoff-on")"
 # [recovery] uses the same key without opting out of handoffs.
 mkdir -p "$TMP/recovery-off/inner" "$TMP/recovery-on"
@@ -692,8 +691,8 @@ assert_eq "recovery-only marker is a settings boundary" \
 assert_eq "marker_qs forwards recovery without disabling handoff" \
     "&cwd=$(ai_memory_url_encode "$TMP/recovery-off/inner")&profile_contribute=1&profile_consume=1&recovery=0" \
     "$(ai_memory_marker_qs "$TMP/recovery-off/inner")"
-assert_eq "marker_qs omits recovery for a truthy value" \
-    "&cwd=$(ai_memory_url_encode "$TMP/recovery-on")&profile_contribute=1&profile_consume=1" \
+assert_eq "marker_qs forwards a declared recovery opt-in" \
+    "&cwd=$(ai_memory_url_encode "$TMP/recovery-on")&profile_contribute=1&profile_consume=1&recovery=1" \
     "$(ai_memory_marker_qs "$TMP/recovery-on")"
 printf '[handoff]\ndeliver_on_session_start = false\n[recovery]\ndeliver_on_session_start = false\n' >"$TMP/recovery-on/.ai-memory.toml"
 assert_eq "marker_qs forwards independent handoff and recovery opt-outs" \
@@ -717,11 +716,11 @@ assert_eq "the session-start briefing query ignores the subagent opt-in" \
 assert_eq "the subagent briefing query ignores the session-start opt-in" \
     "" "$(ai_memory_subagent_briefing_qs "$TMP/session-brief-only")"
 HF_PS=$(grep -q 'deliver_on_session_start' hooks/lib/ai-memory-hook.ps1 \
-    && grep -q '&handoff=0' hooks/lib/ai-memory-hook.ps1 \
-    && grep -q '&recovery=0' hooks/lib/ai-memory-hook.ps1 \
+    && grep -Fq '&handoff=$handoffValue' hooks/lib/ai-memory-hook.ps1 \
+    && grep -Fq '&recovery=$recoveryValue' hooks/lib/ai-memory-hook.ps1 \
     && grep -q 'Get-AiMemoryTomlScopedFlag' hooks/lib/ai-memory-hook.ps1 \
     && printf 'ok' || printf 'missing')
-assert_eq "powershell marker query forwards independent delivery opt-outs (static)" "ok" "$HF_PS"
+assert_eq "powershell marker query forwards delivery values (static)" "ok" "$HF_PS"
 PSH=""
 if command -v pwsh >/dev/null 2>&1; then
     PSH=$(command -v pwsh)
@@ -753,9 +752,23 @@ if [ -n "$PSH" ]; then
         *) PS_RECOVERY="got: $PS_REC_QS" ;;
     esac
     case "$PS_REC_QS" in
-        *"&handoff="*) PS_RECOVERY="unexpected handoff opt-out: $PS_REC_QS" ;;
+        *"&handoff="*) PS_RECOVERY="unexpected handoff value: $PS_REC_QS" ;;
     esac
     assert_eq "powershell forwards recovery without disabling handoff" "ok" "$PS_RECOVERY"
+fi
+if [ -n "$PSH" ]; then
+    PS_HAND_CWD=$(host_path "$TMP/handoff-on")
+    PS_HAND_QS=$(HOME="$TMP" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+        ". '$PS_LIB'; Get-AiMemoryMarkerQuery -Cwd '$PS_HAND_CWD'")
+    assert_eq "powershell forwards a declared handoff opt-in" \
+        "&cwd=$(ai_memory_url_encode "$PS_HAND_CWD")&profile_contribute=1&profile_consume=1&handoff=1" \
+        "$PS_HAND_QS"
+    PS_EMPTY_CWD=$(host_path "$TMP/ps-handoff-empty")
+    PS_EMPTY_QS=$(HOME="$TMP" "$PSH" -NoProfile -ExecutionPolicy Bypass -Command \
+        ". '$PS_LIB'; Get-AiMemoryMarkerQuery -Cwd '$PS_EMPTY_CWD'")
+    assert_eq "powershell treats an exact empty delivery value as absent" \
+        "&cwd=$(ai_memory_url_encode "$PS_EMPTY_CWD")&workspace=outer&profile_contribute=1&profile_consume=1" \
+        "$PS_EMPTY_QS"
 fi
 if [ -n "$PSH" ]; then
     PS_SUB_CWD=$(host_path "$TMP/subagent-only/inner")

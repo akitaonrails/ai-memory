@@ -1403,6 +1403,7 @@ per_user = false                  # shared + own slots in agent context
 
 [handoff]                         # optional server-wide handoff policy
 claim_on_session_start = true     # false offers metadata; explicit accept claims
+deliver_on_session_start = true   # false skips the handoff and notice; a project marker overrides
 create_on_session_end = true      # false stops automatic handoffs at session end and OpenCode/Antigravity turn checkpoints
 
 [profile]                         # cross-project profile (docs/cross-project-profile.md)

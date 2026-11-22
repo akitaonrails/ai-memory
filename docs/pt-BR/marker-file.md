@@ -206,21 +206,22 @@ max_chars = 4000
 # every subagent pays for the brief in tokens, so opt in per repo.
 inject_on_subagent_start = "true"
 
-# Optional. Stop delivering this project's handoff at session start. Only an
-# explicit false / "no" / "off" / "0" turns it off; the default is to deliver.
-# Handoffs are still created when a session ends, and stay open (an agent can
-# still take one with `memory_handoff_accept`), so only the automatic delivery
-# stops. The brief, the profile digest and everything else on start are
-# unchanged.
+# Optional. Override this project's handoff delivery at session start. Only an
+# explicit false / "no" / "off" / "0" turns it off; `true` turns it back on even
+# when the server's `[handoff] deliver_on_session_start` is false. Handoffs are
+# still created when a session ends, and stay open (an agent can still take one
+# with `memory_handoff_accept`), so only the automatic delivery stops. The
+# brief, the profile digest and everything else on start are unchanged.
 [handoff]
 deliver_on_session_start = false
 
-# Optional. Stop delivering the unfinished-session recovery snapshot at
+# Optional. Override delivery of the unfinished-session recovery snapshot at
 # session start. Only an explicit false / "no" / "off" / "0" turns it off;
-# the default is to deliver. This also suppresses the snapshot's backfill
-# marker. The source session remains open and its lifecycle is unchanged.
-# Independent of [handoff]: handoffs, managed context, the brief, the profile
-# digest and the inbox notice are unchanged.
+# `true` turns it back on even when the server's `[recovery]
+# deliver_on_session_start` is false. This also suppresses the snapshot's
+# backfill marker. The source session remains open and its lifecycle is
+# unchanged. Independent of [handoff]: handoffs, managed context, the brief,
+# the profile digest and the inbox notice are unchanged.
 [recovery]
 deliver_on_session_start = false
 
@@ -335,21 +336,33 @@ desconhecidos são ignorados e se comportam como a estratégia padrão `basename
 falso (`false` / `0` / `no` / `off`, entre aspas ou puro). Um marcador que define apenas
 chaves de `[profile]` é um limite de configurações, como um com chaves de `[briefing]`.
 
-`[handoff] deliver_on_session_start` fica ativado a menos que o valor seja explicitamente falso
-(`false` / `0` / `no` / `off`, entre aspas ou puro). Clientes enviam `handoff=0` na
-busca de início de sessão apenas quando o marcador o desativa, de modo que o servidor não lê
-nada, não reivindica nada e não adiciona aviso de handoff ou continuidade para aquele
-projeto. Um marcador que define apenas `[handoff]` é um limite de configurações, como um
+`[handoff] deliver_on_session_start` sobrescreve o padrão do servidor
+`[handoff] deliver_on_session_start` em qualquer direção e fica ativado quando nenhum
+dos dois é definido. Clientes enviam o valor declarado na busca de início de sessão
+(`handoff=0` quando falso, `handoff=1` caso contrário, entre aspas ou puro). Um
+valor entre aspas exatamente vazio é ausente e não envia nada; um valor só com
+espaços conta como declarado. `false` faz o servidor não ler nada, não
+reivindicar nada e não adicionar aviso de handoff ou continuidade para aquele
+projeto, enquanto `true` restaura a entrega sob um padrão de servidor `false`.
+Um marcador que define apenas `[handoff]` é um limite de configurações, como um
 com chaves de `[briefing]` ou `[profile]`. Use-o para projetos cujos handoffs
-automáticos sejam em sua maioria ruído, como uma frota de bots orientada por rotinas e webhooks.
+automáticos sejam em sua maioria ruído, como uma frota de bots orientada por
+rotinas e webhooks. Arquivos de hook antigos enviam apenas `0`, então um projeto que reativa a
+entrega precisa da atualização de hooks descrita em
+[install.md](install.md#arquivos-de-hook-após-uma-atualização).
 
-`[recovery] deliver_on_session_start` também fica ativado a menos que seja explicitamente falso.
-Clientes então enviam `recovery=0`, o que suprime apenas o snapshot de recuperação
-de sessão inacabada e seu marcador de preenchimento retroativo (backfill). A sessão de origem permanece aberta, e
-handoffs, contexto gerenciado, o briefing, o digest de perfil e o aviso da caixa de entrada
-ainda são entregues. Um marcador que define apenas `[recovery]` é um limite de
-configurações. Use isso em projetos com sessões paralelas de longa duração, onde o snapshot
-de recuperação de outra sessão geralmente é ruído para essa disposição.
+`[recovery] deliver_on_session_start` sobrescreve o padrão do servidor
+`[recovery] deliver_on_session_start` da mesma forma. Clientes enviam `recovery=0`
+quando falso e `recovery=1` caso contrário; a regra de valor vazio é a mesma.
+`0` suprime apenas o snapshot de recuperação de sessão inacabada e seu marcador
+de preenchimento retroativo (backfill), e `1` o restaura sob um padrão de
+servidor `false`. A sessão de origem permanece aberta, e handoffs, contexto
+gerenciado, o briefing, o digest de perfil e o aviso da caixa de entrada ainda
+são entregues. Um marcador que define apenas `[recovery]` é um limite de
+configurações. Use isso em projetos com sessões paralelas de longa duração,
+onde o snapshot de recuperação de outra sessão geralmente é ruído para essa
+disposição. A mesma ressalva
+sobre hooks desatualizados de `[handoff]` vale ao reativar esta entrega.
 
 `[recall] default_global` se aplica às chamadas sem escopo `memory_query` e
 `memory_recent` de um agente. Em `memory_query`, um `global: false` explícito mantém

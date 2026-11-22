@@ -746,8 +746,8 @@ brief_on_project_change = false
 # [hook_spool]
 # max_attempts = 8
 
-# Session handoff delivery and creation. Both keys apply to every operator on
-# the server.
+# Session handoff delivery and creation. These settings apply to every operator
+# on the server.
 #
 # claim_on_session_start true (the default) makes a SessionStart that finds a
 # pending handoff claim it automatically. False makes it render a notice with
@@ -760,9 +760,25 @@ brief_on_project_change = false
 # create an automatic open handoff. False still writes the session summary page
 # and queues consolidation but creates no handoff (#1043). Handoffs from
 # `memory_handoff_begin` and managed runs are unaffected.
+#
+# deliver_on_session_start true (the default) delivers a pending handoff at
+# session start, claiming it when claim_on_session_start is on. False delivers
+# no handoff and posts no continuity notice; the baton stays open for
+# `memory_handoff_accept`. A project's `.ai-memory.toml` `[handoff]
+# deliver_on_session_start` overrides this default in either direction.
 # [handoff]
 # claim_on_session_start = true
+# deliver_on_session_start = true
 # create_on_session_end = true
+
+# Session-start unfinished-session recovery. deliver_on_session_start true
+# (the default) renders the bounded recovery snapshot and its backfill marker.
+# False skips only that snapshot; the source session stays open and the brief,
+# profile digest, handoffs and inbox notice are unchanged. A project's
+# `.ai-memory.toml` `[recovery] deliver_on_session_start` overrides this
+# default in either direction.
+# [recovery]
+# deliver_on_session_start = true
 
 # Scheduled server jobs. `enabled` is the master switch. The interval keys are
 # in seconds and 0 disables that job. The forget sweep and lint persist their
